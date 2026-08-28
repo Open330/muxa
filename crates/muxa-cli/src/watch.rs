@@ -12370,6 +12370,12 @@ fn help_popup_rect(r: Rect) -> Rect {
 /// Deliberately its own table rather than the topology one: the columns
 /// identify a request and both of its endpoints, and none of the node columns
 /// (state, duration, prompt) mean anything for a message.
+/// Rows the detail pane costs the table, plus its two borders.
+const COLLAB_DETAIL_HEIGHT: u16 = 7;
+/// Below this the table is too short to be worth splitting, so the body stays
+/// one `M` away instead of leaving three rows of listing.
+const COLLAB_DETAIL_MIN_HEIGHT: u16 = 16;
+
 fn render_collab_screen(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let filter = app.search_query.clone();
@@ -12413,6 +12419,19 @@ fn render_collab_screen(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
+    // A row carries an excerpt, and the body is what the operator came for.
+    // Below the table rather than beside it: a vertical split takes its width
+    // out of the columns that identify both ends of a request.
+    let (area, detail_area) = if area.height >= COLLAB_DETAIL_MIN_HEIGHT {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(COLLAB_DETAIL_HEIGHT)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
+
     let now = OffsetDateTime::now_utc();
     // The cursor counts requests, not rows: group headers are not selectable,
     // so the nth request is the nth *selectable* line.
@@ -12450,6 +12469,66 @@ fn render_collab_screen(f: &mut Frame, area: Rect, app: &mut App) {
     let mut state = TableState::default();
     state.select(selected_row);
     f.render_stateful_widget(table, area, &mut state);
+    if let Some(detail_area) = detail_area {
+        render_collab_detail(f, detail_area, app, theme);
+    }
+}
+
+/// The selected request in full: both ends with their rooms, the contract it
+/// was sent under, the body, and the reply when one has come back.
+fn render_collab_detail(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpec) {
+    let filter = app.search_query.clone();
+    let Some(request) = app.collab.selected_request(&filter) else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "{} [{}]",
+                    request.from.label(),
+                    collab_screen::location(&request.from)
+                ),
+                theme.table_header_style(),
+            ),
+            Span::raw(" → "),
+            Span::styled(
+                format!(
+                    "{} [{}]",
+                    request.to.label(),
+                    collab_screen::location(&request.to)
+                ),
+                theme.table_header_style(),
+            ),
+            Span::styled(
+                format!(
+                    "   {:?} · {:?} · {} ago",
+                    request.kind,
+                    request.work_mode,
+                    collab_screen::age(now, request.created_at)
+                ),
+                theme.dim_style(),
+            ),
+        ]),
+        Line::raw(request.body.clone()),
+    ];
+    if let Some(reply) = &request.reply {
+        lines.push(Line::from(Span::styled(
+            format!("↳ {:?}: {}", reply.status, reply.body),
+            theme.dim_style(),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.border_style())
+                .border_type(theme.border_type)
+                .title(format!(" {} ", request.id)),
+        ),
+        area,
+    );
 }
 
 fn render_preview(f: &mut Frame, area: Rect, app: &App) {
@@ -15791,6 +15870,31 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
             Paragraph::new(Line::from(vec![
                 Span::styled(" g… ", theme.action_badge()),
                 Span::raw("press g for first row · Esc cancels"),
+            ])),
+            area,
+        );
+        return true;
+    }
+    // Last, so every overlay above still owns the footer while it is open.
+    // The default strip advertises tree navigation and a preview, none of
+    // which this screen has — a request has no children and no pane output.
+    if matches!(app.watch_cfg.screen, WatchScreen::Collab) {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" j/k ", theme.key_badge()),
+                Span::raw(" move  "),
+                Span::styled(" / ", theme.action_badge()),
+                Span::raw(" filter  "),
+                Span::styled(" : ", theme.action_badge()),
+                Span::raw(" commands  "),
+                Span::styled(" ⏎ ", theme.action_badge()),
+                Span::raw(" go to peer  "),
+                Span::styled(" Alt-1 ", theme.key_badge()),
+                Span::raw(" topology  "),
+                Span::styled(" m ", theme.action_badge()),
+                Span::raw(" message  "),
+                Span::styled(" ? ", theme.key_badge()),
+                Span::raw(" help"),
             ])),
             area,
         );
@@ -23822,6 +23926,11 @@ sort = ["state"]
         }
     }
 
+    /// Longer than a row can show, so a frame carrying the tail proves the
+    /// detail pane rendered rather than the excerpt.
+    const COLLAB_FIXTURE_BODY: &str =
+        "check the upload chunking before the multipart retry lands downstream";
+
     fn collab_request(to_pane: &str) -> CollaborationRequest {
         CollaborationRequest {
             id: "req_1".into(),
@@ -23829,7 +23938,7 @@ sort = ["state"]
             to: collab_participant(to_pane, "callabo", "CAL-7330"),
             provenance: None,
             kind: RequestKind::Review,
-            body: "check the upload chunking".into(),
+            body: COLLAB_FIXTURE_BODY.into(),
             expects_reply: true,
             work_mode: WorkMode::ReadOnly,
             paths: Vec::new(),
@@ -23954,6 +24063,46 @@ sort = ["state"]
         assert!(painted.contains("callabo:CAL-7330"), "{painted}");
         assert!(painted.contains("Collab"), "{painted}");
         assert!(painted.contains("check the upload chunking"), "{painted}");
+    }
+
+    #[test]
+    fn the_detail_pane_carries_the_body_the_row_had_to_cut() {
+        // The row can only hold an excerpt, and the body is the reason the
+        // operator opened the screen.
+        let mut app = collab_app("%2");
+        let backend = ratatui::backend::TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let painted: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(painted.contains(COLLAB_FIXTURE_BODY), "{painted}");
+        assert!(painted.contains("req_1"), "the pane is titled by request");
+        // The footer speaks this screen's language, not the tree's.
+        assert!(painted.contains("go to peer"), "{painted}");
+        assert!(!painted.contains("tree"), "{painted}");
+    }
+
+    #[test]
+    fn a_short_terminal_keeps_the_listing_instead_of_the_detail() {
+        // Splitting a 12-row frame would leave three rows of listing.
+        let mut app = collab_app("%2");
+        let backend = ratatui::backend::TestBackend::new(160, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let painted: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(!painted.contains(COLLAB_FIXTURE_BODY), "{painted}");
+        assert!(painted.contains("Collab"), "{painted}");
     }
 
     fn rename_app(level: RenameLevel, original: &str) -> App {

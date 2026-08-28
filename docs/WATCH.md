@@ -191,6 +191,12 @@ Typing filters on either end's alias, its `session:window`, the message, the
 kind, and the status. `Enter` attaches to the peer's pane — requests outlive
 panes, so a request whose peer is gone says so rather than doing nothing.
 
+A row can only hold an excerpt, so the selected request also opens in a detail
+pane under the table: both ends with their rooms, the kind and delivery mode it
+was sent under, the body in full, and the reply when one has come back. The
+pane costs seven rows, so terminals shorter than sixteen rows keep the listing
+instead and leave the body to `M`.
+
 Widening past your own mailbox is an operator-console operation, so the screen
 needs a daemon built from the same tree as the CLI; an older one is reported
 rather than silently answered with a caller-scoped listing.
