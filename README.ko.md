@@ -197,17 +197,17 @@ GitHub PR을 의미하지 않습니다. `@peer`는 같은 window의 정상 agent
 
 기본 tmux 운영 정책은 workspace 실행 context를 session에, Work의 활성 Run을
 window에, Agent session을 pane에 연결합니다. `muxa onboard`는 이 mapping을 전용
-sandbox에서 실행하는 15단계 live tour입니다. 실제 session과 window를 만들고 tree를
+sandbox에서 실행하는 16단계 live tour입니다. 실제 session과 window를 만들고 tree를
 확인하며 detach/attach를 거친 뒤 pane을 나누고 scripted agent를 시작합니다. 이어
 실제 `muxa watch`, `muxa attend`, `muxa msg`를 실제 sandbox mailbox에 사용합니다.
 narration은 tmux와 Muxa state를 관찰해 진행하며 key를 가로채지 않습니다. 한국어
 locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도중 `F2`로 전환할 수
-있습니다. `--print`는 tmux를 시작하지 않고 같은 15단계 written guide를 출력합니다.
+있습니다. `--print`는 tmux를 시작하지 않고 같은 16단계 written guide를 출력합니다.
 
 | Command | 목적 |
 | --- | --- |
 | `muxa status [--json]` | 추적 중인 agent 테이블 또는 desktop integration용 versioned JSON snapshot. |
-| `muxa watch [--view pane\|work]` | workspace → work → agent live TUI picker/dashboard. |
+| `muxa watch [--view session\|window\|pane]` | workspace → work → agent live TUI picker/dashboard. |
 | `muxa dashboard [--since today]` | Run capture와 agent별/Work 일괄 prompt·abort, ACT/WACT total을 보여주는 Work-card TUI. |
 | `muxa attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |
 | `muxa status-line [--pane %N]` | tmux status-line 출력. |
@@ -228,7 +228,7 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 | `muxa work list/show/close [--workspace muxa]` | Work와 현재 Run binding을 조회하거나 Run window를 명시적으로 종료. |
 | `muxa agent start --host tmux --workspace muxa --work muxa-onboarding ...` | allowlist agent pane을 managed tmux Work window에 추가. MCP에서는 `muxa_start_agent`로 제공. |
 | `muxa agent control (--pane %N\|--session pty-N) --action interrupt` | managed tmux pane 또는 muxa-owned PTY agent session 하나를 중단하거나 명시적으로 종료. |
-| `muxa onboard [--tour live] [--lang auto\|en\|ko]` | 전용 sandbox에서 실제 tmux, watch, attend, mailbox를 다루는 15단계 tour. 기존 tmux 안에서는 실행을 거부합니다. `F2` 언어 전환, `--no-quiz`의 즉시 `F12` 제공, `--print` guide를 지원합니다. |
+| `muxa onboard [--tour live] [--lang auto\|en\|ko]` | 전용 sandbox에서 실제 tmux, watch, attend, mailbox를 다루는 16단계 tour. 기존 tmux 안에서는 실행을 거부합니다. `F2` 언어 전환, `--no-quiz`의 즉시 `F12` 제공, `--print` guide를 지원합니다. |
 | `muxa mcp` | coding agent가 상태 확인, 메시지, pane capture, 변경 대기, tmux lifecycle을 Muxa를 통해 수행하는 MCP stdio server. [docs/MCP.md](docs/MCP.md) 참고. |
 | `muxa init` | install/uninstall wizard. |
 | `muxad` | daemon process. |

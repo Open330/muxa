@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --print
 ```
 
-After installing Muxa, run `muxa onboard` directly for the same fifteen-step
+After installing Muxa, run `muxa onboard` directly for the same sixteen-step
 live tour, or `muxa onboard --print` when tmux is unavailable.
 
 ## One-Shot Install

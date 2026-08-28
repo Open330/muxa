@@ -232,18 +232,19 @@ rollback details, see [docs/INSTALL.md](docs/INSTALL.md).
 
 Managed tmux policy binds a workspace context to a session, an active Work Run
 to a window, and an Agent session to a pane. `muxa onboard` teaches that mapping
-in fifteen live steps on a private sandbox. You create a real session and
-window, inspect the tree, detach and reattach, split a pane, start a scripted
-agent, and then use real `muxa watch`, `muxa attend`, and `muxa msg` commands
+in sixteen live steps on a private sandbox. You create a real session and
+window, inspect the tree, detach and reattach, split a pane and let the tour
+bring up two scripted agents, then use real `muxa watch` — including the
+`j`/`k`, `Enter` and `?` keys it is driven with — `muxa attend`, and `muxa msg`
 against a real sandbox mailbox. The narration observes tmux and Muxa state; it
 does not intercept your keys. Korean is selected automatically for a Korean
 locale, can be requested with `--lang ko`, and can be toggled with `F2` during
-the tour. `--print` emits the same fifteen-step workflow without starting tmux.
+the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 
 | Command | Purpose |
 | --- | --- |
 | `muxa status [--json]` | Human-readable table, or a versioned JSON snapshot for desktop integrations. |
-| `muxa watch [--view pane\|work]` | Live workspace → work → agent TUI picker/dashboard. |
+| `muxa watch [--view session\|window\|pane]` | Live workspace → work → agent TUI picker/dashboard. |
 | `muxa dashboard [--since today]` | Work-card TUI with Run capture, per-agent and Work-wide prompt/abort actions, ACT/WACT totals, and collaboration controls. |
 | `muxa attend [--cycle] [--list]` | Focus or list agents needing attention. |
 | `muxa status-line [--pane %N]` | tmux status-line output. |
@@ -269,7 +270,7 @@ the tour. `--print` emits the same fifteen-step workflow without starting tmux.
 | `muxa work list/show/close [--workspace muxa]` | Inspect Work and its current Run binding, or explicitly close that Run window. |
 | `muxa agent start --host tmux --workspace muxa --work muxa-onboarding ...` | Add an allowlisted agent pane to one managed tmux Work window; also exposed as MCP `muxa_start_agent`. |
 | `muxa agent control (--pane %N\|--session pty-N) --action interrupt` | Interrupt or explicitly terminate one managed tmux pane or muxa-owned PTY agent session. |
-| `muxa onboard [--tour live] [--lang auto\|en\|ko]` | Fifteen live steps on a throwaway muxa: real tmux, watch, attend, and mailbox. Refuses to nest inside an existing tmux session. `F2` switches language, `--no-quiz` offers `F12` immediately, and `--print` emits the written guide. |
+| `muxa onboard [--tour live] [--lang auto\|en\|ko]` | Sixteen live steps on a throwaway muxa: real tmux, watch, attend, and mailbox. Refuses to nest inside an existing tmux session. `F2` switches language, `--no-quiz` offers `F12` immediately, and `--print` emits the written guide. |
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |

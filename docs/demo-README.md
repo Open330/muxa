@@ -12,7 +12,7 @@ new keybinds, layout shifts, a renamed subcommand, a new panel.
 | `docs/demo-collab.tape`   | VHS script for the collaboration GIF.                                                     |
 | `scripts/muxa-sandbox.sh` | The isolation itself: private socket, config, data dir, tmux server, and the `tmux` PATH shim. `up` / `daemon` / `env` / `status` / `down`. |
 | `scripts/sandbox-smoke.sh`| Lifecycle test for the sandbox — proves `down` returns the machine to clean from every state, including the ones a crash leaves. |
-| `scripts/live-tour-smoke.py`| Types a learner's commands at `muxa onboard --tour live` and checks each of the fifteen steps advances. |
+| `scripts/live-tour-smoke.py`| Types a learner's commands at `muxa onboard --tour live` and checks each of the sixteen steps advances. |
 | `docs/demo-setup.sh`      | The fixture layered on the sandbox: the seeded fleet, the mailbox, the ask history, and the painted panes. |
 | `docs/demo-paint.sh`      | Emits one agent's screen — `demo-paint.sh <agent> <state> <prompt> [tool]...` — so panes hold a believable frame instead of a bare `cat`. |
 | `docs/demo-teardown.sh`   | Removes all of it — delegates to the sandbox, then clears the fixture-only files. Safe at any time, including after a half-finished render. |

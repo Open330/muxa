@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --print
 ```
 
-Muxa를 설치한 뒤에는 `muxa onboard`로 같은 15단계 live tour를 바로 실행하거나,
+Muxa를 설치한 뒤에는 `muxa onboard`로 같은 16단계 live tour를 바로 실행하거나,
 tmux를 사용할 수 없을 때 `muxa onboard --print`로 written guide를 볼 수 있습니다.
 
 ## One-Shot 설치

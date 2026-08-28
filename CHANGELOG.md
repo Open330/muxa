@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The live sandbox is now the only `muxa onboard` tour and the default.** The
   20-step Rust and POSIX-shell simulations, their mock renderers, the hidden
   `--emit step-table` parity contract, and the parity/split-arrow drivers are
-  gone. `muxa onboard --print` now follows the live tour's fifteen steps.
+  gone. `muxa onboard --print` now follows the live tour's sixteen steps.
   `scripts/onboard.sh` remains a no-install entry point by downloading and
   verifying a temporary release binary, but no longer carries an offline
   fallback implementation.
@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`muxa onboard --tour live` — the onboarding stops simulating muxa and
-  becomes it.** Fifteen steps in two acts, against a sandbox on its own tmux
+  becomes it.** Sixteen steps in two acts, against a sandbox on its own tmux
   server: Act I is real `tmux new-session`, a real second window, a real detach
   proving the work kept running, and a real reattach; Act II adds two scripted
   agents to the learner's own window and walks them through real `muxa watch`,
@@ -78,7 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `checkout · 3 agents` instead of `muxa` and `bash`. None of it shells out to
   an agent CLI, and each transcript says so on its first line.
 
-  Fifteen steps, not nine, and one action each. Compressing them put two
+  Sixteen steps, not nine, and one action each. Compressing them put two
   instructions on a line — "see both: Ctrl-b s · then leave: Ctrl-b d" — which
   reads as one and leaves the learner unsure which half registered. `Ctrl-b s`,
   `tmux ls`, `Ctrl-b ;` and `muxa msg list` are steps in their own right now;

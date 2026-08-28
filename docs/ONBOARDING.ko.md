@@ -14,7 +14,7 @@ session에는 서로 다른 cwd/worktree를 가진 여러 work window가 공존�
 
 ## 온보딩 실행
 
-`muxa onboard`의 기본 동작은 실제 tmux와 Muxa를 사용하는 15단계 live tour입니다.
+`muxa onboard`의 기본 동작은 실제 tmux와 Muxa를 사용하는 16단계 live tour입니다.
 개인 환경과 격리된 전용 tmux server, `muxad`, config, data directory, mailbox를
 만들고 모든 종료 경로에서 sandbox를 삭제합니다. 기존 tmux 안에서 실행하면 prefix가
 모호해지므로 거부합니다. detach한 terminal이나 tmux 밖 terminal에서 실행하세요.
@@ -35,23 +35,28 @@ polling하고, 그 상태가 확인되면 다음 단계로 넘어갑니다. 한 
 
     muxa onboard --no-quiz
 
-## 15단계 live workflow
+## 16단계 live workflow
 
-1. `tmux new-session -s muxa-onboarding`으로 session/workspace를 만듭니다.
-2. `Ctrl-b`, `c`로 두 번째 window/Work를 만듭니다.
-3. `Ctrl-b`, `s`로 session/window tree를 확인하고 `q`로 닫습니다.
-4. `Ctrl-b`, `d`로 detach합니다. client만 나가고 작업은 계속됩니다.
-5. 원래 shell에서 `tmux ls`로 session이 남아 있음을 확인합니다.
+`muxa onboard --print --lang ko`가 같은 목록을 출력합니다. 그 출력은 tour의
+단계 정의에서 직접 생성되므로, 아래 요약과 달라지면 아래가 낡은 것입니다.
+
+1. `tmux new-session -s muxa-onboarding` — session은 당신 없이도 도는 작업 공간.
+2. `Ctrl-b`, `c` — window 하나가 Work 하나.
+3. `Ctrl-b`, `s`로 tree를 보고 `q`로 닫습니다.
+4. `Ctrl-b`, `d`로 detach. client만 나가고 작업은 계속됩니다.
+5. `tmux ls`로 session이 남아 있음을 직접 확인합니다.
 6. `tmux attach -t muxa-onboarding`으로 다시 들어갑니다.
-7. `Ctrl-b`, `%`로 window를 나눕니다. pane 하나가 agent 하나입니다.
-8. 새 pane에서 `claude`를 실행합니다. sandbox shim이 실제 CLI를 안전하게 대신합니다.
-9. 자신의 pane에서 `muxa watch`를 실행해 checkout Work와 agent 전체를 확인합니다.
-10. `muxa attend`로 가장 오래 막힌 codex pane으로 이동합니다.
-11. `Ctrl-b`, `;`로 직전에 사용한 자신의 pane으로 돌아갑니다.
-12. `muxa msg send @claude "어디까지 됐나요?"`로 attach 없이 질문합니다.
-13. `muxa msg list`로 보낸 요청과 claude의 답장을 확인합니다.
-14. `muxa msg inbox`로 codex가 보낸 요청을 가져옵니다.
-15. `Ctrl-b`, `d`로 마칩니다. tour가 전용 server와 sandbox를 삭제합니다.
+7. `Ctrl-b`, `%`로 window를 나눕니다 (`"`는 상하). pane 하나가 agent 하나.
+8. `Enter` — tour가 연습용 agent 둘을 띄웁니다. 실제 CLI는 실행되지 않습니다.
+9. `muxa watch` — 진입점. session·window·agent를 살아있는 채로 봅니다.
+10. watch 안에서 `j`/`k` 이동, `h`/`l` 접기, `Enter`로 pane 진입, `?`로 키 목록.
+    둘러본 뒤 `q`로 나옵니다.
+11. `muxa attend` — 가장 오래 막힌 agent로 이동합니다.
+12. `Ctrl-b`, `;`로 직전 pane으로 복귀 (`Ctrl-b o`는 순환).
+13. `muxa msg send @claude "어디까지 됐나요?"` — attach 없이 질문합니다.
+14. `muxa msg list` — 보낸 것과 돌아온 답을 확인합니다.
+15. `muxa msg inbox` — codex가 보낸 요청을 가져옵니다.
+16. `Ctrl-b`, `d`로 마칩니다. tour가 전용 server와 sandbox를 삭제합니다.
 
 핵심 mapping은 `session = workspace`, `window = Work`, `pane = agent`입니다.
 터미널 상호작용 없이 같은 순서의 written guide만 출력할 수도 있습니다.
