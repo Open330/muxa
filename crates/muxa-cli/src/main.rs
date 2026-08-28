@@ -1213,12 +1213,23 @@ struct RawModeGuard;
 impl RawModeGuard {
     fn enter() -> Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
+        if let Err(error) =
+            crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)
+        {
+            // `execute!` may have written the enable sequence before a later
+            // flush error. Best-effort reversal keeps a failed attach from
+            // leaving the parent terminal in paste mode without a guard.
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(error.into());
+        }
         Ok(Self)
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
@@ -1255,6 +1266,14 @@ async fn attach_session_loop(client: &Client, session_id: &str) -> Result<()> {
 
         while crossterm::event::poll(Duration::ZERO)? {
             match crossterm::event::read()? {
+                Event::Paste(text) => {
+                    // A detach prefix applies only to the immediately
+                    // following key, never across a whole paste event.
+                    detach_armed = false;
+                    client
+                        .write_session(session_id, &bracketed_paste_input(&text))
+                        .await?;
+                }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if detach_armed {
                         detach_armed = false;
@@ -1282,6 +1301,32 @@ async fn attach_session_loop(client: &Client, session_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Recreate the framing that crossterm strips from an `Event::Paste` before
+/// relaying it to the child PTY. Keeping the payload bracketed prevents a
+/// multiline paste from being executed one line at a time by an interactive
+/// shell. The parent terminal reports line feeds; PTY input expects carriage
+/// returns, with CRLF normalized first so it does not become a doubled CR.
+fn bracketed_paste_input(text: &str) -> String {
+    const START: &str = "\x1b[200~";
+    const END: &str = "\x1b[201~";
+
+    // Clipboard text can contain terminal controls. If an end marker reaches
+    // the child unchanged, readline leaves paste mode early and processes the
+    // remainder as ordinary keystrokes, including carriage returns that execute
+    // commands. Remove markers while streaming so overlapping inputs cannot
+    // reveal a fresh marker after an earlier one is deleted.
+    let mut defanged = Vec::with_capacity(text.len());
+    for byte in text.bytes() {
+        defanged.push(byte);
+        if defanged.ends_with(START.as_bytes()) || defanged.ends_with(END.as_bytes()) {
+            defanged.truncate(defanged.len() - START.len());
+        }
+    }
+    let defanged = String::from_utf8(defanged).expect("removing ASCII preserves UTF-8");
+    let normalized = defanged.replace("\r\n", "\n").replace('\n', "\r");
+    format!("{START}{normalized}{END}")
+}
+
 fn is_detach_prefix(key: crossterm::event::KeyEvent) -> bool {
     key.modifiers
         .contains(crossterm::event::KeyModifiers::CONTROL)
@@ -1290,6 +1335,13 @@ fn is_detach_prefix(key: crossterm::event::KeyEvent) -> bool {
 
 fn key_to_pty_input(key: crossterm::event::KeyEvent) -> Option<String> {
     use crossterm::event::{KeyCode, KeyModifiers};
+
+    // The parent terminal owns platform shortcuts. If one still reaches
+    // crossterm, dropping it is safer than turning Cmd+V into a literal `v`.
+    if key.modifiers.contains(KeyModifiers::SUPER) {
+        return None;
+    }
+
     Some(match key.code {
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let lower = c.to_ascii_lowercase();
@@ -2842,6 +2894,34 @@ mod tests {
             },
             at: time::OffsetDateTime::now_utc(),
         }
+    }
+
+    #[test]
+    fn attached_session_paste_is_reframed_and_normalizes_newlines() {
+        assert_eq!(
+            bracketed_paste_input("first\nsecond\r\nthird"),
+            "\x1b[200~first\rsecond\rthird\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn attached_session_paste_cannot_close_its_own_brackets() {
+        let framed =
+            bracketed_paste_input("safe\x1b[201~\r\nnext\x1b[200~\x1b\x1b[201~[201~\r\ncommand");
+        assert!(framed.starts_with("\x1b[200~"));
+        assert!(framed.ends_with("\x1b[201~"));
+        assert_eq!(framed.matches("\x1b[200~").count(), 1);
+        assert_eq!(framed.matches("\x1b[201~").count(), 1);
+        assert_eq!(&framed[6..framed.len() - 6], "safe\rnext\rcommand");
+    }
+
+    #[test]
+    fn attached_session_drops_super_shortcuts() {
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('v'),
+            crossterm::event::KeyModifiers::SUPER,
+        );
+        assert_eq!(key_to_pty_input(key), None);
     }
 
     #[test]
