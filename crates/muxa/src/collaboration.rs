@@ -98,6 +98,13 @@ fn addresses(to: &Participant, caller: &Participant) -> bool {
         && !caller.console
         && to.pane == caller.pane
         && to.socket == caller.socket
+        // The room too, not just the endpoint. Session ids are globally
+        // unique, so the session-pinned path needs no such guard; pane ids are
+        // only unique per server and restart at `%0` when one does, and a
+        // queued request outlives that. Without the room a stale pending
+        // request could be adopted by whatever agent later occupies the same
+        // pane id in an unrelated window.
+        && to.room == caller.room
 }
 
 /// Pin a pending recipient to the concrete session now acting as it, so every
@@ -1889,11 +1896,20 @@ pub fn pending_recipient_ready(
     if row.state != AgentState::Idle {
         return None;
     }
+    // Re-apply the send-time guard at delivery time. `@muxa_agent_role` is a
+    // tmux *pane* option that outlives the process it was stamped for, so a
+    // kept-alive pane stays addressable; without this re-check an unrelated
+    // `Task`/`Unknown` row idling there would be enough to get a request body
+    // typed into it.
+    if !muxa_launched_agent_pane(pane, Some(row)) {
+        return None;
+    }
     let socket = pane.socket.clone().or_else(|| to.socket.clone());
     let ready = pane_participant(pane, socket, Some(row));
-    // The identity must stay byte-identical to `request.to`: delivery reserves
-    // the request through `prepare_direct_wake`, which is session-pinned.
-    (ready.same_endpoint(to)).then_some(ready)
+    // The identity must stay byte-identical to `request.to` — delivery
+    // reserves the request through the session-pinned `prepare_direct_wake` —
+    // and the pane must still live in the room the request was addressed to.
+    (ready.same_endpoint(to) && ready.room == to.room).then_some(ready)
 }
 
 /// The one pane with this id, disambiguated by control endpoint the same way
@@ -2496,6 +2512,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replied.status, RequestStatus::Completed);
+    }
+
+    /// Pane ids restart at `%0` when a tmux server does, and a queued request
+    /// outlives that. Ownership therefore checks the room as well as the
+    /// endpoint, or a recycled pane id would inherit unrelated work.
+    #[tokio::test]
+    async fn a_recycled_pane_id_in_another_room_does_not_inherit_the_request() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let mut pending = participant("%2", "placeholder");
+        pending.agent_session_id = format!("{PENDING_SESSION_PREFIX}default:%2");
+
+        mailbox
+            .create(
+                sender,
+                pending,
+                NewRequest {
+                    kind: RequestKind::Review,
+                    body: "review the diff".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut elsewhere = participant("%2", "unrelated-session");
+        elsewhere.room.window_id = "@9".into();
+        assert!(
+            mailbox.claim_for(&elsewhere).await.unwrap().is_empty(),
+            "same pane id, different room: not the addressed pane",
+        );
+        assert_eq!(mailbox.unread_count(&elsewhere).await, 0);
+
+        let same_room = participant("%2", "codex-session");
+        assert_eq!(mailbox.claim_for(&same_room).await.unwrap().len(), 1);
+    }
+
+    /// The launch mark is a tmux *pane* option that outlives the process it was
+    /// stamped for, so the delivery gate re-applies the send-time evidence
+    /// rather than trusting the mark alone.
+    #[tokio::test]
+    async fn delivery_refuses_a_pane_whose_agent_evidence_is_gone() {
+        let store = crate::Store::shared();
+        store
+            .apply(&crate::event::AgentEvent::Started {
+                id: crate::event::AgentId {
+                    kind: AgentKind::Unknown,
+                    session_id: format!("{}default:%2", crate::state::SYNTHETIC_SESSION_PREFIX),
+                    surface: None,
+                    pane: Some("%2".into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let agents = store.snapshot().await;
+        let mut pending = participant("%2", "placeholder");
+        pending.agent_session_id = format!("{PENDING_SESSION_PREFIX}default:%2");
+
+        // No launch mark left, and the row classifies as nothing in
+        // particular: the pane is no longer evidently an agent.
+        assert!(pending_recipient_ready(&pending, &agents, &[pane_info("%2")]).is_none());
+
+        // The same row on a pane muxa marked is still deliverable.
+        let mut marked = pane_info("%2");
+        marked.agent_role = Some("peer".into());
+        assert!(pending_recipient_ready(&pending, &agents, &[marked]).is_some());
     }
 
     /// A pending request answered without an inbox pull — the direct-wake path

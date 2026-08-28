@@ -255,7 +255,11 @@ codex fires `SessionStart` when its first prompt is submitted, not when its TUI
 boots, so waiting for registration before sending would deadlock against the
 very request being sent. muxad delivers a pane-addressed request as soon as the
 pane reads idle, and the first agent session to register on that pane adopts
-it; from then on the request is session-pinned like any other. The result
+it — same room, same pane, same control endpoint — after which the request is
+session-pinned like any other. Readiness needs muxa to see an agent process on
+the pane, so the fallback is limited to providers discovery classifies or a
+screen manifest covers; a spawned `opencode` pane still fails fast instead of
+queueing work nothing would deliver. The result
 reports `peer_pending: true` and a `request_id` — wait on that with
 `muxa_wait_reply`, never with `tmux capture-pane` polling.
 

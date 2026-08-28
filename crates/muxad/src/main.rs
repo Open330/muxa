@@ -772,9 +772,7 @@ fn spawn_collaboration_waker_task(
                                 | muxa::AgentState::Stopped
                                 | muxa::AgentState::Error
                         ) {
-                            if let Some(key) = collaboration_wake_key_for_agent(&transition.agent) {
-                                wake_inflight.remove(&key);
-                            }
+                            clear_wake_inflight_for_agent(&mut wake_inflight, &transition.agent);
                         }
                         should_scan
                     }
@@ -1213,14 +1211,22 @@ fn collaboration_wake_key(
     )
 }
 
-fn collaboration_wake_key_for_agent(
+/// Drop the wake debounce for everything addressed at this agent's pane.
+///
+/// Keyed by endpoint rather than session id on purpose: a request queued
+/// against a pane that had not registered yet carries a `pending-pane:`
+/// placeholder, which no registry row will ever name. Matching the row's own
+/// session id would leave that entry suppressing further wakes to the pane
+/// until the slow reconcile tick cleared the whole set.
+fn clear_wake_inflight_for_agent(
+    wake_inflight: &mut HashSet<(String, Option<String>, String)>,
     agent: &muxa::Agent,
-) -> Option<(String, Option<String>, String)> {
-    Some((
-        agent.pane.clone()?,
-        agent.tmux_socket.clone(),
-        agent.session_id.clone(),
-    ))
+) {
+    let Some(pane) = agent.pane.as_deref() else {
+        return;
+    };
+    wake_inflight
+        .retain(|(key_pane, key_socket, _)| key_pane != pane || *key_socket != agent.tmux_socket);
 }
 
 async fn send_collaboration_wake(
@@ -2457,6 +2463,42 @@ mod tests {
 
         shutdown_tx.send(()).unwrap();
         waker.await.unwrap();
+    }
+
+    /// A pending recipient's debounce is keyed by the placeholder session id,
+    /// which no registry row will ever name. Clearing has to be endpoint-based
+    /// or a second request to the same pane stays suppressed until the slow
+    /// reconcile tick.
+    #[tokio::test]
+    async fn wake_debounce_for_a_pending_pane_clears_on_that_pane_s_transition() {
+        let store = muxa::Store::shared();
+        add_agent(&store, "%2", "synthetic-7:default:%2", AgentKind::Codex).await;
+        let row = store
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|agent| agent.pane.as_deref() == Some("%2"))
+            .expect("the pane has a row");
+
+        let mut wake_inflight = HashSet::new();
+        wake_inflight.insert((
+            "%2".to_string(),
+            Some("default".to_string()),
+            "pending-pane:default:%2".to_string(),
+        ));
+        wake_inflight.insert((
+            "%3".to_string(),
+            Some("default".to_string()),
+            "other-session".to_string(),
+        ));
+
+        clear_wake_inflight_for_agent(&mut wake_inflight, &row);
+
+        assert!(
+            !wake_inflight.iter().any(|(pane, _, _)| pane == "%2"),
+            "the pending key for this pane must clear",
+        );
+        assert_eq!(wake_inflight.len(), 1, "other panes are untouched");
     }
 
     /// The spawn deadlock, end to end: a pane muxa launched carries only a

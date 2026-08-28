@@ -271,7 +271,11 @@ agent 재시작이며 GitHub를 대체 transport로 사용하지 않습니다.
 agent는 아예 동작하지 않습니다. codex는 TUI가 뜰 때가 아니라 첫 프롬프트가 제출될 때
 `SessionStart`를 발생시키므로, 보내기 전에 등록을 기다리면 지금 보내려는 그 request와
 교착합니다. muxad는 pane이 idle로 읽히는 즉시 배달하고, 그 pane에 처음 등록한 agent
-session이 request를 인계받습니다. 그 뒤부터는 다른 request와 똑같이 session에 고정됩니다.
+session이 request를 인계받습니다(같은 room·pane·endpoint일 때만). 그 뒤부터는 다른
+request와 똑같이 session에 고정됩니다. 준비 여부는 muxa가 그 pane에서 agent
+프로세스를 볼 수 있어야 판단되므로, 이 fallback은 discovery가 분류하거나 screen
+manifest가 있는 provider에만 적용됩니다. `opencode` pane spawn은 큐잉 대신 종전처럼
+빠르게 실패합니다.
 결과에는 `peer_pending: true`와 `request_id`가 실리며, 대기는 `muxa_wait_reply`로 합니다.
 `tmux capture-pane` polling으로 대체하지 마세요.
 

@@ -1496,8 +1496,9 @@ async fn call_peer(
         common["peer_pending"] = json!(true);
         common["delivery"] = json!(format!(
             "pane {} has no registered agent session yet; muxad delivers this request as soon as \
-             the pane reads idle. Wait on request_id {} with muxa_wait_reply — never watch the \
-             pane with capture-pane or sleep.",
+             that pane reports idle, which needs muxa to see an agent process there. Wait on \
+             request_id {} with muxa_wait_reply — never watch the pane with capture-pane or \
+             sleep. If the reply times out, check `muxa status` for a row on the pane.",
             selection.pane, sent.id
         ));
     }
@@ -1681,6 +1682,16 @@ fn select_peer(
             format!("explicit pane {}", peer.pane),
         )));
     }
+    if is_pane_selector(pane_target) {
+        // An explicitly addressed pane that hosts no registered peer is not an
+        // error here: muxad resolves a muxa-launched pane whose agent has not
+        // registered yet, and refuses anything else. Deciding that locally
+        // would duplicate — and could contradict — the authoritative guard.
+        return Ok(Some(PeerSelection::pending(
+            pane_target.to_string(),
+            format!("explicit pane {pane_target}, pending its agent's registration"),
+        )));
+    }
     if let Some(kind) = provider_kind(target) {
         let candidates = live
             .iter()
@@ -1737,6 +1748,12 @@ fn select_peer(
             "alias @{alias} matches multiple peers; use an exact pane id"
         )),
     }
+}
+
+/// Does this selector name a concrete pane? `%N` for tmux/zellij, and the
+/// namespaced ids other hosts use (`herdr:…`, `cmux:…`, `rmux:%N`).
+fn is_pane_selector(target: &str) -> bool {
+    target.starts_with('%') || muxa::backend::pane_id_host_kind(target).is_some()
 }
 
 fn peer_is_eligible(peer: &Participant) -> bool {
@@ -1916,6 +1933,20 @@ async fn spawn_peer(
         registrations,
     )
     .await?;
+    if peer.is_none() && !has_pane_readiness_signal(program) {
+        // Delivery to an unregistered pane needs a row that reports `Idle`,
+        // which means discovery must classify the process or a screen manifest
+        // must cover it. Neither holds for opencode today, so queueing against
+        // the pane would promise a delivery that can never happen — fail fast
+        // with something the caller can act on instead.
+        return Err(format!(
+            "created {} peer pane {} but it did not register within {timeout_secs}s, and muxa has no readiness signal for {} panes; keep the pane, submit one prompt in it so its hooks fire, then call again with target=\"pane:{}\"",
+            agent_program_label(program),
+            started.pane,
+            agent_program_label(program),
+            started.pane
+        ));
+    }
     // Registration is not a precondition for sending. An agent that registers
     // on boot (claude) lands in the grace window above; codex creates its
     // session — and so fires its first hook — only when a prompt arrives, so
@@ -1941,6 +1972,25 @@ async fn spawn_peer(
         ),
     };
     Ok((selection, started))
+}
+
+/// Can muxad tell that a pane of this program is ready for input before its
+/// agent registers?
+///
+/// That requires the pane to carry a registry row, which comes from discovery
+/// classifying the process (`discovery::classify_command`) or from a bundled
+/// screen manifest. Opencode has neither today — `DiscoveryReport::bump`
+/// documents that it is never synthesized — so a request queued against an
+/// unregistered opencode pane would wait forever.
+fn has_pane_readiness_signal(program: crate::agent_launch::AgentProgram) -> bool {
+    use crate::agent_launch::AgentProgram;
+    match program {
+        AgentProgram::Claude
+        | AgentProgram::Codex
+        | AgentProgram::Gemini
+        | AgentProgram::Antigravity => true,
+        AgentProgram::Opencode => false,
+    }
 }
 
 async fn wait_for_spawned_peer_registration(
@@ -3160,6 +3210,40 @@ mod tests {
             select_peer(&room, "@muxa-peer").unwrap().unwrap().pane,
             "%3"
         );
+    }
+
+    /// An explicitly addressed pane with no registered peer is handed to muxad
+    /// as a pending selection — that is the documented retry after a spawn,
+    /// and the daemon owns the decision about whether the pane is addressable.
+    #[test]
+    fn explicit_pane_target_without_a_registered_peer_stays_addressable() {
+        let current = peer_participant(AgentKind::ClaudeCode, "%1", AgentState::Idle);
+        let room = peer_room(current, vec![]);
+
+        let selection = select_peer(&room, "pane:%3").unwrap().unwrap();
+        assert_eq!(selection.pane, "%3");
+        assert!(selection.peer.is_none(), "no registered peer to pin to");
+
+        let bare = select_peer(&room, "%3").unwrap().unwrap();
+        assert_eq!(bare.pane, "%3");
+
+        // A non-pane selector still reports that nothing matched.
+        assert!(select_peer(&room, "@nobody")
+            .unwrap_err()
+            .contains("no eligible peer matches"));
+    }
+
+    /// Queueing against a pane only makes sense when muxa can tell that the
+    /// pane became ready. Opencode has neither a discovery classification nor
+    /// a screen manifest, so its spawns must keep failing fast.
+    #[test]
+    fn only_providers_with_a_readiness_signal_fall_back_to_the_pane() {
+        use crate::agent_launch::AgentProgram;
+        assert!(has_pane_readiness_signal(AgentProgram::Codex));
+        assert!(has_pane_readiness_signal(AgentProgram::Claude));
+        assert!(has_pane_readiness_signal(AgentProgram::Gemini));
+        assert!(has_pane_readiness_signal(AgentProgram::Antigravity));
+        assert!(!has_pane_readiness_signal(AgentProgram::Opencode));
     }
 
     #[test]
