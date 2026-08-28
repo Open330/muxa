@@ -2426,6 +2426,19 @@ fn next_steps(language: UiLanguage) {
         println!("  {line}");
     }
     println!();
+    // Not something muxa installs, and deliberately so: oh-my-zsh's tmux
+    // plugin already gives these names, with session-name completion that a
+    // plain alias would not have. Writing our own into somebody's rc would
+    // shadow the better version depending on load order. Point at it instead.
+    println!(
+        "  {}",
+        tr(
+            language,
+            "In your shell:  oh-my-zsh's `tmux` plugin gives `ta` / `ts` / `tl`, with session-name completion",
+            "셸에서:  oh-my-zsh의 `tmux` 플러그인이 `ta` / `ts` / `tl` 을 세션 이름 자동완성과 함께 줍니다",
+        )
+    );
+    println!();
     println!(
         "  {}",
         tr(

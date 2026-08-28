@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   somebody else's keys goes stale the first time they change one, and this one
   tells the learner what their own machine will do.
 
+  It also points at oh-my-zsh's `tmux` plugin for `ta` / `ts` / `tl`, rather
+  than writing them into anyone's shell rc. That plugin builds them as
+  functions with session-name completion; a plain alias would not have it, and
+  ours would shadow the better version depending on load order.
+
 ### Fixed
 
 - **An alias reserved with `--alias` reached the daemon the launch was talking
