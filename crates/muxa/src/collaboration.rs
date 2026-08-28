@@ -49,6 +49,83 @@ pub const CONSOLE_PANE: &str = "console";
 /// shares one sender identity no matter which pane the console was opened from.
 pub const CONSOLE_SESSION_ID: &str = "console";
 
+/// Session-id prefix of a **pending** recipient: a muxa-launched pane that
+/// hosts an agent CLI which has not registered a session yet.
+///
+/// Codex is why this exists. Its `SessionStart` hook fires when the first
+/// prompt is submitted, not when the TUI boots — a freshly spawned codex pane
+/// therefore cannot become a participant until something types into it, while
+/// the sender is waiting for exactly that registration. Addressing the *pane*
+/// breaks the deadlock: the request is queued immediately, the daemon's waker
+/// delivers it once the pane reads idle (a screen-detected row is enough), and
+/// the concrete session that registers there adopts the request the first time
+/// it claims or answers it — see [`pin_pending_recipient`].
+///
+/// The id is only ever a placeholder inside `to`. Every ordinary match stays
+/// session-pinned; [`addresses`] is the single seam where a pane-scoped
+/// recipient is honoured.
+pub const PENDING_SESSION_PREFIX: &str = "pending-pane:";
+
+/// Is this the placeholder identity of a pane whose agent has not registered?
+#[must_use]
+pub fn is_pending_session(session_id: &str) -> bool {
+    session_id.starts_with(PENDING_SESSION_PREFIX)
+}
+
+/// The placeholder session id for one pane on one control endpoint. Pane ids
+/// repeat across tmux servers, so the endpoint rides along: `same_endpoint`
+/// compares `(pane, socket, session)` and must not collapse two servers'
+/// `%3` into one recipient.
+fn pending_session_id(pane: &str, socket: Option<&str>) -> String {
+    match socket {
+        Some(socket) => format!("{PENDING_SESSION_PREFIX}{socket}:{pane}"),
+        None => format!("{PENDING_SESSION_PREFIX}{pane}"),
+    }
+}
+
+/// Does `caller` own the request addressed to `to`?
+///
+/// The ordinary answer is the session-pinned one. The exception is a *pending*
+/// recipient: the request was addressed to a pane before any session existed
+/// there, so the real agent that registered on that pane — and only on that
+/// exact pane and control endpoint — owns it too.
+fn addresses(to: &Participant, caller: &Participant) -> bool {
+    if to.same_endpoint(caller) {
+        return true;
+    }
+    is_pending_session(&to.agent_session_id)
+        && !is_pending_session(&caller.agent_session_id)
+        && !caller.console
+        && to.pane == caller.pane
+        && to.socket == caller.socket
+}
+
+/// Pin a pending recipient to the concrete session now acting as it, so every
+/// later match is the ordinary session-pinned one and a *different* agent
+/// reusing the pane can never inherit the work.
+///
+/// Returns whether anything changed, so callers can persist only real edits.
+fn pin_pending_recipient(request: &mut CollaborationRequest, caller: &Participant) -> bool {
+    if !is_pending_session(&request.to.agent_session_id)
+        || is_pending_session(&caller.agent_session_id)
+        || caller.console
+    {
+        return false;
+    }
+    // Keep the alias/roles the launcher stamped when the registering session
+    // has none of its own: they are what `@alias` / `role:` routing already
+    // resolved this pane by.
+    let mut pinned = caller.clone();
+    if pinned.alias.is_none() {
+        pinned.alias.clone_from(&request.to.alias);
+    }
+    if pinned.roles.is_empty() {
+        pinned.roles.clone_from(&request.to.roles);
+    }
+    request.to = pinned;
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CollaborationOrigin {
     pub pane: String,
@@ -986,12 +1063,16 @@ impl CollaborationStore {
         {
             let mut requests = self.requests.write().await;
             for request in requests.values_mut() {
-                if request.to.same_endpoint(caller)
+                if addresses(&request.to, caller)
                     && matches!(
                         request.status,
                         RequestStatus::Queued | RequestStatus::Claimed
                     )
                 {
+                    // The session pulling this inbox is the one the pane's
+                    // pending request was waiting for: adopt it, so every
+                    // later match is session-pinned.
+                    changed |= pin_pending_recipient(request, caller);
                     if request.status == RequestStatus::Queued {
                         request.status = if request.expects_reply {
                             RequestStatus::Claimed
@@ -1041,12 +1122,13 @@ impl CollaborationStore {
             let Some(request) = requests.get_mut(request_id) else {
                 return Err(CollaborationError::NotFound(request_id.to_string()));
             };
-            if !request.to.same_endpoint(caller) {
+            if !addresses(&request.to, caller) {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
             if request.status != RequestStatus::Queued || request.notified_at.is_some() {
                 None
             } else {
+                pin_pending_recipient(request, caller);
                 request.status = RequestStatus::Claimed;
                 request.claimed_at = Some(OffsetDateTime::now_utc());
                 request.wake_delivery = Some(WakeDeliveryState::Prepared);
@@ -1124,12 +1206,13 @@ impl CollaborationStore {
             let request = requests
                 .get_mut(request_id)
                 .ok_or_else(|| CollaborationError::NotFound(request_id.to_string()))?;
-            if !request.to.same_endpoint(caller) {
+            if !addresses(&request.to, caller) {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
             if request.status.is_terminal() {
                 return Err(CollaborationError::AlreadyTerminal(request_id.to_string()));
             }
+            pin_pending_recipient(request, caller);
             request.status = status;
             request.reply = Some(CollaborationReply {
                 status,
@@ -1163,7 +1246,7 @@ impl CollaborationStore {
                 .get_mut(request_id)
                 .ok_or_else(|| CollaborationError::NotFound(request_id.to_string()))?;
             let is_sender = request.from.same_endpoint(caller);
-            if !is_sender && !request.to.same_endpoint(caller) {
+            if !is_sender && !addresses(&request.to, caller) {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
             if is_sender && request.reply.is_some() && request.reply_read_at.is_none() {
@@ -1233,10 +1316,10 @@ impl CollaborationStore {
             .values()
             .filter(|request| match scope {
                 MailboxScope::Caller => match mailbox {
-                    RequestMailbox::Incoming => request.to.same_endpoint(caller),
+                    RequestMailbox::Incoming => addresses(&request.to, caller),
                     RequestMailbox::Sent => request.from.same_endpoint(caller),
                     RequestMailbox::All => {
-                        request.from.same_endpoint(caller) || request.to.same_endpoint(caller)
+                        request.from.same_endpoint(caller) || addresses(&request.to, caller)
                     }
                 },
                 MailboxScope::Room => match mailbox {
@@ -1391,7 +1474,7 @@ impl CollaborationStore {
             .await
             .values()
             .filter(|request| {
-                request.to.same_endpoint(participant)
+                addresses(&request.to, participant)
                     && (request.status == RequestStatus::Queued || request.wake_delivery.is_some())
             })
             .count()
@@ -1724,6 +1807,181 @@ fn select_target(
     }
 }
 
+/// Resolve an explicit `pane:%N` target whose agent has not registered yet.
+///
+/// This is the fallback [`resolve_target`] cannot serve: `participants_from`
+/// only admits real, session-pinned rows, so a pane muxa launched a moment ago
+/// is invisible until its agent's first hook — which, for codex, never comes
+/// unaided (see [`PENDING_SESSION_PREFIX`]).
+///
+/// Deliberately narrow. It requires all of:
+/// * an **explicit pane selector** — `peer`, `@alias` and `role:` stay
+///   registered-peer concepts, so no automatic routing can land here;
+/// * a pane muxa itself marked as an agent launch (`@muxa_agent_role` /
+///   `@muxa_agent_alias`) or that discovery already classified as an agent
+///   CLI, so a request can never be typed at a human's shell;
+/// * no live participant on that pane, so a registered agent always wins; and
+/// * the sender's own room, unless the deployment widened scope to the host.
+pub fn resolve_pending_pane_target(
+    sender: &Participant,
+    selector: &str,
+    participants: &[Participant],
+    agents: &[Agent],
+    panes: &[PaneInfo],
+    scope: crate::config::CollaborationScope,
+) -> Result<Participant, CollaborationError> {
+    let pane_id = selector.strip_prefix("pane:").unwrap_or(selector);
+    if !pane_id.starts_with('%') && crate::backend::pane_id_host_kind(pane_id).is_none() {
+        return Err(CollaborationError::UnknownTarget(selector.to_string()));
+    }
+    if pane_id == sender.pane {
+        return Err(CollaborationError::UnknownTarget(selector.to_string()));
+    }
+    // A registered agent on the pane is always the better recipient, and
+    // `resolve_target` already had its chance at it.
+    if participants
+        .iter()
+        .any(|participant| participant.pane == pane_id)
+    {
+        return Err(CollaborationError::UnknownTarget(selector.to_string()));
+    }
+    let pane = unique_pane(pane_id, sender.socket.as_deref(), panes)
+        .ok_or_else(|| CollaborationError::UnknownTarget(selector.to_string()))?;
+    let socket = pane.socket.clone().or_else(|| sender.socket.clone());
+    let row = live_pane_row(pane_id, socket.as_deref(), agents);
+    if !muxa_launched_agent_pane(pane, row) {
+        return Err(CollaborationError::UnknownTarget(selector.to_string()));
+    }
+    let pending = pane_participant(pane, socket, row);
+    if scope != crate::config::CollaborationScope::Host && pending.room != sender.room {
+        return Err(CollaborationError::UnknownTarget(selector.to_string()));
+    }
+    Ok(pending)
+}
+
+/// The recipient to deliver a *pending* request to, or `None` while the pane
+/// is not ready for input.
+///
+/// Readiness is the pane's current row, whatever produced it: a hook, or the
+/// discovery/screen placeholder that stands in before the agent registers. A
+/// discovered agent pane reads `Idle`, which includes the seconds a TUI spends
+/// booting — that is deliberate and safe: keys sent then sit in the pty until
+/// the TUI reads them (verified against codex mid-`Starting MCP servers`,
+/// where the queued prompt arrived verbatim).
+///
+/// What must hold delivery is a pane asking a question, and that is exactly
+/// what the bundled screen manifests classify: codex's startup trust gate
+/// lands the row on `WaitingInput`/`WaitingChoice`, never `Idle`, so a queued
+/// request cannot answer a policy prompt by accident. A vanished pane yields
+/// `None` too, so work queued for a dead pane stays queued instead of being
+/// typed at whatever replaced it.
+#[must_use]
+pub fn pending_recipient_ready(
+    to: &Participant,
+    agents: &[Agent],
+    panes: &[PaneInfo],
+) -> Option<Participant> {
+    if !is_pending_session(&to.agent_session_id) {
+        return None;
+    }
+    let pane = unique_pane(&to.pane, to.socket.as_deref(), panes)?;
+    let row = live_pane_row(&to.pane, to.socket.as_deref(), agents)?;
+    if row.state != AgentState::Idle {
+        return None;
+    }
+    let socket = pane.socket.clone().or_else(|| to.socket.clone());
+    let ready = pane_participant(pane, socket, Some(row));
+    // The identity must stay byte-identical to `request.to`: delivery reserves
+    // the request through `prepare_direct_wake`, which is session-pinned.
+    (ready.same_endpoint(to)).then_some(ready)
+}
+
+/// The one pane with this id, disambiguated by control endpoint the same way
+/// [`participants_from`] does — pane ids repeat across tmux servers.
+fn unique_pane<'a>(
+    pane_id: &str,
+    socket: Option<&str>,
+    panes: &'a [PaneInfo],
+) -> Option<&'a PaneInfo> {
+    let candidates: Vec<_> = panes
+        .iter()
+        .filter(|pane| pane.pane_id == pane_id)
+        .collect();
+    match candidates.as_slice() {
+        [pane] => Some(pane),
+        [] => None,
+        _ => {
+            let socket = socket?;
+            let mut matching = candidates.into_iter().filter(|pane| {
+                pane.socket.as_deref().is_some_and(|candidate| {
+                    crate::backend::pane_endpoints_match(Some(pane_id), candidate, socket)
+                })
+            });
+            let first = matching.next()?;
+            matching.next().is_none().then_some(first)
+        }
+    }
+}
+
+/// The live agent row occupying a pane, real or synthetic. Discovery and
+/// screen detection share one synthetic key per pane, so at most one row is
+/// returned for a pane that has never registered a session.
+fn live_pane_row<'a>(
+    pane_id: &str,
+    socket: Option<&str>,
+    agents: &'a [Agent],
+) -> Option<&'a Agent> {
+    agents
+        .iter()
+        .filter(|agent| {
+            agent.pane.as_deref() == Some(pane_id)
+                && agent.state != AgentState::Stopped
+                && socket.is_none_or(|socket| {
+                    agent.tmux_socket.as_deref().is_none_or(|candidate| {
+                        crate::backend::pane_endpoints_match(Some(pane_id), candidate, socket)
+                    })
+                })
+        })
+        // A real row wins a tie with a synthetic placeholder for the same pane.
+        .min_by_key(|agent| {
+            u8::from(
+                agent
+                    .session_id
+                    .starts_with(crate::state::SYNTHETIC_SESSION_PREFIX),
+            )
+        })
+}
+
+/// Evidence that an agent CLI — not a human's shell — occupies this pane:
+/// muxa's own launch marks, or a discovery row that classified the process.
+fn muxa_launched_agent_pane(pane: &PaneInfo, row: Option<&Agent>) -> bool {
+    pane.agent_role.is_some()
+        || pane.agent_alias.is_some()
+        || row.is_some_and(|row| row.kind != AgentKind::Task && row.kind != AgentKind::Unknown)
+}
+
+/// Build the pane-scoped participant a pending recipient is addressed as.
+fn pane_participant(pane: &PaneInfo, socket: Option<String>, row: Option<&Agent>) -> Participant {
+    Participant {
+        agent_kind: row.map_or(AgentKind::Unknown, |row| row.kind),
+        agent_session_id: pending_session_id(&pane.pane_id, socket.as_deref()),
+        pane: pane.pane_id.clone(),
+        socket: socket.clone(),
+        room: pane_room(&pane.pane_id, pane, socket),
+        tmux_session_id: (!pane.session_id.is_empty()).then(|| pane.session_id.clone()),
+        tmux_session_name: Some(pane.session.clone()),
+        window_name: (!pane.window_name.is_empty()).then(|| pane.window_name.clone()),
+        // `Starting` is the honest state for a pane whose agent has not
+        // reported anything yet; the waker refuses to type into it until a row
+        // says `Idle`.
+        state: row.map_or(AgentState::Starting, |row| row.state),
+        cwd: (!pane.current_path.is_empty()).then(|| pane.current_path.clone()),
+        alias: pane.agent_alias.clone(),
+        roles: pane.agent_role.clone().into_iter().collect(),
+        console: false,
+    }
+}
+
 pub async fn room_context(
     mailbox: &CollaborationStore,
     current: Participant,
@@ -2035,6 +2293,250 @@ mod tests {
             vec!["rust".to_string()],
             "the registered role set replaces the launcher's, never merges",
         );
+    }
+
+    /// A pane muxa launched but whose agent has not registered yet is
+    /// addressable by pane id. This is the codex spawn case: no hook can fire
+    /// until a prompt arrives, so waiting for registration before sending
+    /// would deadlock.
+    #[tokio::test]
+    async fn explicit_pane_target_resolves_a_launched_pane_with_no_session() {
+        let sender = participant("%1", "sender");
+        let mut launched = pane_info("%2");
+        launched.agent_role = Some("peer".into());
+        let panes = vec![pane_info("%1"), launched];
+        let agents = Vec::new();
+
+        // Ordinary resolution has nothing to select: the pane hosts no
+        // participant.
+        assert!(resolve_target(&sender, "pane:%2", &[], CollaborationScope::Window).is_err());
+
+        let pending = resolve_pending_pane_target(
+            &sender,
+            "pane:%2",
+            &[],
+            &agents,
+            &panes,
+            CollaborationScope::Window,
+        )
+        .expect("launched pane resolves");
+        assert_eq!(pending.pane, "%2");
+        assert!(is_pending_session(&pending.agent_session_id));
+        assert_eq!(
+            pending.state,
+            AgentState::Starting,
+            "a pane with no row at all has reported nothing yet",
+        );
+        assert_eq!(pending.roles, vec!["peer".to_string()]);
+    }
+
+    /// The guards that keep a queued request off a human's shell and off a
+    /// pane that already has a registered agent.
+    #[tokio::test]
+    async fn pending_pane_target_refuses_unmarked_panes_and_registered_ones() {
+        let sender = participant("%1", "sender");
+        let plain = pane_info("%2");
+        let panes = vec![pane_info("%1"), plain];
+
+        // No muxa launch mark and no classified row: not an agent pane.
+        assert!(resolve_pending_pane_target(
+            &sender,
+            "pane:%2",
+            &[],
+            &[],
+            &panes,
+            CollaborationScope::Window,
+        )
+        .is_err());
+
+        // A registered participant on the pane always wins; the pending path
+        // must not shadow it with a pane-scoped placeholder.
+        let registered = participant("%2", "real-session");
+        let mut launched = pane_info("%2");
+        launched.agent_role = Some("peer".into());
+        assert!(resolve_pending_pane_target(
+            &sender,
+            "pane:%2",
+            std::slice::from_ref(&registered),
+            &[],
+            &[pane_info("%1"), launched],
+            CollaborationScope::Window,
+        )
+        .is_err());
+
+        // Automatic routing never lands on a pending pane.
+        assert!(resolve_pending_pane_target(
+            &sender,
+            "peer",
+            &[],
+            &[],
+            &panes,
+            CollaborationScope::Window,
+        )
+        .is_err());
+    }
+
+    /// Delivery waits for the pane to read idle — a screen-detected row is
+    /// enough, which is the only readiness signal a pre-session codex emits.
+    #[tokio::test]
+    async fn pending_recipient_becomes_deliverable_once_the_pane_reads_idle() {
+        let store = crate::Store::shared();
+        let id = crate::event::AgentId {
+            kind: AgentKind::Codex,
+            session_id: format!("{}default:%2", crate::state::SYNTHETIC_SESSION_PREFIX),
+            surface: None,
+            pane: Some("%2".into()),
+            tmux_socket: Some("default".into()),
+            cwd: Some("/repo".into()),
+        };
+        store
+            .apply(&crate::event::AgentEvent::Started {
+                id: id.clone(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+
+        let sender = participant("%1", "sender");
+        let mut launched = pane_info("%2");
+        launched.agent_role = Some("peer".into());
+        let panes = vec![pane_info("%1"), launched];
+        let agents = store.snapshot().await;
+        let pending = resolve_pending_pane_target(
+            &sender,
+            "pane:%2",
+            &[],
+            &agents,
+            &panes,
+            CollaborationScope::Window,
+        )
+        .expect("discovered agent pane resolves");
+        assert_eq!(pending.agent_kind, AgentKind::Codex);
+
+        // A discovered agent pane reads idle, boot window included.
+        let ready = pending_recipient_ready(&pending, &agents, &panes).expect("idle pane delivers");
+        assert!(ready.same_endpoint(&pending), "identity must stay pinned");
+        assert_eq!(ready.state, AgentState::Idle);
+
+        // The startup gate — screen detection's whole reason for covering
+        // codex — must hold delivery rather than answer the question.
+        store
+            .apply(&crate::event::AgentEvent::NotificationFired {
+                id,
+                level: crate::event::NotificationLevel::NeedsInput,
+                message: "codex is waiting".into(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let waiting = store.snapshot().await;
+        assert!(pending_recipient_ready(&pending, &waiting, &panes).is_none());
+
+        // A pane that vanished delivers to nothing.
+        assert!(pending_recipient_ready(&pending, &agents, &[pane_info("%1")]).is_none());
+    }
+
+    /// The session that finally registers on the pane adopts the request, and
+    /// from then on the request is session-pinned like any other.
+    #[tokio::test]
+    async fn a_registering_session_adopts_and_pins_its_pane_request() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let mut pending = participant("%2", "placeholder");
+        pending.agent_session_id = format!("{PENDING_SESSION_PREFIX}default:%2");
+        pending.state = AgentState::Starting;
+        pending.roles = vec!["peer".into()];
+
+        let request = mailbox
+            .create(
+                sender.clone(),
+                pending.clone(),
+                NewRequest {
+                    kind: RequestKind::Review,
+                    body: "review the diff".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // An agent on a different pane must never inherit the work.
+        let intruder = participant("%3", "other-session");
+        assert!(mailbox.claim_for(&intruder).await.unwrap().is_empty());
+
+        let registered = participant("%2", "codex-session");
+        let inbox = mailbox.claim_for(&registered).await.unwrap();
+        assert_eq!(inbox.len(), 1, "the pane's agent claims the queued request");
+        assert_eq!(inbox[0].id, request.id);
+
+        let stored = mailbox.get_for(&registered, &request.id).await.unwrap();
+        assert_eq!(
+            stored.to.agent_session_id, "codex-session",
+            "the claiming session is pinned into the recipient",
+        );
+        assert_eq!(
+            stored.to.roles,
+            vec!["peer".to_string()],
+            "the launcher's role survives adoption when the session has none",
+        );
+
+        // Pinned means pinned: the placeholder no longer matches.
+        assert!(mailbox.claim_for(&pending).await.unwrap().is_empty());
+
+        let replied = mailbox
+            .reply(
+                &registered,
+                &request.id,
+                RequestStatus::Completed,
+                "looks good".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replied.status, RequestStatus::Completed);
+    }
+
+    /// A pending request answered without an inbox pull — the direct-wake path
+    /// — is adopted just the same.
+    #[tokio::test]
+    async fn a_pending_request_can_be_answered_by_the_registered_session_directly() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let mut pending = participant("%2", "placeholder");
+        pending.agent_session_id = format!("{PENDING_SESSION_PREFIX}default:%2");
+
+        let request = mailbox
+            .create(
+                sender,
+                pending,
+                NewRequest {
+                    kind: RequestKind::Question,
+                    body: "is the release green?".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let registered = participant("%2", "codex-session");
+        assert_eq!(mailbox.unread_count(&registered).await, 1);
+        let replied = mailbox
+            .reply(
+                &registered,
+                &request.id,
+                RequestStatus::Completed,
+                "green".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replied.to.agent_session_id, "codex-session");
     }
 
     #[tokio::test]

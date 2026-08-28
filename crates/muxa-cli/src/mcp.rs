@@ -50,6 +50,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// Default `muxa_wait_for_change` timeout when the caller omits one.
 const DEFAULT_WAIT_SECS: u64 = 30;
+
+/// How long a spawned peer is given to register before the request is queued
+/// against its pane instead. Agents that register on boot (claude fires
+/// `SessionStart` within a second) resolve inside this window and keep the
+/// ordinary session-pinned path; the rest cost one grace period, not a
+/// failure — codex cannot register until a prompt reaches it.
+const DEFAULT_SPAWN_GRACE_SECS: u64 = 10;
 /// Hard ceiling on `muxa_wait_for_change` so a caller can't pin the stdio
 /// loop forever on a typo'd huge timeout.
 const MAX_WAIT_SECS: u64 = 600;
@@ -617,7 +624,7 @@ fn tool_definitions() -> Vec<Value> {
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." },
                     "spawn_if_missing": { "type": "boolean", "description": "Default false. Create a same-window bypass-permission peer only after explicit user confirmation." },
                     "spawn_agent": { "type": "string", "enum": ["claude", "codex", "gemini", "agy", "opencode"], "description": "Provider to create when spawn_if_missing=true. Defaults to the current agent's opposite provider." },
-                    "spawn_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60, "description": "How long to wait for the new pane to register as a collaboration peer. Default 30." },
+                    "spawn_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60, "description": "Grace period for the new pane to register as a collaboration peer before the request is queued against the pane itself. Default 10. Never poll the pane instead of raising this." },
                     "air_artifacts": {
                         "type": "array",
                         "maxItems": 8,
@@ -1277,8 +1284,31 @@ fn collaboration_guide(room: RoomContext) -> Value {
 
 #[derive(Debug, Clone)]
 struct PeerSelection {
-    peer: Participant,
+    /// The registered peer, when one exists. `None` for a pane muxa just
+    /// launched whose agent has not registered a session yet — the request is
+    /// addressed to the pane and the daemon adopts it onto the session that
+    /// registers there.
+    peer: Option<Participant>,
+    pane: String,
     reason: String,
+}
+
+impl PeerSelection {
+    fn registered(peer: Participant, reason: String) -> Self {
+        Self {
+            pane: peer.pane.clone(),
+            peer: Some(peer),
+            reason,
+        }
+    }
+
+    fn pending(pane: String, reason: String) -> Self {
+        Self {
+            peer: None,
+            pane,
+            reason,
+        }
+    }
 }
 
 /// Read a prior peer's structured response without asking it to do new work.
@@ -1443,7 +1473,7 @@ async fn call_peer(
         paths,
         air_artifacts,
     };
-    let selector = format!("pane:{}", selection.peer.pane);
+    let selector = format!("pane:{}", selection.pane);
     let sent = match client
         .collaboration_send(&origin, &selector, &request)
         .await
@@ -1451,9 +1481,10 @@ async fn call_peer(
         Ok(request) => request,
         Err(error) => return error_result(&format!("call_peer send failed: {error}")),
     };
-    let common = json!({
+    let peer_pending = selection.peer.is_none();
+    let mut common = json!({
         "sent": true,
-        "selected_peer": selection.peer,
+        "selected_peer": selection.peer.clone().unwrap_or_else(|| sent.to.clone()),
         "selection_reason": selection.reason,
         "expanded_skill": expanded_skill,
         "spawned": spawned,
@@ -1461,6 +1492,15 @@ async fn call_peer(
         "kind": kind,
         "work_mode": work_mode,
     });
+    if peer_pending {
+        common["peer_pending"] = json!(true);
+        common["delivery"] = json!(format!(
+            "pane {} has no registered agent session yet; muxad delivers this request as soon as \
+             the pane reads idle. Wait on request_id {} with muxa_wait_reply — never watch the \
+             pane with capture-pane or sleep.",
+            selection.pane, sent.id
+        ));
+    }
     if !args.get("wait").and_then(Value::as_bool).unwrap_or(true) {
         let mut payload = common;
         payload["completed"] = json!(false);
@@ -1487,6 +1527,11 @@ async fn call_peer(
             payload["reason"] = json!("timeout");
             payload["timeout_secs"] = json!(timeout_secs);
             payload["request"] = json!(sent);
+            payload["next_step"] = json!(format!(
+                "the request stays queued for {}; call muxa_wait_reply with request_id {} to keep \
+                 waiting, or muxa_peer_report later. Do not poll the pane.",
+                selection.pane, sent.id
+            ));
             json_result(&payload)
         }
         Err(error) => error_result(&format!("call_peer wait failed: {error}")),
@@ -1621,19 +1666,20 @@ fn select_peer(
         || target.eq_ignore_ascii_case("@muxa-peer")
         || target.eq_ignore_ascii_case("peer")
     {
-        return Ok(best_peer(&live, &room.current).map(|peer| PeerSelection {
-            peer: peer.clone(),
-            reason:
+        return Ok(best_peer(&live, &room.current).map(|peer| {
+            PeerSelection::registered(
+                peer.clone(),
                 "auto: healthy different-provider preference, then state and numeric pane order"
                     .into(),
+            )
         }));
     }
     let pane_target = target.strip_prefix("pane:").unwrap_or(target);
     if let Some(peer) = live.iter().copied().find(|peer| peer.pane == pane_target) {
-        return Ok(Some(PeerSelection {
-            peer: peer.clone(),
-            reason: format!("explicit pane {}", peer.pane),
-        }));
+        return Ok(Some(PeerSelection::registered(
+            peer.clone(),
+            format!("explicit pane {}", peer.pane),
+        )));
     }
     if let Some(kind) = provider_kind(target) {
         let candidates = live
@@ -1641,12 +1687,9 @@ fn select_peer(
             .copied()
             .filter(|peer| peer.agent_kind == kind)
             .collect::<Vec<_>>();
-        return Ok(
-            best_peer(&candidates, &room.current).map(|peer| PeerSelection {
-                peer: peer.clone(),
-                reason: format!("explicit provider {kind}"),
-            }),
-        );
+        return Ok(best_peer(&candidates, &room.current).map(|peer| {
+            PeerSelection::registered(peer.clone(), format!("explicit provider {kind}"))
+        }));
     }
     if let Some(role) = target.strip_prefix("role:") {
         let matches = live
@@ -1660,10 +1703,10 @@ fn select_peer(
             .collect::<Vec<_>>();
         return match matches.as_slice() {
             [] => Err(format!("no eligible peer has role {role:?}")),
-            [peer] => Ok(Some(PeerSelection {
-                peer: (*peer).clone(),
-                reason: format!("explicit role {role}"),
-            })),
+            [peer] => Ok(Some(PeerSelection::registered(
+                (*peer).clone(),
+                format!("explicit role {role}"),
+            ))),
             _ => Err(format!(
                 "role {role:?} matches multiple peers; use @alias or pane id"
             )),
@@ -1686,10 +1729,10 @@ fn select_peer(
         [] => Err(format!(
             "no eligible peer matches {target:?}; use auto, a provider, @alias, role:<name>, or pane id"
         )),
-        [peer] => Ok(Some(PeerSelection {
-            peer: (*peer).clone(),
-            reason: format!("explicit alias @{alias}"),
-        })),
+        [peer] => Ok(Some(PeerSelection::registered(
+            (*peer).clone(),
+            format!("explicit alias @{alias}"),
+        ))),
         _ => Err(format!(
             "alias @{alias} matches multiple peers; use an exact pane id"
         )),
@@ -1863,7 +1906,7 @@ async fn spawn_peer(
     let timeout_secs = args
         .get("spawn_timeout_secs")
         .and_then(Value::as_u64)
-        .unwrap_or(30)
+        .unwrap_or(DEFAULT_SPAWN_GRACE_SECS)
         .clamp(1, 60);
     let peer = wait_for_spawned_peer_registration(
         client,
@@ -1872,26 +1915,32 @@ async fn spawn_peer(
         timeout_secs,
         registrations,
     )
-    .await?
-    .ok_or_else(|| {
-        format!(
-            "created {} peer pane {} but it did not register for collaboration within {timeout_secs}s; keep the pane, verify its hooks/MCP setup, then call again with target=\"pane:{}\"",
-            agent_program_label(program),
-            started.pane,
-            started.pane
-        )
-    })?;
-    Ok((
-        PeerSelection {
+    .await?;
+    // Registration is not a precondition for sending. An agent that registers
+    // on boot (claude) lands in the grace window above; codex creates its
+    // session — and so fires its first hook — only when a prompt arrives, so
+    // waiting for it here would deadlock against the very request we are about
+    // to send. Address the pane instead: muxad queues the request and delivers
+    // it when the pane reads idle.
+    let selection = match peer {
+        Some(peer) => PeerSelection::registered(
             peer,
-            reason: format!(
+            format!(
                 "spawned {} in {} after explicit confirmation for target {target:?}",
                 agent_program_label(program),
                 started.pane
             ),
-        },
-        started,
-    ))
+        ),
+        None => PeerSelection::pending(
+            started.pane.clone(),
+            format!(
+                "spawned {} in {}; queued for the pane, which has not registered a session yet",
+                agent_program_label(program),
+                started.pane
+            ),
+        ),
+    };
+    Ok((selection, started))
 }
 
 async fn wait_for_spawned_peer_registration(
@@ -3105,13 +3154,10 @@ mod tests {
         );
 
         let selected = select_peer(&room, "auto").unwrap().unwrap();
-        assert_eq!(selected.peer.pane, "%3");
+        assert_eq!(selected.pane, "%3");
+        assert_eq!(select_peer(&room, "@claude").unwrap().unwrap().pane, "%2");
         assert_eq!(
-            select_peer(&room, "@claude").unwrap().unwrap().peer.pane,
-            "%2"
-        );
-        assert_eq!(
-            select_peer(&room, "@muxa-peer").unwrap().unwrap().peer.pane,
+            select_peer(&room, "@muxa-peer").unwrap().unwrap().pane,
             "%3"
         );
     }
@@ -3142,10 +3188,7 @@ mod tests {
         other.roles = vec!["rust".into()];
         let room = peer_room(current, vec![reviewer, other]);
 
-        assert_eq!(
-            select_peer(&room, "@reviewer").unwrap().unwrap().peer.pane,
-            "%2"
-        );
+        assert_eq!(select_peer(&room, "@reviewer").unwrap().unwrap().pane, "%2");
         assert!(select_peer(&room, "role:rust")
             .unwrap_err()
             .contains("multiple peers"));

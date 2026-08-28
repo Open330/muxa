@@ -1445,6 +1445,10 @@ fn unique_pane_endpoint(pane: &str, agents: &[Agent]) -> Result<Option<String>, 
 struct CollaborationTopology {
     participants: Vec<collaboration::Participant>,
     panes: Vec<crate::tmux::PaneInfo>,
+    /// The raw registry rows behind `participants`, kept so a pane whose agent
+    /// has not registered yet can still be addressed explicitly — a real row
+    /// is not the only evidence that an agent CLI occupies a pane.
+    agents: Vec<crate::state::Agent>,
 }
 
 impl CollaborationTopology {
@@ -1472,6 +1476,31 @@ impl CollaborationTopology {
     ) -> Result<collaboration::Participant, collaboration::CollaborationError> {
         collaboration::resolve_origin(origin, &self.participants, &self.panes)
     }
+
+    /// Resolve a send target, falling back to an explicit pane that muxa
+    /// launched but whose agent has not registered a session yet.
+    ///
+    /// The fallback only ever runs after the ordinary resolution failed, and
+    /// it returns that original error when it does not apply — an unroutable
+    /// target must keep reporting why it was unroutable.
+    fn resolve_target(
+        &self,
+        sender: &collaboration::Participant,
+        target: &str,
+        scope: crate::config::CollaborationScope,
+    ) -> Result<collaboration::Participant, collaboration::CollaborationError> {
+        collaboration::resolve_target(sender, target, &self.participants, scope).or_else(|error| {
+            collaboration::resolve_pending_pane_target(
+                sender,
+                target,
+                &self.participants,
+                &self.agents,
+                &self.panes,
+                scope,
+            )
+            .map_err(|_| error)
+        })
+    }
 }
 
 async fn collaboration_participants(
@@ -1494,6 +1523,7 @@ async fn collaboration_participants(
     CollaborationTopology {
         participants,
         panes,
+        agents,
     }
 }
 
@@ -2380,13 +2410,9 @@ async fn handle(
                     let topology =
                         collaboration_participants(&store, &backends, &collaboration).await;
                     let result = topology.resolve_origin(&origin).and_then(|sender| {
-                        collaboration::resolve_target(
-                            &sender,
-                            &target,
-                            &topology.participants,
-                            collaboration.scope(),
-                        )
-                        .map(|recipient| (sender, recipient))
+                        topology
+                            .resolve_target(&sender, &target, collaboration.scope())
+                            .map(|recipient| (sender, recipient))
                     });
                     let response = match result {
                         Ok((sender, recipient)) => {

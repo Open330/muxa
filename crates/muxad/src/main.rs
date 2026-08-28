@@ -871,9 +871,12 @@ async fn wake_idle_collaboration_peers_with_inflight(
     collaboration.enrich_participants(&mut participants).await;
 
     for request in requests {
-        let Some(recipient) = idle_collaboration_participant(&participants, &request.to) else {
+        let Some(recipient) =
+            ready_collaboration_recipient(&participants, &agents, &panes, &request)
+        else {
             continue;
         };
+        let recipient = &recipient;
         let wake_key = collaboration_wake_key(recipient);
         if wake_inflight.contains(&wake_key) {
             continue;
@@ -916,8 +919,27 @@ async fn wake_idle_collaboration_peers_with_inflight(
         }
     }
 
+    wake_senders_of_ready_replies(
+        collaboration,
+        &participants,
+        backends,
+        replies,
+        wake_inflight,
+    )
+    .await;
+}
+
+/// Tell each sender that a terminal reply is waiting. Reply bodies always stay
+/// in the mailbox, so this is a notice pass with no payload policy.
+async fn wake_senders_of_ready_replies(
+    collaboration: &CollaborationStore,
+    participants: &[muxa::collaboration::Participant],
+    backends: &[muxa::SharedBackend],
+    replies: Vec<CollaborationRequest>,
+    wake_inflight: &mut HashSet<(String, Option<String>, String)>,
+) {
     for request in replies {
-        let Some(sender) = idle_collaboration_participant(&participants, &request.from) else {
+        let Some(sender) = idle_collaboration_participant(participants, &request.from) else {
             continue;
         };
         let wake_key = collaboration_wake_key(sender);
@@ -1131,6 +1153,39 @@ fn collaboration_request_source(request: &CollaborationRequest) -> String {
         CollaborationOriginMatch::Unverifiable => "; origin unverified",
     };
     format!("via {surface} representing {represented} ({actor}{mismatch})")
+}
+
+/// The participant a queued request may be delivered to *right now*.
+///
+/// The ordinary case is its session-pinned recipient, idle. A **pending**
+/// recipient — a launched pane whose agent has not registered a session yet —
+/// resolves two further ways: a real session that registered on that pane
+/// after the request was queued, or the pane's own discovery/screen row once
+/// it reads idle. The latter is what unblocks codex, whose `SessionStart` hook
+/// cannot fire until something is typed at it. Discovery supplies the idle
+/// row; screen detection's job here is the opposite one, holding delivery
+/// while the pane sits on its startup approval gate.
+fn ready_collaboration_recipient(
+    participants: &[muxa::collaboration::Participant],
+    agents: &[muxa::state::Agent],
+    panes: &[muxa::tmux::PaneInfo],
+    request: &CollaborationRequest,
+) -> Option<muxa::collaboration::Participant> {
+    if let Some(participant) = idle_collaboration_participant(participants, &request.to) {
+        return Some(participant.clone());
+    }
+    if !muxa::collaboration::is_pending_session(&request.to.agent_session_id) {
+        return None;
+    }
+    participants
+        .iter()
+        .find(|participant| {
+            participant.pane == request.to.pane
+                && participant.socket == request.to.socket
+                && participant.state == muxa::AgentState::Idle
+        })
+        .cloned()
+        .or_else(|| muxa::collaboration::pending_recipient_ready(&request.to, agents, panes))
 }
 
 fn idle_collaboration_participant<'a>(
@@ -2399,6 +2454,117 @@ mod tests {
             assert_eq!(delivered[0].0, "%2");
             assert!(delivered[0].1.contains(&request.id));
         }
+
+        shutdown_tx.send(()).unwrap();
+        waker.await.unwrap();
+    }
+
+    /// The spawn deadlock, end to end: a pane muxa launched carries only a
+    /// synthetic row — no session has registered, so it is not a participant —
+    /// yet the request queued against it is delivered as soon as the pane
+    /// reads idle. Without this the sender would wait for a registration that
+    /// codex cannot produce until something types at it.
+    #[tokio::test]
+    async fn collaboration_waker_delivers_to_a_launched_pane_before_it_registers() {
+        let store = muxa::Store::shared();
+        add_agent(&store, "%1", "sender", AgentKind::ClaudeCode).await;
+        add_agent(
+            &store,
+            "%2",
+            &format!("{}default:%2", muxa::state::SYNTHETIC_SESSION_PREFIX),
+            AgentKind::Codex,
+        )
+        .await;
+        let mut launched = collaboration_pane("%2", "1");
+        launched.agent_role = Some("peer".into());
+        let panes = vec![collaboration_pane("%1", "0"), launched];
+        let agents = store.snapshot().await;
+        let participants = muxa::collaboration::participants_from(&agents, &panes);
+        assert!(
+            participants
+                .iter()
+                .all(|participant| participant.pane != "%2"),
+            "a synthetic row is not a participant — that is the whole problem",
+        );
+        let sender = participants
+            .iter()
+            .find(|participant| participant.pane == "%1")
+            .unwrap()
+            .clone();
+        let pending = muxa::collaboration::resolve_pending_pane_target(
+            &sender,
+            "pane:%2",
+            &participants,
+            &agents,
+            &panes,
+            muxa::config::CollaborationScope::Window,
+        )
+        .expect("a launched agent pane is addressable by pane id");
+
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+            panes,
+            sends: sends.clone(),
+        });
+        let mut cfg = Config::default();
+        cfg.collaboration.enabled = true;
+        cfg.collaboration.wake = CollaborationWake::IdleOnly;
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let waker = spawn_collaboration_waker_task(
+            &cfg,
+            mailbox.clone(),
+            store.clone(),
+            vec![backend],
+            &shutdown_tx,
+        )
+        .expect("enabled collaboration should spawn a waker");
+
+        let request = mailbox
+            .create(
+                sender,
+                pending,
+                NewRequest {
+                    kind: RequestKind::Review,
+                    body: "review the pending diff".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                if sends.lock().unwrap().len() >= 2 && mailbox.pending_unnotified().await.is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a pending pane recipient should be woken like any other");
+        {
+            let delivered = sends.lock().unwrap();
+            assert_eq!(delivered[0].0, "%2");
+            assert!(delivered[0].1.contains(&request.id));
+        }
+
+        // The session that finally registers adopts the request.
+        add_agent(&store, "%2", "codex-session", AgentKind::Codex).await;
+        let registered = muxa::collaboration::participants_from(
+            &store.snapshot().await,
+            &[collaboration_pane("%1", "0"), collaboration_pane("%2", "1")],
+        )
+        .into_iter()
+        .find(|participant| participant.pane == "%2")
+        .expect("the hook row registers the pane");
+        let inbox = mailbox.claim_for(&registered).await.unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].id, request.id);
 
         shutdown_tx.send(()).unwrap();
         waker.await.unwrap();
