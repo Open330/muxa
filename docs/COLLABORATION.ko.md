@@ -186,6 +186,10 @@ muxa msg wait req_... --timeout-secs 300
 muxa msg list --mailbox sent
 muxa msg list --mailbox incoming --json
 
+# 이 window 전체 / 이 daemon이 가진 모든 room (operator console 전용)
+muxa msg list --scope room
+muxa msg list --scope all
+
 # 아직 상대가 claim하지 않은 요청 취소
 muxa msg cancel req_...
 ```
@@ -193,6 +197,12 @@ muxa msg cancel req_...
 `send`, `reply`, `cancel`은 한 줄 영수증만 출력하고, `list`와 `inbox`는 각
 요청과 (도착했다면) 그 답장을 함께 보여줍니다. 저장된 레코드 전체가 필요하면
 `--json`을 붙이세요.
+
+`--scope`는 자기 pane의 mailbox 너머까지 목록을 넓히고, `--mailbox`는 그 안에서
+방향을 고릅니다. 기본값 `caller`를 넘어서는 조회는 operator console 자격으로
+나가며 pane agent에게는 거부됩니다 — 같은 window에 있다는 사실이 room-mate들끼리
+주고받은 내용을 읽을 권한이 되지는 않습니다. 넓힌 목록은 각 요청의 양쪽 끝과 그
+각각이 있는 `session:window`를 함께 출력합니다.
 
 tracked agent pane에서 `prefix+s`로 `muxa watch`를 열면 같은 lifecycle을 TUI로
 사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `b`는 claim 없는

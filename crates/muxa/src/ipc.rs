@@ -24,8 +24,8 @@ use crate::backend::{default_backend, HostKind, SharedBackend};
 use crate::collaboration::{
     self, AirArtifactReference, CollaborationClientKind, CollaborationOptions, CollaborationOrigin,
     CollaborationOriginMatch, CollaborationPaneEvidence, CollaborationProvenance,
-    CollaborationRequest, CollaborationStore, NewRequest, Participant, RequestMailbox,
-    RequestStatus, RoomContext,
+    CollaborationRequest, CollaborationStore, MailboxScope, NewRequest, Participant,
+    RequestMailbox, RequestStatus, RoomContext,
 };
 use crate::collaboration_audit::{
     CollaborationAuditContext, CollaborationAuditLog, CollaborationAuditOperation,
@@ -336,6 +336,11 @@ enum RequestBody {
         origin: CollaborationOrigin,
         #[serde(default)]
         mailbox: RequestMailbox,
+        /// Absent from every client built before scoped listing existed, and
+        /// defaulting to the caller's own mailbox is exactly what those
+        /// clients asked for.
+        #[serde(default)]
+        scope: MailboxScope,
     },
     CollaborationReply {
         origin: CollaborationOrigin,
@@ -465,6 +470,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_wait",
     "collaboration_identity",
     "collaboration_provenance",
+    "collaboration_scope",
     "fleet_v1",
     "fleet_subscribe",
     "pipeline_runs_v1",
@@ -496,6 +502,12 @@ pub struct Response {
     pub max_protocol: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<&'static str>>,
+    /// The listing breadth the daemon actually applied. A daemon that predates
+    /// scoped listing simply drops the request field, so its absence here is
+    /// how a new client detects that its `--scope` was ignored rather than
+    /// silently reading a caller-scoped answer as a fleet-wide one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_scope: Option<MailboxScope>,
     /// Present only when the daemon can restart itself. It increments across
     /// each re-exec so a client can distinguish the replacement image from
     /// the old daemon still finishing an in-flight response.
@@ -575,6 +587,7 @@ impl Response {
             min_protocol: None,
             max_protocol: None,
             capabilities: None,
+            collaboration_scope: None,
             generation: None,
             sessions: None,
             session: None,
@@ -700,6 +713,14 @@ impl Response {
     fn with_collaboration_requests(requests: Vec<CollaborationRequest>) -> Self {
         let mut r = Self::ok();
         r.collaboration_requests = Some(requests);
+        r
+    }
+    fn with_scoped_collaboration_requests(
+        requests: Vec<CollaborationRequest>,
+        scope: MailboxScope,
+    ) -> Self {
+        let mut r = Self::with_collaboration_requests(requests);
+        r.collaboration_scope = Some(scope);
         r
     }
     fn with_collaboration_request(request: CollaborationRequest) -> Self {
@@ -2419,7 +2440,11 @@ async fn handle(
                     .await;
                     response
                 }
-                RequestBody::CollaborationList { origin, mailbox } => {
+                RequestBody::CollaborationList {
+                    origin,
+                    mailbox,
+                    scope,
+                } => {
                     kind = "collaboration_list";
                     collaboration_actor.observe_pane(&backends).await;
                     let mut audit_context = CollaborationAuditContext::new(
@@ -2427,11 +2452,18 @@ async fn handle(
                         origin.clone(),
                     );
                     audit_context.mailbox = Some(mailbox);
+                    // Only the widened listings are worth a ledger line of
+                    // their own — a caller-scoped list is the norm and says
+                    // nothing about reach.
+                    audit_context.scope = (!matches!(scope, MailboxScope::Caller)).then_some(scope);
                     let topology =
                         collaboration_participants(&store, &backends, &collaboration).await;
                     let response = match topology.resolve_origin(&origin) {
-                        Ok(current) => match collaboration.list_for(&current, mailbox).await {
-                            Ok(requests) => Response::with_collaboration_requests(requests),
+                        Ok(current) => match collaboration.list_for(&current, mailbox, scope).await
+                        {
+                            Ok(requests) => {
+                                Response::with_scoped_collaboration_requests(requests, scope)
+                            }
                             Err(error) => Response::err(error.to_string()),
                         },
                         Err(error) => Response::err(error.to_string()),
@@ -3387,18 +3419,44 @@ impl Client {
         serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
     }
 
+    /// One participant's mailbox — the caller's own.
     pub async fn collaboration_list(
         &self,
         origin: &CollaborationOrigin,
         mailbox: RequestMailbox,
+    ) -> Result<Vec<CollaborationRequest>, RuntimeError> {
+        self.collaboration_list_scoped(origin, mailbox, MailboxScope::Caller)
+            .await
+    }
+
+    /// A mailbox listing that may reach past the caller's own endpoint.
+    ///
+    /// Anything wider than [`MailboxScope::Caller`] needs a console origin;
+    /// the daemon rejects the rest.
+    pub async fn collaboration_list_scoped(
+        &self,
+        origin: &CollaborationOrigin,
+        mailbox: RequestMailbox,
+        scope: MailboxScope,
     ) -> Result<Vec<CollaborationRequest>, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "collaboration_list",
             "origin": origin,
             "mailbox": mailbox,
+            "scope": scope,
         });
         let resp = self.call_checked(&req).await?;
+        // An older daemon ignores the field and answers the caller-scoped
+        // listing it has always answered. Reporting that as the fleet would be
+        // worse than failing: the operator would read "no cross-session
+        // traffic" off a mailbox that was never asked about it.
+        if !matches!(scope, MailboxScope::Caller) && resp["collaboration_scope"].is_null() {
+            return Err(RuntimeError::Daemon(
+                "this muxad predates scoped collaboration listing; restart the daemon from the same tree as the CLI (`muxa daemon restart`)"
+                    .into(),
+            ));
+        }
         serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
     }
 
@@ -4271,6 +4329,128 @@ mod tests {
             CollaborationOriginMatch::Mismatched
         );
         assert_eq!(provenance.observed_pane.as_deref(), Some("%9"));
+    }
+
+    #[test]
+    fn a_list_request_without_a_scope_stays_caller_scoped() {
+        // Every muxa built before scoped listing omits the field. Defaulting
+        // it to anything wider would hand those clients other agents' mail.
+        let body: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "collaboration_list",
+            "origin": { "pane": "%1", "socket": "default" },
+            "mailbox": "incoming",
+        }))
+        .expect("an old client's list request still parses");
+        match body {
+            RequestBody::CollaborationList { scope, .. } => {
+                assert_eq!(scope, MailboxScope::Caller);
+            }
+            other => panic!("expected a collaboration_list request, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn widening_a_listing_over_ipc_is_console_only() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-collaboration-scope.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        add_collaboration_agent(&store, "%3", "elsewhere", AgentKind::GeminiCli).await;
+        add_collaboration_agent(&store, "%4", "elsewhere-peer", AgentKind::Codex).await;
+        // %3 and %4 sit in a second window, so they form a room of their own.
+        let other_window = |pane_id: &str, pane_index: &str| PaneInfo {
+            window_id: "@2".into(),
+            window_name: "other".into(),
+            window_index: "1".into(),
+            ..collaboration_test_pane(pane_id, pane_index)
+        };
+        let backend: SharedBackend = Arc::new(CollaborationTestBackend {
+            panes: vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+                other_window("%3", "0"),
+                other_window("%4", "1"),
+            ],
+        });
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let server = Server::new(sock.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let client =
+            Client::new(sock).with_collaboration_client_kind(CollaborationClientKind::Watch);
+        let origin = |pane: &str, console: bool| CollaborationOrigin {
+            pane: pane.into(),
+            socket: Some("default".into()),
+            console,
+        };
+        let ask = |from: CollaborationOrigin, to: &'static str, body: &'static str| {
+            let client = client.clone();
+            async move {
+                client
+                    .collaboration_send(
+                        &from,
+                        to,
+                        &NewRequest {
+                            kind: collaboration::RequestKind::Question,
+                            body: body.into(),
+                            expects_reply: true,
+                            work_mode: collaboration::WorkMode::ReadOnly,
+                            paths: Vec::new(),
+                            air_artifacts: Vec::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        ask(origin("%1", false), "%2", "inside window one").await;
+        ask(origin("%3", false), "%4", "inside window two").await;
+
+        // The console dispatched neither, so its own mailbox is empty.
+        let console = origin("%1", true);
+        assert!(client
+            .collaboration_list(&console, RequestMailbox::All)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            client
+                .collaboration_list_scoped(&console, RequestMailbox::All, MailboxScope::Room)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let fleet = client
+            .collaboration_list_scoped(&console, RequestMailbox::All, MailboxScope::All)
+            .await
+            .unwrap();
+        assert_eq!(fleet.len(), 2);
+        // Every row carries the window it happened in, which is what a
+        // fleet-wide listing has to render.
+        let windows: HashSet<_> = fleet
+            .iter()
+            .map(|request| request.from.room.window_id.clone())
+            .collect();
+        assert_eq!(windows.len(), 2);
+
+        // The same call from an agent is refused, room-mate or not.
+        let denied = client
+            .collaboration_list_scoped(&origin("%1", false), RequestMailbox::All, MailboxScope::All)
+            .await
+            .expect_err("an agent may not read the fleet's mail");
+        assert!(
+            denied.to_string().contains("operator-console"),
+            "unexpected error: {denied}"
+        );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
     }
 
     #[tokio::test]
