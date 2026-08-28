@@ -109,6 +109,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vanished server the way it treats `Ctrl-b d`, and `scripts/exit-check.py`
   holds it there in CI.
 
+  The ending prints before the teardown rather than after it. Stopping a
+  daemon and waiting for it to actually exit takes a couple of seconds, and the
+  learner spent them looking at a blank terminal before the part worth reading
+  arrived. Everything that does not depend on the teardown goes out first; the
+  one line that claims the sandbox is gone waits until it is.
+
   The block printed when nobody is attached stopped fighting the shell. It was
   written beside a prompt bash had already drawn, which doubled
   `muxa-onboarding $` and ate characters out of the line under it. It clears
