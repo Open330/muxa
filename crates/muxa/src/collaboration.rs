@@ -380,6 +380,26 @@ pub enum RequestMailbox {
     All,
 }
 
+/// How wide a mailbox listing reaches.
+///
+/// [`RequestMailbox`] picks a *direction*; this picks *whose* traffic is in
+/// scope. The two are independent — `Sent` at [`MailboxScope::Room`] is
+/// everything the room dispatched, not just what the caller sent.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MailboxScope {
+    /// The caller's own mailbox — all an agent is entitled to.
+    #[default]
+    Caller,
+    /// Every participant in the caller's room.
+    Room,
+    /// Every request the store holds, across rooms, sessions and hosts.
+    ///
+    /// `mailbox` stops applying here: with no endpoint to sit on one side of,
+    /// every request is equally incoming and sent.
+    All,
+}
+
 impl RequestStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
@@ -540,6 +560,10 @@ pub enum CollaborationError {
     NotFound(String),
     #[error("request {0} does not belong to the calling participant")]
     NotParticipant(String),
+    #[error(
+        "listing past your own mailbox is an operator-console operation; this origin speaks for a pane agent"
+    )]
+    ScopeDenied,
     #[error("reply status must be completed, blocked, declined, or failed")]
     InvalidReplyStatus,
     #[error("request {0} is already terminal")]
@@ -1186,24 +1210,43 @@ impl CollaborationStore {
         }
     }
 
+    /// List one mailbox. `scope` widens the listing past the caller's own
+    /// endpoint; see [`MailboxScope`].
     pub async fn list_for(
         &self,
         caller: &Participant,
         mailbox: RequestMailbox,
+        scope: MailboxScope,
     ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
         self.ensure_enabled()?;
+        // Reading past your own mailbox is an operator act. An agent must not
+        // be able to read what its room-mates said to each other just because
+        // it shares their window.
+        if !matches!(scope, MailboxScope::Caller) && !caller.console {
+            return Err(CollaborationError::ScopeDenied);
+        }
         let _transaction = self.transaction_lock.lock().await;
         let mut requests: Vec<_> = self
             .requests
             .read()
             .await
             .values()
-            .filter(|request| match mailbox {
-                RequestMailbox::Incoming => request.to.same_endpoint(caller),
-                RequestMailbox::Sent => request.from.same_endpoint(caller),
-                RequestMailbox::All => {
-                    request.from.same_endpoint(caller) || request.to.same_endpoint(caller)
-                }
+            .filter(|request| match scope {
+                MailboxScope::Caller => match mailbox {
+                    RequestMailbox::Incoming => request.to.same_endpoint(caller),
+                    RequestMailbox::Sent => request.from.same_endpoint(caller),
+                    RequestMailbox::All => {
+                        request.from.same_endpoint(caller) || request.to.same_endpoint(caller)
+                    }
+                },
+                MailboxScope::Room => match mailbox {
+                    RequestMailbox::Incoming => request.to.room == caller.room,
+                    RequestMailbox::Sent => request.from.room == caller.room,
+                    RequestMailbox::All => {
+                        request.from.room == caller.room || request.to.room == caller.room
+                    }
+                },
+                MailboxScope::All => true,
             })
             .cloned()
             .collect();
@@ -2413,14 +2456,14 @@ mod tests {
 
         assert_eq!(
             mailbox
-                .list_for(&sender, RequestMailbox::Sent)
+                .list_for(&sender, RequestMailbox::Sent, MailboxScope::Caller)
                 .await
                 .unwrap()
                 .len(),
             2
         );
         assert!(mailbox
-            .list_for(&recipient, RequestMailbox::Sent)
+            .list_for(&recipient, RequestMailbox::Sent, MailboxScope::Caller)
             .await
             .unwrap()
             .is_empty());
@@ -2523,7 +2566,7 @@ mod tests {
         assert!(matches!(result, Err(CollaborationError::Persistence(_))));
         assert!(mailbox.pending_unnotified().await.is_empty());
         assert!(mailbox
-            .list_for(&sender, RequestMailbox::All)
+            .list_for(&sender, RequestMailbox::All, MailboxScope::Caller)
             .await
             .unwrap()
             .is_empty());
@@ -2564,6 +2607,150 @@ mod tests {
             Err(CollaborationError::Persistence(_))
         ));
         assert!(mailbox.pending_unnotified().await.is_empty());
+    }
+
+    fn participant_in_window(pane: &str, session: &str, window_id: &str) -> Participant {
+        let mut participant = participant(pane, session);
+        participant.room.window_id = window_id.into();
+        participant
+    }
+
+    fn console_in_window(window_id: &str) -> Participant {
+        Participant::console(RoomId {
+            host: "tmux".into(),
+            socket: Some("default".into()),
+            window_id: window_id.into(),
+        })
+    }
+
+    async fn ask(store: &CollaborationStore, from: Participant, to: Participant, body: &str) {
+        store
+            .create(
+                from,
+                to,
+                NewRequest {
+                    kind: RequestKind::Question,
+                    body: body.into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn room_scope_lists_traffic_the_caller_was_never_party_to() {
+        // The operator console dispatches and never receives, so its own
+        // mailbox says nothing about what the agents in front of it are
+        // saying to each other. That is the whole point of widening.
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        ask(
+            &store,
+            participant_in_window("%1", "one", "@1"),
+            participant_in_window("%2", "two", "@1"),
+            "peer to peer",
+        )
+        .await;
+        let console = console_in_window("@1");
+
+        assert!(store
+            .list_for(&console, RequestMailbox::All, MailboxScope::Caller)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .list_for(&console, RequestMailbox::All, MailboxScope::Room)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn all_scope_reaches_rooms_the_console_is_not_in() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        ask(
+            &store,
+            participant_in_window("%1", "one", "@1"),
+            participant_in_window("%2", "two", "@1"),
+            "inside the room",
+        )
+        .await;
+        ask(
+            &store,
+            participant_in_window("%3", "three", "@2"),
+            participant_in_window("%4", "four", "@2"),
+            "another window entirely",
+        )
+        .await;
+        // Crosses rooms: sent by @1, received in @2.
+        ask(
+            &store,
+            participant_in_window("%1", "one", "@1"),
+            participant_in_window("%3", "three", "@2"),
+            "across the two",
+        )
+        .await;
+        let console = console_in_window("@1");
+
+        assert_eq!(
+            store
+                .list_for(&console, RequestMailbox::All, MailboxScope::Room)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "the room's own traffic plus what it sent out"
+        );
+        // Direction still discriminates inside a widened scope: the crossing
+        // request left @1 and landed in @2.
+        assert_eq!(
+            store
+                .list_for(&console, RequestMailbox::Incoming, MailboxScope::Room)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_for(&console, RequestMailbox::All, MailboxScope::All)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_list_past_its_own_mailbox() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        ask(
+            &store,
+            participant_in_window("%1", "one", "@1"),
+            participant_in_window("%2", "two", "@1"),
+            "not yours to read",
+        )
+        .await;
+        // A room-mate, not the console: same window, no operator authority.
+        let agent = participant_in_window("%9", "nine", "@1");
+
+        for scope in [MailboxScope::Room, MailboxScope::All] {
+            assert!(matches!(
+                store.list_for(&agent, RequestMailbox::All, scope).await,
+                Err(CollaborationError::ScopeDenied)
+            ));
+        }
+        assert!(store
+            .list_for(&agent, RequestMailbox::All, MailboxScope::Caller)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2796,7 +2983,7 @@ mod tests {
 
         assert_eq!(
             mailbox
-                .list_for(&from_here, RequestMailbox::Sent)
+                .list_for(&from_here, RequestMailbox::Sent, MailboxScope::Caller)
                 .await
                 .unwrap()
                 .len(),
@@ -2806,7 +2993,7 @@ mod tests {
         // operator reads them — by pointing the cursor at that row.
         assert_eq!(
             mailbox
-                .list_for(&recipient, RequestMailbox::Incoming)
+                .list_for(&recipient, RequestMailbox::Incoming, MailboxScope::Caller)
                 .await
                 .unwrap()
                 .len(),

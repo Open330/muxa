@@ -2989,7 +2989,11 @@ mod tests {
         // watch` reads it, by pointing the cursor at that row.
         assert_eq!(
             mailbox
-                .list_for(&recipient, muxa::collaboration::RequestMailbox::Incoming)
+                .list_for(
+                    &recipient,
+                    muxa::collaboration::RequestMailbox::Incoming,
+                    muxa::collaboration::MailboxScope::Caller,
+                )
                 .await
                 .unwrap()[0]
                 .reply

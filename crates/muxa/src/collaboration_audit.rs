@@ -7,7 +7,8 @@
 //! store.
 
 use crate::collaboration::{
-    CollaborationOrigin, CollaborationProvenance, Participant, RequestMailbox, RequestStatus,
+    CollaborationOrigin, CollaborationProvenance, MailboxScope, Participant, RequestMailbox,
+    RequestStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -58,6 +59,10 @@ pub struct CollaborationAuditEntry {
     pub request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mailbox: Option<RequestMailbox>,
+    /// How far past the caller's own mailbox the listing reached. Absent on
+    /// operations that never widen, and on the default caller-only listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<MailboxScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<RequestStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,6 +81,7 @@ pub struct CollaborationAuditContext {
     pub target: Option<String>,
     pub request_id: Option<String>,
     pub mailbox: Option<RequestMailbox>,
+    pub scope: Option<MailboxScope>,
     pub status: Option<RequestStatus>,
     pub message_bytes: Option<usize>,
 }
@@ -91,6 +97,7 @@ impl CollaborationAuditContext {
             target: None,
             request_id: None,
             mailbox: None,
+            scope: None,
             status: None,
             message_bytes: None,
         }
@@ -117,6 +124,7 @@ impl CollaborationAuditContext {
                 .request_id
                 .or_else(|| response_request_id.map(str::to_string)),
             mailbox: self.mailbox,
+            scope: self.scope,
             status: self.status,
             message_bytes: self.message_bytes,
             result_count,

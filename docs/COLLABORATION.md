@@ -160,12 +160,21 @@ muxa msg inbox
 muxa msg reply req_... "review complete" --status completed
 muxa msg wait req_... --timeout-secs 300
 muxa msg list --mailbox sent
+muxa msg list --scope room     # every participant in this window
+muxa msg list --scope all      # every room this daemon holds
 muxa msg cancel req_... # queued requests only
 ```
 
 `send`, `reply`, and `cancel` print a one-line receipt; `list` and `inbox`
 print each request followed by its reply, when one has come back. Add `--json`
 to any of them for the stored record instead.
+
+`--scope` widens a listing past the pane's own mailbox, and `--mailbox` still
+picks the direction within it. Anything past the default `caller` speaks as the
+operator console and is refused for a pane agent: sharing a window does not
+entitle an agent to read what its room-mates said to each other. A widened
+listing names both ends of every request and the `session:window` each sits
+in — without that a fleet-wide list cannot say where the work happened.
 
 The same lifecycle is available interactively in `muxa watch`: `m` sends to the
 selected room peer, `b` opens non-claiming mailbox history, `i` claims the

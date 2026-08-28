@@ -35,7 +35,7 @@ use muxa::adapters::{
 };
 use muxa::collaboration::{
     AirArtifactReference, CollaborationClientKind, CollaborationOrigin, CollaborationOriginMatch,
-    NewRequest, RequestKind, RequestMailbox, RequestStatus, WorkMode,
+    MailboxScope, NewRequest, Participant, RequestKind, RequestMailbox, RequestStatus, WorkMode,
 };
 use muxa::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme};
 use muxa::ipc::Client;
@@ -361,6 +361,11 @@ enum MsgCmd {
     List {
         #[arg(long, default_value = "all")]
         mailbox: String,
+        /// How wide to look: `caller` (this pane's own mailbox), `room` (every
+        /// participant in this window), or `all` (every room this daemon
+        /// holds). Anything past `caller` speaks as the operator console.
+        #[arg(long, default_value = "caller")]
+        scope: String,
         #[arg(long)]
         json: bool,
     },
@@ -897,6 +902,15 @@ fn collaboration_air_references(values: &[String]) -> Result<Vec<AirArtifactRefe
         .collect()
 }
 
+fn collaboration_list_scope(value: &str) -> Result<MailboxScope> {
+    match value {
+        "caller" | "self" | "mine" => Ok(MailboxScope::Caller),
+        "room" | "window" => Ok(MailboxScope::Room),
+        "all" | "fleet" => Ok(MailboxScope::All),
+        _ => anyhow::bail!("scope must be caller, room, or all"),
+    }
+}
+
 fn collaboration_mailbox(value: &str) -> Result<RequestMailbox> {
     match value {
         "incoming" | "inbox" => Ok(RequestMailbox::Incoming),
@@ -1037,12 +1051,11 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                 }
             }
         }
-        MsgCmd::List { mailbox, json } => {
-            let requests = client
-                .collaboration_list(&origin, collaboration_mailbox(&mailbox)?)
-                .await?;
-            print_collaboration_messages(&requests, json, &origin)?;
-        }
+        MsgCmd::List {
+            mailbox,
+            scope,
+            json,
+        } => cmd_msg_list(client, &origin, &mailbox, &scope, json).await?,
         MsgCmd::Reply {
             request_id,
             body,
@@ -1074,6 +1087,27 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn cmd_msg_list(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    mailbox: &str,
+    scope: &str,
+    json: bool,
+) -> Result<()> {
+    let scope = collaboration_list_scope(scope)?;
+    // A widened listing is the operator asking what the fleet is saying, not
+    // the pane agent asking after its own inbox — so it goes out under the
+    // console identity the daemon requires for it.
+    let listing_origin = CollaborationOrigin {
+        console: !matches!(scope, MailboxScope::Caller),
+        ..origin.clone()
+    };
+    let requests = client
+        .collaboration_list_scoped(&listing_origin, collaboration_mailbox(mailbox)?, scope)
+        .await?;
+    print_collaboration_messages(&requests, json, origin, scope)
 }
 
 async fn cmd_msg_wait(
@@ -1129,10 +1163,32 @@ fn print_collaboration_receipt(
     Ok(())
 }
 
+/// Where a participant sits, for listings that span more than one room.
+///
+/// A room id alone (`@7` on some socket) tells an operator nothing; the tmux
+/// names they navigate by do. Fall back to the ids only when the scan that
+/// would have supplied the names has not run yet.
+fn participant_location(participant: &Participant) -> String {
+    if participant.console {
+        return "console".to_string();
+    }
+    let session = participant
+        .tmux_session_name
+        .as_deref()
+        .or(participant.tmux_session_id.as_deref())
+        .unwrap_or("?");
+    let window = participant
+        .window_name
+        .as_deref()
+        .unwrap_or(&participant.room.window_id);
+    format!("{session}:{window}")
+}
+
 fn print_collaboration_messages(
     requests: &[muxa::collaboration::CollaborationRequest],
     json: bool,
     origin: &CollaborationOrigin,
+    scope: MailboxScope,
 ) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(requests)?);
@@ -1140,15 +1196,28 @@ fn print_collaboration_messages(
         println!("No collaboration messages.");
     } else {
         for request in requests {
-            let direction = if request.from.pane == origin.pane
-                && origin
-                    .socket
-                    .as_deref()
-                    .is_none_or(|socket| request.from.socket.as_deref() == Some(socket))
-            {
-                format!("to {}", request.to.label())
+            // Past the caller's own mailbox there is no "the other end" to
+            // name: the operator is reading other agents' traffic, so both
+            // ends and the window each sits in have to be on the line.
+            let direction = if matches!(scope, MailboxScope::Caller) {
+                if request.from.pane == origin.pane
+                    && origin
+                        .socket
+                        .as_deref()
+                        .is_none_or(|socket| request.from.socket.as_deref() == Some(socket))
+                {
+                    format!("to {}", request.to.label())
+                } else {
+                    format!("from {}", request.from.label())
+                }
             } else {
-                format!("from {}", request.from.label())
+                format!(
+                    "{} [{}] -> {} [{}]",
+                    request.from.label(),
+                    participant_location(&request.from),
+                    request.to.label(),
+                    participant_location(&request.to),
+                )
             };
             // Only when it is worth knowing. `matched` is every ordinary
             // request, and printing the caller's pid and pane on each of them
