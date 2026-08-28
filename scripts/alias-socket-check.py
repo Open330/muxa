@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """`--alias` must reserve the handle on the daemon the launch is talking to.
 
-The reservation used `paths::default_socket()` regardless of `--socket`, so a
-launch against any other daemon reserved the name in the wrong room — and on a
-host with no daemon on the default socket at all, the reservation failed, the
-error propagated out of `mark_agent`, and the whole launch was rolled back.
+`mark_agent` registered the name against `paths::default_socket()` regardless
+of `--socket` or `MUXA_SOCKET`. Against any other daemon the name is taken in a
+room that knows nothing about the pane, while the room that owns it never
+hears — so that room's next minted handle can hand the same name to a second
+pane, and two panes answer to one alias.
 
-Driven against a sandbox, which is exactly the "some other daemon" case.
+Driven against a sandbox, which is the "some other daemon" case by
+construction: reserve `codex` on one pane, fire a codex session start on
+another, and read back what the second pane was given. `codex2` means the
+sandbox daemon heard the reservation; `codex` means it did not.
 """
 import argparse
 import os
@@ -14,15 +18,9 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = pathlib.Path(__file__).resolve().parent
-
-
-def sandbox(name: str, *args: str, env=None) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["bash", str(HERE / "muxa-sandbox.sh"), *args, "--name", name],
-        capture_output=True, text=True, env=env,
-    )
 
 
 def main() -> int:
@@ -33,107 +31,92 @@ def main() -> int:
     args = ap.parse_args()
 
     muxa = str(pathlib.Path(args.muxa).resolve())
-    # A stand-in `codex`, because the runner has none and a pane whose command
-    # cannot exec closes before its metadata is stamped. Held to a gate below:
-    # if the real one ever wins the PATH, this check would be starting agents
-    # on somebody's machine rather than testing handle arbitration.
+    muxad = str(pathlib.Path(args.muxad).resolve())
+    sock = f"/tmp/{args.name}-sandbox/tmux.sock"
+    script = str(HERE / "muxa-sandbox.sh")
+
+    env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
+
+    # A stand-in `codex`: CI has none, and a pane whose command cannot exec
+    # closes before its metadata is stamped.
     fake_bin = pathlib.Path(tempfile.mkdtemp())
     fake = fake_bin / "codex"
     fake.write_text("#!/bin/sh\nexec sleep 600\n")
     fake.chmod(0o755)
-    env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
-    # No daemon on the default socket: the old code had nothing to reserve
-    # against and failed the launch outright.
-    env["XDG_RUNTIME_DIR"] = str(pathlib.Path(subprocess.run(
-        ["mktemp", "-d"], capture_output=True, text=True).stdout.strip()))
+
+    def sandbox(*argv: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", script, *argv, "--name", args.name],
+                              capture_output=True, text=True, env=env)
+
+    def tmux(*argv: str, tenv=None) -> str:
+        return subprocess.run(["tmux", "-S", sock, *argv], capture_output=True,
+                              text=True, env=tenv or env).stdout
 
     failures = 0
     try:
-        up = sandbox(args.name, "up", "--muxa", muxa,
-                     "--muxad", str(pathlib.Path(args.muxad).resolve()),
-                     "--extra-path", str(fake_bin), env=env)
+        up = sandbox("up", "--muxa", muxa, "--muxad", muxad,
+                     "--extra-path", str(fake_bin))
         if up.returncode != 0:
             print(f"  FAIL  sandbox did not come up\n{up.stdout}\n{up.stderr}")
             return 1
-        if sandbox(args.name, "daemon", env=env).returncode != 0:
+        if sandbox("daemon").returncode != 0:
             print("  FAIL  sandbox daemon did not start")
             return 1
 
-        sandbox_env = dict(env)
-        for line in sandbox(args.name, "env", env=env).stdout.splitlines():
+        senv = dict(env)
+        for line in sandbox("env").stdout.splitlines():
             if line.startswith("export ") and "=" in line:
                 key, _, value = line[len("export "):].partition("=")
-                sandbox_env[key] = value.split(':"$PATH"')[0].strip("'")
-        sandbox_env["TMUX"] = sandbox_env.get("MUXA_SANDBOX_TMUX_ENV", "")
+                senv[key] = value.split(':"$PATH"')[0].strip("'")
+        senv["TMUX"] = senv.get("MUXA_SANDBOX_TMUX_ENV", "")
 
-        # A session of its own, so the launch has a window to place into.
-        sock = f"/tmp/{args.name}-sandbox/tmux.sock"
-        subprocess.run(["tmux", "-S", sock, "new-session", "-d", "-s", "aliascheck"],
-                       capture_output=True, text=True, env=sandbox_env)
-        pane = subprocess.run(
-            ["tmux", "-S", sock, "list-panes", "-t", "aliascheck:", "-F", "#{pane_id}"],
-            capture_output=True, text=True, env=sandbox_env,
-        ).stdout.split()[0]
-        # Reserve `codex` on one pane, then let the *other* pane mint a
-        # default handle from a codex session start. The sandbox daemon
-        # arbitrates that namespace: if it heard the reservation it hands the
-        # second pane `codex2`, and if it never heard it — because the
-        # reservation went to whatever daemon `default_socket()` names — it
-        # hands out `codex` again and two panes answer to one name.
-        sock = f"/tmp/{args.name}-sandbox/tmux.sock"
-        subprocess.run(["tmux", "-S", sock, "new-session", "-d", "-s", "aliascheck"],
-                       capture_output=True, text=True, env=sandbox_env)
-        subprocess.run(["tmux", "-S", sock, "split-window", "-d", "-t", "aliascheck:"],
-                       capture_output=True, text=True, env=sandbox_env)
-        panes = subprocess.run(
-            ["tmux", "-S", sock, "list-panes", "-t", "aliascheck:", "-F", "#{pane_id}"],
-            capture_output=True, text=True, env=sandbox_env,
-        ).stdout.split()
-        held, other = panes[0], panes[1]
-
-        which = subprocess.run(
-            ["/bin/sh", "-c", "command -v codex"],
-            capture_output=True, text=True, env=sandbox_env,
-        ).stdout.strip()
-        if which != str(fake):
-            print(f"  FAIL  the stand-in codex does not win the sandbox PATH   ({which!r})")
+        # The launch resolves `codex` inside a pane, from the tmux server's
+        # environment rather than this process's. `--extra-path` only prepends
+        # to what `sandbox env` prints for the caller, so the server — and
+        # every pane it spawns — still finds the real one. Put the stand-in on
+        # the server's PATH, and check it landed in front: a real `codex`
+        # winning would mean this check starts agents on somebody's machine
+        # instead of measuring handle arbitration.
+        tmux("set-environment", "-g", "PATH",
+             f"{fake_bin}:{senv.get('PATH', '')}", tenv=senv)
+        server_path = tmux("show-environment", "-g", "PATH", tenv=senv).strip()
+        if not server_path.startswith(f"PATH={fake_bin}:"):
+            print(f"  FAIL  the stand-in codex is not first on the server PATH\n        {server_path[:160]}")
             return 1
-        print("  ok    the stand-in codex wins the sandbox PATH")
+        print("  ok    the stand-in codex leads the tmux server's PATH")
+
+        tmux("new-session", "-d", "-s", "aliascheck", tenv=senv)
+        tmux("split-window", "-d", "-t", "aliascheck:", tenv=senv)
+        panes = tmux("list-panes", "-t", "aliascheck:", "-F", "#{pane_id}", tenv=senv).split()
+        held, other = panes[0], panes[1]
 
         started = subprocess.run(
             [muxa, "agent", "start", "--agent", "codex", "--alias", "codex",
              "--placement", "pane", "--target", held, "--json"],
-            capture_output=True, text=True, env=sandbox_env,
+            capture_output=True, text=True, env=senv,
         )
         if started.returncode != 0:
             print(f"  FAIL  `agent start --alias` did not run\n        {started.stderr.strip()[:200]}")
             return 1
         print("  ok    `agent start --alias codex` succeeded")
 
-        hook_env = dict(sandbox_env, TMUX_PANE=other)
-        subprocess.run(
-            [muxa, "hook", "codex", "--event", "session_start"],
-            input='{"session_id":"alias-socket-check"}',
-            capture_output=True, text=True, env=hook_env,
-        )
-        import time
+        subprocess.run([muxa, "hook", "codex", "--event", "session_start"],
+                       input='{"session_id":"alias-socket-check"}',
+                       capture_output=True, text=True,
+                       env=dict(senv, TMUX_PANE=other))
         minted = ""
-        for _ in range(30):
+        for _ in range(40):
             time.sleep(0.4)
-            minted = subprocess.run(
-                ["tmux", "-S", sock, "show", "-p", "-t", other, "-v", "@muxa_agent_alias"],
-                capture_output=True, text=True, env=sandbox_env,
-            ).stdout.strip()
+            minted = tmux("show", "-p", "-t", other, "-v", "@muxa_agent_alias", tenv=senv).strip()
             if minted:
                 break
 
-        ok = minted != "codex"
+        ok = bool(minted) and minted != "codex"
         print(f"  {'ok  ' if ok else 'FAIL'}  the sandbox daemon knew `codex` was taken"
               + (f"   (second pane minted {minted!r})" if minted else "   (nothing minted)"))
         failures += not ok
-
     finally:
-        sandbox(args.name, "down", env=env)
+        sandbox("down")
 
     print("the alias reservation follows the launch's daemon" if not failures
           else f"{failures} failed")
