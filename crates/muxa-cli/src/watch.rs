@@ -775,6 +775,10 @@ struct VisibleTarget {
 #[allow(clippy::struct_excessive_bools)] // independent branch/disclosure rendering facts
 struct TreeTarget {
     key: TopologyNodeKey,
+    /// The only window folded into this session row in pane view. The row
+    /// keeps its session identity/action semantics, while rendering the work
+    /// name and exposing the window's panes as direct visual children.
+    compacted_window: Option<WindowKey>,
     depth: u8,
     is_last_sibling: bool,
     parent_is_last_sibling: bool,
@@ -3486,18 +3490,50 @@ impl App {
             let windows = self.sorted_windows(session.windows.iter().filter(|window| {
                 tree_window_relevant(window, session, &query, self.attention_only)
             }));
+            // Pane view is about reaching agents. When the unfiltered
+            // topology has a single window, a separate session -> window
+            // step repeats the same scope without adding a choice. Fold the
+            // work name into the session row and expose panes directly. A
+            // filter deliberately restores the full ancestry so a lone
+            // matching window is never mistaken for the session's full
+            // topology.
+            let compacted_window = (!filtering
+                && self.watch_cfg.view == WatchView::Pane
+                && session.windows.len() == 1)
+                .then(|| &session.windows[0]);
             let session_key = session.node_key();
             let session_expanded =
                 self.expanded_nodes.contains(&session_key) || (filtering && !windows.is_empty());
             targets.push(TreeTarget {
                 key: session_key,
+                compacted_window: compacted_window.map(|window| window.key.clone()),
                 depth: 0,
                 is_last_sibling: session_index + 1 == session_count,
                 parent_is_last_sibling: true,
-                has_children: !session.windows.is_empty(),
+                has_children: compacted_window.map_or_else(
+                    || !session.windows.is_empty(),
+                    |window| !window.panes.is_empty(),
+                ),
                 expanded: session_expanded,
             });
             if !session_expanded {
+                continue;
+            }
+
+            if let Some(window) = compacted_window {
+                let panes = self.sorted_panes(window.panes.iter());
+                let pane_count = panes.len();
+                for (pane_index, pane) in panes.into_iter().enumerate() {
+                    targets.push(TreeTarget {
+                        key: pane.node_key(),
+                        compacted_window: None,
+                        depth: 1,
+                        is_last_sibling: pane_index + 1 == pane_count,
+                        parent_is_last_sibling: true,
+                        has_children: false,
+                        expanded: false,
+                    });
+                }
                 continue;
             }
 
@@ -3511,6 +3547,7 @@ impl App {
                     self.expanded_nodes.contains(&window_key) || (filtering && !panes.is_empty());
                 targets.push(TreeTarget {
                     key: window_key,
+                    compacted_window: None,
                     depth: 1,
                     is_last_sibling: window_index + 1 == window_count,
                     parent_is_last_sibling: session_index + 1 == session_count,
@@ -3524,6 +3561,7 @@ impl App {
                 for (pane_index, pane) in panes.into_iter().enumerate() {
                     targets.push(TreeTarget {
                         key: pane.node_key(),
+                        compacted_window: None,
                         depth: 2,
                         is_last_sibling: pane_index + 1 == pane_count,
                         parent_is_last_sibling: window_index + 1 == window_count,
@@ -4150,17 +4188,18 @@ impl App {
 
         let mut anchor = targets[current].key.clone();
         loop {
-            let candidates = targets
-                .iter()
-                .enumerate()
-                .filter_map(|(index, target)| {
-                    same_topology_parent(&anchor, &target.key).then_some(index)
-                })
-                .collect::<Vec<_>>();
             let anchor_index = targets
                 .iter()
                 .position(|target| target.key == anchor)
                 .unwrap_or(current);
+            let parent = visible_tree_parent_key(&targets[anchor_index]);
+            let candidates = targets
+                .iter()
+                .enumerate()
+                .filter_map(|(index, target)| {
+                    (visible_tree_parent_key(target) == parent).then_some(index)
+                })
+                .collect::<Vec<_>>();
             let anchor_position = candidates
                 .iter()
                 .position(|candidate| *candidate == anchor_index)
@@ -4169,7 +4208,7 @@ impl App {
             if candidates.len() != 1 {
                 return (candidates, anchor_position);
             }
-            let Some(parent) = topology_parent_key(&anchor) else {
+            let Some(parent) = parent else {
                 return (candidates, anchor_position);
             };
             anchor = parent;
@@ -4291,7 +4330,7 @@ impl App {
         let Some(target) = self.selected_tree_target() else {
             return;
         };
-        let parent = topology_parent_key(&target.key);
+        let parent = visible_tree_parent_key(&target);
 
         // Focus mode expands the selected path automatically, so collapsing
         // that same node would be immediately undone on refresh. Treat left
@@ -4617,22 +4656,25 @@ fn default_tree_expanded(key: &TopologyNodeKey, view: WatchView) -> bool {
     )
 }
 
-fn same_topology_parent(left: &TopologyNodeKey, right: &TopologyNodeKey) -> bool {
-    match (left, right) {
-        (TopologyNodeKey::Session(_), TopologyNodeKey::Session(_)) => true,
-        (TopologyNodeKey::Window(left), TopologyNodeKey::Window(right)) => {
-            left.session == right.session
-        }
-        (TopologyNodeKey::Pane(left), TopologyNodeKey::Pane(right)) => left.window == right.window,
-        _ => false,
-    }
-}
-
 fn topology_parent_key(key: &TopologyNodeKey) -> Option<TopologyNodeKey> {
     match key {
         TopologyNodeKey::Session(_) => None,
         TopologyNodeKey::Window(key) => Some(TopologyNodeKey::Session(key.session.clone())),
         TopologyNodeKey::Pane(key) => Some(TopologyNodeKey::Window(key.window.clone())),
+    }
+}
+
+/// Parent in the rendered tree rather than in the canonical topology.
+///
+/// A pane at depth one belongs to a compacted single-window session, so its
+/// visible parent is the session row even though its durable topology key
+/// still records the hidden window.
+fn visible_tree_parent_key(target: &TreeTarget) -> Option<TopologyNodeKey> {
+    match (&target.key, target.depth) {
+        (TopologyNodeKey::Pane(pane), 1) => {
+            Some(TopologyNodeKey::Session(pane.window.session.clone()))
+        }
+        _ => topology_parent_key(&target.key),
     }
 }
 
@@ -14257,6 +14299,17 @@ fn tree_node_states(node: TopologyNodeRef<'_>) -> Vec<AgentState> {
     }
 }
 
+fn target_window<'a>(target: &TreeTarget, node: TopologyNodeRef<'a>) -> Option<&'a WindowNode> {
+    match node {
+        TopologyNodeRef::Session(session) => target
+            .compacted_window
+            .as_ref()
+            .and_then(|key| session.windows.iter().find(|window| &window.key == key)),
+        TopologyNodeRef::Window(window) => Some(window),
+        TopologyNodeRef::Pane(_) => None,
+    }
+}
+
 fn tree_state_cell(
     target: &TreeTarget,
     node: TopologyNodeRef<'_>,
@@ -14284,7 +14337,10 @@ fn tree_state_is_redundant(target: &TreeTarget, node: TopologyNodeRef<'_>) -> bo
         return false;
     }
     match node {
-        TopologyNodeRef::Session(session) => session.windows.len() == 1,
+        TopologyNodeRef::Session(session) => target_window(target, node).map_or_else(
+            || session.windows.len() == 1,
+            |window| window.panes.len() == 1,
+        ),
         TopologyNodeRef::Window(window) => window.panes.len() == 1,
         TopologyNodeRef::Pane(_) => false,
     }
@@ -14353,7 +14409,10 @@ fn tree_node_label(
     }
     spans.push(Span::styled(disclosure.to_string(), theme.dim_style()));
     let label = match node {
-        TopologyNodeRef::Session(session) => session.name.clone(),
+        TopologyNodeRef::Session(session) => target_window(target, node).map_or_else(
+            || session.name.clone(),
+            |window| format!("{} › {}", session.name, window.name),
+        ),
         TopologyNodeRef::Window(window) => window.name.clone(),
         TopologyNodeRef::Pane(pane) => {
             let owner = pane_label_owner(pane);
@@ -14374,7 +14433,7 @@ fn tree_node_label(
     }
     // A work window that has finished looks exactly like one that stalled —
     // every agent idle — unless the row says so.
-    if let TopologyNodeRef::Window(window) = node {
+    if let Some(window) = target_window(target, node) {
         if let Some(completion) = window.completion {
             let style = if completion.is_complete() {
                 Style::default().fg(theme.state_idle)
@@ -14396,23 +14455,35 @@ fn tree_node_label(
     Text::from(Line::from(spans))
 }
 
-fn tree_node_age(app: &App, node: TopologyNodeRef<'_>, now: OffsetDateTime) -> String {
+fn window_node_age(window: &WindowNode, now: OffsetDateTime) -> String {
+    window
+        .panes
+        .iter()
+        .filter_map(|pane| pane.agent.as_ref().map(|agent| agent.started_at))
+        .min()
+        .map_or_else(
+            || "—".into(),
+            |started| {
+                format_duration(
+                    u64::try_from((now - started).whole_seconds().max(0)).unwrap_or(u64::MAX),
+                )
+            },
+        )
+}
+
+fn tree_node_age(
+    app: &App,
+    target: &TreeTarget,
+    node: TopologyNodeRef<'_>,
+    now: OffsetDateTime,
+) -> String {
+    if let Some(window) = target_window(target, node) {
+        return window_node_age(window, now);
+    }
     match node {
         TopologyNodeRef::Session(session) => unambiguous_session_activity_secs(app, session, now)
             .map_or_else(|| "—".into(), format_duration),
-        TopologyNodeRef::Window(window) => window
-            .panes
-            .iter()
-            .filter_map(|pane| pane.agent.as_ref().map(|agent| agent.started_at))
-            .min()
-            .map_or_else(
-                || "—".into(),
-                |started| {
-                    format_duration(
-                        u64::try_from((now - started).whole_seconds().max(0)).unwrap_or(u64::MAX),
-                    )
-                },
-            ),
+        TopologyNodeRef::Window(window) => window_node_age(window, now),
         TopologyNodeRef::Pane(pane) => pane.agent.as_ref().map_or_else(
             || "—".into(),
             |agent| relative_time(agent.state_entered_at, now),
@@ -14502,7 +14573,14 @@ fn window_node_summary(window: &WindowNode, layout: WatchLayout) -> String {
     }
 }
 
-fn tree_node_summary(node: TopologyNodeRef<'_>, layout: WatchLayout) -> String {
+fn tree_node_summary(
+    target: &TreeTarget,
+    node: TopologyNodeRef<'_>,
+    layout: WatchLayout,
+) -> String {
+    if let Some(window) = target_window(target, node) {
+        return window_node_summary(window, layout);
+    }
     match node {
         TopologyNodeRef::Session(session) => {
             let agents = session.states.total();
@@ -14642,9 +14720,9 @@ fn render_topology_table(
                     TopologyTableColumn::Node => {
                         Cell::from(tree_node_label(target, node, endpoint_count > 1, theme))
                     }
-                    TopologyTableColumn::Age => Cell::from(tree_node_age(app, node, now)),
+                    TopologyTableColumn::Age => Cell::from(tree_node_age(app, target, node, now)),
                     TopologyTableColumn::Summary => Cell::from(truncate_chars(
-                        &tree_node_summary(node, app.watch_cfg.layout),
+                        &tree_node_summary(target, node, app.watch_cfg.layout),
                         120,
                     )),
                 })
@@ -16320,7 +16398,7 @@ mod tests {
         for (view, expected_depths) in [
             (WatchView::Session, vec![0]),
             (WatchView::Window, vec![0, 1]),
-            (WatchView::Pane, vec![0, 1, 2, 2]),
+            (WatchView::Pane, vec![0, 1, 1]),
         ] {
             let app = topology_watch(view, agents.clone(), panes.clone());
             assert_eq!(
@@ -16570,7 +16648,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_focus_reveals_panes_only_after_window_focus() {
+    fn pane_focus_skips_a_single_window_and_descends_directly_to_its_pane() {
         let panes = vec![fake_topology_pane(
             "default", "$1", "alpha", "@1", "AUTH", 0, "%1", 0,
         )];
@@ -16597,15 +16675,74 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
+        assert!(app.tree_targets()[0].compacted_window.is_some());
+        assert!(matches!(
+            app.tree_targets()[1].key,
+            TopologyNodeKey::Pane(_)
+        ));
 
         app.move_into_work();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Pane(pane)) if pane.key.pane_id == "%1"
+        ));
+        app.move_to_work_parent();
+        assert!(matches!(
+            app.selected_node(),
+            Some(TopologyNodeRef::Session(session)) if session.name == "alpha"
+        ));
+    }
+
+    #[test]
+    fn pane_filter_restores_the_full_single_window_ancestry() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
         assert_eq!(
             app.tree_targets()
                 .iter()
                 .map(|target| target.depth)
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2]
+            vec![0, 1, 1]
         );
+
+        app.search_query = "auth".into();
+        let filtered = app.tree_targets();
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|target| target.depth)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 2]
+        );
+        assert!(filtered
+            .iter()
+            .all(|target| target.compacted_window.is_none()));
+    }
+
+    #[test]
+    fn compacted_row_keeps_session_actions_and_exact_window_identity() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let session_key = app.topology.sessions[0].node_key();
+        let window_key = app.topology.sessions[0].windows[0].key.clone();
+        let compacted = &app.tree_targets()[0];
+        assert_eq!(compacted.key, session_key);
+        assert_eq!(compacted.compacted_window.as_ref(), Some(&window_key));
+
+        app.table_state.select(Some(0));
+        assert!(matches!(
+            quick_kill_action(&app),
+            Action::AskConfirm(ConfirmPopup {
+                on_confirm: ConfirmAction::Quick(QuickAction::TerminateNode(ref key)),
+                ..
+            }) if key == &session_key
+        ));
+
+        app.apply_view(WatchView::Window);
+        assert!(app
+            .tree_targets()
+            .iter()
+            .any(|target| target.key == TopologyNodeKey::Window(window_key.clone())));
     }
 
     #[test]
@@ -16623,7 +16760,7 @@ mod tests {
         )];
         let app = topology_watch(WatchView::Pane, agents, panes);
         let targets = app.tree_targets();
-        assert_eq!(targets.len(), 3);
+        assert_eq!(targets.len(), 2);
 
         let redundant = targets
             .iter()
@@ -16632,7 +16769,7 @@ mod tests {
                 tree_state_is_redundant(target, node)
             })
             .collect::<Vec<_>>();
-        assert_eq!(redundant, vec![true, true, false]);
+        assert_eq!(redundant, vec![true, false]);
 
         let theme = watch_theme(WatchTheme::default());
         let state_cells = targets
@@ -16643,8 +16780,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(state_cells[0].lines.is_empty());
-        assert!(state_cells[1].lines.is_empty());
-        assert!(!state_cells[2].lines.is_empty());
+        assert!(!state_cells[1].lines.is_empty());
     }
 
     #[test]
@@ -16666,11 +16802,10 @@ mod tests {
         let pane_app = topology_watch(WatchView::Pane, agents, panes);
         let targets = pane_app.tree_targets();
         let session = pane_app.topology.find(&targets[0].key).unwrap();
-        let window = pane_app.topology.find(&targets[1].key).unwrap();
-        // The expanded session merely repeats its only window, while the
-        // two-pane window is a meaningful aggregation boundary.
-        assert!(tree_state_is_redundant(&targets[0], session));
-        assert!(!tree_state_is_redundant(&targets[1], window));
+        // The session and its only window are one visual row. Its two pane
+        // children form a real branch, so the compacted parent keeps the
+        // aggregate marker.
+        assert!(!tree_state_is_redundant(&targets[0], session));
     }
 
     #[test]
@@ -16950,7 +17085,6 @@ mod tests {
             labels,
             vec![
                 "s:alpha",
-                "w:only",
                 "p:%1",
                 "s:zeta",
                 "w:a-window",
@@ -17190,7 +17324,7 @@ mod tests {
         agents[0].context_used_pct = Some(82.0);
         agents[0].cost_usd = Some(1.25);
         agents[1].cost_usd = Some(0.50);
-        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let mut app = topology_watch(WatchView::Window, agents, panes);
         app.watch_cfg.spinner = false;
         app.inspector_split = InspectorSplit::InspectorWide;
         let window_key = app.topology.sessions[0].windows[0].node_key();
@@ -17257,7 +17391,7 @@ mod tests {
     #[test]
     fn window_inspector_renders_live_capture_in_real_pane_layout() {
         let (agents, panes) = basic_topology_fixture();
-        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let mut app = topology_watch(WatchView::Window, agents, panes);
         app.watch_cfg.spinner = false;
         app.inspector_split = InspectorSplit::InspectorWide;
         let window_key = app.topology.sessions[0].windows[0].key.clone();
@@ -17321,7 +17455,7 @@ mod tests {
     #[test]
     fn compact_window_inspector_drops_secondary_columns_first() {
         let (agents, panes) = basic_topology_fixture();
-        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let mut app = topology_watch(WatchView::Window, agents, panes);
         app.watch_cfg.spinner = false;
         let window_key = app.topology.sessions[0].windows[0].key.clone();
         select_tree_key(&mut app, &TopologyNodeKey::Window(window_key.clone()));
@@ -17373,7 +17507,7 @@ mod tests {
             topology_agent("loading", "%1", "default", AgentState::Starting, "boot", 1),
             topology_agent("idle", "%2", "default", AgentState::Idle, "ready", 2),
         ];
-        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let mut app = topology_watch(WatchView::Window, agents, panes);
         app.watch_cfg.spinner = false;
         app.inspector_split = InspectorSplit::InspectorWide;
         let window_key = app.topology.sessions[0].windows[0].node_key();
@@ -17468,7 +17602,7 @@ mod tests {
     #[test]
     fn spawn_composer_only_edits_a_window_name_for_session_targets() {
         let (agents, panes) = basic_topology_fixture();
-        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let mut app = topology_watch(WatchView::Window, agents, panes);
 
         app.table_state.select(Some(0));
         assert!(matches!(key_action(&mut app, 'n'), Action::None));
@@ -18397,7 +18531,7 @@ mod tests {
     #[test]
     fn session_and_window_message_target_the_lowest_index_live_agent() {
         let (agents, panes) = basic_topology_fixture();
-        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let mut app = topology_watch(WatchView::Window, agents, panes);
         app.collaboration_scope = muxa::config::CollaborationScope::Host;
         app.collaboration.origin = Some(CollaborationOrigin {
             pane: "console".into(),
@@ -18428,7 +18562,7 @@ mod tests {
     #[test]
     fn window_scope_parent_message_uses_the_same_stable_primary_peer() {
         let (agents, panes) = basic_topology_fixture();
-        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let mut app = topology_watch(WatchView::Window, agents, panes);
         let first = fake_collaboration_participant("%1", "agent-1", None);
         let second = fake_collaboration_participant("%2", "agent-2", None);
         app.collaboration.origin = Some(CollaborationOrigin {

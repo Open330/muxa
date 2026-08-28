@@ -38,10 +38,17 @@ visible even when the automatic `view` depth is `"session"` or `"window"`. Set
 `l`/Right; those two policies retain visible-row traversal. The default is
 `"focus"`.
 
-Session, window, and pane rows remain independently selectable. The tree also
-avoids repeating an identical state marker down a single-child chain: an
-expanded parent with one child leaves its state cell empty and the deepest
-visible row carries the state. Collapsed parents and nodes with multiple
+In pane view, an unfiltered session with exactly one real window is rendered as
+one `session › window` row, with the panes directly underneath it. The compacted
+row keeps session selection semantics (`n`, rename, and close still target the
+session), and switching to window view exposes the exact window row for
+window-level actions. Sessions with multiple windows keep the complete
+hierarchy. Filtering also restores the complete ancestry, so one matching
+window is not confused with a genuinely single-window session.
+
+The tree also avoids repeating an identical state marker down a single-child
+chain: an expanded parent with one child leaves its state cell empty and the
+deepest visible row carries the state. Collapsed parents and nodes with multiple
 children keep their aggregate state markers.
 
 ## Common Keys
