@@ -35,7 +35,7 @@ screen-manifest match ───┘
        detection task)                       +--> state.json
                                              +--> prompts.ndjson
                                              +--> activity.ndjson
-                                             +--> collaboration.json
+                                             +--> collaboration.sqlite3
                                              +--> notifications / sinks
                                              +--> dashboard SSE
 ```
@@ -80,7 +80,7 @@ hook claims the pane.
 | `prompts.ndjson` | Retained prompt audit log. |
 | `activity.ndjson` | Append-only duration ledger. |
 | `session-activity.json` | Legacy/compat tmux foreground totals. |
-| `collaboration.json` | Durable same-window mailbox plus exact-session aliases and roles. |
+| `collaboration.sqlite3` | Indexed durable mailbox, thread/Work metadata, and exact-session aliases/roles. An existing `collaboration.json` is imported once and retained as a migration backup. |
 | `dashboard-work.json` | Schema-v2 Work definitions and external issue references keyed by logical Work identity. |
 | `host-id` | Owner-only stable physical-node UUID used by Fleet handshakes. |
 

@@ -534,6 +534,21 @@ pub struct PaneInfo {
     /// use this to disambiguate. `None` when the backend cannot name one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket: Option<String>,
+    /// Work-orchestration workspace stamped on this pane. Managed agent
+    /// metadata (`@muxa_agent_workspace_id`) takes precedence over the
+    /// enclosing pane/window metadata (`@muxa_workspace_id`), so an agent
+    /// launched for a specific work item retains its exact identity even when
+    /// it runs inside a more general workspace surface.
+    ///
+    /// Additive on the wire: older pane snapshots omit it entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// Work item paired with [`Self::workspace_id`]. Agent-specific
+    /// `@muxa_agent_work_id` takes precedence over `@muxa_work_id`.
+    /// Consumers should require both fields before constructing a work
+    /// identity; either can be absent on unmanaged or partially stamped panes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<String>,
     /// `@muxa_agent_role` — the role a muxa-managed launch stamped on this
     /// pane (`implementer`, `reviewer`, ...). Declared by the launcher, not
     /// self-registered by the agent, so it survives the window before the
@@ -640,6 +655,10 @@ fn non_empty(col: Option<&&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn first_non_empty(primary: Option<&&str>, fallback: Option<&&str>) -> Option<String> {
+    non_empty(primary).or_else(|| non_empty(fallback))
+}
+
 pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) -> Vec<PaneInfo> {
     let mut panes = Vec::new();
     for line in stdout.lines() {
@@ -662,6 +681,8 @@ pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) ->
             pane_pid,
             current_path: cols.get(8).map(|s| (*s).to_string()).unwrap_or_default(),
             socket: socket.map(Into::into),
+            workspace_id: first_non_empty(cols.get(22), cols.get(12)),
+            work_id: first_non_empty(cols.get(23), cols.get(15)),
             agent_role: non_empty(cols.get(19)),
             agent_alias: non_empty(cols.get(31)),
             session_group: non_empty(cols.get(32)),
@@ -1416,6 +1437,8 @@ mod tests {
         assert_eq!(pane.pane_id, "%1");
         assert_eq!(pane.agent_role, None);
         assert_eq!(pane.agent_alias, None);
+        assert_eq!(pane.workspace_id, None);
+        assert_eq!(pane.work_id, None);
     }
 
     /// And the reverse: an unaliased pane must not grow the payload it sends
@@ -1439,10 +1462,44 @@ mod tests {
             pane_pid: 0,
             current_path: String::new(),
             socket: None,
+            workspace_id: None,
+            work_id: None,
         };
         let json = serde_json::to_string(&pane).expect("serialize");
         assert!(!json.contains("agent_role"), "{json}");
         assert!(!json.contains("agent_alias"), "{json}");
+        assert!(!json.contains("workspace_id"), "{json}");
+        assert!(!json.contains("work_id"), "{json}");
+    }
+
+    #[test]
+    fn parses_agent_work_identity_before_surface_fallback() {
+        let mut cols = vec!["%10", "main", "0", "0", "/dev/pts/0", "codex", "title"];
+        cols.resize(12, "");
+        cols.push("surface-workspace"); // 12: @muxa_workspace_id
+        cols.resize(15, "");
+        cols.push("surface-work"); // 15: @muxa_work_id
+        cols.resize(22, "");
+        cols.push("agent-workspace"); // 22: @muxa_agent_workspace_id
+        cols.push("agent-work"); // 23: @muxa_agent_work_id
+
+        let panes = parse_pane_lines(&format!("{}\n", cols.join("\t")));
+        assert_eq!(panes[0].workspace_id.as_deref(), Some("agent-workspace"));
+        assert_eq!(panes[0].work_id.as_deref(), Some("agent-work"));
+    }
+
+    #[test]
+    fn parses_surface_work_identity_when_agent_stamp_is_unset() {
+        let mut cols = vec!["%10", "main", "0", "0", "/dev/pts/0", "codex", "title"];
+        cols.resize(12, "");
+        cols.push("workspace"); // 12: @muxa_workspace_id
+        cols.resize(15, "");
+        cols.push("CAL-7345"); // 15: @muxa_work_id
+        cols.resize(24, "");
+
+        let panes = parse_pane_lines(&format!("{}\n", cols.join("\t")));
+        assert_eq!(panes[0].workspace_id.as_deref(), Some("workspace"));
+        assert_eq!(panes[0].work_id.as_deref(), Some("CAL-7345"));
     }
 
     #[test]

@@ -47,8 +47,9 @@ window였던 것처럼 보이지 않도록 전체 session → window → pane an
 | `R` / `:rename` | 선택한 tmux session/window 이름 또는 pane title 변경. |
 | `\|` | list/inspector 분할 순환: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | 설정한 agent에게 headless 질의 / 답변 이력 보기. |
-| `m` / `M` | 선택한 agent에게 request 보내기 / incoming·sent mailbox 열기. |
+| `m` / `M` | resolve된 agent에게 request 보내기 / 선택 topology scope 이력 열기. |
 | `b` | `M`의 이전 alias. mailbox 안에서 `i`는 claim, `e`는 reply. |
+| `v` | collaboration 화면에서 table / 시간순 sequence 전환. |
 | `o` / `Alt-P` | live preview 열기. |
 | `:` | 명령 팔레트 열기. `Tab`은 첫 번째 일치 명령 완성. |
 | `r` / `Ctrl-R` / `Alt-R` | 탐색 중 refresh. |
@@ -128,8 +129,9 @@ inbox를 열면 확인 처리됩니다.
 탐색 중 `:`를 누르면 명령 팔레트가 열립니다. 명령을 입력하고 `Enter`로 실행하며,
 `Tab`은 첫 번째 일치 항목을 완성하고 `Esc`는 취소합니다. `refresh`, `preview`,
 `copy`, `attention`, `events`, `inspector`, `sort latest|duration|session|state`,
-`view pane|session|swarm`, `layout tree|swarm|work`, `screen topology|collab`,
-`help`, `quit`를 지원합니다. `kill`과 `abort`는 기존과
+`view pane|session|swarm`, `layout tree|swarm|work`, `layout table|sequence`,
+`screen topology|collab`, `help`, `quit`를 지원합니다. table/sequence 명령은
+collaboration 화면만 바꾸고 topology layout은 그대로 둡니다. `kill`과 `abort`는 기존과
 동일하게 확인 popup을 거칩니다. `view` 변경은 cached snapshot에 즉시 반영되며
 현재 watch process의 이후 refresh에도 유지됩니다.
 
@@ -169,6 +171,12 @@ pane으로 이동합니다 — request는 pane보다 오래 남으므로 상대 
 양쪽 끝과 각자의 room, 어떤 kind·전달 모드로 보냈는지, 본문 전문, 그리고 답장이
 왔다면 답장까지. 이 pane은 7행을 쓰므로 16행보다 짧은 터미널에서는 목록을 지키고
 본문은 `M`에 맡깁니다.
+
+기본 `table`은 최신순입니다. `v`, `:layout sequence`,
+`--collab-layout sequence`, `[watch] collab_layout = "sequence"`를 사용하면 같은
+필터 결과를 시간순 participant lifeline으로 그립니다. request는 발신자에서 수신자로,
+reply는 점선 역방향 화살표로 표시됩니다. 표현 방식만 바뀌며 필터·선택·attach와
+durable history는 table과 같습니다.
 
 자기 mailbox 너머를 보는 것은 operator console 작업이라, 이 화면은 CLI와 같은
 트리에서 빌드된 daemon을 요구합니다. 구버전 daemon은 caller 범위 결과로 조용히
@@ -232,9 +240,11 @@ watch가 자동으로 선택합니다. composer에서 `Tab`은 request kind를 �
 적용됩니다.
 
 console에는 자기 pane이 없으므로 응답은 발신자에게 되돌아오지 않고 **수신 agent의
-mailbox**에 request와 함께 남습니다. `M`은 커서가 놓인 agent의 mailbox를 보여주며
-`incoming`은 그 agent의 것, `sent`는 console이 모든 대상에게 보낸 기록입니다.
-claim(`i`)과 응답(`e`)은 수신자의 행위이므로 선택한 agent를 대행해 동작합니다.
+mailbox**에 request와 함께 남습니다. `M`은 커서의 topology level을 따릅니다. pane이면
+`incoming`은 그 agent의 것, `sent`는 console이 모든 대상에게 보낸 기록이며
+claim(`i`)·응답(`e`)·새 메시지(`m`)도 그 agent를 대행합니다. window이면 room 전체를,
+session이면 모든 room을 window별로 묶어 보여줍니다. window/session 이력은 read-only라
+claim·reply·새 메시지는 pane을 선택한 뒤 사용할 수 있습니다.
 
 `[collaboration].scope = "host"`이면 선택한 session, window, pane이 watch를 연
 window의 유일한 peer보다 우선합니다. `l`로 하위 pane까지 내려가지 않아도 parent
@@ -260,9 +270,10 @@ tracked agent를, session은 window index와 pane index가 낮은 순서의 agen
 계약입니다. watch는 별도 path scope 입력을 제공하지 않으므로 execute 요청에는
 메시지 본문에 수정 범위를 함께 적는 것이 좋습니다.
 
-`M`은 incoming/sent mailbox를 엽니다(`b`도 alias로 유지됩니다). mailbox 안에서
-`m`은 새 메시지를 작성하고 `M`은 mailbox를 닫습니다. `Tab`으로 mailbox를 전환하고
-`j`/`k`로 request를 선택하며 `i`로 incoming 작업을 claim하고 `e`로 응답합니다.
+`M`은 이력을 엽니다(`b`도 alias로 유지됩니다). pane mailbox에서는 `m`으로 새
+메시지를 작성하고 `M`으로 닫습니다. `Tab`으로 mailbox를 전환하고 `j`/`k`로 요청을
+선택하며 `i`로 pending 요청을 claim하고 `e`로 응답합니다. window/session aggregate는
+하나의 결합 stream이므로 `Tab`, `m`, `i`, `e`가 비활성화됩니다.
 console이 발신자이므로 일반 shell pane에서 watch를 열어도 협업이 그대로
 동작합니다.
 

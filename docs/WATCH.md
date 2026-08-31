@@ -68,8 +68,9 @@ children keep their aggregate state markers.
 | `R` / `:rename` | Rename the selected tmux session or window, or set the selected pane title. |
 | `\|` | Cycle the list/inspector split: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | Ask the configured agent a headless question / browse the answers. |
-| `m` / `M` | Message the selected agent / open incoming/sent mailbox. |
+| `m` / `M` | Message the resolved agent / open history for the selected topology scope. |
 | `b` | Legacy alias for `M`; `i` claims and `e` replies inside the mailbox. |
+| `v` | On the collaboration screen, toggle table / chronological sequence. |
 | `o` / `Alt-P` | Open live preview. |
 | `:` | Open the command palette; `Tab` completes the first match. |
 | `r` / `Ctrl-R` / `Alt-R` | Refresh while browsing. |
@@ -176,7 +177,10 @@ Press `:` while browsing to open the command palette. Type a command and press
 `Enter`; `Tab` completes the first visible match and `Esc` cancels. Available
 commands include `refresh`, `preview`, `copy`, `attention`, `events`,
 `inspector`, `sort latest|duration|session|state`, `view pane|session|swarm`,
-`layout tree|swarm|work`, `screen topology|collab`, `help`, and `quit`. `kill` and `abort` still open the normal confirmation popup.
+`layout tree|swarm|work`, `layout table|sequence`,
+`screen topology|collab`, `help`, and `quit`. The table/sequence commands only
+change the collaboration screen; topology keeps its own layout. `kill` and
+`abort` still open the normal confirmation popup.
 Runtime `view` changes use the cached snapshot immediately and remain active
 for subsequent refreshes in the current watch process.
 
@@ -219,6 +223,13 @@ pane under the table: both ends with their rooms, the kind and delivery mode it
 was sent under, the body in full, and the reply when one has come back. The
 pane costs seven rows, so terminals shorter than sixteen rows keep the listing
 instead and leave the body to `M`.
+
+The default `table` layout is newest-first. Press `v`, run `:layout sequence`,
+start with `--collab-layout sequence`, or set
+`[watch] collab_layout = "sequence"` to draw the same filtered history as
+chronological participant lifelines. Requests point from sender to recipient;
+replies return on a dashed reverse arrow. This is a presentation change only:
+filtering, selection, attach, and durable history are shared with the table.
 
 Widening past your own mailbox is an operator-console operation, so the screen
 needs a daemon built from the same tree as the CLI; an older one is reported
@@ -289,10 +300,13 @@ unchanged when a skill is inserted and are applied only when the expanded text
 is explicitly sent with the second `Enter`.
 
 A console has no pane of its own, so replies are not routed back to it: they
-stay on the request in the recipient's mailbox. `M` shows the mailbox of the
-agent under the cursor — `incoming` is that agent's, `sent` is the console's
-dispatch log across every target — and `i` (claim) and `e` (reply) act as that
-agent, because both are the recipient's move.
+stay on the request in the recipient's mailbox. `M` follows the topology level
+under the cursor. On a pane, `incoming` is that agent's mailbox and `sent` is
+the console's dispatch log across every target; `i` (claim), `e` (reply), and
+`m` remain available because watch can act as that recipient. On a window,
+`M` combines the whole room. On a session, it combines all of its rooms and
+groups the rows by window. Window/session history is deliberately read-only:
+select a pane before claiming, replying, or composing a new request.
 
 With `[collaboration].scope = "host"`, the selected session, window, or pane
 takes precedence over the launch window's only peer. Parent nodes are directly
@@ -320,11 +334,12 @@ file changes. This is a contract delivered to the receiving agent, not a
 command that muxa executes immediately. Watch has no separate path-scope
 field, so include the intended edit scope in an execute request's body.
 
-Press `M` for incoming/sent history (`b` remains an alias). In the mailbox,
-`m` opens a new message and `M` closes the mailbox. `Tab` switches mailbox,
-`j`/`k` selects a request, `i` claims pending incoming work, and `e` replies.
-If watch was opened from a normal shell, observation still works and the UI
-explains that collaboration requires opening `prefix+s` from an agent pane.
+Press `M` for history (`b` remains an alias). In a pane mailbox, `m` opens a
+new message and `M` closes the mailbox. `Tab` switches mailbox, `j`/`k`
+selects a request, `i` claims pending incoming work, and `e` replies. Aggregate
+window/session history has one combined stream, so `Tab`, `m`, `i`, and `e`
+are disabled there. A watch opened from a normal shell still collaborates as
+the operator console; it never borrows an agent identity from the launch pane.
 
 Requests with AIR artifact references carry profile-colored mailbox badges:
 blue `AIR WORKFLOW`, magenta `AIR PLAN`, cyan `AIR TRACE`, and light-cyan

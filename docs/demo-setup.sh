@@ -504,8 +504,8 @@ hook "$P_OPS" gemini after_agent '{"session_id":"s-c"}'
 # ---------------------------------------------------------------------------
 # 5) Collaboration mailbox
 # ---------------------------------------------------------------------------
-# Sent through the real `muxa msg` path rather than written into
-# collaboration.json, so the recording exercises the same code an agent
+# Sent through the real `muxa msg` path rather than written into the
+# collaboration store, so the recording exercises the same code an agent
 # would. `$PA` is the pane the recording runs `muxa watch` from, and the
 # mailbox is scoped to its origin pane — so these have to point at it.
 

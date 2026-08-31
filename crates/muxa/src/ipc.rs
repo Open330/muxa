@@ -1477,6 +1477,39 @@ impl CollaborationTopology {
         collaboration::resolve_origin(origin, &self.participants, &self.panes)
     }
 
+    /// Fill execution context that older/minimal collaboration clients do not
+    /// know how to send. Work identity comes from the exact pane inventory row
+    /// for the represented endpoint; the run id is a snapshot of that
+    /// endpoint's room rather than a durable Work identity.
+    fn stamp_request_metadata(
+        &self,
+        anchor: &collaboration::Participant,
+        request: &mut NewRequest,
+    ) {
+        if request.workspace_id.is_none() || request.work_id.is_none() {
+            if let Some(pane) = self
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == anchor.pane && pane.socket == anchor.socket)
+            {
+                if request.workspace_id.is_none() {
+                    request.workspace_id.clone_from(&pane.workspace_id);
+                }
+                if request.work_id.is_none() {
+                    request.work_id.clone_from(&pane.work_id);
+                }
+            }
+        }
+        if request.run_id.is_none() {
+            request.run_id = Some(format!(
+                "{}:{}:{}",
+                anchor.room.host,
+                anchor.room.socket.as_deref().unwrap_or("default"),
+                anchor.room.window_id
+            ));
+        }
+    }
+
     /// Resolve a send target, falling back to an explicit pane that muxa
     /// launched but whose agent has not registered a session yet.
     ///
@@ -2397,7 +2430,7 @@ async fn handle(
                 RequestBody::CollaborationSend {
                     origin,
                     target,
-                    request,
+                    mut request,
                 } => {
                     kind = "collaboration_send";
                     collaboration_actor.observe_pane(&backends).await;
@@ -2416,6 +2449,11 @@ async fn handle(
                     });
                     let response = match result {
                         Ok((sender, recipient)) => {
+                            // A console represents the operator, so stamp the
+                            // pane it dispatches to. Agent-originated sends are
+                            // stamped from the sending execution surface.
+                            let anchor = if origin.console { &recipient } else { &sender };
+                            topology.stamp_request_metadata(anchor, &mut request);
                             let provenance = collaboration_actor.provenance(&origin);
                             match collaboration
                                 .create_with_provenance(
@@ -4214,6 +4252,8 @@ mod tests {
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: Some("callabo".into()),
+            work_id: Some("CAL-7345".into()),
             pane_id: pane_id.into(),
             session_id: "$1".into(),
             session: "collaboration".into(),
@@ -4436,7 +4476,14 @@ mod tests {
                             body: body.into(),
                             expects_reply: true,
                             work_mode: collaboration::WorkMode::ReadOnly,
+                            thread_id: None,
+                            parent_request_id: None,
+                            workspace_id: None,
+                            work_id: None,
+                            run_id: None,
                             paths: Vec::new(),
+                            artifacts: Vec::new(),
+                            links: Vec::new(),
                             air_artifacts: Vec::new(),
                         },
                     )
@@ -4490,6 +4537,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one IPC lifecycle verifies send, reply, read, and cancellation state
     async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("muxa-collaboration.sock");
@@ -4567,7 +4615,14 @@ mod tests {
                     body: "ambiguous".into(),
                     expects_reply: true,
                     work_mode: collaboration::WorkMode::ReadOnly,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: None,
+                    work_id: None,
+                    run_id: None,
                     paths: Vec::new(),
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
             )
@@ -4583,12 +4638,22 @@ mod tests {
                     body: "review this".into(),
                     expects_reply: true,
                     work_mode: collaboration::WorkMode::ReadOnly,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: None,
+                    work_id: None,
+                    run_id: None,
                     paths: vec!["src/**".into()],
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
             )
             .await
             .unwrap();
+        assert_eq!(request.workspace_id.as_deref(), Some("callabo"));
+        assert_eq!(request.work_id.as_deref(), Some("CAL-7345"));
+        assert_eq!(request.run_id.as_deref(), Some("tmux:default:@1"));
         let provenance = request.provenance.as_ref().unwrap();
         assert_eq!(provenance.client_kind, CollaborationClientKind::Watch);
         assert_eq!(provenance.caller_pid, Some(std::process::id()));
@@ -4661,12 +4726,22 @@ mod tests {
                     body: "obsolete question".into(),
                     expects_reply: true,
                     work_mode: collaboration::WorkMode::ReadOnly,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: Some("explicit-workspace".into()),
+                    work_id: Some("explicit-work".into()),
+                    run_id: Some("explicit-run".into()),
                     paths: Vec::new(),
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
             )
             .await
             .unwrap();
+        assert_eq!(queued.workspace_id.as_deref(), Some("explicit-workspace"));
+        assert_eq!(queued.work_id.as_deref(), Some("explicit-work"));
+        assert_eq!(queued.run_id.as_deref(), Some("explicit-run"));
         assert_eq!(
             client
                 .collaboration_cancel(&sender, &queued.id)
@@ -4697,12 +4772,22 @@ mod tests {
                     body: "dispatch to launch pane".into(),
                     expects_reply: true,
                     work_mode: collaboration::WorkMode::ReadOnly,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: None,
+                    work_id: None,
+                    run_id: None,
                     paths: Vec::new(),
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
             )
             .await
             .unwrap();
+        assert_eq!(console_request.workspace_id.as_deref(), Some("callabo"));
+        assert_eq!(console_request.work_id.as_deref(), Some("CAL-7345"));
+        assert_eq!(console_request.run_id.as_deref(), Some("tmux:default:@1"));
 
         let audit_entries = audit.entries().await;
         assert!(audit_entries.iter().any(|entry| {
@@ -5620,6 +5705,8 @@ mod tests {
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: None,
+            work_id: None,
             socket: None,
             pane_id: "zellij:3".into(),
             session_id: String::new(),

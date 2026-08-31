@@ -328,6 +328,7 @@ async fn main() -> Result<()> {
         // route to the correct host during mixed-host migrations.
         let backends_for_dash = backends.clone();
         let dashboard_runtime = muxa::dashboard::DashboardRuntimeConfig {
+            collaboration: Some(collaboration.clone()),
             message_skills: cfg.message.skills.clone(),
             activity_path: dashboard_activity_path,
             session_activity_path: dashboard_session_activity_path,
@@ -557,6 +558,7 @@ async fn build_collaboration(cfg: &Config) -> Arc<CollaborationStore> {
             })
             .flatten(),
         max_message_bytes: cfg.collaboration.max_message_bytes,
+        retention_days: cfg.collaboration.retention_days,
     };
     match CollaborationStore::load(options.clone()).await {
         Ok(store) => {
@@ -2360,6 +2362,8 @@ mod tests {
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: None,
+            work_id: None,
             pane_id: pane_id.into(),
             session_id: "$1".into(),
             session: "collaboration".into(),
@@ -2437,7 +2441,14 @@ mod tests {
                     body: "wake from revision".into(),
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: None,
+                    work_id: None,
+                    run_id: None,
                     paths: Vec::new(),
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
             )
@@ -2507,6 +2518,7 @@ mod tests {
     /// reads idle. Without this the sender would wait for a registration that
     /// codex cannot produce until something types at it.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // end-to-end wake setup is intentionally kept in one scenario
     async fn collaboration_waker_delivers_to_a_launched_pane_before_it_registers() {
         let store = muxa::Store::shared();
         add_agent(&store, "%1", "sender", AgentKind::ClaudeCode).await;
@@ -2571,7 +2583,14 @@ mod tests {
                     body: "review the pending diff".into(),
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: None,
+                    work_id: None,
+                    run_id: None,
                     paths: Vec::new(),
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
             )
@@ -2613,6 +2632,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // end-to-end wake setup is intentionally kept in one scenario
     async fn full_wake_claims_and_injects_the_structured_request_body() {
         let store = muxa::Store::shared();
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
@@ -2639,7 +2659,14 @@ mod tests {
                     body: "change only the authorized file".into(),
                     expects_reply: true,
                     work_mode: WorkMode::Execute,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: None,
+                    work_id: None,
+                    run_id: None,
                     paths: vec!["src/auth.rs".into()],
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
             )
@@ -2684,7 +2711,14 @@ mod tests {
                     body: "unsafe\u{1b}[201~\rsubmit".into(),
                     expects_reply: true,
                     work_mode: WorkMode::Execute,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: None,
+                    work_id: None,
+                    run_id: None,
                     paths: Vec::new(),
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
             )
@@ -2737,7 +2771,14 @@ mod tests {
                     body: "operator request body".into(),
                     expects_reply: true,
                     work_mode: WorkMode::Execute,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: None,
+                    work_id: None,
+                    run_id: None,
                     paths: Vec::new(),
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
                 Some(CollaborationProvenance {
@@ -2811,7 +2852,14 @@ mod tests {
                     body: "agent delegated body".into(),
                     expects_reply: true,
                     work_mode: WorkMode::Execute,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: None,
+                    work_id: None,
+                    run_id: None,
                     paths: Vec::new(),
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
             )
@@ -2873,7 +2921,14 @@ mod tests {
                         body: body.into(),
                         expects_reply: true,
                         work_mode: WorkMode::Execute,
+                        thread_id: None,
+                        parent_request_id: None,
+                        workspace_id: None,
+                        work_id: None,
+                        run_id: None,
                         paths: Vec::new(),
+                        artifacts: Vec::new(),
+                        links: Vec::new(),
                         air_artifacts: Vec::new(),
                     },
                 )
@@ -2952,7 +3007,14 @@ mod tests {
                     body: "do not inject this twice".into(),
                     expects_reply: true,
                     work_mode: WorkMode::Execute,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: None,
+                    work_id: None,
+                    run_id: None,
                     paths: Vec::new(),
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
             )
@@ -2994,7 +3056,14 @@ mod tests {
                     body: "the prompt text is already buffered".into(),
                     expects_reply: true,
                     work_mode: WorkMode::Execute,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: None,
+                    work_id: None,
+                    run_id: None,
                     paths: Vec::new(),
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
             )
@@ -3017,6 +3086,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // end-to-end wake setup is intentionally kept in one scenario
     async fn terminal_reply_wakes_idle_sender_without_injecting_body() {
         let store = muxa::Store::shared();
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
@@ -3044,7 +3114,14 @@ mod tests {
                     body: "secret request body".into(),
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: None,
+                    work_id: None,
+                    run_id: None,
                     paths: Vec::new(),
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
                 Some(CollaborationProvenance {
@@ -3154,7 +3231,14 @@ mod tests {
                     body: "dispatched by a human".into(),
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
+                    thread_id: None,
+                    parent_request_id: None,
+                    workspace_id: None,
+                    work_id: None,
+                    run_id: None,
                     paths: Vec::new(),
+                    artifacts: Vec::new(),
+                    links: Vec::new(),
                     air_artifacts: Vec::new(),
                 },
             )

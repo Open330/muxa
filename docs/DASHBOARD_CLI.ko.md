@@ -114,6 +114,10 @@ mailbox를 바꾸고 화살표로 request를 선택합니다. `i`는 pending inc
 발신 request의 취소 확인창을 엽니다. reply composer의 `Tab`은 `completed`,
 `blocked`, `declined`, `failed`를 전환합니다.
 
+이 TUI mailbox는 계속 선택 agent 범위입니다. window/session 전체를 read-only로
+보려면 `muxa watch`의 해당 topology 행에서 `M`을 누르고, room을 넘나드는 node-edge
+graph와 시간순 sequence를 탐색하려면 Web dashboard의 collaboration panel을 사용하세요.
+
 window에 agent가 하나도 없다면 같은 window의 새 pane에서 하나 실행합니다 —
 `muxa watch`와 달리 dashboard의 사정권은 여전히 room이라
 `[collaboration].scope = "host"`를 따라 다른 window로 넘어가지 않습니다. 협업

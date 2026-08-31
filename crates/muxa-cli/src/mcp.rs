@@ -60,6 +60,9 @@ const DEFAULT_SPAWN_GRACE_SECS: u64 = 10;
 /// Hard ceiling on `muxa_wait_for_change` so a caller can't pin the stdio
 /// loop forever on a typo'd huge timeout.
 const MAX_WAIT_SECS: u64 = 600;
+/// Fleet commands have their own short IPC/relay deadlines, so remote reply
+/// waits poll exact durable request state instead of pinning one relay frame.
+const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
@@ -107,10 +110,17 @@ const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team c
     When work is already represented by a validated AIR 1 workflow, plan, or trace, \
     attach its typed air_artifacts reference for shared identity and visualization; \
     AIR Workbench remains the validator/editor and muxa never implies conformance. \
+    For causal follow-up requests, pass parent_request_id from the request being answered; \
+    muxa inherits and validates its canonical thread_id. Carry workspace_id, work_id, and \
+    run_id when the enclosing Work is known so history and graph views can group the exchange. \
     Fleet operations are a separate physical-host control plane whose always-present \
     local host needs no SSH configuration: discover hosts \
     with muxa_fleet_status, always name the host and pane explicitly for capture or \
-    prompt delivery, and remember that observe-mode hosts reject control actions.";
+    prompt delivery, and remember that observe-mode hosts reject control actions. \
+    For durable structured work on an explicitly authorized remote agent, use \
+    muxa_fleet_call_peer; if its bounded wait expires, continue with \
+    muxa_fleet_wait_reply using the returned exact pane_key. Never substitute raw \
+    prompt delivery when a structured reply is required.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -580,6 +590,58 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "muxa_fleet_call_peer",
+            "description": "Send one durable structured collaboration request to one exact agent pane on a named Fleet host and optionally wait for its reply. The host and pane are always explicit; this tool never auto-selects or spawns a remote agent. Remote hosts must be configured mode='control' and advertise collaboration reply support. Defaults to review + read_only. Set execute=true only after explicit user authorization. If the bounded wait expires, continue with muxa_fleet_wait_reply and the returned pane_key.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host": { "type": "string", "description": "Exact Fleet host alias. The remote host must be explicitly configured mode='control'." },
+                    "pane": { "type": "string", "description": "Exact or unambiguous live pane id/path, for example %12 or session/window/%12." },
+                    "intent": { "type": "string", "enum": ["review", "question", "task"], "description": "Default review." },
+                    "body": { "type": "string", "description": "Request-specific instruction. Optional when skill is supplied." },
+                    "skill": { "type": "string", "description": "Registered local Muxa message skill name, with or without leading /. Its prompt is expanded before sending." },
+                    "context": { "type": "string", "description": "Optional bounded context appended after the skill/body. Muxa never attaches transcripts or diffs implicitly." },
+                    "execute": { "type": "boolean", "description": "Default false. Requires intent=task, explicit user authorization, and a control-mode host." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope, especially for execute work." },
+                    "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true." },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." },
+                    "thread_id": { "type": "string", "description": "Stable id shared by one causal conversation. Omit for a root request; muxa assigns its request id." },
+                    "parent_request_id": { "type": "string", "description": "Exact prior request that caused this follow-up." },
+                    "workspace_id": { "type": "string", "description": "Stable workspace/project id used to group collaboration history." },
+                    "work_id": { "type": "string", "description": "Durable Work id within the workspace, used to group requests across runs." },
+                    "run_id": { "type": "string", "description": "Specific execution/run id for this request." },
+                    "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Generic artifact identifiers or locators attached to the request." },
+                    "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." },
+                    "air_artifacts": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": air_artifact_reference_schema(),
+                        "description": "Optional validated AIR artifact references carried with the request."
+                    }
+                },
+                "required": ["host", "pane"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "muxa_fleet_wait_reply",
+            "description": "Continue waiting for the structured reply to a prior muxa_fleet_call_peer request. Pass the exact host, pane_key, and request_id returned by that call. The durable remote request remains readable even if the target pane has since exited. Remote hosts must remain explicitly configured mode='control'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host": { "type": "string", "description": "Exact Fleet host alias used for the original call." },
+                    "pane_key": {
+                        "type": "object",
+                        "description": "Exact collision-free PaneKey object returned by muxa_fleet_call_peer; do not reconstruct it from a pane id."
+                    },
+                    "request_id": { "type": "string", "description": "Exact collaboration request id returned by muxa_fleet_call_peer." },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." }
+                },
+                "required": ["host", "pane_key", "request_id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "muxa_wait_for_change",
             "description": "Block until an agent changes state. Set until=settled \
                 to ignore intermediate working transitions and return only when the \
@@ -625,6 +687,13 @@ fn tool_definitions() -> Vec<Value> {
                     "spawn_if_missing": { "type": "boolean", "description": "Default false. Create a same-window bypass-permission peer only after explicit user confirmation." },
                     "spawn_agent": { "type": "string", "enum": ["claude", "codex", "gemini", "agy", "opencode"], "description": "Provider to create when spawn_if_missing=true. Defaults to the current agent's opposite provider." },
                     "spawn_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60, "description": "Grace period for the new pane to register as a collaboration peer before the request is queued against the pane itself. Default 10. Never poll the pane instead of raising this." },
+                    "thread_id": { "type": "string", "description": "Stable id shared by one causal conversation. Omit for a root request; muxa assigns its request id. When parent_request_id is set, this must match the parent's canonical thread." },
+                    "parent_request_id": { "type": "string", "description": "Exact prior request that caused this follow-up. Muxa validates the parent and inherits its canonical thread_id when thread_id is omitted." },
+                    "workspace_id": { "type": "string", "description": "Stable workspace/project id used to group collaboration history." },
+                    "work_id": { "type": "string", "description": "Durable Work id within the workspace, used to group requests across runs." },
+                    "run_id": { "type": "string", "description": "Specific execution/run id for this request." },
+                    "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Generic artifact identifiers or locators attached to the request." },
+                    "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." },
                     "air_artifacts": {
                         "type": "array",
                         "maxItems": 8,
@@ -671,6 +740,13 @@ fn tool_definitions() -> Vec<Value> {
                     "expects_reply": { "type": "boolean", "description": "Default true except notice." },
                     "work_mode": { "type": "string", "enum": ["read_only", "execute"], "description": "Default read_only." },
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope for execute work." },
+                    "thread_id": { "type": "string", "description": "Stable id shared by one causal conversation. Omit for a root request; muxa assigns its request id. When parent_request_id is set, this must match the parent's canonical thread." },
+                    "parent_request_id": { "type": "string", "description": "Exact prior request that caused this follow-up. Muxa validates the parent and inherits its canonical thread_id when thread_id is omitted." },
+                    "workspace_id": { "type": "string", "description": "Stable workspace/project id used to group collaboration history." },
+                    "work_id": { "type": "string", "description": "Durable Work id within the workspace, used to group requests across runs." },
+                    "run_id": { "type": "string", "description": "Specific execution/run id for this request." },
+                    "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Generic artifact identifiers or locators attached to the request." },
+                    "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." },
                     "air_artifacts": {
                         "type": "array",
                         "maxItems": 8,
@@ -1045,6 +1121,8 @@ async fn call_tool(
                 },
             )
         }
+        "muxa_fleet_call_peer" => Ok(fleet_call_peer(client, &args, &config.message.skills).await),
+        "muxa_fleet_wait_reply" => Ok(fleet_wait_reply(client, &args).await),
         "muxa_wait_for_change" => Ok(wait_for_change(client, &args).await),
         "muxa_collaboration_guide" => {
             let origin = match current_collaboration_origin() {
@@ -1114,13 +1192,17 @@ async fn call_tool(
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
-            let request = NewRequest {
+            let request = match new_request_from_args(
+                &args,
                 kind,
-                body: body.to_string(),
+                body.to_string(),
                 expects_reply,
                 work_mode,
                 paths,
                 air_artifacts,
+            ) {
+                Ok(request) => request,
+                Err(error) => return Ok(error_result(&error)),
             };
             Ok(
                 match client.collaboration_send(&origin, target, &request).await {
@@ -1415,6 +1497,12 @@ async fn call_peer(
         Ok(references) => references,
         Err(error) => return error_result(&error),
     };
+    let paths = string_array(args, "paths");
+    let request =
+        match new_request_from_args(args, kind, body, true, work_mode, paths, air_artifacts) {
+            Ok(request) => request,
+            Err(error) => return error_result(&error),
+        };
     let origin = match current_collaboration_origin() {
         Ok(origin) => origin,
         Err(error) => return error_result(&error),
@@ -1464,15 +1552,6 @@ async fn call_peer(
     }
 
     let selection = selection.expect("missing selection handled above");
-    let paths = string_array(args, "paths");
-    let request = NewRequest {
-        kind,
-        body,
-        expects_reply: true,
-        work_mode,
-        paths,
-        air_artifacts,
-    };
     let selector = format!("pane:{}", selection.pane);
     let sent = match client
         .collaboration_send(&origin, &selector, &request)
@@ -1489,6 +1568,11 @@ async fn call_peer(
         "expanded_skill": expanded_skill,
         "spawned": spawned,
         "request_id": sent.id,
+        "thread_id": sent.thread_id,
+        "parent_request_id": sent.parent_request_id,
+        "workspace_id": sent.workspace_id,
+        "work_id": sent.work_id,
+        "run_id": sent.run_id,
         "kind": kind,
         "work_mode": work_mode,
     });
@@ -1536,6 +1620,283 @@ async fn call_peer(
             json_result(&payload)
         }
         Err(error) => error_result(&format!("call_peer wait failed: {error}")),
+    }
+}
+
+/// Durable colleague call across a named physical Fleet host.
+///
+/// Unlike the same-window call surface, every routing dimension is explicit:
+/// no peer selection, remote pane creation, or terminal-output inference is
+/// performed here. The target host's control mode remains the daemon's
+/// authoritative authorization check on both send and reply retrieval.
+#[allow(clippy::too_many_lines)] // keep remote authorization, send, and wait correlation auditable
+async fn fleet_call_peer(
+    client: &Client,
+    args: &Value,
+    message_skills: &BTreeMap<String, String>,
+) -> Value {
+    let Some(host) = args
+        .get("host")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+    else {
+        return error_result("fleet_call_peer requires a non-empty `host` argument");
+    };
+    let Some(pane) = args
+        .get("pane")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|pane| !pane.is_empty())
+    else {
+        return error_result("fleet_call_peer requires a non-empty `pane` argument");
+    };
+    let (body, expanded_skill) = match peer_call_body(args, message_skills) {
+        Ok(body) => body,
+        Err(error) => return error_result(&error),
+    };
+    let (kind, work_mode) = match peer_call_contract(args) {
+        Ok(contract) => contract,
+        Err(error) => return error_result(error),
+    };
+    let air_artifacts = match parse_air_artifact_references(args) {
+        Ok(references) => references,
+        Err(error) => return error_result(&error),
+    };
+    let paths = string_array(args, "paths");
+    let request =
+        match new_request_from_args(args, kind, body, true, work_mode, paths, air_artifacts) {
+            Ok(request) => request,
+            Err(error) => return error_result(&error),
+        };
+
+    if let Err(error) = ensure_fleet_collaboration_ready(client, host).await {
+        return error_result(&format!("fleet_call_peer refused: {error}"));
+    }
+    let pane_key = match crate::fleet_cli::resolve_pane(client, host, pane).await {
+        Ok(target) => target,
+        Err(error) => return error_result(&format!("fleet_call_peer failed: {error}")),
+    };
+    let result = match client
+        .fleet_execute(
+            host,
+            &muxa::FleetOperation::CollaborationSend {
+                pane: pane_key.clone(),
+                request,
+            },
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return error_result(&format!("fleet_call_peer send failed: {error}")),
+    };
+    let Some(sent) = result.collaboration_request.map(|request| *request) else {
+        return error_result("fleet_call_peer send returned no collaboration request");
+    };
+    let common = json!({
+        "sent": true,
+        "host": host,
+        "pane_key": pane_key,
+        "selected_peer": sent.to,
+        "expanded_skill": expanded_skill,
+        "request_id": sent.id,
+        "thread_id": sent.thread_id,
+        "parent_request_id": sent.parent_request_id,
+        "workspace_id": sent.workspace_id,
+        "work_id": sent.work_id,
+        "run_id": sent.run_id,
+        "kind": kind,
+        "work_mode": work_mode,
+    });
+    if !args.get("wait").and_then(Value::as_bool).unwrap_or(true) {
+        let mut payload = common;
+        payload["completed"] = json!(false);
+        payload["reason"] = json!("sent_without_waiting");
+        payload["request"] = json!(sent);
+        return json_result(&payload);
+    }
+
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(300)
+        .clamp(1, MAX_WAIT_SECS);
+    match await_fleet_collaboration_reply(client, host, &pane_key, &sent.id, timeout_secs).await {
+        Ok(Some(request)) if request.status.is_terminal() => {
+            let mut payload = common;
+            payload["completed"] = json!(true);
+            payload["request"] = json!(request);
+            json_result(&payload)
+        }
+        Ok(current) => {
+            let mut payload = common;
+            payload["completed"] = json!(false);
+            payload["reason"] = json!("timeout");
+            payload["timeout_secs"] = json!(timeout_secs);
+            payload["request"] = json!(current.unwrap_or(sent));
+            payload["next_step"] = json!({
+                "tool": "muxa_fleet_wait_reply",
+                "arguments": {
+                    "host": host,
+                    "pane_key": pane_key,
+                    "request_id": payload["request_id"],
+                },
+                "message": "The request remains durable on the target host; continue by exact request id. Do not poll terminal capture."
+            });
+            json_result(&payload)
+        }
+        Err(error) => {
+            // Delivery already succeeded. Returning a tool error here would
+            // discard the only correlation handle and tempt callers to send
+            // duplicate work. Preserve the durable request and exact pane so
+            // a later wait can resume after a transient relay failure.
+            let mut payload = common;
+            payload["completed"] = json!(false);
+            payload["reason"] = json!("wait_failed");
+            payload["error"] = json!(error);
+            payload["request"] = json!(sent);
+            payload["next_step"] = json!({
+                "tool": "muxa_fleet_wait_reply",
+                "arguments": {
+                    "host": host,
+                    "pane_key": pane_key,
+                    "request_id": payload["request_id"],
+                },
+                "message": "Delivery succeeded and remains durable; retry the exact reply wait. Do not resend the request or poll terminal capture."
+            });
+            json_result(&payload)
+        }
+    }
+}
+
+async fn fleet_wait_reply(client: &Client, args: &Value) -> Value {
+    let Some(host) = args
+        .get("host")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+    else {
+        return error_result("fleet_wait_reply requires a non-empty `host` argument");
+    };
+    let Some(request_id) = args
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|request_id| !request_id.is_empty())
+    else {
+        return error_result("fleet_wait_reply requires a non-empty `request_id` argument");
+    };
+    let Some(pane_key_value) = args.get("pane_key") else {
+        return error_result(
+            "fleet_wait_reply requires the exact `pane_key` object returned by fleet_call_peer",
+        );
+    };
+    let pane_key: muxa::PaneKey = match serde_json::from_value(pane_key_value.clone()) {
+        Ok(pane_key) => pane_key,
+        Err(error) => {
+            return error_result(&format!(
+                "fleet_wait_reply `pane_key` is not a valid exact PaneKey: {error}"
+            ));
+        }
+    };
+    if let Err(error) = ensure_fleet_collaboration_ready(client, host).await {
+        return error_result(&format!("fleet_wait_reply refused: {error}"));
+    }
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(300)
+        .clamp(1, MAX_WAIT_SECS);
+    match await_fleet_collaboration_reply(client, host, &pane_key, request_id, timeout_secs).await {
+        Ok(Some(request)) if request.status.is_terminal() => json_result(&json!({
+            "completed": true,
+            "host": host,
+            "pane_key": pane_key,
+            "request": request,
+        })),
+        Ok(current) => json_result(&json!({
+            "completed": false,
+            "reason": "timeout",
+            "timeout_secs": timeout_secs,
+            "host": host,
+            "pane_key": pane_key,
+            "request_id": request_id,
+            "request": current,
+        })),
+        Err(error) => error_result(&format!("fleet_wait_reply failed: {error}")),
+    }
+}
+
+async fn ensure_fleet_collaboration_ready(
+    client: &Client,
+    host_alias: &str,
+) -> std::result::Result<(), String> {
+    let snapshot = client
+        .fleet_snapshot(None)
+        .await
+        .map_err(|error| format!("could not read Fleet status: {error}"))?;
+    let host = snapshot
+        .hosts
+        .into_iter()
+        .find(|host| host.alias == host_alias)
+        .ok_or_else(|| format!("Fleet host '{host_alias}' is not known"))?;
+    validate_fleet_collaboration_authority(host_alias, host.local, host.mode, &host.capabilities)
+}
+
+fn validate_fleet_collaboration_authority(
+    host_alias: &str,
+    local: bool,
+    mode: muxa::HostAccessMode,
+    capabilities: &[String],
+) -> std::result::Result<(), String> {
+    if !local && mode != muxa::HostAccessMode::Control {
+        return Err(format!(
+            "host '{host_alias}' is observe-only; explicitly grant mode='control' before an agent may call it"
+        ));
+    }
+    for capability in ["collaboration", "collaboration_get"] {
+        if !capabilities.iter().any(|candidate| candidate == capability) {
+            return Err(format!(
+                "host '{host_alias}' does not advertise '{capability}'; connect it and upgrade muxa on that host"
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn await_fleet_collaboration_reply(
+    client: &Client,
+    host: &str,
+    pane: &muxa::PaneKey,
+    request_id: &str,
+    timeout_secs: u64,
+) -> std::result::Result<Option<CollaborationRequest>, String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let mut current = None;
+    loop {
+        let operation = muxa::FleetOperation::CollaborationGet {
+            pane: pane.clone(),
+            request_id: request_id.to_string(),
+        };
+        let result =
+            match tokio::time::timeout_at(deadline, client.fleet_execute(host, &operation)).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => return Err(error.to_string()),
+                Err(_) => return Ok(current),
+            };
+        let request = *result
+            .collaboration_request
+            .ok_or_else(|| "Fleet collaboration get returned no request".to_string())?;
+        let terminal = request.status.is_terminal();
+        current = Some(request);
+        if terminal || tokio::time::Instant::now() >= deadline {
+            return Ok(current);
+        }
+        tokio::time::sleep_until(std::cmp::min(
+            deadline,
+            tokio::time::Instant::now() + FLEET_REPLY_POLL_INTERVAL,
+        ))
+        .await;
     }
 }
 
@@ -2176,6 +2537,43 @@ fn string_array(args: &Value, key: &str) -> Vec<String> {
         .collect()
 }
 
+/// Construct the daemon request only after extracting the optional causal and
+/// Work identity carried by both MCP send surfaces. Keeping this seam shared
+/// prevents `muxa_call_peer` and `muxa_send_message` from silently diverging.
+fn new_request_from_args(
+    args: &Value,
+    kind: RequestKind,
+    body: String,
+    expects_reply: bool,
+    work_mode: WorkMode,
+    paths: Vec<String>,
+    air_artifacts: Vec<AirArtifactReference>,
+) -> std::result::Result<NewRequest, String> {
+    Ok(NewRequest {
+        kind,
+        body,
+        expects_reply,
+        work_mode,
+        thread_id: optional_string(args, "thread_id")?,
+        parent_request_id: optional_string(args, "parent_request_id")?,
+        workspace_id: optional_string(args, "workspace_id")?,
+        work_id: optional_string(args, "work_id")?,
+        run_id: optional_string(args, "run_id")?,
+        paths,
+        artifacts: string_array(args, "artifacts"),
+        links: string_array(args, "links"),
+        air_artifacts,
+    })
+}
+
+fn optional_string(args: &Value, key: &str) -> std::result::Result<Option<String>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("{key} must be a string")),
+    }
+}
+
 fn parse_air_artifact_references(
     args: &Value,
 ) -> std::result::Result<Vec<AirArtifactReference>, String> {
@@ -2814,6 +3212,8 @@ mod tests {
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: None,
+            work_id: None,
             pane_id: pane_id.into(),
             session_id: "$1".into(),
             session: "registration".into(),
@@ -3002,6 +3402,8 @@ mod tests {
                 "muxa_fleet_status",
                 "muxa_fleet_capture",
                 "muxa_fleet_send_prompt",
+                "muxa_fleet_call_peer",
+                "muxa_fleet_wait_reply",
                 "muxa_wait_for_change",
                 "muxa_collaboration_guide",
                 "muxa_room_context",
@@ -3042,9 +3444,43 @@ mod tests {
             .unwrap()
             .contains("reviewer/subagent workflows"));
         assert_peer_tool_definitions(tools);
+        assert_fleet_tool_definitions(tools, instructions);
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    fn assert_fleet_tool_definitions(tools: &[Value], instructions: &str) {
+        assert!(instructions.contains("muxa_fleet_call_peer"));
+        assert!(instructions.contains("muxa_fleet_wait_reply"));
+        let fleet_call = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_fleet_call_peer")
+            .unwrap();
+        assert_eq!(
+            fleet_call["inputSchema"]["required"],
+            json!(["host", "pane"])
+        );
+        assert_eq!(
+            fleet_call["inputSchema"]["properties"]["intent"]["enum"],
+            json!(["review", "question", "task"])
+        );
+        assert!(fleet_call["description"]
+            .as_str()
+            .unwrap()
+            .contains("never auto-selects or spawns"));
+        let fleet_wait = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_fleet_wait_reply")
+            .unwrap();
+        assert_eq!(
+            fleet_wait["inputSchema"]["required"],
+            json!(["host", "pane_key", "request_id"])
+        );
+        assert_eq!(
+            fleet_wait["inputSchema"]["properties"]["pane_key"]["type"],
+            "object"
+        );
     }
 
     fn assert_peer_tool_definitions(tools: &[Value]) {
@@ -3069,6 +3505,31 @@ mod tests {
             .unwrap()
             .contains("not a GitHub PR review"));
         assert!(peer_report["inputSchema"]["properties"]["request_id"].is_object());
+
+        let send_message = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_send_message")
+            .unwrap();
+        for tool in [call_peer, send_message] {
+            let properties = &tool["inputSchema"]["properties"];
+            for field in [
+                "thread_id",
+                "parent_request_id",
+                "workspace_id",
+                "work_id",
+                "run_id",
+                "artifacts",
+                "links",
+            ] {
+                assert!(properties[field].is_object(), "missing {field} on {tool}");
+                assert!(
+                    properties[field]["description"]
+                        .as_str()
+                        .is_some_and(|description| !description.is_empty()),
+                    "missing {field} description on {tool}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3189,6 +3650,105 @@ mod tests {
             peer_call_contract(&json!({ "intent": "task", "execute": true })).unwrap(),
             (RequestKind::Task, WorkMode::Execute)
         );
+    }
+
+    #[test]
+    fn fleet_peer_call_requires_control_and_exact_reply_capability() {
+        let collaboration = vec!["collaboration".to_string()];
+        let complete = vec!["collaboration".to_string(), "collaboration_get".to_string()];
+
+        let observe = validate_fleet_collaboration_authority(
+            "dev",
+            false,
+            muxa::HostAccessMode::Observe,
+            &complete,
+        )
+        .unwrap_err();
+        assert!(observe.contains("explicitly grant mode='control'"));
+
+        let old_remote = validate_fleet_collaboration_authority(
+            "dev",
+            false,
+            muxa::HostAccessMode::Control,
+            &collaboration,
+        )
+        .unwrap_err();
+        assert!(old_remote.contains("collaboration_get"));
+
+        validate_fleet_collaboration_authority(
+            "dev",
+            false,
+            muxa::HostAccessMode::Control,
+            &complete,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn request_correlation_and_work_metadata_are_parsed_into_new_request() {
+        let request = new_request_from_args(
+            &json!({
+                "thread_id": "thread-7345",
+                "parent_request_id": "req-review-1",
+                "workspace_id": "callabo",
+                "work_id": "CAL-7345",
+                "run_id": "resolve-2",
+                "artifacts": ["commit:d4bf2aa53", "test:258-passed"],
+                "links": ["https://linear.app/callabo/issue/CAL-7345"]
+            }),
+            RequestKind::Review,
+            "review the must-fix follow-up".into(),
+            true,
+            WorkMode::ReadOnly,
+            vec!["crates/muxa/src/collaboration.rs".into()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(request.thread_id.as_deref(), Some("thread-7345"));
+        assert_eq!(request.parent_request_id.as_deref(), Some("req-review-1"));
+        assert_eq!(request.workspace_id.as_deref(), Some("callabo"));
+        assert_eq!(request.work_id.as_deref(), Some("CAL-7345"));
+        assert_eq!(request.run_id.as_deref(), Some("resolve-2"));
+        assert_eq!(request.artifacts, ["commit:d4bf2aa53", "test:258-passed"]);
+        assert_eq!(request.links, ["https://linear.app/callabo/issue/CAL-7345"]);
+        assert_eq!(
+            request.paths,
+            ["crates/muxa/src/collaboration.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn request_metadata_is_optional_and_rejects_non_string_ids() {
+        let request = new_request_from_args(
+            &json!({}),
+            RequestKind::Question,
+            "question".into(),
+            true,
+            WorkMode::ReadOnly,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(request.thread_id.is_none());
+        assert!(request.parent_request_id.is_none());
+        assert!(request.workspace_id.is_none());
+        assert!(request.work_id.is_none());
+        assert!(request.run_id.is_none());
+        assert!(request.artifacts.is_empty());
+        assert!(request.links.is_empty());
+
+        let error = new_request_from_args(
+            &json!({ "parent_request_id": 7345 }),
+            RequestKind::Question,
+            "question".into(),
+            true,
+            WorkMode::ReadOnly,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "parent_request_id must be a string");
     }
 
     #[test]

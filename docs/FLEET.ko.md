@@ -240,8 +240,12 @@ mutation은 자동 retry하지 않습니다. 결과는 text delivery와 Enter su
 ## 다른 interface
 
 `muxa mcp`는 `muxa_fleet_status`, `muxa_fleet_capture`,
-`muxa_fleet_send_prompt`를 제공합니다. control 도구는 host와 pane을 명시해야 합니다.
-remote는 observe/control 검사를 적용하고 `local`은 owner-only socket control입니다.
+`muxa_fleet_send_prompt`와 durable collaboration용 `muxa_fleet_call_peer`,
+`muxa_fleet_wait_reply`를 제공합니다. control 도구는 host와 pane을 명시해야 하며 원격
+에이전트를 자동 선택하거나 생성하지 않습니다. remote는 매 명령마다 observe/control
+검사를 적용하고 `local`은 owner-only socket control입니다. 호출 대기 시간이 끝나면
+결과의 정확한 `pane_key`와 `request_id`를 wait 도구에 그대로 넘기면 됩니다. 요청과
+구조화된 reply는 선택한 physical node에 남으므로 terminal capture polling이 필요 없습니다.
 
 web dashboard를 켜면 read API에 `GET /api/fleet?selector=...`가 추가됩니다.
 `POST /api/fleet/{host}/command`는 serialized `FleetOperation`을 받아 PAT를 요구합니다.
@@ -249,9 +253,9 @@ dashboard `auth = "none"`에서는 기존 정책대로 모든 write가 비활성
 
 durable collaboration data의 소유권은 계속 각 physical node에 있습니다. Fleet watch는
 이를 중앙 DB로 복제하지 않고 `m`, `M`, claim, reply를 authenticated SSH stdio relay로
-선택한 node의 muxad에 전달합니다. `collaboration` relay capability가 이 명령을 gate하므로
-구버전 node에서는 durable request를 keystroke로 조용히 낮추지 않고 upgrade 안내를
-표시합니다.
+선택한 node의 muxad에 전달합니다. `collaboration` 및 exact reply 조회용
+`collaboration_get` relay capability가 이 명령을 gate하므로 구버전 node에서는 durable
+request를 keystroke로 조용히 낮추지 않고 upgrade 안내를 표시합니다.
 
 ## 보안 checklist
 

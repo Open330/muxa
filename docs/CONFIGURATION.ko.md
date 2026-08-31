@@ -91,11 +91,18 @@ wake = "idle_only" # idle_only | never
 wake_payload = "operator_full" # notice | operator_full | full
 scope = "window"   # window | host
 max_message_bytes = 16384
+# path = "$XDG_DATA_HOME/muxa/collaboration.json"
+# retention_days = 90 # 생략하면 영구 보존
 ```
 
 같은 stable tmux window에 있는 agent 사이의 durable request/reply 기능입니다.
-optional `path` 기본값은 `$XDG_DATA_HOME/muxa/collaboration.json`이며 mailbox와
-exact-session alias/role을 함께 저장합니다.
+과거 optional `path` 기본값은 `$XDG_DATA_HOME/muxa/collaboration.json`입니다.
+Muxa는 기존 JSON을 authoritative sibling `collaboration.sqlite3`에 한 번 import하고
+JSON은 migration backup으로 유지합니다. `.sqlite`, `.sqlite3`, `.db` path를 설정하면
+그 파일을 직접 사용합니다. DB는 mailbox와 exact-session alias/role을 함께 저장합니다.
+`retention_days`는 daemon 시작 시 조건을 만족하는 전달 완료 terminal thread를
+정리하며 생략하면 모두 보존합니다. 남은 JSON backup은 본문의 중복 사본이고 retention
+대상이 아닙니다.
 `idle_only`는 hook 기반 top-level agent가 Idle일 때만 입력합니다.
 기본값인 `wake_payload = "operator_full"`은 watch/dashboard 같은 operator surface에서
 보낸 요청은 본문을 직접 전달하고, agent가 MCP/CLI로 보낸 요청은 mailbox 알림으로
@@ -154,6 +161,7 @@ sort = ["state", "workspace", "latest"]
 hide_paneless = true
 collaboration_kind = "question"   # question | review | task | notice
 collaboration_mode = "read_only"  # read_only | execute | just_send
+collab_layout = "table"            # table | sequence
 
 [watch.widths]
 prompt = "min:20"
@@ -168,6 +176,8 @@ template = "{last_response || last_prompt || last_notification}"
 `m` composer에서 `Tab`이나 `Ctrl-E`로 badge를 바꾸면 watch가
 `collaboration_kind`와 `collaboration_mode`를 갱신합니다. 마지막 선택은 composer를
 닫거나 watch를 다시 실행한 뒤에도 유지됩니다.
+`collab_layout`은 collaboration-history 화면만 제어하며 topology `layout`과
+독립적입니다. 실행 중에는 `v`로 전환할 수 있습니다.
 
 TUI 동작, column, sort, keybinding은 [WATCH.ko.md](WATCH.ko.md)에 있습니다.
 

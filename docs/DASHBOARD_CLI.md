@@ -117,6 +117,11 @@ mailbox, arrows select a request, `i` atomically claims pending incoming work,
 request that is still queued. The reply composer uses `Tab` to cycle
 `completed`, `blocked`, `declined`, and `failed`.
 
+This TUI mailbox remains scoped to the selected agent. For read-only whole
+window/session history, use `M` on the corresponding `muxa watch` topology row;
+for cross-room node/edge and chronological sequence exploration, use the web
+dashboard's collaboration panel.
+
 If the window has no agent at all, start one in another pane of it — unlike
 `muxa watch`, the dashboard's reach is still the room, so it does not follow
 `[collaboration].scope = "host"` to other windows. If collaboration says it is

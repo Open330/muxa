@@ -486,8 +486,10 @@ pub struct PipelineAgentConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CollaborationConfig {
     pub enabled: bool,
-    /// Atomic mailbox snapshot. Defaults to
-    /// `$XDG_DATA_HOME/muxa/collaboration.json`.
+    /// Indexed mailbox database. The historical default remains
+    /// `$XDG_DATA_HOME/muxa/collaboration.json`; muxa imports that JSON once
+    /// into `collaboration.sqlite3` and keeps the JSON as a migration backup.
+    /// A `.sqlite`, `.sqlite3`, or `.db` path may also be configured directly.
     pub path: Option<PathBuf>,
     /// `never` keeps delivery pull-only; `idle_only` wakes hook-authoritative
     /// agents only at their top-level idle prompt.
@@ -507,6 +509,10 @@ pub struct CollaborationConfig {
     pub scope: CollaborationScope,
     #[serde(default = "default_collaboration_max_message_bytes")]
     pub max_message_bytes: usize,
+    /// Retain completed collaboration threads for this many days. Omitted by
+    /// default, which preserves all history. Pruning is whole-thread only and
+    /// never removes pending delivery or unread reply state.
+    pub retention_days: Option<u64>,
 }
 
 impl Default for CollaborationConfig {
@@ -518,6 +524,7 @@ impl Default for CollaborationConfig {
             wake_payload: CollaborationWakePayload::OperatorFull,
             scope: CollaborationScope::default(),
             max_message_bytes: default_collaboration_max_message_bytes(),
+            retention_days: None,
         }
     }
 }
@@ -1473,6 +1480,16 @@ pub enum WatchCollaborationMode {
     JustSend,
 }
 
+/// Presentation used by the collaboration-history screen. Kept separate
+/// from [`WatchLayout`], which only describes topology nodes.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchCollabLayout {
+    #[default]
+    Table,
+    Sequence,
+}
+
 /// `[watch]` config — controls the `muxa watch` TUI columns.
 ///
 /// Validation of column keys and width specs happens lazily at render time
@@ -1509,6 +1526,10 @@ pub struct WatchConfig {
     /// Presentation of the same canonical topology. Defaults to `tree`.
     #[serde(default)]
     pub layout: WatchLayout,
+    /// Collaboration-screen presentation, independently persisted from the
+    /// topology layout.
+    #[serde(default)]
+    pub collab_layout: WatchCollabLayout,
     /// Which list `muxa watch` opens on. Defaults to `topology`.
     #[serde(default)]
     pub screen: WatchScreen,
@@ -1781,6 +1802,7 @@ impl Default for WatchConfig {
             widths,
             view: WatchView::Window,
             layout: WatchLayout::Tree,
+            collab_layout: WatchCollabLayout::Table,
             screen: WatchScreen::Topology,
             tree_expansion: WatchTreeExpansion::Focus,
             summary: WatchSummary::default(),

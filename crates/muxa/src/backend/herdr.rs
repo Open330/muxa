@@ -525,6 +525,8 @@ fn to_pane_info(pane: &HerdrPaneInfo, process: Option<&HerdrProcessInfo>) -> Pan
         current_path: pane.cwd.clone().unwrap_or_default(),
         pane_pid,
         socket: None,
+        workspace_id: None,
+        work_id: None,
     }
 }
 

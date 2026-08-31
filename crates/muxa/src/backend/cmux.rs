@@ -195,6 +195,8 @@ fn current_pane_info_from(
         session_group: None,
         agent_role: None,
         agent_alias: None,
+        workspace_id: None,
+        work_id: None,
         socket: endpoint,
         pane_id: namespace_pane_id(&surface),
         session_id: workspace.clone(),

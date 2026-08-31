@@ -61,10 +61,10 @@
 #                                   # no pane matches a manifest (idle cost ≈ one pane list).
 
 # Durable request/reply collaboration between top-level agents in the same
-# tmux window. Opt-in: idle_only delivery types a short mailbox notification
-# into a hook-authoritative agent only when muxa observes its top-level Idle
-# state. Working / waiting / choice / error panes and synthetic screen-detected
-# agents are never auto-woken. The message body itself stays in the mailbox.
+# tmux window. Opt-in: idle_only delivery types only at a hook-authoritative
+# agent's top-level Idle state. Working / waiting / choice / error panes and
+# synthetic screen-detected agents are never auto-woken. `wake_payload`
+# controls whether the body or a short mailbox notification is delivered.
 # Headless one-shot questions from `muxa watch` (`a` asks, `A` browses).
 # Off by default: enabling it lets muxad spawn an agent CLI that bills
 # your account.
@@ -78,8 +78,15 @@
 [collaboration]
 # enabled           = true
 # wake              = "idle_only"  # idle_only | never (pull-only)
+# wake_payload      = "operator_full" # notice | operator_full | full
+# Historical JSON paths map to an indexed sibling collaboration.sqlite3.
+# Existing JSON is imported once and retained as a migration backup; its
+# duplicate message bodies are not covered by retention. A .sqlite/.sqlite3/.db
+# path is used directly.
 # path              = "/home/$USER/.local/share/muxa/collaboration.json"
 # max_message_bytes = 16384
+# retention_days    = 90 # omit to retain indefinitely; prunes eligible whole
+#                        # terminal threads at daemon startup
 
 # Prompt audit log: every PromptSubmitted event is appended to a bounded
 # NDJSON file plus an in-memory ring per pane. Powers `muxa recap --all`
@@ -202,6 +209,9 @@
 # layout = "swarm"    # dense collaboration-room clusters
 # layout = "work"     # flat one row per Work, like `muxa work list` with a
 #                     # live state gauge
+# Collaboration history has its own presentation axis, independent of the
+# topology layout above. `v` toggles it at runtime.
+# collab_layout = "table" # table (newest-first) | sequence (chronological)
 # Which list watch opens on. `topology` is everything view/layout describe;
 # `collab` lists collaboration requests across every room the daemon holds.
 # screen = "topology" # (default)
