@@ -844,28 +844,28 @@ fn resolve_placement_target(request: &mut StartRequest, cwd: &Path) -> Result<()
 /// **Reading the input.** `--target junia` means the session `junia`. Asked
 /// plainly, tmux answers with whatever window named `junia` sits in the
 /// caller's session — a different session's id, returned without complaint. A
-/// trailing colon forces the session reading, so a name is resolved that way
-/// first and only falls back to the plain form (which is what a window *name*
-/// target needs, and the only form ids accept).
+/// trailing colon forces the session reading, so every target is tried that
+/// way first and falls back to the plain form. The fallback is what pane and
+/// window ids need (tmux rejects `%5:` outright) and what a window *name*
+/// target needs; asking tmux which spelling it accepts beats guessing from the
+/// first character, which a session named `$work` or a window named `%tmp`
+/// would answer wrongly.
 ///
 /// **Writing the output.** The answer is the session id with its own trailing
 /// colon: `$7` cannot be re-read as a window name, and the colon means "window
 /// unspecified", which is what leaves the index for tmux to choose. A session
 /// target without it still carries its current window's index along.
 fn resolve_window_session(target: &str) -> Result<String> {
-    let is_id = target.starts_with(['%', '@', '$']);
     let mut last_error = None;
     let mut session = None;
-    // Ids are already unambiguous, and tmux rejects `%5:` / `@3:` outright.
-    if !is_id {
-        match session_id_of(&format!("{target}:"))? {
-            Ok(found) => session = Some(found),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    if session.is_none() {
-        match session_id_of(target)? {
-            Ok(found) => session = Some(found),
+    for spelling in [format!("{target}:"), target.to_string()] {
+        match session_id_of(&spelling)? {
+            Ok(found) => {
+                session = Some(found);
+                break;
+            }
+            // Keep the plain form's complaint: it is the one that describes a
+            // target tmux does not know at all.
             Err(error) => last_error = Some(error),
         }
     }

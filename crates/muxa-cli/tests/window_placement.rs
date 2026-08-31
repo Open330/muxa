@@ -75,6 +75,20 @@ impl Server {
         server
             .tmux(&["rename-window", "-t", "caller:0", "junia"])
             .expect("name the caller's window after the target session");
+        // A window name that matches no session, so addressing it can only be
+        // served by falling back from the session spelling to the plain one.
+        server
+            .tmux(&[
+                "new-window",
+                "-d",
+                "-t",
+                "caller:",
+                "-n",
+                "scratch",
+                "-c",
+                "/tmp",
+            ])
+            .expect("add the caller's scratch window");
         server
     }
 
@@ -115,6 +129,79 @@ fn stub_agent_dir(root: &Path) -> PathBuf {
     std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755))
         .expect("chmod stub claude");
     bin
+}
+
+/// What every launch in this test shares: where the stub lives, and the
+/// environment of a caller sitting in the `caller` session.
+struct Launch<'a> {
+    stub_bin: &'a Path,
+    tmux_env: &'a str,
+    caller_pane: &'a str,
+}
+
+/// Start one agent addressed by `target`, then assert where it landed:
+/// `owner`'s session, at an index tmux picked, running the stub.
+fn launch_and_assert(server: &Server, launch: &Launch<'_>, target: &str, owner: &str, name: &str) {
+    let path = format!(
+        "{}:{}",
+        launch.stub_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(muxa())
+        .args([
+            "agent",
+            "start",
+            "--agent",
+            "claude",
+            "--placement",
+            "window",
+            "--target",
+            target,
+            "--name",
+            name,
+            "--cwd",
+            "/tmp",
+            "--json",
+        ])
+        .env("PATH", path)
+        .env("MUXA_TMUX_SOCKET", &server.socket)
+        .env("TMUX", launch.tmux_env)
+        .env("TMUX_PANE", launch.caller_pane)
+        .output()
+        .expect("run muxa agent start");
+    assert!(
+        out.status.success(),
+        "target {target:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // Where it landed, across every session on the server: a window in the
+    // wrong one is the silent half of this bug.
+    let placed = server.query(&[
+        "list-windows",
+        "-a",
+        "-F",
+        "#{session_name} #{window_index} #{window_name}",
+    ]);
+    let row = placed
+        .lines()
+        .find(|line| line.split_whitespace().nth(2) == Some(name))
+        .unwrap_or_else(|| panic!("no window named {name} anywhere; windows:\n{placed}"));
+    let mut fields = row.split_whitespace();
+    let session = fields.next().expect("session name");
+    let index: u32 = fields
+        .next()
+        .and_then(|idx| idx.parse().ok())
+        .expect("window index");
+    assert_eq!(
+        session, owner,
+        "target {target:?} addresses {owner}; windows:\n{placed}",
+    );
+    assert_ne!(index, 0, "index 0 belongs to the session's first window");
+    // The stub is what ran, so a machine with a real `claude` on PATH cannot
+    // make this test pass for the wrong reason.
+    let command = wait_for_pane_command(server, &format!("{owner}:{index}"));
+    assert_eq!(command, "sleep", "the stub agent should own the new pane");
 }
 
 /// tmux runs the launch through `sh -c`, which then execs the stub, so the
@@ -164,82 +251,35 @@ fn window_placement_lands_in_the_target_session_beside_a_same_named_window() {
         caller_session.trim_start_matches('$'),
     );
 
-    // Every address muxa accepts for the same session.
-    for (nth, target) in [
-        session_id.as_str(),
-        "junia",
-        window_id.as_str(),
-        pane_id.as_str(),
+    // Every address muxa accepts, and the session each one names. The last
+    // is a *window* name owned by no session of that name: only the fallback
+    // from the session spelling to the plain one can resolve it, and it
+    // belongs to the caller's session rather than the target's.
+    for (nth, (target, owner)) in [
+        (session_id.as_str(), "junia"),
+        ("junia", "junia"),
+        (window_id.as_str(), "junia"),
+        (pane_id.as_str(), "junia"),
+        ("scratch", "caller"),
     ]
     .iter()
     .enumerate()
     {
-        let name = format!("GH-13{nth}");
-        let path = format!(
-            "{}:{}",
-            stub_bin.display(),
-            std::env::var("PATH").unwrap_or_default()
+        launch_and_assert(
+            &server,
+            &Launch {
+                stub_bin: &stub_bin,
+                tmux_env: &tmux_env,
+                caller_pane: &caller_pane,
+            },
+            target,
+            owner,
+            &format!("GH-13{nth}"),
         );
-        let out = Command::new(muxa())
-            .args([
-                "agent",
-                "start",
-                "--agent",
-                "claude",
-                "--placement",
-                "window",
-                "--target",
-                target,
-                "--name",
-                &name,
-                "--cwd",
-                "/tmp",
-                "--json",
-            ])
-            .env("PATH", path)
-            .env("MUXA_TMUX_SOCKET", &server.socket)
-            .env("TMUX", &tmux_env)
-            .env("TMUX_PANE", &caller_pane)
-            .output()
-            .expect("run muxa agent start");
-        assert!(
-            out.status.success(),
-            "target {target:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr),
-        );
-
-        // Where it landed, across every session on the server: a window in
-        // `caller` would be the silent half of this bug.
-        let placed = server.query(&[
-            "list-windows",
-            "-a",
-            "-F",
-            "#{session_name} #{window_index} #{window_name}",
-        ]);
-        let row = placed
-            .lines()
-            .find(|line| line.split_whitespace().nth(2) == Some(name.as_str()))
-            .unwrap_or_else(|| panic!("no window named {name} anywhere; windows:\n{placed}"));
-        let mut fields = row.split_whitespace();
-        let session = fields.next().expect("session name");
-        let index: u32 = fields
-            .next()
-            .and_then(|idx| idx.parse().ok())
-            .expect("window index");
-        assert_eq!(
-            session, "junia",
-            "target {target:?} addressed junia; windows:\n{placed}",
-        );
-        assert_ne!(index, 0, "index 0 belongs to the session's first window");
-        // The stub is what ran, so a machine with a real `claude` on PATH
-        // cannot make this test pass for the wrong reason. The pane goes
-        // through `sh -c` first, so give the exec a moment to land.
-        let command = wait_for_pane_command(&server, &format!("junia:{index}"));
-        assert_eq!(command, "sleep", "the stub agent should own the new pane");
     }
 
-    // Four launches, four windows, every one of them in the addressed
-    // session and none in the caller's.
+    // Every launch landed where its address pointed: the four session
+    // addresses in `junia`, the window name in the session that owns it.
     let windows = server.query(&["list-windows", "-a", "-F", "#{session_name}:#{window_name}"]);
     assert_eq!(
         windows
@@ -249,8 +289,12 @@ fn window_placement_lands_in_the_target_session_beside_a_same_named_window() {
         4,
         "windows:\n{windows}",
     );
-    assert!(
-        !windows.lines().any(|w| w.starts_with("caller:GH-13")),
-        "nothing may be created in the caller's session; windows:\n{windows}",
+    assert_eq!(
+        windows
+            .lines()
+            .filter(|w| w.starts_with("caller:GH-13"))
+            .count(),
+        1,
+        "only the window-name address belongs to the caller; windows:\n{windows}",
     );
 }
