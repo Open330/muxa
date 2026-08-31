@@ -53,10 +53,28 @@ impl Server {
                 "/tmp",
             ])
             .expect("start the test tmux server");
-        // The collision under test: window 0 carries the session's own name.
+        // A second session, standing in for the pane a caller runs from, whose
+        // window carries the *target* session's name. That is the collision:
+        // tmux reads a colonless `junia` as this window before it tries the
+        // session, which is both how `index 0 in use` happened and how a
+        // window could land in the caller's session instead.
         server
-            .tmux(&["rename-window", "-t", "junia:0", "junia"])
-            .expect("name window 0 after the session");
+            .tmux(&[
+                "new-session",
+                "-d",
+                "-s",
+                "caller",
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "-c",
+                "/tmp",
+            ])
+            .expect("start the caller session");
+        server
+            .tmux(&["rename-window", "-t", "caller:0", "junia"])
+            .expect("name the caller's window after the target session");
         server
     }
 
@@ -99,6 +117,27 @@ fn stub_agent_dir(root: &Path) -> PathBuf {
     bin
 }
 
+/// tmux runs the launch through `sh -c`, which then execs the stub, so the
+/// foreground command reported the instant the window appears may still be the
+/// shell. Poll briefly rather than race it.
+fn wait_for_pane_command(server: &Server, window: &str) -> String {
+    let mut command = String::new();
+    for _ in 0..50 {
+        command = server.query(&[
+            "display-message",
+            "-p",
+            "-t",
+            window,
+            "#{pane_current_command}",
+        ]);
+        if command == "sleep" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    command
+}
+
 #[test]
 fn window_placement_lands_in_the_target_session_beside_a_same_named_window() {
     if !tmux_installed() {
@@ -109,18 +148,20 @@ fn window_placement_lands_in_the_target_session_beside_a_same_named_window() {
     let stub_bin = stub_agent_dir(dir.path());
     let server = Server::start(dir);
 
-    let session_id = server.query(&["display-message", "-p", "-t", "junia", "#{session_id}"]);
+    let session_id = server.query(&["display-message", "-p", "-t", "junia:", "#{session_id}"]);
     let window_id = server.query(&["display-message", "-p", "-t", "junia:0", "#{window_id}"]);
     let pane_id = server.query(&["display-message", "-p", "-t", "junia:0", "#{pane_id}"]);
+    let caller_session = server.query(&["display-message", "-p", "-t", "caller:", "#{session_id}"]);
+    let caller_pane = server.query(&["display-message", "-p", "-t", "caller:0", "#{pane_id}"]);
     let server_pid = server.query(&["display-message", "-p", "#{pid}"]);
-    // What a caller inside that session has in its environment. It is what
+    // What a caller running inside `caller` has in its environment. It is what
     // gives tmux a "current session" to resolve an ambiguous target against,
     // so without it the collision cannot happen at all.
     let tmux_env = format!(
         "{},{},{}",
         server.socket.display(),
         server_pid,
-        session_id.trim_start_matches('$'),
+        caller_session.trim_start_matches('$'),
     );
 
     // Every address muxa accepts for the same session.
@@ -158,7 +199,7 @@ fn window_placement_lands_in_the_target_session_beside_a_same_named_window() {
             .env("PATH", path)
             .env("MUXA_TMUX_SOCKET", &server.socket)
             .env("TMUX", &tmux_env)
-            .env("TMUX_PANE", &pane_id)
+            .env("TMUX_PANE", &caller_pane)
             .output()
             .expect("run muxa agent start");
         assert!(
@@ -167,32 +208,38 @@ fn window_placement_lands_in_the_target_session_beside_a_same_named_window() {
             String::from_utf8_lossy(&out.stderr),
         );
 
+        // Where it landed, across every session on the server: a window in
+        // `caller` would be the silent half of this bug.
         let placed = server.query(&[
             "list-windows",
-            "-t",
-            "junia",
+            "-a",
             "-F",
-            "#{window_index} #{window_name} #{pane_current_command}",
+            "#{session_name} #{window_index} #{window_name}",
         ]);
         let row = placed
             .lines()
-            .find(|line| line.split_whitespace().nth(1) == Some(name.as_str()))
-            .unwrap_or_else(|| panic!("no window named {name} in junia; windows:\n{placed}"));
-        let index: u32 = row
-            .split_whitespace()
+            .find(|line| line.split_whitespace().nth(2) == Some(name.as_str()))
+            .unwrap_or_else(|| panic!("no window named {name} anywhere; windows:\n{placed}"));
+        let mut fields = row.split_whitespace();
+        let session = fields.next().expect("session name");
+        let index: u32 = fields
             .next()
             .and_then(|idx| idx.parse().ok())
             .expect("window index");
+        assert_eq!(
+            session, "junia",
+            "target {target:?} addressed junia; windows:\n{placed}",
+        );
         assert_ne!(index, 0, "index 0 belongs to the session's first window");
         // The stub is what ran, so a machine with a real `claude` on PATH
-        // cannot make this test pass for the wrong reason.
-        assert!(
-            row.ends_with("sleep"),
-            "the stub agent should own the new pane: {row}",
-        );
+        // cannot make this test pass for the wrong reason. The pane goes
+        // through `sh -c` first, so give the exec a moment to land.
+        let command = wait_for_pane_command(&server, &format!("junia:{index}"));
+        assert_eq!(command, "sleep", "the stub agent should own the new pane");
     }
 
-    // Four launches, four windows, all in the session that was addressed.
+    // Four launches, four windows, every one of them in the addressed
+    // session and none in the caller's.
     let windows = server.query(&["list-windows", "-a", "-F", "#{session_name}:#{window_name}"]);
     assert_eq!(
         windows
@@ -201,5 +248,9 @@ fn window_placement_lands_in_the_target_session_beside_a_same_named_window() {
             .count(),
         4,
         "windows:\n{windows}",
+    );
+    assert!(
+        !windows.lines().any(|w| w.starts_with("caller:GH-13")),
+        "nothing may be created in the caller's session; windows:\n{windows}",
     );
 }

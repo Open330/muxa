@@ -20,7 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   usually named after it — so `-t junia` found the window `junia` at index 0 and
   refused to create anything there. The target is now the session *id* with a
   trailing colon (`$7:`), which cannot be read as a window name and leaves the
-  index for tmux to choose. A failing launch also names the resolved target,
+  index for tmux to choose.
+
+  Reading the target had the same flaw with a quieter ending: asked plainly for
+  `--target junia`, tmux answered with the id of whichever session owned a
+  window named `junia` — the caller's — so the window was created there, in the
+  wrong session, without an error. A name is now resolved as a session first
+  (`junia:`) and falls back to the plain form, which is what a window-name
+  target needs and the only form ids accept. A failing launch also names the
+  resolved target,
   since the address tmux was given is not the one the caller typed. Covered by
   a regression test that drives the real binary against a private tmux server
   laid out that way, through all four addresses muxa accepts — session id,

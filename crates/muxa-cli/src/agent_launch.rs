@@ -835,41 +835,69 @@ fn resolve_placement_target(request: &mut StartRequest, cwd: &Path) -> Result<()
 
 /// The `new-window -t` target for the session that owns `target`.
 ///
-/// Two details carry the whole fix for a `create window failed: index 0 in
-/// use` that made new windows impossible in a session muxa itself lays out.
+/// tmux reads a colonless string as a **window** in the caller's current
+/// session before it tries it as a session, and muxa's own topology makes that
+/// collision ordinary rather than unlucky: one session per workspace, whose
+/// first window is commonly named after it. Both ends of this function exist
+/// for that.
 ///
-/// **The session id, not its name.** `new-window -t` takes a *window* target,
-/// and a string with no colon is looked up as a window in the caller's current
-/// session before it is tried as a session. Muxa's own topology — one session
-/// per workspace, whose first window is usually named after it — makes that
-/// collision the common case, not a corner: `-t junia` finds the window named
-/// `junia` at index 0 and refuses to create anything there. A `$7` id cannot
-/// be read as a window name.
+/// **Reading the input.** `--target junia` means the session `junia`. Asked
+/// plainly, tmux answers with whatever window named `junia` sits in the
+/// caller's session — a different session's id, returned without complaint. A
+/// trailing colon forces the session reading, so a name is resolved that way
+/// first and only falls back to the plain form (which is what a window *name*
+/// target needs, and the only form ids accept).
 ///
-/// **The trailing colon.** `$7:` means "this session, window unspecified",
-/// which is what leaves the index for tmux to choose. Without it a session
-/// target still carries its current window's index along.
+/// **Writing the output.** The answer is the session id with its own trailing
+/// colon: `$7` cannot be re-read as a window name, and the colon means "window
+/// unspecified", which is what leaves the index for tmux to choose. A session
+/// target without it still carries its current window's index along.
 fn resolve_window_session(target: &str) -> Result<String> {
+    let is_id = target.starts_with(['%', '@', '$']);
+    let mut last_error = None;
+    let mut session = None;
+    // Ids are already unambiguous, and tmux rejects `%5:` / `@3:` outright.
+    if !is_id {
+        match session_id_of(&format!("{target}:"))? {
+            Ok(found) => session = Some(found),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if session.is_none() {
+        match session_id_of(target)? {
+            Ok(found) => session = Some(found),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let session = session.ok_or_else(|| {
+        let detail = last_error
+            .filter(|error| !error.is_empty())
+            .map_or(String::new(), |error| format!(": {error}"));
+        anyhow::anyhow!("cannot resolve tmux target {target:?}{detail}")
+    })?;
+    Ok(format!("{session}:"))
+}
+
+/// The session id tmux reports for one target spelling, or the message it
+/// refused with. The outer `Result` is reserved for not being able to run tmux
+/// at all, which is not something another spelling can recover from.
+fn session_id_of(target: &str) -> Result<std::result::Result<String, String>> {
     let output = muxa::tmux::tmux_command_scoped()
         .args(["display-message", "-p", "-t", target, "#{session_id}"])
         .output()
         .context("resolve tmux window target")?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        bail!(
-            "cannot resolve tmux target {target:?}{}",
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        );
+        return Ok(Err(String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .to_string()));
     }
     let session = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if session.is_empty() {
-        bail!("tmux target {target:?} resolved to an empty session");
+        return Ok(Err(format!(
+            "tmux target {target:?} resolved to an empty session"
+        )));
     }
-    Ok(format!("{session}:"))
+    Ok(Ok(session))
 }
 
 fn tmux_args(request: &StartRequest, cwd: &Path, command: &str) -> Result<Vec<String>> {
