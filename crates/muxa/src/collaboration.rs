@@ -2072,6 +2072,19 @@ impl CollaborationStore {
         ) {
             return Err(CollaborationError::InvalidReplyStatus);
         }
+        // The same guard `create` puts on a request body, for the same reason
+        // and one more: a reply is a terminal write. An empty one — an
+        // argument that did not survive its shell, a variable that expanded to
+        // nothing — closes the request with no answer in it, and the real
+        // answer can never be posted to that thread afterwards. The sender
+        // sees `completed` and an empty body, which reads as a reviewer with
+        // nothing to say rather than as a delivery that went missing.
+        // A refusal without a reason is no more useful than an empty
+        // completion, so this holds for every terminal status.
+        let body = body.trim().to_string();
+        if body.is_empty() {
+            return Err(CollaborationError::EmptyMessage);
+        }
         if body.len() > self.opts.max_message_bytes {
             return Err(CollaborationError::MessageTooLarge(
                 self.opts.max_message_bytes,
@@ -3664,6 +3677,120 @@ mod tests {
         let participants = participants_from(&store.snapshot().await, &panes);
         assert_eq!(participants.len(), 1);
         assert_eq!(participants[0].agent_session_id, "real-session");
+    }
+
+    /// A reply is a terminal write, so an empty one must not spend it. This
+    /// cost a real review round trip: a peer's `muxa msg reply` lost its body
+    /// to the shell, the request closed with nothing in it, and the findings
+    /// that followed were refused as "already terminal".
+    #[tokio::test]
+    async fn an_empty_reply_is_refused_and_leaves_the_request_answerable() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "reviewer");
+        let request = mailbox
+            .create(
+                sender,
+                recipient.clone(),
+                NewRequest {
+                    kind: RequestKind::Review,
+                    body: "review the diff".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        mailbox.claim_for(&recipient).await.unwrap();
+
+        for blank in ["", "   ", "\n\t "] {
+            let refused = mailbox
+                .reply(
+                    &recipient,
+                    &request.id,
+                    RequestStatus::Completed,
+                    blank.into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await;
+            assert!(
+                matches!(refused, Err(CollaborationError::EmptyMessage)),
+                "{blank:?} should be refused, got {refused:?}",
+            );
+        }
+
+        // Refusing a terminal write is only worth anything if the request is
+        // still there to answer.
+        let stored = mailbox.get_for(&recipient, &request.id).await.unwrap();
+        assert_eq!(stored.status, RequestStatus::Claimed);
+        assert!(stored.reply.is_none());
+
+        let answered = mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "  no blockers found  ".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answered.status, RequestStatus::Completed);
+        assert_eq!(
+            answered.reply.expect("reply").body,
+            "no blockers found",
+            "stored trimmed, the way a request body is",
+        );
+    }
+
+    /// A decline with no reason tells the sender as little as an empty
+    /// completion does.
+    #[tokio::test]
+    async fn every_terminal_status_needs_a_body() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "reviewer");
+        for status in [
+            RequestStatus::Declined,
+            RequestStatus::Blocked,
+            RequestStatus::Failed,
+        ] {
+            let request = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        kind: RequestKind::Question,
+                        body: "is the release green?".into(),
+                        expects_reply: true,
+                        work_mode: WorkMode::ReadOnly,
+                        paths: Vec::new(),
+                        air_artifacts: Vec::new(),
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let refused = mailbox
+                .reply(
+                    &recipient,
+                    &request.id,
+                    status,
+                    String::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await;
+            assert!(
+                matches!(refused, Err(CollaborationError::EmptyMessage)),
+                "{status:?} with no body should be refused, got {refused:?}",
+            );
+        }
     }
 
     #[tokio::test]

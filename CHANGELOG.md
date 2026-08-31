@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A reply must carry a body.** `create` refuses an empty request body;
+  `reply` refused nothing, so an argument that did not survive its shell closed
+  the request with an empty answer in it — and, the request now being terminal,
+  the real answer could never be posted to that thread. The sender saw
+  `completed` with an empty body, which reads as a reviewer who had nothing to
+  say rather than as a delivery that went missing. A blank or whitespace-only
+  reply is now `EmptyMessage`, leaving the request claimed and still
+  answerable, and the stored body is trimmed the way a request body already
+  was. This holds for every terminal status: a decline with no reason tells the
+  sender as little as an empty completion does.
+
 - **A release syncs the Homebrew tap again.** `tap-bump` listens for
   `release: published`, which worked while a human published each draft and
   stopped the moment the release workflow started publishing for itself:
