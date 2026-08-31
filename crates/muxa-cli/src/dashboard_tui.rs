@@ -1006,6 +1006,8 @@ enum PendingAction {
         kind: RequestKind,
         body: String,
         work_mode: WorkMode,
+        workspace_id: Option<String>,
+        work_id: Option<String>,
     },
     CollaborationReply {
         origin: CollaborationOrigin,
@@ -1092,6 +1094,8 @@ enum PromptTarget {
         target: String,
         kind: RequestKind,
         work_mode: WorkMode,
+        workspace_id: Option<String>,
+        work_id: Option<String>,
     },
     CollaborationReply {
         origin: CollaborationOrigin,
@@ -2277,12 +2281,16 @@ fn handle_composer_key(app: &mut DashboardApp, key: KeyEvent) -> UiAction {
                     target,
                     kind,
                     work_mode,
+                    workspace_id,
+                    work_id,
                 } => PendingAction::CollaborationSend {
                     origin,
                     target,
                     kind,
                     body: text,
                     work_mode,
+                    workspace_id,
+                    work_id,
                 },
                 PromptTarget::CollaborationReply {
                     origin,
@@ -2543,12 +2551,17 @@ fn open_collaboration_composer(app: &mut DashboardApp) -> UiAction {
     };
     let target = format!("pane:{}", peer.pane);
     let label = peer.label();
+    let (workspace_id, work_id) = app.selected_card().map_or((None, None), |card| {
+        (card.workspace.clone(), card.work_id.clone())
+    });
     app.composer = Some(PromptComposer::new(
         PromptTarget::CollaborationSend {
             origin,
             target,
             kind: RequestKind::Question,
             work_mode: WorkMode::ReadOnly,
+            workspace_id,
+            work_id,
         },
         label,
     ));
@@ -2843,7 +2856,21 @@ async fn run_pending_action(client: &Client, action: PendingAction) -> ActionOut
             kind,
             body,
             work_mode,
-        } => collaboration_send(client, origin, target, kind, body, work_mode).await,
+            workspace_id,
+            work_id,
+        } => {
+            collaboration_send(
+                client,
+                origin,
+                target,
+                kind,
+                body,
+                work_mode,
+                workspace_id,
+                work_id,
+            )
+            .await
+        }
         PendingAction::CollaborationReply {
             origin,
             request_id,
@@ -2870,6 +2897,7 @@ async fn collaboration_inbox(client: &Client, origin: CollaborationOrigin) -> Ac
     }
 }
 
+#[allow(clippy::too_many_arguments)] // collaboration envelope fields stay explicit at the UI boundary
 async fn collaboration_send(
     client: &Client,
     origin: CollaborationOrigin,
@@ -2877,13 +2905,22 @@ async fn collaboration_send(
     kind: RequestKind,
     body: String,
     work_mode: WorkMode,
+    workspace_id: Option<String>,
+    work_id: Option<String>,
 ) -> ActionOutcome {
     let request = NewRequest {
         kind,
         body,
         expects_reply: kind != RequestKind::Notice,
         work_mode,
+        thread_id: None,
+        parent_request_id: None,
+        workspace_id,
+        work_id,
+        run_id: None,
         paths: Vec::new(),
+        artifacts: Vec::new(),
+        links: Vec::new(),
         air_artifacts: Vec::new(),
     };
     match client.collaboration_send(&origin, &target, &request).await {
@@ -4558,15 +4595,17 @@ fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &DashboardApp) {
     );
     f.render_widget(Paragraph::new(detail_lines).block(detail_block), chunks[1]);
 
-    let help = app.data.collaboration.unavailable.as_deref().map_or_else(
-        || match tab {
+    let help = app
+        .data
+        .collaboration
+        .unavailable
+        .as_deref()
+        .unwrap_or(match tab {
             CollaborationTab::Incoming => {
                 "Tab mailbox · ↑↓ select · i claim inbox · e reply · Esc/b close"
             }
             CollaborationTab::Sent => "Tab mailbox · ↑↓ select · x cancel queued · Esc/b close",
-        },
-        |error| error,
-    );
+        });
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(help, app.theme.dim_style()))),
         chunks[2],
@@ -5180,6 +5219,8 @@ mod tests {
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: None,
+            work_id: None,
             socket: None,
             pane_id: pane_id.to_string(),
             session_id: String::new(),
@@ -5203,6 +5244,7 @@ mod tests {
             display_name: Some(name.to_string()),
             cwd: Some("/tmp/pty".into()),
             attached_clients: 0,
+            has_been_attached: false,
             exited: false,
             exit_status: None,
             pid: Some(99),
@@ -5252,7 +5294,14 @@ mod tests {
             body: "review the auth change".into(),
             expects_reply: true,
             work_mode: WorkMode::ReadOnly,
+            thread_id: None,
+            parent_request_id: None,
+            workspace_id: None,
+            work_id: None,
+            run_id: None,
             paths: Vec::new(),
+            artifacts: Vec::new(),
+            links: Vec::new(),
             air_artifacts: Vec::new(),
             status,
             created_at: now,
@@ -6511,7 +6560,7 @@ mod tests {
             unlinked_executions: Vec::new(),
         };
 
-        let data = build_work_dashboard_data(
+        let mut data = build_work_dashboard_data(
             now,
             snapshot,
             Vec::new(),
@@ -6528,6 +6577,25 @@ mod tests {
             card.action_targets().first(),
             Some(ActionTarget::TopologyPane(key))
                 if key.window.session.endpoint.socket == "alpha" && key.pane_id == "%1"
+        ));
+
+        attach_collaboration(
+            &mut data,
+            fake_participant("%2", "console-anchor", None, &[]),
+            vec![fake_participant("%1", "agent-1", Some("reviewer"), &[])],
+        );
+        let mut app = DashboardApp::new(data, WatchTheme::Classic);
+        assert!(matches!(
+            open_collaboration_composer(&mut app),
+            UiAction::None
+        ));
+        assert!(matches!(
+            app.composer.as_ref().map(|composer| &composer.target),
+            Some(PromptTarget::CollaborationSend {
+                workspace_id: Some(workspace_id),
+                work_id: Some(work_id),
+                ..
+            }) if workspace_id == "muxa" && work_id == "dashboard-v2"
         ));
     }
 

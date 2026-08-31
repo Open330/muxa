@@ -67,6 +67,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused, so the one command that resolved the skew could not be run against a
   daemon skewed far enough to need it.
 
+## [0.8.39] - 2026-08-31
+
+### Fixed
+
+- **A reply must carry a body.** `create` refuses an empty request body;
+  `reply` refused nothing, so an argument that did not survive its shell closed
+  the request with an empty answer in it — and, the request now being terminal,
+  the real answer could never be posted to that thread. The sender saw
+  `completed` with an empty body, which reads as a reviewer who had nothing to
+  say rather than as a delivery that went missing. A blank or whitespace-only
+  reply is now `EmptyMessage`, leaving the request claimed and still
+  answerable, and the stored body is trimmed the way a request body already
+  was. This holds for every terminal status: a decline with no reason tells the
+  sender as little as an empty completion does.
+
+- **A release syncs the Homebrew tap again.** `tap-bump` listens for
+  `release: published`, which worked while a human published each draft and
+  stopped the moment the release workflow started publishing for itself:
+  GitHub does not start workflows from events raised with the automatic
+  `GITHUB_TOKEN`. v0.8.38 published cleanly and left the formula on v0.8.37,
+  with nothing failing anywhere to say so — the worst shape a break can take.
+  The release run now *calls* `tap-bump` as a reusable workflow once the
+  publish job succeeds. The event trigger stays for releases published by
+  hand, and the two cannot double up, since the automated publish raises no
+  event to begin with.
+
+
+## [0.8.38] - 2026-08-31
+
+### Fixed
+
+- **`--placement window` no longer collides with a window named after its own
+  session.** Adding a window to an existing session failed with `create window
+  failed: index 0 in use`, and removing every other window did not help. Muxa
+  resolved a pane/window/session target to the owning session's *name* and
+  passed it to `tmux new-window -t`, which takes a **window** target: a string
+  with no colon is looked up as a window in the caller's current session before
+  it is tried as a session. Muxa's own topology makes that collision the common
+  case rather than a corner — one session per workspace, whose first window is
+  usually named after it — so `-t junia` found the window `junia` at index 0 and
+  refused to create anything there. The target is now the session *id* with a
+  trailing colon (`$7:`), which cannot be read as a window name and leaves the
+  index for tmux to choose.
+
+  Reading the target had the same flaw with a quieter ending: asked plainly for
+  `--target junia`, tmux answered with the id of whichever session owned a
+  window named `junia` — the caller's — so the window was created there, in the
+  wrong session, without an error. A name is now resolved as a session first
+  (`junia:`) and falls back to the plain form, which is what a window-name
+  target needs and the only form ids accept. A failing launch also names the
+  resolved target,
+  since the address tmux was given is not the one the caller typed. Covered by
+  a regression test that drives the real binary against a private tmux server
+  laid out that way, through all four addresses muxa accepts — session id,
+  session name, window id, pane id.
+
+
+### Added
+
+- **MCP agents can call an explicitly authorized agent on any Fleet host.**
+  `muxa_fleet_call_peer` sends a durable structured request to an explicit
+  host and live pane; it never auto-selects or spawns remotely, defaults to
+  review/read-only, and requires remote `mode = "control"`. Its bounded wait
+  returns an exact `pane_key` for `muxa_fleet_wait_reply`, which retrieves the
+  reply by durable request id even after the target pane exits. A new
+  `collaboration_get` relay capability rejects mixed-version nodes before the
+  controller sends an unsupported frame.
+- **Collaboration history now has stable causal and Work identity.** Requests
+  carry canonical thread/parent, workspace/Work/Run, artifact, and link
+  metadata. Managed pane metadata fills missing Work identity; CLI and MCP
+  callers can provide or override it. Parent links are validated in-room and
+  cannot cross participant pairs or conflict with the parent thread.
+- **History can be filtered and paged without loading it all into the web
+  dashboard.** The indexed query supports time, Work/workspace, thread/parent,
+  kind, status, and exact room filters plus newest-first keyset cursors. `muxa
+  msg list` exposes compatible conjunctive filters with local `--offset` /
+  `--limit`, preserving its legacy bare-array JSON and older-daemon behavior.
+- **Collaboration is visual, in both terminal and browser.** Watch's collab
+  screen toggles its table and chronological lifeline sequence with `v`,
+  `:layout sequence`, `--collab-layout sequence`, or `[watch] collab_layout`.
+  The web dashboard adds a cross-room participant graph, aggregated directional
+  request/reply edges, room/edge sequence drill-down, filters, and load-more.
+
+### Changed
+
+- **Watch `M` follows hierarchy scope instead of collapsing parents to one
+  pane.** A window shows its whole room and a session shows every room grouped
+  by window. Aggregate views are read-only; pane history retains compose,
+  claim, reply, and incoming/sent actions.
+- **The durable mailbox is now indexed SQLite.** The historical
+  `collaboration.json` path maps to `collaboration.sqlite3`; existing JSON is
+  imported transactionally once and retained as a migration backup. Optional
+  `retention_days` prunes only fully delivered terminal threads at daemon
+  startup, never partial causal chains or live/unread state.
+
+### Security
+
+- **Dashboard collaboration details require strict token-auth mode.** In
+  `public_read` and `none`, the API and graph retain topology/status metadata
+  but redact request/reply bodies, provenance, paths, artifacts, links, and AIR
+  references; supplying a PAT does not unredact a `public_read` server.
+- SQLite, WAL, and shared-memory files are owner-only (`0600`). The retained
+  legacy JSON remains a duplicate body copy outside retention; operators
+  should archive or remove it under equivalent controls when rollback is no
+  longer needed, and must not run an older daemon against it after migration.
+
 ## [0.8.37] - 2026-08-28
 
 ### Added
@@ -2673,7 +2779,7 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.37...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.39...HEAD
 [0.8.26]: https://github.com/Open330/muxa/compare/v0.8.25...v0.8.26
 [0.8.25]: https://github.com/Open330/muxa/compare/v0.8.24...v0.8.25
 [0.8.24]: https://github.com/Open330/muxa/compare/v0.8.23...v0.8.24

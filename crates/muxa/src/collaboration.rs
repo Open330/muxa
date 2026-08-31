@@ -7,16 +7,21 @@
 use crate::event::{AgentKind, AgentState};
 use crate::state::Agent;
 use crate::tmux::PaneInfo;
+use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{watch, Mutex, RwLock};
 
 pub const COLLABORATION_SCHEMA_VERSION: u32 = 1;
+const COLLABORATION_DATABASE_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_QUERY_LIMIT: usize = 100;
+const MAX_QUERY_LIMIT: usize = 500;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 const MAX_AIR_ARTIFACT_REFERENCES: usize = 8;
 const MAX_AIR_REFERENCE_LABEL_BYTES: usize = 256;
@@ -28,6 +33,8 @@ pub struct CollaborationOptions {
     pub path: Option<PathBuf>,
     pub max_message_bytes: usize,
     pub scope: crate::config::CollaborationScope,
+    /// Optional terminal-thread retention. `None` preserves history forever.
+    pub retention_days: Option<u64>,
 }
 
 impl Default for CollaborationOptions {
@@ -37,6 +44,7 @@ impl Default for CollaborationOptions {
             path: None,
             max_message_bytes: 16 * 1024,
             scope: crate::config::CollaborationScope::default(),
+            retention_days: None,
         }
     }
 }
@@ -105,6 +113,19 @@ fn addresses(to: &Participant, caller: &Participant) -> bool {
         // request could be adopted by whatever agent later occupies the same
         // pane id in an unrelated window.
         && to.room == caller.room
+}
+
+fn same_endpoint_in_room(left: &Participant, right: &Participant) -> bool {
+    left.same_endpoint(right) && left.room == right.room
+}
+
+fn same_participant_pair(
+    parent: &CollaborationRequest,
+    from: &Participant,
+    to: &Participant,
+) -> bool {
+    (same_endpoint_in_room(&parent.from, from) && same_endpoint_in_room(&parent.to, to))
+        || (same_endpoint_in_room(&parent.from, to) && same_endpoint_in_room(&parent.to, from))
 }
 
 /// Pin a pending recipient to the concrete session now acting as it, so every
@@ -523,8 +544,32 @@ pub struct CollaborationRequest {
     pub body: String,
     pub expects_reply: bool,
     pub work_mode: WorkMode,
+    /// Stable id shared by every request in one causal conversation.
+    ///
+    /// A child whose caller omits this value inherits its parent's canonical
+    /// thread id. For a legacy parent with no explicit id, the parent's
+    /// request id becomes the canonical thread id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    /// The exact request that caused this request. The store rejects missing
+    /// parents and cross-thread parent links when creating new requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
+    /// Generic artifact identifiers or locators. AIR artifacts retain their
+    /// typed representation in `air_artifacts`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
+    /// Generic relationship/URL locators associated with the request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub air_artifacts: Vec<AirArtifactReference>,
     pub status: RequestStatus,
@@ -613,9 +658,98 @@ pub struct NewRequest {
     pub body: String,
     pub expects_reply: bool,
     pub work_mode: WorkMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<String>,
     #[serde(default)]
     pub air_artifacts: Vec<AirArtifactReference>,
+}
+
+impl Default for NewRequest {
+    fn default() -> Self {
+        Self {
+            kind: RequestKind::Question,
+            body: String::new(),
+            expects_reply: true,
+            work_mode: WorkMode::ReadOnly,
+            thread_id: None,
+            parent_request_id: None,
+            workspace_id: None,
+            work_id: None,
+            run_id: None,
+            paths: Vec::new(),
+            artifacts: Vec::new(),
+            links: Vec::new(),
+            air_artifacts: Vec::new(),
+        }
+    }
+}
+
+/// Exclusive keyset cursor for newest-first collaboration history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollaborationCursor {
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    pub id: String,
+}
+
+/// Indexed collaboration-history filters. `since` is inclusive; `cursor` is
+/// exclusive. Room matching is exact across host, socket and tmux window id.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollaborationQuery {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub since: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<RequestKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<RequestStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<RoomId>,
+    /// Exact tmux session aggregate. Agent-originated requests are anchored
+    /// to `from`; console-originated requests are anchored to their target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_session_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<CollaborationCursor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CollaborationPage {
+    pub requests: Vec<CollaborationRequest>,
+    /// Number of rows matching the filters and mailbox scope before applying
+    /// the cursor. This lets overview surfaces size history without offsets.
+    pub total: usize,
+    pub has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<CollaborationCursor>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -642,6 +776,16 @@ pub enum CollaborationError {
     InvalidAirArtifactReference(String),
     #[error("request not found: {0}")]
     NotFound(String),
+    #[error("parent collaboration request not found: {0}")]
+    ParentNotFound(String),
+    #[error("parent collaboration request {0} does not involve this participant pair and room")]
+    InvalidParentScope(String),
+    #[error("thread {thread_id:?} conflicts with parent {parent_request_id}'s thread {parent_thread_id:?}")]
+    ThreadMismatch {
+        thread_id: String,
+        parent_request_id: String,
+        parent_thread_id: String,
+    },
     #[error("request {0} does not belong to the calling participant")]
     NotParticipant(String),
     #[error(
@@ -668,6 +812,8 @@ pub enum CollaborationError {
     Persistence(#[from] std::io::Error),
     #[error("invalid persisted mailbox: {0}")]
     InvalidSnapshot(#[from] serde_json::Error),
+    #[error("collaboration database error: {0}")]
+    Database(#[from] rusqlite::Error),
     #[error("unsupported collaboration schema: {0}")]
     UnsupportedSchema(u32),
 }
@@ -680,14 +826,659 @@ struct Snapshot {
     identities: Vec<CollaborationIdentity>,
 }
 
-/// In-memory mailbox with an optional atomic JSON snapshot. Collaboration
-/// traffic is low-volume, so rewriting the mailbox after mutations is
-/// simpler and safer than maintaining a database or partially-replayed log.
+fn has_database_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "sqlite" | "sqlite3" | "db"
+            )
+        })
+}
+
+fn collaboration_database_path(legacy_path: &Path) -> PathBuf {
+    if has_database_extension(legacy_path) {
+        legacy_path.to_path_buf()
+    } else {
+        legacy_path.with_extension("sqlite3")
+    }
+}
+
+fn is_sqlite_header(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"SQLite format 3\0")
+}
+
+#[cfg(unix)]
+fn secure_database_files(path: &Path) -> Result<(), CollaborationError> {
+    use std::os::unix::fs::PermissionsExt;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        let candidate = PathBuf::from(candidate);
+        if candidate.exists() {
+            std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_database_files(_path: &Path) -> Result<(), CollaborationError> {
+    Ok(())
+}
+
+/// Create the main database with owner-only permissions before SQLite opens
+/// it. Chmod existing files as well: relying on the process umask would leave
+/// a short first-open window where collaboration bodies could be world-readable.
+#[cfg(unix)]
+fn prepare_database_file(path: &Path) -> Result<(), CollaborationError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_database_file(_path: &Path) -> Result<(), CollaborationError> {
+    Ok(())
+}
+
+fn open_database(path: &Path) -> Result<Connection, CollaborationError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    prepare_database_file(path)?;
+    let connection = Connection::open(path)?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > COLLABORATION_DATABASE_SCHEMA_VERSION {
+        return Err(CollaborationError::UnsupportedSchema(version));
+    }
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS collaboration_requests (
+             id TEXT PRIMARY KEY,
+             created_at_ns INTEGER NOT NULL,
+             thread_id TEXT,
+             parent_request_id TEXT,
+             workspace_id TEXT,
+             work_id TEXT,
+             run_id TEXT,
+             kind TEXT NOT NULL,
+             status TEXT NOT NULL,
+             from_room_host TEXT NOT NULL,
+             from_room_socket TEXT,
+             from_room_window_id TEXT NOT NULL,
+             to_room_host TEXT NOT NULL,
+             to_room_socket TEXT,
+             to_room_window_id TEXT NOT NULL,
+             from_pane TEXT NOT NULL,
+             from_socket TEXT,
+             from_agent_session_id TEXT NOT NULL,
+             to_pane TEXT NOT NULL,
+             to_socket TEXT,
+             to_agent_session_id TEXT NOT NULL,
+             anchor_tmux_session_id TEXT,
+             anchor_tmux_session_name TEXT,
+             payload TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS collab_created_idx
+             ON collaboration_requests(created_at_ns DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS collab_work_idx
+             ON collaboration_requests(
+                 workspace_id, work_id, created_at_ns DESC, id DESC
+             );
+         CREATE INDEX IF NOT EXISTS collab_work_id_idx
+             ON collaboration_requests(work_id, created_at_ns DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS collab_thread_idx
+             ON collaboration_requests(thread_id, created_at_ns DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS collab_parent_idx
+             ON collaboration_requests(parent_request_id, created_at_ns DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS collab_kind_idx
+             ON collaboration_requests(kind, created_at_ns DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS collab_status_idx
+             ON collaboration_requests(status, created_at_ns DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS collab_from_room_idx
+             ON collaboration_requests(
+                 from_room_host, from_room_socket, from_room_window_id,
+                 created_at_ns DESC, id DESC
+             );
+         CREATE INDEX IF NOT EXISTS collab_to_room_idx
+             ON collaboration_requests(
+                 to_room_host, to_room_socket, to_room_window_id,
+                 created_at_ns DESC, id DESC
+             );
+         CREATE INDEX IF NOT EXISTS collab_from_endpoint_idx
+             ON collaboration_requests(
+                 from_pane, from_socket, from_agent_session_id,
+                 created_at_ns DESC, id DESC
+             );
+         CREATE INDEX IF NOT EXISTS collab_to_endpoint_idx
+             ON collaboration_requests(
+                 to_pane, to_socket, to_agent_session_id,
+                 created_at_ns DESC, id DESC
+             );
+         CREATE INDEX IF NOT EXISTS collab_tmux_session_idx
+             ON collaboration_requests(
+                 anchor_tmux_session_id, created_at_ns DESC, id DESC
+             );
+         CREATE INDEX IF NOT EXISTS collab_tmux_session_name_idx
+             ON collaboration_requests(
+                 anchor_tmux_session_name, created_at_ns DESC, id DESC
+             );
+         CREATE TABLE IF NOT EXISTS collaboration_identities (
+             identity_key TEXT PRIMARY KEY,
+             payload TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS collaboration_metadata (
+             key TEXT PRIMARY KEY,
+             value TEXT NOT NULL
+         );",
+    )?;
+    connection.pragma_update(None, "user_version", COLLABORATION_DATABASE_SCHEMA_VERSION)?;
+    secure_database_files(path)?;
+    Ok(connection)
+}
+
+fn timestamp_nanos(value: OffsetDateTime) -> Result<i64, CollaborationError> {
+    i64::try_from(value.unix_timestamp_nanos()).map_err(|_| {
+        CollaborationError::Persistence(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "collaboration timestamp is outside SQLite's indexed range",
+        ))
+    })
+}
+
+fn request_kind_name(kind: RequestKind) -> &'static str {
+    match kind {
+        RequestKind::Question => "question",
+        RequestKind::Review => "review",
+        RequestKind::Task => "task",
+        RequestKind::Notice => "notice",
+    }
+}
+
+fn request_status_name(status: RequestStatus) -> &'static str {
+    match status {
+        RequestStatus::Queued => "queued",
+        RequestStatus::Claimed => "claimed",
+        RequestStatus::Completed => "completed",
+        RequestStatus::Blocked => "blocked",
+        RequestStatus::Declined => "declined",
+        RequestStatus::Failed => "failed",
+        RequestStatus::Expired => "expired",
+        RequestStatus::Cancelled => "cancelled",
+    }
+}
+
+const UPSERT_REQUEST_SQL: &str = "INSERT INTO collaboration_requests (
+         id, created_at_ns, thread_id, parent_request_id, workspace_id, work_id, run_id,
+         kind, status,
+         from_room_host, from_room_socket, from_room_window_id,
+         to_room_host, to_room_socket, to_room_window_id,
+         from_pane, from_socket, from_agent_session_id,
+         to_pane, to_socket, to_agent_session_id,
+         anchor_tmux_session_id, anchor_tmux_session_name, payload
+     ) VALUES (
+         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+         ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+     ) ON CONFLICT(id) DO UPDATE SET
+         created_at_ns=excluded.created_at_ns,
+         thread_id=excluded.thread_id,
+         parent_request_id=excluded.parent_request_id,
+         workspace_id=excluded.workspace_id,
+         work_id=excluded.work_id,
+         run_id=excluded.run_id,
+         kind=excluded.kind,
+         status=excluded.status,
+         from_room_host=excluded.from_room_host,
+         from_room_socket=excluded.from_room_socket,
+         from_room_window_id=excluded.from_room_window_id,
+         to_room_host=excluded.to_room_host,
+         to_room_socket=excluded.to_room_socket,
+         to_room_window_id=excluded.to_room_window_id,
+         from_pane=excluded.from_pane,
+         from_socket=excluded.from_socket,
+         from_agent_session_id=excluded.from_agent_session_id,
+         to_pane=excluded.to_pane,
+         to_socket=excluded.to_socket,
+         to_agent_session_id=excluded.to_agent_session_id,
+         anchor_tmux_session_id=excluded.anchor_tmux_session_id,
+         anchor_tmux_session_name=excluded.anchor_tmux_session_name,
+         payload=excluded.payload";
+
+const IMPORT_REQUEST_SQL: &str = "INSERT OR IGNORE INTO collaboration_requests (
+         id, created_at_ns, thread_id, parent_request_id, workspace_id, work_id, run_id,
+         kind, status,
+         from_room_host, from_room_socket, from_room_window_id,
+         to_room_host, to_room_socket, to_room_window_id,
+         from_pane, from_socket, from_agent_session_id,
+         to_pane, to_socket, to_agent_session_id,
+         anchor_tmux_session_id, anchor_tmux_session_name, payload
+     ) VALUES (
+         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+         ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+     )";
+
+fn write_request(
+    connection: &Connection,
+    request: &CollaborationRequest,
+    import_only: bool,
+) -> Result<(), CollaborationError> {
+    let payload = serde_json::to_string(request)?;
+    let anchor = if request.from.console {
+        &request.to
+    } else {
+        &request.from
+    };
+    connection.execute(
+        if import_only {
+            IMPORT_REQUEST_SQL
+        } else {
+            UPSERT_REQUEST_SQL
+        },
+        params![
+            request.id,
+            timestamp_nanos(request.created_at)?,
+            request.thread_id,
+            request.parent_request_id,
+            request.workspace_id,
+            request.work_id,
+            request.run_id,
+            request_kind_name(request.kind),
+            request_status_name(request.status),
+            request.from.room.host,
+            request.from.room.socket,
+            request.from.room.window_id,
+            request.to.room.host,
+            request.to.room.socket,
+            request.to.room.window_id,
+            request.from.pane,
+            request.from.socket,
+            request.from.agent_session_id,
+            request.to.pane,
+            request.to.socket,
+            request.to.agent_session_id,
+            anchor.tmux_session_id,
+            anchor.tmux_session_name,
+            payload,
+        ],
+    )?;
+    Ok(())
+}
+
+fn identity_key(identity: &CollaborationIdentity) -> Result<String, CollaborationError> {
+    Ok(serde_json::to_string(&(
+        &identity.room,
+        &identity.pane,
+        &identity.socket,
+        &identity.agent_session_id,
+    ))?)
+}
+
+fn load_database(
+    path: &Path,
+    legacy: Option<&Snapshot>,
+) -> Result<
+    (
+        HashMap<String, CollaborationRequest>,
+        Vec<CollaborationIdentity>,
+    ),
+    CollaborationError,
+> {
+    let mut connection = open_database(path)?;
+    let migrated = connection
+        .query_row(
+            "SELECT value FROM collaboration_metadata WHERE key = 'legacy_json_imported'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some();
+    if !migrated {
+        let transaction = connection.transaction()?;
+        if let Some(snapshot) = legacy {
+            for request in &snapshot.requests {
+                let mut request = request.clone();
+                request.thread_id.get_or_insert_with(|| request.id.clone());
+                write_request(&transaction, &request, true)?;
+            }
+            for identity in &snapshot.identities {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO collaboration_identities (identity_key, payload)
+                     VALUES (?1, ?2)",
+                    params![identity_key(identity)?, serde_json::to_string(identity)?],
+                )?;
+            }
+        }
+        transaction.execute(
+            "INSERT OR REPLACE INTO collaboration_metadata (key, value)
+             VALUES ('legacy_json_imported', '1')",
+            [],
+        )?;
+        transaction.commit()?;
+        secure_database_files(path)?;
+    }
+
+    let mut requests = HashMap::new();
+    let mut backfilled = Vec::new();
+    {
+        let mut statement = connection.prepare("SELECT payload FROM collaboration_requests")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let mut request: CollaborationRequest = serde_json::from_str(&row?)?;
+            if request.thread_id.is_none() {
+                request.thread_id = Some(request.id.clone());
+                backfilled.push(request.clone());
+            }
+            requests.insert(request.id.clone(), request);
+        }
+    }
+    if !backfilled.is_empty() {
+        let transaction = connection.transaction()?;
+        for request in &backfilled {
+            write_request(&transaction, request, false)?;
+        }
+        transaction.commit()?;
+        secure_database_files(path)?;
+    }
+    let mut identities = Vec::new();
+    {
+        let mut statement = connection.prepare("SELECT payload FROM collaboration_identities")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            identities.push(serde_json::from_str(&row?)?);
+        }
+    }
+    Ok((requests, identities))
+}
+
+fn nullable_text(value: Option<&String>) -> Value {
+    value.map_or(Value::Null, |value| Value::Text(value.clone()))
+}
+
+fn push_room_values(values: &mut Vec<Value>, room: &RoomId) {
+    values.push(Value::Text(room.host.clone()));
+    values.push(nullable_text(room.socket.as_ref()));
+    values.push(Value::Text(room.window_id.clone()));
+}
+
+fn push_endpoint_values(values: &mut Vec<Value>, participant: &Participant) {
+    values.push(Value::Text(participant.pane.clone()));
+    values.push(nullable_text(participant.socket.as_ref()));
+    values.push(Value::Text(participant.agent_session_id.clone()));
+}
+
+fn incoming_caller_clause(caller: &Participant, values: &mut Vec<Value>) -> String {
+    let mut alternatives =
+        vec!["(to_pane = ? AND to_socket IS ? AND to_agent_session_id = ?)".to_string()];
+    push_endpoint_values(values, caller);
+    if !caller.console && !is_pending_session(&caller.agent_session_id) {
+        alternatives.push(
+            "(to_agent_session_id LIKE 'pending-pane:%' AND to_pane = ? AND to_socket IS ?
+              AND to_room_host = ? AND to_room_socket IS ? AND to_room_window_id = ?)"
+                .to_string(),
+        );
+        values.push(Value::Text(caller.pane.clone()));
+        values.push(nullable_text(caller.socket.as_ref()));
+        push_room_values(values, &caller.room);
+    }
+    format!("({})", alternatives.join(" OR "))
+}
+
+fn request_access_clause(
+    caller: &Participant,
+    mailbox: RequestMailbox,
+    scope: MailboxScope,
+    values: &mut Vec<Value>,
+) -> Option<String> {
+    match scope {
+        MailboxScope::All => None,
+        MailboxScope::Room => {
+            let incoming = "(to_room_host = ? AND to_room_socket IS ? AND to_room_window_id = ?)";
+            let sent = "(from_room_host = ? AND from_room_socket IS ? AND from_room_window_id = ?)";
+            match mailbox {
+                RequestMailbox::Incoming => {
+                    push_room_values(values, &caller.room);
+                    Some(incoming.to_string())
+                }
+                RequestMailbox::Sent => {
+                    push_room_values(values, &caller.room);
+                    Some(sent.to_string())
+                }
+                RequestMailbox::All => {
+                    push_room_values(values, &caller.room);
+                    push_room_values(values, &caller.room);
+                    Some(format!("({incoming} OR {sent})"))
+                }
+            }
+        }
+        MailboxScope::Caller => {
+            let sent =
+                "(from_pane = ? AND from_socket IS ? AND from_agent_session_id = ?)".to_string();
+            match mailbox {
+                RequestMailbox::Incoming => Some(incoming_caller_clause(caller, values)),
+                RequestMailbox::Sent => {
+                    push_endpoint_values(values, caller);
+                    Some(sent)
+                }
+                RequestMailbox::All => {
+                    let incoming = incoming_caller_clause(caller, values);
+                    push_endpoint_values(values, caller);
+                    Some(format!("({incoming} OR {sent})"))
+                }
+            }
+        }
+    }
+}
+
+fn query_database(
+    path: &Path,
+    caller: &Participant,
+    mailbox: RequestMailbox,
+    scope: MailboxScope,
+    query: &CollaborationQuery,
+) -> Result<CollaborationPage, CollaborationError> {
+    let connection = open_database(path)?;
+    let mut clauses = Vec::new();
+    let mut values = Vec::new();
+    if let Some(clause) = request_access_clause(caller, mailbox, scope, &mut values) {
+        clauses.push(clause);
+    }
+    if let Some(since) = query.since {
+        clauses.push("created_at_ns >= ?".to_string());
+        values.push(Value::Integer(timestamp_nanos(since)?));
+    }
+    for (column, value) in [
+        ("workspace_id", query.workspace_id.as_ref()),
+        ("work_id", query.work_id.as_ref()),
+        ("thread_id", query.thread_id.as_ref()),
+        ("parent_request_id", query.parent_request_id.as_ref()),
+        ("anchor_tmux_session_id", query.tmux_session_id.as_ref()),
+        ("anchor_tmux_session_name", query.tmux_session_name.as_ref()),
+    ] {
+        if let Some(value) = value {
+            clauses.push(format!("{column} = ?"));
+            values.push(Value::Text(value.clone()));
+        }
+    }
+    if let Some(kind) = query.kind {
+        clauses.push("kind = ?".to_string());
+        values.push(Value::Text(request_kind_name(kind).to_string()));
+    }
+    if let Some(status) = query.status {
+        clauses.push("status = ?".to_string());
+        values.push(Value::Text(request_status_name(status).to_string()));
+    }
+    if let Some(room) = query.room.as_ref() {
+        clauses.push(
+            "((from_room_host = ? AND from_room_socket IS ? AND from_room_window_id = ?)
+              OR (to_room_host = ? AND to_room_socket IS ? AND to_room_window_id = ?))"
+                .to_string(),
+        );
+        push_room_values(&mut values, room);
+        push_room_values(&mut values, room);
+    }
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    let total: i64 = connection.query_row(
+        &format!("SELECT COUNT(*) FROM collaboration_requests{where_sql}"),
+        params_from_iter(values.iter()),
+        |row| row.get(0),
+    )?;
+
+    let mut page_clauses = clauses;
+    let mut page_values = values;
+    if let Some(cursor) = query.cursor.as_ref() {
+        let cursor_at = timestamp_nanos(cursor.created_at)?;
+        page_clauses.push("(created_at_ns < ? OR (created_at_ns = ? AND id < ?))".to_string());
+        page_values.push(Value::Integer(cursor_at));
+        page_values.push(Value::Integer(cursor_at));
+        page_values.push(Value::Text(cursor.id.clone()));
+    }
+    let page_where_sql = if page_clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", page_clauses.join(" AND "))
+    };
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_QUERY_LIMIT)
+        .clamp(1, MAX_QUERY_LIMIT);
+    page_values.push(Value::Integer(i64::try_from(limit + 1).unwrap_or(i64::MAX)));
+    let mut statement = connection.prepare(&format!(
+        "SELECT payload FROM collaboration_requests{page_where_sql}
+         ORDER BY created_at_ns DESC, id DESC LIMIT ?"
+    ))?;
+    let rows = statement.query_map(params_from_iter(page_values.iter()), |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut requests: Vec<CollaborationRequest> = Vec::new();
+    for row in rows {
+        requests.push(serde_json::from_str(&row?)?);
+    }
+    let has_more = requests.len() > limit;
+    requests.truncate(limit);
+    let next_cursor = if has_more {
+        requests.last().map(|last| CollaborationCursor {
+            created_at: last.created_at,
+            id: last.id.clone(),
+        })
+    } else {
+        None
+    };
+    Ok(CollaborationPage {
+        requests,
+        total: usize::try_from(total).unwrap_or(usize::MAX),
+        has_more,
+        next_cursor,
+    })
+}
+
+fn request_visible(
+    request: &CollaborationRequest,
+    caller: &Participant,
+    mailbox: RequestMailbox,
+    scope: MailboxScope,
+) -> bool {
+    match scope {
+        MailboxScope::Caller => match mailbox {
+            RequestMailbox::Incoming => addresses(&request.to, caller),
+            RequestMailbox::Sent => request.from.same_endpoint(caller),
+            RequestMailbox::All => {
+                request.from.same_endpoint(caller) || addresses(&request.to, caller)
+            }
+        },
+        MailboxScope::Room => match mailbox {
+            RequestMailbox::Incoming => request.to.room == caller.room,
+            RequestMailbox::Sent => request.from.room == caller.room,
+            RequestMailbox::All => {
+                request.from.room == caller.room || request.to.room == caller.room
+            }
+        },
+        MailboxScope::All => true,
+    }
+}
+
+fn request_matches_query(request: &CollaborationRequest, query: &CollaborationQuery) -> bool {
+    let session_anchor = if request.from.console {
+        &request.to
+    } else {
+        &request.from
+    };
+    query.since.is_none_or(|since| request.created_at >= since)
+        && query
+            .workspace_id
+            .as_ref()
+            .is_none_or(|workspace_id| request.workspace_id.as_ref() == Some(workspace_id))
+        && query
+            .work_id
+            .as_ref()
+            .is_none_or(|work_id| request.work_id.as_ref() == Some(work_id))
+        && query
+            .thread_id
+            .as_ref()
+            .is_none_or(|thread_id| request.thread_id.as_ref() == Some(thread_id))
+        && query
+            .parent_request_id
+            .as_ref()
+            .is_none_or(|parent| request.parent_request_id.as_ref() == Some(parent))
+        && query.kind.is_none_or(|kind| request.kind == kind)
+        && query.status.is_none_or(|status| request.status == status)
+        && query
+            .room
+            .as_ref()
+            .is_none_or(|room| request.from.room == *room || request.to.room == *room)
+        && query
+            .tmux_session_id
+            .as_ref()
+            .is_none_or(|session_id| session_anchor.tmux_session_id.as_ref() == Some(session_id))
+        && query.tmux_session_name.as_ref().is_none_or(|session_name| {
+            session_anchor.tmux_session_name.as_ref() == Some(session_name)
+        })
+}
+
+fn request_latest_activity(request: &CollaborationRequest) -> OffsetDateTime {
+    [
+        request.claimed_at,
+        request.notified_at,
+        request.reply_notified_at,
+        request.reply_read_at,
+        request.reply.as_ref().map(|reply| reply.at),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(request.created_at, std::cmp::max)
+}
+
+/// In-memory mailbox projection backed by indexed SQLite row updates when a
+/// durable path is configured. The projection keeps wake and routing reads
+/// cheap while `transaction_lock` preserves atomic durable visibility.
 pub struct CollaborationStore {
     opts: CollaborationOptions,
+    /// Indexed SQLite sidecar. The configured JSON path remains the migration
+    /// source and is deliberately retained as a recoverable backup.
+    database_path: Option<PathBuf>,
     requests: RwLock<HashMap<String, CollaborationRequest>>,
     identities: RwLock<Vec<CollaborationIdentity>>,
-    /// Serializes each in-memory mutation with its durable snapshot. Wake
+    /// Serializes each in-memory mutation with its durable row update. Wake
     /// scans also take this lock, so an unpersisted request is never visible
     /// to the delivery loop.
     transaction_lock: Mutex<()>,
@@ -722,6 +1513,7 @@ impl CollaborationStore {
                 path: None,
                 ..options
             },
+            database_path: None,
             requests: RwLock::new(HashMap::new()),
             identities: RwLock::new(Vec::new()),
             reservations: RwLock::new(Vec::new()),
@@ -731,31 +1523,75 @@ impl CollaborationStore {
     }
 
     pub async fn load(options: CollaborationOptions) -> Result<Arc<Self>, CollaborationError> {
-        let mut requests = HashMap::new();
-        let mut identities = Vec::new();
-        if let Some(path) = options.path.as_ref() {
-            match tokio::fs::read(path).await {
-                Ok(bytes) => {
-                    let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
-                    if snapshot.version != COLLABORATION_SCHEMA_VERSION {
-                        return Err(CollaborationError::UnsupportedSchema(snapshot.version));
+        let (legacy, configured_path_is_database) = if let Some(path) = options.path.as_ref() {
+            if has_database_extension(path) {
+                (None, true)
+            } else {
+                match tokio::fs::File::open(path).await {
+                    Ok(mut file) => {
+                        let mut header = [0_u8; 16];
+                        let bytes_read = file.read(&mut header).await?;
+                        if is_sqlite_header(&header[..bytes_read]) {
+                            (None, true)
+                        } else {
+                            let bytes = tokio::fs::read(path).await?;
+                            let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
+                            if snapshot.version != COLLABORATION_SCHEMA_VERSION {
+                                return Err(CollaborationError::UnsupportedSchema(
+                                    snapshot.version,
+                                ));
+                            }
+                            (Some(snapshot), false)
+                        }
                     }
-                    requests.extend(snapshot.requests.into_iter().map(|r| (r.id.clone(), r)));
-                    identities = snapshot.identities;
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, false),
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
             }
-        }
+        } else {
+            (None, false)
+        };
+        let database_path = options.path.as_deref().map(|path| {
+            if configured_path_is_database {
+                path.to_path_buf()
+            } else {
+                collaboration_database_path(path)
+            }
+        });
+        let (requests, identities) = if let Some(path) = database_path.as_ref() {
+            load_database(path, legacy.as_ref())?
+        } else {
+            let snapshot = legacy.unwrap_or(Snapshot {
+                version: COLLABORATION_SCHEMA_VERSION,
+                requests: Vec::new(),
+                identities: Vec::new(),
+            });
+            (
+                snapshot
+                    .requests
+                    .into_iter()
+                    .map(|request| (request.id.clone(), request))
+                    .collect(),
+                snapshot.identities,
+            )
+        };
         let (changes, _) = watch::channel(0);
-        Ok(Arc::new(Self {
+        let store = Arc::new(Self {
             opts: options,
+            database_path,
             requests: RwLock::new(requests),
             identities: RwLock::new(identities),
             reservations: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
             changes,
-        }))
+        });
+        if let Some(days) = store.opts.retention_days {
+            let seconds = days.saturating_mul(24 * 60 * 60).min(i64::MAX as u64);
+            let cutoff = OffsetDateTime::now_utc()
+                - time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX));
+            store.prune_history(cutoff).await?;
+        }
+        Ok(store)
     }
 
     pub fn enabled(&self) -> bool {
@@ -969,7 +1805,8 @@ impl CollaborationStore {
                 });
             }
         }
-        if let Err(error) = self.persist_current().await {
+        let current_identities = self.identities.read().await.clone();
+        if let Err(error) = self.persist_identities(&current_identities) {
             *self.identities.write().await = previous;
             return Err(error);
         }
@@ -1012,7 +1849,7 @@ impl CollaborationStore {
         provenance: Option<CollaborationProvenance>,
     ) -> Result<CollaborationRequest, CollaborationError> {
         self.ensure_enabled()?;
-        let body = input.body.trim();
+        let body = input.body.trim().to_string();
         if body.is_empty() {
             return Err(CollaborationError::EmptyMessage);
         }
@@ -1025,16 +1862,53 @@ impl CollaborationStore {
         let _transaction = self.transaction_lock.lock().await;
         let previous = self.requests.read().await.clone();
         let now = OffsetDateTime::now_utc();
+        let id = next_request_id(now);
+        let supplied_thread_id = normalize_optional_id(input.thread_id);
+        let parent_request_id = normalize_optional_id(input.parent_request_id);
+        let thread_id = if let Some(parent_request_id) = parent_request_id.as_deref() {
+            let requests = self.requests.read().await;
+            let parent = requests
+                .get(parent_request_id)
+                .ok_or_else(|| CollaborationError::ParentNotFound(parent_request_id.to_string()))?;
+            if !same_participant_pair(parent, &from, &to) {
+                return Err(CollaborationError::InvalidParentScope(
+                    parent_request_id.to_string(),
+                ));
+            }
+            let parent_thread_id = parent
+                .thread_id
+                .clone()
+                .unwrap_or_else(|| parent.id.clone());
+            if let Some(thread_id) = supplied_thread_id.as_deref() {
+                if thread_id != parent_thread_id {
+                    return Err(CollaborationError::ThreadMismatch {
+                        thread_id: thread_id.to_string(),
+                        parent_request_id: parent_request_id.to_string(),
+                        parent_thread_id,
+                    });
+                }
+            }
+            Some(parent_thread_id)
+        } else {
+            Some(supplied_thread_id.unwrap_or_else(|| id.clone()))
+        };
         let request = CollaborationRequest {
-            id: next_request_id(now),
+            id,
             from,
             to,
             provenance,
             kind: input.kind,
-            body: body.to_string(),
+            body,
             expects_reply: input.expects_reply,
             work_mode: input.work_mode,
+            thread_id,
+            parent_request_id,
+            workspace_id: normalize_optional_id(input.workspace_id),
+            work_id: normalize_optional_id(input.work_id),
+            run_id: normalize_optional_id(input.run_id),
             paths: input.paths,
+            artifacts: input.artifacts,
+            links: input.links,
             air_artifacts: input.air_artifacts,
             status: RequestStatus::Queued,
             created_at: now,
@@ -1049,7 +1923,7 @@ impl CollaborationStore {
             .write()
             .await
             .insert(request.id.clone(), request.clone());
-        if let Err(error) = self.persist_current().await {
+        if let Err(error) = self.persist_requests(std::slice::from_ref(&request)) {
             *self.requests.write().await = previous;
             return Err(error);
         }
@@ -1104,7 +1978,7 @@ impl CollaborationStore {
         }
         inbox.sort_by_key(|request| request.created_at);
         if changed {
-            if let Err(error) = self.persist_current().await {
+            if let Err(error) = self.persist_requests(&inbox) {
                 *self.requests.write().await = previous;
                 return Err(error);
             }
@@ -1143,7 +2017,7 @@ impl CollaborationStore {
             }
         };
         if prepared.is_some() {
-            if let Err(error) = self.persist_current().await {
+            if let Err(error) = self.persist_requests(prepared.as_slice()) {
                 *self.requests.write().await = previous;
                 return Err(error);
             }
@@ -1162,19 +2036,17 @@ impl CollaborationStore {
         let _transaction = self.transaction_lock.lock().await;
         let changed = {
             let mut requests = self.requests.write().await;
-            requests.get_mut(request_id).is_some_and(|request| {
-                if request.wake_delivery == Some(WakeDeliveryState::Prepared) {
+            requests.get_mut(request_id).and_then(|request| {
+                (request.wake_delivery == Some(WakeDeliveryState::Prepared)).then(|| {
                     request.wake_delivery = Some(WakeDeliveryState::PromptWritten);
-                    true
-                } else {
-                    false
-                }
+                    request.clone()
+                })
             })
         };
-        if changed {
+        if let Some(changed) = changed {
             // The text side effect cannot be rolled back. Retain the in-memory
             // phase even if persistence fails, matching notification markers.
-            let result = self.persist_current().await;
+            let result = self.persist_requests(std::slice::from_ref(&changed));
             self.publish_change();
             result?;
         }
@@ -1199,6 +2071,19 @@ impl CollaborationStore {
                 | RequestStatus::Failed
         ) {
             return Err(CollaborationError::InvalidReplyStatus);
+        }
+        // The same guard `create` puts on a request body, for the same reason
+        // and one more: a reply is a terminal write. An empty one — an
+        // argument that did not survive its shell, a variable that expanded to
+        // nothing — closes the request with no answer in it, and the real
+        // answer can never be posted to that thread afterwards. The sender
+        // sees `completed` and an empty body, which reads as a reviewer with
+        // nothing to say rather than as a delivery that went missing.
+        // A refusal without a reason is no more useful than an empty
+        // completion, so this holds for every terminal status.
+        let body = body.trim().to_string();
+        if body.is_empty() {
+            return Err(CollaborationError::EmptyMessage);
         }
         if body.len() > self.opts.max_message_bytes {
             return Err(CollaborationError::MessageTooLarge(
@@ -1230,7 +2115,7 @@ impl CollaborationStore {
             });
             request.clone()
         };
-        if let Err(error) = self.persist_current().await {
+        if let Err(error) = self.persist_requests(std::slice::from_ref(&updated)) {
             *self.requests.write().await = previous;
             return Err(error);
         }
@@ -1265,7 +2150,7 @@ impl CollaborationStore {
             request.clone()
         };
         if changed {
-            if let Err(error) = self.persist_current().await {
+            if let Err(error) = self.persist_requests(std::slice::from_ref(&request)) {
                 *self.requests.write().await = previous;
                 return Err(error);
             }
@@ -1344,6 +2229,108 @@ impl CollaborationStore {
         Ok(requests)
     }
 
+    /// Query indexed durable history without changing the legacy unbounded
+    /// `list_for` contract used by older CLI, watch and MCP clients.
+    pub async fn query_for(
+        &self,
+        caller: &Participant,
+        mailbox: RequestMailbox,
+        scope: MailboxScope,
+        query: &CollaborationQuery,
+    ) -> Result<CollaborationPage, CollaborationError> {
+        self.ensure_enabled()?;
+        if !matches!(scope, MailboxScope::Caller) && !caller.console {
+            return Err(CollaborationError::ScopeDenied);
+        }
+        let _transaction = self.transaction_lock.lock().await;
+        if let Some(path) = self.database_path.as_ref() {
+            return query_database(path, caller, mailbox, scope, query);
+        }
+
+        let limit = query
+            .limit
+            .unwrap_or(DEFAULT_QUERY_LIMIT)
+            .clamp(1, MAX_QUERY_LIMIT);
+        let requests = self.requests.read().await;
+        let mut matched: Vec<_> = requests
+            .values()
+            .filter(|request| request_visible(request, caller, mailbox, scope))
+            .filter(|request| request_matches_query(request, query))
+            .cloned()
+            .collect();
+        matched
+            .sort_by(|left, right| (right.created_at, &right.id).cmp(&(left.created_at, &left.id)));
+        let total = matched.len();
+        if let Some(cursor) = query.cursor.as_ref() {
+            matched.retain(|request| {
+                (request.created_at, &request.id) < (cursor.created_at, &cursor.id)
+            });
+        }
+        let has_more = matched.len() > limit;
+        matched.truncate(limit);
+        let next_cursor = has_more.then(|| {
+            let last = matched
+                .last()
+                .expect("a positive page limit with has_more has a last row");
+            CollaborationCursor {
+                created_at: last.created_at,
+                id: last.id.clone(),
+            }
+        });
+        Ok(CollaborationPage {
+            requests: matched,
+            total,
+            has_more,
+            next_cursor,
+        })
+    }
+
+    /// Remove whole, fully delivered terminal threads whose newest activity
+    /// predates `cutoff`. Parent chains are never split, and live/unread work
+    /// is retained even when another row in the thread is old.
+    pub async fn prune_history(&self, cutoff: OffsetDateTime) -> Result<usize, CollaborationError> {
+        let _transaction = self.transaction_lock.lock().await;
+        let request_ids = {
+            let requests = self.requests.read().await;
+            let mut threads: HashMap<String, Vec<&CollaborationRequest>> = HashMap::new();
+            for request in requests.values() {
+                let thread_id = request
+                    .thread_id
+                    .clone()
+                    .unwrap_or_else(|| request.id.clone());
+                threads.entry(thread_id).or_default().push(request);
+            }
+            threads
+                .into_values()
+                .filter(|thread| {
+                    thread.iter().all(|request| {
+                        request.status.is_terminal()
+                            && request.wake_delivery.is_none()
+                            && request.reply.as_ref().is_none_or(|_| {
+                                request.reply_read_at.is_some() || request.from.console
+                            })
+                    }) && thread
+                        .iter()
+                        .map(|request| request_latest_activity(request))
+                        .max()
+                        .is_some_and(|latest| latest < cutoff)
+                })
+                .flat_map(|thread| thread.into_iter().map(|request| request.id.clone()))
+                .collect::<Vec<_>>()
+        };
+        if request_ids.is_empty() {
+            return Ok(0);
+        }
+        self.delete_requests(&request_ids)?;
+        let mut requests = self.requests.write().await;
+        for request_id in &request_ids {
+            requests.remove(request_id);
+        }
+        drop(requests);
+        self.publish_change();
+        Ok(request_ids.len())
+    }
+
     pub async fn cancel_for(
         &self,
         caller: &Participant,
@@ -1369,7 +2356,7 @@ impl CollaborationStore {
             }
             request.clone()
         };
-        if let Err(error) = self.persist_current().await {
+        if let Err(error) = self.persist_requests(std::slice::from_ref(&cancelled)) {
             *self.requests.write().await = previous;
             return Err(error);
         }
@@ -1423,7 +2410,7 @@ impl CollaborationStore {
         let _transaction = self.transaction_lock.lock().await;
         let changed = {
             let mut requests = self.requests.write().await;
-            requests.get_mut(request_id).is_some_and(|request| {
+            requests.get_mut(request_id).and_then(|request| {
                 if request.notified_at.is_none()
                     && (request.status == RequestStatus::Queued || request.wake_delivery.is_some())
                 {
@@ -1432,17 +2419,17 @@ impl CollaborationStore {
                     if !request.expects_reply && request.status == RequestStatus::Claimed {
                         request.status = RequestStatus::Completed;
                     }
-                    true
+                    Some(request.clone())
                 } else {
-                    false
+                    None
                 }
             })
         };
-        if changed {
+        if let Some(changed) = changed {
             // The terminal injection already happened. Keep the in-memory
             // marker even if disk persistence fails so the live daemon does
             // not inject the same wake on the next revision/reconcile scan.
-            let result = self.persist_current().await;
+            let result = self.persist_requests(std::slice::from_ref(&changed));
             self.publish_change();
             result?;
         }
@@ -1453,21 +2440,21 @@ impl CollaborationStore {
         let _transaction = self.transaction_lock.lock().await;
         let changed = {
             let mut requests = self.requests.write().await;
-            requests.get_mut(request_id).is_some_and(|request| {
+            requests.get_mut(request_id).and_then(|request| {
                 if request.status.is_terminal()
                     && request.reply.is_some()
                     && request.reply_notified_at.is_none()
                 {
                     request.reply_notified_at = Some(OffsetDateTime::now_utc());
-                    true
+                    Some(request.clone())
                 } else {
-                    false
+                    None
                 }
             })
         };
-        if changed {
+        if let Some(changed) = changed {
             // As above, a delivered side effect cannot be rolled back.
-            let result = self.persist_current().await;
+            let result = self.persist_requests(std::slice::from_ref(&changed));
             self.publish_change();
             result?;
         }
@@ -1517,48 +2504,64 @@ impl CollaborationStore {
         }
     }
 
-    /// Persist the current transaction. The caller must hold
-    /// `transaction_lock` until this returns.
-    async fn persist_current(&self) -> Result<(), CollaborationError> {
-        let Some(path) = self.opts.path.as_ref() else {
+    /// Upsert only requests changed by the current transaction. History
+    /// growth therefore does not turn every state transition into a rewrite
+    /// of every prior message.
+    fn persist_requests(
+        &self,
+        requests: &[CollaborationRequest],
+    ) -> Result<(), CollaborationError> {
+        let Some(path) = self.database_path.as_ref() else {
             return Ok(());
         };
-        let mut requests: Vec<_> = self.requests.read().await.values().cloned().collect();
-        requests.sort_by_key(|request| request.created_at);
-        let mut identities = self.identities.read().await.clone();
-        identities.sort_by(|left, right| {
-            (
-                &left.room.host,
-                &left.room.socket,
-                &left.room.window_id,
-                &left.pane,
-                &left.agent_session_id,
-            )
-                .cmp(&(
-                    &right.room.host,
-                    &right.room.socket,
-                    &right.room.window_id,
-                    &right.pane,
-                    &right.agent_session_id,
-                ))
-        });
-        let snapshot = Snapshot {
-            version: COLLABORATION_SCHEMA_VERSION,
-            requests,
-            identities,
+        let mut connection = open_database(path)?;
+        let transaction = connection.transaction()?;
+        for request in requests {
+            write_request(&transaction, request, false)?;
+        }
+        transaction.commit()?;
+        secure_database_files(path)?;
+        Ok(())
+    }
+
+    /// Identity rows are tiny and mutable (including deletion), so replace
+    /// their independent table atomically without touching request history.
+    fn persist_identities(
+        &self,
+        identities: &[CollaborationIdentity],
+    ) -> Result<(), CollaborationError> {
+        let Some(path) = self.database_path.as_ref() else {
+            return Ok(());
         };
-        let bytes = serde_json::to_vec_pretty(&snapshot)?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        let mut connection = open_database(path)?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM collaboration_identities", [])?;
+        for identity in identities {
+            transaction.execute(
+                "INSERT INTO collaboration_identities (identity_key, payload) VALUES (?1, ?2)",
+                params![identity_key(identity)?, serde_json::to_string(identity)?],
+            )?;
         }
-        let tmp = path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, bytes).await?;
-        #[cfg(unix)]
+        transaction.commit()?;
+        secure_database_files(path)?;
+        Ok(())
+    }
+
+    fn delete_requests(&self, request_ids: &[String]) -> Result<(), CollaborationError> {
+        let Some(path) = self.database_path.as_ref() else {
+            return Ok(());
+        };
+        let mut connection = open_database(path)?;
+        let transaction = connection.transaction()?;
         {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
+            let mut statement =
+                transaction.prepare("DELETE FROM collaboration_requests WHERE id = ?1")?;
+            for request_id in request_ids {
+                statement.execute([request_id])?;
+            }
         }
-        tokio::fs::rename(tmp, path).await?;
+        transaction.commit()?;
+        secure_database_files(path)?;
         Ok(())
     }
 }
@@ -2101,6 +3104,13 @@ fn mint_from_family(base: &str, taken: &[String]) -> Option<String> {
 /// walk rather than expressing a policy.
 const MINT_FAMILY_LIMIT: usize = 64;
 
+fn normalize_optional_id(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
 fn normalize_alias(alias: Option<String>) -> Result<Option<String>, CollaborationError> {
     let Some(alias) = alias else {
         return Ok(None);
@@ -2174,6 +3184,8 @@ mod tests {
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: None,
+            work_id: None,
             pane_id: pane_id.into(),
             session_id: "$1".into(),
             session: "main".into(),
@@ -2199,6 +3211,20 @@ mod tests {
                 display: "plans/review.air.json".into(),
                 disclosure: AirLocatorDisclosure::LocalOnly,
             }),
+        }
+    }
+
+    fn remove_database_files(legacy_path: &Path) {
+        let database_path = collaboration_database_path(legacy_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut candidate = database_path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let candidate = PathBuf::from(candidate);
+            match std::fs::remove_file(candidate) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove test database file: {error}"),
+            }
         }
     }
 
@@ -2472,6 +3498,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -2535,6 +3562,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -2605,6 +3633,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -2650,6 +3679,120 @@ mod tests {
         assert_eq!(participants[0].agent_session_id, "real-session");
     }
 
+    /// A reply is a terminal write, so an empty one must not spend it. This
+    /// cost a real review round trip: a peer's `muxa msg reply` lost its body
+    /// to the shell, the request closed with nothing in it, and the findings
+    /// that followed were refused as "already terminal".
+    #[tokio::test]
+    async fn an_empty_reply_is_refused_and_leaves_the_request_answerable() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "reviewer");
+        let request = mailbox
+            .create(
+                sender,
+                recipient.clone(),
+                NewRequest {
+                    kind: RequestKind::Review,
+                    body: "review the diff".into(),
+                    expects_reply: true,
+                    work_mode: WorkMode::ReadOnly,
+                    paths: Vec::new(),
+                    air_artifacts: Vec::new(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        mailbox.claim_for(&recipient).await.unwrap();
+
+        for blank in ["", "   ", "\n\t "] {
+            let refused = mailbox
+                .reply(
+                    &recipient,
+                    &request.id,
+                    RequestStatus::Completed,
+                    blank.into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await;
+            assert!(
+                matches!(refused, Err(CollaborationError::EmptyMessage)),
+                "{blank:?} should be refused, got {refused:?}",
+            );
+        }
+
+        // Refusing a terminal write is only worth anything if the request is
+        // still there to answer.
+        let stored = mailbox.get_for(&recipient, &request.id).await.unwrap();
+        assert_eq!(stored.status, RequestStatus::Claimed);
+        assert!(stored.reply.is_none());
+
+        let answered = mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "  no blockers found  ".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answered.status, RequestStatus::Completed);
+        assert_eq!(
+            answered.reply.expect("reply").body,
+            "no blockers found",
+            "stored trimmed, the way a request body is",
+        );
+    }
+
+    /// A decline with no reason tells the sender as little as an empty
+    /// completion does.
+    #[tokio::test]
+    async fn every_terminal_status_needs_a_body() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "reviewer");
+        for status in [
+            RequestStatus::Declined,
+            RequestStatus::Blocked,
+            RequestStatus::Failed,
+        ] {
+            let request = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        kind: RequestKind::Question,
+                        body: "is the release green?".into(),
+                        expects_reply: true,
+                        work_mode: WorkMode::ReadOnly,
+                        paths: Vec::new(),
+                        air_artifacts: Vec::new(),
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let refused = mailbox
+                .reply(
+                    &recipient,
+                    &request.id,
+                    status,
+                    String::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await;
+            assert!(
+                matches!(refused, Err(CollaborationError::EmptyMessage)),
+                "{status:?} with no body should be refused, got {refused:?}",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn request_claim_and_reply_round_trip() {
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
@@ -2666,6 +3809,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: vec!["src/auth.rs".into()],
                     air_artifacts: vec![air_reference(AirArtifactProfile::PlanNativeCli)],
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -2725,6 +3869,7 @@ mod tests {
                     work_mode: WorkMode::Execute,
                     paths: vec!["src/auth.rs".into()],
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -2772,6 +3917,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -2811,6 +3957,7 @@ mod tests {
                     work_mode: WorkMode::Execute,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -2848,6 +3995,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -2883,6 +4031,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -2916,6 +4065,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -2968,6 +4118,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -2997,6 +4148,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: vec![invalid],
+                    ..NewRequest::default()
                 },
             )
             .await;
@@ -3023,6 +4175,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -3038,6 +4191,7 @@ mod tests {
                     work_mode: WorkMode::Execute,
                     paths: vec!["src/**".into()],
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -3092,6 +4246,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -3101,7 +4256,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                std::fs::metadata(options.path.as_ref().unwrap())
+                std::fs::metadata(collaboration_database_path(options.path.as_ref().unwrap()))
                     .unwrap()
                     .permissions()
                     .mode()
@@ -3124,6 +4279,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_empty_sqlite_path_initializes_with_owner_only_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collaboration.sqlite3");
+        std::fs::write(&path, []).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let store = CollaborationStore::load(CollaborationOptions {
+            path: Some(path.clone()),
+            ..CollaborationOptions::default()
+        })
+        .await
+        .unwrap();
+        assert!(store.enabled());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn failed_persistence_rolls_back_request_before_wake_visibility() {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().join("mailbox");
@@ -3134,6 +4317,7 @@ mod tests {
         };
         let mailbox = CollaborationStore::load(options).await.unwrap();
 
+        remove_database_files(&parent.join("collaboration.json"));
         std::fs::remove_dir(&parent).unwrap();
         std::fs::write(&parent, b"blocks create_dir_all").unwrap();
         let sender = participant("%1", "sender");
@@ -3148,6 +4332,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await;
@@ -3183,12 +4368,13 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
             .unwrap();
 
-        std::fs::remove_file(path).unwrap();
+        remove_database_files(&path);
         std::fs::remove_dir(&parent).unwrap();
         std::fs::write(&parent, b"blocks create_dir_all").unwrap();
         assert!(matches!(
@@ -3224,6 +4410,7 @@ mod tests {
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
                     air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -3564,6 +4751,7 @@ mod tests {
                         work_mode: WorkMode::ReadOnly,
                         paths: Vec::new(),
                         air_artifacts: Vec::new(),
+                        ..NewRequest::default()
                     },
                 )
                 .await
@@ -3623,6 +4811,7 @@ mod tests {
                         work_mode: WorkMode::ReadOnly,
                         paths: Vec::new(),
                         air_artifacts: Vec::new(),
+                        ..NewRequest::default()
                     },
                 )
                 .await
@@ -4006,6 +5195,478 @@ mod tests {
         assert_eq!(participants[0].alias.as_deref(), Some("builder"));
         assert_eq!(participants[0].roles, vec!["implementation"]);
         assert!(participants[1].alias.is_none());
+    }
+
+    #[tokio::test]
+    async fn parent_links_derive_one_exact_thread_and_reject_foreign_parents() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let root = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    kind: RequestKind::Review,
+                    body: "round one".into(),
+                    workspace_id: Some("workspace-a".into()),
+                    work_id: Some("CAL-7345".into()),
+                    artifacts: vec!["commit:d4bf2aa53".into()],
+                    links: vec!["https://example.invalid/review/1".into()],
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(root.thread_id.as_deref(), Some(root.id.as_str()));
+
+        let child = mailbox
+            .create(
+                recipient.clone(),
+                sender.clone(),
+                NewRequest {
+                    kind: RequestKind::Notice,
+                    body: "changes required".into(),
+                    parent_request_id: Some(root.id.clone()),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(child.thread_id, root.thread_id);
+        assert_eq!(child.parent_request_id.as_deref(), Some(root.id.as_str()));
+
+        let conflict = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "wrong thread".into(),
+                    thread_id: Some("guessed-thread".into()),
+                    parent_request_id: Some(root.id.clone()),
+                    ..NewRequest::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(CollaborationError::ThreadMismatch { .. })
+        ));
+
+        let mut foreign_sender = sender;
+        let mut foreign_recipient = recipient;
+        foreign_sender.room.window_id = "@99".into();
+        foreign_recipient.room.window_id = "@99".into();
+        let foreign = mailbox
+            .create(
+                foreign_sender,
+                foreign_recipient,
+                NewRequest {
+                    body: "cross-room parent".into(),
+                    parent_request_id: Some(root.id.clone()),
+                    ..NewRequest::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            foreign,
+            Err(CollaborationError::InvalidParentScope(_))
+        ));
+        let missing = mailbox
+            .create(
+                child.from,
+                child.to,
+                NewRequest {
+                    body: "missing parent".into(),
+                    parent_request_id: Some("req-does-not-exist".into()),
+                    ..NewRequest::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            missing,
+            Err(CollaborationError::ParentNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one scenario proves the indexed filters and cursor boundary together
+    async fn sqlite_query_filters_and_keyset_pages_use_room_and_session_anchors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collaboration.sqlite3");
+        let mailbox = CollaborationStore::load(CollaborationOptions {
+            path: Some(path),
+            ..CollaborationOptions::default()
+        })
+        .await
+        .unwrap();
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let root = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    kind: RequestKind::Review,
+                    body: "review".into(),
+                    workspace_id: Some("workspace-a".into()),
+                    work_id: Some("CAL-7345".into()),
+                    run_id: Some("run-1".into()),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        mailbox.claim_for(&recipient).await.unwrap();
+        mailbox
+            .reply(
+                &recipient,
+                &root.id,
+                RequestStatus::Completed,
+                "approved".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        mailbox.get_for(&sender, &root.id).await.unwrap();
+        let child = mailbox
+            .create(
+                recipient.clone(),
+                sender.clone(),
+                NewRequest {
+                    kind: RequestKind::Task,
+                    body: "follow up".into(),
+                    parent_request_id: Some(root.id.clone()),
+                    workspace_id: Some("workspace-a".into()),
+                    work_id: Some("CAL-7345".into()),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut other_room = recipient.clone();
+        other_room.room.window_id = "@2".into();
+        mailbox
+            .create(
+                sender.clone(),
+                other_room.clone(),
+                NewRequest {
+                    body: "cross room".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut other_session = recipient;
+        other_session.tmux_session_id = Some("$9".into());
+        other_session.tmux_session_name = Some("release".into());
+        mailbox
+            .create(
+                Participant::console(sender.room.clone()),
+                other_session,
+                NewRequest {
+                    kind: RequestKind::Notice,
+                    body: "operator notice".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let console = Participant::console(sender.room);
+        let filtered = mailbox
+            .query_for(
+                &console,
+                RequestMailbox::All,
+                MailboxScope::All,
+                &CollaborationQuery {
+                    workspace_id: Some("workspace-a".into()),
+                    work_id: Some("CAL-7345".into()),
+                    thread_id: root.thread_id.clone(),
+                    kind: Some(RequestKind::Review),
+                    status: Some(RequestStatus::Completed),
+                    ..CollaborationQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered.requests.len(), 1);
+        assert_eq!(filtered.requests[0].id, root.id);
+
+        let children = mailbox
+            .query_for(
+                &console,
+                RequestMailbox::All,
+                MailboxScope::All,
+                &CollaborationQuery {
+                    parent_request_id: Some(root.id.clone()),
+                    ..CollaborationQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(children.requests[0].id, child.id);
+
+        let room_page = mailbox
+            .query_for(
+                &console,
+                RequestMailbox::All,
+                MailboxScope::All,
+                &CollaborationQuery {
+                    room: Some(other_room.room),
+                    ..CollaborationQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(room_page.requests.len(), 1);
+        let session_page = mailbox
+            .query_for(
+                &console,
+                RequestMailbox::All,
+                MailboxScope::All,
+                &CollaborationQuery {
+                    tmux_session_id: Some("$9".into()),
+                    tmux_session_name: Some("release".into()),
+                    ..CollaborationQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(session_page.requests.len(), 1);
+        assert!(session_page.requests[0].from.console);
+
+        let first_page = mailbox
+            .query_for(
+                &console,
+                RequestMailbox::All,
+                MailboxScope::All,
+                &CollaborationQuery {
+                    limit: Some(2),
+                    ..CollaborationQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_page.total, 4);
+        assert!(first_page.has_more);
+        let second_page = mailbox
+            .query_for(
+                &console,
+                RequestMailbox::All,
+                MailboxScope::All,
+                &CollaborationQuery {
+                    limit: Some(2),
+                    cursor: first_page.next_cursor,
+                    ..CollaborationQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_page.requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_json_migrates_idempotently_and_backfills_thread_and_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collaboration.json");
+        let seed = CollaborationStore::in_memory(CollaborationOptions::default());
+        let mut request = seed
+            .create(
+                participant("%1", "sender"),
+                participant("%2", "recipient"),
+                NewRequest {
+                    body: "legacy message".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        request.thread_id = None;
+        let original = participant("%4", "identity-session");
+        let snapshot = Snapshot {
+            version: COLLABORATION_SCHEMA_VERSION,
+            requests: vec![request.clone()],
+            identities: vec![CollaborationIdentity {
+                room: original.room.clone(),
+                pane: original.pane.clone(),
+                socket: original.socket.clone(),
+                agent_session_id: original.agent_session_id.clone(),
+                alias: Some("builder".into()),
+                roles: vec!["implementation".into()],
+                updated_at: OffsetDateTime::now_utc(),
+            }],
+        };
+        let legacy_bytes = serde_json::to_vec_pretty(&snapshot).unwrap();
+        std::fs::write(&path, &legacy_bytes).unwrap();
+
+        let options = CollaborationOptions {
+            path: Some(path.clone()),
+            ..CollaborationOptions::default()
+        };
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        let loaded = mailbox
+            .list_for(
+                &participant("%1", "sender"),
+                RequestMailbox::Sent,
+                MailboxScope::Caller,
+            )
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].thread_id.as_deref(), Some(request.id.as_str()));
+        let mut enriched = vec![original];
+        mailbox.enrich_participants(&mut enriched).await;
+        assert_eq!(enriched[0].alias.as_deref(), Some("builder"));
+        assert_eq!(std::fs::read(&path).unwrap(), legacy_bytes);
+
+        let database_path = collaboration_database_path(&path);
+        assert!(database_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["", "-wal", "-shm"] {
+                let mut candidate = database_path.as_os_str().to_os_string();
+                candidate.push(suffix);
+                let candidate = PathBuf::from(candidate);
+                if candidate.exists() {
+                    assert_eq!(
+                        std::fs::metadata(candidate).unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                }
+            }
+        }
+        drop(mailbox);
+        let reloaded = CollaborationStore::load(CollaborationOptions {
+            path: Some(database_path),
+            ..CollaborationOptions::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            reloaded
+                .list_for(
+                    &participant("%1", "sender"),
+                    RequestMailbox::Sent,
+                    MailboxScope::Caller,
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one planted history covers every whole-thread retention guard
+    async fn retention_prunes_only_whole_old_terminal_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collaboration.json");
+        let seed = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let mut eligible = seed
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "old terminal".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut mixed_root = seed
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "old root with live child".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut mixed_child = seed
+            .create(
+                recipient.clone(),
+                sender.clone(),
+                NewRequest {
+                    body: "still queued".into(),
+                    parent_request_id: Some(mixed_root.id.clone()),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut unread = seed
+            .create(
+                sender,
+                recipient,
+                NewRequest {
+                    body: "unread reply".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let old = OffsetDateTime::UNIX_EPOCH;
+        eligible.created_at = old;
+        eligible.status = RequestStatus::Cancelled;
+        mixed_root.created_at = old;
+        mixed_root.status = RequestStatus::Completed;
+        mixed_child.created_at = old;
+        unread.created_at = old;
+        unread.status = RequestStatus::Completed;
+        unread.reply = Some(CollaborationReply {
+            status: RequestStatus::Completed,
+            body: "not read".into(),
+            artifacts: Vec::new(),
+            air_artifacts: Vec::new(),
+            at: old,
+        });
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&Snapshot {
+                version: COLLABORATION_SCHEMA_VERSION,
+                requests: vec![
+                    eligible.clone(),
+                    mixed_root.clone(),
+                    mixed_child.clone(),
+                    unread.clone(),
+                ],
+                identities: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mailbox = CollaborationStore::load(CollaborationOptions {
+            path: Some(path),
+            retention_days: Some(1),
+            ..CollaborationOptions::default()
+        })
+        .await
+        .unwrap();
+        let remaining = mailbox
+            .list_for(
+                &Participant::console(mixed_root.from.room.clone()),
+                RequestMailbox::All,
+                MailboxScope::All,
+            )
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<_> = remaining
+            .iter()
+            .map(|request| request.id.as_str())
+            .collect();
+        assert_eq!(remaining.len(), 3);
+        assert!(!ids.contains(eligible.id.as_str()));
+        assert!(ids.contains(mixed_root.id.as_str()));
+        assert!(ids.contains(mixed_child.id.as_str()));
+        assert!(ids.contains(unread.id.as_str()));
     }
 
     #[test]

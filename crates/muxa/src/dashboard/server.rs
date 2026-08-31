@@ -39,6 +39,11 @@ use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tower_http::trace::TraceLayer;
 
 use crate::backend::{HostKind, SharedBackend};
+use crate::collaboration::{
+    CollaborationCursor, CollaborationError, CollaborationOptions, CollaborationQuery,
+    CollaborationStore, MailboxScope, Participant, RequestKind, RequestMailbox, RequestStatus,
+    RoomId,
+};
 use crate::config::{DashboardAuthMode, StatsConfig};
 use crate::dashboard::work_store::WorkStore;
 use crate::dashboard::{assets, auth, DashboardConfig};
@@ -56,6 +61,7 @@ use crate::tmux::scanner::{self, MuxaPaneMetadata, PaneCache, PaneSummary, ScanE
 use crate::work::{
     self, ExecutionIdentity, WorkIdentity, WorkMetadataPatch, WorkRecord, WorkSnapshot,
 };
+use crate::work_control::{self, WorkUpError, WorkUpRequest};
 
 /// SSE keep-alive ping interval. Picked long enough to be invisible
 /// (15s is well under any sane proxy idle-timeout) but short enough
@@ -101,6 +107,10 @@ struct TimelineSummaryCache {
 #[derive(Clone)]
 pub struct AppState {
     pub store: SharedStore,
+    /// Durable request/reply history shared with muxad's collaboration IPC
+    /// handlers. Dashboard reads use this same store so the web graph never
+    /// races or diverges from the CLI mailbox.
+    pub collaboration: Arc<CollaborationStore>,
     pub config: Arc<DashboardConfig>,
     pub pane_cache: Arc<PaneCache>,
     pub sessions: SharedSessionBackend,
@@ -148,6 +158,9 @@ pub struct AppState {
 
 #[derive(Clone, Default)]
 pub struct DashboardRuntimeConfig {
+    /// The daemon's durable collaboration store. Optional to preserve the
+    /// embedding API for callers that serve a dashboard without muxad.
+    pub collaboration: Option<Arc<CollaborationStore>>,
     pub message_skills: BTreeMap<String, String>,
     pub activity_path: Option<PathBuf>,
     pub session_activity_path: Option<PathBuf>,
@@ -167,6 +180,7 @@ impl AppState {
         let metrics = store.metrics();
         Self {
             store,
+            collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
             config,
             pane_cache,
             sessions,
@@ -187,6 +201,12 @@ impl AppState {
             )),
             message_skills: Arc::new(BTreeMap::new()),
         }
+    }
+
+    #[must_use]
+    pub fn with_collaboration(mut self, collaboration: Arc<CollaborationStore>) -> Self {
+        self.collaboration = collaboration;
+        self
     }
 
     #[must_use]
@@ -352,6 +372,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/works", get(works_handler))
         .route("/api/work-metadata", get(work_metadata_handler))
         .route("/api/terminal-sessions", get(terminal_sessions_handler))
+        .route("/api/collaboration", get(collaboration_handler))
         .route(
             "/api/terminal-sessions/{id}/capture",
             get(terminal_capture_handler),
@@ -438,7 +459,14 @@ pub async fn serve(
     runtime: DashboardRuntimeConfig,
     mut shutdown: broadcast::Receiver<()>,
 ) -> std::io::Result<()> {
+    let collaboration = runtime.collaboration.unwrap_or_else(|| {
+        CollaborationStore::in_memory(CollaborationOptions {
+            enabled: false,
+            ..CollaborationOptions::default()
+        })
+    });
     let state = AppState::new(store, config.clone(), pane_cache, sessions)
+        .with_collaboration(collaboration)
         .with_backends(backends)
         .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
         .with_work_store_path(runtime.work_store_path)
@@ -643,6 +671,298 @@ async fn health_handler() -> impl IntoResponse {
         version: env!("CARGO_PKG_VERSION"),
         protocol: PROTOCOL_VERSION,
     })
+}
+
+const COLLABORATION_PAGE_DEFAULT: usize = 100;
+const COLLABORATION_PAGE_MAX: usize = 500;
+const COLLABORATION_FILTER_MAX_BYTES: usize = 512;
+const COLLABORATION_CURSOR_ID_MAX_BYTES: usize = 128;
+
+/// HTTP-shaped collaboration filters. The durable store owns filtering and
+/// keyset pagination; this type only translates ergonomic query strings into
+/// its typed contract.
+#[derive(Debug, Default, Deserialize)]
+struct CollaborationHttpQuery {
+    /// Same grammar as the CLI timeline (`24h`, `7d`, RFC3339, `all`, ...).
+    since: Option<String>,
+    #[serde(alias = "work_id")]
+    work: Option<String>,
+    #[serde(alias = "workspace_id")]
+    workspace: Option<String>,
+    #[serde(alias = "thread_id")]
+    thread: Option<String>,
+    #[serde(alias = "parent_request_id")]
+    parent: Option<String>,
+    kind: Option<String>,
+    status: Option<String>,
+    /// URL-encoded JSON `RoomId`, e.g. `{"host":"tmux","window_id":"@1"}`.
+    room: Option<String>,
+    limit: Option<String>,
+    /// Opaque keyset token returned as `pagination.next_cursor`.
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CollaborationPagination {
+    total: usize,
+    limit: usize,
+    has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CollaborationHttpResponse {
+    #[serde(with = "time::serde::rfc3339")]
+    generated_at: OffsetDateTime,
+    /// False outside authenticated `auth = "token"` mode. Topology and status
+    /// remain useful for the graph, but message bodies and attached details
+    /// are omitted.
+    details_included: bool,
+    requests: Vec<serde_json::Value>,
+    pagination: CollaborationPagination,
+}
+
+async fn collaboration_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(http): Query<CollaborationHttpQuery>,
+) -> Response {
+    let (query, limit) = match collaboration_query_from_http(http) {
+        Ok(query) => query,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": error })),
+            )
+                .into_response();
+        }
+    };
+    // All-scope reads are explicitly operator-only in CollaborationStore.
+    // The dashboard is the operator surface; the room value is immaterial at
+    // this scope but keeps the authority marker a normal console participant.
+    let console = Participant::console(RoomId {
+        host: "dashboard".to_string(),
+        socket: None,
+        window_id: "dashboard".to_string(),
+    });
+    let page = match state
+        .collaboration
+        .query_for(&console, RequestMailbox::All, MailboxScope::All, &query)
+        .await
+    {
+        Ok(page) => page,
+        Err(CollaborationError::Disabled) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ok": false,
+                    "error": "agent collaboration is disabled"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::warn!(%error, "dashboard collaboration history query failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": "collaboration history query failed" })),
+            )
+                .into_response();
+        }
+    };
+
+    let details_included = dashboard_details_authorized(&state, &headers);
+    let requests = page
+        .requests
+        .into_iter()
+        .map(|request| {
+            let mut value =
+                serde_json::to_value(request).expect("collaboration request serializes");
+            if !details_included {
+                redact_collaboration_details(&mut value);
+            }
+            value
+        })
+        .collect();
+    Json(CollaborationHttpResponse {
+        generated_at: OffsetDateTime::now_utc(),
+        details_included,
+        requests,
+        pagination: CollaborationPagination {
+            total: page.total,
+            limit,
+            has_more: page.has_more,
+            next_cursor: page.next_cursor.as_ref().map(encode_collaboration_cursor),
+        },
+    })
+    .into_response()
+}
+
+fn collaboration_query_from_http(
+    http: CollaborationHttpQuery,
+) -> Result<(CollaborationQuery, usize), String> {
+    let now = OffsetDateTime::now_utc();
+    let since = http
+        .since
+        .as_deref()
+        .map(|raw| timeline::parse_since(raw, now, "all collaboration history"))
+        .transpose()?
+        .and_then(|range| range.since_at);
+    let limit = http
+        .limit
+        .as_deref()
+        .map(str::parse::<usize>)
+        .transpose()
+        .map_err(|_| "limit must be an integer from 1 to 500".to_string())?
+        .unwrap_or(COLLABORATION_PAGE_DEFAULT);
+    if !(1..=COLLABORATION_PAGE_MAX).contains(&limit) {
+        return Err("limit must be an integer from 1 to 500".to_string());
+    }
+    let room = http
+        .room
+        .as_deref()
+        .map(serde_json::from_str::<RoomId>)
+        .transpose()
+        .map_err(|error| format!("invalid room; expected a JSON RoomId: {error}"))?;
+    Ok((
+        CollaborationQuery {
+            since,
+            work_id: non_empty_collaboration_filter("work", http.work)?,
+            workspace_id: non_empty_collaboration_filter("workspace", http.workspace)?,
+            thread_id: non_empty_collaboration_filter("thread", http.thread)?,
+            parent_request_id: non_empty_collaboration_filter("parent", http.parent)?,
+            kind: http.kind.as_deref().map(parse_request_kind).transpose()?,
+            status: http
+                .status
+                .as_deref()
+                .map(parse_request_status)
+                .transpose()?,
+            room,
+            tmux_session_id: None,
+            tmux_session_name: None,
+            limit: Some(limit),
+            cursor: http
+                .cursor
+                .as_deref()
+                .map(parse_collaboration_cursor)
+                .transpose()?,
+        },
+        limit,
+    ))
+}
+
+fn non_empty_collaboration_filter(
+    name: &str,
+    value: Option<String>,
+) -> Result<Option<String>, String> {
+    value
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                Err(format!("{name} must not be empty"))
+            } else if value.len() > COLLABORATION_FILTER_MAX_BYTES {
+                Err(format!(
+                    "{name} must not exceed {COLLABORATION_FILTER_MAX_BYTES} bytes"
+                ))
+            } else {
+                Ok(value.to_string())
+            }
+        })
+        .transpose()
+}
+
+fn parse_request_kind(raw: &str) -> Result<RequestKind, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "question" => Ok(RequestKind::Question),
+        "review" => Ok(RequestKind::Review),
+        "task" => Ok(RequestKind::Task),
+        "notice" => Ok(RequestKind::Notice),
+        _ => Err(format!(
+            "invalid collaboration kind {raw:?}; expected question, review, task, or notice"
+        )),
+    }
+}
+
+fn parse_request_status(raw: &str) -> Result<RequestStatus, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "queued" => Ok(RequestStatus::Queued),
+        "claimed" => Ok(RequestStatus::Claimed),
+        "completed" => Ok(RequestStatus::Completed),
+        "blocked" => Ok(RequestStatus::Blocked),
+        "declined" => Ok(RequestStatus::Declined),
+        "failed" => Ok(RequestStatus::Failed),
+        "expired" => Ok(RequestStatus::Expired),
+        "cancelled" | "canceled" => Ok(RequestStatus::Cancelled),
+        _ => Err(format!(
+            "invalid collaboration status {raw:?}; expected queued, claimed, completed, blocked, declined, failed, expired, or cancelled"
+        )),
+    }
+}
+
+fn encode_collaboration_cursor(cursor: &CollaborationCursor) -> String {
+    format!("{}:{}", cursor.created_at.unix_timestamp_nanos(), cursor.id)
+}
+
+fn parse_collaboration_cursor(raw: &str) -> Result<CollaborationCursor, String> {
+    let (nanos, id) = raw
+        .split_once(':')
+        .ok_or_else(|| "invalid collaboration cursor".to_string())?;
+    if id.is_empty()
+        || id.len() > COLLABORATION_CURSOR_ID_MAX_BYTES
+        || !id.starts_with("req_")
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err("invalid collaboration cursor".to_string());
+    }
+    let nanos = nanos
+        .parse::<i128>()
+        .map_err(|_| "invalid collaboration cursor".to_string())?;
+    let created_at = OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .map_err(|_| "invalid collaboration cursor".to_string())?;
+    Ok(CollaborationCursor {
+        created_at,
+        id: id.to_string(),
+    })
+}
+
+fn dashboard_details_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    if !matches!(state.config.auth, DashboardAuthMode::Token) {
+        return false;
+    }
+    let Some(expected) = state.config.token.as_deref() else {
+        return false;
+    };
+    let header_value = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    auth::check_bearer(header_value, expected)
+}
+
+fn redact_collaboration_details(request: &mut serde_json::Value) {
+    let Some(request) = request.as_object_mut() else {
+        return;
+    };
+    for field in [
+        "body",
+        "provenance",
+        "paths",
+        "artifacts",
+        "links",
+        "air_artifacts",
+    ] {
+        request.remove(field);
+    }
+    if let Some(reply) = request
+        .get_mut("reply")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for field in ["body", "artifacts", "air_artifacts"] {
+            reply.remove(field);
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -879,33 +1199,6 @@ struct WorkControlResult {
     submitted: bool,
 }
 
-/// Ceiling for one `muxa work up` run. Generous because resolving a ticket
-/// spends a headless agent turn, which is minutes rather than milliseconds.
-const WORK_UP_TIMEOUT: Duration = Duration::from_secs(600);
-
-#[derive(Debug, Deserialize)]
-struct WorkUpRequest {
-    /// Stable Muxa Work id.
-    work: String,
-    /// Optional external issue key resolved by `muxa work up`.
-    #[serde(default)]
-    external: Option<String>,
-    #[serde(default)]
-    pipeline: Option<String>,
-    #[serde(default)]
-    workspace: Option<String>,
-    #[serde(default)]
-    skill: Option<String>,
-    #[serde(default)]
-    body: Option<String>,
-    #[serde(default)]
-    context: Option<String>,
-    #[serde(default)]
-    no_ticket: bool,
-    #[serde(default)]
-    dry_run: bool,
-}
-
 /// Stand a work item's pipeline up from the dashboard.
 ///
 /// This delegates to the `muxa` binary rather than reimplementing the
@@ -931,57 +1224,9 @@ async fn work_up_handler(
             "starting work is disabled; set [dashboard] allow_work_start = true to enable it",
         );
     }
-    if input.work.trim().is_empty() {
-        return control_error(StatusCode::BAD_REQUEST, "work id is empty");
-    }
-    if input.no_ticket
-        && input
-            .external
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-    {
-        return control_error(
-            StatusCode::BAD_REQUEST,
-            "external cannot be combined with no_ticket",
-        );
-    }
-
-    let mut args: Vec<String> = vec![
-        "work".into(),
-        "up".into(),
-        input.work.trim().into(),
-        "--json".into(),
-    ];
-    let mut push = |flag: &str, value: Option<&String>| {
-        if let Some(value) = value.map(|v| v.trim()).filter(|v| !v.is_empty()) {
-            args.push(flag.to_string());
-            args.push(value.to_string());
-        }
-    };
-    push("--pipeline", input.pipeline.as_ref());
-    push("--workspace", input.workspace.as_ref());
-    push("--external", input.external.as_ref());
-    push("--skill", input.skill.as_ref());
-    push("--body", input.body.as_ref());
-    push("--context", input.context.as_ref());
-    // The dashboard's empty external field means a local Work. The CLI keeps
-    // implicit Work-id lookup for compatibility, but the new UI never
-    // silently turns a Work id into an external issue key.
-    if input.no_ticket
-        || input
-            .external
-            .as_deref()
-            .is_none_or(|value| value.trim().is_empty())
-    {
-        args.push("--no-ticket".into());
-    }
-    if input.dry_run {
-        args.push("--dry-run".into());
-    }
-
-    let result = match execute_work_up(args).await {
+    let result = match work_control::execute_work_up(&input, None).await {
         Ok(result) => result,
-        Err((status, error)) => return control_error(status, error),
+        Err(error) => return control_error(work_up_error_status(&error), error.to_string()),
     };
     let linked_external_item = if input.dry_run {
         false
@@ -1000,42 +1245,14 @@ async fn work_up_handler(
     .into_response()
 }
 
-async fn execute_work_up(args: Vec<String>) -> Result<serde_json::Value, (StatusCode, String)> {
-    let mut command = tokio::process::Command::new("muxa");
-    command
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let output = match tokio::time::timeout(WORK_UP_TIMEOUT, command.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("spawning muxa: {error}"),
-            ));
+fn work_up_error_status(error: &WorkUpError) -> StatusCode {
+    match error {
+        WorkUpError::Invalid(_) | WorkUpError::Failed(_) => StatusCode::BAD_REQUEST,
+        WorkUpError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        WorkUpError::Spawn(_) | WorkUpError::OutputTooLarge | WorkUpError::InvalidJson(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
         }
-        Err(_) => {
-            return Err((
-                StatusCode::GATEWAY_TIMEOUT,
-                format!("muxa work up exceeded {}s", WORK_UP_TIMEOUT.as_secs()),
-            ));
-        }
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim().lines().next_back().unwrap_or("no stderr");
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("muxa work up failed: {detail}"),
-        ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(stdout.trim()).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("muxa work up answered with unparseable JSON: {error}"),
-        )
-    })
 }
 
 /// Persist the external reference recorded on the newly created Run without
@@ -2351,6 +2568,8 @@ mod tests {
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: None,
+            work_id: None,
             socket: None,
             pane_id: pane_id.into(),
             session_id: session_id.into(),
@@ -2365,6 +2584,93 @@ mod tests {
             pane_pid: 0,
             current_path: "/work/muxa".into(),
         }
+    }
+
+    fn collaboration_participant(
+        pane: &str,
+        agent_session_id: &str,
+        window_id: &str,
+    ) -> Participant {
+        Participant {
+            agent_kind: AgentKind::Codex,
+            agent_session_id: agent_session_id.to_string(),
+            pane: pane.to_string(),
+            socket: Some("default".to_string()),
+            room: RoomId {
+                host: "tmux".to_string(),
+                socket: Some("default".to_string()),
+                window_id: window_id.to_string(),
+            },
+            tmux_session_id: Some("$1".to_string()),
+            tmux_session_name: Some("callabo".to_string()),
+            window_name: Some("CAL-7345".to_string()),
+            state: AgentState::Idle,
+            cwd: Some("/work/muxa".to_string()),
+            alias: None,
+            roles: Vec::new(),
+            console: false,
+        }
+    }
+
+    async fn seed_collaboration_requests(
+        collaboration: &Arc<CollaborationStore>,
+    ) -> Vec<crate::collaboration::CollaborationRequest> {
+        use crate::collaboration::{NewRequest, WorkMode};
+
+        let from = collaboration_participant("%1", "implementer-session", "@7");
+        let to = collaboration_participant("%2", "reviewer-session", "@7");
+        let mut requests = Vec::new();
+        for body in ["review round one", "review round two"] {
+            requests.push(
+                collaboration
+                    .create(
+                        from.clone(),
+                        to.clone(),
+                        NewRequest {
+                            kind: RequestKind::Review,
+                            body: body.to_string(),
+                            expects_reply: true,
+                            work_mode: WorkMode::ReadOnly,
+                            thread_id: Some("thread-cal-7345".to_string()),
+                            parent_request_id: None,
+                            workspace_id: Some("callabo".to_string()),
+                            work_id: Some("CAL-7345".to_string()),
+                            run_id: Some("run-1".to_string()),
+                            paths: vec!["/private/review.patch".to_string()],
+                            artifacts: vec!["artifact-request-secret".to_string()],
+                            links: vec!["https://private.invalid/review".to_string()],
+                            air_artifacts: Vec::new(),
+                        },
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        requests.push(
+            collaboration
+                .create(
+                    from,
+                    to,
+                    NewRequest {
+                        kind: RequestKind::Notice,
+                        body: "finalize".to_string(),
+                        expects_reply: false,
+                        work_mode: WorkMode::ReadOnly,
+                        thread_id: Some("thread-cal-7345".to_string()),
+                        parent_request_id: None,
+                        workspace_id: Some("callabo".to_string()),
+                        work_id: Some("CAL-7345".to_string()),
+                        run_id: Some("run-1".to_string()),
+                        paths: Vec::new(),
+                        artifacts: Vec::new(),
+                        links: Vec::new(),
+                        air_artifacts: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+        requests
     }
 
     async fn seed_agent(state: &AppState, session_id: &str, pane: &str) {
@@ -2721,6 +3027,8 @@ mod tests {
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: None,
+            work_id: None,
             socket: None,
             pane_id: "herdr:p1".into(),
             session_id: "ws1".into(),
@@ -2751,6 +3059,8 @@ mod tests {
                 session_group: None,
                 agent_role: None,
                 agent_alias: None,
+                workspace_id: None,
+                work_id: None,
                 socket: Some("/tmp/rmux-user/default".into()),
                 pane_id: "rmux:%4".into(),
                 session_id: "$1".into(),
@@ -2783,6 +3093,8 @@ mod tests {
                 session_group: None,
                 agent_role: None,
                 agent_alias: None,
+                workspace_id: None,
+                work_id: None,
                 socket: Some("/tmp/rmux-secondary/default".into()),
                 pane_id: "rmux:%8".into(),
                 session_id: "$2".into(),
@@ -2902,6 +3214,235 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn collaboration_endpoint_filters_and_uses_keyset_pagination() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+        seed_collaboration_requests(&collaboration).await;
+        let app = router(state_with_token("s3cret").with_collaboration(Arc::clone(&collaboration)));
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/api/collaboration?workspace=callabo&work=CAL-7345&thread=thread-cal-7345&kind=review&status=queued&limit=1",
+                    )
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = body_json(first).await;
+        assert_eq!(first["details_included"], true);
+        assert_eq!(first["pagination"]["total"], 2);
+        assert_eq!(first["pagination"]["limit"], 1);
+        assert_eq!(first["pagination"]["has_more"], true);
+        assert_eq!(first["requests"].as_array().map(Vec::len), Some(1));
+        assert!(first["requests"][0]["body"].is_string());
+        assert!(first["requests"][0]["paths"].is_array());
+        let cursor = first["pagination"]["next_cursor"]
+            .as_str()
+            .expect("first page should return a cursor");
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/collaboration?work=CAL-7345&kind=review&limit=1&cursor={cursor}"
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second = body_json(second).await;
+        assert_eq!(second["pagination"]["total"], 2);
+        assert_eq!(second["pagination"]["has_more"], false);
+        assert_eq!(second["requests"].as_array().map(Vec::len), Some(1));
+        assert_ne!(second["requests"][0]["id"], first["requests"][0]["id"]);
+
+        let future = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?since=2099-01-01T00%3A00%3A00Z")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(future.status(), StatusCode::OK);
+        let future = body_json(future).await;
+        assert_eq!(future["pagination"]["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn collaboration_endpoint_accepts_exact_json_room_filter() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+        seed_collaboration_requests(&collaboration).await;
+        let room = serde_json::to_string(&RoomId {
+            host: "tmux".to_string(),
+            socket: Some("default".to_string()),
+            window_id: "@7".to_string(),
+        })
+        .unwrap();
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("room", &room)
+            .append_pair("limit", "10")
+            .finish();
+        let app = router(state_with_token("s3cret").with_collaboration(Arc::clone(&collaboration)));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/collaboration?{query}"))
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = body_json(response).await;
+        assert_eq!(response["pagination"]["total"], 3);
+    }
+
+    #[tokio::test]
+    async fn public_collaboration_history_redacts_message_details_without_pat() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+        let requests = seed_collaboration_requests(&collaboration).await;
+        let recipient = collaboration_participant("%2", "reviewer-session", "@7");
+        collaboration
+            .reply(
+                &recipient,
+                &requests[0].id,
+                RequestStatus::Completed,
+                "approved".to_string(),
+                vec!["artifact-secret".to_string()],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let app =
+            router(public_read_state("s3cret").with_collaboration(Arc::clone(&collaboration)));
+
+        let public = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?status=completed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public.status(), StatusCode::OK);
+        let public = body_json(public).await;
+        assert_eq!(public["details_included"], false);
+        let request = &public["requests"][0];
+        assert!(request.get("body").is_none());
+        assert!(request.get("paths").is_none());
+        assert!(request["reply"].get("body").is_none());
+        assert!(request["reply"].get("artifacts").is_none());
+
+        let public_with_pat = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?status=completed")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_with_pat.status(), StatusCode::OK);
+        let public_with_pat = body_json(public_with_pat).await;
+        assert_eq!(public_with_pat["details_included"], false);
+        assert!(public_with_pat["requests"][0].get("body").is_none());
+        assert!(public_with_pat["requests"][0]["reply"]
+            .get("body")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn collaboration_details_require_token_auth_mode() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+        seed_collaboration_requests(&collaboration).await;
+
+        let token_app =
+            router(state_with_token("s3cret").with_collaboration(Arc::clone(&collaboration)));
+        let unauthorized = token_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let mut config = DashboardConfig::loopback_default();
+        config.auth = DashboardAuthMode::None;
+        config.token = None;
+        let none_app = router(state_from(config).with_collaboration(collaboration));
+        let summary = none_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.status(), StatusCode::OK);
+        let summary = body_json(summary).await;
+        assert_eq!(summary["details_included"], false);
+        assert!(summary["requests"][0].get("body").is_none());
+    }
+
+    #[tokio::test]
+    async fn collaboration_endpoint_reports_disabled_store() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions {
+            enabled: false,
+            ..CollaborationOptions::default()
+        });
+        let app = router(fresh_state().with_collaboration(collaboration));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn collaboration_endpoint_rejects_invalid_filters() {
+        let app = router(fresh_state());
+        for uri in [
+            "/api/collaboration?limit=0",
+            "/api/collaboration?limit=501",
+            "/api/collaboration?kind=unknown",
+            "/api/collaboration?status=unknown",
+            "/api/collaboration?room=not-json",
+            "/api/collaboration?cursor=not-a-cursor",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
     }
 
     #[tokio::test]

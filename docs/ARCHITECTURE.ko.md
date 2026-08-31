@@ -28,7 +28,7 @@ agent hook/status event
                                              +--> state.json
                                              +--> prompts.ndjson
                                              +--> activity.ndjson
-                                             +--> collaboration.json
+                                             +--> collaboration.sqlite3
                                              +--> notifications / sinks
                                              +--> dashboard SSE
 ```
@@ -65,7 +65,7 @@ IPC로 `FleetStore` invalidation을 구독해 coalesce하고 revision이 바뀐 
 | `prompts.ndjson` | retained prompt audit log. |
 | `activity.ndjson` | append-only duration ledger. |
 | `session-activity.json` | legacy/compat tmux foreground total. |
-| `collaboration.json` | same-window mailbox와 exact-session alias/role snapshot. |
+| `collaboration.sqlite3` | indexed mailbox, thread/Work metadata, exact-session alias/role. 기존 `collaboration.json`은 한 번 import한 뒤 migration backup으로 남습니다. |
 | `host-id` | Fleet handshake에 쓰는 owner-only stable physical-node UUID. |
 
 경로는 설정 가능하며 기본값은 `$XDG_DATA_HOME/muxa` 아래입니다.

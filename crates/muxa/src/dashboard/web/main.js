@@ -1,4 +1,17 @@
 import { logicalWorkKey, normalizeAgent, validateWorkSnapshot, WORK_STAGES } from "./work-model.mjs";
+import {
+  collaborationSequence,
+  dominantCount,
+  normalizeCollaborationPayload,
+  participantIdentity,
+  participantLabel,
+  projectCollaboration,
+  requestRoomKey,
+  requestThreadId,
+  requestWorkId,
+  roomLabel,
+  sequenceParticipants,
+} from "./collaboration-model.mjs";
 
 // muxa dashboard frontend.
 //
@@ -38,6 +51,8 @@ const TERMINALS_REFETCH_INTERVAL_MS = 2000;
 const TIMELINE_REFETCH_INTERVAL_MS = 30000;
 const TIMELINE_MIN_REFRESH_INTERVAL_MS = 10000;
 const TIMELINE_EVENT_DEBOUNCE_MS = 2000;
+const COLLABORATION_REFETCH_INTERVAL_MS = 5000;
+const COLLABORATION_PAGE_SIZE = 500;
 const SESSION_PAGE_SIZE = 40;
 
 const AGENT_STATES = ["working", "waiting_input", "waiting_choice", "idle", "starting", "error", "stopped"];
@@ -233,6 +248,24 @@ const dom = {
   timelineRangeChips: document.getElementById("timeline-range-chips"),
   timelineSession: document.getElementById("timeline-session"),
   timelineMeta: document.getElementById("timeline-meta"),
+  collaborationMeta: document.getElementById("collaboration-meta"),
+  collaborationRefresh: document.getElementById("collaboration-refresh"),
+  collaborationRange: document.getElementById("collaboration-range"),
+  collaborationRoom: document.getElementById("collaboration-room"),
+  collaborationWork: document.getElementById("collaboration-work"),
+  collaborationWorkOptions: document.getElementById("collaboration-work-options"),
+  collaborationThread: document.getElementById("collaboration-thread"),
+  collaborationThreadOptions: document.getElementById("collaboration-thread-options"),
+  collaborationKind: document.getElementById("collaboration-kind"),
+  collaborationStatus: document.getElementById("collaboration-status"),
+  collaborationRooms: document.getElementById("collaboration-rooms"),
+  collaborationGraph: document.getElementById("collaboration-graph"),
+  collaborationSequence: document.getElementById("collaboration-sequence"),
+  collaborationSequenceMeta: document.getElementById("collaboration-sequence-meta"),
+  collaborationClearSelection: document.getElementById("collaboration-clear-selection"),
+  collaborationDetail: document.getElementById("collaboration-detail"),
+  collaborationPageMeta: document.getElementById("collaboration-page-meta"),
+  collaborationLoadMore: document.getElementById("collaboration-load-more"),
   agentStateChips: document.getElementById("agent-state-chips"),
   agentKindChips: document.getElementById("agent-kind-chips"),
   agentsMeta: document.getElementById("agents-meta"),
@@ -393,16 +426,25 @@ const store = {
   timeline: null, // TimelineDocument
   timelineSummary: null, // compact all-session TimelineDocument
   timelineSessions: new Set(),
+  collaboration: {
+    requests: [],
+    pagination: { total: 0, limit: 0, offset: 0, has_more: false, next_offset: null, next_cursor: null },
+    generated_at: null,
+    details_included: false,
+    unavailable: "",
+  },
   indexes: {
     paneBySocketAndId: new Map(),
     panesById: new Map(),
     timelineSessionByAgent: new Map(),
   },
-  revisions: { agents: 0, panes: 0, timeline: 0, works: 0 },
+  revisions: { agents: 0, panes: 0, timeline: 0, works: 0, collaboration: 0 },
   cache: {
     paneFingerprint: "",
     workSnapshotFingerprint: "",
     terminalFingerprint: "",
+    collaborationFingerprint: "",
+    collaborationProjection: null,
     sessionSummariesKey: "",
     sessionSummaries: [],
     workProjectionKey: "",
@@ -420,6 +462,9 @@ const store = {
     selectedTimelineDay: "",
     selectedWorkKey: "",
     selectedWorkspaceKey: "",
+    selectedCollaborationEdge: "",
+    selectedCollaborationRoom: "",
+    selectedCollaborationRequest: "",
   },
   filters: {
     agentStates: new Set(AGENT_STATES),
@@ -427,6 +472,13 @@ const store = {
     paneSockets: new Set(), // populated dynamically
     timelineRange: "7d",
     timelineSession: "",
+    collaborationRange: "7d",
+    collaborationRoom: "",
+    collaborationRoomObject: null,
+    collaborationWork: "",
+    collaborationThread: "",
+    collaborationKind: "",
+    collaborationStatus: "",
   },
 };
 
@@ -2177,7 +2229,98 @@ function initSessionControls() {
   });
 }
 
+let collaborationFilterTimer = null;
+function initCollaborationControls() {
+  if (!dom.collaborationGraph) return;
+  const refreshFromControls = () => {
+    store.filters.collaborationRange = dom.collaborationRange.value;
+    store.filters.collaborationWork = dom.collaborationWork.value.trim();
+    store.filters.collaborationThread = dom.collaborationThread.value.trim();
+    store.filters.collaborationKind = dom.collaborationKind.value;
+    store.filters.collaborationStatus = dom.collaborationStatus.value;
+    store.ui.selectedCollaborationEdge = "";
+    store.ui.selectedCollaborationRequest = "";
+    fetchCollaboration().catch(() => {});
+  };
+  for (const select of [dom.collaborationRange, dom.collaborationKind, dom.collaborationStatus]) {
+    select.addEventListener("change", refreshFromControls);
+  }
+  for (const input of [dom.collaborationWork, dom.collaborationThread]) {
+    input.addEventListener("input", () => {
+      if (collaborationFilterTimer) clearTimeout(collaborationFilterTimer);
+      collaborationFilterTimer = setTimeout(refreshFromControls, 350);
+    });
+  }
+  dom.collaborationRoom.addEventListener("change", () => {
+    const room = store.cache.collaborationProjection?.rooms.find((candidate) =>
+      candidate.key === dom.collaborationRoom.value
+    );
+    chooseCollaborationRoom(room || null);
+  });
+  dom.collaborationRefresh.addEventListener("click", () => fetchCollaboration().catch(() => {}));
+  dom.collaborationLoadMore.addEventListener("click", () => fetchCollaboration({ append: true }).catch(() => {}));
+  dom.collaborationClearSelection.addEventListener("click", () => {
+    const hadRoomFilter = Boolean(store.filters.collaborationRoom);
+    store.ui.selectedCollaborationEdge = "";
+    store.ui.selectedCollaborationRoom = "";
+    store.ui.selectedCollaborationRequest = "";
+    if (hadRoomFilter) {
+      store.filters.collaborationRoom = "";
+      store.filters.collaborationRoomObject = null;
+      dom.collaborationRoom.value = "";
+      fetchCollaboration().catch(() => {});
+    } else {
+      renderCollaboration();
+    }
+  });
+}
+
 function initDynamicEventDelegation() {
+  const activateEdge = (element) => {
+    const index = Number(element?.getAttribute("data-collaboration-edge-index"));
+    const edge = store.cache.collaborationProjection?.edges[index];
+    if (!edge) return;
+    store.ui.selectedCollaborationEdge = edge.key;
+    store.ui.selectedCollaborationRequest = "";
+    renderCollaboration();
+  };
+  dom.collaborationGraph?.addEventListener("click", (event) => {
+    activateEdge(event.target.closest("[data-collaboration-edge-index]"));
+  });
+  dom.collaborationGraph?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const edge = event.target.closest("[data-collaboration-edge-index]");
+    if (!edge) return;
+    event.preventDefault();
+    activateEdge(edge);
+  });
+  dom.collaborationRooms?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-collaboration-room-index]");
+    const index = Number(button?.getAttribute("data-collaboration-room-index"));
+    const room = store.cache.collaborationProjection?.rooms[index];
+    if (room) chooseCollaborationRoom(room);
+  });
+  dom.collaborationSequence?.addEventListener("click", (event) => {
+    const item = event.target.closest("[data-collaboration-request]");
+    const id = item?.getAttribute("data-collaboration-request") || "";
+    const request = store.collaboration.requests.find((candidate) => candidate.id === id);
+    if (!request) return;
+    store.ui.selectedCollaborationRequest = id;
+    renderCollaborationDetail(request);
+  });
+  dom.collaborationSequence?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const item = event.target.closest("[data-collaboration-request]");
+    if (!item) return;
+    event.preventDefault();
+    item.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  dom.collaborationDetail?.addEventListener("click", (event) => {
+    if (!event.target.closest("[data-close-collaboration-detail]")) return;
+    store.ui.selectedCollaborationRequest = "";
+    dom.collaborationDetail.hidden = true;
+  });
+
   dom.sessionList.addEventListener("click", (event) => {
     const loadMore = event.target.closest("[data-load-more-sessions]");
     if (loadMore) {
@@ -2375,6 +2518,9 @@ function initCollapseControls() {
       saveSet(COLLAPSED_PANELS_KEY, store.ui.collapsedPanels);
       if (panelId === "timeline-panel" && !next) {
         fetchTimeline({ force: true }).catch(() => {});
+      }
+      if (panelId === "collaboration-panel" && !next) {
+        fetchCollaboration().catch(() => {});
       }
     });
   });
@@ -2600,6 +2746,296 @@ function formatDuration(totalSecs) {
   return `${days}d${String(hours % 24).padStart(2, "0")}h`;
 }
 
+// ── Collaboration graph + sequence ───────────────────────────────
+
+function collaborationStatusClass(status) {
+  if (["failed", "blocked", "declined", "cancelled", "expired"].includes(status)) return "danger";
+  if (["queued", "claimed"].includes(status)) return "pending";
+  return status === "completed" ? "success" : "neutral";
+}
+
+function renderCollaboration() {
+  if (!dom.collaborationGraph) return;
+  const data = store.collaboration;
+  if (data.unavailable) {
+    dom.collaborationMeta.textContent = "unavailable";
+    dom.collaborationRooms.innerHTML = "";
+    dom.collaborationGraph.innerHTML = `<div class="empty-block">${esc(data.unavailable)}</div>`;
+    dom.collaborationSequence.innerHTML = `<div class="empty-block compact">collaboration history is unavailable</div>`;
+    dom.collaborationDetail.hidden = true;
+    dom.collaborationPageMeta.textContent = "";
+    dom.collaborationLoadMore.hidden = true;
+    return;
+  }
+
+  const projection = projectCollaboration(data.requests);
+  store.cache.collaborationProjection = projection;
+  const page = data.pagination;
+  dom.collaborationMeta.textContent = `${projection.nodes.length} participants · ${data.requests.length} messages`;
+  dom.collaborationPageMeta.textContent = page.has_more
+    ? `${data.requests.length} of ${page.total || "many"} loaded · graph is partial`
+    : `${data.requests.length} retained messages loaded`;
+  dom.collaborationLoadMore.hidden = !page.has_more;
+  renderCollaborationFilterOptions(projection);
+  renderCollaborationRooms(projection.rooms);
+  renderCollaborationGraph(projection);
+  renderCollaborationSequence();
+}
+
+function renderCollaborationFilterOptions(projection) {
+  const selectedRoom = store.filters.collaborationRoom;
+  dom.collaborationRoom.replaceChildren(new Option("all rooms", ""));
+  for (const room of projection.rooms) {
+    const option = new Option(`${room.label} (${room.count})`, room.key);
+    option.selected = room.key === selectedRoom;
+    dom.collaborationRoom.add(option);
+  }
+  if (selectedRoom && !projection.rooms.some((room) => room.key === selectedRoom)) {
+    const option = new Option("selected room (no results)", selectedRoom);
+    option.selected = true;
+    dom.collaborationRoom.add(option);
+  }
+  dom.collaborationWorkOptions.innerHTML = projection.works.map((work) => `<option value="${esc(work)}"></option>`).join("");
+  dom.collaborationThreadOptions.innerHTML = projection.threads.map((thread) => `<option value="${esc(thread)}"></option>`).join("");
+}
+
+function renderCollaborationRooms(rooms) {
+  if (!rooms.length) {
+    dom.collaborationRooms.innerHTML = "";
+    return;
+  }
+  dom.collaborationRooms.innerHTML = rooms.map((room, index) => `
+    <button class="collaboration-room-chip${room.key === store.ui.selectedCollaborationRoom ? " active" : ""}"
+      type="button" data-collaboration-room-index="${index}">
+      <span>${esc(room.label)}</span><b>${room.count}</b>
+    </button>`).join("");
+}
+
+function graphNodePositions(nodes, width, height) {
+  if (nodes.length === 1) return new Map([[nodes[0].id, { x: width / 2, y: height / 2 }]]);
+  const radiusX = Math.min(width * .38, Math.max(150, nodes.length * 42));
+  const radiusY = Math.min(height * .34, Math.max(90, nodes.length * 20));
+  const positions = new Map();
+  nodes.forEach((node, index) => {
+    const angle = -Math.PI / 2 + (index * Math.PI * 2 / nodes.length);
+    positions.set(node.id, {
+      x: width / 2 + Math.cos(angle) * radiusX,
+      y: height / 2 + Math.sin(angle) * radiusY,
+    });
+  });
+  return positions;
+}
+
+function graphPath(from, to, bend = 0) {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const distance = Math.max(1, Math.hypot(dx, dy));
+  if (distance < 2) {
+    return `M ${from.x - 22} ${from.y - 5} C ${from.x - 78} ${from.y - 76}, ${from.x + 78} ${from.y - 76}, ${from.x + 22} ${from.y - 5}`;
+  }
+  const start = { x: from.x + dx / distance * 48, y: from.y + dy / distance * 30 };
+  const end = { x: to.x - dx / distance * 52, y: to.y - dy / distance * 32 };
+  const mx = (start.x + end.x) / 2 - dy / distance * bend;
+  const my = (start.y + end.y) / 2 + dx / distance * bend;
+  return `M ${start.x.toFixed(1)} ${start.y.toFixed(1)} Q ${mx.toFixed(1)} ${my.toFixed(1)} ${end.x.toFixed(1)} ${end.y.toFixed(1)}`;
+}
+
+function renderCollaborationGraph(projection) {
+  if (!projection.nodes.length) {
+    dom.collaborationGraph.innerHTML = `<div class="empty-block">no collaboration messages match these filters</div>`;
+    return;
+  }
+  const width = Math.max(640, projection.nodes.length * 145);
+  const height = Math.max(320, Math.min(520, projection.nodes.length * 65));
+  const positions = graphNodePositions(projection.nodes, width, height);
+  const nodeById = new Map(projection.nodes.map((node) => [node.id, node]));
+  const edges = projection.edges.map((edge, index) => {
+    const from = positions.get(edge.from);
+    const to = positions.get(edge.to);
+    const reverse = projection.edges.find((candidate) => candidate.from === edge.to && candidate.to === edge.from);
+    const bend = reverse ? (edge.from.localeCompare(edge.to) < 0 ? 34 : -34) : 0;
+    const selected = edge.key === store.ui.selectedCollaborationEdge ? " selected" : "";
+    const dominant = dominantCount(edge.statuses);
+    const midpoint = { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 + bend * .45 };
+    const replyPath = edge.replyCount ? `
+      <path class="collaboration-edge-reply ${collaborationStatusClass(dominantCount(edge.replyStatuses))}${selected}"
+        data-collaboration-edge-index="${index}" d="${graphPath(to, from, bend ? -bend - 10 : 16)}" marker-end="url(#collab-reply-arrow)">
+        <title>${edge.replyCount} replies return to sender</title>
+      </path>` : "";
+    const fromLabel = nodeById.get(edge.from)?.label || edge.from;
+    const toLabel = nodeById.get(edge.to)?.label || edge.to;
+    return `<g class="collaboration-edge-group" role="button" tabindex="0" aria-label="${esc(`${fromLabel} to ${toLabel}: ${edge.count} requests, ${edge.replyCount} replies`)}" data-collaboration-edge-index="${index}">
+      <path class="collaboration-edge-hit" d="${graphPath(from, to, bend)}"></path>
+      <path class="collaboration-edge ${collaborationStatusClass(dominant)}${selected}"
+        d="${graphPath(from, to, bend)}" marker-end="url(#collab-request-arrow)">
+        <title>${edge.count} requests · ${edge.replyCount} replies · ${dominant}</title>
+      </path>
+      ${replyPath}
+      <text class="collaboration-edge-label" x="${midpoint.x}" y="${midpoint.y}">${edge.count} req${edge.replyCount ? ` · ${edge.replyCount} reply` : ""}</text>
+    </g>`;
+  }).join("");
+  const nodes = projection.nodes.map((node) => {
+    const pos = positions.get(node.id);
+    const kind = node.participant.agent_kind || "unknown";
+    return `<g class="collaboration-node kind-${esc(kind)}" transform="translate(${pos.x} ${pos.y})">
+      <rect x="-50" y="-30" width="100" height="60" rx="9"></rect>
+      <text class="collaboration-node-label" text-anchor="middle" y="-3">${esc(node.label).slice(0, 18)}</text>
+      <text class="collaboration-node-subtitle" text-anchor="middle" y="14">${esc(node.subtitle).slice(0, 22)}</text>
+      <title>${esc(node.participant.agent_session_id || node.id)}</title>
+    </g>`;
+  }).join("");
+  const accessibleRows = projection.edges.map((edge) => `<tr>
+    <td>${esc(nodeById.get(edge.from)?.label || edge.from)}</td>
+    <td>${esc(nodeById.get(edge.to)?.label || edge.to)}</td>
+    <td>${edge.count}</td><td>${edge.replyCount}</td><td>${esc(dominantCount(edge.kinds))}</td><td>${esc(dominantCount(edge.statuses))}</td>
+  </tr>`).join("");
+  dom.collaborationGraph.innerHTML = `<svg class="collaboration-graph-svg" viewBox="0 0 ${width} ${height}" style="min-width:${width}px" role="img" aria-label="Directional collaboration graph">
+    <defs>
+      <marker id="collab-request-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
+      <marker id="collab-reply-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
+    </defs>
+    <g class="collaboration-edges">${edges}</g>
+    <g class="collaboration-nodes">${nodes}</g>
+  </svg>
+  <table class="sr-only"><caption>Collaboration graph edge summary</caption><thead><tr><th>From</th><th>To</th><th>Requests</th><th>Replies</th><th>Kind</th><th>Status</th></tr></thead><tbody>${accessibleRows}</tbody></table>`;
+}
+
+function renderCollaborationSequence() {
+  const requests = collaborationSequence(store.collaboration.requests, {
+    edgeKey: store.ui.selectedCollaborationEdge,
+    room: store.ui.selectedCollaborationRoom,
+  });
+  const selected = Boolean(store.ui.selectedCollaborationEdge || store.ui.selectedCollaborationRoom);
+  dom.collaborationClearSelection.hidden = !selected;
+  dom.collaborationSequenceMeta.textContent = selected
+    ? `${requests.length} requests · chronological`
+    : `${requests.length} requests · all filtered rooms`;
+  if (!requests.length) {
+    dom.collaborationSequence.innerHTML = `<div class="empty-block compact">no messages in this sequence</div>`;
+    dom.collaborationDetail.hidden = true;
+    return;
+  }
+
+  const visibleRequests = requests.slice(-200);
+  const participants = sequenceParticipants(visibleRequests);
+  const participantIndex = new Map(participants.map((participant, index) => [participant.id, index]));
+  const events = [];
+  for (const request of visibleRequests) {
+    events.push({
+      request,
+      at: request.created_at,
+      from: participantIdentity(request.from),
+      to: participantIdentity(request.to),
+      reply: false,
+      status: "request",
+      label: `${request.kind || "request"} · sent`,
+    });
+    if (request.reply) {
+      events.push({
+        request,
+        at: request.reply.at || request.created_at,
+        from: participantIdentity(request.to),
+        to: participantIdentity(request.from),
+        reply: true,
+        status: request.reply.status || request.status,
+        label: `reply · ${request.reply.status || request.status || "completed"}`,
+      });
+    }
+  }
+  events.sort((left, right) =>
+    String(left.at || "").localeCompare(String(right.at || "")) ||
+    String(left.request.id || "").localeCompare(String(right.request.id || "")) ||
+    Number(left.reply) - Number(right.reply)
+  );
+  const laneWidth = 170;
+  const left = 65;
+  const width = Math.max(420, left * 2 + Math.max(1, participants.length - 1) * laneWidth);
+  const header = 52;
+  const rowHeight = 58;
+  const height = header + events.length * rowHeight + 20;
+  const laneX = (id) => left + (participantIndex.get(id) || 0) * laneWidth;
+  const lanes = participants.map((participant, index) => {
+    const x = left + index * laneWidth;
+    return `<g class="collaboration-sequence-lane">
+      <text class="sequence-lane-label" text-anchor="middle" x="${x}" y="18">${esc(participant.label).slice(0, 18)}</text>
+      <text class="sequence-lane-subtitle" text-anchor="middle" x="${x}" y="34">${esc(participant.subtitle).slice(0, 20)}</text>
+      <line x1="${x}" x2="${x}" y1="44" y2="${height - 8}"></line>
+    </g>`;
+  }).join("");
+  const rows = events.map((event, index) => {
+    const y = header + index * rowHeight + 25;
+    const sx = laneX(event.from);
+    const tx = laneX(event.to);
+    const labelX = sx === tx ? sx + 44 : (sx + tx) / 2;
+    const time = event.at ? dateTimeLabel(new Date(event.at)) : "—";
+    const path = sx === tx
+      ? `M ${sx} ${y} C ${sx + 80} ${y - 28}, ${sx + 80} ${y + 28}, ${sx + 4} ${y + 8}`
+      : `M ${sx} ${y} L ${tx} ${y}`;
+    return `<g class="sequence-event ${event.reply ? "reply" : "request"} ${collaborationStatusClass(event.status)}"
+      role="button" tabindex="0" aria-label="${esc(`${event.label}, ${time}`)}" data-collaboration-request="${esc(event.request.id)}">
+      <path d="${path}" marker-end="url(#${event.reply ? "sequence-reply-arrow" : "sequence-request-arrow"})"></path>
+      <circle cx="${sx}" cy="${y}" r="4"></circle>
+      <text class="sequence-event-label" text-anchor="middle" x="${labelX}" y="${y - 9}">${esc(event.label)}</text>
+      <text class="sequence-event-time" text-anchor="middle" x="${labelX}" y="${y + 17}">${esc(time)}</text>
+      <title>${esc(`${event.label} · ${event.request.id || "message"}`)}</title>
+    </g>`;
+  }).join("");
+  dom.collaborationSequence.innerHTML = `${requests.length > visibleRequests.length ? `<div class="collaboration-cap-note">showing latest ${visibleRequests.length} of ${requests.length} requests</div>` : ""}
+    <svg class="collaboration-sequence-svg" viewBox="0 0 ${width} ${height}" style="min-width:${width}px;height:${height}px" role="img" aria-label="Chronological request and reply sequence">
+      <defs>
+        <marker id="sequence-request-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
+        <marker id="sequence-reply-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
+      </defs>
+      ${lanes}${rows}
+    </svg>`;
+  const selectedRequest = requests.find((request) => request.id === store.ui.selectedCollaborationRequest);
+  if (selectedRequest) renderCollaborationDetail(selectedRequest);
+  else dom.collaborationDetail.hidden = true;
+}
+
+function renderCollaborationDetail(request) {
+  const reply = request.reply;
+  const work = requestWorkId(request);
+  const thread = requestThreadId(request);
+  const parent = request.parent_request_id || "";
+  const artifacts = [...(request.artifacts || []), ...(reply?.artifacts || [])];
+  const links = (request.links || []).map((link) => typeof link === "string" ? { label: link, url: link } : link);
+  const detailsIncluded = store.collaboration.details_included;
+  dom.collaborationDetail.hidden = false;
+  dom.collaborationDetail.innerHTML = `
+    <div class="collaboration-detail-head">
+      <span class="collaboration-kind">${esc(request.kind || "request")}</span>
+      <strong>${esc(participantLabel(request.from))} → ${esc(participantLabel(request.to))}</strong>
+      <span class="collaboration-status ${collaborationStatusClass(request.status)}">${esc(request.status || "unknown")}</span>
+      <button class="icon-btn" type="button" data-close-collaboration-detail aria-label="Close message detail">×</button>
+    </div>
+    <dl class="collaboration-detail-meta">
+      <dt>id</dt><dd>${esc(request.id)}</dd>
+      <dt>room</dt><dd>${esc(roomLabel(request))}</dd>
+      ${work ? `<dt>work</dt><dd>${esc(work)}</dd>` : ""}
+      ${thread ? `<dt>thread</dt><dd>${esc(thread)}</dd>` : ""}
+      ${parent ? `<dt>parent</dt><dd>${esc(parent)}</dd>` : ""}
+      <dt>sent</dt><dd>${esc(request.created_at ? new Date(request.created_at).toLocaleString() : "—")}</dd>
+    </dl>
+    ${detailsIncluded ? `<div class="collaboration-message-body"><span>request</span><pre>${esc(request.body || "")}</pre></div>` : `<div class="collaboration-detail-redacted">Message bodies and artifacts are available only when dashboard auth mode is token.</div>`}
+    ${detailsIncluded && reply ? `<div class="collaboration-message-body reply"><span>reply · ${esc(reply.status || request.status)}</span><pre>${esc(reply.body || "")}</pre></div>` : ""}
+    ${detailsIncluded && artifacts.length ? `<div class="collaboration-detail-list"><span>artifacts</span>${artifacts.map((artifact) => `<code>${esc(typeof artifact === "string" ? artifact : JSON.stringify(artifact))}</code>`).join("")}</div>` : ""}
+    ${detailsIncluded && links.length ? `<div class="collaboration-detail-list"><span>links</span>${links.map((link) => {
+      const href = safeExternalHref(link.url || link.href);
+      return href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(link.label || href)}</a>` : `<code>${esc(link.label || link.url || link.href || "")}</code>`;
+    }).join("")}</div>` : ""}`;
+}
+
+function chooseCollaborationRoom(room) {
+  store.filters.collaborationRoom = room?.key || "";
+  store.filters.collaborationRoomObject = room?.room || null;
+  store.ui.selectedCollaborationRoom = room?.key || "";
+  store.ui.selectedCollaborationEdge = "";
+  store.ui.selectedCollaborationRequest = "";
+  dom.collaborationRoom.value = store.filters.collaborationRoom;
+  fetchCollaboration().catch(() => {});
+}
+
 // ── Data loading ──────────────────────────────────────────────────
 
 const liveRenderDirty = { panes: false, terminals: false };
@@ -2618,6 +3054,83 @@ function scheduleLiveRender({ panes = false, terminals = false } = {}) {
     liveRenderDirty.terminals = false;
     renderCounts();
   });
+}
+
+let collaborationRequest = null;
+async function fetchCollaboration({ append = false } = {}) {
+  if (!dom.collaborationGraph || collaborationRequest) return collaborationRequest;
+  const params = new URLSearchParams({ limit: String(COLLABORATION_PAGE_SIZE) });
+  const filters = store.filters;
+  if (filters.collaborationRange) params.set("since", filters.collaborationRange);
+  if (filters.collaborationWork) {
+    const slash = filters.collaborationWork.indexOf("/");
+    if (slash > 0) {
+      params.set("workspace", filters.collaborationWork.slice(0, slash));
+      params.set("work", filters.collaborationWork.slice(slash + 1));
+    } else {
+      params.set("work", filters.collaborationWork);
+    }
+  }
+  if (filters.collaborationThread) params.set("thread", filters.collaborationThread);
+  if (filters.collaborationKind) params.set("kind", filters.collaborationKind);
+  if (filters.collaborationStatus) params.set("status", filters.collaborationStatus);
+  if (filters.collaborationRoomObject) params.set("room", JSON.stringify(filters.collaborationRoomObject));
+  if (append) {
+    const page = store.collaboration.pagination;
+    if (page.next_cursor) params.set("cursor", page.next_cursor);
+    else if (page.next_offset != null) params.set("offset", String(page.next_offset));
+  }
+
+  dom.collaborationRefresh.disabled = true;
+  collaborationRequest = (async () => {
+    try {
+      const resp = await fetch(`/api/collaboration?${params.toString()}`, { headers: authHeaders() });
+      if (resp.status === 401) {
+        setConnectionStatus("dead", "401 — bad or missing token");
+        throw new Error("unauthorized");
+      }
+      if (resp.status === 503) {
+        store.collaboration = {
+          ...store.collaboration,
+          requests: [],
+          unavailable: "collaboration is disabled in muxad configuration",
+        };
+        renderCollaboration();
+        return;
+      }
+      if (!resp.ok) {
+        let message = `collaboration history → ${resp.status}`;
+        try {
+          const body = await resp.json();
+          message = body.error || body.message || message;
+        } catch (_) {}
+        throw new Error(message);
+      }
+      const incoming = normalizeCollaborationPayload(await resp.json());
+      const requests = append
+        ? mergeCollaborationRequests(store.collaboration.requests, incoming.requests)
+        : incoming.requests;
+      store.collaboration = { ...incoming, requests, unavailable: "" };
+      store.revisions.collaboration += 1;
+      renderCollaboration();
+    } catch (error) {
+      if (error?.message === "unauthorized") throw error;
+      store.collaboration.unavailable = error?.message || "could not load collaboration history";
+      renderCollaboration();
+    } finally {
+      collaborationRequest = null;
+      dom.collaborationRefresh.disabled = false;
+    }
+  })();
+  return collaborationRequest;
+}
+
+function mergeCollaborationRequests(current, incoming) {
+  const byId = new Map();
+  for (const request of [...current, ...incoming]) byId.set(request.id, request);
+  return [...byId.values()].sort((left, right) =>
+    String(left.created_at || "").localeCompare(String(right.created_at || ""))
+  );
 }
 
 async function fetchAgentsSnapshot() {
@@ -2815,6 +3328,7 @@ async function main() {
   initCollapseControls();
   initDataTabs();
   initSessionControls();
+  initCollaborationControls();
   initDynamicEventDelegation();
   renderStaticChips();
   setConnectionStatus("connecting", "loading…");
@@ -2830,6 +3344,7 @@ async function main() {
     fetchAgentsSnapshot(),
     fetchPanes(),
     fetchWorks(),
+    fetchCollaboration(),
     store.ui.activeTab === "terminals" ? fetchTerminalSessions() : Promise.resolve(),
     fetchTimeline({ force: true }),
   ]);
@@ -2838,12 +3353,14 @@ async function main() {
   setTimeout(pollWorks, WORK_REFETCH_INTERVAL_MS);
   setTimeout(pollTerminals, TERMINALS_REFETCH_INTERVAL_MS);
   setTimeout(pollTimeline, TIMELINE_REFETCH_INTERVAL_MS);
+  setTimeout(pollCollaboration, COLLABORATION_REFETCH_INTERVAL_MS);
 
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
     scheduleLiveRender({ panes: true, terminals: true });
     fetchPanes().catch(() => {});
     fetchWorks().catch(() => {});
+    fetchCollaboration().catch(() => {});
     if (store.ui.activeTab === "terminals") fetchTerminalSessions().catch(() => {});
     if (Date.now() - lastTimelineFetchAt >= TIMELINE_MIN_REFRESH_INTERVAL_MS) {
       fetchTimeline().catch(() => {});
@@ -2883,6 +3400,12 @@ async function pollTerminals() {
 async function pollTimeline() {
   if (!document.hidden) await fetchTimeline().catch(() => {});
   setTimeout(pollTimeline, TIMELINE_REFETCH_INTERVAL_MS);
+}
+
+async function pollCollaboration() {
+  const collapsed = document.getElementById("collaboration-panel")?.classList.contains("collapsed");
+  if (!document.hidden && !collapsed) await fetchCollaboration().catch(() => {});
+  setTimeout(pollCollaboration, COLLABORATION_REFETCH_INTERVAL_MS);
 }
 
 main();

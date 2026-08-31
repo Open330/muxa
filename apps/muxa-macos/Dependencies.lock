@@ -1,0 +1,16 @@
+# Reproducible source inputs for Muxa for Mac.
+# This file is sourced by Scripts/build-libghostty.sh; keep values shell-safe.
+
+GHOSTTY_VERSION=1.3.1
+GHOSTTY_COMMIT=332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28
+GHOSTTY_REPOSITORY=https://github.com/ghostty-org/ghostty.git
+
+# We vendor no prebuilt binary from this project. Its pinned patch set and
+# Swift terminal surface are consumed as source, while Muxa builds and links
+# its own GhosttyKit.xcframework from GHOSTTY_COMMIT above.
+GHOSTTY_SWIFT_COMMIT=fa68fefb35b18078f00b5297d331fbcc8e41c36c
+GHOSTTY_SWIFT_REPOSITORY=https://github.com/Lakr233/libghostty-spm.git
+
+ZIG_VERSION=0.15.2
+ZIG_ARM64_SHA256=3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b
+ZIG_X86_64_SHA256=375b6909fc1495d16fc2c7db9538f707456bfc3373b14ee83fdd3e22b3d43f7f

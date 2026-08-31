@@ -37,8 +37,9 @@ OpenSSH stdio channel. It is intentionally not a network service. The remote
 exchanges full snapshots, revisioned transitions/keepalives, exact capture,
 prompt, or collaboration/mailbox requests, results, errors, and explicit
 resync markers. Collaboration operations are advertised by the optional
-`collaboration` capability so mixed-version controllers reject them before
-sending an unsupported frame. See
+`collaboration` capability; exact durable reply lookup additionally requires
+`collaboration_get`, so mixed-version controllers reject it before sending an
+unsupported frame. See
 [`docs/FLEET.md`](docs/FLEET.md); `FLEET_PROTOCOL_VERSION` is negotiated
 separately from this local IPC protocol.
 
@@ -139,9 +140,12 @@ Dispatch one operation to an exact host. The local adapter rechecks complete
 pane identity in process. For remote hosts the manager also rechecks
 observe/control mode and the relay verifies complete pane identity. Prompt and
 collaboration mutations are not retried. The collaboration operations are
-`collaboration_send`, `collaboration_mailbox`, `collaboration_claim`, and
-`collaboration_reply`; their durable data remains in the selected physical
-node's muxad rather than being copied into the controller.
+`collaboration_send`, `collaboration_mailbox`, `collaboration_get`,
+`collaboration_claim`, and `collaboration_reply`. `collaboration_get` carries
+both a relay correlation id and the durable collaboration request id; the
+former routes the frame while the latter selects and acknowledges an exact
+reply. Their durable data remains in the selected physical node's muxad rather
+than being copied into the controller.
 
 ```json
 {
@@ -440,6 +444,12 @@ other agent occupies the same stable tmux window.
   "target": "peer",
   "request": { "kind": "review", "body": "review auth", "expects_reply": true,
                "work_mode": "read_only", "paths": ["crates/auth/**"],
+               "thread_id": "thread-cal-7345",
+               "parent_request_id": "req_earlier",
+               "workspace_id": "callabo", "work_id": "CAL-7345",
+               "run_id": "tmux:default:@1",
+               "artifacts": ["commit:d4bf2aa"],
+               "links": ["https://example.test/review"],
                "air_artifacts": [{
                  "artifact_id": "urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                  "profile": "https://open330.github.io/air/profiles/1.0.0/plan-native-cli",
@@ -493,6 +503,25 @@ model turns. All other errors remain errors and do not trigger the fallback.
 Identity is pinned to the registering agent session. `@alias` targets a unique
 live alias, while `role:<name>` succeeds only when exactly one live peer in the
 room carries that role.
+
+The causal/Work fields on `NewRequest` are additive and optional. A root
+request without `thread_id` is assigned its request id. With
+`parent_request_id`, the daemon requires an existing request between the same
+participants in the same room, inherits its canonical thread, and rejects a
+conflicting explicit thread. Missing `workspace_id`/`work_id` are stamped from
+managed pane metadata when available; missing `run_id` is derived from the
+execution binding. Explicit values take precedence. `artifacts` and `links`
+are opaque metadata and do not grant file, network, or execution authority.
+Existing persisted/wire requests omit all of these fields cleanly.
+Because pre-1.0 older daemons may deserialize and ignore unknown additive
+fields, callers that require causal or Work metadata must upgrade client and
+daemon together and verify the stored response.
+
+`collaboration_list` deliberately retains its unbounded response shape for
+mixed-version CLI/watch/MCP compatibility. The CLI's new list filters and
+offset/limit are applied locally to that newest-first snapshot. Indexed
+keyset queries are currently an in-process store contract used by the
+dashboard, not a new local IPC method.
 
 `air_artifacts` is an additive list of typed AIR 1.0 references on both
 requests and replies. The daemon validates the SHA-256 URN, exact supported

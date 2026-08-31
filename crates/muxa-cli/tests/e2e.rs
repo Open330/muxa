@@ -254,6 +254,73 @@ fn onboarding_prints_even_when_config_is_invalid() {
 }
 
 #[test]
+fn collaboration_cli_exposes_history_and_correlation_options() {
+    let list = Command::new(bin("muxa"))
+        .args(["msg", "list", "--help"])
+        .output()
+        .expect("show msg list help");
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let list_help = String::from_utf8_lossy(&list.stdout);
+    for flag in [
+        "--since",
+        "--workspace",
+        "--work",
+        "--thread",
+        "--kind",
+        "--status",
+        "--window",
+        "--room",
+        "--limit",
+        "--offset",
+    ] {
+        assert!(list_help.contains(flag), "missing {flag} in:\n{list_help}");
+    }
+
+    let send = Command::new(bin("muxa"))
+        .args(["msg", "send", "--help"])
+        .output()
+        .expect("show msg send help");
+    assert!(
+        send.status.success(),
+        "{}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+    let send_help = String::from_utf8_lossy(&send.stdout);
+    for flag in [
+        "--thread",
+        "--parent",
+        "--workspace",
+        "--work",
+        "--run",
+        "--artifact",
+        "--link",
+    ] {
+        assert!(send_help.contains(flag), "missing {flag} in:\n{send_help}");
+    }
+
+    let watch = Command::new(bin("muxa"))
+        .args(["watch", "--help"])
+        .output()
+        .expect("show watch help");
+    assert!(
+        watch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&watch.stderr)
+    );
+    let watch_help = String::from_utf8_lossy(&watch.stdout);
+    assert!(
+        watch_help.contains("--collab-layout"),
+        "missing --collab-layout in:\n{watch_help}"
+    );
+    assert!(watch_help.contains("table"));
+    assert!(watch_help.contains("sequence"));
+}
+
+#[test]
 fn claude_hook_round_trip() {
     let d = Daemon::spawn();
 

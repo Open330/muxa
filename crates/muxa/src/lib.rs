@@ -67,6 +67,8 @@ pub mod timeline;
 pub mod tmux;
 pub mod topology;
 pub mod work;
+#[doc(hidden)]
+pub mod work_control;
 
 // ---------------------------------------------------------------------------
 // Stable public surface.

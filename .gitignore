@@ -5,5 +5,10 @@
 .envrc
 .direnv/
 .context/
+/apps/muxa-macos/.build/
+/apps/muxa-macos/.derived-data/
+/apps/muxa-macos/.qa-derived/
+/apps/muxa-macos/*.xcresult/
+/apps/muxa-macos/Muxa.xcodeproj/
 # Claude Code's sub-agent isolation worktrees + local agent state.
 .claude/

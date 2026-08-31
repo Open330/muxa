@@ -35,7 +35,7 @@ screen-manifest match ───┘
        detection task)                       +--> state.json
                                              +--> prompts.ndjson
                                              +--> activity.ndjson
-                                             +--> collaboration.json
+                                             +--> collaboration.sqlite3
                                              +--> notifications / sinks
                                              +--> dashboard SSE
 ```
@@ -61,6 +61,7 @@ slow full-snapshot reconciliation poll.
 | --- | --- |
 | `muxad` | Long-running daemon. Owns the registry, IPC server, background tasks, and optional dashboard. |
 | `muxa` | CLI for status, watch, attend, recap, stats, reports, activity queries, init, hook entrypoints, and the `mcp` control server. |
+| `Muxa.app` | Native macOS control surface. Renders muxad-owned PTY byte streams through a pinned, locally built libghostty XCFramework; it never owns agent process identity. |
 | Agent adapters | Translate Claude/Codex/Gemini/Antigravity hook events into muxa state transitions. |
 | Pane backends | Resolve panes, sessions, captures, and foreground activity per host (tmux, cmux, rmux, herdr, zellij). The daemon can observe several at once; each non-tmux pane id is namespaced by host. |
 | herdr bridge | Translates herdr's own `agent_status` stream into synthetic rows for agents muxa has no hooks for. |
@@ -80,7 +81,7 @@ hook claims the pane.
 | `prompts.ndjson` | Retained prompt audit log. |
 | `activity.ndjson` | Append-only duration ledger. |
 | `session-activity.json` | Legacy/compat tmux foreground totals. |
-| `collaboration.json` | Durable same-window mailbox plus exact-session aliases and roles. |
+| `collaboration.sqlite3` | Indexed durable mailbox, thread/Work metadata, and exact-session aliases/roles. An existing `collaboration.json` is imported once and retained as a migration backup. |
 | `dashboard-work.json` | Schema-v2 Work definitions and external issue references keyed by logical Work identity. |
 | `host-id` | Owner-only stable physical-node UUID used by Fleet handshakes. |
 
@@ -98,6 +99,8 @@ Paths are configurable; defaults live under `$XDG_DATA_HOME/muxa`.
   global pane identities, defaults hosts to observe-only, and never opens a
   remote network listener.
 - The codebase forbids unsafe Rust.
+- The macOS app requires the additive `session_bytes_v1` capability and never
+  substitutes the legacy lossy UTF-8 projection for terminal bytes.
 
 ## Shutdown
 

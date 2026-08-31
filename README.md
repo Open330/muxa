@@ -91,14 +91,15 @@ exit.
 | --- | --- |
 | `muxa status-line` | One-line tmux `status-right` summary for the active pane. |
 | `muxa peek` | `prefix + q` overlay: each pane's live screen dimmed under a box with its handle (`@claude`) and tmux pane id, its agent's state, summary, and latest prompt/response — including how long ago you last prompted it and which pane was prompted most recently; press a digit to jump. |
-| `muxa watch` | Main TUI for agents, prompts, live previews, and same-window collaboration. |
+| `muxa watch` | Main TUI for agents, prompts, live previews, hierarchy-aware mailbox history, and table/sequence collaboration. |
 | `muxa dashboard` | Work-first TUI console; `P` prompts and `A` aborts every live agent in the selected Work. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |
 | `muxa stats` / `muxa report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
 | `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
 | `muxa activity` | Raw duration ledger query for debugging exactly what fed stats/report. |
 | BarShelf widget (macOS) | Menu-bar popover summary of active, working, waiting, and error agents. |
-| Dashboard | Optional loopback HTTP UI with SSE live updates and a timeline graph. |
+| Muxa for Mac | Native session browser and menu-bar app with a locally built libghostty terminal; native PTYs remain owned by `muxad`. |
+| Dashboard | Optional loopback HTTP UI with SSE live updates, timeline, and collaboration node-edge/sequence graphs. |
 | Notifications | Optional desktop alerts when agents need attention. |
 
 ## Install Muxa
@@ -138,6 +139,24 @@ muxa daemon status
 muxa status
 muxa watch
 ```
+
+### Build Muxa for Mac
+
+The native macOS app embeds a libghostty terminal while keeping shells and
+agents in `muxad`, so closing the app does not stop them. Ghostty, its Swift
+surface, and the required Zig compiler are pinned and verified; Muxa builds its
+own local XCFramework instead of consuming a prebuilt terminal binary.
+
+```bash
+brew install xcodegen
+apps/muxa-macos/Scripts/build-app.sh --open
+```
+
+After building, run `apps/muxa-macos/Scripts/smoke-test.sh` for a
+non-interactive product smoke test.
+
+See [Muxa for Mac](docs/MACOS.md) for the architecture, build inputs, and IPC
+contract.
 
 ### Collaborate from `muxa watch`
 
@@ -221,6 +240,15 @@ Then:
    `/` opens reusable skills registered with `muxa skill add`; selection inserts
    at the cursor and a second `Enter` sends. Press `M` to read and reply from
    the mailbox (`b` remains an alias).
+
+`M` on a window combines its room; on a session it combines all windows and
+groups the read-only history by window. On the collaboration screen, `v`
+toggles the newest-first table and chronological sequence (`muxa watch
+--screen collab --collab-layout sequence` starts there directly). The web
+dashboard adds a cross-room node-edge graph, sequence drill-down, filters, and
+cursor pagination. Durable history is indexed in `collaboration.sqlite3`; an
+existing `collaboration.json` is imported once and retained as a migration
+backup until you remove or archive that duplicate copy.
 
 For request/reply details, see
 [docs/COLLABORATION.md](docs/COLLABORATION.md); for skill registration and

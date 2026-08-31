@@ -11,11 +11,12 @@ use muxa::collaboration::{CollaborationOrigin, RequestMailbox};
 use muxa::config::{FleetCapturePolicy, FleetConfig, FleetConnectPolicy, FleetHostConfig};
 use muxa::fleet::{
     drain_bounded, load_or_create_node_id, read_bounded_line, sanitize_capture_text,
-    sanitize_terminal_text, validate_label_value, FleetCapturedWindowPane, FleetCommandEnvelope,
-    FleetCommandReceiver, FleetCommandResult, FleetHostSnapshot, FleetHostState, FleetOperation,
-    FleetRuntime, FleetStore, FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello,
-    RelayRequest, RemoteSnapshot, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES,
-    FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, LOCAL_HOST_ALIAS,
+    sanitize_raw_capture_base64, sanitize_terminal_text, validate_label_value,
+    FleetCapturedWindowPane, FleetCommandEnvelope, FleetCommandReceiver, FleetCommandResult,
+    FleetHostSnapshot, FleetHostState, FleetOperation, FleetRuntime, FleetStore,
+    FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
+    RemoteSnapshot, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES, FLEET_MAX_FRAME_BYTES,
+    FLEET_PROTOCOL_VERSION, LOCAL_HOST_ALIAS,
 };
 use muxa::tmux::SessionInfo;
 use muxa::{HostKind, PaneKey, SharedBackend, SharedStore, WindowKey};
@@ -344,6 +345,7 @@ impl LocalTask {
             .await;
     }
 
+    #[allow(clippy::too_many_lines)] // one exhaustive local Fleet operation table
     async fn execute(&self, operation: FleetOperation) -> Result<FleetCommandResult, String> {
         match operation {
             FleetOperation::Connect => Ok(FleetCommandResult::accepted(
@@ -406,6 +408,14 @@ impl LocalTask {
                 )
                 .map_err(|error| error.to_string())?;
                 Ok(FleetCommandResult::collaboration_mailbox(incoming, sent))
+            }
+            FleetOperation::CollaborationGet { pane, request_id } => {
+                audit_operation(LOCAL_HOST_ALIAS, "collaboration_get", 0);
+                self.client
+                    .collaboration_get(&fleet_collaboration_origin(&pane, true), &request_id)
+                    .await
+                    .map(FleetCommandResult::collaboration_request)
+                    .map_err(|error| error.to_string())
             }
             FleetOperation::CollaborationClaim { pane } => {
                 exact_local_backend(&self.backends, &pane).await?;
@@ -564,14 +574,11 @@ async fn local_capture(
     }
     let socket = pane.window.session.endpoint.socket;
     let pane_id = pane.pane_id;
-    let capture = tokio::task::spawn_blocking(move || {
-        backend
-            .capture_pane_on(Some(&socket), &pane_id)
-            .map(sanitize_capture_text)
-    })
-    .await
-    .map_err(|error| format!("local capture task panicked: {error}"))?;
-    Ok(FleetCommandResult::capture(capture))
+    let capture =
+        tokio::task::spawn_blocking(move || backend.capture_pane_on(Some(&socket), &pane_id))
+            .await
+            .map_err(|error| format!("local capture task panicked: {error}"))?;
+    Ok(FleetCommandResult::capture_with_raw(capture))
 }
 
 async fn local_capture_window(
@@ -612,10 +619,10 @@ async fn local_capture_window(
             panes.extend(std::thread::scope(|scope| {
                 batch
                     .iter()
-                    .cloned()
                     .map(|geometry| {
                         let backend = backend.clone();
                         let socket = socket.clone();
+                        let geometry = geometry.clone();
                         scope.spawn(move || {
                             let text = backend
                                 .capture_pane_on(Some(&socket), &geometry.pane_id)
@@ -1024,13 +1031,14 @@ impl HostTask {
                         command.operation,
                         FleetOperation::SendPrompt { .. }
                             | FleetOperation::CollaborationSend { .. }
+                            | FleetOperation::CollaborationGet { .. }
                             | FleetOperation::CollaborationClaim { .. }
                             | FleetOperation::CollaborationReply { .. }
                     )
                         && self.config.mode != HostAccessMode::Control
                     {
                         let _ = command.reply.send(Err(format!(
-                            "host '{}' is observe-only; set mode = 'control' to send prompts",
+                            "host '{}' is observe-only; set mode = 'control' to perform control actions",
                             self.alias
                         )));
                         continue;
@@ -1039,12 +1047,26 @@ impl HostTask {
                         command.operation,
                         FleetOperation::CollaborationSend { .. }
                             | FleetOperation::CollaborationMailbox { .. }
+                            | FleetOperation::CollaborationGet { .. }
                             | FleetOperation::CollaborationClaim { .. }
                             | FleetOperation::CollaborationReply { .. }
                     ) && !connected.hello.capabilities.iter().any(|capability| capability == "collaboration")
                     {
                         let _ = command.reply.send(Err(format!(
                             "host '{}' does not support Fleet collaboration; upgrade muxa on that host",
+                            self.alias
+                        )));
+                        continue;
+                    }
+                    if matches!(command.operation, FleetOperation::CollaborationGet { .. })
+                        && !connected
+                            .hello
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability == "collaboration_get")
+                    {
+                        let _ = command.reply.send(Err(format!(
+                            "host '{}' does not support exact Fleet collaboration replies; upgrade muxa on that host",
                             self.alias
                         )));
                         continue;
@@ -1114,6 +1136,18 @@ impl HostTask {
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
                             RelayRequest::CollaborationMailbox { request_id: id, pane }
+                        }
+                        FleetOperation::CollaborationGet { pane, request_id } => {
+                            audit_operation(&self.alias, "collaboration_get", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::CollaborationGet {
+                                request_id: id,
+                                pane,
+                                collaboration_request_id: request_id,
+                            }
                         }
                         FleetOperation::CollaborationClaim { pane } => {
                             audit_operation(&self.alias, "collaboration_claim", 0);
@@ -1453,6 +1487,9 @@ fn sanitize_command_result(mut result: FleetCommandResult) -> FleetCommandResult
         .message
         .map(|message| sanitize_remote_error(&message));
     result.capture = result.capture.map(sanitize_capture_text);
+    result.capture_raw_base64 = result
+        .capture_raw_base64
+        .and_then(sanitize_raw_capture_base64);
     if let Some(window) = &mut result.window_capture {
         for pane in &mut window.panes {
             pane.text = pane.text.take().map(sanitize_capture_text);

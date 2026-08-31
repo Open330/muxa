@@ -1,0 +1,17 @@
+diff --git a/Script/build.sh b/Script/build.sh
+index 265a231..b4c38e4 100755
+--- a/Script/build.sh
++++ b/Script/build.sh
+@@ -86,8 +86,10 @@ fi
+ 
+ if [ -n "$GHOSTTY_REF" ]; then
+     echo "[*] checking out ghostty ref: $GHOSTTY_REF"
+-    git -C "$SOURCE_DIR" fetch --tags origin
+-    git -C "$SOURCE_DIR" checkout "$GHOSTTY_REF"
++    if ! git -C "$SOURCE_DIR" cat-file -e "$GHOSTTY_REF^{commit}" 2>/dev/null; then
++        git -C "$SOURCE_DIR" fetch --depth 1 origin "$GHOSTTY_REF"
++    fi
++    git -C "$SOURCE_DIR" checkout --detach "$GHOSTTY_REF"
+ fi
+ 
+ ARTIFACTS_DIR="$ROOT_DIR/build/artifacts"

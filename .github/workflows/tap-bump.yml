@@ -1,10 +1,20 @@
 name: tap-bump
 
 # Keep Open330/homebrew-tap's Formula/muxa.rb pointing at the newest
-# published release. Runs on `release: published` (NOT on tag push) so
-# the formula's download URLs are live by the time it lands — the
-# release workflow creates a *draft* whose asset URLs 404 until a
-# maintainer publishes it.
+# published release. Never on tag push: the release workflow creates a
+# *draft* whose asset URLs 404 until it is published, and a formula
+# pointing at a 404 is worse than one that is merely stale.
+#
+# Two ways in, because one of them cannot reach the other:
+#
+#   * `workflow_call`, which is how `release.yml` runs this the moment it
+#     publishes. GitHub deliberately does not start workflows from events
+#     raised with the automatic `GITHUB_TOKEN`, so the publish this repo
+#     performs for itself never produces a `release: published` any
+#     workflow can see. Calling it directly sidesteps the whole question.
+#   * `release: published`, which covers a release a human publishes from
+#     the web UI or their own credentials — the recovery path when the
+#     automated publish did not run.
 #
 # Requires the `TAP_GITHUB_TOKEN` repo secret: a fine-grained PAT with
 # Contents read/write on Open330/homebrew-tap (the default
@@ -15,6 +25,12 @@ name: tap-bump
 on:
   release:
     types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to sync the formula to (e.g. v0.8.38)"
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -35,10 +51,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.tag }}"
-          else
-            tag="${{ github.event.release.tag_name }}"
+          # `inputs.tag` covers both ways in that name a tag explicitly
+          # (workflow_call and workflow_dispatch); the release event carries
+          # its own.
+          tag="${{ inputs.tag || github.event.release.tag_name }}"
+          if [ -z "$tag" ]; then
+            echo "::error::no tag to sync the formula to" >&2
+            exit 1
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
@@ -118,8 +137,8 @@ jobs:
               <<~CAVEATS
                 Upgrading does not replace a muxad that is already running: the
                 new binary lands on disk, and the live process keeps serving
-                from the old one. Since 0.8.38 muxad notices the swap on its own
-                and re-execs onto the new build within about 30 seconds.
+                from the old one. This version of muxad notices the swap on its
+                own and re-execs onto the new build within about 30 seconds.
 
                 To pick it up immediately, or after disabling that in
                 [daemon] restart_on_new_binary:

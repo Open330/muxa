@@ -209,7 +209,7 @@ impl AskStore {
         let parsed =
             AskAgent::parse(agent).ok_or_else(|| AskError::UnsupportedAgent(agent.to_string()))?;
         let label = parsed.label().to_string();
-        *self.agent.write().await = label.clone();
+        self.agent.write().await.clone_from(&label);
         Ok(label)
     }
 

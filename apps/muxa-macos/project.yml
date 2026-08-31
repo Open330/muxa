@@ -1,0 +1,89 @@
+name: Muxa
+
+options:
+  minimumXcodeGenVersion: 2.44.1
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+
+packages:
+  GhosttyKit:
+    path: .build/dependencies/libghostty-spm
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    CLANG_ENABLE_MODULES: YES
+
+targets:
+  Muxa:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    dependencies:
+      - package: GhosttyKit
+        product: GhosttyTerminal
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.muxa.mac
+        PRODUCT_NAME: Muxa
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Muxa
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_NSHighResolutionCapable: YES
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_STYLE: Automatic
+    postBuildScripts:
+      - name: Embed muxa runtime
+        script: '"$SRCROOT/Scripts/embed-muxad.sh"'
+        basedOnDependencyAnalysis: false
+
+  MuxaTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: Muxa
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: dev.muxa.mac.tests
+
+  MuxaQAHelper:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: HelperSources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.muxa.qa-helper
+        PRODUCT_NAME: MuxaQAHelper
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Muxa QA Helper
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_NSScreenCaptureUsageDescription: Muxa QA Helper captures only the Muxa window for local UI verification.
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_STYLE: Automatic
+
+schemes:
+  Muxa:
+    build:
+      targets:
+        Muxa: all
+        MuxaTests: [test]
+    test:
+      targets:
+        - MuxaTests
+  MuxaQAHelper:
+    build:
+      targets:
+        MuxaQAHelper: all

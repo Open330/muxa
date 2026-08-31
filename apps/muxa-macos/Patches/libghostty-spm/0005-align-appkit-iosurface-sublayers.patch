@@ -1,0 +1,57 @@
+diff --git a/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView+Lifecycle.swift b/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView+Lifecycle.swift
+--- a/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView+Lifecycle.swift
++++ b/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView+Lifecycle.swift
+@@ -247,6 +247,7 @@
+             // observable symptom is text rendered at half size after the
+             // window crosses to a display with a different
+             // backingScaleFactor.
++            layer?.masksToBounds = true
+             layer?.contentsScale = scale
+             if let metal = layer as? CAMetalLayer {
+                 metal.drawableSize = CGSize(
+@@ -256,6 +257,10 @@
+                     height: bounds.height * scale
+                 )
+             }
++            for sublayer in layer?.sublayers ?? [] {
++                sublayer.frame = bounds
++                sublayer.contentsScale = scale
++            }
+             // Mirror to the cached ivar in case anything else still
+             // reads through it during a transitional layout pass.
+             metalLayer?.contentsScale = scale
+@@ -267,10 +272,21 @@
+ 
+         func enforceMetalLayerScale() {
+             let scale = core.scaleFactor()
+-            if let layer, layer.contentsScale != scale {
+-                layer.contentsScale = scale
++            if let layer {
++                layer.masksToBounds = true
++                if layer.contentsScale != scale {
++                    layer.contentsScale = scale
++                }
++                for sublayer in layer.sublayers ?? [] {
++                    if sublayer.contentsScale != scale {
++                        sublayer.contentsScale = scale
++                    }
++                    if sublayer.frame != bounds {
++                        sublayer.frame = bounds
++                    }
++                }
+             }
+             if let metalLayer, metalLayer.contentsScale != scale {
+                 metalLayer.contentsScale = scale
+             }
+         }
+diff --git a/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView.swift b/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView.swift
+--- a/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView.swift
++++ b/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView.swift
+@@ -77,6 +77,7 @@
+             metal.backgroundColor = NSColor.clear.cgColor
+             layer = metal
+             metalLayer = metal
++            layer?.masksToBounds = true
+             layer?.backgroundColor = NSColor.clear.cgColor
+ 
+             inputHandler = TerminalKeyEventHandler(view: self)

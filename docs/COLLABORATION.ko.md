@@ -66,6 +66,8 @@ enabled = true
 wake = "idle_only"
 # 선택 사항: 기본값 "operator_full", 또는 "notice" / "full"
 wake_payload = "operator_full"
+# 선택 사항. 생략하면 이력을 영구 보존
+# retention_days = 90
 ```
 
 이미 있는 `wake` 값은 덮어쓰지 않습니다. `never`는 "mailbox는 쓰되 내 pane은
@@ -167,6 +169,11 @@ alias는 live peer 사이에서 room-local unique이며 32자 이하 slug입니�
 # 질문/리뷰는 read-only가 기본
 muxa msg send peer "auth 변경의 race 가능성을 검토해 주세요" --kind review
 
+# 원인 request와 Work/Run을 연결한 후속 검증
+muxa msg send peer "수정 결과를 검증해 주세요" --kind review \
+  --parent req_... --workspace callabo --work CAL-7345 --run resolve-2 \
+  --artifact commit:d4bf2aa --link https://example.test/review
+
 # 수정 권한과 advisory path scope를 명시한 작업
 muxa msg send pane:%18 "테스트를 보강해 주세요" \
   --kind task --execute --path 'crates/auth/**'
@@ -190,6 +197,10 @@ muxa msg list --mailbox incoming --json
 muxa msg list --scope room
 muxa msg list --scope all
 
+# 모든 조건은 AND이며 필터 뒤 offset/limit 적용
+muxa msg list --scope all --since 7d --work CAL-7345 --kind review \
+  --status completed --limit 50 --offset 0
+
 # 아직 상대가 claim하지 않은 요청 취소
 muxa msg cancel req_...
 ```
@@ -204,10 +215,32 @@ muxa msg cancel req_...
 주고받은 내용을 읽을 권한이 되지는 않습니다. 넓힌 목록은 각 요청의 양쪽 끝과 그
 각각이 있는 `session:window`를 함께 출력합니다.
 
+root request에는 `thread_id`가 생깁니다. 기본값은 request id이며 `--thread`로
+명시할 수도 있습니다. `--parent <request-id>`는 causal edge를 만들고 parent의
+canonical thread를 상속합니다. parent가 없거나 room/participant pair가 다르거나
+명시한 thread가 충돌하면 거부합니다. `workspace_id`, `work_id`, `run_id`는 durable
+Work와 한 번의 실행을 구분합니다. Muxa는 관리 중인 pane/window metadata에서 빠진
+Work 필드를 채우고 가능하면 execution binding으로 run id를 만들며, CLI/MCP에서
+명시한 값이 우선합니다. 일반 `artifacts`와 `links`는 metadata일 뿐 파일·URL 접근
+권한이 아닙니다.
+
+`muxa msg list`의 `--since`, `--workspace`, `--work`, `--thread`, `--kind`,
+`--status`, `--window`(`--room` alias)는 AND로 결합되고 최신순 snapshot에
+`--offset`, `--limit`가 적용됩니다. 새 CLI가 구형 daemon과 연결돼도 필터 없는 결과를
+조용히 반환하지 않도록 CLI가 전체 결과를 받아 필터링합니다. 따라서 offset은 동시
+쓰기 사이에도 고정되는 cursor가 아니라 한 snapshot을 빠르게 넘기는 기능입니다.
+필터 없는 `--json`은 호환성을 위해 기존 bare array를 유지합니다. `--since`는
+`2h`/`7d` 같은 duration, local date, RFC 3339 timestamp, timeline과 같은 calendar
+keyword를 받습니다.
+
 tracked agent pane에서 `prefix+s`로 `muxa watch`를 열면 같은 lifecycle을 TUI로
-사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `b`는 claim 없는
-mailbox 이력을 열며, `i`는 inbox를 claim하고 `e`는 응답합니다. `muxa dashboard`는
-같은 기능을 더 상세한 workspace-card 화면으로 제공합니다.
+사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `M`/`b`는 claim
+없는 mailbox 이력을 열며, `i`는 inbox를 claim하고 `e`는 응답합니다. window 행의
+`M`은 room 전체를, session 행에서는 모든 room을 window별로 모아 보여주며 두
+aggregate view는 read-only입니다. collaboration 화면은 `v` 또는
+`:layout sequence`로 최신순 table과 시간순 sequence를 전환할 수 있고 CLI에서는
+`--collab-layout sequence`를 사용합니다. Web dashboard는 Work/thread/status filter와
+drill-down을 포함한 node-edge graph와 sequence view를 제공합니다.
 
 composer 안에서 `Ctrl-E`는 전달 방식을 순환합니다. `read-only`와 `execute`는
 durable request에 실리는 계약이고, `just send`는 본문을 키스트로크로 pane에 그대로
@@ -329,6 +362,12 @@ agent가 상당한 작업을 시작할 때 권장 순서는 다음과 같습니�
 관계없이 `muxa_reply`로 terminal 상태를 남겨야 합니다. 두 agent가 같은 파일을
 동시에 수정해야 한다면 별도 worktree를 사용하세요.
 
+`muxa_send_message`와 `muxa_call_peer`는 동일한 causal/Work metadata인
+`thread_id`, `parent_request_id`, `workspace_id`, `work_id`, `run_id`와
+`artifacts`, `links`를 optional 입력으로 받습니다. MCP가 반환하는 저장 request에도
+이 필드가 포함되므로 메시지 본문에서 관계를 추측하지 말고 다음 호출에 정확한
+request id를 parent로 넘길 수 있습니다.
+
 ## AIR artifact 전달과 시각화
 
 request와 reply의 `air_artifacts`에는 AIR 1.0 artifact의 타입이 지정된 참조를 최대
@@ -350,10 +389,29 @@ conformance를 주장하지 않습니다. 검증·편집·그래프 탐색은 AI
 수행하세요. muxa 협업 내용을 위해 새 trace profile을 만들거나 session snapshot에
 prompt/message/path/provider 식별자를 넣어서는 안 됩니다.
 
+## Indexed history, migration, retention
+
+mailbox는 전달 전에 owner-only SQLite DB에 저장됩니다. 과거 기본 config path인
+`$XDG_DATA_HOME/muxa/collaboration.json`은 그대로지만, Muxa는 이를 authoritative
+`collaboration.sqlite3`로 매핑합니다. 첫 시작 때 기존 JSON snapshot을 transaction으로
+한 번 import하고 완료 marker를 남기며, 예전 request의 `thread_id`는 자기 request id로
+채웁니다. 설정한 path의 확장자가 `.sqlite`, `.sqlite3`, `.db`이면 그 파일을 직접
+사용합니다. JSON은 migration backup으로 그대로 남으므로 message 본문의 두 번째
+사본이며 SQLite retention 대상이 **아닙니다**. rollback이 필요 없어지면 동일한 접근
+통제로 archive하거나 직접 제거하세요.
+
+이후 mutation은 전체 이력을 다시 쓰지 않고 indexed row만 갱신합니다. SQLite 본체,
+WAL, shared-memory 파일은 `0600`입니다. `retention_days`를 생략하면 영구 보존합니다.
+값을 설정하면 muxad 시작 시 newest activity가 cutoff보다 오래되고 모든 request가
+terminal·전달 완료된 thread만 통째로 정리합니다. parent chain을 나누거나 pending
+delivery/wake 또는 아직 읽지 않은 reply 상태를 지우지 않습니다. 본문을 담지 않는
+별도 audit ledger는 그대로 유지됩니다. migration 뒤 구형 muxad를 남겨 둔 JSON에
+대해 실행하는 downgrade는 안전하지 않습니다. 구형 daemon이 stale fork를 써도 import
+완료된 SQLite가 다시 가져오지 않으므로 downgrade 전 두 파일을 모두 백업하세요.
+
 ## 전달 안전성
 
-메시지와 응답 본문은 `$XDG_DATA_HOME/muxa/collaboration.json`에 먼저
-저장됩니다. `idle_only` wake는 새 요청뿐 아니라 아직 발신자가 읽지 않은 terminal
+`idle_only` wake는 새 요청뿐 아니라 아직 발신자가 읽지 않은 terminal
 응답에도 적용됩니다. 다음 조건을 모두 만족할 때만 pane에 입력합니다.
 
 - hook 기반의 실제 agent session

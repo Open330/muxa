@@ -71,6 +71,8 @@ enabled = true
 wake = "idle_only" # or "never" for pull-only delivery
 # Optional: "operator_full" (default), "notice", or "full".
 wake_payload = "operator_full"
+# Optional; omitted retains history indefinitely.
+# retention_days = 90
 ```
 
 An existing `wake` is never overwritten — a deliberate `never` means "give me
@@ -154,6 +156,9 @@ is refused. Identity never follows a later agent that reuses the pane.
 ```bash
 muxa peers
 muxa msg send peer "review the auth change" --kind review
+muxa msg send peer "verify the fix" --kind review \
+  --parent req_... --workspace callabo --work CAL-7345 --run resolve-2 \
+  --artifact commit:d4bf2aa --link https://example.test/review
 muxa msg send peer "review the risks in this plan" --kind review \
   --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"CAL-6924 plan","locator":{"display":".air/cal-6924-plan.air.json","disclosure":"local-only"}}'
 muxa msg inbox
@@ -162,6 +167,8 @@ muxa msg wait req_... --timeout-secs 300
 muxa msg list --mailbox sent
 muxa msg list --scope room     # every participant in this window
 muxa msg list --scope all      # every room this daemon holds
+muxa msg list --scope all --since 7d --work CAL-7345 --kind review \
+  --status completed --limit 50 --offset 0
 muxa msg cancel req_... # queued requests only
 ```
 
@@ -176,10 +183,33 @@ entitle an agent to read what its room-mates said to each other. A widened
 listing names both ends of every request and the `session:window` each sits
 in — without that a fleet-wide list cannot say where the work happened.
 
+Every root request receives a `thread_id` (its request id unless `--thread` is
+explicit). `--parent <request-id>` creates a causal edge and inherits the
+parent's canonical thread; a missing parent, different room/participant pair,
+or conflicting explicit thread is rejected. `workspace_id`, `work_id`, and
+`run_id` keep the durable Work identity separate from one execution attempt.
+Muxa stamps missing Work fields from managed pane/window metadata and derives a
+run identity from the execution binding when available; explicit CLI/MCP
+values win. Generic `artifacts` and `links` are metadata only, not file or URL
+authority.
+
+`muxa msg list` combines `--since`, `--workspace`, `--work`, `--thread`,
+`--kind`, `--status`, and `--window` (`--room` is an alias) by conjunction,
+then applies `--offset` and `--limit` to the newest-first snapshot. Filtering
+is client-side so a new CLI talking to an older daemon cannot silently return
+unfiltered rows; consequently offset pagination is a snapshot convenience,
+not a stable cursor across concurrent writes. The unfiltered `--json` form
+remains the legacy bare array. `--since` accepts durations such as `2h`/`7d`,
+local dates, RFC 3339 timestamps, and the same calendar keywords as timeline.
+
 The same lifecycle is available interactively in `muxa watch`: `m` sends to the
-selected room peer, `b` opens non-claiming mailbox history, `i` claims the
-inbox, and `e` replies. `muxa dashboard` provides the richer workspace-card form
-of the same controls.
+selected room peer, `M`/`b` opens non-claiming mailbox history, `i` claims the
+inbox, and `e` replies. On a window row, `M` reads the whole room; on a session
+row it reads every room grouped by window. Those aggregate views are read-only.
+The collaboration screen toggles between a newest-first table and chronological
+sequence with `v` or `:layout sequence` (`--collab-layout sequence` is the CLI
+equivalent). The web dashboard provides aggregated node/edge and sequence views
+with Work/thread/status filters and drill-down.
 
 Inside the composer, `Ctrl-E` cycles how the text leaves: `read-only` and
 `execute` are the contract carried by a durable request, while `just send`
@@ -214,6 +244,12 @@ worktrees remain the safest choice for concurrent edits.
 | `muxa_reply` | Return a completed/blocked/declined/failed response. |
 | `muxa_wait_reply` | Event-driven wait for the structured terminal response. |
 | `muxa_cancel_message` | Cancel a sent request while it is still queued. |
+
+`muxa_send_message` and `muxa_call_peer` accept the same optional causal and
+Work metadata (`thread_id`, `parent_request_id`, `workspace_id`, `work_id`,
+`run_id`) plus `artifacts` and `links`. Stored request objects returned by MCP
+include these fields, so an orchestrator can pass a request id as the next
+call's parent instead of inferring a thread from message text.
 
 ## Natural calls from an agent conversation
 
@@ -309,10 +345,33 @@ artifact in AIR Workbench. Do not invent a collaboration trace profile or put
 prompts, messages, filesystem paths, or provider identifiers into an AIR
 session snapshot.
 
+## Indexed history, migration, and retention
+
+The mailbox is persisted to an owner-only SQLite database before delivery.
+The historical default config path remains
+`$XDG_DATA_HOME/muxa/collaboration.json`, but muxa maps it to the authoritative
+`collaboration.sqlite3`. On first startup it imports an existing JSON snapshot
+transactionally and marks the import complete; legacy requests receive their
+own request id as `thread_id`. A configured `.sqlite`, `.sqlite3`, or `.db`
+path is used directly. The JSON file is intentionally left untouched as a
+migration backup, so it is a second copy of message bodies and is **not**
+covered by SQLite retention. Remove or archive it under equivalent access
+controls once rollback is no longer required.
+
+New mutations update indexed rows instead of rewriting the full history.
+SQLite, WAL, and shared-memory files are set to `0600`. `retention_days` is
+unset by default and therefore keeps history indefinitely. When configured,
+muxad prunes at startup only whole threads whose newest activity is older than
+the cutoff and whose requests are terminal and fully delivered; it never
+splits a parent chain or removes pending delivery/wake or unread reply state.
+The separate body-free audit ledger is unchanged. Do not downgrade and run an
+older muxad against the retained JSON after migration: it can write a stale
+fork that the already-marked SQLite database will not import again. Back up
+both files before any downgrade.
+
 ## Wake-up safety
 
-The mailbox is persisted to `$XDG_DATA_HOME/muxa/collaboration.json` before
-delivery. With `idle_only`, muxad injects only when the exact
+With `idle_only`, muxad injects only when the exact
 hook-authoritative participant is `Idle`. It never injects into `Working`,
 `WaitingInput`, `WaitingChoice`, or `Error` panes. Synthetic screen-detected
 agents have no stable session identity, so they are not room participants and

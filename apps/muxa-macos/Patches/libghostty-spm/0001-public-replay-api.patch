@@ -1,0 +1,129 @@
+diff --git a/Sources/GhosttyTerminal/InMemory/InMemoryTerminalSession.swift b/Sources/GhosttyTerminal/InMemory/InMemoryTerminalSession.swift
+index 49a81da..c092aa9 100644
+--- a/Sources/GhosttyTerminal/InMemory/InMemoryTerminalSession.swift
++++ b/Sources/GhosttyTerminal/InMemory/InMemoryTerminalSession.swift
+@@ -35,6 +35,7 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
+         self.suppressesPixelOnlyResizes = suppressesPixelOnlyResizes
+         surfaceAccess = InMemoryTerminalSurfaceAccess(
+             write: Self.writeToSurface,
++            replay: Self.replayToSurface,
+             processExit: Self.reportProcessExit
+         )
+     }
+@@ -52,6 +53,7 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
+         self.suppressesPixelOnlyResizes = suppressesPixelOnlyResizes
+         surfaceAccess = InMemoryTerminalSurfaceAccess(
+             write: surfaceWrite,
++            replay: Self.replayToSurface,
+             processExit: processExit
+         )
+     }
+@@ -170,6 +172,16 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
+         receive(data)
+     }
+ 
++    /// Enqueue reconstructed terminal history without emitting terminal
++    /// protocol responses back into an already-served host PTY.
++    public func replay(_ data: Data) {
++        surfaceAccess.enqueueReplay(data)
++        TerminalDebugLog.log(
++            .output,
++            "terminal <- replay \(TerminalDebugLog.describe(data))"
++        )
++    }
++
+     /// Inject input bytes directly into the host-side consumer.
+     ///
+     /// This bypasses `ghostty_surface_key` translation and is intended for
+@@ -294,6 +304,15 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
+         }
+     }
+ 
++    private static func replayToSurface(_ surface: ghostty_surface_t, _ data: Data) {
++        data.withUnsafeBytes { buffer in
++            guard let ptr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
++                return
++            }
++            ghostty_surface_write_buffer_replay(surface, ptr, UInt(buffer.count))
++        }
++    }
++
+     private static func reportProcessExit(
+         _ surface: ghostty_surface_t,
+         _ exitCode: UInt32,
+diff --git a/Sources/GhosttyTerminal/InMemory/InMemoryTerminalSurfaceAccess.swift b/Sources/GhosttyTerminal/InMemory/InMemoryTerminalSurfaceAccess.swift
+index 9333318..db15ad3 100644
+--- a/Sources/GhosttyTerminal/InMemory/InMemoryTerminalSurfaceAccess.swift
++++ b/Sources/GhosttyTerminal/InMemory/InMemoryTerminalSurfaceAccess.swift
+@@ -12,6 +12,7 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
+         qos: .userInitiated
+     )
+     private let write: Write
++    private let replay: Write
+     private let processExit: ProcessExit
+ 
+     private var surface: ghostty_surface_t?
+@@ -25,11 +26,14 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
+     /// what a terminal scrollback would have forgotten anyway.
+     private var pendingWrites = Data()
++    private var pendingReplay = Data()
+     private static let pendingWriteByteLimit = 1 << 20
+ 
+     init(
+         write: @escaping Write,
++        replay: @escaping Write,
+         processExit: @escaping ProcessExit
+     ) {
+         self.write = write
++        self.replay = replay
+         self.processExit = processExit
+     }
+@@ -49,8 +53,20 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
+             flush = pendingWrites
+             pendingWrites = Data()
+         }
++        var replayFlush: Data?
++        if surface != nil, !pendingReplay.isEmpty {
++            replayFlush = pendingReplay
++            pendingReplay = Data()
++        }
+         let flushGeneration = generation
+         condition.unlock()
++        if let replayFlush {
++            outputQueue.async { [self] in
++                withSurface(generation: flushGeneration) { surface in
++                    replay(surface, replayFlush)
++                }
++            }
++        }
+         if let flush {
+             outputQueue.async { [self] in
+                 withSurface(generation: flushGeneration) { surface in
+@@ -98,5 +114,27 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
+         return true
+     }
+ 
++    @discardableResult
++    func enqueueReplay(_ data: Data) -> Bool {
++        condition.lock()
++        guard surface != nil else {
++            pendingReplay.append(data)
++            let excess = pendingReplay.count - Self.pendingWriteByteLimit
++            if excess > 0 {
++                pendingReplay.removeFirst(excess)
++            }
++            condition.unlock()
++            return true
++        }
++        let writeGeneration = generation
++        condition.unlock()
++        outputQueue.async { [self] in
++            withSurface(generation: writeGeneration) { surface in
++                replay(surface, data)
++            }
++        }
++        return true
++    }
++
+     @discardableResult
+     func enqueueProcessExit(

@@ -442,6 +442,8 @@ mod tests {
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: None,
+            work_id: None,
             socket: Some("default".into()),
             pane_id: pane_id.into(),
             session_id: String::new(),

@@ -12,6 +12,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt};
@@ -52,8 +53,10 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     "window_capture",
     "send_prompt",
     "collaboration",
+    "collaboration_get",
     "exact_pane_ref",
     "labels_v1",
+    "raw_capture_base64",
 ];
 
 /// Read one UTF-8 line without allowing a peer that withholds `\n` to grow
@@ -164,6 +167,27 @@ pub fn sanitize_capture_text(value: String) -> String {
     }
     text.drain(..start);
     text
+}
+
+/// Encode the newest bounded portion of a pane capture without interpreting
+/// terminal control sequences. Base64 keeps hostile CSI/OSC bytes inert while
+/// an authorized UI can still expose an escaped diagnostic view.
+#[must_use]
+pub fn raw_capture_base64(value: &str) -> String {
+    let mut start = value.len().saturating_sub(FLEET_MAX_CAPTURE_BYTES);
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    BASE64_STANDARD.encode(&value.as_bytes()[start..])
+}
+
+/// Revalidate an untrusted relay's raw capture and reapply the byte bound.
+/// Invalid base64 is dropped instead of being forwarded to a UI.
+#[must_use]
+pub fn sanitize_raw_capture_base64(value: String) -> Option<String> {
+    let decoded = BASE64_STANDARD.decode(value).ok()?;
+    let start = decoded.len().saturating_sub(FLEET_MAX_CAPTURE_BYTES);
+    Some(BASE64_STANDARD.encode(&decoded[start..]))
 }
 
 /// Durable UUID belonging to a physical machine.
@@ -474,6 +498,11 @@ pub enum RelayRequest {
         request_id: String,
         pane: PaneKey,
     },
+    CollaborationGet {
+        request_id: String,
+        pane: PaneKey,
+        collaboration_request_id: String,
+    },
     CollaborationClaim {
         request_id: String,
         pane: PaneKey,
@@ -498,6 +527,7 @@ impl RelayRequest {
             | Self::SendPrompt { request_id, .. }
             | Self::CollaborationSend { request_id, .. }
             | Self::CollaborationMailbox { request_id, .. }
+            | Self::CollaborationGet { request_id, .. }
             | Self::CollaborationClaim { request_id, .. }
             | Self::CollaborationReply { request_id, .. } => request_id,
         }
@@ -562,6 +592,10 @@ pub enum FleetOperation {
     CollaborationMailbox {
         pane: PaneKey,
     },
+    CollaborationGet {
+        pane: PaneKey,
+        request_id: String,
+    },
     CollaborationClaim {
         pane: PaneKey,
     },
@@ -581,6 +615,8 @@ pub struct FleetCommandResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_raw_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send: Option<SendPromptOutcomeWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_capture: Option<FleetWindowCapture>,
@@ -599,6 +635,7 @@ impl FleetCommandResult {
             accepted: true,
             message: Some(message.into()),
             capture: None,
+            capture_raw_base64: None,
             send: None,
             window_capture: None,
             collaboration_request: None,
@@ -613,6 +650,24 @@ impl FleetCommandResult {
             accepted: true,
             message: None,
             capture,
+            capture_raw_base64: None,
+            send: None,
+            window_capture: None,
+            collaboration_request: None,
+            collaboration_incoming: Vec::new(),
+            collaboration_sent: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn capture_with_raw(raw_capture: Option<String>) -> Self {
+        let capture_raw_base64 = raw_capture.as_deref().map(raw_capture_base64);
+        let capture = raw_capture.map(sanitize_capture_text);
+        Self {
+            accepted: true,
+            message: None,
+            capture,
+            capture_raw_base64,
             send: None,
             window_capture: None,
             collaboration_request: None,
@@ -627,6 +682,7 @@ impl FleetCommandResult {
             accepted: true,
             message: None,
             capture: None,
+            capture_raw_base64: None,
             send: Some(outcome.into()),
             window_capture: None,
             collaboration_request: None,
@@ -641,6 +697,7 @@ impl FleetCommandResult {
             accepted: true,
             message: None,
             capture: None,
+            capture_raw_base64: None,
             send: None,
             window_capture: Some(capture),
             collaboration_request: None,
@@ -655,6 +712,7 @@ impl FleetCommandResult {
             accepted: true,
             message: None,
             capture: None,
+            capture_raw_base64: None,
             send: None,
             window_capture: None,
             collaboration_request: Some(Box::new(request)),
@@ -674,6 +732,7 @@ impl FleetCommandResult {
             accepted: true,
             message: None,
             capture: None,
+            capture_raw_base64: None,
             send: None,
             window_capture: None,
             collaboration_request: None,
@@ -1218,6 +1277,20 @@ mod tests {
     }
 
     #[test]
+    fn raw_capture_is_bounded_encoded_and_kept_separate_from_safe_text() {
+        let raw = "ok\u{1b}[31mred\u{1b}[0m\r\n";
+        let result = FleetCommandResult::capture_with_raw(Some(raw.into()));
+        assert_eq!(result.capture.as_deref(), Some("okred\n"));
+        assert_eq!(
+            BASE64_STANDARD
+                .decode(result.capture_raw_base64.unwrap())
+                .unwrap(),
+            raw.as_bytes()
+        );
+        assert!(sanitize_raw_capture_base64("not-base64".into()).is_none());
+    }
+
+    #[test]
     fn collaboration_relay_requests_round_trip_with_exact_pane_identity() {
         let pane = PaneKey {
             window: WindowKey {
@@ -1240,7 +1313,14 @@ mod tests {
                 body: "review this change".into(),
                 expects_reply: true,
                 work_mode: crate::collaboration::WorkMode::ReadOnly,
+                thread_id: None,
+                parent_request_id: None,
+                workspace_id: None,
+                work_id: None,
+                run_id: None,
                 paths: Vec::new(),
+                artifacts: Vec::new(),
+                links: Vec::new(),
                 air_artifacts: Vec::new(),
             },
         };
@@ -1256,6 +1336,27 @@ mod tests {
                 assert_eq!(decoded_pane, pane);
                 assert_eq!(request.kind, crate::collaboration::RequestKind::Review);
                 assert_eq!(request.body, "review this change");
+            }
+            _ => panic!("wrong relay request variant"),
+        }
+
+        let get = RelayRequest::CollaborationGet {
+            request_id: "relay-2".into(),
+            pane: pane.clone(),
+            collaboration_request_id: "collab-42".into(),
+        };
+        let encoded = serde_json::to_string(&get).unwrap();
+        assert!(encoded.contains("\"kind\":\"collaboration_get\""));
+        let decoded: RelayRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.request_id(), "relay-2");
+        match decoded {
+            RelayRequest::CollaborationGet {
+                pane: decoded_pane,
+                collaboration_request_id,
+                ..
+            } => {
+                assert_eq!(decoded_pane, pane);
+                assert_eq!(collaboration_request_id, "collab-42");
             }
             _ => panic!("wrong relay request variant"),
         }

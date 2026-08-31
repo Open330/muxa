@@ -259,10 +259,14 @@ partial acknowledgement.
 
 ## Other interfaces
 
-`muxa mcp` exposes `muxa_fleet_status`, `muxa_fleet_capture`, and
-`muxa_fleet_send_prompt`. Control tools require an explicit host and pane;
-remote hosts apply the observe/control check, while `local` is owner-socket
-control.
+`muxa mcp` exposes `muxa_fleet_status`, `muxa_fleet_capture`,
+`muxa_fleet_send_prompt`, and the durable collaboration pair
+`muxa_fleet_call_peer` / `muxa_fleet_wait_reply`. Control tools require an
+explicit host and pane and never auto-select or create a remote agent. Remote
+hosts recheck observe/control mode on every command, while `local` is
+owner-socket control. When a call's bounded wait expires, pass its exact
+`pane_key` and `request_id` to the wait tool. The structured request and reply
+stay on the selected physical node, so no terminal-capture polling is needed.
 
 When the web dashboard is enabled, its authenticated read surface includes
 `GET /api/fleet?selector=...`. PAT-gated control is available at
@@ -272,9 +276,10 @@ When the web dashboard is enabled, its authenticated read surface includes
 Durable collaboration data remains owned by each physical node. Fleet watch
 does not copy it into a central database: `m`, `M`, claim, and reply commands
 are routed to the selected node's muxad over the authenticated SSH stdio relay.
-The `collaboration` relay capability gates these commands, so mixed-version
-nodes fail with an upgrade instruction instead of silently degrading durable
-requests into keystrokes.
+The `collaboration` capability gates these commands, and `collaboration_get`
+separately gates exact reply retrieval. Mixed-version nodes therefore fail
+with an upgrade instruction instead of silently degrading durable requests
+into keystrokes.
 
 ## Security checklist
 

@@ -57,7 +57,7 @@ use muxa::{
     HumanInteractionKind, PaneKey, PaneNode, SessionNode, StateDistribution, TopologyInput,
     TopologyNodeKey, TopologyNodeRef, TopologySnapshot, WindowKey, WindowNode,
 };
-use muxa::{AgentKind, AgentState};
+use muxa::{AgentKind, AgentState, SessionKey};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -72,7 +72,8 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
-use crate::collab_screen::{self, CollabRow, CollabScreen};
+pub use crate::collab_screen::CollabLayout;
+use crate::collab_screen::{self, CollabRow, CollabScreen, SequenceRow};
 use crate::message_skill::{
     insert_prompt as insert_message_skill_prompt, matching_skills, remove as remove_message_skill,
     upsert as upsert_message_skill, validate_name as validate_message_skill_name,
@@ -119,6 +120,13 @@ const SWARM_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
 /// Inspector frames needlessly expensive. Four frames per second stays visibly
 /// animated while halving steady-state topology and terminal rendering work.
 const TREE_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Parse the collaboration-only presentation axis. Kept public so the CLI
+/// argument/config layer can seed watch without adding sequence variants to
+/// the unrelated topology [`WatchLayout`] enum.
+pub fn parse_collab_layout(value: &str) -> Option<CollabLayout> {
+    collab_screen::parse_layout(value)
+}
 
 /// How long a transient action hint stays visible in the footer before
 /// the renderer falls back to the default keybinding strip. 2 s is the
@@ -1799,6 +1807,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  Enter          (in preview) jump to pinned pane",
         "  m / M          message selected agent / mailbox (b alias)",
         "  Alt-1/2 · W    screen topology / collab · W is the work table",
+        "  v              (in collab) toggle table / sequence history",
         "  i / e          (in mailbox) claim inbox / reply",
         "Sorting",
         "  Alt-S/L/D/T    sibling name / latest / duration / state",
@@ -2325,6 +2334,42 @@ fn persist_watch_collaboration_defaults(
     std::fs::write(path, doc.to_string()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
+fn persist_watch_collab_layout(
+    path: &Path,
+    layout: CollabLayout,
+) -> std::result::Result<(), String> {
+    let original = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let mut doc = if original.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        original
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| format!("parse {}: {e}", path.display()))?
+    };
+    match doc.get("watch") {
+        Some(toml_edit::Item::Table(_)) | None => {}
+        Some(_) => return Err("[watch] is not a table".to_string()),
+    }
+    if doc.get("watch").is_none() {
+        doc["watch"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let watch = doc["watch"]
+        .as_table_mut()
+        .ok_or_else(|| "[watch] is not a table".to_string())?;
+    watch["collab_layout"] = toml_edit::value(collab_screen::layout_label(layout));
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, doc.to_string()).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
 #[derive(Debug, Clone, Default)]
 struct WatchCollaboration {
     origin: Option<CollaborationOrigin>,
@@ -2332,6 +2377,10 @@ struct WatchCollaboration {
     /// The agent whose inbox `incoming` holds — the row under the cursor when
     /// the mailbox was last refreshed. `None` when that row hosts no agent.
     inbox: Option<MailboxAnchor>,
+    /// Topology level whose history the overlay is presenting. Pane scopes
+    /// retain claim/reply actions; window and session scopes are aggregate,
+    /// read-only history assembled from the console-wide durable log.
+    history_scope: Option<MailboxHistoryScope>,
     incoming: Vec<CollaborationRequest>,
     sent: Vec<CollaborationRequest>,
     unavailable: Option<String>,
@@ -2347,6 +2396,68 @@ struct WatchCollaboration {
 struct MailboxAnchor {
     origin: CollaborationOrigin,
     label: String,
+}
+
+#[derive(Debug, Clone)]
+enum MailboxHistoryScope {
+    Pane(MailboxAnchor),
+    Window { key: WindowKey, label: String },
+    Session { key: SessionKey, label: String },
+}
+
+impl MailboxHistoryScope {
+    fn label(&self) -> &str {
+        match self {
+            Self::Pane(anchor) => &anchor.label,
+            Self::Window { label, .. } | Self::Session { label, .. } => label,
+        }
+    }
+
+    fn aggregate(&self) -> bool {
+        matches!(self, Self::Window { .. } | Self::Session { .. })
+    }
+
+    fn matches(&self, participant: &Participant) -> bool {
+        if participant.console {
+            return false;
+        }
+        match self {
+            Self::Pane(anchor) => {
+                participant.pane == anchor.origin.pane
+                    && anchor.origin.socket.as_deref().is_none_or(|socket| {
+                        participant.socket.as_deref() == Some(socket)
+                            || participant.room.socket.as_deref() == Some(socket)
+                    })
+            }
+            Self::Window { key, .. } => {
+                participant_matches_session(participant, &key.session)
+                    && participant.room.window_id == key.window_id
+            }
+            Self::Session { key, .. } => participant_matches_session(participant, key),
+        }
+    }
+}
+
+fn participant_matches_session(participant: &Participant, key: &SessionKey) -> bool {
+    participant.tmux_session_id.as_deref() == Some(key.session_id.as_str())
+        && participant.room.host == key.endpoint.host.to_string()
+        && participant
+            .socket
+            .as_deref()
+            .or(participant.room.socket.as_deref())
+            == Some(key.endpoint.socket.as_str())
+}
+
+fn history_for_scope(
+    requests: &[CollaborationRequest],
+    scope: &MailboxHistoryScope,
+) -> Vec<CollaborationRequest> {
+    let aggregate = scope.aggregate();
+    requests
+        .iter()
+        .filter(|request| scope.matches(&request.to) || (aggregate && scope.matches(&request.from)))
+        .cloned()
+        .collect()
 }
 
 impl WatchCollaboration {
@@ -2986,10 +3097,10 @@ fn capture_tmux_window(key: WindowKey) -> CapturedWindow {
         panes.extend(std::thread::scope(|scope| {
             let handles = batch
                 .iter()
-                .cloned()
                 .map(|geometry| {
                     let backend = backend.clone();
                     let socket = socket.clone();
+                    let geometry = geometry.clone();
                     scope.spawn(move || {
                         let pane_id = geometry.pane_id.clone();
                         let text = backend
@@ -3050,6 +3161,8 @@ impl App {
             kind: cfg.collaboration_kind.unwrap_or(RequestKind::Question),
             mode: cfg.collaboration_mode.unwrap_or_default().into(),
         };
+        let mut collab = CollabScreen::default();
+        collab.set_layout(cfg.collab_layout);
         Self {
             rows: Vec::new(),
             topology: TopologySnapshot::build(OffsetDateTime::now_utc(), Vec::new(), Vec::new()),
@@ -3096,7 +3209,7 @@ impl App {
             inspector_split,
             collaboration_mailbox: CollaborationMailboxState::default(),
             previous_layout: WatchLayout::Tree,
-            collab: CollabScreen::default(),
+            collab,
             collaboration_composer: None,
             message_skills: BTreeMap::new(),
             message_skill_editor: None,
@@ -7501,6 +7614,24 @@ pub async fn run(
                     };
                     app.set_hint(format!("layout: {label}"), HintLevel::Ok);
                 }
+                Action::SetCollabLayout(layout) => {
+                    app.collab.set_layout(layout);
+                    app.watch_cfg.collab_layout = layout;
+                    let label = collab_screen::layout_label(layout);
+                    match sort_persist_path
+                        .as_deref()
+                        .map(|path| persist_watch_collab_layout(path, layout))
+                    {
+                        Some(Ok(())) => {
+                            app.set_hint(format!("collab layout: {label} (saved)"), HintLevel::Ok);
+                        }
+                        Some(Err(error)) => app.set_hint(
+                            format!("collab layout: {label} (save failed: {error})"),
+                            HintLevel::Warn,
+                        ),
+                        None => app.set_hint(format!("collab layout: {label}"), HintLevel::Ok),
+                    }
+                }
                 Action::AskConfirm(popup) => {
                     app.confirm = Some(popup);
                 }
@@ -8049,6 +8180,7 @@ async fn refresh_fleet_collaboration(client: &Client, app: &mut App) {
 }
 
 async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
+    let selected_request_id = selected_collaboration_request(app).map(|request| request.id.clone());
     let Some(origin) = app.collaboration.origin.clone() else {
         app.collaboration = WatchCollaboration {
             unavailable: Some(collaboration_open_hint().into()),
@@ -8067,59 +8199,125 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
             return;
         }
     };
-    // Incoming is the *selected row's* mailbox, not the console's: the console
-    // dispatches and never receives, and a reply belongs to the session that
-    // was commanded. Sent stays the console's own dispatch log across targets.
-    let anchor = mailbox_anchor(app);
-    let (incoming, sent) = tokio::join!(
-        async {
-            match anchor.as_ref() {
-                Some(anchor) => {
-                    client
-                        .collaboration_list(&anchor.origin, RequestMailbox::Incoming)
-                        .await
-                }
-                None => Ok(Vec::new()),
-            }
-        },
+    let history_scope = mailbox_history_scope(app);
+    // A console-wide read is the one primitive that can faithfully answer
+    // session and window selections. Direction is reconstructed locally from
+    // the selected topology scope: `to` is incoming, `from` is sent. This also
+    // avoids N pane-mailbox round trips for a large session.
+    let history_origin = CollaborationOrigin {
+        console: true,
+        ..origin.clone()
+    };
+    let (history, console_sent) = tokio::join!(
+        client.collaboration_list_scoped(&history_origin, RequestMailbox::All, MailboxScope::All,),
         client.collaboration_list(&origin, RequestMailbox::Sent),
     );
-    // A row that carries an agent in the topology is not necessarily a
-    // collaboration participant — `muxa register` task rows and just-stopped
-    // agents both look like one and resolve to nothing. That is a fact about
-    // the cursor, not about the console, so it costs this row its inbox and
-    // nothing else. Letting it fall through to the shared failure branch would
-    // drop the room and downgrade `m` to keystrokes for the whole session.
-    let (inbox, incoming) = match incoming {
-        Ok(incoming) => (anchor, incoming),
-        Err(_) => (None, Vec::new()),
-    };
-    match sent {
-        Ok(sent) => {
+    match history {
+        Ok(requests) => {
+            let aggregate = history_scope
+                .as_ref()
+                .is_some_and(MailboxHistoryScope::aggregate);
+            let incoming = history_scope
+                .as_ref()
+                .map_or_else(Vec::new, |scope| history_for_scope(&requests, scope));
+            let sent = if aggregate {
+                // Aggregate history is a union, not two directional mailboxes:
+                // an internal session/window request touches both ends but
+                // must still appear exactly once.
+                Vec::new()
+            } else {
+                // Pane mode keeps the established two-owner contract:
+                // incoming belongs to the selected recipient, while Sent is
+                // this watch console's dispatch log across targets.
+                console_sent.unwrap_or_default()
+            };
+            let inbox = match &history_scope {
+                Some(MailboxHistoryScope::Pane(anchor)) => Some(anchor.clone()),
+                Some(MailboxHistoryScope::Window { .. } | MailboxHistoryScope::Session { .. })
+                | None => None,
+            };
             app.collaboration = WatchCollaboration {
                 origin: Some(origin),
                 room: Some(room),
+                history_scope,
                 inbox,
                 incoming,
                 sent,
                 unavailable: None,
             };
+            if aggregate {
+                app.collaboration_mailbox.tab = CollaborationMailboxTab::Incoming;
+            }
         }
         Err(error) => {
             app.collaboration = WatchCollaboration {
                 origin: Some(origin),
                 room: Some(room),
-                inbox,
-                incoming,
+                history_scope,
                 unavailable: Some(format!("mailbox unavailable: {error}")),
                 ..WatchCollaboration::default()
             };
         }
     }
+    if let Some(selected_request_id) = selected_request_id {
+        if let Some(index) = collaboration_requests(app)
+            .iter()
+            .position(|request| request.id == selected_request_id)
+        {
+            app.collaboration_mailbox.selected = index;
+        }
+    }
     clamp_collaboration_mailbox(app);
 }
 
-/// Whose inbox `M` shows: the agent under the cursor.
+/// Which topology scope `M` shows. Session and window nodes are deliberately
+/// not collapsed to their active panes: their whole durable history is the
+/// reason hierarchy-aware mailbox browsing exists.
+fn mailbox_history_scope(app: &App) -> Option<MailboxHistoryScope> {
+    if app.uses_tree() {
+        return match app.selected_node()? {
+            TopologyNodeRef::Session(session) => Some(MailboxHistoryScope::Session {
+                key: session.key.clone(),
+                label: session.name.clone(),
+            }),
+            TopologyNodeRef::Window(window) => {
+                let session = app
+                    .topology
+                    .sessions
+                    .iter()
+                    .find(|session| session.key == window.key.session)
+                    .map_or(window.key.session.session_id.as_str(), |session| {
+                        session.name.as_str()
+                    });
+                Some(MailboxHistoryScope::Window {
+                    key: window.key.clone(),
+                    label: format!("{session}:{}", window.name),
+                })
+            }
+            TopologyNodeRef::Pane(pane) => {
+                mailbox_anchor_for_pane(pane).map(MailboxHistoryScope::Pane)
+            }
+        };
+    }
+    mailbox_anchor(app).map(MailboxHistoryScope::Pane)
+}
+
+fn mailbox_anchor_for_pane(pane: &PaneNode) -> Option<MailboxAnchor> {
+    let agent = pane.agent.as_ref()?;
+    let endpoint = &pane.key.window.session.endpoint;
+    Some(MailboxAnchor {
+        origin: CollaborationOrigin {
+            pane: pane.key.pane_id.clone(),
+            socket: matches!(endpoint.host, muxa::HostKind::Tmux | muxa::HostKind::Rmux)
+                .then(|| endpoint.socket.clone()),
+            console: false,
+        },
+        label: format!("{}@{}", agent.kind, pane.key.pane_id),
+    })
+}
+
+/// Whose inbox `M` shows in legacy flat layouts: the exact agent under the
+/// cursor. Canonical tree layouts use [`mailbox_history_scope`] above.
 ///
 /// The mailbox overlay is modal, so the row cannot move while it is open — one
 /// fetch per open is enough. Preserve the backend endpoint whenever the host
@@ -8127,17 +8325,7 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
 /// mailbox identity. Origin resolution normalizes full and short endpoint
 /// spellings with the same rules as canonical topology.
 fn mailbox_anchor(app: &App) -> Option<MailboxAnchor> {
-    let (pane, socket, label) = if app.uses_tree() {
-        let pane = app.selected_action_pane()?;
-        let agent = pane.agent.as_ref()?;
-        let endpoint = &pane.key.window.session.endpoint;
-        (
-            pane.key.pane_id.clone(),
-            matches!(endpoint.host, muxa::HostKind::Tmux | muxa::HostKind::Rmux)
-                .then(|| endpoint.socket.clone()),
-            format!("{}@{}", agent.kind, pane.key.pane_id),
-        )
-    } else {
+    let (pane, socket, label) = {
         // Both halves come from the same agent. `selected_pane` falls back to a
         // work row's representative pane while `selected_agent` falls back to
         // its latest agent, and those are not always the same pane — pairing
@@ -8539,7 +8727,14 @@ async fn run_watch_collaboration_composer(
                 body: composer.input,
                 expects_reply: kind != RequestKind::Notice,
                 work_mode,
+                thread_id: None,
+                parent_request_id: None,
+                workspace_id: None,
+                work_id: None,
+                run_id: None,
                 paths: Vec::new(),
+                artifacts: Vec::new(),
+                links: Vec::new(),
                 air_artifacts: Vec::new(),
             };
             match client.collaboration_send(&origin, &target, &request).await {
@@ -8838,6 +9033,8 @@ pub(crate) enum Action {
     SetView(WatchView),
     /// Change presentation without changing topology granularity.
     SetLayout(WatchLayout),
+    /// Change the collaboration screen's independent table/sequence axis.
+    SetCollabLayout(CollabLayout),
     SetScreen(WatchScreen),
     /// Resolve the selected row as a same-window collaboration peer and open
     /// the durable request composer.
@@ -8976,6 +9173,14 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         description: "show one row per Work",
     },
     CommandSpec {
+        command: "layout table",
+        description: "show collaboration as a compact table",
+    },
+    CommandSpec {
+        command: "layout sequence",
+        description: "show chronological collaboration lifelines",
+    },
+    CommandSpec {
         command: "screen topology",
         description: "show sessions, windows and panes",
     },
@@ -9069,6 +9274,8 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         "layout work" | "work" => Action::SetLayout(WatchLayout::Work),
         "layout tree" => Action::SetLayout(WatchLayout::Tree),
         "layout swarm" => Action::SetLayout(WatchLayout::Swarm),
+        "layout table" => Action::SetCollabLayout(CollabLayout::Table),
+        "layout sequence" | "sequence" => Action::SetCollabLayout(CollabLayout::Sequence),
         "" => {
             app.set_hint("command: type a command or press Esc", HintLevel::Warn);
             Action::None
@@ -9744,25 +9951,32 @@ fn handle_collab_screen_key(
     let page = isize::try_from(app.table_page_rows.max(1)).unwrap_or(isize::MAX);
     let browsing = app.browse_keys_active();
     match code {
-        KeyCode::Down => app.collab.move_selection(1, &filter),
-        KeyCode::Up => app.collab.move_selection(-1, &filter),
-        KeyCode::Char('j') if browsing => app.collab.move_selection(1, &filter),
-        KeyCode::Char('k') if browsing => app.collab.move_selection(-1, &filter),
-        KeyCode::PageDown => app.collab.move_selection(page, &filter),
-        KeyCode::PageUp => app.collab.move_selection(-page, &filter),
+        KeyCode::Down => app.collab.move_visual_selection(1, &filter),
+        KeyCode::Up => app.collab.move_visual_selection(-1, &filter),
+        KeyCode::Char('j') if browsing => app.collab.move_visual_selection(1, &filter),
+        KeyCode::Char('k') if browsing => app.collab.move_visual_selection(-1, &filter),
+        KeyCode::PageDown => app.collab.move_visual_selection(page, &filter),
+        KeyCode::PageUp => app.collab.move_visual_selection(-page, &filter),
         KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.collab.move_selection(page / 2, &filter);
+            app.collab.move_visual_selection(page / 2, &filter);
         }
         KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.collab.move_selection(-(page / 2), &filter);
+            app.collab.move_visual_selection(-(page / 2), &filter);
         }
-        KeyCode::Home => app.collab.select_first(),
-        KeyCode::End => app.collab.select_last(&filter),
-        KeyCode::Char('G') if browsing => app.collab.select_last(&filter),
+        KeyCode::Home => app.collab.select_visual_first(&filter),
+        KeyCode::End => app.collab.select_visual_last(&filter),
+        KeyCode::Char('G') if browsing => app.collab.select_visual_last(&filter),
+        KeyCode::Char('v') if browsing => {
+            let layout = match app.collab.layout() {
+                CollabLayout::Table => CollabLayout::Sequence,
+                CollabLayout::Sequence => CollabLayout::Table,
+            };
+            return Some(Action::SetCollabLayout(layout));
+        }
         KeyCode::Char('g') if browsing => {
             if app.pending_g {
                 app.pending_g = false;
-                app.collab.select_first();
+                app.collab.select_visual_first(&filter);
             } else {
                 app.pending_g = true;
             }
@@ -10633,12 +10847,31 @@ fn handle_collaboration_composer_event(
 }
 
 fn handle_collaboration_mailbox_event(code: KeyCode, app: &mut App) -> Action {
+    let aggregate = app
+        .collaboration
+        .history_scope
+        .as_ref()
+        .is_some_and(MailboxHistoryScope::aggregate);
     match code {
         KeyCode::Esc | KeyCode::Char('q' | 'M' | 'b') => {
             app.collaboration_mailbox.open = false;
             Action::None
         }
+        KeyCode::Char('m') if aggregate => {
+            app.set_hint(
+                "select an exact pane before composing a message",
+                HintLevel::Warn,
+            );
+            Action::None
+        }
         KeyCode::Char('m') => Action::OpenCollaborationMessage,
+        KeyCode::Tab | KeyCode::BackTab if aggregate => {
+            app.set_hint(
+                "aggregate history already includes both directions",
+                HintLevel::Ok,
+            );
+            Action::None
+        }
         KeyCode::Tab | KeyCode::BackTab => {
             toggle_collaboration_mailbox(app);
             Action::None
@@ -10656,6 +10889,13 @@ fn handle_collaboration_mailbox_event(code: KeyCode, app: &mut App) -> Action {
                 app.collaboration_mailbox.detail_expand.next();
             let label = app.collaboration_mailbox.detail_expand.label();
             app.set_hint(format!("mailbox detail: {label}"), HintLevel::Ok);
+            Action::None
+        }
+        KeyCode::Char('i' | 'e') if aggregate => {
+            app.set_hint(
+                "session/window history is read-only; select an exact recipient pane",
+                HintLevel::Warn,
+            );
             Action::None
         }
         KeyCode::Char('i') => Action::ClaimCollaborationInbox,
@@ -12182,10 +12422,23 @@ fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &App) {
     let lines = collaboration_mailbox_request_lines(app, width, max_lines, theme);
     f.render_widget(Paragraph::new(lines), chunks[0]);
 
+    let detail_title = selected_collaboration_request(app).map_or_else(
+        || Line::from(Span::styled(" conversation ", theme.dim_style())),
+        |request| {
+            Line::from(Span::styled(
+                format!(
+                    " conversation · {} → {} ",
+                    request.from.label(),
+                    request.to.label()
+                ),
+                theme.table_header_style(),
+            ))
+        },
+    );
     let detail_block = Block::default()
         .borders(Borders::TOP)
         .border_style(theme.border_style())
-        .title(Span::styled(" selected request ", theme.dim_style()));
+        .title(detail_title);
     let detail_inner = detail_block.inner(chunks[1]);
     let detail_width = usize::from(detail_inner.width).max(1);
     let detail_height = usize::from(detail_inner.height).max(1);
@@ -12198,39 +12451,51 @@ fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &App) {
 
 fn collaboration_mailbox_title(app: &App, theme: WatchThemeSpec) -> Line<'static> {
     let tab = app.collaboration_mailbox.tab;
-    // The two tabs belong to different participants now — the row's inbox and
-    // the console's outbox — so each badge names its owner. Without that,
-    // "incoming 0" reads as "nobody messaged me" instead of "nothing was sent
-    // to the row I am pointing at".
-    let incoming_owner = app
+    let owner = app
         .collaboration
-        .inbox
+        .history_scope
         .as_ref()
-        .map_or("no agent selected", |anchor| anchor.label.as_str());
-    Line::from(vec![
-        Span::styled(" collaboration ", theme.accent_badge()),
+        .map_or("no topology scope selected", MailboxHistoryScope::label);
+    let read_only = app
+        .collaboration
+        .history_scope
+        .as_ref()
+        .is_some_and(MailboxHistoryScope::aggregate);
+    let mut spans = vec![
+        Span::styled(" messages ", theme.accent_badge()),
         Span::raw(" "),
-        Span::styled(
-            format!(
-                " incoming {} · {incoming_owner} ",
-                app.collaboration.incoming.len()
+    ];
+    if read_only {
+        spans.extend([
+            Span::styled(format!(" {owner} "), theme.table_header_style()),
+            Span::raw(" "),
+            Span::styled(
+                format!(" {} in history ", app.collaboration.incoming.len()),
+                theme.action_badge(),
             ),
-            if tab == CollaborationMailboxTab::Incoming {
-                theme.action_badge()
-            } else {
-                theme.dim_style()
-            },
-        ),
-        Span::raw(" "),
-        Span::styled(
-            format!(" sent {} · console ", app.collaboration.sent.len()),
-            if tab == CollaborationMailboxTab::Sent {
-                theme.action_badge()
-            } else {
-                theme.dim_style()
-            },
-        ),
-    ])
+        ]);
+    } else {
+        spans.extend([
+            Span::styled(
+                format!(" incoming {} · {owner} ", app.collaboration.incoming.len()),
+                if tab == CollaborationMailboxTab::Incoming {
+                    theme.action_badge()
+                } else {
+                    theme.dim_style()
+                },
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!(" sent {} · console ", app.collaboration.sent.len()),
+                if tab == CollaborationMailboxTab::Sent {
+                    theme.action_badge()
+                } else {
+                    theme.dim_style()
+                },
+            ),
+        ]);
+    }
+    Line::from(spans)
 }
 
 fn collaboration_mailbox_request_lines(
@@ -12242,72 +12507,216 @@ fn collaboration_mailbox_request_lines(
     let requests = collaboration_requests(app);
     let selected = app.collaboration_mailbox.selected;
     let tab = app.collaboration_mailbox.tab;
-    let start = selected
-        .saturating_add(1)
-        .saturating_sub(max_lines)
-        .min(requests.len().saturating_sub(max_lines));
-    let mut lines = requests
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(max_lines)
-        .map(|(index, request)| {
-            let focused = index == selected;
-            let peer = match tab {
-                CollaborationMailboxTab::Incoming => request.from.label(),
-                CollaborationMailboxTab::Sent => request.to.label(),
-            };
-            let body = request
-                .body
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            let air_badge = request.air_artifacts.first();
-            let air_width = air_badge.map_or(0, |reference| reference.profile.label().len() + 3);
-            let text = truncate_chars(
-                &format!(
-                    "{} {:<9} {:<10} {:<14} {}",
-                    short_collaboration_request_id(&request.id),
-                    request_kind_label(request.kind),
-                    request_status_label(request.status),
-                    peer,
-                    body
-                ),
-                width.saturating_sub(air_width),
-            );
-            let mut spans = vec![Span::styled(
-                if focused { "> " } else { "  " },
-                if focused {
-                    Style::default().fg(theme.action)
-                } else {
-                    theme.dim_style()
-                },
-            )];
-            if let Some(reference) = air_badge {
-                spans.push(air_artifact_badge(reference));
-                spans.push(Span::raw(" "));
-            }
-            spans.push(Span::styled(
-                text,
-                if focused {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
+    let group_windows = matches!(
+        app.collaboration.history_scope.as_ref(),
+        Some(MailboxHistoryScope::Session { .. })
+    );
+    let aggregate = app
+        .collaboration
+        .history_scope
+        .as_ref()
+        .is_some_and(MailboxHistoryScope::aggregate);
+    // Retain request indexes beside painted lines because window headers are
+    // not selectable. The viewport can then follow the selected request even
+    // when a header consumes one of its rows.
+    let mut painted: Vec<(Option<usize>, Line<'static>)> = Vec::new();
+    if group_windows {
+        for (window, requests) in session_mailbox_window_groups(app, requests) {
+            painted.push((
+                None,
+                Line::from(Span::styled(
+                    format!(
+                        "  {window} · {} message{}",
+                        requests.len(),
+                        if requests.len() == 1 { "" } else { "s" }
+                    ),
+                    theme.table_header_style(),
+                )),
             ));
-            Line::from(spans)
-        })
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
+            for (index, request) in requests {
+                let lines = collaboration_mailbox_request_lines_for_request(
+                    request,
+                    index == selected,
+                    tab,
+                    aggregate,
+                    width,
+                    theme,
+                );
+                let mut lines = lines.into_iter();
+                if let Some(first) = lines.next() {
+                    painted.push((Some(index), first));
+                }
+                painted.extend(lines.map(|line| (None, line)));
+            }
+        }
+    } else {
+        for (index, request) in requests.iter().enumerate() {
+            let lines = collaboration_mailbox_request_lines_for_request(
+                request,
+                index == selected,
+                tab,
+                aggregate,
+                width,
+                theme,
+            );
+            let mut lines = lines.into_iter();
+            if let Some(first) = lines.next() {
+                painted.push((Some(index), first));
+            }
+            painted.extend(lines.map(|line| (None, line)));
+        }
+    }
+    if painted.is_empty() {
+        return vec![Line::from(Span::styled(
             match tab {
                 CollaborationMailboxTab::Incoming => "no incoming requests",
                 CollaborationMailboxTab::Sent => "no sent requests",
             },
             theme.dim_style(),
-        )));
+        ))];
     }
-    lines
+    let selected_line = painted
+        .iter()
+        .position(|(index, _)| *index == Some(selected))
+        .unwrap_or(0);
+    let start = selected_line
+        .saturating_add(1)
+        .saturating_sub(max_lines)
+        .min(painted.len().saturating_sub(max_lines));
+    painted
+        .into_iter()
+        .skip(start)
+        .take(max_lines)
+        .map(|(_, line)| line)
+        .collect()
+}
+
+fn mailbox_scope_participant<'a>(app: &App, request: &'a CollaborationRequest) -> &'a Participant {
+    app.collaboration
+        .history_scope
+        .as_ref()
+        .filter(|scope| scope.matches(&request.from))
+        .map_or(&request.to, |_| &request.from)
+}
+
+fn session_mailbox_window_groups<'a>(
+    app: &App,
+    requests: &'a [CollaborationRequest],
+) -> Vec<(String, Vec<(usize, &'a CollaborationRequest)>)> {
+    let mut groups: Vec<(String, Vec<(usize, &CollaborationRequest)>)> = Vec::new();
+    let mut indexes = HashMap::<String, usize>::new();
+    for (index, request) in requests.iter().enumerate() {
+        let participant = mailbox_scope_participant(app, request);
+        let stable = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            participant.room.host,
+            participant.room.socket.as_deref().unwrap_or_default(),
+            participant.room.window_id
+        );
+        let label = participant
+            .window_name
+            .clone()
+            .unwrap_or_else(|| participant.room.window_id.clone());
+        let group = *indexes.entry(stable).or_insert_with(|| {
+            groups.push((label, Vec::new()));
+            groups.len() - 1
+        });
+        groups[group].1.push((index, request));
+    }
+    let mut label_counts = HashMap::<String, usize>::new();
+    for (label, _) in &groups {
+        *label_counts.entry(label.clone()).or_default() += 1;
+    }
+    groups
+        .into_iter()
+        .map(|(label, requests)| {
+            let duplicate = label_counts.get(&label).copied().unwrap_or_default() > 1;
+            let label = if duplicate {
+                let window_id = requests
+                    .first()
+                    .map(|(_, request)| {
+                        mailbox_scope_participant(app, request)
+                            .room
+                            .window_id
+                            .as_str()
+                    })
+                    .unwrap_or_default();
+                format!("{label} · {window_id}")
+            } else {
+                label
+            };
+            (label, requests)
+        })
+        .collect()
+}
+
+fn collaboration_mailbox_request_lines_for_request(
+    request: &CollaborationRequest,
+    focused: bool,
+    tab: CollaborationMailboxTab,
+    aggregate: bool,
+    width: usize,
+    theme: WatchThemeSpec,
+) -> Vec<Line<'static>> {
+    let peer = if aggregate {
+        format!("{} → {}", request.from.label(), request.to.label())
+    } else {
+        match tab {
+            CollaborationMailboxTab::Incoming => request.from.label(),
+            CollaborationMailboxTab::Sent => request.to.label(),
+        }
+    };
+    let body = request
+        .body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let age = collab_screen::age(OffsetDateTime::now_utc(), request.created_at);
+    let (status_icon, status_label) = mailbox_status(request.status);
+    let summary = truncate_chars(
+        &format!(
+            "{status_icon} {peer}  ·  {status_label}  ·  {}  ·  {age} ago",
+            request_kind_label(request.kind)
+        ),
+        width.saturating_sub(2),
+    );
+    let marker = Span::styled(
+        if focused { "> " } else { "  " },
+        if focused {
+            Style::default().fg(theme.action)
+        } else {
+            theme.dim_style()
+        },
+    );
+    let row_style = if focused {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    vec![
+        Line::from(vec![marker, Span::styled(summary, row_style)]),
+        Line::from(Span::styled(
+            truncate_chars(&format!("    {body}"), width),
+            if focused {
+                row_style
+            } else {
+                theme.dim_style()
+            },
+        )),
+    ]
+}
+
+fn mailbox_status(status: RequestStatus) -> (&'static str, &'static str) {
+    match status {
+        RequestStatus::Queued => ("○", "waiting"),
+        RequestStatus::Claimed => ("●", "in progress"),
+        RequestStatus::Completed => ("✓", "done"),
+        RequestStatus::Blocked => ("!", "blocked"),
+        RequestStatus::Declined => ("–", "declined"),
+        RequestStatus::Failed => ("×", "failed"),
+        RequestStatus::Expired => ("×", "expired"),
+        RequestStatus::Cancelled => ("×", "cancelled"),
+    }
 }
 
 /// Wrap `prefix + text` into at most `max_lines` rows of `width` chars,
@@ -12393,41 +12802,35 @@ fn collaboration_request_detail_lines(
     height: usize,
     theme: WatchThemeSpec,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(truncate_chars(
+    let (_, status) = mailbox_status(request.status);
+    let mut lines = vec![Line::from(Span::styled(
+        truncate_chars(
             &format!(
-                "{} · {} → {}",
-                request.id,
-                request.from.label(),
-                request.to.label()
-            ),
-            width,
-        )),
-        Line::from(truncate_chars(
-            &format!(
-                "{} · {} · {}",
+                "{} · {status} · {} · {} ago",
                 request_kind_label(request.kind),
-                request_status_label(request.status),
-                work_mode_label(request.work_mode)
+                work_mode_label(request.work_mode),
+                collab_screen::age(OffsetDateTime::now_utc(), request.created_at)
             ),
             width,
-        )),
-    ];
+        ),
+        theme.dim_style(),
+    ))];
     lines.extend(
         request
             .air_artifacts
             .iter()
             .map(|reference| air_artifact_detail_line("input", reference, width)),
     );
-    // Everything after the fixed header shares the remaining height between
-    // body and reply. The body was previously one truncated line under a
-    // hard seven-row cap, which turned the expanded detail pane into a
-    // field of blank rows under an ellipsis.
+    // Human-readable content owns the compact view. Stable ids and causal
+    // metadata only appear after `|` expands the detail pane.
+    let show_technical = height >= 10;
     let reply_air = request
         .reply
         .as_ref()
         .map_or(0, |reply| reply.air_artifacts.len());
-    let remaining = height.saturating_sub(lines.len() + reply_air).max(2);
+    let remaining = height
+        .saturating_sub(lines.len() + reply_air + usize::from(show_technical))
+        .max(2);
     let (body_budget, reply_budget) = if request.reply.is_some() {
         let body = remaining.div_ceil(2);
         (body, remaining - body)
@@ -12435,12 +12838,13 @@ fn collaboration_request_detail_lines(
         (remaining, 0)
     };
     lines.extend(
-        wrap_detail_text("body: ", &request.body, width, body_budget)
+        wrap_detail_text("Request: ", &request.body, width, body_budget)
             .into_iter()
             .map(Line::from),
     );
     if let Some(reply) = request.reply.as_ref() {
-        let prefix = format!("reply [{}]: ", request_status_label(reply.status));
+        let (_, reply_status) = mailbox_status(reply.status);
+        let prefix = format!("Reply ({reply_status}): ");
         lines.extend(
             wrap_detail_text(&prefix, &reply.body, width, reply_budget.max(1))
                 .into_iter()
@@ -12452,6 +12856,32 @@ fn collaboration_request_detail_lines(
                 .iter()
                 .map(|reference| air_artifact_detail_line("output", reference, width)),
         );
+    }
+    if show_technical {
+        let work = match (request.workspace_id.as_deref(), request.work_id.as_deref()) {
+            (Some(workspace), Some(work)) => format!(" · work {workspace}/{work}"),
+            (None, Some(work)) => format!(" · work {work}"),
+            _ => String::new(),
+        };
+        let parent = request
+            .parent_request_id
+            .as_deref()
+            .map_or_else(String::new, |parent| format!(" · parent {parent}"));
+        let run = request
+            .run_id
+            .as_deref()
+            .map_or_else(String::new, |run| format!(" · run {run}"));
+        lines.push(Line::from(Span::styled(
+            truncate_chars(
+                &format!(
+                    "id {} · thread {}{parent}{work}{run}",
+                    request.id,
+                    request.thread_id.as_deref().unwrap_or(&request.id),
+                ),
+                width,
+            ),
+            theme.dim_style(),
+        )));
     }
     lines.truncate(height.max(1));
     if lines.is_empty() {
@@ -12620,18 +13050,22 @@ fn help_popup_rect(r: Rect) -> Rect {
 /// identify a request and both of its endpoints, and none of the node columns
 /// (state, duration, prompt) mean anything for a message.
 /// Rows the detail pane costs the table, plus its two borders.
-const COLLAB_DETAIL_HEIGHT: u16 = 7;
+const COLLAB_DETAIL_HEIGHT: u16 = 9;
 /// Below this the table is too short to be worth splitting, so the body stays
 /// one `M` away instead of leaving three rows of listing.
 const COLLAB_DETAIL_MIN_HEIGHT: u16 = 16;
 
+#[allow(clippy::too_many_lines)] // table and sequence share selection and detail-pane state
 fn render_collab_screen(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let filter = app.search_query.clone();
     let entries = app.collab.rows(app.watch_cfg.view, &filter);
     let visible = app.collab.visible(&filter).len();
     let selected = app.collab.selected_index();
-    let title = format!(" Collab · fleet ({visible}) ");
+    let title = format!(
+        " Collab · fleet ({visible}) · {} ",
+        collab_screen::layout_label(app.collab.layout())
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border_style())
@@ -12682,6 +13116,49 @@ fn render_collab_screen(f: &mut Frame, area: Rect, app: &mut App) {
     };
 
     let now = OffsetDateTime::now_utc();
+    if app.collab.layout() == CollabLayout::Sequence {
+        let sequence = app.collab.sequence_rows(&filter);
+        let selected_id = app
+            .collab
+            .selected_request(&filter)
+            .map(|request| request.id.as_str());
+        let mut selected_row = None;
+        let rows = sequence
+            .iter()
+            .enumerate()
+            .map(|(row_index, entry)| {
+                let request = match entry {
+                    SequenceRow::Group { .. } => None,
+                    SequenceRow::Request(request) | SequenceRow::Reply(request) => Some(*request),
+                };
+                let selected = request.is_some_and(|request| {
+                    let hit = selected_id == Some(request.id.as_str());
+                    if hit && matches!(entry, SequenceRow::Request(_)) {
+                        selected_row = Some(row_index);
+                    }
+                    hit
+                });
+                collab_screen::sequence_row(entry, now, theme, selected)
+            })
+            .collect::<Vec<_>>();
+        let header = Row::new(
+            collab_screen::SEQUENCE_HEADERS
+                .iter()
+                .map(|header| Cell::from(*header).style(theme.table_header_style())),
+        );
+        let table = Table::new(rows, collab_screen::SEQUENCE_COLUMNS)
+            .header(header)
+            .block(block)
+            .highlight_symbol("> ")
+            .highlight_spacing(HighlightSpacing::Always);
+        let mut state = TableState::default();
+        state.select(selected_row);
+        f.render_stateful_widget(table, area, &mut state);
+        if let Some(detail_area) = detail_area {
+            render_collab_detail(f, detail_area, app, theme);
+        }
+        return;
+    }
     // The cursor counts requests, not rows: group headers are not selectable,
     // so the nth request is the nth *selectable* line.
     let mut request_index = 0usize;
@@ -12750,16 +13227,26 @@ fn render_collab_detail(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeS
                 ),
                 theme.table_header_style(),
             ),
-            Span::styled(
-                format!(
-                    "   {:?} · {:?} · {} ago",
-                    request.kind,
-                    request.work_mode,
-                    collab_screen::age(now, request.created_at)
-                ),
-                theme.dim_style(),
-            ),
         ]),
+        Line::from(Span::styled(
+            format!(
+                "{:?} · {:?} · {:?} · {} ago · thread {}{}{}",
+                request.kind,
+                request.work_mode,
+                request.status,
+                collab_screen::age(now, request.created_at),
+                request.thread_id.as_deref().unwrap_or(&request.id),
+                request
+                    .work_id
+                    .as_deref()
+                    .map_or_else(String::new, |work| format!(" · work {work}")),
+                request
+                    .run_id
+                    .as_deref()
+                    .map_or_else(String::new, |run| format!(" · run {run}")),
+            ),
+            theme.dim_style(),
+        )),
         Line::raw(request.body.clone()),
     ];
     if let Some(reply) = &request.reply {
@@ -16319,22 +16806,37 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
     }
 
     if app.collaboration_mailbox.open {
-        let spans = vec![
-            Span::styled(" Tab ", theme.action_badge()),
-            Span::raw("incoming/sent  "),
+        let aggregate = app
+            .collaboration
+            .history_scope
+            .as_ref()
+            .is_some_and(MailboxHistoryScope::aggregate);
+        let mut spans = vec![
             Span::styled(" j/k ", theme.key_badge()),
-            Span::raw("select  "),
-            Span::styled(" i ", theme.action_badge()),
-            Span::raw("claim  "),
-            Span::styled(" e ", theme.action_badge()),
-            Span::raw("reply  "),
-            Span::styled(" | ", theme.key_badge()),
-            Span::raw("detail size  "),
-            Span::styled(" m ", theme.action_badge()),
             Span::raw("message  "),
+        ];
+        if aggregate {
+            spans.extend([
+                Span::styled(" | ", theme.key_badge()),
+                Span::raw("more detail  "),
+                Span::styled(" history only ", theme.dim_style()),
+            ]);
+        } else {
+            spans.extend([
+                Span::styled(" Tab ", theme.action_badge()),
+                Span::raw("inbox/sent  "),
+                Span::styled(" i ", theme.action_badge()),
+                Span::raw("claim  "),
+                Span::styled(" e ", theme.action_badge()),
+                Span::raw("reply  "),
+                Span::styled(" | ", theme.key_badge()),
+                Span::raw("more detail  "),
+            ]);
+        }
+        spans.extend([
             Span::styled(" Esc/M ", theme.key_badge()),
             Span::raw("close"),
-        ];
+        ]);
         f.render_widget(Paragraph::new(Line::from(spans)), area);
         return true;
     }
@@ -16381,6 +16883,8 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
                 Span::raw(" filter  "),
                 Span::styled(" : ", theme.action_badge()),
                 Span::raw(" commands  "),
+                Span::styled(" v ", theme.action_badge()),
+                Span::raw(" table/sequence  "),
                 Span::styled(" ⏎ ", theme.action_badge()),
                 Span::raw(" go to peer  "),
                 Span::styled(" Alt-1 ", theme.key_badge()),
@@ -16790,6 +17294,8 @@ mod tests {
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: None,
+            work_id: None,
             socket: None,
             pane_id: pane.into(),
             session_id: String::new(),
@@ -16821,6 +17327,8 @@ mod tests {
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: None,
+            work_id: None,
             socket: Some(socket.into()),
             pane_id: pane_id.into(),
             session_id: session_id.into(),
@@ -18302,7 +18810,14 @@ mod tests {
             body: "review the auth change".into(),
             expects_reply: true,
             work_mode: WorkMode::ReadOnly,
+            thread_id: None,
+            parent_request_id: None,
+            workspace_id: None,
+            work_id: None,
+            run_id: None,
             paths: Vec::new(),
+            artifacts: Vec::new(),
+            links: Vec::new(),
             air_artifacts: Vec::new(),
             status,
             created_at: now,
@@ -18313,6 +18828,172 @@ mod tests {
             reply_read_at: None,
             reply: None,
         }
+    }
+
+    fn participant_on(
+        pane: &str,
+        socket: &str,
+        session_id: &str,
+        session: &str,
+        window_id: &str,
+        window: &str,
+    ) -> Participant {
+        let mut participant = fake_collaboration_participant(pane, pane, None);
+        participant.socket = Some(socket.into());
+        participant.room.socket = Some(socket.into());
+        participant.room.window_id = window_id.into();
+        participant.tmux_session_id = Some(session_id.into());
+        participant.tmux_session_name = Some(session.into());
+        participant.window_name = Some(window.into());
+        participant
+    }
+
+    #[test]
+    fn aggregate_session_history_is_exact_socket_scoped_and_de_duplicates_internal_traffic() {
+        let scope = MailboxHistoryScope::Session {
+            key: SessionKey {
+                endpoint: BackendEndpoint {
+                    host: muxa::HostKind::Tmux,
+                    socket: "default".into(),
+                },
+                session_id: "$1".into(),
+            },
+            label: "callabo".into(),
+        };
+        let internal = fake_watch_collaboration_request(
+            "internal",
+            participant_on("%1", "default", "$1", "callabo", "@1", "CAL-1"),
+            participant_on("%2", "default", "$1", "callabo", "@2", "CAL-2"),
+            RequestStatus::Completed,
+        );
+        let cross_socket = fake_watch_collaboration_request(
+            "other-socket",
+            participant_on("%1", "amux", "$1", "other", "@1", "CAL-1"),
+            participant_on("%2", "amux", "$1", "other", "@2", "CAL-2"),
+            RequestStatus::Completed,
+        );
+        let mut missing_socket = participant_on("%3", "default", "$1", "callabo", "@1", "CAL-1");
+        missing_socket.socket = None;
+        missing_socket.room.socket = None;
+        let missing_socket = fake_watch_collaboration_request(
+            "missing-socket",
+            missing_socket,
+            Participant::console(RoomId {
+                host: "tmux".into(),
+                socket: Some("default".into()),
+                window_id: "@1".into(),
+            }),
+            RequestStatus::Completed,
+        );
+
+        let history = history_for_scope(&[internal, cross_socket, missing_socket], &scope);
+        assert_eq!(
+            history.len(),
+            1,
+            "one internal request, never one per endpoint"
+        );
+        assert_eq!(history[0].id, "internal");
+    }
+
+    #[test]
+    fn hierarchy_mailbox_scope_keeps_session_and_window_nodes_aggregate() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "callabo", "@1", "CAL-1", 0, "%1", 0),
+            fake_topology_pane("default", "$1", "callabo", "@2", "CAL-2", 1, "%2", 0),
+        ];
+        let agents = vec![
+            topology_agent("one", "%1", "default", AgentState::Idle, "one", 0),
+            topology_agent("two", "%2", "default", AgentState::Working, "two", 1),
+        ];
+        let mut app = topology_watch(WatchView::Session, agents, panes);
+        let session = app.topology.sessions[0].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Session(session));
+        assert!(matches!(
+            mailbox_history_scope(&app),
+            Some(MailboxHistoryScope::Session { .. })
+        ));
+
+        app.apply_view(WatchView::Window);
+        let window = app.topology.sessions[0].windows[1].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Window(window));
+        assert!(matches!(
+            mailbox_history_scope(&app),
+            Some(MailboxHistoryScope::Window { .. })
+        ));
+    }
+
+    #[test]
+    fn aggregate_mailbox_actions_are_read_only() {
+        let mut app = collaboration_watch_app();
+        app.collaboration.history_scope = Some(MailboxHistoryScope::Session {
+            key: SessionKey {
+                endpoint: BackendEndpoint {
+                    host: muxa::HostKind::Tmux,
+                    socket: "default".into(),
+                },
+                session_id: "$1".into(),
+            },
+            label: "callabo".into(),
+        });
+        for key in ['i', 'e', 'm'] {
+            assert!(matches!(
+                handle_collaboration_mailbox_event(KeyCode::Char(key), &mut app),
+                Action::None
+            ));
+            assert!(app.footer_hint.is_some());
+        }
+    }
+
+    #[test]
+    fn session_mailbox_leads_with_human_window_names_and_message_summaries() {
+        let mut app = collaboration_watch_app();
+        app.collaboration.history_scope = Some(MailboxHistoryScope::Session {
+            key: SessionKey {
+                endpoint: BackendEndpoint {
+                    host: muxa::HostKind::Tmux,
+                    socket: "default".into(),
+                },
+                session_id: "$1".into(),
+            },
+            label: "callabo".into(),
+        });
+        app.collaboration.incoming = vec![
+            fake_watch_collaboration_request(
+                "req_internal_one",
+                participant_on("%1", "default", "$1", "callabo", "@1", "CAL-7345"),
+                participant_on("%2", "default", "$1", "callabo", "@2", "CAL-8000"),
+                RequestStatus::Completed,
+            ),
+            fake_watch_collaboration_request(
+                "req_internal_two",
+                participant_on("%2", "default", "$1", "callabo", "@2", "CAL-8000"),
+                participant_on("%1", "default", "$1", "callabo", "@1", "CAL-7345"),
+                RequestStatus::Blocked,
+            ),
+        ];
+
+        let lines =
+            collaboration_mailbox_request_lines(&app, 100, 20, watch_theme(WatchTheme::Classic));
+        let painted = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(lines.len(), 6, "one header and two rows per message");
+        assert!(painted.contains("CAL-7345 · 1 message"), "{painted}");
+        assert!(painted.contains("CAL-8000 · 1 message"), "{painted}");
+        assert!(painted.contains("done"), "{painted}");
+        assert!(painted.contains("blocked"), "{painted}");
+        assert!(painted.contains("review the auth change"), "{painted}");
+        assert!(!painted.contains("req_internal"), "{painted}");
+        assert!(!painted.contains("@1"), "{painted}");
+        assert!(!painted.contains("@2"), "{painted}");
     }
 
     fn collaboration_watch_app() -> App {
@@ -19728,11 +20409,16 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
 
-        assert!(dump.contains("collaboration"));
+        assert!(dump.contains("messages"));
         assert!(dump.contains("reviewer@%2"));
+        assert!(dump.contains("in progress"));
         assert!(dump.contains("AIR PLAN"));
         assert!(dump.contains("bbbbbbbbbbbb"));
         assert!(dump.contains("review the auth change"));
+        assert!(
+            !dump.contains("req_watch_render_123456"),
+            "compact mailbox should prioritize the conversation over internal ids"
+        );
     }
 
     fn grouped_session(id: &str, name: &str, attached: u32, group: &str) -> SessionInfo {
@@ -21244,6 +21930,19 @@ mod tests {
     }
 
     #[test]
+    fn collaboration_layout_persists_and_seeds_the_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        persist_watch_collab_layout(&path, CollabLayout::Sequence).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("collab_layout = \"sequence\""), "{saved}");
+        let cfg = muxa::config::Config::load_or_default(Some(&path)).unwrap();
+        let app = App::with_legacy_config(cfg.watch);
+        assert_eq!(app.collab.layout(), CollabLayout::Sequence);
+    }
+
+    #[test]
     fn persist_watch_sort_creates_config_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/config.toml");
@@ -21453,6 +22152,8 @@ sort = ["state"]
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: None,
+            work_id: None,
             socket: None,
             pane_id: "%42".into(),
             session_id: String::new(),
@@ -23814,6 +24515,10 @@ sort = ["state"]
             Action::SetLayout(layout) => {
                 app.apply_layout(layout);
             }
+            Action::SetCollabLayout(layout) => {
+                app.collab.set_layout(layout);
+                app.watch_cfg.collab_layout = layout;
+            }
             // The run loop also reloads the fleet listing here; the harness
             // stops at the state change so no test needs a daemon.
             Action::SetScreen(screen) => {
@@ -24673,7 +25378,14 @@ sort = ["state"]
             body: COLLAB_FIXTURE_BODY.into(),
             expects_reply: true,
             work_mode: WorkMode::ReadOnly,
+            thread_id: None,
+            parent_request_id: None,
+            workspace_id: None,
+            work_id: None,
+            run_id: None,
             paths: Vec::new(),
+            artifacts: Vec::new(),
+            links: Vec::new(),
             air_artifacts: Vec::new(),
             status: RequestStatus::Queued,
             created_at: OffsetDateTime::now_utc(),
@@ -24726,6 +25438,44 @@ sort = ["state"]
             execute_palette_command(&mut app, "topology"),
             Action::SetScreen(WatchScreen::Topology)
         ));
+    }
+
+    #[test]
+    fn collab_layout_toggles_by_key_and_palette_without_touching_topology_layout() {
+        let mut app = collab_app("%2");
+        assert_eq!(app.collab.layout(), CollabLayout::Table);
+        let Action::SetCollabLayout(layout) = key_action(&mut app, 'v') else {
+            panic!("v should set the collaboration layout");
+        };
+        app.collab.set_layout(layout);
+        assert_eq!(app.collab.layout(), CollabLayout::Sequence);
+        assert_eq!(app.watch_cfg.layout, WatchLayout::Tree);
+
+        assert!(matches!(
+            execute_palette_command(&mut app, "layout table"),
+            Action::SetCollabLayout(CollabLayout::Table)
+        ));
+        assert_eq!(parse_collab_layout("history"), Some(CollabLayout::Sequence));
+    }
+
+    #[test]
+    fn collab_sequence_paints_lifelines_and_chronological_arrow() {
+        let mut app = collab_app("%2");
+        app.collab.set_layout(CollabLayout::Sequence);
+        let backend = ratatui::backend::TestBackend::new(180, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let painted: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(painted.contains("SEQUENCE / LIFELINES"), "{painted}");
+        assert!(painted.contains("●──────▶"), "{painted}");
+        assert!(painted.contains("sequence"), "{painted}");
+        assert!(painted.contains(COLLAB_FIXTURE_BODY), "{painted}");
     }
 
     #[test]

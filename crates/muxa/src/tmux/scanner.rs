@@ -583,6 +583,8 @@ mod tests {
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: None,
+            work_id: None,
             socket: None,
             pane_id: id.into(),
             session_id: String::new(),
@@ -786,6 +788,8 @@ mod tests {
         assert_eq!(panes.len(), 1);
         let pane = &panes[0];
         assert_eq!(pane.pane.socket.as_deref(), Some("default"));
+        assert_eq!(pane.pane.workspace_id.as_deref(), Some("payments"));
+        assert_eq!(pane.pane.work_id.as_deref(), Some("PAY-42"));
         assert!(pane.muxa.managed_workspace);
         assert!(pane.muxa.managed_work);
         assert!(pane.muxa.managed_agent);

@@ -90,6 +90,7 @@ mod tests {
         assert!(WebAssets::get("index.html").is_some());
         assert!(WebAssets::get("main.js").is_some());
         assert!(WebAssets::get("work-model.mjs").is_some());
+        assert!(WebAssets::get("collaboration-model.mjs").is_some());
         assert!(WebAssets::get("style.css").is_some());
     }
 
