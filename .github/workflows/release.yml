@@ -189,4 +189,20 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           gh release edit "$tag" --draft=false --notes-file notes.md
-          echo "::notice::published $tag (${{ steps.notes.outputs.bytes }} bytes of notes); tap-bump takes it from here"
+          echo "::notice::published $tag (${{ steps.notes.outputs.bytes }} bytes of notes)"
+
+  # Sync the Homebrew formula to what was just published.
+  #
+  # Called, not triggered. `tap-bump` also listens for `release: published`,
+  # but GitHub does not start workflows from events raised with the automatic
+  # `GITHUB_TOKEN` — so the publish above, performed by this workflow, is
+  # invisible to that trigger. v0.8.38 shipped that way: published on its own,
+  # with the tap left a version behind and no failure anywhere to say so.
+  tap:
+    name: bump homebrew tap
+    needs: [publish]
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/tap-bump.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit

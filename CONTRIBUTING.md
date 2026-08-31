@@ -85,12 +85,19 @@ than after.
    - the `publish` job failed — publish by hand with
      `gh release edit vX.Y.Z --draft=false --notes-file <(awk '/## \[X.Y.Z\]/{f=1;next}/^## \[/{f=0}f' CHANGELOG.md)`.
 
-5. The Homebrew tap follows the published release through `tap-bump`, which
-   needs the `TAP_GITHUB_TOKEN` secret (a fine-grained PAT with Contents
-   read/write on `Open330/homebrew-tap`). Without it — including when the token
-   expires — the job still *succeeds*, with a "skipping" notice, and the
-   formula quietly stays behind: if `brew` keeps offering the old version after
-   a release, suspect the token first. Recover with `scripts/bump-tap.sh
+5. The Homebrew tap is synced by the release run itself, which *calls*
+   `tap-bump` after publishing rather than relying on the `release: published`
+   event — GitHub does not start workflows from events raised with the
+   automatic `GITHUB_TOKEN`, so a publish this repo performs for itself is
+   invisible to that trigger (v0.8.38 shipped with the tap a version behind
+   for exactly this reason). The event trigger remains for a release a human
+   publishes by hand.
+
+   Either way it needs the `TAP_GITHUB_TOKEN` secret (a fine-grained PAT with
+   Contents read/write on `Open330/homebrew-tap`). Without it — including when
+   the token expires — the job still *succeeds*, with a "skipping" notice, and
+   the formula quietly stays behind: if `brew` keeps offering the old version
+   after a release, suspect the token first. Recover with `scripts/bump-tap.sh
    vX.Y.Z`, which is idempotent and prints "nothing to push" on a current tap.
 
 ## Project layout

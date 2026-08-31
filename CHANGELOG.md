@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A release syncs the Homebrew tap again.** `tap-bump` listens for
+  `release: published`, which worked while a human published each draft and
+  stopped the moment the release workflow started publishing for itself:
+  GitHub does not start workflows from events raised with the automatic
+  `GITHUB_TOKEN`. v0.8.38 published cleanly and left the formula on v0.8.37,
+  with nothing failing anywhere to say so — the worst shape a break can take.
+  The release run now *calls* `tap-bump` as a reusable workflow once the
+  publish job succeeds. The event trigger stays for releases published by
+  hand, and the two cannot double up, since the automated publish raises no
+  event to begin with.
+
+
 ## [0.8.38] - 2026-08-31
 
 ### Fixed
