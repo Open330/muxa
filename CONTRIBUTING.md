@@ -66,30 +66,32 @@ for the deferred stub.
    version you have not run is how a broken release gets tagged.
 3. Commit as `release: vX.Y.Z`, push `main`, then push the annotated tag.
 
-Pushing the tag is the whole trigger. **Do not run `gh release create`**:
-the workflow creates the draft itself and the build matrix uploads four
-archives into it. Creating the release by hand publishes it before the
-archives exist, and `tap-bump` — which fires on *published* — dies with
-"no assets to download".
+Pushing the tag is the whole trigger, and everything after it is automatic.
+**Do not run `gh release create`**: the workflow creates the draft itself, the
+build matrix uploads four archives into it, and only then does the `publish`
+job flip the draft — with the tag's `CHANGELOG.md` section as its notes.
+Creating the release by hand publishes it before the archives exist, and
+`tap-bump` — which fires on *published* — dies with "no assets to download".
 
-4. When the build finishes, publish the draft with the changelog section
-   as its notes:
+The run refuses to start when the tag disagrees with the tree: the workspace
+version in `Cargo.toml` must equal the tag, and `CHANGELOG.md` must already
+have that `## [X.Y.Z]` section. Both are cheaper to catch before four builds
+than after.
 
-   ```bash
-   gh release edit vX.Y.Z --draft=false --notes-file <(awk '/## \[X.Y.Z\]/{f=1;next}/^## \[/{f=0}f' CHANGELOG.md)
-   ```
+4. Watch the run. It publishes on its own; you only step in when it does not:
 
-5. Bump the Homebrew tap:
+   - a build target failed, so the release stays a draft on purpose — fix the
+     target and re-push the tag, or publish the partial set deliberately;
+   - the `publish` job failed — publish by hand with
+     `gh release edit vX.Y.Z --draft=false --notes-file <(awk '/## \[X.Y.Z\]/{f=1;next}/^## \[/{f=0}f' CHANGELOG.md)`.
 
-   ```bash
-   scripts/bump-tap.sh vX.Y.Z
-   ```
-
-   The `tap-bump` workflow does this automatically only when the
-   `TAP_GITHUB_TOKEN` secret is set; without it the job succeeds with a
-   "skipping" notice and the formula quietly stays behind. The script is
-   idempotent — running it on an already-current tap prints "nothing to
-   push" and exits.
+5. The Homebrew tap follows the published release through `tap-bump`, which
+   needs the `TAP_GITHUB_TOKEN` secret (a fine-grained PAT with Contents
+   read/write on `Open330/homebrew-tap`). Without it — including when the token
+   expires — the job still *succeeds*, with a "skipping" notice, and the
+   formula quietly stays behind: if `brew` keeps offering the old version after
+   a release, suspect the token first. Recover with `scripts/bump-tap.sh
+   vX.Y.Z`, which is idempotent and prints "nothing to push" on a current tap.
 
 ## Project layout
 
