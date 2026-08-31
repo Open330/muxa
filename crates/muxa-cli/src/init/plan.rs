@@ -118,8 +118,7 @@ pub fn build(
                 let Some(path) = files::dashboard::default_path() else {
                     continue;
                 };
-                let before = read_to_string_opt(&path)?;
-                let original = before.clone().unwrap_or_default();
+                let (before, original) = file_base(&actions, &path)?;
                 match direction {
                     Direction::Install => {
                         let (after, outcome, token) = files::dashboard::upsert(&original)
@@ -154,8 +153,7 @@ pub fn build(
                 let Some(path) = files::collaboration::default_path() else {
                     continue;
                 };
-                let before = read_to_string_opt(&path)?;
-                let original = before.clone().unwrap_or_default();
+                let (before, original) = file_base(&actions, &path)?;
                 let (after, outcome) = match direction {
                     Direction::Install => files::collaboration::upsert(&original)
                         .context("enabling collaboration in config.toml")?,
@@ -255,20 +253,9 @@ fn plan_tmux_env(
     actions: &mut Vec<Action>,
 ) -> Result<()> {
     let path = tmux_conf.to_path_buf();
-    // Re-read tmux.conf from disk fresh: an earlier `plan_tmux` action
-    // for popup/statusline only carries its post-edit content in the
-    // `Action`, not on disk. Pulling from disk would race with the
-    // earlier edit when apply.rs runs sequentially. Instead, fold our
-    // change on top of that pending content by replaying the earlier
-    // `EditFile` outputs targeting the same path.
-    let mut latest = read_to_string_opt(&path)?.unwrap_or_default();
-    for action in actions.iter() {
-        if let Action::EditFile { path: p, after, .. } = action {
-            if p == &path {
-                latest.clone_from(after);
-            }
-        }
-    }
+    // Folds onto whatever popup/statusline planned for this file, rather than
+    // onto disk — see `file_base`.
+    let (_, latest) = file_base(actions, &path)?;
     let (after, outcome) = match direction {
         Direction::Install if !needs_socket_pin(socket, &muxa::paths::default_socket()) => {
             files::tmux::remove_env(&latest)
@@ -313,6 +300,37 @@ fn needs_socket_pin(socket: &Path, default_socket: &Path) -> bool {
     socket != default_socket
 }
 
+/// The content a file will hold once every edit planned before this point
+/// has been applied, and the `before` to record against the next one.
+///
+/// Planning a component reads its file from disk. That is right for the first
+/// component to touch a path and wrong for every one after it: `apply` writes
+/// each `after` in turn, so a second edit computed from the *original* text
+/// silently overwrites the first one's block. Several components share a file
+/// — `tmux-popup` and `tmux-statusline` both own part of `~/.tmux.conf`, and
+/// `ask`, `collaboration` and `dashboard` each own a table in the same
+/// `config.toml` — so this is the ordinary case, not a corner.
+///
+/// Returning the pending text as `before` also keeps the chain honest: the
+/// backup `apply` takes is the file as it stood a moment earlier, and the
+/// dry-run diff for each component shows only that component's change.
+fn file_base(actions: &[Action], path: &Path) -> Result<(Option<String>, String)> {
+    let pending = actions.iter().rev().find_map(|action| match action {
+        Action::EditFile {
+            path: planned,
+            after,
+            ..
+        } if planned == path => Some(after.clone()),
+        _ => None,
+    });
+    if let Some(pending) = pending {
+        return Ok((Some(pending.clone()), pending));
+    }
+    let before = read_to_string_opt(&path.to_path_buf())?;
+    let original = before.clone().unwrap_or_default();
+    Ok((before, original))
+}
+
 fn plan_tmux(
     direction: Direction,
     c: Component,
@@ -322,8 +340,7 @@ fn plan_tmux(
     let Some(path) = tmux_path.cloned() else {
         return Ok(());
     };
-    let before = read_to_string_opt(&path)?;
-    let original = before.clone().unwrap_or_default();
+    let (before, original) = file_base(actions, &path)?;
     let (after, outcome) = match direction {
         Direction::Install => files::tmux::upsert(&original, c),
         Direction::Uninstall => files::tmux::remove(&original, c),
@@ -344,8 +361,7 @@ fn plan_ask(direction: Direction, component: Component, actions: &mut Vec<Action
     let Some(path) = files::ask::default_path() else {
         return Ok(());
     };
-    let before = read_to_string_opt(&path)?;
-    let original = before.clone().unwrap_or_default();
+    let (before, original) = file_base(actions, &path)?;
     let (after, outcome) = match direction {
         Direction::Install => {
             files::ask::upsert(&original).context("enabling ask in config.toml")?
@@ -580,6 +596,80 @@ mod tests {
         let plan = build(Direction::Install, &[], &d, &fake_socket()).unwrap();
         assert!(plan.actions.is_empty());
         assert!(!plan.has_changes());
+    }
+
+    /// The seam the silent overwrite went through. Several components share
+    /// one file — `tmux-popup` and `tmux-statusline` in `~/.tmux.conf`, `ask`
+    /// / `collaboration` / `dashboard` in one `config.toml` — and planning the
+    /// second from disk gives it text that has never seen the first one's
+    /// block. `apply` then writes them in turn and the first is gone, with
+    /// nothing on screen wrong: each component's own plan was accurate.
+    ///
+    /// Driven directly rather than through `build`, because the planners read
+    /// the operator's real `$HOME`: a machine whose `~/.tmux.conf` already
+    /// carries both blocks passes an end-to-end assertion no matter which way
+    /// the bug goes.
+    #[test]
+    fn a_planned_edit_folds_onto_the_one_already_planned_for_that_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tmux.conf");
+        std::fs::write(&path, "on disk\n").expect("seed the file");
+
+        let actions = vec![Action::EditFile {
+            component: Component::TmuxPopup,
+            path: path.clone(),
+            before: Some("on disk\n".into()),
+            after: "on disk\nfirst component's block\n".into(),
+            outcome: Outcome::Inserted,
+        }];
+
+        let (before, original) = file_base(&actions, &path).expect("resolve the base");
+        assert_eq!(
+            original, "on disk\nfirst component's block\n",
+            "the next component must build on the pending edit, not the file",
+        );
+        assert_eq!(
+            before.as_deref(),
+            Some("on disk\nfirst component's block\n"),
+            "and record it as `before`, so the backup is the file as it will stand",
+        );
+    }
+
+    /// The first component to touch a file still reads it, including the
+    /// `None` that says it does not exist yet.
+    #[test]
+    fn the_first_planned_edit_reads_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tmux.conf");
+
+        let (before, original) = file_base(&[], &path).expect("resolve the base");
+        assert_eq!(before, None, "a missing file has no `before` to back up");
+        assert!(original.is_empty());
+
+        std::fs::write(&path, "on disk\n").expect("seed the file");
+        let (before, original) = file_base(&[], &path).expect("resolve the base");
+        assert_eq!(before.as_deref(), Some("on disk\n"));
+        assert_eq!(original, "on disk\n");
+    }
+
+    /// An edit planned for a *different* file is not the base for this one.
+    #[test]
+    fn a_pending_edit_elsewhere_is_not_this_file_s_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mine = dir.path().join("config.toml");
+        let theirs = dir.path().join("tmux.conf");
+        std::fs::write(&mine, "[ask]\n").expect("seed the file");
+
+        let actions = vec![Action::EditFile {
+            component: Component::TmuxPopup,
+            path: theirs,
+            before: None,
+            after: "someone else's file\n".into(),
+            outcome: Outcome::Inserted,
+        }];
+
+        let (_, original) = file_base(&actions, &mine).expect("resolve the base");
+        assert_eq!(original, "[ask]\n");
     }
 
     #[test]
