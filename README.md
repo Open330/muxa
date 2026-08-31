@@ -98,6 +98,7 @@ exit.
 | `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
 | `muxa activity` | Raw duration ledger query for debugging exactly what fed stats/report. |
 | BarShelf widget (macOS) | Menu-bar popover summary of active, working, waiting, and error agents. |
+| Muxa for Mac | Native session browser and menu-bar app with a locally built libghostty terminal; native PTYs remain owned by `muxad`. |
 | Dashboard | Optional loopback HTTP UI with SSE live updates, timeline, and collaboration node-edge/sequence graphs. |
 | Notifications | Optional desktop alerts when agents need attention. |
 
@@ -138,6 +139,24 @@ muxa daemon status
 muxa status
 muxa watch
 ```
+
+### Build Muxa for Mac
+
+The native macOS app embeds a libghostty terminal while keeping shells and
+agents in `muxad`, so closing the app does not stop them. Ghostty, its Swift
+surface, and the required Zig compiler are pinned and verified; Muxa builds its
+own local XCFramework instead of consuming a prebuilt terminal binary.
+
+```bash
+brew install xcodegen
+apps/muxa-macos/Scripts/build-app.sh --open
+```
+
+After building, run `apps/muxa-macos/Scripts/smoke-test.sh` for a
+non-interactive product smoke test.
+
+See [Muxa for Mac](docs/MACOS.md) for the architecture, build inputs, and IPC
+contract.
 
 ### Collaborate from `muxa watch`
 

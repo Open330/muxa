@@ -3008,10 +3008,10 @@ fn capture_tmux_window(key: WindowKey) -> CapturedWindow {
         panes.extend(std::thread::scope(|scope| {
             let handles = batch
                 .iter()
-                .cloned()
                 .map(|geometry| {
                     let backend = backend.clone();
                     let socket = socket.clone();
+                    let geometry = geometry.clone();
                     scope.spawn(move || {
                         let pane_id = geometry.pane_id.clone();
                         let text = backend

@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "id": "dev.barshelf.muxa-watch",
   "name": "muxa Watch",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "icon": "rectangle.3.group.bubble.left.fill",
   "bucket": { "group": "Agents", "order": 10, "size": "L", "pinned": true },
 
@@ -12,7 +12,7 @@
     "kind": "script",
     "command": ["muxa"],
     "discover": ["$MUXA_BIN", "/opt/homebrew/bin/muxa", "/usr/local/bin/muxa", "~/.cargo/bin/muxa", "PATH"],
-    "timeoutMs": 4000,
+    "timeoutMs": 8000,
     "output": "viewtree"
   },
 
@@ -38,6 +38,15 @@
         "sensitiveOutput": true
       },
       {
+        "command": "muxa",
+        "allowedArgs": [
+          ["fleet", "status", "--json"],
+          ["--socket", "*", "fleet", "status", "--json"]
+        ],
+        "maxOutputBytes": 4194304,
+        "sensitiveOutput": true
+      },
+      {
         "command": "ssh",
         "allowedArgs": [
           ["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "--", "*", "muxa", "status", "--json"]
@@ -52,9 +61,10 @@
   },
 
   "settings": [
-    { "key": "sshHost", "title": "SSH host (empty means this Mac)", "type": "string", "default": "" },
-    { "key": "maxAgents", "title": "Maximum rows", "type": "integer", "default": 5, "min": 1, "max": 10 },
-    { "key": "showPrompts", "title": "Show last prompts", "type": "boolean", "default": true },
+    { "key": "source", "title": "Source", "type": "enum", "options": ["Single host", "Fleet"], "default": "Single host" },
+    { "key": "sshHost", "title": "SSH host (Single host only; empty means this Mac)", "type": "string", "default": "" },
+    { "key": "maxAgents", "title": "Maximum rows per host", "type": "integer", "default": 5, "min": 1, "max": 10 },
+    { "key": "showPrompts", "title": "Show what each agent is working on", "type": "boolean", "default": true },
     { "key": "showSubagents", "title": "Show subagents in flight", "type": "boolean", "default": true },
     { "key": "includeStopped", "title": "Include stopped agents", "type": "boolean", "default": false },
     { "key": "socket", "title": "Custom local muxa socket", "type": "string", "default": "" }

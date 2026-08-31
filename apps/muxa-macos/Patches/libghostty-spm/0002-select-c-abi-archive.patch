@@ -1,0 +1,107 @@
+diff --git a/Script/build-ghostty.sh b/Script/build-ghostty.sh
+index 42df863..faf2c9d 100755
+--- a/Script/build-ghostty.sh
++++ b/Script/build-ghostty.sh
+@@ -96,22 +96,43 @@ find_built_library() {
+     find "$LOCAL_CACHE_DIR/o" -type f -name "$preferred_name" -print 2>/dev/null | sort | tail -n 1
+ }
+ 
++archive_has_required_symbols() {
++    local library_path="$1"
++    nm -g "$library_path" 2>/dev/null | awk '
++        $NF == "_ghostty_init" { init = 1 }
++        $NF == "_ghostty_surface_write_buffer_replay" { replay = 1 }
++        END { exit !(init && replay) }
++    '
++}
++
++find_c_abi_library() {
++    local preferred_name="$1"
++    local candidate
++    while IFS= read -r candidate; do
++        if archive_has_required_symbols "$candidate"; then
++            printf '%s\n' "$candidate"
++            return
++        fi
++    done < <(find "$LOCAL_CACHE_DIR/o" -type f -name "$preferred_name" -print 2>/dev/null | sort -r)
++}
++
+ LIBRARY_PATH=
+ 
+-if [ -f "$SOURCE_DIR/zig-out/lib/libghostty.a" ]; then
++if [ -f "$SOURCE_DIR/zig-out/lib/libghostty.a" ] &&
++    archive_has_required_symbols "$SOURCE_DIR/zig-out/lib/libghostty.a"; then
+     LIBRARY_PATH="$SOURCE_DIR/zig-out/lib/libghostty.a"
+ fi
+ 
+ if [ -z "$LIBRARY_PATH" ]; then
+-    LIBRARY_PATH=$(find_built_library "libghostty-fat.a")
++    LIBRARY_PATH=$(find_c_abi_library "libghostty.a")
+ fi
+ 
+ if [ -z "$LIBRARY_PATH" ]; then
+-    LIBRARY_PATH=$(find_built_library "libghostty.a")
++    LIBRARY_PATH=$(find_c_abi_library "libghostty-fat.a")
+ fi
+ 
+ if [ -z "$LIBRARY_PATH" ]; then
+-    echo "[!] failed to locate built libghostty archive in $LOCAL_CACHE_DIR"
++    echo "[!] failed to locate a libghostty archive with the required C ABI in $LOCAL_CACHE_DIR"
+     if [[ "$ZIG_TARGET" == *macos* || "$ZIG_TARGET" == *ios* || "$ZIG_TARGET" == *tvos* || "$ZIG_TARGET" == *visionos* || "$ZIG_TARGET" == *watchos* ]]; then
+         echo "[!] note: upstream Ghostty does not install Darwin libghostty for app-runtime=none unless extra build wiring is triggered"
+         echo "[!] try again with ZIG_BUILD_EXTRA_ARGS='-Demit-xcframework=true' if you want to force Darwin libghostty build graph execution"
+@@ -120,6 +141,13 @@ if [ -z "$LIBRARY_PATH" ]; then
+     exit 1
+ fi
+ 
++find_dependency_libraries() {
++    find "$LOCAL_CACHE_DIR/o" -type f -name '*.a' \
++        ! -name 'libghostty.a' \
++        ! -name 'libghostty-fat.a' \
++        -print 2>/dev/null | sort
++}
++
+ # Resolve std::__1::__libcpp_verbose_abort inside the archive: the Apple
+ # system libc++ only exports it since iOS 16.3 / macOS 13.3 / tvOS 16.3, and
+ # Zig's bundled libc++ headers reference it strongly (no availability markup),
+@@ -127,11 +155,35 @@ fi
+ COMPAT_SOURCE="$ROOT_DIR/Script/support/libcxx-verbose-abort-compat.c"
+ COMPAT_OBJECT="$LOCAL_CACHE_DIR/libcxx-verbose-abort-compat.o"
+ zig cc -target "$ZIG_TARGET" -Os -fno-sanitize=undefined -c "$COMPAT_SOURCE" -o "$COMPAT_OBJECT"
+-xcrun libtool -static -no_warning_for_no_symbols \
+-    -o "$OUTPUT_DIR/lib/libghostty.a" \
+-    "$LIBRARY_PATH" \
+-    "$COMPAT_OBJECT"
+-echo "[*] appended libc++ verbose abort compatibility object"
++OUTPUT_LIBRARY=$(cd "$OUTPUT_DIR/lib" && pwd)/libghostty.a
++cp "$LIBRARY_PATH" "$OUTPUT_LIBRARY"
++EXTRACTED_DEPENDENCIES="$LOCAL_CACHE_DIR/libghostty-dependencies"
++rm -rf "$EXTRACTED_DEPENDENCIES"
++mkdir -p "$EXTRACTED_DEPENDENCIES"
++dependency_count=0
++while IFS= read -r dependency_library; do
++    dependency_dir="$EXTRACTED_DEPENDENCIES/$dependency_count"
++    mkdir -p "$dependency_dir"
++    (
++        cd "$dependency_dir"
++        ar -x "$dependency_library"
++        chmod u+r ./*.o
++        ar -q "$OUTPUT_LIBRARY" ./*.o
++    )
++    dependency_count=$((dependency_count + 1))
++done < <(find_dependency_libraries)
++if [ "$dependency_count" -eq 0 ]; then
++    echo "[!] no Ghostty dependency archives were found in $LOCAL_CACHE_DIR" >&2
++    exit 1
++fi
++ar -r "$OUTPUT_LIBRARY" "$COMPAT_OBJECT"
++ranlib "$OUTPUT_LIBRARY"
++echo "[*] appended Ghostty dependencies and libc++ compatibility object"
++if ! archive_has_required_symbols "$OUTPUT_LIBRARY"; then
++    echo "[!] assembled archive is missing the required Ghostty C ABI" >&2
++    exit 1
++fi
++echo "[*] verified Ghostty C ABI symbols"
+ 
+ mkdir -p "$OUTPUT_DIR/include/libghostty"
+ cp "$SOURCE_DIR/include/ghostty.h" "$OUTPUT_DIR/include/libghostty/ghostty.h"

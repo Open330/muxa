@@ -44,11 +44,13 @@ use crate::session::{
 use crate::state::{Agent, SharedStore};
 use crate::tmux::PaneInfo;
 use crate::work::WorkIdentity;
+use crate::work_control::{self, WorkUpRequest};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -162,6 +164,15 @@ enum RequestBody {
     },
     /// Durable desired graph and per-alias execution state for every Work Run.
     PipelineRuns,
+    /// Start the canonical `muxa work up` implementation as a bounded daemon
+    /// operation. The initial call returns immediately; native clients poll
+    /// `work_up_status` so a ticket lookup never freezes their state stream.
+    WorkUp {
+        request: WorkUpRequest,
+    },
+    WorkUpStatus {
+        operation_id: String,
+    },
     /// Create or update one desired Run and reconcile live pane evidence.
     PipelineRegister {
         registration: PipelineRunRegistration,
@@ -407,6 +418,12 @@ enum RequestBody {
         session_id: String,
         data: String,
     },
+    /// Byte-safe input for native terminal clients. The legacy
+    /// `write_session` request remains available for text-only clients.
+    WriteSessionBytes {
+        session_id: String,
+        data_base64: String,
+    },
     ResizeSession {
         session_id: String,
         cols: u16,
@@ -414,6 +431,8 @@ enum RequestBody {
     },
     SetSessionAttached {
         session_id: String,
+        #[serde(default)]
+        client_id: Option<String>,
         attached: bool,
     },
     TerminateSession {
@@ -472,9 +491,13 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_provenance",
     "collaboration_scope",
     "fleet_v1",
+    "fleet_raw_capture_v1",
     "fleet_subscribe",
     "pipeline_runs_v1",
+    "work_control_v1",
     "handle_namespace_v1",
+    "session_bytes_v1",
+    "session_attachment_identity_v1",
 ];
 
 /// Advertised only when the server has the controller required to come back
@@ -567,6 +590,8 @@ pub struct Response {
     pub pipeline_run: Option<PipelineRun>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pipeline_claims: Option<Vec<PipelineClaim>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_operation: Option<WorkUpOperation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -609,6 +634,7 @@ impl Response {
             pipeline_runs: None,
             pipeline_run: None,
             pipeline_claims: None,
+            work_operation: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -645,6 +671,11 @@ impl Response {
     fn with_pipeline_claims(claims: Vec<PipelineClaim>) -> Self {
         let mut response = Self::ok();
         response.pipeline_claims = Some(claims);
+        response
+    }
+    fn with_work_operation(operation: WorkUpOperation) -> Self {
+        let mut response = Self::ok();
+        response.work_operation = Some(operation);
         response
     }
     fn with_prompts(prompts: Vec<crate::history::HistoryEntry>) -> Self {
@@ -822,6 +853,153 @@ impl RestartController {
     }
 }
 
+const MAX_RETAINED_WORK_OPERATIONS: usize = 32;
+const MAX_CONCURRENT_WORK_OPERATIONS: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkUpOperationState {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkUpOperation {
+    pub operation_id: String,
+    pub state: WorkUpOperationState,
+    pub work: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct TrackedWorkUp {
+    request: WorkUpRequest,
+    operation: WorkUpOperation,
+}
+
+#[derive(Debug, Default)]
+struct WorkUpOperations {
+    values: BTreeMap<String, TrackedWorkUp>,
+    order: VecDeque<String>,
+}
+
+#[derive(Debug)]
+struct WorkUpManager {
+    socket_path: PathBuf,
+    next_id: AtomicU64,
+    operations: tokio::sync::Mutex<WorkUpOperations>,
+}
+
+impl WorkUpManager {
+    fn new(socket_path: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            socket_path,
+            next_id: AtomicU64::new(1),
+            operations: tokio::sync::Mutex::new(WorkUpOperations::default()),
+        })
+    }
+
+    async fn start(self: &Arc<Self>, request: WorkUpRequest) -> Result<WorkUpOperation, String> {
+        request.validate().map_err(|error| error.to_string())?;
+        let mut operations = self.operations.lock().await;
+        if let Some(existing) = operations.values.values().find(|tracked| {
+            tracked.operation.state == WorkUpOperationState::Running && tracked.request == request
+        }) {
+            return Ok(existing.operation.clone());
+        }
+        let running = operations
+            .values
+            .values()
+            .filter(|tracked| tracked.operation.state == WorkUpOperationState::Running)
+            .count();
+        if running >= MAX_CONCURRENT_WORK_OPERATIONS {
+            return Err(format!(
+                "at most {MAX_CONCURRENT_WORK_OPERATIONS} Work operations may run at once"
+            ));
+        }
+        while operations.values.len() >= MAX_RETAINED_WORK_OPERATIONS {
+            let removable = operations.order.iter().position(|id| {
+                operations
+                    .values
+                    .get(id)
+                    .is_some_and(|tracked| tracked.operation.state != WorkUpOperationState::Running)
+            });
+            let Some(index) = removable else {
+                return Err("Work operation history is full of running operations".into());
+            };
+            if let Some(id) = operations.order.remove(index) {
+                operations.values.remove(&id);
+            }
+        }
+
+        let operation_id = format!(
+            "native-work-{}",
+            self.next_id.fetch_add(1, AtomicOrdering::Relaxed)
+        );
+        let operation = WorkUpOperation {
+            operation_id: operation_id.clone(),
+            state: WorkUpOperationState::Running,
+            work: request.work.trim().to_string(),
+            workspace: request
+                .workspace
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            message: "Starting configured Work pipeline…".into(),
+            result: None,
+        };
+        operations.order.push_back(operation_id.clone());
+        operations.values.insert(
+            operation_id.clone(),
+            TrackedWorkUp {
+                request: request.clone(),
+                operation: operation.clone(),
+            },
+        );
+        drop(operations);
+
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let outcome = work_control::execute_work_up(&request, Some(&manager.socket_path)).await;
+            let mut operations = manager.operations.lock().await;
+            let Some(tracked) = operations.values.get_mut(&operation_id) else {
+                return;
+            };
+            match outcome {
+                Ok(result) => {
+                    tracked.operation.state = WorkUpOperationState::Succeeded;
+                    tracked.operation.message = if request.dry_run {
+                        "Work plan is ready".into()
+                    } else {
+                        "Work pipeline started".into()
+                    };
+                    tracked.operation.result = Some(result);
+                }
+                Err(error) => {
+                    tracked.operation.state = WorkUpOperationState::Failed;
+                    tracked.operation.message = error.to_string();
+                }
+            }
+        });
+        Ok(operation)
+    }
+
+    async fn status(&self, operation_id: &str) -> Option<WorkUpOperation> {
+        self.operations
+            .lock()
+            .await
+            .values
+            .get(operation_id)
+            .map(|tracked| tracked.operation.clone())
+    }
+}
+
 /// Daemon-side server. Construct once, call `run` under the tokio runtime.
 pub struct Server {
     socket_path: PathBuf,
@@ -841,12 +1019,14 @@ pub struct Server {
     restart: Option<Arc<RestartController>>,
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
+    work_up: Arc<WorkUpManager>,
     handler_limit: usize,
 }
 
 impl Server {
     pub fn new(socket_path: PathBuf, store: SharedStore) -> Self {
         let backend = default_backend();
+        let work_up = WorkUpManager::new(socket_path.clone());
         Self {
             socket_path,
             store,
@@ -859,6 +1039,7 @@ impl Server {
             restart: None,
             fleet: None,
             pipeline_runs: PipelineRunStore::in_memory(),
+            work_up,
             handler_limit: MAX_INFLIGHT_HANDLERS,
         }
     }
@@ -1031,6 +1212,7 @@ impl Server {
                     let restart = self.restart.clone();
                     let fleet = self.fleet.clone();
                     let pipeline_runs = self.pipeline_runs.clone();
+                    let work_up = self.work_up.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
@@ -1047,6 +1229,7 @@ impl Server {
                                 restart,
                                 fleet,
                                 pipeline_runs,
+                                work_up,
                             ))
                             .await
                         {
@@ -1725,6 +1908,7 @@ fn process_identity(pid: u32) -> (Option<String>, CollaborationClientKind) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn client_kind_from_arg(arg: &str) -> Option<CollaborationClientKind> {
     match arg {
         "watch" => Some(CollaborationClientKind::Watch),
@@ -1811,7 +1995,8 @@ async fn record_collaboration_audit(
         ask,
         restart,
         fleet,
-        pipeline_runs
+        pipeline_runs,
+        work_up
     )
 )]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // IPC dispatch table and its shared daemon state
@@ -1827,6 +2012,7 @@ async fn handle(
     restart: Option<Arc<RestartController>>,
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
+    work_up: Arc<WorkUpManager>,
 ) -> Result<(), RuntimeError> {
     let mut collaboration_actor = observe_collaboration_actor(&stream);
     let (reader, mut writer) = stream.into_split();
@@ -1989,6 +2175,22 @@ async fn handle(
                 RequestBody::PipelineRuns => {
                     kind = "pipeline_runs";
                     Response::with_pipeline_runs(pipeline_runs.list().await)
+                }
+                RequestBody::WorkUp { request } => {
+                    kind = "work_up";
+                    match work_up.start(request).await {
+                        Ok(operation) => Response::with_work_operation(operation),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                RequestBody::WorkUpStatus { operation_id } => {
+                    kind = "work_up_status";
+                    match work_up.status(&operation_id).await {
+                        Some(operation) => Response::with_work_operation(operation),
+                        None => {
+                            Response::err(format!("Work operation {operation_id:?} was not found"))
+                        }
+                    }
                 }
                 RequestBody::PipelineRegister { registration } => {
                     kind = "pipeline_register";
@@ -2745,6 +2947,19 @@ async fn handle(
                         Err(e) => Response::err(e.to_string()),
                     }
                 }
+                RequestBody::WriteSessionBytes {
+                    session_id,
+                    data_base64,
+                } => {
+                    kind = "write_session_bytes";
+                    match BASE64_STANDARD.decode(data_base64) {
+                        Ok(data) => match sessions.send_input(&session_id, &data) {
+                            Ok(()) => Response::ok(),
+                            Err(e) => Response::err(e.to_string()),
+                        },
+                        Err(e) => Response::err(format!("invalid base64 session input: {e}")),
+                    }
+                }
                 RequestBody::ResizeSession {
                     session_id,
                     cols,
@@ -2758,10 +2973,11 @@ async fn handle(
                 }
                 RequestBody::SetSessionAttached {
                     session_id,
+                    client_id,
                     attached,
                 } => {
                     kind = "set_session_attached";
-                    match sessions.set_attached(&session_id, attached) {
+                    match sessions.set_attached(&session_id, client_id.as_deref(), attached) {
                         Ok(()) => Response::ok(),
                         Err(e) => Response::err(e.to_string()),
                     }
@@ -3981,6 +4197,21 @@ impl Client {
         Ok(())
     }
 
+    pub async fn write_session_bytes(
+        &self,
+        session_id: &str,
+        data: &[u8],
+    ) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "write_session_bytes",
+            "session_id": session_id,
+            "data_base64": BASE64_STANDARD.encode(data),
+        });
+        let _ = self.call_checked(&req).await?;
+        Ok(())
+    }
+
     pub async fn resize_session(
         &self,
         session_id: &str,
@@ -4007,6 +4238,23 @@ impl Client {
             "protocol": PROTOCOL_VERSION,
             "kind": "set_session_attached",
             "session_id": session_id,
+            "attached": attached,
+        });
+        let _ = self.call_checked(&req).await?;
+        Ok(())
+    }
+
+    pub async fn set_session_client_attached(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        attached: bool,
+    ) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "set_session_attached",
+            "session_id": session_id,
+            "client_id": client_id,
             "attached": attached,
         });
         let _ = self.call_checked(&req).await?;
@@ -5151,6 +5399,7 @@ mod tests {
             None,
             None,
             PipelineRunStore::in_memory(),
+            WorkUpManager::new(PathBuf::from("/tmp/muxa-disconnect-test.sock")),
         ));
 
         let req = serde_json::json!({
@@ -5315,9 +5564,43 @@ mod tests {
         assert!(caps.contains(&"needs_choice"));
         assert!(caps.contains(&"rate_limited"));
         assert!(caps.contains(&"collaboration_wait"));
+        assert!(caps.contains(&"fleet_raw_capture_v1"));
+        assert!(caps.contains(&"session_bytes_v1"));
+        assert!(caps.contains(&"work_control_v1"));
+        assert!(caps.contains(&"session_attachment_identity_v1"));
         assert!(!caps.contains(&RESTART_CAPABILITY));
         assert!(!caps.contains(&STOP_CAPABILITY));
         assert!(resp["generation"].is_null());
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_session_bytes_rejects_invalid_base64() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-session-bytes.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let resp = raw_call(
+            &sock,
+            &serde_json::json!({
+                "protocol": PROTOCOL_VERSION,
+                "kind": "write_session_bytes",
+                "session_id": "pty:missing",
+                "data_base64": "%%%not-base64%%%",
+            }),
+        )
+        .await;
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid base64 session input"));
 
         tx.send(()).unwrap();
         handle.await.unwrap();

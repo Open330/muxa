@@ -1635,9 +1635,14 @@ impl Drop for RawModeGuard {
 
 async fn attach_session(client: &Client, session_id: &str) -> Result<()> {
     let _guard = RawModeGuard::enter()?;
-    client.set_session_attached(session_id, true).await?;
+    let attachment_id = format!("muxa-cli:{}", std::process::id());
+    client
+        .set_session_client_attached(session_id, &attachment_id, true)
+        .await?;
     let result = attach_session_loop(client, session_id).await;
-    let detach_result = client.set_session_attached(session_id, false).await;
+    let detach_result = client
+        .set_session_client_attached(session_id, &attachment_id, false)
+        .await;
     match (result, detach_result) {
         (Err(e), _) => Err(e),
         (Ok(()), Err(e)) => Err(e).context("detaching muxa session"),
@@ -1654,8 +1659,11 @@ async fn attach_session_loop(client: &Client, session_id: &str) -> Result<()> {
 
     loop {
         let output = client.read_session(session_id, offset).await?;
-        if !output.data.is_empty() {
-            stdout.write_all(output.data.as_bytes())?;
+        let output_bytes = output
+            .data_bytes()
+            .context("decoding byte-safe PTY output")?;
+        if !output_bytes.is_empty() {
+            stdout.write_all(&output_bytes)?;
             stdout.flush()?;
             offset = output.next_offset;
         }

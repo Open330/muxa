@@ -887,7 +887,7 @@ version = "0.1.0"
             do_pull: true,
             do_restart: true,
         };
-        let s = render_plan(&plan);
+        let s = render_plan_for_os(&plan, "linux");
         assert!(s.contains("/tmp/fake-muxa"));
         assert!(s.contains("git pull"));
         assert!(s.contains("cargo install --path crates/muxad --locked --force"));

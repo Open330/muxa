@@ -12,6 +12,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt};
@@ -55,6 +56,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     "collaboration_get",
     "exact_pane_ref",
     "labels_v1",
+    "raw_capture_base64",
 ];
 
 /// Read one UTF-8 line without allowing a peer that withholds `\n` to grow
@@ -165,6 +167,27 @@ pub fn sanitize_capture_text(value: String) -> String {
     }
     text.drain(..start);
     text
+}
+
+/// Encode the newest bounded portion of a pane capture without interpreting
+/// terminal control sequences. Base64 keeps hostile CSI/OSC bytes inert while
+/// an authorized UI can still expose an escaped diagnostic view.
+#[must_use]
+pub fn raw_capture_base64(value: &str) -> String {
+    let mut start = value.len().saturating_sub(FLEET_MAX_CAPTURE_BYTES);
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    BASE64_STANDARD.encode(&value.as_bytes()[start..])
+}
+
+/// Revalidate an untrusted relay's raw capture and reapply the byte bound.
+/// Invalid base64 is dropped instead of being forwarded to a UI.
+#[must_use]
+pub fn sanitize_raw_capture_base64(value: String) -> Option<String> {
+    let decoded = BASE64_STANDARD.decode(value).ok()?;
+    let start = decoded.len().saturating_sub(FLEET_MAX_CAPTURE_BYTES);
+    Some(BASE64_STANDARD.encode(&decoded[start..]))
 }
 
 /// Durable UUID belonging to a physical machine.
@@ -592,6 +615,8 @@ pub struct FleetCommandResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_raw_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send: Option<SendPromptOutcomeWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_capture: Option<FleetWindowCapture>,
@@ -610,6 +635,7 @@ impl FleetCommandResult {
             accepted: true,
             message: Some(message.into()),
             capture: None,
+            capture_raw_base64: None,
             send: None,
             window_capture: None,
             collaboration_request: None,
@@ -624,6 +650,24 @@ impl FleetCommandResult {
             accepted: true,
             message: None,
             capture,
+            capture_raw_base64: None,
+            send: None,
+            window_capture: None,
+            collaboration_request: None,
+            collaboration_incoming: Vec::new(),
+            collaboration_sent: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn capture_with_raw(raw_capture: Option<String>) -> Self {
+        let capture_raw_base64 = raw_capture.as_deref().map(raw_capture_base64);
+        let capture = raw_capture.map(sanitize_capture_text);
+        Self {
+            accepted: true,
+            message: None,
+            capture,
+            capture_raw_base64,
             send: None,
             window_capture: None,
             collaboration_request: None,
@@ -638,6 +682,7 @@ impl FleetCommandResult {
             accepted: true,
             message: None,
             capture: None,
+            capture_raw_base64: None,
             send: Some(outcome.into()),
             window_capture: None,
             collaboration_request: None,
@@ -652,6 +697,7 @@ impl FleetCommandResult {
             accepted: true,
             message: None,
             capture: None,
+            capture_raw_base64: None,
             send: None,
             window_capture: Some(capture),
             collaboration_request: None,
@@ -666,6 +712,7 @@ impl FleetCommandResult {
             accepted: true,
             message: None,
             capture: None,
+            capture_raw_base64: None,
             send: None,
             window_capture: None,
             collaboration_request: Some(Box::new(request)),
@@ -685,6 +732,7 @@ impl FleetCommandResult {
             accepted: true,
             message: None,
             capture: None,
+            capture_raw_base64: None,
             send: None,
             window_capture: None,
             collaboration_request: None,
@@ -1226,6 +1274,20 @@ mod tests {
             sanitize_terminal_text("ok\u{1b}[31mred\u{1b}[0m\u{1b}]0;bad\u{7}\u{0}done"),
             "okreddone"
         );
+    }
+
+    #[test]
+    fn raw_capture_is_bounded_encoded_and_kept_separate_from_safe_text() {
+        let raw = "ok\u{1b}[31mred\u{1b}[0m\r\n";
+        let result = FleetCommandResult::capture_with_raw(Some(raw.into()));
+        assert_eq!(result.capture.as_deref(), Some("okred\n"));
+        assert_eq!(
+            BASE64_STANDARD
+                .decode(result.capture_raw_base64.unwrap())
+                .unwrap(),
+            raw.as_bytes()
+        );
+        assert!(sanitize_raw_capture_base64("not-base64".into()).is_none());
     }
 
     #[test]

@@ -1,0 +1,17 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Zig 0.15.2 discovers its host SDK by executing xcrun from PATH. Xcode 26.4+
+# libSystem.tbd lists arm64e but omits arm64, which makes Zig's build runner
+# fail before Ghostty is compiled. Intercept only the macOS SDK-path lookup;
+# every real Xcode/Metal invocation still goes through the system xcrun.
+if [ "${MUXA_ZIG_MACOS_SDK:-}" != "" ]; then
+    joined=" $* "
+    if [[ "$joined" == *" --sdk macosx "* ]] && [[ "$joined" == *" --show-sdk-path "* ]]; then
+        printf '%s\n' "$MUXA_ZIG_MACOS_SDK"
+        exit 0
+    fi
+fi
+
+exec /usr/bin/xcrun "$@"

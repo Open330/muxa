@@ -7,11 +7,12 @@
 //! capture.
 
 use crate::event::{SurfaceKind, SurfaceRef};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use portable_pty::{
     native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize as PortablePtySize,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,6 +54,11 @@ pub struct SessionRef {
     pub display_name: Option<String>,
     pub cwd: Option<String>,
     pub attached_clients: usize,
+    /// True after at least one terminal client has attached. A renderer uses
+    /// this to distinguish first-time negotiation from reconstructed-history
+    /// replay, which must not send protocol responses twice.
+    #[serde(default)]
+    pub has_been_attached: bool,
     pub exited: bool,
     pub exit_status: Option<i32>,
     /// OS pid of the PTY child, when known. Lets the daemon register the
@@ -88,10 +94,26 @@ pub struct SessionOutput {
     pub session_id: String,
     pub offset: u64,
     pub next_offset: u64,
+    /// Legacy lossy UTF-8 projection retained for protocol compatibility.
+    /// Byte-oriented clients must prefer `data_base64`.
     pub data: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
     pub truncated: bool,
     pub exited: bool,
     pub exit_status: Option<i32>,
+}
+
+impl SessionOutput {
+    /// Decode the byte-safe payload when the server advertises
+    /// `session_bytes_v1`, falling back to the legacy UTF-8 field for older
+    /// peers.
+    pub fn data_bytes(&self) -> Result<Vec<u8>, base64::DecodeError> {
+        self.data_base64.as_ref().map_or_else(
+            || Ok(self.data.as_bytes().to_vec()),
+            |encoded| BASE64_STANDARD.decode(encoded),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,7 +177,12 @@ pub trait SessionBackend: Send + Sync + 'static {
     fn read_output(&self, session_id: &str, offset: u64) -> Result<SessionOutput, SessionError>;
     fn send_input(&self, session_id: &str, bytes: &[u8]) -> Result<(), SessionError>;
     fn resize(&self, session_id: &str, cols: u16, rows: u16) -> Result<(), SessionError>;
-    fn set_attached(&self, session_id: &str, attached: bool) -> Result<(), SessionError>;
+    fn set_attached(
+        &self,
+        session_id: &str,
+        client_id: Option<&str>,
+        attached: bool,
+    ) -> Result<(), SessionError>;
     fn terminate(&self, session_id: &str) -> Result<(), SessionError>;
     fn caps(&self) -> SessionBackendCaps {
         SessionBackendCaps::default()
@@ -230,6 +257,8 @@ impl PtySessionBackend {
                 cols,
                 rows,
                 attached_clients: 0,
+                attached_client_ids: HashSet::new(),
+                has_been_attached: false,
                 exited: false,
                 exit_status: None,
                 exited_at: None,
@@ -276,7 +305,7 @@ impl PtySessionBackend {
             let Ok(meta) = session.meta.lock() else {
                 return false;
             };
-            if !meta.exited || meta.attached_clients > 0 {
+            if !meta.exited {
                 return true;
             }
             let Some(exited_at) = meta.exited_at else {
@@ -379,17 +408,34 @@ impl SessionBackend for PtySessionBackend {
         result
     }
 
-    fn set_attached(&self, session_id: &str, attached: bool) -> Result<(), SessionError> {
+    fn set_attached(
+        &self,
+        session_id: &str,
+        client_id: Option<&str>,
+        attached: bool,
+    ) -> Result<(), SessionError> {
         let session = self.get(session_id)?;
         let mut meta = session
             .meta
             .lock()
             .map_err(|_| SessionError::Pty("session meta lock poisoned".into()))?;
-        if attached {
+        if let Some(client_id) = client_id {
+            if client_id.is_empty() || client_id.len() > 128 {
+                return Err(SessionError::Pty(
+                    "attachment client_id must contain 1 to 128 bytes".into(),
+                ));
+            }
+            if attached {
+                meta.attached_client_ids.insert(client_id.to_string());
+            } else {
+                meta.attached_client_ids.remove(client_id);
+            }
+        } else if attached {
             meta.attached_clients = meta.attached_clients.saturating_add(1);
         } else {
             meta.attached_clients = meta.attached_clients.saturating_sub(1);
         }
+        meta.has_been_attached |= attached;
         Ok(())
     }
 
@@ -421,7 +467,8 @@ impl PtySession {
             backend: SessionBackendKind::Pty,
             display_name: meta.display_name.clone(),
             cwd: meta.cwd.clone(),
-            attached_clients: meta.attached_clients,
+            attached_clients: meta.total_attached_clients(),
+            has_been_attached: meta.has_been_attached,
             exited: meta.exited,
             exit_status: meta.exit_status,
             pid: meta.pid,
@@ -458,6 +505,7 @@ impl PtySession {
             offset: base,
             next_offset: next,
             data: String::from_utf8_lossy(&bytes).into_owned(),
+            data_base64: Some(BASE64_STANDARD.encode(&bytes)),
             truncated,
             exited: reference.exited,
             exit_status: reference.exit_status,
@@ -472,10 +520,23 @@ struct SessionMeta {
     pid: Option<u32>,
     cols: u16,
     rows: u16,
+    /// Compatibility count for clients predating attachment identities.
     attached_clients: usize,
+    /// Idempotent identities let a restarted GUI reclaim the same attachment
+    /// instead of leaking another count when its previous detach was skipped
+    /// by a crash or forced termination.
+    attached_client_ids: HashSet<String>,
+    has_been_attached: bool,
     exited: bool,
     exit_status: Option<i32>,
     exited_at: Option<SystemTime>,
+}
+
+impl SessionMeta {
+    fn total_attached_clients(&self) -> usize {
+        self.attached_clients
+            .saturating_add(self.attached_client_ids.len())
+    }
 }
 
 struct OutputBuffer {
@@ -579,6 +640,67 @@ mod tests {
         assert!(validate_env_pair("", "value").is_err());
         assert!(validate_env_pair("A=B", "value").is_err());
         assert!(validate_env_pair("A", "bad\0value").is_err());
+    }
+
+    #[test]
+    fn session_output_preserves_non_utf8_bytes() {
+        let bytes = [0x1b, b'[', b'3', b'1', b'm', 0xff, 0x00, 0x80];
+        let output = SessionOutput {
+            session_id: "pty:test".into(),
+            offset: 0,
+            next_offset: u64::try_from(bytes.len()).unwrap(),
+            data: String::from_utf8_lossy(&bytes).into_owned(),
+            data_base64: Some(BASE64_STANDARD.encode(bytes)),
+            truncated: false,
+            exited: false,
+            exit_status: None,
+        };
+
+        assert_eq!(output.data_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn named_session_attachments_are_idempotent() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let backend = PtySessionBackend::default();
+        let session = backend
+            .spawn_session(SpawnSession {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 1".into()],
+                env: Vec::new(),
+                cwd: None,
+                name: None,
+                cols: Some(80),
+                rows: Some(24),
+            })
+            .unwrap();
+
+        backend
+            .set_attached(&session.id, Some("muxa-macos:501"), true)
+            .unwrap();
+        backend
+            .set_attached(&session.id, Some("muxa-macos:501"), true)
+            .unwrap();
+        assert_eq!(
+            backend
+                .resolve_session(&session.id)
+                .unwrap()
+                .attached_clients,
+            1
+        );
+
+        backend
+            .set_attached(&session.id, Some("muxa-macos:501"), false)
+            .unwrap();
+        assert_eq!(
+            backend
+                .resolve_session(&session.id)
+                .unwrap()
+                .attached_clients,
+            0
+        );
     }
 
     #[test]

@@ -1,0 +1,10 @@
+#!/bin/bash
+
+set -euo pipefail
+
+if [ -z "${MUXA_REAL_ZIG:-}" ] || [ ! -x "$MUXA_REAL_ZIG" ]; then
+    echo "MUXA_REAL_ZIG must point to the pinned Zig executable" >&2
+    exit 1
+fi
+
+exec "$MUXA_REAL_ZIG" "$@"

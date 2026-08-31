@@ -61,6 +61,7 @@ use crate::tmux::scanner::{self, MuxaPaneMetadata, PaneCache, PaneSummary, ScanE
 use crate::work::{
     self, ExecutionIdentity, WorkIdentity, WorkMetadataPatch, WorkRecord, WorkSnapshot,
 };
+use crate::work_control::{self, WorkUpError, WorkUpRequest};
 
 /// SSE keep-alive ping interval. Picked long enough to be invisible
 /// (15s is well under any sane proxy idle-timeout) but short enough
@@ -1198,33 +1199,6 @@ struct WorkControlResult {
     submitted: bool,
 }
 
-/// Ceiling for one `muxa work up` run. Generous because resolving a ticket
-/// spends a headless agent turn, which is minutes rather than milliseconds.
-const WORK_UP_TIMEOUT: Duration = Duration::from_secs(600);
-
-#[derive(Debug, Deserialize)]
-struct WorkUpRequest {
-    /// Stable Muxa Work id.
-    work: String,
-    /// Optional external issue key resolved by `muxa work up`.
-    #[serde(default)]
-    external: Option<String>,
-    #[serde(default)]
-    pipeline: Option<String>,
-    #[serde(default)]
-    workspace: Option<String>,
-    #[serde(default)]
-    skill: Option<String>,
-    #[serde(default)]
-    body: Option<String>,
-    #[serde(default)]
-    context: Option<String>,
-    #[serde(default)]
-    no_ticket: bool,
-    #[serde(default)]
-    dry_run: bool,
-}
-
 /// Stand a work item's pipeline up from the dashboard.
 ///
 /// This delegates to the `muxa` binary rather than reimplementing the
@@ -1250,57 +1224,9 @@ async fn work_up_handler(
             "starting work is disabled; set [dashboard] allow_work_start = true to enable it",
         );
     }
-    if input.work.trim().is_empty() {
-        return control_error(StatusCode::BAD_REQUEST, "work id is empty");
-    }
-    if input.no_ticket
-        && input
-            .external
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-    {
-        return control_error(
-            StatusCode::BAD_REQUEST,
-            "external cannot be combined with no_ticket",
-        );
-    }
-
-    let mut args: Vec<String> = vec![
-        "work".into(),
-        "up".into(),
-        input.work.trim().into(),
-        "--json".into(),
-    ];
-    let mut push = |flag: &str, value: Option<&String>| {
-        if let Some(value) = value.map(|v| v.trim()).filter(|v| !v.is_empty()) {
-            args.push(flag.to_string());
-            args.push(value.to_string());
-        }
-    };
-    push("--pipeline", input.pipeline.as_ref());
-    push("--workspace", input.workspace.as_ref());
-    push("--external", input.external.as_ref());
-    push("--skill", input.skill.as_ref());
-    push("--body", input.body.as_ref());
-    push("--context", input.context.as_ref());
-    // The dashboard's empty external field means a local Work. The CLI keeps
-    // implicit Work-id lookup for compatibility, but the new UI never
-    // silently turns a Work id into an external issue key.
-    if input.no_ticket
-        || input
-            .external
-            .as_deref()
-            .is_none_or(|value| value.trim().is_empty())
-    {
-        args.push("--no-ticket".into());
-    }
-    if input.dry_run {
-        args.push("--dry-run".into());
-    }
-
-    let result = match execute_work_up(args).await {
+    let result = match work_control::execute_work_up(&input, None).await {
         Ok(result) => result,
-        Err((status, error)) => return control_error(status, error),
+        Err(error) => return control_error(work_up_error_status(&error), error.to_string()),
     };
     let linked_external_item = if input.dry_run {
         false
@@ -1319,42 +1245,14 @@ async fn work_up_handler(
     .into_response()
 }
 
-async fn execute_work_up(args: Vec<String>) -> Result<serde_json::Value, (StatusCode, String)> {
-    let mut command = tokio::process::Command::new("muxa");
-    command
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let output = match tokio::time::timeout(WORK_UP_TIMEOUT, command.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("spawning muxa: {error}"),
-            ));
+fn work_up_error_status(error: &WorkUpError) -> StatusCode {
+    match error {
+        WorkUpError::Invalid(_) | WorkUpError::Failed(_) => StatusCode::BAD_REQUEST,
+        WorkUpError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        WorkUpError::Spawn(_) | WorkUpError::OutputTooLarge | WorkUpError::InvalidJson(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
         }
-        Err(_) => {
-            return Err((
-                StatusCode::GATEWAY_TIMEOUT,
-                format!("muxa work up exceeded {}s", WORK_UP_TIMEOUT.as_secs()),
-            ));
-        }
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim().lines().next_back().unwrap_or("no stderr");
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("muxa work up failed: {detail}"),
-        ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(stdout.trim()).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("muxa work up answered with unparseable JSON: {error}"),
-        )
-    })
 }
 
 /// Persist the external reference recorded on the newly created Run without

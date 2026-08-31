@@ -1,0 +1,226 @@
+diff --git a/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView+Lifecycle.swift b/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView+Lifecycle.swift
+index 7326517..4cd8b89 100644
+--- a/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView+Lifecycle.swift
++++ b/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView+Lifecycle.swift
+@@ -7,6 +7,7 @@
+ 
+ #if canImport(AppKit) && !canImport(UIKit)
+     import AppKit
++    import CoreGraphics
+ 
+     /// SwiftUI focus-bridge hooks; behavior lives in +Lifecycle.
+     struct FocusBridgeState {
+@@ -58,6 +59,7 @@
+             super.viewDidMoveToWindow()
+             removeWindowObservers()
+             if window != nil {
++                refreshDisplayAvailability()
+                 // SwiftUI/AppKit can temporarily detach and reattach the terminal view while
+                 // diffing the view hierarchy. Rebuilding on every reattach discards Ghostty's
+                 // scrollback/state, so only create a new surface when one does not already exist.
+@@ -98,6 +100,24 @@
+                     name: NSWindow.didChangeScreenNotification,
+                     object: window
+                 )
++                NotificationCenter.default.addObserver(
++                    self,
++                    selector: #selector(displayAvailabilityDidChange),
++                    name: NSApplication.didChangeScreenParametersNotification,
++                    object: nil
++                )
++                NSWorkspace.shared.notificationCenter.addObserver(
++                    self,
++                    selector: #selector(displayAvailabilityDidChange),
++                    name: NSWorkspace.screensDidSleepNotification,
++                    object: nil
++                )
++                NSWorkspace.shared.notificationCenter.addObserver(
++                    self,
++                    selector: #selector(displayAvailabilityDidChange),
++                    name: NSWorkspace.screensDidWakeNotification,
++                    object: nil
++                )
+                 // Same runloop hop as `requestFocus`: attaching can happen
+                 // mid SwiftUI update, where the first-responder dance must
+                 // not mutate focus state.
+@@ -136,6 +156,28 @@
+             }
+         }
+ 
++        @objc func displayAvailabilityDidChange(_: Notification) {
++            refreshDisplayAvailability()
++            guard displayAvailable else {
++                core.stopDisplayLink()
++                return
++            }
++
++            if surface == nil {
++                core.rebuildIfReady()
++            } else {
++                updateMetalLayerMetrics()
++                core.synchronizeMetrics()
++            }
++            core.startDisplayLink()
++            core.requestImmediateTick()
++        }
++
++        private func refreshDisplayAvailability() {
++            var count: UInt32 = 0
++            displayAvailable = CGGetActiveDisplayList(0, nil, &count) == .success && count > 0
++        }
++
+         private func removeWindowObservers() {
+             // Remove any existing key-window observers before registering for the
+             // current window. AppKit can move the view directly between windows
+@@ -155,6 +197,21 @@
+                 name: NSWindow.didChangeScreenNotification,
+                 object: nil
+             )
++            NotificationCenter.default.removeObserver(
++                self,
++                name: NSApplication.didChangeScreenParametersNotification,
++                object: nil
++            )
++            NSWorkspace.shared.notificationCenter.removeObserver(
++                self,
++                name: NSWorkspace.screensDidSleepNotification,
++                object: nil
++            )
++            NSWorkspace.shared.notificationCenter.removeObserver(
++                self,
++                name: NSWorkspace.screensDidWakeNotification,
++                object: nil
++            )
+         }
+ 
+         override open func setFrameSize(_ newSize: NSSize) {
+diff --git a/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView.swift b/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView.swift
+index efaf060..ec12e27 100644
+--- a/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView.swift
++++ b/Sources/GhosttyTerminal/Platform/AppKit/AppTerminalView.swift
+@@ -22,6 +22,7 @@
+         var keyEcho: KeyEchoState = .init()
+         var pointer: PointerSelectionState = .init()
+         var focusBridge: FocusBridgeState = .init()
++        var displayAvailable = true
+ 
+         open weak var delegate: (any TerminalSurfaceViewDelegate)? {
+             get { core.delegate }
+@@ -82,6 +83,7 @@
+             setupTrackingArea()
+ 
+             core.isAttached = { [weak self] in self?.window != nil }
++            core.isDisplayAvailable = { [weak self] in self?.displayAvailable == true }
+             core.scaleFactor = { [weak self] in
+                 Double(
+                     self?.window?.backingScaleFactor
+diff --git a/Sources/GhosttyTerminal/Surface/TerminalSurfaceCoordinator.swift b/Sources/GhosttyTerminal/Surface/TerminalSurfaceCoordinator.swift
+index 29cad5b..5a70dee 100644
+--- a/Sources/GhosttyTerminal/Surface/TerminalSurfaceCoordinator.swift
++++ b/Sources/GhosttyTerminal/Surface/TerminalSurfaceCoordinator.swift
+@@ -40,6 +40,7 @@ final class TerminalSurfaceCoordinator {
+     // MARK: - Platform Hooks
+ 
+     var isAttached: () -> Bool = { false }
++    var isDisplayAvailable: () -> Bool = { true }
+     var scaleFactor: () -> Double = { 2.0 }
+     var viewSize: () -> (width: Double, height: Double) = { (0, 0) }
+     var platformSetup: ((inout ghostty_surface_config_s) -> Void)?
+@@ -122,7 +123,9 @@ final class TerminalSurfaceCoordinator {
+         // This is the same intent as the reattach guard in viewDidMoveToWindow
+         // ("rebuilding on every reattach discards Ghostty's scrollback/state"),
+         // which cannot help while the teardown happens before the checks.
+-        if surface != nil, previousController == nil, !hasValidViewSize {
++        if surface != nil, previousController == nil,
++           (!hasValidViewSize || !isDisplayAvailable())
++        {
+             // The rebuild is owed, not cancelled. Configuration options are
+             // consumed only by createSurface, and no caller re-runs this once
+             // the view regains a size (fitToSize, viewDidMoveToWindow and the
+@@ -157,6 +160,11 @@ final class TerminalSurfaceCoordinator {
+             )
+             return
+         }
++        guard isDisplayAvailable() else {
++            pendingRebuild = true
++            TerminalDebugLog.log(.lifecycle, "surface rebuild deferred: no active display")
++            return
++        }
+ 
+         let scale = scaleFactor()
+         TerminalDebugLog.log(
+@@ -253,7 +261,7 @@ final class TerminalSurfaceCoordinator {
+         // Redeem a rebuild the zero-size guard deferred. Every caller that
+         // could restore a usable size lands here, so this is the one place
+         // that reliably observes the transition.
+-        if pendingRebuild, hasValidViewSize {
++        if pendingRebuild, hasValidViewSize, isDisplayAvailable() {
+             pendingRebuild = false
+             rebuildIfReady()
+             return
+@@ -367,13 +375,21 @@ final class TerminalSurfaceCoordinator {
+         // stock Ghostty, where pty.setSize runs only inside Termio.resize.
+         // Local UI metrics still flow via the delegate below and
+         // onMetricsUpdate.
+-        if let delegate = delegate as? any TerminalSurfaceGridResizeDelegate {
+-            delegate.terminalDidResize(surfaceSize)
+-        } else if let delegate = delegate as? any TerminalSurfaceResizeDelegate {
+-            delegate.terminalDidResize(
+-                columns: Int(surfaceSize.columns),
+-                rows: Int(surfaceSize.rows)
+-            )
++        // AppKit may synchronously reach this path from NSViewRepresentable's
++        // make/update pass. Publishing TerminalViewState.surfaceSize from
++        // inside that pass triggers SwiftUI's undefined-behavior diagnostic.
++        // The host PTY resize is delivered independently by the in-memory
++        // backend, so defer only this observable UI metric by one runloop turn.
++        DispatchQueue.main.async { [weak self] in
++            guard let self else { return }
++            if let delegate = self.delegate as? any TerminalSurfaceGridResizeDelegate {
++                delegate.terminalDidResize(surfaceSize)
++            } else if let delegate = self.delegate as? any TerminalSurfaceResizeDelegate {
++                delegate.terminalDidResize(
++                    columns: Int(surfaceSize.columns),
++                    rows: Int(surfaceSize.rows)
++                )
++            }
+         }
+         onMetricsUpdate?()
+     }
+@@ -572,7 +588,7 @@ final class TerminalSurfaceCoordinator {
+     }
+ 
+     private var canRenderFrame: Bool {
+-        effectiveSurfaceVisible && isAttached()
++        effectiveSurfaceVisible && isAttached() && isDisplayAvailable()
+     }
+ 
+     private var hasValidViewSize: Bool {
+diff --git a/Tests/GhosttyKitTest/TerminalSurfaceResizeThrottleTests.swift b/Tests/GhosttyKitTest/TerminalSurfaceResizeThrottleTests.swift
+index 16fba5f..568de5d 100644
+--- a/Tests/GhosttyKitTest/TerminalSurfaceResizeThrottleTests.swift
++++ b/Tests/GhosttyKitTest/TerminalSurfaceResizeThrottleTests.swift
+@@ -36,6 +36,23 @@ struct TerminalSurfaceResizeThrottleTests {
+         #expect(coordinator.testHooks_pendingRebuild)
+     }
+ 
++    @Test
++    func `a deferred rebuild waits until an active display is available`() {
++        let coordinator = TerminalSurfaceCoordinator()
++        coordinator.viewSize = { (100, 50) }
++        coordinator.isAttached = { true }
++        var displayAvailable = false
++        coordinator.isDisplayAvailable = { displayAvailable }
++        coordinator.testHooks_pendingRebuild = true
++
++        coordinator.synchronizeMetrics()
++        #expect(coordinator.testHooks_pendingRebuild)
++
++        displayAvailable = true
++        coordinator.synchronizeMetrics()
++        #expect(!coordinator.testHooks_pendingRebuild)
++    }
++
+     @Test
+     func `the throttle is inert by default`() {
+         let coordinator = TerminalSurfaceCoordinator()

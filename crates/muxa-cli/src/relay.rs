@@ -228,15 +228,13 @@ async fn handle_request(
             let socket = pane.window.session.endpoint.socket.clone();
             let pane_id = pane.pane_id.clone();
             let capture = tokio::task::spawn_blocking(move || {
-                backend
-                    .capture_pane_on(Some(&socket), &pane_id)
-                    .map(sanitize_capture_text)
+                backend.capture_pane_on(Some(&socket), &pane_id)
             })
             .await
             .context("capture task panicked")?;
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::capture(capture),
+                result: FleetCommandResult::capture_with_raw(capture),
             })
         }
         RelayRequest::CaptureWindow { request_id, window } => {
@@ -274,10 +272,10 @@ async fn handle_request(
                     panes.extend(std::thread::scope(|scope| {
                         let handles = batch
                             .iter()
-                            .cloned()
                             .map(|geometry| {
                                 let backend = backend.clone();
                                 let socket = socket.clone();
+                                let geometry = geometry.clone();
                                 scope.spawn(move || {
                                     let text = backend
                                         .capture_pane_on(Some(&socket), &geometry.pane_id)

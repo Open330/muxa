@@ -40,6 +40,7 @@ url = "2"
 portable-pty = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+base64 = "0.22"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

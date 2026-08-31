@@ -4595,15 +4595,17 @@ fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &DashboardApp) {
     );
     f.render_widget(Paragraph::new(detail_lines).block(detail_block), chunks[1]);
 
-    let help = app.data.collaboration.unavailable.as_deref().map_or_else(
-        || match tab {
+    let help = app
+        .data
+        .collaboration
+        .unavailable
+        .as_deref()
+        .unwrap_or(match tab {
             CollaborationTab::Incoming => {
                 "Tab mailbox · ↑↓ select · i claim inbox · e reply · Esc/b close"
             }
             CollaborationTab::Sent => "Tab mailbox · ↑↓ select · x cancel queued · Esc/b close",
-        },
-        |error| error,
-    );
+        });
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(help, app.theme.dim_style()))),
         chunks[2],
@@ -5242,6 +5244,7 @@ mod tests {
             display_name: Some(name.to_string()),
             cwd: Some("/tmp/pty".into()),
             attached_clients: 0,
+            has_been_attached: false,
             exited: false,
             exit_status: None,
             pid: Some(99),

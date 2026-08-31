@@ -2319,6 +2319,7 @@ name = "muxa"
 version = "0.8.38"
 dependencies = [
  "axum",
+ "base64",
  "dirs",
  "futures",
  "http-body-util",
