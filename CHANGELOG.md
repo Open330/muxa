@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MCP agents can call an explicitly authorized agent on any Fleet host.**
+  `muxa_fleet_call_peer` sends a durable structured request to an explicit
+  host and live pane; it never auto-selects or spawns remotely, defaults to
+  review/read-only, and requires remote `mode = "control"`. Its bounded wait
+  returns an exact `pane_key` for `muxa_fleet_wait_reply`, which retrieves the
+  reply by durable request id even after the target pane exits. A new
+  `collaboration_get` relay capability rejects mixed-version nodes before the
+  controller sends an unsupported frame.
+- **Collaboration history now has stable causal and Work identity.** Requests
+  carry canonical thread/parent, workspace/Work/Run, artifact, and link
+  metadata. Managed pane metadata fills missing Work identity; CLI and MCP
+  callers can provide or override it. Parent links are validated in-room and
+  cannot cross participant pairs or conflict with the parent thread.
+- **History can be filtered and paged without loading it all into the web
+  dashboard.** The indexed query supports time, Work/workspace, thread/parent,
+  kind, status, and exact room filters plus newest-first keyset cursors. `muxa
+  msg list` exposes compatible conjunctive filters with local `--offset` /
+  `--limit`, preserving its legacy bare-array JSON and older-daemon behavior.
+- **Collaboration is visual, in both terminal and browser.** Watch's collab
+  screen toggles its table and chronological lifeline sequence with `v`,
+  `:layout sequence`, `--collab-layout sequence`, or `[watch] collab_layout`.
+  The web dashboard adds a cross-room participant graph, aggregated directional
+  request/reply edges, room/edge sequence drill-down, filters, and load-more.
+
+### Changed
+
+- **Watch `M` follows hierarchy scope instead of collapsing parents to one
+  pane.** A window shows its whole room and a session shows every room grouped
+  by window. Aggregate views are read-only; pane history retains compose,
+  claim, reply, and incoming/sent actions.
+- **The durable mailbox is now indexed SQLite.** The historical
+  `collaboration.json` path maps to `collaboration.sqlite3`; existing JSON is
+  imported transactionally once and retained as a migration backup. Optional
+  `retention_days` prunes only fully delivered terminal threads at daemon
+  startup, never partial causal chains or live/unread state.
+
+### Security
+
+- **Dashboard collaboration details require strict token-auth mode.** In
+  `public_read` and `none`, the API and graph retain topology/status metadata
+  but redact request/reply bodies, provenance, paths, artifacts, links, and AIR
+  references; supplying a PAT does not unredact a `public_read` server.
+- SQLite, WAL, and shared-memory files are owner-only (`0600`). The retained
+  legacy JSON remains a duplicate body copy outside retention; operators
+  should archive or remove it under equivalent controls when rollback is no
+  longer needed, and must not run an older daemon against it after migration.
+
 ## [0.8.37] - 2026-08-28
 
 ### Added

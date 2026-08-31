@@ -123,6 +123,93 @@
           <span>Execution diagnostics</span>
           <small>secondary topology and retained activity</small>
         </div>
+      <section class="panel collaboration-panel" id="collaboration-panel" data-panel="collaboration">
+        <div class="panel-header">
+          <div class="panel-title">
+            <button class="collapse-btn" type="button" data-collapse-target="collaboration-panel" aria-expanded="true" aria-controls="collaboration-content" title="Collapse collaboration graph">
+              <span aria-hidden="true">⌄</span>
+            </button>
+            <h2>Collaboration</h2>
+            <span class="panel-meta" id="collaboration-meta"></span>
+          </div>
+          <button class="control-btn" type="button" id="collaboration-refresh">refresh</button>
+        </div>
+        <div class="panel-content collaboration-content" id="collaboration-content">
+          <div class="collaboration-toolbar filters">
+            <label><span class="filter-label">range</span>
+              <select id="collaboration-range" class="select">
+                <option value="1h">1 hour</option>
+                <option value="24h">24 hours</option>
+                <option value="7d" selected>7 days</option>
+                <option value="30d">30 days</option>
+                <option value="">all retained</option>
+              </select>
+            </label>
+            <label><span class="filter-label">room</span>
+              <select id="collaboration-room" class="select">
+                <option value="">all rooms</option>
+              </select>
+            </label>
+            <label><span class="filter-label">work</span>
+              <input id="collaboration-work" class="collaboration-filter-input" type="search" list="collaboration-work-options" placeholder="all" autocomplete="off">
+              <datalist id="collaboration-work-options"></datalist>
+            </label>
+            <label><span class="filter-label">thread</span>
+              <input id="collaboration-thread" class="collaboration-filter-input" type="search" list="collaboration-thread-options" placeholder="all" autocomplete="off">
+              <datalist id="collaboration-thread-options"></datalist>
+            </label>
+            <label><span class="filter-label">kind</span>
+              <select id="collaboration-kind" class="select">
+                <option value="">all</option>
+                <option value="review">review</option>
+                <option value="question">question</option>
+                <option value="task">task</option>
+                <option value="notice">notice</option>
+              </select>
+            </label>
+            <label><span class="filter-label">status</span>
+              <select id="collaboration-status" class="select">
+                <option value="">all</option>
+                <option value="queued">queued</option>
+                <option value="claimed">claimed</option>
+                <option value="completed">completed</option>
+                <option value="blocked">blocked</option>
+                <option value="declined">declined</option>
+                <option value="failed">failed</option>
+                <option value="expired">expired</option>
+                <option value="cancelled">cancelled</option>
+              </select>
+            </label>
+          </div>
+          <div class="collaboration-rooms" id="collaboration-rooms" aria-label="Rooms"></div>
+          <div class="collaboration-split">
+            <section class="collaboration-graph-pane" aria-labelledby="collaboration-graph-title">
+              <div class="collaboration-subhead">
+                <span id="collaboration-graph-title">Participant graph</span>
+                <small>request → · reply ⇢</small>
+              </div>
+              <div class="collaboration-canvas" id="collaboration-graph">
+                <div class="empty-block">loading…</div>
+              </div>
+            </section>
+            <section class="collaboration-sequence-pane" aria-labelledby="collaboration-sequence-title">
+              <div class="collaboration-subhead">
+                <span id="collaboration-sequence-title">Sequence</span>
+                <small id="collaboration-sequence-meta">select an edge or room</small>
+                <button class="control-btn" type="button" id="collaboration-clear-selection" hidden>show all</button>
+              </div>
+              <div class="collaboration-sequence" id="collaboration-sequence">
+                <div class="empty-block">loading…</div>
+              </div>
+              <div class="collaboration-detail" id="collaboration-detail" hidden></div>
+            </section>
+          </div>
+          <div class="collaboration-pagination">
+            <span id="collaboration-page-meta"></span>
+            <button class="control-btn" type="button" id="collaboration-load-more" hidden>load older messages</button>
+          </div>
+        </div>
+      </section>
       <section class="panel timeline-panel" id="timeline-panel" data-panel="timeline">
         <div class="panel-header">
           <div class="panel-title">

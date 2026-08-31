@@ -205,6 +205,10 @@ enum Cmd {
         /// a flat one-row-per-Work table.
         #[arg(long, value_enum)]
         layout: Option<WatchLayoutArg>,
+        /// Collaboration history presentation: table (default) or sequence.
+        /// This is independent from the topology `--layout`.
+        #[arg(long, value_parser = parse_watch_collab_layout)]
+        collab_layout: Option<watch::CollabLayout>,
         /// Which list to open on: the topology (default), or collaboration
         /// across every room the daemon holds.
         #[arg(long, value_enum)]
@@ -342,12 +346,34 @@ enum MsgCmd {
         body: String,
         #[arg(long, default_value = "question")]
         kind: String,
+        /// Stable conversation id used to group related requests and replies.
+        #[arg(long)]
+        thread: Option<String>,
+        /// Request id this message follows. Its thread is inherited when
+        /// `--thread` is omitted.
+        #[arg(long)]
+        parent: Option<String>,
+        /// Stable Work id associated with this message (for example CAL-7345).
+        #[arg(long)]
+        work: Option<String>,
+        /// Workspace containing `--work`.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Stable Run id associated with this message.
+        #[arg(long)]
+        run: Option<String>,
         /// Explicitly authorize edits; the default collaboration contract is read-only.
         #[arg(long)]
         execute: bool,
         /// Advisory writable path scope. Repeat for multiple paths.
         #[arg(long = "path")]
         paths: Vec<String>,
+        /// Generic artifact produced or consumed by this request. Repeatable.
+        #[arg(long = "artifact")]
+        artifacts: Vec<String>,
+        /// Related URL or external resource. Repeatable.
+        #[arg(long = "link")]
+        links: Vec<String>,
         /// AIR 1 artifact reference as JSON. Repeat for multiple references.
         #[arg(long = "air-ref")]
         air_refs: Vec<String>,
@@ -372,6 +398,37 @@ enum MsgCmd {
         /// holds). Anything past `caller` speaks as the operator console.
         #[arg(long, default_value = "caller")]
         scope: String,
+        /// Only messages in this time range. Accepts durations such as `2h`
+        /// and `7d`, dates, RFC 3339 timestamps, and calendar keywords.
+        #[arg(long)]
+        since: Option<String>,
+        /// Only messages associated with this Work id.
+        #[arg(long)]
+        work: Option<String>,
+        /// Only messages associated with this workspace. Combines with
+        /// `--work` when both are supplied.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Only messages in this conversation thread.
+        #[arg(long)]
+        thread: Option<String>,
+        /// Only messages of this kind: question, review, task, or notice.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only messages with this status: queued, claimed, completed,
+        /// blocked, declined, failed, expired, or cancelled.
+        #[arg(long)]
+        status: Option<String>,
+        /// Only messages whose sender or recipient is in this window. Matches
+        /// either the human window name or stable tmux window id.
+        #[arg(long, visible_alias = "room")]
+        window: Option<String>,
+        /// Maximum number of matching messages to print.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Number of matching messages to skip before applying `--limit`.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         #[arg(long)]
         json: bool,
     },
@@ -573,6 +630,14 @@ impl From<WatchLayoutArg> for muxa::config::WatchLayout {
     }
 }
 
+fn parse_watch_collab_layout(value: &str) -> std::result::Result<watch::CollabLayout, String> {
+    match value {
+        "table" | "sequence" => watch::parse_collab_layout(value)
+            .ok_or_else(|| format!("unsupported collaboration layout {value:?}")),
+        _ => Err("collaboration layout must be table or sequence".into()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum WatchSortArg {
     Name,
@@ -722,12 +787,17 @@ async fn main() -> Result<()> {
             include_paneless,
             view,
             layout,
+            collab_layout,
             screen,
             sort,
             theme,
             caller_client,
             caller_pane,
         } => {
+            let mut cfg = cfg;
+            if let Some(collab_layout) = collab_layout {
+                cfg.watch.collab_layout = collab_layout;
+            }
             // Pin focus-moving commands to the requesting client. A value
             // still containing `#{` is a binding that never expanded.
             if let Some(client_name) = caller_client.filter(|c| !c.contains("#{")) {
@@ -917,6 +987,22 @@ fn collaboration_reply_status(value: &str) -> Result<RequestStatus> {
     }
 }
 
+fn collaboration_request_status(value: &str) -> Result<RequestStatus> {
+    match value {
+        "queued" => Ok(RequestStatus::Queued),
+        "claimed" => Ok(RequestStatus::Claimed),
+        "completed" => Ok(RequestStatus::Completed),
+        "blocked" => Ok(RequestStatus::Blocked),
+        "declined" => Ok(RequestStatus::Declined),
+        "failed" => Ok(RequestStatus::Failed),
+        "expired" => Ok(RequestStatus::Expired),
+        "cancelled" | "canceled" => Ok(RequestStatus::Cancelled),
+        _ => anyhow::bail!(
+            "status must be queued, claimed, completed, blocked, declined, failed, expired, or cancelled"
+        ),
+    }
+}
+
 fn collaboration_air_references(values: &[String]) -> Result<Vec<AirArtifactReference>> {
     values
         .iter()
@@ -1023,6 +1109,112 @@ fn display_roles(roles: &[String]) -> String {
     }
 }
 
+/// Client-side collaboration history filters.
+///
+/// Keeping this at the CLI boundary lets a new CLI query an older daemon
+/// without changing the wire protocol. The daemon already returns newest
+/// first, so filtering retains that order and pagination remains stable for a
+/// single snapshot.
+#[derive(Debug, Default)]
+struct CollaborationListFilters {
+    range: Option<time_range::TimeRange>,
+    workspace_id: Option<String>,
+    work_id: Option<String>,
+    thread_id: Option<String>,
+    kind: Option<RequestKind>,
+    status: Option<RequestStatus>,
+    window: Option<String>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+impl CollaborationListFilters {
+    #[allow(clippy::too_many_arguments)]
+    fn parse(
+        since: Option<&str>,
+        workspace_id: Option<String>,
+        work_id: Option<String>,
+        thread_id: Option<String>,
+        kind: Option<&str>,
+        status: Option<&str>,
+        window: Option<String>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            range: since
+                .map(|value| {
+                    time_range::parse_since(
+                        value,
+                        OffsetDateTime::now_utc(),
+                        "all collaboration history",
+                    )
+                })
+                .transpose()?,
+            workspace_id,
+            work_id,
+            thread_id,
+            kind: kind.map(collaboration_request_kind).transpose()?,
+            status: status.map(collaboration_request_status).transpose()?,
+            window,
+            limit,
+            offset,
+        })
+    }
+
+    fn apply(
+        &self,
+        requests: Vec<muxa::collaboration::CollaborationRequest>,
+    ) -> Vec<muxa::collaboration::CollaborationRequest> {
+        let matches = requests
+            .into_iter()
+            .filter(|request| self.matches(request))
+            .skip(self.offset);
+        match self.limit {
+            Some(limit) => matches.take(limit).collect(),
+            None => matches.collect(),
+        }
+    }
+
+    fn matches(&self, request: &muxa::collaboration::CollaborationRequest) -> bool {
+        self.range
+            .as_ref()
+            .is_none_or(|range| range.includes(request.created_at))
+            && self
+                .workspace_id
+                .as_deref()
+                .is_none_or(|wanted| optional_id_matches(request.workspace_id.as_deref(), wanted))
+            && self
+                .work_id
+                .as_deref()
+                .is_none_or(|wanted| optional_id_matches(request.work_id.as_deref(), wanted))
+            && self
+                .thread_id
+                .as_deref()
+                .is_none_or(|wanted| optional_id_matches(request.thread_id.as_deref(), wanted))
+            && self.kind.is_none_or(|wanted| request.kind == wanted)
+            && self.status.is_none_or(|wanted| request.status == wanted)
+            && self.window.as_deref().is_none_or(|wanted| {
+                participant_matches_window(&request.from, wanted)
+                    || participant_matches_window(&request.to, wanted)
+            })
+    }
+}
+
+fn optional_id_matches(actual: Option<&str>, wanted: &str) -> bool {
+    actual == Some(wanted)
+}
+
+fn participant_matches_window(participant: &Participant, wanted: &str) -> bool {
+    participant
+        .window_name
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+        || participant.room.window_id.eq_ignore_ascii_case(wanted)
+        || participant_location(participant).eq_ignore_ascii_case(wanted)
+}
+
+#[allow(clippy::too_many_lines)] // explicit message subcommand dispatch keeps output compatibility visible
 async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
     let origin = collaboration_origin()?;
     match action {
@@ -1030,8 +1222,15 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             target,
             body,
             kind,
+            thread,
+            parent,
+            work,
+            workspace,
+            run,
             execute,
             paths,
+            artifacts,
+            links,
             air_refs,
             no_reply,
             json,
@@ -1053,6 +1252,13 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                         },
                         paths,
                         air_artifacts,
+                        thread_id: thread,
+                        parent_request_id: parent,
+                        workspace_id: workspace,
+                        work_id: work,
+                        run_id: run,
+                        artifacts,
+                        links,
                     },
                 )
                 .await?;
@@ -1080,8 +1286,30 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
         MsgCmd::List {
             mailbox,
             scope,
+            since,
+            work,
+            workspace,
+            thread,
+            kind,
+            status,
+            window,
+            limit,
+            offset,
             json,
-        } => cmd_msg_list(client, &origin, &mailbox, &scope, json).await?,
+        } => {
+            let filters = CollaborationListFilters::parse(
+                since.as_deref(),
+                workspace,
+                work,
+                thread,
+                kind.as_deref(),
+                status.as_deref(),
+                window,
+                limit,
+                offset,
+            )?;
+            cmd_msg_list(client, &origin, &mailbox, &scope, &filters, json).await?;
+        }
         MsgCmd::Reply {
             request_id,
             body,
@@ -1120,6 +1348,7 @@ async fn cmd_msg_list(
     origin: &CollaborationOrigin,
     mailbox: &str,
     scope: &str,
+    filters: &CollaborationListFilters,
     json: bool,
 ) -> Result<()> {
     let scope = collaboration_list_scope(scope)?;
@@ -1133,6 +1362,7 @@ async fn cmd_msg_list(
     let requests = client
         .collaboration_list_scoped(&listing_origin, collaboration_mailbox(mailbox)?, scope)
         .await?;
+    let requests = filters.apply(requests);
     print_collaboration_messages(&requests, json, origin, scope)
 }
 
@@ -3052,6 +3282,7 @@ fn status_state_cell(label: &str, state: AgentState, theme: CliTheme) -> Cell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muxa::collaboration::{CollaborationRequest, RoomId};
     use muxa::AgentKind;
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
@@ -3067,6 +3298,66 @@ mod tests {
                 cwd: None,
             },
             at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn collaboration_participant(pane: &str, window: &str) -> Participant {
+        Participant {
+            agent_kind: AgentKind::Codex,
+            agent_session_id: format!("agent-{pane}"),
+            pane: pane.to_string(),
+            socket: Some("test".into()),
+            room: RoomId {
+                host: "local".into(),
+                socket: Some("test".into()),
+                window_id: format!("@{window}"),
+            },
+            tmux_session_id: Some("$1".into()),
+            tmux_session_name: Some("callabo".into()),
+            window_name: Some(window.into()),
+            state: AgentState::Idle,
+            cwd: None,
+            alias: None,
+            roles: Vec::new(),
+            console: false,
+        }
+    }
+
+    fn collaboration_request(
+        id: &str,
+        at: OffsetDateTime,
+        window: &str,
+        work_id: Option<&str>,
+        thread_id: Option<&str>,
+        kind: RequestKind,
+        status: RequestStatus,
+    ) -> CollaborationRequest {
+        CollaborationRequest {
+            id: id.into(),
+            from: collaboration_participant("%1", window),
+            to: collaboration_participant("%2", window),
+            provenance: None,
+            kind,
+            body: format!("body {id}"),
+            expects_reply: true,
+            work_mode: WorkMode::ReadOnly,
+            thread_id: thread_id.map(str::to_string),
+            parent_request_id: None,
+            workspace_id: Some("muxa".into()),
+            work_id: work_id.map(str::to_string),
+            run_id: None,
+            paths: Vec::new(),
+            artifacts: Vec::new(),
+            links: Vec::new(),
+            air_artifacts: Vec::new(),
+            status,
+            created_at: at,
+            claimed_at: None,
+            wake_delivery: None,
+            notified_at: None,
+            reply_notified_at: None,
+            reply_read_at: None,
+            reply: None,
         }
     }
 
@@ -3266,6 +3557,8 @@ mod tests {
             session_group: None,
             agent_role: None,
             agent_alias: None,
+            workspace_id: None,
+            work_id: None,
             socket: None,
             pane_id: id.into(),
             session_id: String::new(),
@@ -3313,6 +3606,32 @@ mod tests {
             assert!(Args::try_parse_from(args).is_err(), "accepted {args:?}");
         }
         assert!(Args::try_parse_from(["muxa", "watch", "--layout", "swarm"]).is_ok());
+        assert!(Args::try_parse_from(["muxa", "watch", "--layout", "sequence"]).is_err());
+        assert!(Args::try_parse_from(["muxa", "watch", "--collab-layout", "tree"]).is_err());
+    }
+
+    #[test]
+    fn watch_collaboration_layout_is_independent_from_topology_layout() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "watch",
+            "--screen",
+            "collab",
+            "--layout",
+            "tree",
+            "--collab-layout",
+            "sequence",
+        ])
+        .unwrap();
+        let Cmd::Watch {
+            layout: Some(WatchLayoutArg::Tree),
+            collab_layout: Some(collab_layout),
+            ..
+        } = args.cmd
+        else {
+            panic!("expected independent topology and collaboration layouts");
+        };
+        assert_eq!(Some(collab_layout), watch::parse_collab_layout("sequence"));
     }
 
     #[test]
@@ -3328,6 +3647,215 @@ mod tests {
         assert!(matches!(args.cmd, Cmd::Skill(_)));
         assert!(Args::try_parse_from(["muxa", "skill", "list"]).is_ok());
         assert!(Args::try_parse_from(["muxa", "skill", "remove", "agent-review"]).is_ok());
+    }
+
+    #[test]
+    fn message_list_cli_parses_history_filters_and_pagination() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "msg",
+            "list",
+            "--scope",
+            "all",
+            "--since",
+            "7d",
+            "--work",
+            "CAL-7345",
+            "--workspace",
+            "muxa",
+            "--thread",
+            "review-cycle",
+            "--kind",
+            "review",
+            "--status",
+            "completed",
+            "--room",
+            "CAL-7345",
+            "--offset",
+            "20",
+            "--limit",
+            "10",
+            "--json",
+        ])
+        .unwrap();
+        let Cmd::Msg {
+            action:
+                MsgCmd::List {
+                    scope,
+                    since,
+                    work,
+                    workspace,
+                    thread,
+                    kind,
+                    status,
+                    window,
+                    offset,
+                    limit,
+                    json,
+                    ..
+                },
+        } = args.cmd
+        else {
+            panic!("expected msg list");
+        };
+        assert_eq!(scope, "all");
+        assert_eq!(since.as_deref(), Some("7d"));
+        assert_eq!(work.as_deref(), Some("CAL-7345"));
+        assert_eq!(workspace.as_deref(), Some("muxa"));
+        assert_eq!(thread.as_deref(), Some("review-cycle"));
+        assert_eq!(kind.as_deref(), Some("review"));
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert_eq!(window.as_deref(), Some("CAL-7345"));
+        assert_eq!(offset, 20);
+        assert_eq!(limit, Some(10));
+        assert!(json);
+    }
+
+    #[test]
+    fn message_send_cli_parses_correlation_and_artifact_metadata() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "msg",
+            "send",
+            "@reviewer",
+            "review this",
+            "--thread",
+            "review-cycle",
+            "--parent",
+            "req-parent",
+            "--work",
+            "CAL-7345",
+            "--workspace",
+            "muxa",
+            "--run",
+            "run-2",
+            "--artifact",
+            "commit:d4bf2aa53",
+            "--link",
+            "https://example.test/review",
+        ])
+        .unwrap();
+        let Cmd::Msg {
+            action:
+                MsgCmd::Send {
+                    thread,
+                    parent,
+                    work,
+                    workspace,
+                    run,
+                    artifacts,
+                    links,
+                    ..
+                },
+        } = args.cmd
+        else {
+            panic!("expected msg send");
+        };
+        assert_eq!(thread.as_deref(), Some("review-cycle"));
+        assert_eq!(parent.as_deref(), Some("req-parent"));
+        assert_eq!(work.as_deref(), Some("CAL-7345"));
+        assert_eq!(workspace.as_deref(), Some("muxa"));
+        assert_eq!(run.as_deref(), Some("run-2"));
+        assert_eq!(artifacts, ["commit:d4bf2aa53"]);
+        assert_eq!(links, ["https://example.test/review"]);
+    }
+
+    #[test]
+    fn message_history_filters_before_paginating_and_keeps_newest_order() {
+        let requests = vec![
+            collaboration_request(
+                "newest",
+                datetime!(2026-08-30 12:00:00 UTC),
+                "CAL-7345",
+                Some("CAL-7345"),
+                Some("review-cycle"),
+                RequestKind::Review,
+                RequestStatus::Completed,
+            ),
+            collaboration_request(
+                "wrong-kind",
+                datetime!(2026-08-30 11:00:00 UTC),
+                "CAL-7345",
+                Some("CAL-7345"),
+                Some("review-cycle"),
+                RequestKind::Notice,
+                RequestStatus::Completed,
+            ),
+            collaboration_request(
+                "second-match",
+                datetime!(2026-08-30 10:00:00 UTC),
+                "CAL-7345",
+                Some("CAL-7345"),
+                Some("review-cycle"),
+                RequestKind::Review,
+                RequestStatus::Completed,
+            ),
+            collaboration_request(
+                "too-old",
+                datetime!(2026-08-29 09:00:00 UTC),
+                "CAL-7345",
+                Some("CAL-7345"),
+                Some("review-cycle"),
+                RequestKind::Review,
+                RequestStatus::Completed,
+            ),
+        ];
+        let filters = CollaborationListFilters {
+            range: Some(time_range::TimeRange {
+                label: "test".into(),
+                since_at: Some(datetime!(2026-08-30 00:00:00 UTC)),
+                until_at: None,
+            }),
+            workspace_id: Some("muxa".into()),
+            work_id: Some("CAL-7345".into()),
+            thread_id: Some("review-cycle".into()),
+            kind: Some(RequestKind::Review),
+            status: Some(RequestStatus::Completed),
+            window: Some("@CAL-7345".into()),
+            limit: Some(1),
+            offset: 1,
+        };
+
+        let page = filters.apply(requests);
+        assert_eq!(
+            page.iter()
+                .map(|request| request.id.as_str())
+                .collect::<Vec<_>>(),
+            ["second-match"]
+        );
+    }
+
+    #[test]
+    fn message_history_filter_validation_is_actionable() {
+        let status = CollaborationListFilters::parse(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("unknown"),
+            None,
+            None,
+            0,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(status.contains("queued, claimed, completed"));
+
+        let kind = CollaborationListFilters::parse(
+            None,
+            None,
+            None,
+            None,
+            Some("unknown"),
+            None,
+            None,
+            None,
+            0,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(kind.contains("question, review, task, or notice"));
     }
 
     #[test]

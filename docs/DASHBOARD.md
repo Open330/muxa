@@ -34,6 +34,7 @@ machine without explicit public-bind acknowledgement.
 | `GET /api/panes`    | Global tmux pane list (every readable socket), with per-socket scan errors.   |
 | `GET /api/works`    | Canonical v2 Workspace/Work/Run snapshot plus unlinked executions.            |
 | `GET /api/work-metadata` | Durable titles, goals, next actions, and manual workflow stages.        |
+| `GET /api/collaboration` | Indexed collaboration requests for the node/edge graph and sequence drill-down. |
 | `GET /api/terminal-sessions` | Muxa-owned PTY sessions.                                           |
 | `GET /api/timeline` | Timeline document from `activity.ndjson` plus currently-open agent/tmux spans. |
 | `GET /api/events`   | SSE stream: `snapshot` (initial), `transition` (live), `lagged` (backpressure)|
@@ -50,6 +51,9 @@ machine without explicit public-bind acknowledgement.
 `auth = "token"` protects all API endpoints. `auth = "public_read"` leaves
 GET/SSE endpoints public but always requires the bearer token for write/control
 actions. `auth = "none"` leaves reads public and disables writes entirely.
+Collaboration bodies and attached details are stricter: they are returned only
+in `auth = "token"` mode with a valid bearer. `public_read` and `none` expose a
+redacted topology/status summary even if a PAT is supplied.
 Static routes are public in every mode — see "Why the HTML is public" below.
 Fleet routes always expose the in-process `local` node. `[fleet] enabled =
 true` adds outbound SSH hosts; reads reuse the daemon's per-host cache and
@@ -248,6 +252,42 @@ Managed tmux options (`@muxa_workspace_id`, `@muxa_work_id`, agent role/task)
 link a Run to Work. `muxa work up` also stores optional external-source metadata
 on the window, which `/api/works` discovers and persists. Unmanaged windows stay
 in `unlinked_executions`; they are never guessed into Work from their names.
+
+## Collaboration graph and history API
+
+The collaboration panel projects retained requests into two linked views. The
+graph uses stable host/socket/agent-session nodes (plus one operator-console
+node) and aggregates directed request edges by peer pair, count, kind, and
+status; replies appear as dashed reverse edges. Selecting an edge or room
+drills the adjacent sequence into chronological request/reply arrows. Selecting
+an event opens its thread/parent, Work/Run, artifact, link, AIR, message, and
+reply details when the response is authorized. The sequence caps the rendered
+tail at 200 requests, while **load more** extends the retained result used by
+the graph and drill-down.
+
+The toolbar filters by time range, exact room, Work, thread, kind, and status.
+The API form is:
+
+```text
+GET /api/collaboration?since=7d&workspace=callabo&work=CAL-7345&thread=thread-id&parent=req-id&kind=review&status=completed&limit=100&cursor=...
+```
+
+All supplied filters are conjunctive. `work_id`, `workspace_id`, `thread_id`,
+and `parent_request_id` are accepted as aliases for their short names. `room`
+is a URL-encoded JSON `RoomId` and matches host, socket, and window exactly.
+`limit` defaults to 100 and must be 1–500. Pagination is newest-first keyset
+pagination: pass opaque `pagination.next_cursor` back as `cursor`; do not parse
+it or replace it with an offset. The response contains `generated_at`,
+`details_included`, `requests`, and
+`pagination { total, limit, has_more, next_cursor }`. Invalid filters return
+`400`; a disabled collaboration subsystem returns `503`.
+
+When `details_included` is false, request/reply bodies, provenance, paths,
+generic artifacts, links, and AIR references are omitted. Participant, room,
+thread/parent, Work/Run, kind, status, timestamps, and counts remain available
+for a useful summary graph. Use `auth = "token"` for private full-detail
+history; a PAT cannot unlock details while the server is configured as
+`public_read`.
 
 ## Starting work from the board
 

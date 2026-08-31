@@ -80,14 +80,14 @@ workflow까지 하나의 시나리오로 익히게 합니다. 기존 tmux server
 | --- | --- |
 | `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
 | `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 handle(`@claude`)·tmux pane id와 agent의 상태·요약·최근 프롬프트/응답과 마지막 프롬프트 시각을 얹으며, 가장 최근에 프롬프트를 보낸 pane은 따로 표시함. 숫자 키로 이동. |
-| `muxa watch` | agent/pane 관측, prompt, live preview, 같은 window 협업을 제공하는 기본 TUI. |
+| `muxa watch` | agent/pane 관측, prompt, live preview, hierarchy-aware mailbox와 table/sequence 협업을 제공하는 기본 TUI. |
 | `muxa dashboard` | Work 중심 TUI. `P`는 선택 Work의 모든 live agent에 prompt를 보내고 `A`는 모두 중단. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
 | `muxa stats` / `muxa report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
 | `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
 | `muxa activity` | stats/report에 들어간 raw duration ledger 조회. |
 | BarShelf widget (macOS) | active/working/waiting/error agent를 메뉴바 popover에서 요약. |
-| Dashboard | optional loopback HTTP UI + SSE live update + timeline graph. |
+| Dashboard | optional loopback HTTP UI + SSE live update + timeline 및 collaboration node-edge/sequence graph. |
 | Notifications | agent가 attention을 필요로 할 때 desktop alert. |
 
 ## Muxa 설치
@@ -187,8 +187,16 @@ GitHub PR을 의미하지 않습니다. `@peer`는 같은 window의 정상 agent
 3. watch에서 상대 agent를 선택하고 `m`을 눌러 메시지를 보냅니다. 받은 메시지와
    응답은 `M` mailbox에서 확인합니다(`b`는 alias로 유지됩니다).
 
-일반 shell pane에서 watch를 열면 그 shell은 agent가 아니므로 협업할 수 없습니다.
-협업 workflow는 watch에서 그대로 이어갑니다. 설정과 응답 흐름은
+window에서 `M`을 누르면 room 전체를, session에서는 모든 window를 window별로 묶은
+read-only 이력을 봅니다. collaboration 화면의 `v`는 최신순 table과 시간순 sequence를
+전환하며 `muxa watch --screen collab --collab-layout sequence`로 바로 열 수 있습니다.
+Web dashboard에는 room을 넘나드는 node-edge graph, sequence drill-down, filter, cursor
+pagination이 있습니다. Durable history는 `collaboration.sqlite3`에 index되고 기존
+`collaboration.json`은 한 번 import한 뒤 직접 archive/remove할 때까지 migration
+backup이자 중복 사본으로 남습니다.
+
+일반 shell pane에서 watch를 열어도 operator console이 발신자이므로 메시지를 보낼 수
+있습니다. 설정과 응답 흐름은
 [docs/COLLABORATION.ko.md](docs/COLLABORATION.ko.md)를 참고하세요.
 
 설치 모드, `muxa init` preset, systemd, 수동 hook wiring, rollback은

@@ -94,11 +94,19 @@ wake = "idle_only" # idle_only | never
 wake_payload = "operator_full" # notice | operator_full | full
 scope = "window"   # window | host
 max_message_bytes = 16384
+# path = "$XDG_DATA_HOME/muxa/collaboration.json"
+# retention_days = 90 # omitted: retain indefinitely
 ```
 
 Opt-in durable request/reply between agents in the same stable tmux window.
-The optional `path` defaults to `$XDG_DATA_HOME/muxa/collaboration.json` and
-stores both mailbox state and exact-session aliases/roles.
+The historical optional `path` default is
+`$XDG_DATA_HOME/muxa/collaboration.json`; muxa imports that JSON once into the
+authoritative sibling `collaboration.sqlite3` and retains the JSON as a
+migration backup. A configured `.sqlite`, `.sqlite3`, or `.db` path is used
+directly. The database stores mailbox state and exact-session aliases/roles.
+`retention_days` prunes eligible fully delivered terminal threads at daemon
+startup; omission retains all history. The retained JSON backup is a duplicate
+copy of bodies and is not pruned.
 `idle_only` injects only at a hook-authoritative top-level Idle prompt.
 The default `wake_payload = "operator_full"` directly delivers requests sent
 from operator surfaces such as watch and dashboard, while agent-originated MCP
@@ -158,6 +166,7 @@ sort = ["state", "workspace", "latest"]
 hide_paneless = true
 collaboration_kind = "question"   # question | review | task | notice
 collaboration_mode = "read_only"  # read_only | execute | just_send
+collab_layout = "table"            # table | sequence
 
 [watch.widths]
 prompt = "min:20"
@@ -172,6 +181,8 @@ template = "{last_response || last_prompt || last_notification}"
 Watch rewrites `collaboration_kind` and `collaboration_mode` when `Tab` or
 `Ctrl-E` changes the `m` composer badges. The last selection therefore
 survives both closing the composer and restarting watch.
+`collab_layout` controls only the collaboration-history screen; it is
+independent from the topology `layout` and can be toggled with `v`.
 
 See [WATCH.md](WATCH.md) for TUI behavior, columns, sort, and keybindings.
 

@@ -344,6 +344,7 @@ impl LocalTask {
             .await;
     }
 
+    #[allow(clippy::too_many_lines)] // one exhaustive local Fleet operation table
     async fn execute(&self, operation: FleetOperation) -> Result<FleetCommandResult, String> {
         match operation {
             FleetOperation::Connect => Ok(FleetCommandResult::accepted(
@@ -406,6 +407,14 @@ impl LocalTask {
                 )
                 .map_err(|error| error.to_string())?;
                 Ok(FleetCommandResult::collaboration_mailbox(incoming, sent))
+            }
+            FleetOperation::CollaborationGet { pane, request_id } => {
+                audit_operation(LOCAL_HOST_ALIAS, "collaboration_get", 0);
+                self.client
+                    .collaboration_get(&fleet_collaboration_origin(&pane, true), &request_id)
+                    .await
+                    .map(FleetCommandResult::collaboration_request)
+                    .map_err(|error| error.to_string())
             }
             FleetOperation::CollaborationClaim { pane } => {
                 exact_local_backend(&self.backends, &pane).await?;
@@ -1024,13 +1033,14 @@ impl HostTask {
                         command.operation,
                         FleetOperation::SendPrompt { .. }
                             | FleetOperation::CollaborationSend { .. }
+                            | FleetOperation::CollaborationGet { .. }
                             | FleetOperation::CollaborationClaim { .. }
                             | FleetOperation::CollaborationReply { .. }
                     )
                         && self.config.mode != HostAccessMode::Control
                     {
                         let _ = command.reply.send(Err(format!(
-                            "host '{}' is observe-only; set mode = 'control' to send prompts",
+                            "host '{}' is observe-only; set mode = 'control' to perform control actions",
                             self.alias
                         )));
                         continue;
@@ -1039,12 +1049,26 @@ impl HostTask {
                         command.operation,
                         FleetOperation::CollaborationSend { .. }
                             | FleetOperation::CollaborationMailbox { .. }
+                            | FleetOperation::CollaborationGet { .. }
                             | FleetOperation::CollaborationClaim { .. }
                             | FleetOperation::CollaborationReply { .. }
                     ) && !connected.hello.capabilities.iter().any(|capability| capability == "collaboration")
                     {
                         let _ = command.reply.send(Err(format!(
                             "host '{}' does not support Fleet collaboration; upgrade muxa on that host",
+                            self.alias
+                        )));
+                        continue;
+                    }
+                    if matches!(command.operation, FleetOperation::CollaborationGet { .. })
+                        && !connected
+                            .hello
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability == "collaboration_get")
+                    {
+                        let _ = command.reply.send(Err(format!(
+                            "host '{}' does not support exact Fleet collaboration replies; upgrade muxa on that host",
                             self.alias
                         )));
                         continue;
@@ -1114,6 +1138,18 @@ impl HostTask {
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
                             RelayRequest::CollaborationMailbox { request_id: id, pane }
+                        }
+                        FleetOperation::CollaborationGet { pane, request_id } => {
+                            audit_operation(&self.alias, "collaboration_get", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::CollaborationGet {
+                                request_id: id,
+                                pane,
+                                collaboration_request_id: request_id,
+                            }
                         }
                         FleetOperation::CollaborationClaim { pane } => {
                             audit_operation(&self.alias, "collaboration_claim", 0);

@@ -372,6 +372,21 @@ async fn handle_request(
                 result: FleetCommandResult::collaboration_mailbox(incoming, sent),
             })
         }
+        RelayRequest::CollaborationGet {
+            request_id,
+            pane,
+            collaboration_request_id,
+        } => {
+            let origin = collaboration_origin(&pane, true);
+            let request = client
+                .collaboration_get(&origin, &collaboration_request_id)
+                .await
+                .context("reading collaboration request")?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: FleetCommandResult::collaboration_request(request),
+            })
+        }
         RelayRequest::CollaborationClaim { request_id, pane } => {
             exact_backend(&backends, &pane).await?;
             let agent = collaboration_origin(&pane, false);

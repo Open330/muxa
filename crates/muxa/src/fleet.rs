@@ -52,6 +52,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     "window_capture",
     "send_prompt",
     "collaboration",
+    "collaboration_get",
     "exact_pane_ref",
     "labels_v1",
 ];
@@ -474,6 +475,11 @@ pub enum RelayRequest {
         request_id: String,
         pane: PaneKey,
     },
+    CollaborationGet {
+        request_id: String,
+        pane: PaneKey,
+        collaboration_request_id: String,
+    },
     CollaborationClaim {
         request_id: String,
         pane: PaneKey,
@@ -498,6 +504,7 @@ impl RelayRequest {
             | Self::SendPrompt { request_id, .. }
             | Self::CollaborationSend { request_id, .. }
             | Self::CollaborationMailbox { request_id, .. }
+            | Self::CollaborationGet { request_id, .. }
             | Self::CollaborationClaim { request_id, .. }
             | Self::CollaborationReply { request_id, .. } => request_id,
         }
@@ -561,6 +568,10 @@ pub enum FleetOperation {
     },
     CollaborationMailbox {
         pane: PaneKey,
+    },
+    CollaborationGet {
+        pane: PaneKey,
+        request_id: String,
     },
     CollaborationClaim {
         pane: PaneKey,
@@ -1240,7 +1251,14 @@ mod tests {
                 body: "review this change".into(),
                 expects_reply: true,
                 work_mode: crate::collaboration::WorkMode::ReadOnly,
+                thread_id: None,
+                parent_request_id: None,
+                workspace_id: None,
+                work_id: None,
+                run_id: None,
                 paths: Vec::new(),
+                artifacts: Vec::new(),
+                links: Vec::new(),
                 air_artifacts: Vec::new(),
             },
         };
@@ -1256,6 +1274,27 @@ mod tests {
                 assert_eq!(decoded_pane, pane);
                 assert_eq!(request.kind, crate::collaboration::RequestKind::Review);
                 assert_eq!(request.body, "review this change");
+            }
+            _ => panic!("wrong relay request variant"),
+        }
+
+        let get = RelayRequest::CollaborationGet {
+            request_id: "relay-2".into(),
+            pane: pane.clone(),
+            collaboration_request_id: "collab-42".into(),
+        };
+        let encoded = serde_json::to_string(&get).unwrap();
+        assert!(encoded.contains("\"kind\":\"collaboration_get\""));
+        let decoded: RelayRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.request_id(), "relay-2");
+        match decoded {
+            RelayRequest::CollaborationGet {
+                pane: decoded_pane,
+                collaboration_request_id,
+                ..
+            } => {
+                assert_eq!(decoded_pane, pane);
+                assert_eq!(collaboration_request_id, "collab-42");
             }
             _ => panic!("wrong relay request variant"),
         }

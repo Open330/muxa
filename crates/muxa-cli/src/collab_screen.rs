@@ -11,7 +11,10 @@
 //! it was *raised* in, because that is the window an operator would go to in
 //! order to ask about it.
 
+use std::collections::HashMap;
+
 use muxa::collaboration::{CollaborationRequest, Participant, RequestStatus};
+pub use muxa::config::WatchCollabLayout as CollabLayout;
 use muxa::config::WatchView;
 use ratatui::layout::Constraint;
 use ratatui::text::{Line, Span};
@@ -37,6 +40,25 @@ pub(crate) struct CollabScreen {
     /// A listing has been attempted. Distinguishes the first paint (before
     /// any fetch has returned) from a genuinely empty fleet.
     pub(crate) loaded: bool,
+    /// The collaboration screen has its own presentation axis. Keeping this
+    /// separate from `WatchLayout` prevents a sequence diagram from becoming
+    /// a nonsensical topology layout when the operator returns to Alt-1.
+    layout: CollabLayout,
+}
+
+pub fn parse_layout(value: &str) -> Option<CollabLayout> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "table" | "list" => Some(CollabLayout::Table),
+        "sequence" | "seq" | "history" => Some(CollabLayout::Sequence),
+        _ => None,
+    }
+}
+
+pub(crate) fn layout_label(layout: CollabLayout) -> &'static str {
+    match layout {
+        CollabLayout::Table => "table",
+        CollabLayout::Sequence => "sequence",
+    }
 }
 
 /// One rendered line: either a grouping header or a request.
@@ -46,9 +68,42 @@ pub(crate) enum CollabRow<'a> {
     Request(&'a CollaborationRequest),
 }
 
+/// One line in the chronological sequence presentation.
+#[derive(Debug)]
+pub(crate) enum SequenceRow<'a> {
+    /// A room/session boundary followed by its participant lifelines.
+    Group {
+        label: String,
+        participants: Vec<String>,
+    },
+    Request(&'a CollaborationRequest),
+    Reply(&'a CollaborationRequest),
+}
+
 impl CollabScreen {
+    pub(crate) fn layout(&self) -> CollabLayout {
+        self.layout
+    }
+
+    pub(crate) fn set_layout(&mut self, layout: CollabLayout) {
+        self.layout = layout;
+    }
+
     pub(crate) fn set_requests(&mut self, requests: Vec<CollaborationRequest>) {
+        let selected_id = self
+            .requests
+            .get(self.selected)
+            .map(|request| request.id.clone());
         self.requests = requests;
+        if let Some(selected_id) = selected_id {
+            if let Some(index) = self
+                .requests
+                .iter()
+                .position(|request| request.id == selected_id)
+            {
+                self.selected = index;
+            }
+        }
         self.unavailable = None;
         self.loaded = true;
         self.clamp();
@@ -100,6 +155,88 @@ impl CollabScreen {
         rows
     }
 
+    /// Room-grouped, chronological request/reply events. A reply is a real
+    /// event with its own timestamp rather than decoration on the request,
+    /// which makes review ping-pong readable in the order it happened.
+    pub(crate) fn sequence_rows<'a>(&'a self, filter: &str) -> Vec<SequenceRow<'a>> {
+        struct Event<'a> {
+            at: OffsetDateTime,
+            request: &'a CollaborationRequest,
+            reply: bool,
+        }
+
+        let mut groups: Vec<(String, Vec<&CollaborationRequest>)> = Vec::new();
+        let mut indexes = HashMap::<String, usize>::new();
+        for request in self.visible(filter) {
+            let room = group_of(request, WatchView::Window).unwrap_or_else(|| "?".into());
+            let thread = request.thread_id.as_deref().unwrap_or(&request.id);
+            let key = format!("{room}\0{thread}");
+            let label = format!("{room} · thread {}", short_id(thread));
+            let index = *indexes.entry(key).or_insert_with(|| {
+                groups.push((label, Vec::new()));
+                groups.len() - 1
+            });
+            groups[index].1.push(request);
+        }
+        // Fleet listings arrive newest-first. Sequence groups read better in
+        // the order their first event happened, while retaining room grouping.
+        groups.sort_by_key(|(_, requests)| {
+            requests
+                .iter()
+                .map(|request| request.created_at)
+                .min()
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        });
+
+        let mut rows = Vec::new();
+        for (label, requests) in groups {
+            let mut participants = Vec::new();
+            let mut participant_keys = Vec::new();
+            for request in &requests {
+                for participant in [&request.from, &request.to] {
+                    let key = participant_lifeline_key(participant);
+                    if !participant_keys.contains(&key) {
+                        participant_keys.push(key);
+                        participants.push(participant_lifeline(participant));
+                    }
+                }
+            }
+            rows.push(SequenceRow::Group {
+                label,
+                participants,
+            });
+            let mut events = Vec::new();
+            for request in requests {
+                events.push(Event {
+                    at: request.created_at,
+                    request,
+                    reply: false,
+                });
+                if let Some(reply) = &request.reply {
+                    events.push(Event {
+                        at: reply.at,
+                        request,
+                        reply: true,
+                    });
+                }
+            }
+            events.sort_by(|left, right| {
+                left.at
+                    .cmp(&right.at)
+                    .then_with(|| left.request.id.cmp(&right.request.id))
+                    .then_with(|| left.reply.cmp(&right.reply))
+            });
+            rows.extend(events.into_iter().map(|event| {
+                if event.reply {
+                    SequenceRow::Reply(event.request)
+                } else {
+                    SequenceRow::Request(event.request)
+                }
+            }));
+        }
+        rows
+    }
+
     /// Move the cursor within the filtered listing, saturating at both ends.
     ///
     /// Saturating rather than wrapping: this list is time-ordered, so running
@@ -127,6 +264,30 @@ impl CollabScreen {
         self.selected = self.visible(filter).len().saturating_sub(1);
     }
 
+    /// Move in the order rows are painted. Table is newest-first; sequence is
+    /// chronological, so their visual directions are intentionally opposite.
+    pub(crate) fn move_visual_selection(&mut self, delta: isize, filter: &str) {
+        let delta = match self.layout {
+            CollabLayout::Table => delta,
+            CollabLayout::Sequence => -delta,
+        };
+        self.move_selection(delta, filter);
+    }
+
+    pub(crate) fn select_visual_first(&mut self, filter: &str) {
+        match self.layout {
+            CollabLayout::Table => self.select_first(),
+            CollabLayout::Sequence => self.select_last(filter),
+        }
+    }
+
+    pub(crate) fn select_visual_last(&mut self, filter: &str) {
+        match self.layout {
+            CollabLayout::Table => self.select_last(filter),
+            CollabLayout::Sequence => self.select_first(),
+        }
+    }
+
     /// Keep the cursor inside the listing after a refresh replaced it.
     fn clamp(&mut self) {
         let len = self.requests.len();
@@ -136,6 +297,32 @@ impl CollabScreen {
             self.selected.min(len - 1)
         };
     }
+}
+
+fn participant_lifeline(participant: &Participant) -> String {
+    if participant.console {
+        "console".into()
+    } else {
+        format!("{} [{}]", participant.label(), location(participant))
+    }
+}
+
+fn participant_lifeline_key(participant: &Participant) -> String {
+    if participant.console {
+        return "console".into();
+    }
+    format!(
+        "{}\0{}\0{}\0{}\0{}",
+        participant.room.host,
+        participant.socket.as_deref().unwrap_or(""),
+        participant.tmux_session_id.as_deref().unwrap_or(""),
+        participant.room.window_id,
+        participant.pane,
+    )
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(12).collect()
 }
 
 /// Where a participant sits, in the names an operator navigates by.
@@ -226,6 +413,17 @@ pub(crate) const COLUMNS: [Constraint; 5] = [
 
 pub(crate) const HEADERS: [&str; 5] = ["AGE", "FROM → TO", "KIND", "STATUS", "MESSAGE"];
 
+pub(crate) const SEQUENCE_COLUMNS: [Constraint; 5] = [
+    Constraint::Length(8),
+    Constraint::Percentage(46),
+    Constraint::Length(9),
+    Constraint::Length(12),
+    Constraint::Min(9),
+];
+
+pub(crate) const SEQUENCE_HEADERS: [&str; 5] =
+    ["TIME", "SEQUENCE / LIFELINES", "KIND", "STATUS", "TIMING"];
+
 /// Render one row. Group headers span the table as a single labelled line.
 pub(crate) fn row<'a>(
     entry: &CollabRow<'a>,
@@ -277,10 +475,92 @@ fn status_label(status: RequestStatus) -> String {
     format!("{status:?}").to_lowercase()
 }
 
+fn clock(at: OffsetDateTime) -> String {
+    at.format(time::macros::format_description!(
+        "[hour]:[minute]:[second]"
+    ))
+    .unwrap_or_else(|_| "--:--:--".into())
+}
+
+fn elapsed(start: OffsetDateTime, end: OffsetDateTime) -> String {
+    let millis = (end - start).whole_milliseconds().max(0);
+    if millis < 1_000 {
+        format!("{millis}ms")
+    } else {
+        let seconds = millis / 1_000;
+        if seconds < 60 {
+            format!("{seconds}s")
+        } else if seconds < 3_600 {
+            format!("{}m {}s", seconds / 60, seconds % 60)
+        } else {
+            format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60)
+        }
+    }
+}
+
+/// Render a chronological request/reply event. The dot and vertical bars are
+/// the participant lifelines; arrow direction reverses for the reply.
+pub(crate) fn sequence_row<'a>(
+    entry: &SequenceRow<'a>,
+    now: OffsetDateTime,
+    theme: WatchThemeSpec,
+    selected: bool,
+) -> Row<'a> {
+    let cells = match entry {
+        SequenceRow::Group {
+            label,
+            participants,
+        } => vec![
+            Cell::from(""),
+            Cell::from(Line::from(vec![
+                Span::styled(format!("{label}  "), theme.table_header_style()),
+                Span::styled(
+                    format!("│ {} │", participants.join(" │ ")),
+                    theme.dim_style(),
+                ),
+            ])),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+        ],
+        SequenceRow::Request(request) => vec![
+            Cell::from(clock(request.created_at)),
+            Cell::from(format!(
+                "{} ●──────▶ {}",
+                participant_lifeline(&request.from),
+                participant_lifeline(&request.to)
+            )),
+            Cell::from(kind_label(request)),
+            Cell::from(format!("now {}", status_label(request.status))),
+            Cell::from(format!("{} ago", age(now, request.created_at))),
+        ],
+        SequenceRow::Reply(request) => {
+            let reply = request.reply.as_ref().expect("reply sequence row");
+            vec![
+                Cell::from(clock(reply.at)),
+                Cell::from(format!(
+                    "{} ◀──────● {}",
+                    participant_lifeline(&request.from),
+                    participant_lifeline(&request.to)
+                )),
+                Cell::from("reply"),
+                Cell::from(status_label(reply.status)),
+                Cell::from(elapsed(request.created_at, reply.at)),
+            ]
+        }
+    };
+    let row = Row::new(cells);
+    if selected {
+        row.style(theme.selected_style())
+    } else {
+        row
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muxa::collaboration::{RequestKind, RoomId, WorkMode};
+    use muxa::collaboration::{CollaborationReply, RequestKind, RoomId, WorkMode};
     use muxa::event::{AgentKind, AgentState};
 
     fn participant(pane: &str, session: &str, window: &str) -> Participant {
@@ -315,7 +595,14 @@ mod tests {
             body: body.into(),
             expects_reply: true,
             work_mode: WorkMode::ReadOnly,
+            thread_id: None,
+            parent_request_id: None,
+            workspace_id: None,
+            work_id: None,
+            run_id: None,
             paths: Vec::new(),
+            artifacts: Vec::new(),
+            links: Vec::new(),
             air_artifacts: Vec::new(),
             status: RequestStatus::Queued,
             created_at: OffsetDateTime::now_utc(),
@@ -458,6 +745,76 @@ mod tests {
         )]);
         assert_eq!(screen.selected_index(), 0);
         assert_eq!(screen.selected_request("").unwrap().id, "req_9");
+    }
+
+    #[test]
+    fn refresh_preserves_the_selected_request_by_id() {
+        let mut screen = screen();
+        screen.move_selection(1, "");
+        assert_eq!(screen.selected_request("").unwrap().id, "req_2");
+        let mut requests = screen.requests.clone();
+        requests.insert(
+            0,
+            request(
+                "req_new",
+                participant("%8", "callabo", "CAL-7332"),
+                participant("%9", "callabo", "CAL-7332"),
+                "a newer request",
+            ),
+        );
+        screen.set_requests(requests);
+        assert_eq!(screen.selected_request("").unwrap().id, "req_2");
+    }
+
+    #[test]
+    fn sequence_is_thread_grouped_and_orders_reply_as_its_own_event() {
+        let now = OffsetDateTime::now_utc();
+        let from = participant("%1", "callabo", "CAL-7345");
+        let to = participant("%2", "callabo", "CAL-7345");
+        let mut first = request("req_1", from.clone(), to.clone(), "review round one");
+        first.thread_id = Some("review-1".into());
+        first.created_at = now - time::Duration::minutes(5);
+        first.status = RequestStatus::Completed;
+        first.reply = Some(CollaborationReply {
+            status: RequestStatus::Completed,
+            body: "changes required".into(),
+            artifacts: Vec::new(),
+            air_artifacts: Vec::new(),
+            at: now - time::Duration::minutes(2),
+        });
+        let mut second = request("req_2", from, to, "review round two");
+        second.thread_id = Some("review-1".into());
+        second.parent_request_id = Some("req_1".into());
+        second.created_at = now - time::Duration::minutes(3);
+
+        let mut screen = CollabScreen::default();
+        screen.set_requests(vec![second, first]);
+        let rows = screen.sequence_rows("");
+        assert!(matches!(rows[0], SequenceRow::Group { .. }));
+        assert!(matches!(rows[1], SequenceRow::Request(request) if request.id == "req_1"));
+        assert!(matches!(rows[2], SequenceRow::Request(request) if request.id == "req_2"));
+        assert!(matches!(rows[3], SequenceRow::Reply(request) if request.id == "req_1"));
+        let SequenceRow::Group {
+            label,
+            participants,
+        } = &rows[0]
+        else {
+            unreachable!()
+        };
+        assert!(label.contains("review-1"));
+        assert_eq!(participants.len(), 2);
+    }
+
+    #[test]
+    fn sequence_navigation_tracks_the_chronological_visual_order() {
+        let mut screen = screen();
+        screen.set_layout(CollabLayout::Sequence);
+        screen.select_visual_first("");
+        assert_eq!(screen.selected_request("").unwrap().id, "req_3");
+        screen.move_visual_selection(1, "");
+        assert_eq!(screen.selected_request("").unwrap().id, "req_2");
+        screen.select_visual_last("");
+        assert_eq!(screen.selected_request("").unwrap().id, "req_1");
     }
 
     #[test]

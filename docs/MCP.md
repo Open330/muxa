@@ -50,7 +50,7 @@ claude mcp add --scope user muxa -e MUXA_SOCKET=/run/user/1000/muxa.sock -- muxa
 ```
 
 Restart agents that were already running, then verify with `claude mcp list`
-or `codex mcp list` (the `muxa` server should list twenty-two tools). Other MCP
+or `codex mcp list` (the `muxa` server should list twenty-four tools). Other MCP
 hosts can run `muxa mcp` as a stdio server command in their config.
 
 At initialization muxa tells the agent how to use same-window peers as a
@@ -71,13 +71,21 @@ muxa_fleet_capture     { "host": "local", "pane": "%12" }
 muxa_fleet_capture     { "host": "dev", "pane": "%12" }
 muxa_fleet_send_prompt { "host": "dev", "pane": "%12",
                          "text": "Summarize the result", "submit": true }
+muxa_fleet_call_peer   { "host": "dev", "pane": "%12",
+                         "intent": "review", "body": "Review the current change" }
+muxa_fleet_wait_reply  { "host": "dev", "pane_key": { "window": { ... },
+                         "pane_id": "%12" }, "request_id": "..." }
 ```
 
 The host and pane are always explicit. Ambiguous pane ids are rejected. The
 local in-process adapter and remote relay both verify the complete identity
-again, and an observe-mode remote host rejects prompt delivery. Fleet calls
-use muxad's cache/control plane; the MCP subprocess never opens SSH itself.
-See [FLEET.md](FLEET.md).
+again, and an observe-mode remote host rejects every control action. Durable
+Fleet calls never auto-select or spawn a remote pane. They record the request
+on the physical target node and return a structured reply; if the first wait
+times out, pass the returned exact `pane_key` and `request_id` to
+`muxa_fleet_wait_reply`. Fleet calls use muxad's cache/control plane; the MCP
+subprocess never opens SSH itself. The remote `muxa` must advertise both
+`collaboration` and `collaboration_get`. See [FLEET.md](FLEET.md).
 
 ## Implementation
 
@@ -123,6 +131,11 @@ it:
 | `muxa_manage_tmux` | `action`, `pane?`, `workspace?`, `work?`, `confirm?` | List/show/close managed workspaces and work; interrupt/terminate an agent pane. |
 | `muxa_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
 | `muxa_capture_pane` | `pane` | Capture the visible contents of a pane. |
+| `muxa_fleet_status` | `selector?` | Read the cached local/remote physical-host hierarchy and capabilities. |
+| `muxa_fleet_capture` | `host`, `pane` | Capture one exact pane on a named Fleet host. |
+| `muxa_fleet_send_prompt` | `host`, `pane`, `text`, `submit?` | Inject literal text into one exact Fleet pane on a control-authorized host. |
+| `muxa_fleet_call_peer` | `host`, `pane`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?` | Send durable structured work to one explicitly selected Fleet agent and optionally wait for its reply. |
+| `muxa_fleet_wait_reply` | `host`, `pane_key`, `request_id`, `timeout_secs?` | Continue an exact remote durable reply wait, including after the target pane exits. |
 | `muxa_wait_for_change` | `timeout_secs?`, `pane?`, `until?`, `include_capture?` | Wait for any change or a focused settled/idle/blocked/stopped state, optionally returning the screen. |
 | `muxa_collaboration_guide` | — | Show the recommended reviewer, question, delegated-subagent, incoming-work, and AIR handoff contracts. |
 | `muxa_room_context` | — | Identify self, list same-window peers, and report unread request/reply counts. |

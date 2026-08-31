@@ -392,6 +392,31 @@ impl App {
         Some((host_alias.to_string(), pane.key.clone()))
     }
 
+    /// Return a Work identity only when the selected pane carries the complete
+    /// managed pair. Partially stamped and legacy Fleet snapshots keep the
+    /// pre-existing unscoped message behavior.
+    fn work_identity_for_message_pane(
+        &self,
+        host_alias: &str,
+        key: &PaneKey,
+    ) -> (Option<String>, Option<String>) {
+        self.snapshot
+            .hosts
+            .iter()
+            .find(|host| host.alias == host_alias)
+            .and_then(|host| host.remote.as_ref())
+            .and_then(|remote| {
+                remote
+                    .panes
+                    .iter()
+                    .find(|pane| PaneKey::from_pane(key.window.session.endpoint.host, pane) == *key)
+            })
+            .and_then(|pane| Some((pane.workspace_id.clone()?, pane.work_id.clone()?)))
+            .map_or((None, None), |(workspace_id, work_id)| {
+                (Some(workspace_id), Some(work_id))
+            })
+    }
+
     fn selected_window(&self) -> Option<(String, WindowKey)> {
         match self.selected_key()? {
             NodeKey::Window { host, key } => Some((host.clone(), key.clone())),
@@ -1115,6 +1140,8 @@ fn handle_key(
                         );
                         app.status("sending prompt…");
                     } else {
+                        let (workspace_id, work_id) =
+                            app.work_identity_for_message_pane(&host, &pane);
                         let request = NewRequest {
                             kind: app.message_kind,
                             body: text,
@@ -1124,7 +1151,14 @@ fn handle_key(
                                 WatchCollaborationMode::ReadOnly
                                 | WatchCollaborationMode::JustSend => WorkMode::ReadOnly,
                             },
+                            thread_id: None,
+                            parent_request_id: None,
+                            workspace_id,
+                            work_id,
+                            run_id: None,
                             paths: Vec::new(),
+                            artifacts: Vec::new(),
+                            links: Vec::new(),
                             air_artifacts: Vec::new(),
                         };
                         spawn_collaboration_send(client, background, app, host, pane, request);
@@ -4118,6 +4152,8 @@ mod tests {
                     session_group: None,
                     agent_role: None,
                     agent_alias: None,
+                    workspace_id: None,
+                    work_id: None,
                     pane_id: "%1".into(),
                     session_id: "$1".into(),
                     session: "work".into(),
@@ -4508,6 +4544,39 @@ mod tests {
         assert_eq!(
             app.selected_message_pane().map(|(_, pane)| pane.pane_id),
             Some("%2".into())
+        );
+    }
+
+    #[test]
+    fn fleet_message_work_identity_uses_only_a_complete_stamped_pair() {
+        let mut remote_host = host();
+        let pane = &mut remote_host.remote.as_mut().unwrap().panes[0];
+        pane.workspace_id = Some("callabo".into());
+        pane.work_id = Some("CAL-7345".into());
+        let key = PaneKey::from_pane(HostKind::Tmux, pane);
+
+        let mut app = App::new(
+            None,
+            WatchTheme::Classic,
+            BTreeMap::new(),
+            WatchLayout::Tree,
+            WatchView::Pane,
+            WatchTreeExpansion::Focus,
+            WatchSortKey::Name,
+        );
+        app.apply_snapshot(FleetSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            hosts: vec![remote_host],
+        });
+        assert_eq!(
+            app.work_identity_for_message_pane("dev", &key),
+            (Some("callabo".into()), Some("CAL-7345".into()))
+        );
+
+        app.snapshot.hosts[0].remote.as_mut().unwrap().panes[0].work_id = None;
+        assert_eq!(
+            app.work_identity_for_message_pane("dev", &key),
+            (None, None)
         );
     }
 

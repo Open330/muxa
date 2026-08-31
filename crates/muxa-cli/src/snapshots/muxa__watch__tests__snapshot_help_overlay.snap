@@ -28,6 +28,7 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │                           │  Enter          (in preview) jump to pinned pane                                 │                           │
 │                           │  m / M          message selected agent / mailbox (b alias)                       │                           │
 │                           │  Alt-1/2 · W    screen topology / collab · W is the work table                   │                           │
+│                           │  v              (in collab) toggle table / sequence history                      │                           │
 │                           │  i / e          (in mailbox) claim inbox / reply                                 │                           │
 │                           │Sorting                                                                           │                           │
 │                           │  Alt-S/L/D/T    sibling name / latest / duration / state                         │                           │
@@ -39,6 +40,5 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │                           │  Alt-C          copy last prompt to clipboard                                    │                           │
 │                           │  Alt-K          close session/window/pane (confirm popup)                        │                           │
 │                           │  Alt-X          interrupt selected agent pane (confirm popup)                    │                           │
-│                           │  r/Ctrl-R/Alt-R force refresh while browsing                                     │                           │
 └───────────────────────────└──────────────────────────────────────────────────────────────────────────────────┘───────────────────────────┘
  j/k  move   h/l  tree   /  filter   :  commands   ⏎  jump   o  preview   m  message   M  mailbox   ?  help
