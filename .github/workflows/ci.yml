@@ -47,6 +47,9 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      # `window_placement` drives a private tmux server; without tmux the test
+      # skips itself and the regression it guards goes unwatched here.
+      - run: sudo apt-get update && sudo apt-get install -y tmux
       # e2e tests shell out to `muxad` / `muxa` — those bins live in other
       # workspace packages and cargo test won't build them otherwise.
       - run: cargo build --workspace --bins

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--placement window` no longer collides with a window named after its own
+  session.** Adding a window to an existing session failed with `create window
+  failed: index 0 in use`, and removing every other window did not help. Muxa
+  resolved a pane/window/session target to the owning session's *name* and
+  passed it to `tmux new-window -t`, which takes a **window** target: a string
+  with no colon is looked up as a window in the caller's current session before
+  it is tried as a session. Muxa's own topology makes that collision the common
+  case rather than a corner — one session per workspace, whose first window is
+  usually named after it — so `-t junia` found the window `junia` at index 0 and
+  refused to create anything there. The target is now the session *id* with a
+  trailing colon (`$7:`), which cannot be read as a window name and leaves the
+  index for tmux to choose. A failing launch also names the resolved target,
+  since the address tmux was given is not the one the caller typed. Covered by
+  a regression test that drives the real binary against a private tmux server
+  laid out that way, through all four addresses muxa accepts — session id,
+  session name, window id, pane id.
+
+
 ### Added
 
 - **MCP agents can call an explicitly authorized agent on any Fleet host.**

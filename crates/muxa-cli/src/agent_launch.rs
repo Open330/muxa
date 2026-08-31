@@ -580,8 +580,16 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         .context("run tmux agent launcher")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // Name the resolved `-t` value: the input the caller gave (a pane id,
+        // a session name) is not what tmux was asked for, and the difference
+        // between them is usually the bug.
+        let target = args
+            .iter()
+            .position(|arg| arg == "-t")
+            .and_then(|at| args.get(at + 1))
+            .map_or(String::new(), |target| format!(" (target {target:?})"));
         bail!(
-            "tmux {} failed{}",
+            "tmux {} failed{target}{}",
             args.first().map_or("command", String::as_str),
             if stderr.is_empty() {
                 String::new()
@@ -825,9 +833,25 @@ fn resolve_placement_target(request: &mut StartRequest, cwd: &Path) -> Result<()
     Ok(())
 }
 
+/// The `new-window -t` target for the session that owns `target`.
+///
+/// Two details carry the whole fix for a `create window failed: index 0 in
+/// use` that made new windows impossible in a session muxa itself lays out.
+///
+/// **The session id, not its name.** `new-window -t` takes a *window* target,
+/// and a string with no colon is looked up as a window in the caller's current
+/// session before it is tried as a session. Muxa's own topology — one session
+/// per workspace, whose first window is usually named after it — makes that
+/// collision the common case, not a corner: `-t junia` finds the window named
+/// `junia` at index 0 and refuses to create anything there. A `$7` id cannot
+/// be read as a window name.
+///
+/// **The trailing colon.** `$7:` means "this session, window unspecified",
+/// which is what leaves the index for tmux to choose. Without it a session
+/// target still carries its current window's index along.
 fn resolve_window_session(target: &str) -> Result<String> {
     let output = muxa::tmux::tmux_command_scoped()
-        .args(["display-message", "-p", "-t", target, "#{session_name}"])
+        .args(["display-message", "-p", "-t", target, "#{session_id}"])
         .output()
         .context("resolve tmux window target")?;
     if !output.status.success() {
@@ -845,7 +869,7 @@ fn resolve_window_session(target: &str) -> Result<String> {
     if session.is_empty() {
         bail!("tmux target {target:?} resolved to an empty session");
     }
-    Ok(session)
+    Ok(format!("{session}:"))
 }
 
 fn tmux_args(request: &StartRequest, cwd: &Path, command: &str) -> Result<Vec<String>> {
@@ -1133,12 +1157,17 @@ mod tests {
     #[test]
     fn window_and_session_plans_use_the_requested_surface() {
         let mut window = request(AgentProgram::Claude, Placement::Window);
-        window.target = Some("muxa".into());
+        // What `resolve_window_session` hands on: a session id, and a trailing
+        // colon that leaves the window index to tmux.
+        window.target = Some("$7:".into());
         window.name = Some("review".into());
         let args = tmux_args(&window, Path::new("/tmp"), "claude").unwrap();
         assert_eq!(args[0], "new-window");
         assert!(args.windows(2).any(|pair| pair == ["-n", "review"]));
-        assert!(args.windows(2).any(|pair| pair == ["-t", "muxa"]));
+        assert!(
+            args.windows(2).any(|pair| pair == ["-t", "$7:"]),
+            "a bare session name would be read as a window in the caller's session: {args:?}",
+        );
 
         let mut session = request(AgentProgram::Gemini, Placement::Session);
         session.target = None;
