@@ -114,6 +114,8 @@ pub struct Config {
     /// SSH-connected physical hosts aggregated by the local daemon.
     pub fleet: FleetConfig,
     pub discovery: DiscoveryConfig,
+    /// How the daemon manages its own process.
+    pub daemon: DaemonConfig,
     pub reconciler: ReconcilerConfig,
     pub screen_detect: ScreenDetectConfig,
     pub collaboration: CollaborationConfig,
@@ -901,6 +903,51 @@ impl Default for ReconcilerConfig {
 }
 
 fn default_reconciler_interval_secs() -> u64 {
+    30
+}
+
+/// `[daemon]` config — how muxad manages its own process.
+///
+/// One concern so far: noticing that the binary underneath it has been
+/// replaced. A package manager installs the new build and moves on; the
+/// running process keeps its open inode and serves the old logic until
+/// something kills it. `KeepAlive`/`Restart=always` do not help, because
+/// nothing exited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DaemonConfig {
+    /// Re-exec onto the installed binary once it changes on disk.
+    ///
+    /// The daemon replaces itself in place (`exec`, same pid), so this works
+    /// whether or not a service manager is supervising it — and a re-exec that
+    /// fails leaves the old image running rather than a hole where the daemon
+    /// was.
+    ///
+    /// Default `true`. Set `false` when something else owns the upgrade
+    /// sequence and wants the old image to keep serving until told otherwise
+    /// — for instance a deploy that installs several binaries and restarts
+    /// them in a specific order.
+    #[serde(default = "default_true")]
+    pub restart_on_new_binary: bool,
+    /// How often to check the installed binary for a change. Defaults to 30s.
+    ///
+    /// The check is two `stat` calls on one path; the cost of a shorter
+    /// interval is negligible, and the cost of a longer one is that a stale
+    /// daemon serves for that much longer after an upgrade.
+    #[serde(default = "default_binary_poll_secs")]
+    pub binary_poll_secs: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            restart_on_new_binary: true,
+            binary_poll_secs: default_binary_poll_secs(),
+        }
+    }
+}
+
+fn default_binary_poll_secs() -> u64 {
     30
 }
 

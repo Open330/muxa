@@ -36,6 +36,7 @@ use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 
+mod binary_watch;
 mod fleet_manager;
 mod herdr_bridge;
 mod screen_detect;
@@ -238,6 +239,7 @@ async fn main() -> Result<()> {
     .await;
     let gc_handle = spawn_gc_task(&store, &shutdown_tx);
     let reconciler_handle = spawn_reconciler_task(&cfg, &store, &shutdown_tx, backends.clone());
+    let binary_watch_handle = spawn_binary_watch_task(&cfg, &shutdown_tx, Arc::clone(&restart));
     // herdr event bridge (Phase 2): spawned when herdr ∈ the observed set.
     // Translates herdr's own agent-state detection into synthetic muxa rows so
     // agents muxa has no hooks for still appear in status/watch/stats. Spawned
@@ -433,6 +435,7 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(());
     await_shutdown_task("gc", Some(gc_handle)).await;
     await_shutdown_task("reconciler", reconciler_handle).await;
+    await_shutdown_task("binary watch", binary_watch_handle).await;
     await_shutdown_task("herdr bridge", herdr_bridge_handle).await;
     await_shutdown_task("herdr report", herdr_report_handle).await;
     await_shutdown_task("screen detection", screen_detect_handle).await;
@@ -1717,6 +1720,78 @@ fn spawn_reconciler_task(
         "reconciler enabled",
     );
     Some(handle)
+}
+
+/// Re-exec onto the installed binary once an upgrade replaces it.
+///
+/// Without this, installing a new muxa leaves the old daemon serving: the
+/// package manager writes the new build, the running process keeps its open
+/// inode, and no service manager intervenes because nothing exited. The gap
+/// closes only when someone notices and restarts it by hand — which, measured
+/// on a live host, took six days.
+///
+/// The daemon re-execs itself rather than exiting for a supervisor to catch,
+/// so this works the same whether muxad was started by launchd, systemd, or a
+/// terminal, and a failed exec leaves the old image running instead of a hole
+/// where the daemon was.
+fn spawn_binary_watch_task(
+    cfg: &Config,
+    shutdown_tx: &broadcast::Sender<()>,
+    restart: Arc<RestartController>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !cfg.daemon.restart_on_new_binary {
+        return None;
+    }
+    let Some(path) = binary_watch::reexec_target() else {
+        tracing::warn!("cannot resolve the binary to watch; upgrades will not restart the daemon");
+        return None;
+    };
+    let Some(baseline) = binary_watch::BinaryIdentity::read(&path) else {
+        // Watching from no baseline would make the first successful read look
+        // like an upgrade and restart a daemon that nothing had replaced.
+        tracing::warn!(
+            ?path,
+            "cannot read the installed binary; upgrades will not restart the daemon"
+        );
+        return None;
+    };
+    let interval = std::time::Duration::from_secs(cfg.daemon.binary_poll_secs.max(1));
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    tracing::info!(
+        ?path,
+        poll_secs = cfg.daemon.binary_poll_secs,
+        "binary watch enabled"
+    );
+    Some(tokio::spawn(async move {
+        let mut watch = binary_watch::BinaryWatch::new(baseline);
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick of a tokio interval completes immediately, and the
+        // baseline was read moments ago — burn it rather than re-stat.
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => return,
+                _ = tick.tick() => {}
+            }
+            let path = path.clone();
+            // `stat` on a cold path can block on the filesystem, and this
+            // runtime also serves IPC.
+            let observed =
+                tokio::task::spawn_blocking(move || binary_watch::BinaryIdentity::read(&path))
+                    .await
+                    .unwrap_or(None);
+            if watch.observe(observed) {
+                if restart.request_self_restart() {
+                    tracing::info!("installed binary changed; restarting onto it");
+                } else {
+                    // An operator's stop has already won. Leave it stopping.
+                    tracing::debug!("installed binary changed during shutdown; not restarting");
+                }
+                return;
+            }
+        }
+    }))
 }
 
 /// Track cumulative session foreground time for `muxa watch --view session`.
