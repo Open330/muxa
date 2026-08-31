@@ -826,17 +826,19 @@ struct Snapshot {
     identities: Vec<CollaborationIdentity>,
 }
 
-fn collaboration_database_path(legacy_path: &Path) -> PathBuf {
-    let database_extension = legacy_path
-        .extension()
+fn has_database_extension(path: &Path) -> bool {
+    path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
                 "sqlite" | "sqlite3" | "db"
             )
-        });
-    if database_extension {
+        })
+}
+
+fn collaboration_database_path(legacy_path: &Path) -> PathBuf {
+    if has_database_extension(legacy_path) {
         legacy_path.to_path_buf()
     } else {
         legacy_path.with_extension("sqlite3")
@@ -866,10 +868,39 @@ fn secure_database_files(_path: &Path) -> Result<(), CollaborationError> {
     Ok(())
 }
 
+/// Create the main database with owner-only permissions before SQLite opens
+/// it. Chmod existing files as well: relying on the process umask would leave
+/// a short first-open window where collaboration bodies could be world-readable.
+#[cfg(unix)]
+fn prepare_database_file(path: &Path) -> Result<(), CollaborationError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_database_file(_path: &Path) -> Result<(), CollaborationError> {
+    Ok(())
+}
+
 fn open_database(path: &Path) -> Result<Connection, CollaborationError> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)?;
     }
+    prepare_database_file(path)?;
     let connection = Connection::open(path)?;
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -1492,31 +1523,37 @@ impl CollaborationStore {
     }
 
     pub async fn load(options: CollaborationOptions) -> Result<Arc<Self>, CollaborationError> {
-        let legacy = if let Some(path) = options.path.as_ref() {
-            match tokio::fs::File::open(path).await {
-                Ok(mut file) => {
-                    let mut header = [0_u8; 16];
-                    let bytes_read = file.read(&mut header).await?;
-                    if is_sqlite_header(&header[..bytes_read]) {
-                        None
-                    } else {
-                        let bytes = tokio::fs::read(path).await?;
-                        let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
-                        if snapshot.version != COLLABORATION_SCHEMA_VERSION {
-                            return Err(CollaborationError::UnsupportedSchema(snapshot.version));
+        let (legacy, configured_path_is_database) = if let Some(path) = options.path.as_ref() {
+            if has_database_extension(path) {
+                (None, true)
+            } else {
+                match tokio::fs::File::open(path).await {
+                    Ok(mut file) => {
+                        let mut header = [0_u8; 16];
+                        let bytes_read = file.read(&mut header).await?;
+                        if is_sqlite_header(&header[..bytes_read]) {
+                            (None, true)
+                        } else {
+                            let bytes = tokio::fs::read(path).await?;
+                            let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
+                            if snapshot.version != COLLABORATION_SCHEMA_VERSION {
+                                return Err(CollaborationError::UnsupportedSchema(
+                                    snapshot.version,
+                                ));
+                            }
+                            (Some(snapshot), false)
                         }
-                        Some(snapshot)
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, false),
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
             }
         } else {
-            None
+            (None, false)
         };
         let database_path = options.path.as_deref().map(|path| {
-            if legacy.is_some() {
-                path.with_extension("sqlite3")
+            if configured_path_is_database {
+                path.to_path_buf()
             } else {
                 collaboration_database_path(path)
             }
@@ -4112,6 +4149,34 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn direct_empty_sqlite_path_initializes_with_owner_only_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collaboration.sqlite3");
+        std::fs::write(&path, []).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let store = CollaborationStore::load(CollaborationOptions {
+            path: Some(path.clone()),
+            ..CollaborationOptions::default()
+        })
+        .await
+        .unwrap();
+        assert!(store.enabled());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[tokio::test]

@@ -1745,7 +1745,27 @@ async fn fleet_call_peer(
             });
             json_result(&payload)
         }
-        Err(error) => error_result(&format!("fleet_call_peer wait failed: {error}")),
+        Err(error) => {
+            // Delivery already succeeded. Returning a tool error here would
+            // discard the only correlation handle and tempt callers to send
+            // duplicate work. Preserve the durable request and exact pane so
+            // a later wait can resume after a transient relay failure.
+            let mut payload = common;
+            payload["completed"] = json!(false);
+            payload["reason"] = json!("wait_failed");
+            payload["error"] = json!(error);
+            payload["request"] = json!(sent);
+            payload["next_step"] = json!({
+                "tool": "muxa_fleet_wait_reply",
+                "arguments": {
+                    "host": host,
+                    "pane_key": pane_key,
+                    "request_id": payload["request_id"],
+                },
+                "message": "Delivery succeeded and remains durable; retry the exact reply wait. Do not resend the request or poll terminal capture."
+            });
+            json_result(&payload)
+        }
     }
 }
 
