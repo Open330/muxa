@@ -366,7 +366,7 @@ impl AskStore {
 
     pub async fn list_conversations(&self) -> Vec<AskConversation> {
         let mut conversations = self.conversations.read().await.clone();
-        conversations.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.updated_at));
         conversations
     }
 
