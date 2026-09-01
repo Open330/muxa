@@ -190,18 +190,24 @@ The multi-node Fleet TUI uses the same focused navigation conventions:
   siblings, so it never traps the cursor. In always/manual expansion they move
   through visible rows.
 - Uppercase `J`/`K` jumps directly between actionable panes across the Fleet.
-- `h`/`l` or Left/Right collapses/descends; Space toggles a parent.
+- `h`/`l` or Left/Right collapses/descends. Space toggles a parent, or marks an
+  exact live-agent pane for a broadcast when the cursor is on a pane row.
 - `/` filters, `Alt-a` toggles attention-only, `a` opens Ask, `A` opens Ask
   history, `r` refreshes, and `c` connects or disconnects a remote host
   (`local` reports that it is always connected).
 - `o`/`p` captures the selected pane. `m` works on a session, window, or pane;
   parent nodes resolve to the lowest-index pane that owns a live agent, while
-  an exact pane stays exact. `Tab` cycles the durable request kind,
-  `Ctrl-E` cycles read-only/execute/just-send, and `/` opens the shared
-  message-skill palette. In that palette, `F2`/`Ctrl-A` registers a skill and
-  Delete/`Ctrl-D` removes the selected skill. `M` (or `b`) opens that pane's mailbox, where `i`
-  claims queued requests and `e` replies. These operations use the selected
-  physical host's local muxad over the existing SSH relay.
+  an exact pane stays exact. With marks set across local or remote hosts, `m`
+  freezes the marked set and sends one ordinary request to each recipient in
+  sequence. Observe-only and collaboration-incompatible remote hosts are
+  shown as **will be refused** without being called. Delivered recipients are
+  unmarked; failed or refused recipients stay marked. `Tab` cycles the durable
+  request kind, `Ctrl-E` cycles read-only/execute/just-send, and `/` opens the
+  shared message-skill palette. In that palette, `F2`/`Ctrl-A` registers a
+  skill and Delete/`Ctrl-D` removes the selected skill. `M` (or `b`) opens that
+  pane's mailbox, where `i` claims queued requests and `e` replies. These
+  operations use the selected physical host's local muxad over the existing
+  SSH relay.
   Each mailbox tab returns its 32 newest requests to keep the interactive
   response bounded; the node remains the durable source of truth.
 - Enter attaches directly on `local` or through a separate remote SSH TTY,

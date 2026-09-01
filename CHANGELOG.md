@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Marked broadcasts now cross physical hosts in `muxa fleet watch`.** A pane
+  row's `Space` mark carries its host alias and complete pane identity, so a
+  local `%1` and a remote `%1` are two exact recipients rather than one
+  ambiguous screen position. `m` freezes that set and gives every recipient
+  its own ordinary durable request, sequentially: `local` uses the controller
+  daemon directly, while remote aliases use their existing Fleet relay.
+
+  Fleet preflights remote authority before the first request leaves. An
+  observe-only host or one missing `collaboration` / `collaboration_get` is
+  shown as **will be refused** and is never called; a later recipient is still
+  attempted after any delivery failure. The result keeps one row and request
+  id (or refusal/error) per recipient. Delivered agents lose their marks, while
+  refused and failed agents remain marked for a deliberate retry.
+
 ## [0.8.41] - 2026-09-01
 
 ### Fixed
