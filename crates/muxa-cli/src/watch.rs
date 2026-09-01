@@ -1315,6 +1315,82 @@ fn plan_spawn_work(
     })
 }
 
+/// `tmux new-window` argv for the `c` binding: one plain shell window in
+/// `session_id`, named by tmux exactly as `prefix + c` would name it, and
+/// reported back as `@window %pane` so the caller can attach to it without
+/// re-listing the server.
+///
+/// Deliberately no `-d`: `prefix + c` leaves the new window current, and this
+/// binding is that keystroke with the attach round trip removed.
+fn plan_new_window(session_id: &str, cwd: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "new-window".to_string(),
+        "-P".into(),
+        "-F".into(),
+        "#{window_id} #{pane_id}".into(),
+        "-t".into(),
+        session_id.to_string(),
+    ];
+    // tmux inherits *watch's* cwd, not the session's, so an unset `-c` opens
+    // the window wherever the console happens to live. A recorded directory
+    // that has since been removed would fail the whole command, so a stale
+    // one is dropped rather than passed on.
+    if let Some(dir) = cwd.filter(|dir| Path::new(dir).is_dir()) {
+        args.push("-c".into());
+        args.push(dir.to_string());
+    }
+    args
+}
+
+/// Turn the `-P -F` line [`plan_new_window`] asks for into the key of the pane
+/// the new window opened with. The session is the one we targeted: tmux only
+/// reports ids local to that server, and a bare `@N`/`%N` is not an identity.
+fn parse_new_window_target(
+    session: &SessionKey,
+    reported: &str,
+) -> std::result::Result<PaneKey, String> {
+    let mut fields = reported.split_whitespace();
+    match (fields.next(), fields.next()) {
+        (Some(window_id), Some(pane_id))
+            if window_id.starts_with('@') && pane_id.starts_with('%') =>
+        {
+            Ok(PaneKey {
+                window: WindowKey {
+                    session: session.clone(),
+                    window_id: window_id.to_string(),
+                },
+                pane_id: pane_id.to_string(),
+            })
+        }
+        _ => Err(format!("tmux reported no new window ({reported:?})")),
+    }
+}
+
+/// Run the `c` binding and hand back the pane to attach to.
+fn create_window(session: &SessionKey, cwd: Option<&str>) -> std::result::Result<PaneKey, String> {
+    if session.endpoint.host != muxa::HostKind::Tmux {
+        return Err(format!(
+            "{} window creation is not supported",
+            session.endpoint.host
+        ));
+    }
+    let args = plan_new_window(&session.session_id, cwd);
+    let output = muxa::tmux::tmux_command_on(Some(&session.endpoint.socket))
+        .args(&args)
+        .output()
+        .map_err(|error| format!("tmux: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let reported = String::from_utf8_lossy(&output.stdout);
+    let line = reported
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('@'))
+        .ok_or_else(|| "tmux returned no window id".to_string())?;
+    parse_new_window_target(session, line)
+}
+
 impl Effects for RealEffects {
     fn spawn_at(
         &mut self,
@@ -1794,7 +1870,10 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  gg/G · Home/End first / last selectable row",
         "  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page",
         "  Enter          attach via active window/pane or exact pane",
-        "  n / w / R      new window/pane / work up / rename the row",
+        // One line, not two: the overlay is sized to its line count and
+        // clipped by the terminal, so a row added here pushes the last
+        // binding off a short screen.
+        "  c / n / w / R  shell window / agent pane / work up / rename the row",
         "  a / A          ask / history; d deletes one · D clears all in A",
         "",
         "Commands & inspection",
@@ -3937,6 +4016,26 @@ impl App {
     fn selected_node(&self) -> Option<TopologyNodeRef<'_>> {
         let key = self.selected_node_key()?;
         self.topology.find(&key)
+    }
+
+    /// Resolve the `c` binding: whichever session owns the selected row, plus
+    /// the directory that row works in. Every level answers — a session is
+    /// the target itself, and a window or pane names the session it lives in
+    /// — so the key never depends on where in the tree the cursor stopped.
+    fn new_window_context(&self) -> Option<(SessionKey, Option<String>)> {
+        Some(match self.selected_node()? {
+            TopologyNodeRef::Session(session) => (
+                session.key.clone(),
+                session
+                    .active_window()
+                    .and_then(|window| window.cwd.clone()),
+            ),
+            TopologyNodeRef::Window(window) => (window.key.session.clone(), window.cwd.clone()),
+            TopologyNodeRef::Pane(pane) => (
+                pane.key.window.session.clone(),
+                (!pane.cwd.is_empty()).then(|| pane.cwd.clone()),
+            ),
+        })
     }
 
     fn spawn_context(&self, fallback_dir: String) -> (Option<TopologyNodeKey>, String, String) {
@@ -7453,6 +7552,27 @@ pub async fn run(
                     quit = true;
                     break;
                 }
+                Action::NewWindow { session, cwd } => {
+                    // tmux shells out; keep it off the input loop like every
+                    // other side-effecting action here.
+                    let created = tokio::task::spawn_blocking(move || {
+                        create_window(&session, cwd.as_deref())
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(format!("action task failed: {error}")));
+                    match created {
+                        // Creating a window the user cannot see would be a
+                        // worse `prefix + c` than the one they already have.
+                        Ok(pane) => {
+                            jump_target = Some(WatchOpenTarget::TopologyPane(pane));
+                            quit = true;
+                            break;
+                        }
+                        Err(error) => {
+                            app.set_hint(format!("✗ new window failed: {error}"), HintLevel::Err);
+                        }
+                    }
+                }
                 Action::Refresh => {
                     request_refresh(&mut app, &wake_tx);
                     refresh_watch_collaboration(client, &mut app).await;
@@ -9018,6 +9138,17 @@ pub(crate) enum Action {
     AttachPane(String),
     /// Attach using the complete host+socket ancestry.
     AttachTopologyPane(PaneKey),
+    /// `c` — open a plain shell window in the session the cursor is inside
+    /// and hand the terminal to it, the way `prefix + c` does from within an
+    /// attached session. No agent, no composer: the point is the two steps
+    /// (attach, then create) collapsing into one keystroke.
+    NewWindow {
+        session: SessionKey,
+        /// Directory the window starts in, when the selected row knows one.
+        /// `None` lets tmux inherit whatever cwd watch itself was launched
+        /// from, which is the wrong project often enough to be worth saying.
+        cwd: Option<String>,
+    },
     /// Pop open the preview overlay for the selected row.
     OpenPreview,
     /// Close the preview overlay and return to the table.
@@ -9601,6 +9732,13 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             });
             Action::None
         }
+        // `c` is tmux's own `prefix + c`, minus the attach that normally has
+        // to come first. Reserving another browse letter costs the filter its
+        // bare leading `c`, which `/` still allows.
+        KeyCode::Char('c') if app.browse_keys_active() => match app.new_window_context() {
+            Some((session, cwd)) => Action::NewWindow { session, cwd },
+            None => Action::NotApplicable("select a row first — a new window needs a session"),
+        },
         KeyCode::Char('|') if app.browse_keys_active() => {
             app.inspector_split = app.inspector_split.next();
             Action::InspectorSplitChanged
@@ -17420,6 +17558,124 @@ mod tests {
         (agents, panes)
     }
 
+    /// Two windows so the single-window compaction does not fold the window
+    /// row into its session — the `c` binding has to answer from either.
+    fn two_window_topology_fixture() -> (Vec<Agent>, Vec<PaneInfo>) {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "muxa", "@1", "TEST-1", 0, "%1", 0),
+            fake_topology_pane("default", "$1", "muxa", "@2", "TEST-2", 1, "%2", 0),
+        ];
+        let agents = vec![
+            topology_agent("agent-1", "%1", "default", AgentState::Working, "one", 1),
+            topology_agent("agent-2", "%2", "default", AgentState::Idle, "two", 2),
+        ];
+        (agents, panes)
+    }
+
+    fn press_c(app: &mut App) -> Action {
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            app,
+        )
+    }
+
+    #[test]
+    fn c_creates_a_window_in_the_session_the_cursor_is_inside() {
+        // `prefix + c` works from any window of a session; the watch binding
+        // has to behave the same whichever level the cursor stopped on.
+        let (agents, panes) = two_window_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let session_key = app.topology.sessions[0].key.clone();
+        let window_key = app.topology.sessions[0].windows[1].key.clone();
+        let pane_key = app.topology.sessions[0].windows[1].panes[0].key.clone();
+
+        for target in [
+            TopologyNodeKey::Session(session_key.clone()),
+            TopologyNodeKey::Window(window_key.clone()),
+            TopologyNodeKey::Pane(pane_key),
+        ] {
+            select_tree_key(&mut app, &target);
+            match press_c(&mut app) {
+                Action::NewWindow { session, cwd } => {
+                    assert_eq!(session, session_key, "wrong session for {target:?}");
+                    // The window opens where the selected row works, not
+                    // where the console was launched from.
+                    assert!(
+                        cwd.is_some_and(|dir| dir.starts_with("/repo/muxa/")),
+                        "no working directory for {target:?}"
+                    );
+                }
+                other => panic!("expected a new window for {target:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn c_takes_the_exact_window_the_cursor_names() {
+        let (agents, panes) = two_window_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let window_key = app.topology.sessions[0].windows[1].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Window(window_key));
+        assert!(matches!(
+            press_c(&mut app),
+            Action::NewWindow { cwd: Some(ref dir), .. } if dir == "/repo/muxa/TEST-2"
+        ));
+    }
+
+    #[test]
+    fn c_is_a_filter_character_once_a_search_is_armed() {
+        // Reserved browse letters give way to typing, the same rule n/w/o
+        // follow — otherwise `/` would be the only way to search for "codex".
+        let (agents, panes) = two_window_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        app.arm_explicit_search();
+        assert!(matches!(press_c(&mut app), Action::None));
+        assert_eq!(app.search_query, "c");
+    }
+
+    #[test]
+    fn new_window_plan_is_prefix_c_on_the_selected_session() {
+        // No `-d`: tmux's own binding leaves the new window current, and the
+        // caller attaches to it immediately afterwards.
+        let args = plan_new_window("$1", None);
+        assert!(!args.iter().any(|arg| arg == "-d"), "{args:?}");
+        assert_eq!(args[0], "new-window");
+        assert!(args.windows(2).any(|pair| pair == ["-t", "$1"]), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "-c"), "{args:?}");
+    }
+
+    #[test]
+    fn new_window_plan_only_passes_a_directory_that_still_exists() {
+        let live = std::env::temp_dir();
+        let live = live.to_str().expect("a utf-8 temp dir");
+        let args = plan_new_window("$1", Some(live));
+        assert!(args.windows(2).any(|pair| pair == ["-c", live]), "{args:?}");
+
+        // A recorded cwd outlives the directory; `-c` on a deleted path fails
+        // the whole command, and no window is worse than one in $HOME.
+        let args = plan_new_window("$1", Some("/definitely/not/here"));
+        assert!(!args.iter().any(|arg| arg == "-c"), "{args:?}");
+    }
+
+    #[test]
+    fn the_created_window_is_keyed_by_the_session_we_targeted() {
+        // `@N`/`%N` repeat across tmux servers, so the reported ids are only
+        // an identity once the session they came from is stapled back on.
+        let session = SessionKey {
+            endpoint: BackendEndpoint {
+                host: muxa::HostKind::Tmux,
+                socket: "work".into(),
+            },
+            session_id: "$3".into(),
+        };
+        let pane = parse_new_window_target(&session, "@7 %21").expect("a window and a pane");
+        assert_eq!(pane.pane_id, "%21");
+        assert_eq!(pane.window.window_id, "@7");
+        assert_eq!(pane.window.session, session);
+        assert!(parse_new_window_target(&session, "").is_err());
+        assert!(parse_new_window_target(&session, "@7").is_err());
+    }
+
     #[test]
     fn tree_view_defaults_control_expansion_without_losing_ancestry() {
         let (agents, panes) = basic_topology_fixture();
@@ -24534,6 +24790,7 @@ sort = ["state"]
             | Action::Refresh
             | Action::AttachPane(_)
             | Action::AttachTopologyPane(_)
+            | Action::NewWindow { .. }
             | Action::OpenCollaborationMessage
             | Action::OpenCollaborationMailbox
             | Action::SubmitCollaboration
@@ -26001,7 +26258,9 @@ sort = ["state"]
         assert!(body.contains("m / M          message selected agent / mailbox (b alias)"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains("a / A          ask / history; d deletes one · D clears all in A"));
-        assert!(body.contains("n / w / R      new window/pane / work up / rename the row"));
+        assert!(
+            body.contains("c / n / w / R  shell window / agent pane / work up / rename the row")
+        );
         // The exit keys deliberately live in the overlay's border rather
         // than the matrix — the body is clipped by terminal height, and
         // "how to leave" must not be the row that falls off.

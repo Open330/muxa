@@ -15,7 +15,7 @@ j/k move  ·  type or / filter  ·  : commands  ·  ? help
 │                           │  gg/G · Home/End first / last selectable row                                     │                           │
 │                           │  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page                                   │                           │
 │                           │  Enter          attach via active window/pane or exact pane                      │                           │
-│                           │  n / w / R      new window/pane / work up / rename the row                       │                           │
+│                           │  c / n / w / R  shell window / agent pane / work up / rename the row             │                           │
 │                           │  a / A          ask / history; d deletes one · D clears all in A                 │                           │
 │                           │                                                                                  │                           │
 │                           │Commands & inspection                                                             │                           │

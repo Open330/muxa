@@ -63,6 +63,7 @@ children keep their aggregate state markers.
 | `gg` / `G`, `Home` / `End` | Jump to the first / last sibling in focus mode, or visible row otherwise. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | Move half / full pages while browsing. |
 | `Enter` | Attach to the selected pane. |
+| `c` | Open a plain shell window in the selected row's session and jump into it — `prefix + c` without attaching first. |
 | `n` | Create/reuse a workspace session and work window, then add an agent pane. |
 | `w` | Run a pipeline: type a work id and hand off to a window running `muxa work up`. |
 | `R` / `:rename` | Rename the selected tmux session or window, or set the selected pane title. |
@@ -80,7 +81,7 @@ children keep their aggregate state markers.
 | `Alt-E` | Open the completion/error/attention event inbox. |
 | `Alt-A` | Toggle attention-only filtering. |
 | `[` / `]` | In preview, show the previous / next agent in the selected work. |
-| `c` | Toggle preview content. |
+| `c` | In preview, toggle content. |
 | `f` | Toggle popup/fullscreen preview. |
 | `Alt-L/D/S/T` | Sort by latest / workspace duration / workspace / attention state. |
 

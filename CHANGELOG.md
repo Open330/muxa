@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`c` opens a window in watch, where `prefix + c` cannot reach.** Creating a
+  plain shell window next to running work meant leaving the console: attach to
+  the session, press `prefix + c`, then find your way back. Watch already knows
+  which session every row belongs to, so the round trip was the only thing
+  standing in the way.
+
+  `c` now creates one bare shell window in the session the cursor is inside —
+  session, window, or pane row, since all three name a session — and hands the
+  terminal to it, exactly as `prefix + c` does from inside an attached session.
+  No agent and no composer: the window is named by tmux and starts in the
+  directory the selected row works in, rather than wherever the console
+  happened to be launched from. A directory that has since been removed is
+  dropped instead of failing the command.
+
+  Reserving another browse letter costs the filter its bare leading `c`; `/c…`
+  still searches for one, the same escape every other reserved key has.
+
 ## [0.8.40] - 2026-09-01
 
 ### Added

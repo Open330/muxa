@@ -42,6 +42,7 @@ window였던 것처럼 보이지 않도록 전체 session → window → pane an
 | `gg` / `G`, `Home` / `End` | 첫 번째 / 마지막 선택 가능 행으로 이동. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | 탐색 중 반 페이지 / 한 페이지 이동. |
 | `Enter` | 선택한 pane에 바로 attach. |
+| `c` | 선택한 행이 속한 session에 shell window를 만들고 바로 이동. attach 후 `prefix + c`를 누르는 것과 같습니다. |
 | `n` | workspace session과 work window를 생성/재사용하고 agent pane 추가. |
 | `w` | pipeline 실행: work id를 입력하면 `muxa work up`을 실행하는 window로 넘어갑니다. |
 | `R` / `:rename` | 선택한 tmux session/window 이름 또는 pane title 변경. |
@@ -59,7 +60,7 @@ window였던 것처럼 보이지 않도록 전체 session → window → pane an
 | `Alt-E` | 완료·오류·입력 요청 event inbox 열기. |
 | `Alt-A` | error/input/choice만 보는 attention filter. |
 | `[` / `]` | preview에서 선택 work의 이전 / 다음 agent 보기. |
-| `c` | preview content toggle. |
+| `c` | preview 안에서 content toggle. |
 | `f` | popup/fullscreen preview toggle. |
 | `Alt-L` | 최신 activity 기준 정렬. |
 | `Alt-D` | workspace duration 기준 정렬. |
