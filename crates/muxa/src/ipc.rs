@@ -525,6 +525,14 @@ pub struct Response {
     pub max_protocol: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<&'static str>>,
+    /// The daemon's own crate version, sent on `hello`. Protocol numbers move
+    /// only when the wire format changes, so two builds can agree on the
+    /// protocol and still disagree on everything else; this is what lets a
+    /// client notice a stale daemon during the window where the protocol
+    /// still matches. Absent from a daemon that predates the field, which is
+    /// itself evidence the daemon is old.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<&'static str>,
     /// The listing breadth the daemon actually applied. A daemon that predates
     /// scoped listing simply drops the request field, so its absence here is
     /// how a new client detects that its `--scope` was ignored rather than
@@ -612,6 +620,7 @@ impl Response {
             min_protocol: None,
             max_protocol: None,
             capabilities: None,
+            version: None,
             collaboration_scope: None,
             generation: None,
             sessions: None,
@@ -784,6 +793,7 @@ impl Response {
             capabilities.push(STOP_CAPABILITY);
         }
         r.capabilities = Some(capabilities);
+        r.version = Some(env!("CARGO_PKG_VERSION"));
         r.generation = restart.map(RestartController::generation);
         r
     }
@@ -832,6 +842,15 @@ impl RestartController {
     #[must_use]
     pub fn restart_requested(&self) -> bool {
         self.state.load(AtomicOrdering::SeqCst) == RESTART_REQUESTED
+    }
+
+    /// Ask for a restart from inside the daemon itself, rather than over IPC.
+    ///
+    /// Same transition and the same refusal after a stop has won: a watcher
+    /// that notices a new binary mid-shutdown must not resurrect the process
+    /// the operator is deliberately stopping.
+    pub fn request_self_restart(&self) -> bool {
+        self.request_restart()
     }
 
     /// Returns false only after an explicit stop has won. Repeated restart
@@ -3135,6 +3154,67 @@ pub struct Client {
 pub struct Hello {
     pub capabilities: Vec<String>,
     pub generation: Option<u64>,
+    /// The daemon's crate version. `None` from a daemon built before the
+    /// field existed — which already means it is older than this client.
+    pub version: Option<String>,
+    /// The protocol the connection settled on, which is the daemon's ceiling
+    /// when it is older than this build.
+    pub protocol: u32,
+}
+
+impl Hello {
+    /// The version skew between the daemon that answered this `hello` and the
+    /// client asking, or `None` when the two builds agree.
+    ///
+    /// Separate from protocol negotiation on purpose. The protocol number only
+    /// moves when the wire format changes, so a daemon left running across an
+    /// upgrade can keep answering every request correctly-shaped while running
+    /// months-old logic. That window is silent today: nothing fails, so nothing
+    /// reports. Comparing crate versions closes it.
+    #[must_use]
+    pub fn version_skew(&self) -> Option<VersionSkew> {
+        let client = env!("CARGO_PKG_VERSION");
+        match self.version.as_deref() {
+            Some(daemon) if daemon == client => None,
+            daemon => Some(VersionSkew {
+                daemon: daemon.map(str::to_string),
+                client,
+            }),
+        }
+    }
+}
+
+/// A daemon and a client that are not the same build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionSkew {
+    /// The running daemon's version, or `None` when it is old enough not to
+    /// report one at all.
+    pub daemon: Option<String>,
+    /// This binary's version.
+    pub client: &'static str,
+}
+
+impl VersionSkew {
+    /// How the daemon's side reads in a message: its version, or a phrase for
+    /// the pre-`version` builds that cannot name themselves.
+    #[must_use]
+    pub fn daemon_label(&self) -> String {
+        self.daemon
+            .clone()
+            .unwrap_or_else(|| "an older build".to_string())
+    }
+}
+
+impl std::fmt::Display for VersionSkew {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "muxad is running {} while this CLI is {} — {}",
+            self.daemon_label(),
+            self.client,
+            restart_remedy()
+        )
+    }
 }
 
 /// The result of a [`Client::send_prompt`]: the two non-atomic keystroke
@@ -3188,6 +3268,21 @@ fn is_lagged_marker(line: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The highest protocol a daemon named in its `unsupported protocol` refusal.
+///
+/// The refusal reads `unsupported protocol: server supports [1,4] client=6`.
+/// Only the upper bound matters — it is the version the caller must step down
+/// to. Parsing the daemon's own words beats guessing `PROTOCOL_VERSION - 1`,
+/// which would need as many round trips as the skew is wide.
+fn server_protocol_ceiling(error: Option<&str>) -> Option<u32> {
+    let error = error?;
+    if !error.starts_with("unsupported protocol") {
+        return None;
+    }
+    let range = error.split_once('[')?.1.split_once(']')?.0;
+    range.split_once(',')?.1.trim().parse().ok()
+}
+
 /// Old daemons deserialize a request kind they do not know as a tagged-enum
 /// `unknown variant` error. Limit compatibility fallback to that exact shape:
 /// authorization, lookup, and persistence failures from a current daemon must
@@ -3206,11 +3301,50 @@ fn response_error(resp: &serde_json::Value) -> RuntimeError {
     let message = resp["error"].as_str().unwrap_or("request failed");
     if message.starts_with("protocol mismatch") {
         RuntimeError::Daemon(format!(
-            "{message} — the running daemon is older than this CLI. \
-             Restart it: `muxa upgrade` (add `--no-pull` to rebuild the current source)"
+            "{message} — the running daemon is older than this CLI. {}",
+            restart_remedy()
         ))
     } else {
         RuntimeError::Daemon(message.to_string())
+    }
+}
+
+/// Whether this binary was installed by Homebrew.
+///
+/// Read off the resolved path of the running executable: Homebrew installs
+/// into a versioned Cellar directory and links the result onto `PATH`, so a
+/// canonicalized `current_exe()` lands inside `…/Cellar/…` no matter which
+/// prefix (`/opt/homebrew`, `/usr/local`, or a custom `HOMEBREW_PREFIX`) the
+/// machine uses. Checking the Cellar segment rather than a hardcoded prefix
+/// keeps Linuxbrew and relocated installs working.
+fn installed_by_homebrew() -> bool {
+    std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .is_ok_and(|exe| {
+            exe.components()
+                .any(|component| component.as_os_str() == "Cellar")
+        })
+}
+
+/// The remedy sentence for a daemon that is out of step with this CLI.
+///
+/// `muxa daemon restart` is the answer in every case: the new binary is
+/// already on disk after any install method, and only the process is stale.
+/// It used to say `muxa upgrade` instead, which is actively wrong on a
+/// Homebrew install — `muxa upgrade` is `git pull` + `cargo install`, writing
+/// to `~/.cargo/bin`, which the Homebrew prefix shadows on `PATH`. That
+/// builds a binary the user never executes and leaves the running daemon
+/// exactly as stale as before.
+fn restart_remedy() -> String {
+    if installed_by_homebrew() {
+        "Restart it: `muxa daemon restart`. `brew upgrade` replaces the binary \
+         on disk but never the process already running on it."
+            .to_string()
+    } else {
+        "Restart it: `muxa daemon restart`. If the versions still disagree \
+         afterwards, the installed binary itself is stale — `muxa upgrade` \
+         rebuilds and reinstalls it (add `--no-pull` to build the current source)."
+            .to_string()
     }
 }
 
@@ -3444,12 +3578,33 @@ impl Client {
     /// Ask the daemon which additive features it supports and, when it can
     /// self-restart, which process-image generation is currently serving.
     pub async fn hello(&self, deadline: Duration) -> Result<Hello, RuntimeError> {
-        let req = serde_json::json!({
-            "protocol": PROTOCOL_VERSION,
-            "kind": "hello",
-            "client": self.collaboration_client_kind.hello_label(),
-        });
-        let resp = self.call_with_timeout(&req, deadline).await?;
+        let hello = |protocol: u32| {
+            serde_json::json!({
+                "protocol": protocol,
+                "kind": "hello",
+                "client": self.collaboration_client_kind.hello_label(),
+            })
+        };
+        let mut resp = self
+            .call_with_timeout(&hello(PROTOCOL_VERSION), deadline)
+            .await?;
+        // A daemon too old to speak our protocol refuses the handshake
+        // outright, naming the range it does support. Take it at its word and
+        // ask again at its ceiling.
+        //
+        // Without this, `hello` fails against exactly the daemon a caller most
+        // needs to reach: the stale one. `muxa daemon restart` opens with a
+        // `hello`, so the remedy for a version-skewed daemon was itself
+        // refused by that daemon — the diagnosis was reachable, the fix was
+        // not. Negotiation is per-connection and `hello` gets its own, so
+        // stepping down here cannot narrow any other call's protocol.
+        if !resp["ok"].as_bool().unwrap_or(false) {
+            let ceiling = server_protocol_ceiling(resp["error"].as_str())
+                .filter(|supported| *supported < PROTOCOL_VERSION);
+            if let Some(supported) = ceiling {
+                resp = self.call_with_timeout(&hello(supported), deadline).await?;
+            }
+        }
         if !resp["ok"].as_bool().unwrap_or(false) {
             return Err(RuntimeError::Json(serde::de::Error::custom(format!(
                 "hello rejected: {}",
@@ -3467,6 +3622,12 @@ impl Client {
                 })
                 .unwrap_or_default(),
             generation: resp["generation"].as_u64(),
+            version: resp["version"].as_str().map(str::to_string),
+            protocol: resp["protocol"]
+                .as_u64()
+                .unwrap_or(0)
+                .try_into()
+                .unwrap_or(0),
         })
     }
 
@@ -3474,7 +3635,12 @@ impl Client {
     /// is not completion; callers confirm completion by waiting for `hello`'s
     /// generation to advance.
     pub async fn restart(&self, deadline: Duration) -> Result<(), RuntimeError> {
-        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "restart" });
+        // Sent unversioned on purpose. `restart` carries no payload for two
+        // builds to disagree about, and a daemon stale enough to need
+        // restarting is exactly the one that would refuse a request stamped
+        // with this CLI's protocol number. `protocol: 0` is the wire's
+        // "unversioned" value, which every daemon accepts.
+        let req = serde_json::json!({ "protocol": 0, "kind": "restart" });
         let resp = self.call_with_timeout(&req, deadline).await?;
         if !resp["ok"].as_bool().unwrap_or(false) {
             return Err(RuntimeError::Json(serde::de::Error::custom(format!(
@@ -3489,7 +3655,9 @@ impl Client {
     /// completion; callers confirm completion by waiting for the socket to
     /// stop answering.
     pub async fn stop(&self, deadline: Duration) -> Result<(), RuntimeError> {
-        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "stop" });
+        // Unversioned for the same reason as `restart` above: stopping a
+        // daemon must not depend on agreeing with it about the wire format.
+        let req = serde_json::json!({ "protocol": 0, "kind": "stop" });
         let resp = self.call_with_timeout(&req, deadline).await?;
         if !resp["ok"].as_bool().unwrap_or(false) {
             return Err(RuntimeError::Json(serde::de::Error::custom(format!(
@@ -4430,7 +4598,79 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("older than this CLI"), "{message}");
-        assert!(message.contains("muxa upgrade"), "{message}");
+        // The remedy has to be the one that actually works from any install:
+        // the fresh binary is already on disk, only the process is stale.
+        assert!(message.contains("muxa daemon restart"), "{message}");
+    }
+
+    #[test]
+    fn a_refusal_names_the_protocol_to_step_down_to() {
+        // The exact sentence an out-of-range daemon returns. Parsing its upper
+        // bound is what lets `hello` reach a daemon too old to answer at this
+        // build's protocol — the daemon a caller most needs to restart.
+        assert_eq!(
+            server_protocol_ceiling(Some("unsupported protocol: server supports [1,4] client=6")),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn only_an_out_of_range_refusal_offers_a_ceiling() {
+        // A protocol mismatch is a different failure with a different remedy,
+        // and re-asking at a parsed-out number would be guessing.
+        assert_eq!(
+            server_protocol_ceiling(Some("protocol mismatch: server=4 client=6")),
+            None
+        );
+        assert_eq!(server_protocol_ceiling(None), None);
+        assert_eq!(
+            server_protocol_ceiling(Some("unsupported protocol: mangled")),
+            None
+        );
+    }
+
+    #[test]
+    fn hello_reports_no_skew_against_a_matching_daemon() {
+        let hello = Hello {
+            capabilities: Vec::new(),
+            generation: None,
+            protocol: PROTOCOL_VERSION,
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        };
+        assert_eq!(hello.version_skew(), None);
+    }
+
+    #[test]
+    fn hello_reports_skew_against_a_different_build() {
+        // The case protocol negotiation cannot see: both halves speak the same
+        // wire format, and the daemon is still months of logic behind.
+        let hello = Hello {
+            capabilities: Vec::new(),
+            generation: None,
+            protocol: PROTOCOL_VERSION,
+            version: Some("0.0.1-ancient".to_string()),
+        };
+        let skew = hello.version_skew().expect("a differing build is skew");
+        assert_eq!(skew.daemon.as_deref(), Some("0.0.1-ancient"));
+        assert_eq!(skew.client, env!("CARGO_PKG_VERSION"));
+        let described = skew.to_string();
+        assert!(described.contains("0.0.1-ancient"), "{described}");
+        assert!(described.contains("muxa daemon restart"), "{described}");
+    }
+
+    #[test]
+    fn hello_treats_a_silent_daemon_as_skewed() {
+        // A daemon old enough to predate the `version` field has, by that fact
+        // alone, established that it is older than this client.
+        let hello = Hello {
+            capabilities: Vec::new(),
+            generation: None,
+            protocol: PROTOCOL_VERSION,
+            version: None,
+        };
+        let skew = hello.version_skew().expect("a silent daemon is skew");
+        assert_eq!(skew.daemon, None);
+        assert_eq!(skew.daemon_label(), "an older build");
     }
 
     #[test]

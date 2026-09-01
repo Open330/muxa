@@ -173,14 +173,39 @@ fn tally(result: CheckResult, issues: &mut u32) {
 async fn check_muxad(socket: &Path) -> CheckResult {
     let client = Client::new(socket.to_path_buf());
     match timeout(Duration::from_millis(1500), client.snapshot()).await {
-        Ok(Ok(_)) => CheckResult::Ok(format!("muxad responding at {}", socket.display())),
+        // Answering is not the same as being current. A daemon left running
+        // across an upgrade keeps serving correctly-shaped responses out of
+        // the old build for as long as the protocol number happens to agree,
+        // so a passing snapshot is exactly when this is worth saying.
+        Ok(Ok(_)) => match timeout(
+            Duration::from_millis(1500),
+            client.hello(Duration::from_millis(1500)),
+        )
+        .await
+        {
+            Ok(Ok(hello)) => hello.version_skew().map_or_else(
+                || CheckResult::Ok(format!("muxad responding at {}", socket.display())),
+                |skew| CheckResult::Warn(skew.to_string()),
+            ),
+            _ => CheckResult::Ok(format!("muxad responding at {}", socket.display())),
+        },
         // The inner error already carries the failure mode — including
         // socket path, connection refused vs. RPC mismatch, etc. The
         // previous wording ("reachable but errored") was misleading when
         // the inner error was actually "daemon not reachable", which is
         // the most common cause. Surface the underlying message and add
         // a single concrete next step.
-        Ok(Err(e)) => CheckResult::Fail(format!("{e} — run `muxa init` to repair")),
+        // A protocol mismatch already carries its own remedy from the IPC
+        // layer, and it is not the one `muxa init` performs — appending the
+        // generic repair line would offer two fixes for a problem with one.
+        Ok(Err(e)) => {
+            let message = e.to_string();
+            if message.starts_with("protocol mismatch") {
+                CheckResult::Fail(message)
+            } else {
+                CheckResult::Fail(format!("{message} — run `muxa init` to repair"))
+            }
+        }
         Err(_) => CheckResult::Fail(format!(
             "muxad not responding within 1.5 s at {} — start `muxad` or run `muxa init`",
             socket.display()
