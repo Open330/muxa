@@ -1016,6 +1016,8 @@ final class AppModel: ObservableObject {
     /// Collaboration requests retain the agent's stable session identity even
     /// when tmux reuses or moves its pane. Prefer that identity, then use the
     /// room alias and pane address only as progressively weaker live fallbacks.
+    /// If the agent really ended, keep the historical conversation actionable
+    /// by opening its surviving window, session, or host instead of failing.
     static func operatorSelection(
         for message: MuxaOperatorMessage,
         in snapshot: MuxaExecutionSnapshot
@@ -1060,6 +1062,30 @@ final class AppModel: ObservableObject {
         let roomPanes = panes.filter { matchesRoom($0.pane) }
         if roomPanes.count == 1, let roomPane = roomPanes.first {
             return .pane(roomPane.id)
+        }
+
+        let host = snapshot.watchHosts.first { $0.host.alias == message.host.alias }
+        let windows = host?.sessions.flatMap(\.windows) ?? []
+        let roomWindows = windows.filter { window in
+            window.windowID == participant.room.windowID
+                && (participantSocket == nil || window.socket == participantSocket)
+        }
+        if roomWindows.count == 1, let roomWindow = roomWindows.first {
+            return .fleetWindow(roomWindow.identity)
+        }
+
+        if let sessionID = participant.sessionID, !sessionID.isEmpty {
+            let sessions = host?.sessions.filter { session in
+                session.sessionID == sessionID
+                    && (participantSocket == nil || session.socket == participantSocket)
+            } ?? []
+            if sessions.count == 1, let session = sessions.first {
+                return .fleetSession(session.identity)
+            }
+        }
+
+        if host != nil {
+            return .host(message.host.alias)
         }
         return nil
     }

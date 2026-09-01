@@ -1572,6 +1572,19 @@ private struct OperatorMessageDetail: View {
     @ObservedObject var model: AppModel
 
     private var request: MuxaCollaborationRequest { message.request }
+    private var openDestination: MuxaSidebarSelection? {
+        AppModel.operatorSelection(for: message, in: model.executionSnapshot)
+    }
+    private var openDestinationLabel: String {
+        switch openDestination {
+        case .agent, .pane: "Open Agent"
+        case .fleetWindow: "Open Window"
+        case .fleetSession: "Open Session"
+        case .host: "Open Host"
+        case nil: "Agent Ended"
+        default: "Open Context"
+        }
+    }
     private var statusColor: Color {
         if request.reply?.status == "completed" { return .green }
         if ["blocked", "failed", "declined", "expired", "cancelled"].contains(request.status) {
@@ -1608,9 +1621,10 @@ private struct OperatorMessageDetail: View {
                 Button {
                     model.openOperatorMessage(message)
                 } label: {
-                    Label("Open Agent", systemImage: "rectangle.and.hand.point.up.left")
+                    Label(openDestinationLabel, systemImage: "rectangle.and.hand.point.up.left")
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(openDestination == nil)
             }
             .padding(.horizontal, 16)
             .frame(minHeight: 54)
