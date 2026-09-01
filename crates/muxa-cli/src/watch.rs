@@ -1884,7 +1884,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  Alt-A          attention-only filter",
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
-        "  m / M          message selected agent / mailbox (b alias)",
+        "  m / M / Space  message selected or marked / mailbox / mark agent",
         "  Alt-1/2 · W    screen topology / collab · W is the work table",
         "  v              (in collab) toggle table / sequence history",
         "  i / e          (in mailbox) claim inbox / reply",
@@ -2614,6 +2614,18 @@ enum CollaborationComposeTarget {
         request_id: String,
         status: RequestStatus,
     },
+    /// One body, several recipients — each delivered as its own ordinary
+    /// request. Not a daemon-side broadcast: per-recipient authorization,
+    /// provenance, wake gating and reply threading only survive if every
+    /// recipient gets a request of its own.
+    Broadcast {
+        origin: CollaborationOrigin,
+        /// `(pane, label)` per recipient, resolved and frozen when the
+        /// composer opened. A refresh mid-compose cannot add or drop one.
+        recipients: Vec<(String, String)>,
+        kind: RequestKind,
+        mode: ComposeSendMode,
+    },
     /// Keystrokes-only composer for a pane that cannot receive a request —
     /// collaboration disabled, no room, no peer, or a row outside this
     /// window. `m` still owes the user a way to type at the agent they are
@@ -2671,6 +2683,58 @@ impl Default for CollaborationComposeDefaults {
         Self {
             kind: RequestKind::Question,
             mode: ComposeSendMode::ReadOnly,
+        }
+    }
+}
+
+/// One marked recipient, addressed the way a single send already addresses
+/// one: by pane. The daemon resolves `pane:%N` itself and refuses what it
+/// cannot route, so marking works the same for a room peer and for the
+/// host-scope target `m` resolves — one path, not two.
+///
+/// `agent_session_id` is carried for pruning rather than addressing: a mark
+/// whose pane is now occupied by a different agent session is dropped instead
+/// of quietly addressing the newcomer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CollaborationMark {
+    pane: String,
+    agent_session_id: Option<String>,
+}
+
+/// What a broadcast did, one row per recipient.
+///
+/// Held rather than summarised: "sent to 5" is the shape of report that let a
+/// tap sit a version behind and an empty reply close a request this week. A
+/// recipient that failed stays on screen with its reason until dismissed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BroadcastReport {
+    rows: Vec<BroadcastRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BroadcastRow {
+    label: String,
+    outcome: Result<String, String>,
+}
+
+impl BroadcastReport {
+    fn delivered(&self) -> usize {
+        self.rows.iter().filter(|row| row.outcome.is_ok()).count()
+    }
+
+    fn failed(&self) -> usize {
+        self.rows.len() - self.delivered()
+    }
+
+    fn title(&self) -> String {
+        let failed = self.failed();
+        if failed == 0 {
+            format!("broadcast · {} delivered", self.delivered())
+        } else {
+            format!(
+                "broadcast · {} delivered, {failed} failed",
+                self.delivered()
+            )
         }
     }
 }
@@ -3020,6 +3084,19 @@ pub(crate) struct App {
     /// room in the daemon to render a topology tree.
     pub(crate) collab: CollabScreen,
     collaboration_composer: Option<CollaborationComposer>,
+    /// Agents the operator marked with `Space`, to be addressed together.
+    ///
+    /// Keyed by `(socket, pane, agent session)` — the same triple the mailbox
+    /// pins a recipient to — so a mark names one agent session rather than a
+    /// screen position. A re-sort cannot move it onto someone else, and an
+    /// agent that exits takes its mark with it: resolution intersects the set
+    /// with the room's current peers, and what is gone is dropped rather than
+    /// silently addressed.
+    collaboration_marks: std::collections::HashSet<CollaborationMark>,
+    /// Per-recipient outcome of the last broadcast, kept on screen until
+    /// dismissed. A fan-out that reports one line cannot say which of five
+    /// agents did not get it.
+    broadcast_report: Option<BroadcastReport>,
     /// Reusable templates loaded once from `[message.skills]`; palette
     /// filtering never touches disk or the daemon.
     message_skills: BTreeMap<String, String>,
@@ -3290,6 +3367,8 @@ impl App {
             previous_layout: WatchLayout::Tree,
             collab,
             collaboration_composer: None,
+            collaboration_marks: std::collections::HashSet::new(),
+            broadcast_report: None,
             message_skills: BTreeMap::new(),
             message_skill_editor: None,
             collaboration_compose_defaults,
@@ -7830,6 +7909,14 @@ pub async fn run(
                     refresh_watch_collaboration(client, &mut app).await;
                     open_watch_collaboration_composer(&mut app);
                 }
+                Action::ToggleCollaborationMark => {
+                    refresh_watch_collaboration(client, &mut app).await;
+                    let outcome = toggle_collaboration_mark(&mut app);
+                    apply_outcome_to_app(&mut app, outcome);
+                }
+                Action::DismissBroadcastReport => {
+                    app.broadcast_report = None;
+                }
                 Action::OpenCollaborationMailbox => {
                     refresh_watch_collaboration(client, &mut app).await;
                     app.collaboration_mailbox.open = true;
@@ -7837,7 +7924,14 @@ pub async fn run(
                 }
                 Action::SubmitCollaboration => {
                     if let Some(composer) = app.collaboration_composer.take() {
-                        let outcome = run_watch_collaboration_composer(client, composer).await;
+                        let (outcome, report) =
+                            run_watch_collaboration_composer(client, composer).await;
+                        if report.is_some() {
+                            // A delivered broadcast consumes its marks: leaving
+                            // them set invites a second, unintended send.
+                            app.collaboration_marks.clear();
+                        }
+                        app.broadcast_report = report;
                         apply_outcome_to_app(&mut app, outcome);
                         refresh_watch_collaboration(client, &mut app).await;
                     }
@@ -8726,7 +8820,16 @@ async fn refresh_ask_entries(client: &Client, app: &mut App) {
     }
 }
 
-fn open_watch_collaboration_composer(app: &mut App) {
+/// Who the cursor means, for both `m` and `Space`.
+///
+/// Extracted so marking and messaging can never disagree about the agent under
+/// the cursor: one resolution, two callers. Returns the recipient as
+/// `(pane, label, pane_key, agent session)` — the same shape the single-send
+/// composer already builds its target from — or the hint explaining why the
+/// cursor names nobody.
+fn collaboration_target_at_cursor(
+    app: &App,
+) -> Result<(String, String, Option<PaneKey>, Option<String>), String> {
     let same_room = match app.collaboration.room.as_ref() {
         None => Err(app
             .collaboration
@@ -8775,6 +8878,7 @@ fn open_watch_collaboration_composer(app: &mut App) {
                         peer.pane.clone(),
                         peer.label(),
                         participant_pane_key(app, peer),
+                        Some(peer.agent_session_id.clone()),
                     )
                 })
                 .ok_or_else(|| no_target_hint(app, room))
@@ -8785,15 +8889,112 @@ fn open_watch_collaboration_composer(app: &mut App) {
     // Otherwise `m` on an external session could silently address the one
     // unrelated agent beside the watch pane. Window scope retains the room
     // behavior.
-    let peer = host_scope_target(app).or_else(|| match same_room {
-        Ok(peer) => Some(peer),
+    if let Some((pane, label, pane_key)) = host_scope_target(app) {
+        let session = app
+            .collaboration
+            .peer_for_pane(&pane)
+            .map(|peer| peer.agent_session_id.clone());
+        return Ok((pane, label, pane_key, session));
+    }
+    match same_room {
+        Ok((pane, label, pane_key, session)) => Ok((pane, label, pane_key, session)),
+        Err(reason) => Err(reason),
+    }
+}
+
+/// `Space`: mark or unmark the agent under the cursor.
+///
+/// Deliberately the same resolution `m` uses, so what you mark is what you
+/// would have messaged.
+fn toggle_collaboration_mark(app: &mut App) -> ActionOutcome {
+    let (pane, label, _, agent_session_id) = match collaboration_target_at_cursor(app) {
+        Ok(target) => target,
+        Err(reason) => return ActionOutcome::Err(reason),
+    };
+    let mark = CollaborationMark {
+        pane,
+        agent_session_id,
+    };
+    if app.collaboration_marks.remove(&mark) {
+        ActionOutcome::Ok(format!(
+            "unmarked {label} · {} marked",
+            app.collaboration_marks.len()
+        ))
+    } else {
+        app.collaboration_marks.insert(mark);
+        ActionOutcome::Ok(format!(
+            "marked {label} · {} marked",
+            app.collaboration_marks.len()
+        ))
+    }
+}
+
+/// The marked recipients that still exist, as `(pane, label)`.
+///
+/// Marks are pruned rather than trusted: a pane that went away, or one whose
+/// agent session was replaced, is dropped here instead of being addressed.
+/// Ordering follows the current row order so the confirmation reads like the
+/// screen.
+fn resolved_marks(app: &App) -> Vec<(String, String)> {
+    let mut resolved = Vec::new();
+    let Some(room) = app.collaboration.room.as_ref() else {
+        return resolved;
+    };
+    for peer in &room.peers {
+        let mark = CollaborationMark {
+            pane: peer.pane.clone(),
+            agent_session_id: Some(peer.agent_session_id.clone()),
+        };
+        let paneless = CollaborationMark {
+            pane: peer.pane.clone(),
+            agent_session_id: None,
+        };
+        if app.collaboration_marks.contains(&mark) || app.collaboration_marks.contains(&paneless) {
+            resolved.push((peer.pane.clone(), peer.label()));
+        }
+    }
+    resolved
+}
+
+/// Marks the room can no longer account for. Shown next to the recipients so a
+/// broadcast never quietly addresses fewer agents than were marked.
+fn stale_mark_count(app: &App) -> usize {
+    app.collaboration_marks
+        .len()
+        .saturating_sub(resolved_marks(app).len())
+}
+
+fn open_watch_collaboration_composer(app: &mut App) {
+    let marked = resolved_marks(app);
+    if !marked.is_empty() {
+        let Some(origin) = app.collaboration.origin.clone() else {
+            app.set_hint(collaboration_open_hint(), HintLevel::Err);
+            return;
+        };
+        let stale = stale_mark_count(app);
+        let label = if stale == 0 {
+            format!("{} marked agents", marked.len())
+        } else {
+            format!("{} marked agents ({stale} gone)", marked.len())
+        };
+        let defaults = app.collaboration_compose_defaults;
+        app.collaboration_composer = Some(CollaborationComposer::new(
+            CollaborationComposeTarget::Broadcast {
+                origin,
+                recipients: marked,
+                kind: defaults.kind,
+                mode: defaults.mode,
+            },
+            label,
+        ));
+        return;
+    }
+    let (peer_pane, peer_label, pane_key, _) = match collaboration_target_at_cursor(app) {
+        Ok(target) => target,
         Err(reason) => {
             open_prompt_only_composer(app, reason);
-            None
+            return;
         }
-    });
-    let Some((peer_pane, peer_label, pane_key)) = peer else {
-        return;
     };
     let Some(origin) = app.collaboration.origin.clone() else {
         app.set_hint(collaboration_open_hint(), HintLevel::Err);
@@ -8819,6 +9020,89 @@ fn open_watch_collaboration_composer(app: &mut App) {
 }
 
 async fn run_watch_collaboration_composer(
+    client: &Client,
+    composer: CollaborationComposer,
+) -> (ActionOutcome, Option<BroadcastReport>) {
+    if let CollaborationComposeTarget::Broadcast {
+        origin,
+        recipients,
+        kind,
+        mode,
+    } = composer.target
+    {
+        return run_watch_collaboration_broadcast(
+            client,
+            &origin,
+            recipients,
+            kind,
+            mode,
+            composer.input,
+        )
+        .await;
+    }
+    (run_watch_collaboration_single(client, composer).await, None)
+}
+
+/// Send one body to several recipients as several ordinary requests.
+///
+/// Sequential on purpose: each send is an independent authorization decision
+/// on the daemon, and a burst of concurrent wakes into the same room is not
+/// something this buys anything by. A failure stops nothing — the remaining
+/// recipients are still attempted, and every outcome is reported.
+async fn run_watch_collaboration_broadcast(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    recipients: Vec<(String, String)>,
+    kind: RequestKind,
+    mode: ComposeSendMode,
+    body: String,
+) -> (ActionOutcome, Option<BroadcastReport>) {
+    let work_mode = match mode {
+        ComposeSendMode::ReadOnly => WorkMode::ReadOnly,
+        ComposeSendMode::Execute => WorkMode::Execute,
+        ComposeSendMode::JustSend => {
+            return (
+                ActionOutcome::Err(
+                    "just-send types into one pane and cannot address a marked set".into(),
+                ),
+                None,
+            )
+        }
+    };
+    let mut rows = Vec::with_capacity(recipients.len());
+    for (pane, label) in recipients {
+        let request = NewRequest {
+            kind,
+            body: body.clone(),
+            expects_reply: kind != RequestKind::Notice,
+            work_mode,
+            thread_id: None,
+            parent_request_id: None,
+            workspace_id: None,
+            work_id: None,
+            run_id: None,
+            paths: Vec::new(),
+            artifacts: Vec::new(),
+            links: Vec::new(),
+            air_artifacts: Vec::new(),
+        };
+        let outcome = client
+            .collaboration_send(origin, &format!("pane:{pane}"), &request)
+            .await
+            .map(|sent| short_collaboration_request_id(&sent.id).clone())
+            .map_err(|error| error.to_string());
+        rows.push(BroadcastRow { label, outcome });
+    }
+    let report = BroadcastReport { rows };
+    let outcome = if report.failed() == 0 {
+        ActionOutcome::Ok(report.title())
+    } else {
+        ActionOutcome::Err(report.title())
+    };
+    (outcome, Some(report))
+}
+
+async fn run_watch_collaboration_single(
     client: &Client,
     composer: CollaborationComposer,
 ) -> ActionOutcome {
@@ -8866,6 +9150,9 @@ async fn run_watch_collaboration_composer(
                 )),
                 Err(error) => ActionOutcome::Err(format!("collaboration send failed: {error}")),
             }
+        }
+        CollaborationComposeTarget::Broadcast { .. } => {
+            ActionOutcome::Err("broadcast is dispatched by its own runner".into())
         }
         CollaborationComposeTarget::Prompt { .. }
         | CollaborationComposeTarget::PromptTopology { .. } => ActionOutcome::Err(
@@ -9170,6 +9457,8 @@ pub(crate) enum Action {
     /// Resolve the selected row as a same-window collaboration peer and open
     /// the durable request composer.
     OpenCollaborationMessage,
+    ToggleCollaborationMark,
+    DismissBroadcastReport,
     /// Refresh and open incoming/sent collaboration history.
     OpenCollaborationMailbox,
     /// Submit the active collaboration request or reply composer.
@@ -9535,6 +9824,13 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     // else passes through but is ignored — we don't want `c` while
     // the overlay is open to silently copy a prompt the user can't
     // see.
+    if app.broadcast_report.is_some() {
+        return match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => Action::DismissBroadcastReport,
+            _ => Action::None,
+        };
+    }
+
     if app.help_open {
         return match code {
             KeyCode::F(1) | KeyCode::Esc | KeyCode::Char('q' | '?') => {
@@ -9711,6 +10007,9 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Char('r') if app.browse_keys_active() => Action::Refresh,
         KeyCode::Char('o') if app.browse_keys_active() => Action::OpenPreview,
         KeyCode::Char('m') if app.browse_keys_active() => Action::OpenCollaborationMessage,
+        // Space marks the agent under the cursor for a `m` that addresses
+        // several at once. Unbound before this, and the conventional mark key.
+        KeyCode::Char(' ') if app.browse_keys_active() => Action::ToggleCollaborationMark,
         // `b` is the legacy alias retained after the pair became m/M.
         KeyCode::Char('M' | 'b') if app.browse_keys_active() => Action::OpenCollaborationMailbox,
         KeyCode::Char('n') if app.browse_keys_active() => {
@@ -10537,7 +10836,15 @@ fn composer_cycle_option(app: &mut App) -> bool {
             hint = Some("kind applies to requests — Ctrl-E to leave just-send");
             None
         }
-        CollaborationComposeTarget::Send { kind, mode, .. } => {
+        CollaborationComposeTarget::Broadcast {
+            mode: ComposeSendMode::JustSend,
+            ..
+        } => {
+            hint = Some("a marked set is addressed as requests — Ctrl-E to leave just-send");
+            None
+        }
+        CollaborationComposeTarget::Send { kind, mode, .. }
+        | CollaborationComposeTarget::Broadcast { kind, mode, .. } => {
             *kind = match *kind {
                 RequestKind::Question => RequestKind::Review,
                 RequestKind::Review => RequestKind::Task,
@@ -11506,11 +11813,8 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         render_collaboration_composer(f, popup_area, app);
     }
-    if app.ask_panel.open {
-        let popup_area = centered_rect(86, 78, chunks[1]);
-        f.render_widget(Clear, popup_area);
-        render_ask_panel(f, popup_area, app);
-    }
+    render_ask_panel_overlay(f, chunks[1], app);
+    render_broadcast_report_overlay(f, chunks[1], app);
     render_work_composer_overlay(f, chunks[1], app);
     render_rename_overlay(f, chunks[1], app);
     if app.ask_composer.is_some() {
@@ -12422,6 +12726,66 @@ fn render_message_skill_editor(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn render_ask_panel_overlay(f: &mut Frame, area: Rect, app: &App) {
+    if !app.ask_panel.open {
+        return;
+    }
+    let popup_area = centered_rect(86, 78, area);
+    f.render_widget(Clear, popup_area);
+    render_ask_panel(f, popup_area, app);
+}
+
+fn render_broadcast_report_overlay(f: &mut Frame, area: Rect, app: &App) {
+    if app.broadcast_report.is_none() {
+        return;
+    }
+    let popup_area = centered_rect(72, 60, area);
+    f.render_widget(Clear, popup_area);
+    render_broadcast_report(f, popup_area, app);
+}
+
+/// One row per recipient: the request id it got, or why it did not.
+fn render_broadcast_report(f: &mut Frame, area: Rect, app: &App) {
+    let Some(report) = app.broadcast_report.as_ref() else {
+        return;
+    };
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let border = if report.failed() == 0 {
+        theme.state_idle
+    } else {
+        theme.state_error
+    };
+    let mut lines: Vec<Line> = report
+        .rows
+        .iter()
+        .map(|row| match &row.outcome {
+            Ok(id) => Line::from(vec![
+                Span::styled("  ok   ", Style::default().fg(theme.state_idle)),
+                Span::raw(format!("{:<28} ", row.label)),
+                Span::styled(id.clone(), theme.dim_style()),
+            ]),
+            Err(error) => Line::from(vec![
+                Span::styled("  fail ", Style::default().fg(theme.state_error)),
+                Span::raw(format!("{:<28} ", row.label)),
+                Span::styled(error.clone(), Style::default().fg(theme.state_error)),
+            ]),
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" Esc ", theme.key_badge()),
+        Span::styled(
+            "dismiss · a failed recipient was not sent to, and no retry happened",
+            theme.dim_style(),
+        ),
+    ]));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Line::from(format!(" {} ", report.title())));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn collaboration_composer_title(
     composer: &CollaborationComposer,
     theme: WatchThemeSpec,
@@ -12456,7 +12820,8 @@ fn collaboration_composer_title(
             ]),
             Color::Gray,
         ),
-        CollaborationComposeTarget::Send { kind, mode, .. } => {
+        CollaborationComposeTarget::Send { kind, mode, .. }
+        | CollaborationComposeTarget::Broadcast { kind, mode, .. } => {
             let work_mode = match mode {
                 ComposeSendMode::Execute => WorkMode::Execute,
                 _ => WorkMode::ReadOnly,
@@ -17067,7 +17432,9 @@ fn render_collaboration_composer_footer(
         Span::raw("send  "),
     ];
     match target {
-        Some(CollaborationComposeTarget::Send { .. }) => {
+        Some(
+            CollaborationComposeTarget::Send { .. } | CollaborationComposeTarget::Broadcast { .. },
+        ) => {
             spans.extend([
                 Span::styled(" Tab ", theme.key_badge()),
                 Span::raw("kind  "),
@@ -20154,6 +20521,178 @@ mod tests {
                 .is_some_and(|composer| composer.label.contains("%1")));
             app.collaboration_composer = None;
         }
+    }
+
+    /// Marking is the same resolution `m` uses, so what is marked is what
+    /// would have been messaged — and `m` then addresses the set rather than
+    /// the cursor.
+    #[test]
+    fn marked_agents_become_the_composer_s_recipients() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let first = fake_collaboration_participant("%1", "agent-1", None);
+        let second = fake_collaboration_participant("%2", "agent-2", None);
+        app.collaboration.origin = Some(CollaborationOrigin {
+            pane: "console".into(),
+            socket: Some("default".into()),
+            console: true,
+        });
+        app.collaboration.room = Some(RoomContext {
+            current: first.clone(),
+            peers: vec![first.clone(), second.clone()],
+            unread: 0,
+            unread_replies: 0,
+        });
+
+        for pane in ["%1", "%2"] {
+            let key = app
+                .topology
+                .sessions
+                .iter()
+                .flat_map(|session| session.windows.iter())
+                .flat_map(|window| window.panes.iter())
+                .find(|candidate| candidate.key.pane_id == pane)
+                .map(|candidate| TopologyNodeKey::Pane(candidate.key.clone()))
+                .expect("pane in the fixture");
+            select_tree_key(&mut app, &key);
+            let outcome = toggle_collaboration_mark(&mut app);
+            assert!(matches!(outcome, ActionOutcome::Ok(_)), "{outcome:?}");
+        }
+        assert_eq!(app.collaboration_marks.len(), 2);
+
+        open_watch_collaboration_composer(&mut app);
+        let Some(CollaborationComposeTarget::Broadcast { recipients, .. }) = app
+            .collaboration_composer
+            .as_ref()
+            .map(|composer| composer.target.clone())
+        else {
+            panic!("marks should open a broadcast composer");
+        };
+        let panes: Vec<_> = recipients.iter().map(|(pane, _)| pane.as_str()).collect();
+        assert_eq!(panes, ["%1", "%2"]);
+    }
+
+    /// Pressing `Space` twice on one agent leaves nothing marked, and `m`
+    /// goes back to addressing the cursor.
+    #[test]
+    fn unmarking_the_last_agent_restores_the_single_recipient_composer() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let peer = fake_collaboration_participant("%1", "agent-1", None);
+        app.collaboration.origin = Some(CollaborationOrigin {
+            pane: "console".into(),
+            socket: Some("default".into()),
+            console: true,
+        });
+        app.collaboration.room = Some(RoomContext {
+            current: peer.clone(),
+            peers: vec![peer.clone()],
+            unread: 0,
+            unread_replies: 0,
+        });
+
+        toggle_collaboration_mark(&mut app);
+        assert_eq!(app.collaboration_marks.len(), 1);
+        toggle_collaboration_mark(&mut app);
+        assert!(app.collaboration_marks.is_empty());
+
+        open_watch_collaboration_composer(&mut app);
+        assert!(matches!(
+            app.collaboration_composer
+                .as_ref()
+                .map(|composer| &composer.target),
+            Some(CollaborationComposeTarget::Send { .. })
+        ));
+    }
+
+    /// A marked agent that exited is dropped rather than addressed, and the
+    /// composer says how many marks it could not account for — a fan-out that
+    /// silently shrinks is the failure this feature exists to avoid.
+    #[test]
+    fn a_mark_whose_agent_is_gone_is_dropped_and_counted() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let peer = fake_collaboration_participant("%1", "agent-1", None);
+        app.collaboration.origin = Some(CollaborationOrigin {
+            pane: "console".into(),
+            socket: Some("default".into()),
+            console: true,
+        });
+        app.collaboration.room = Some(RoomContext {
+            current: peer.clone(),
+            peers: vec![peer.clone()],
+            unread: 0,
+            unread_replies: 0,
+        });
+        app.collaboration_marks.insert(CollaborationMark {
+            pane: "%1".into(),
+            agent_session_id: Some("agent-1".into()),
+        });
+        // Marked while it was there; the room no longer lists it.
+        app.collaboration_marks.insert(CollaborationMark {
+            pane: "%99".into(),
+            agent_session_id: Some("agent-99".into()),
+        });
+
+        assert_eq!(resolved_marks(&app).len(), 1);
+        assert_eq!(stale_mark_count(&app), 1);
+
+        open_watch_collaboration_composer(&mut app);
+        let label = app
+            .collaboration_composer
+            .as_ref()
+            .map(|composer| composer.label.clone())
+            .expect("composer");
+        assert!(label.contains("1 gone"), "{label}");
+    }
+
+    /// A pane whose agent session was replaced is a different agent. The mark
+    /// names the session, so it does not follow the pane to the newcomer.
+    #[test]
+    fn a_mark_does_not_survive_the_agent_it_named() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let replacement = fake_collaboration_participant("%1", "agent-2", None);
+        app.collaboration.origin = Some(CollaborationOrigin {
+            pane: "console".into(),
+            socket: Some("default".into()),
+            console: true,
+        });
+        app.collaboration.room = Some(RoomContext {
+            current: replacement.clone(),
+            peers: vec![replacement],
+            unread: 0,
+            unread_replies: 0,
+        });
+        app.collaboration_marks.insert(CollaborationMark {
+            pane: "%1".into(),
+            agent_session_id: Some("agent-1".into()),
+        });
+
+        assert!(resolved_marks(&app).is_empty());
+        assert_eq!(stale_mark_count(&app), 1);
+    }
+
+    /// Every recipient keeps its own row. A partial failure that renders as
+    /// "sent" is the shape of bug this repo spent the week removing.
+    #[test]
+    fn a_broadcast_report_keeps_every_recipient_outcome() {
+        let report = BroadcastReport {
+            rows: vec![
+                BroadcastRow {
+                    label: "codex@%1".into(),
+                    outcome: Ok("req_ab".into()),
+                },
+                BroadcastRow {
+                    label: "claude@%2".into(),
+                    outcome: Err("target \"pane:%2\" is not a peer in this tmux window".into()),
+                },
+            ],
+        };
+        assert_eq!(report.delivered(), 1);
+        assert_eq!(report.failed(), 1);
+        assert!(report.title().contains("1 delivered"));
+        assert!(report.title().contains("1 failed"));
     }
 
     #[test]
@@ -24841,6 +25380,12 @@ sort = ["state"]
             | Action::Quick(_)
             | Action::RestartDaemon
             | Action::NotApplicable(_) => {}
+            // Mirrors the run loop: marking and dismissing are pure state.
+            Action::ToggleCollaborationMark => {
+                let outcome = toggle_collaboration_mark(app);
+                apply_outcome_to_app(app, outcome);
+            }
+            Action::DismissBroadcastReport => app.broadcast_report = None,
         }
     }
 
@@ -26286,7 +26831,7 @@ sort = ["state"]
         assert!(body.contains("Alt-A          attention-only filter"));
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
-        assert!(body.contains("m / M          message selected agent / mailbox (b alias)"));
+        assert!(body.contains("m / M / Space  message selected or marked / mailbox / mark agent"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains("a / A          ask / history; d deletes one · D clears all in A"));
         assert!(

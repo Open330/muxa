@@ -68,7 +68,8 @@ children keep their aggregate state markers.
 | `R` / `:rename` | Rename the selected tmux session or window, or set the selected pane title. |
 | `\|` | Cycle the list/inspector split: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | Ask the configured agent a headless question / browse the answers. |
-| `m` / `M` | Message the resolved agent / open history for the selected topology scope. |
+| `m` / `M` | Message the resolved agent — or every marked one — / open history for the selected topology scope. |
+| `Space` | Mark or unmark the agent under the cursor. With marks set, `m` composes once and sends one ordinary request to each; the result popup keeps a row per recipient. |
 | `b` | Legacy alias for `M`; `i` claims and `e` replies inside the mailbox. |
 | `v` | On the collaboration screen, toggle table / chronological sequence. |
 | `o` / `Alt-P` | Open live preview. |
