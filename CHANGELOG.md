@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.40] - 2026-09-01
+
 ### Added
 
 - **muxad re-execs onto a new binary on its own.** Installing muxa never
@@ -2798,7 +2800,7 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.39...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.40...HEAD
 [0.8.26]: https://github.com/Open330/muxa/compare/v0.8.25...v0.8.26
 [0.8.25]: https://github.com/Open330/muxa/compare/v0.8.24...v0.8.25
 [0.8.24]: https://github.com/Open330/muxa/compare/v0.8.23...v0.8.24
