@@ -3,10 +3,13 @@ import Foundation
 enum MuxaSidebarSelection: Codable, Hashable, Sendable {
     case workBoard
     case watch
+    case inbox
     case ask
     case work(MuxaWorkIdentity)
     case agent(String)
     case host(String)
+    case fleetSession(MuxaWatchSessionIdentity)
+    case fleetWindow(MuxaWatchWindowIdentity)
     case shell(String)
     case pane(MuxaWatchPaneIdentity)
 }
@@ -14,7 +17,7 @@ enum MuxaSidebarSelection: Codable, Hashable, Sendable {
 enum MuxaSidebarMode: String, CaseIterable, Identifiable {
     case work
     case watch
-    case hosts
+    case inbox
     case shells
 
     var id: Self { self }
@@ -23,7 +26,7 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
         switch self {
         case .work: "Work"
         case .watch: "Explore"
-        case .hosts: "Hosts"
+        case .inbox: "Inbox"
         case .shells: "Shells"
         }
     }
@@ -32,7 +35,7 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
         switch self {
         case .work: "square.stack.3d.up"
         case .watch: "sidebar.left"
-        case .hosts: "network"
+        case .inbox: "tray.full"
         case .shells: "terminal"
         }
     }
@@ -48,6 +51,12 @@ struct MuxaHostRegistrationRequest: Sendable {
     let overwrite: Bool
 }
 
+private struct MuxaInboxFetch: Sendable {
+    let target: MuxaWatchPane
+    let mailbox: MuxaCollaborationMailbox?
+    let error: String?
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     enum ConnectionState: Equatable {
@@ -60,6 +69,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var sessions: [MuxaSession] = []
     @Published private(set) var pipelineRuns: [MuxaPipelineRun] = []
     @Published private(set) var executionSnapshot = MuxaExecutionSnapshot.empty
+    @Published private(set) var workGroups: [MuxaWorkGroup] = []
+    @Published private(set) var hostedAgents: [MuxaHostedAgent] = []
     @Published private(set) var workspaceRevision: UInt64 = 0
     @Published var sidebarSelection: MuxaSidebarSelection?
     @Published var sidebarMode: MuxaSidebarMode = .work
@@ -75,9 +86,21 @@ final class AppModel: ObservableObject {
     @Published private(set) var workStartError: String?
     @Published var isConfirmingDaemonReplacement = false
     @Published private(set) var askEntries: [MuxaAskEntry] = []
+    @Published private(set) var askConversations: [MuxaAskConversation] = []
+    @Published private(set) var activeAskConversationID: String?
     @Published private(set) var askAgent = "claude"
+    @Published private(set) var askEnabled: Bool?
+    @Published private(set) var askConfigurationPendingReload = false
     @Published private(set) var isSendingAsk = false
+    @Published private(set) var isEnablingAsk = false
     @Published private(set) var askError: String?
+    @Published var isPresentingAskSettings = false
+    @Published private(set) var askSettingsStatus: String?
+    @Published private(set) var askSettingsError: String?
+    @Published private(set) var operatorMessages: [MuxaOperatorMessage] = []
+    @Published private(set) var mailboxRevisions: [String: UInt64] = [:]
+    @Published private(set) var isRefreshingInbox = false
+    @Published private(set) var inboxError: String?
     @Published var isPresentingHostRegistration = false
     @Published private(set) var isRegisteringHost = false
     @Published private(set) var hostRegistrationError: String?
@@ -85,9 +108,19 @@ final class AppModel: ObservableObject {
     let client: MuxaIPCClient
     private let daemon = DaemonManager()
     private var refreshTask: Task<Void, Never>?
+    private var fleetRefreshTask: Task<Void, Never>?
+    private var inboxEventTask: Task<Void, Never>?
+    private var askEventRefreshTask: Task<Void, Never>?
+    private var pipelineEventRefreshTask: Task<Void, Never>?
     private var connectionGeneration: UInt64 = 0
     private var refreshInFlight = false
+    private var fleetRefreshPending = false
+    private var askRefreshPending = false
+    private var pipelineRefreshPending = false
+    private var lastFleetRefresh = Date.distantPast
+    private var pendingInboxHosts = Set<String>()
     private var shellNumber = 1
+    private var lastInboxRefresh = Date.distantPast
 
     var isConnected: Bool {
         connectionState == .connected
@@ -100,26 +133,9 @@ final class AppModel: ObservableObject {
             || workStartError.contains("unknown pipeline")
     }
 
-    var workGroups: [MuxaWorkGroup] {
-        executionSnapshot.workGroups(pipelineRuns: pipelineRuns)
-    }
-
     var agents: [MuxaAgent] { executionSnapshot.agents }
 
     var fleetHosts: [MuxaFleetHost] { executionSnapshot.hosts }
-
-    var hostedAgents: [MuxaHostedAgent] {
-        executionSnapshot.hostedAgents
-            .filter { $0.agent.state != "stopped" }
-            .sorted { left, right in
-                let leftPriority = Self.agentPriority(left.agent.state)
-                let rightPriority = Self.agentPriority(right.agent.state)
-                if leftPriority != rightPriority { return leftPriority < rightPriority }
-                if left.host.local != right.host.local { return left.host.local }
-                if left.host.alias != right.host.alias { return left.host.alias < right.host.alias }
-                return left.agent.agentSessionID < right.agent.agentSessionID
-            }
-    }
 
     var selectedSessionID: String? {
         guard case let .shell(id) = sidebarSelection else { return nil }
@@ -153,6 +169,18 @@ final class AppModel: ObservableObject {
 
     private func beginConnection(replacingExistingDaemon: Bool) {
         refreshTask?.cancel()
+        fleetRefreshTask?.cancel()
+        inboxEventTask?.cancel()
+        askEventRefreshTask?.cancel()
+        pipelineEventRefreshTask?.cancel()
+        fleetRefreshTask = nil
+        inboxEventTask = nil
+        askEventRefreshTask = nil
+        pipelineEventRefreshTask = nil
+        fleetRefreshPending = false
+        askRefreshPending = false
+        pipelineRefreshPending = false
+        pendingInboxHosts.removeAll()
         connectionGeneration &+= 1
         let generation = connectionGeneration
         connectionState = .connecting
@@ -172,10 +200,11 @@ final class AppModel: ObservableObject {
                 guard connectionGeneration == generation else { return }
                 connectionState = .connected
                 await refresh(ifGeneration: generation)
-                while !Task.isCancelled {
-                    try await Task.sleep(for: .seconds(2))
-                    await refresh(ifGeneration: generation)
-                }
+                async let events: Void = runFleetSubscription(ifGeneration: generation)
+                async let askEvents: Void = runAskSubscription(ifGeneration: generation)
+                async let pipelineEvents: Void = runPipelineSubscription(ifGeneration: generation)
+                async let reconciliation: Void = runReconciliation(ifGeneration: generation)
+                _ = await (events, askEvents, pipelineEvents, reconciliation)
             } catch is CancellationError {
                 return
             } catch let error as IncompatibleMuxadError {
@@ -208,13 +237,25 @@ final class AppModel: ObservableObject {
             async let pipelineRequest = client.listPipelineRuns()
             async let executionRequest = client.executionSnapshot()
             async let askEntriesRequest = try? client.listAskEntries()
+            async let askConversationsRequest = try? client.listAskConversations()
             async let askAgentRequest = try? client.selectedAskAgent()
-            let (listedSessions, listedRuns, listedExecution, listedAskEntries, selectedAskAgent) = try await (
+            async let askStatusRequest = try? client.askStatus()
+            let (
+                listedSessions,
+                listedRuns,
+                listedExecution,
+                listedAskEntries,
+                listedAskConversations,
+                selectedAskAgent,
+                listedAskStatus
+            ) = try await (
                 sessionsRequest,
                 pipelineRequest,
                 executionRequest,
                 askEntriesRequest,
-                askAgentRequest
+                askConversationsRequest,
+                askAgentRequest,
+                askStatusRequest
             )
             let updated = listedSessions
                 .sorted { lhs, rhs in
@@ -222,19 +263,45 @@ final class AppModel: ObservableObject {
                     return (lhs.displayName ?? lhs.id) < (rhs.displayName ?? rhs.id)
                 }
             if let generation, connectionGeneration != generation { return }
-            sessions = updated
-            pipelineRuns = listedRuns.sorted {
+            let sortedRuns = listedRuns.sorted {
                 if $0.identity.workspaceID != $1.identity.workspaceID {
                     return $0.identity.workspaceID < $1.identity.workspaceID
                 }
                 return $0.identity.workID < $1.identity.workID
             }
-            executionSnapshot = listedExecution
-            if let listedAskEntries { askEntries = listedAskEntries }
-            if let selectedAskAgent { askAgent = selectedAskAgent }
-            reconcileWatchSelection()
-            workspaceRevision &+= 1
-            reconcileSelection()
+            let sessionsChanged = sessions != updated
+            let runsChanged = pipelineRuns != sortedRuns
+            let executionChanged = !executionSnapshot.hasSameSource(as: listedExecution)
+            if sessionsChanged { sessions = updated }
+            if runsChanged { pipelineRuns = sortedRuns }
+            if executionChanged { executionSnapshot = listedExecution }
+            if runsChanged || executionChanged { rebuildWorkspaceProjections() }
+            if let listedAskEntries, askEntries != listedAskEntries {
+                askEntries = listedAskEntries
+            }
+            if let listedAskConversations {
+                if askConversations != listedAskConversations.conversations {
+                    askConversations = listedAskConversations.conversations
+                }
+                if activeAskConversationID != listedAskConversations.active?.id {
+                    activeAskConversationID = listedAskConversations.active?.id
+                }
+            }
+            if let selectedAskAgent, askAgent != selectedAskAgent { askAgent = selectedAskAgent }
+            if let listedAskStatus {
+                if askEnabled != listedAskStatus { askEnabled = listedAskStatus }
+                if listedAskStatus { askConfigurationPendingReload = false }
+            }
+            if sidebarMode == .inbox,
+               Date().timeIntervalSince(lastInboxRefresh) >= 60,
+               !isRefreshingInbox {
+                Task { [weak self] in await self?.refreshOperatorInbox() }
+            }
+            if sessionsChanged || runsChanged || executionChanged {
+                reconcileWatchSelection()
+                workspaceRevision &+= 1
+                reconcileSelection()
+            }
             connectionState = .connected
         } catch is CancellationError {
             return
@@ -254,6 +321,266 @@ final class AppModel: ObservableObject {
                 connectionState = .failed(error.localizedDescription)
             }
         }
+    }
+
+    /// Push is the primary freshness path. A compact Fleet event only wakes
+    /// one coalesced snapshot fetch; bursts are capped at four publishes per
+    /// second and the 15-second reconciliation loop repairs disconnect/lag
+    /// gaps without returning to a high-frequency poll.
+    private func runFleetSubscription(ifGeneration generation: UInt64) async {
+        guard await client.supports(MuxaIPCClient.fleetSubscribeCapability) else { return }
+        while !Task.isCancelled, connectionGeneration == generation {
+            do {
+                let updates = try await client.fleetUpdates()
+                for try await update in updates {
+                    guard !Task.isCancelled, connectionGeneration == generation else { return }
+                    if update.mailboxRevision != nil {
+                        if mailboxRevisions[update.host] != update.mailboxRevision {
+                            mailboxRevisions[update.host] = update.mailboxRevision
+                        }
+                        scheduleInboxRefresh(host: update.host, ifGeneration: generation)
+                    } else {
+                        scheduleFleetRefresh(ifGeneration: generation)
+                    }
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard connectionGeneration == generation else { return }
+                MuxaLog.app.warning(
+                    "Fleet invalidation stream reconnecting: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+            try? await Task.sleep(for: .seconds(1))
+        }
+    }
+
+    private func runReconciliation(ifGeneration generation: UInt64) async {
+        while !Task.isCancelled, connectionGeneration == generation {
+            do {
+                try await Task.sleep(for: .seconds(15))
+            } catch {
+                return
+            }
+            await refresh(ifGeneration: generation)
+        }
+    }
+
+    private func runAskSubscription(ifGeneration generation: UInt64) async {
+        guard await client.supports(MuxaIPCClient.askSubscribeCapability) else { return }
+        while !Task.isCancelled, connectionGeneration == generation {
+            do {
+                let updates = try await client.askUpdates()
+                for try await _ in updates {
+                    guard connectionGeneration == generation else { return }
+                    scheduleAskRefresh(ifGeneration: generation)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard connectionGeneration == generation else { return }
+                MuxaLog.app.warning(
+                    "Ask invalidation stream reconnecting: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+            try? await Task.sleep(for: .seconds(1))
+        }
+    }
+
+    private func runPipelineSubscription(ifGeneration generation: UInt64) async {
+        guard await client.supports(MuxaIPCClient.pipelineSubscribeCapability) else { return }
+        while !Task.isCancelled, connectionGeneration == generation {
+            do {
+                let updates = try await client.pipelineUpdates()
+                for try await _ in updates {
+                    guard connectionGeneration == generation else { return }
+                    schedulePipelineRefresh(ifGeneration: generation)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard connectionGeneration == generation else { return }
+                MuxaLog.app.warning(
+                    "Pipeline invalidation stream reconnecting: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+            try? await Task.sleep(for: .seconds(1))
+        }
+    }
+
+    private func scheduleAskRefresh(ifGeneration generation: UInt64) {
+        askRefreshPending = true
+        guard askEventRefreshTask == nil else { return }
+        askEventRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            defer { askEventRefreshTask = nil }
+            while !Task.isCancelled,
+                  connectionGeneration == generation,
+                  askRefreshPending {
+                askRefreshPending = false
+                try? await Task.sleep(for: .milliseconds(75))
+                await refreshAskState(ifGeneration: generation)
+            }
+        }
+    }
+
+    private func schedulePipelineRefresh(ifGeneration generation: UInt64) {
+        pipelineRefreshPending = true
+        guard pipelineEventRefreshTask == nil else { return }
+        pipelineEventRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            defer { pipelineEventRefreshTask = nil }
+            while !Task.isCancelled,
+                  connectionGeneration == generation,
+                  pipelineRefreshPending {
+                pipelineRefreshPending = false
+                try? await Task.sleep(for: .milliseconds(75))
+                await refreshPipelineState(ifGeneration: generation)
+            }
+        }
+    }
+
+    private func refreshAskState(ifGeneration generation: UInt64) async {
+        do {
+            async let entriesRequest = client.listAskEntries()
+            async let conversationsRequest = client.listAskConversations()
+            let (entries, conversations) = try await (entriesRequest, conversationsRequest)
+            guard connectionGeneration == generation else { return }
+            if askEntries != entries { askEntries = entries }
+            if askConversations != conversations.conversations {
+                askConversations = conversations.conversations
+            }
+            if activeAskConversationID != conversations.active?.id {
+                activeAskConversationID = conversations.active?.id
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            MuxaLog.app.warning(
+                "Ask event refresh failed: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    private func refreshPipelineState(ifGeneration generation: UInt64) async {
+        do {
+            let listedRuns = try await client.listPipelineRuns().sorted {
+                if $0.identity.workspaceID != $1.identity.workspaceID {
+                    return $0.identity.workspaceID < $1.identity.workspaceID
+                }
+                return $0.identity.workID < $1.identity.workID
+            }
+            guard connectionGeneration == generation, pipelineRuns != listedRuns else { return }
+            pipelineRuns = listedRuns
+            rebuildWorkspaceProjections()
+            workspaceRevision &+= 1
+            reconcileSelection()
+        } catch is CancellationError {
+            return
+        } catch {
+            MuxaLog.app.warning(
+                "Pipeline event refresh failed: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    private func scheduleFleetRefresh(ifGeneration generation: UInt64) {
+        fleetRefreshPending = true
+        guard fleetRefreshTask == nil else { return }
+        fleetRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            defer { fleetRefreshTask = nil }
+            try? await Task.sleep(for: .milliseconds(75))
+            while !Task.isCancelled,
+                  connectionGeneration == generation,
+                  fleetRefreshPending {
+                fleetRefreshPending = false
+                let remaining = 0.25 - Date().timeIntervalSince(lastFleetRefresh)
+                if remaining > 0 {
+                    try? await Task.sleep(for: .seconds(remaining))
+                }
+                await refreshFleetState(ifGeneration: generation)
+            }
+        }
+    }
+
+    private func scheduleInboxRefresh(host: String, ifGeneration generation: UInt64) {
+        pendingInboxHosts.insert(host)
+        guard inboxEventTask == nil else { return }
+        inboxEventTask = Task { [weak self] in
+            guard let self else { return }
+            defer { inboxEventTask = nil }
+            try? await Task.sleep(for: .milliseconds(125))
+            while !Task.isCancelled,
+                  connectionGeneration == generation,
+                  !pendingInboxHosts.isEmpty {
+                let hosts = pendingInboxHosts
+                pendingInboxHosts.removeAll()
+                if isRefreshingInbox {
+                    pendingInboxHosts.formUnion(hosts)
+                    try? await Task.sleep(for: .milliseconds(200))
+                    continue
+                }
+                await refreshOperatorInbox(force: true, hostAliases: hosts)
+            }
+        }
+    }
+
+    private func refreshFleetState(ifGeneration generation: UInt64) async {
+        guard connectionGeneration == generation else { return }
+        guard !refreshInFlight else {
+            fleetRefreshPending = true
+            try? await Task.sleep(for: .milliseconds(100))
+            return
+        }
+        refreshInFlight = true
+        defer {
+            refreshInFlight = false
+            lastFleetRefresh = Date()
+        }
+        do {
+            async let sessionsRequest = client.listSessions()
+            async let executionRequest = client.executionSnapshot()
+            let (listedSessions, listedExecution) = try await (sessionsRequest, executionRequest)
+            guard connectionGeneration == generation else { return }
+            let sortedSessions = listedSessions.sorted { lhs, rhs in
+                if lhs.exited != rhs.exited { return !lhs.exited }
+                return (lhs.displayName ?? lhs.id) < (rhs.displayName ?? rhs.id)
+            }
+            let sessionsChanged = sessions != sortedSessions
+            let executionChanged = !executionSnapshot.hasSameSource(as: listedExecution)
+            if sessionsChanged { sessions = sortedSessions }
+            if executionChanged {
+                executionSnapshot = listedExecution
+                rebuildWorkspaceProjections()
+            }
+            if sessionsChanged || executionChanged {
+                reconcileWatchSelection()
+                workspaceRevision &+= 1
+                reconcileSelection()
+            }
+            connectionState = .connected
+        } catch is CancellationError {
+            return
+        } catch {
+            MuxaLog.app.warning(
+                "Fleet event refresh failed: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    private func rebuildWorkspaceProjections() {
+        hostedAgents = executionSnapshot.hostedAgents
+            .filter { $0.agent.state != "stopped" }
+            .sorted { left, right in
+                let leftPriority = Self.agentPriority(left.agent.state)
+                let rightPriority = Self.agentPriority(right.agent.state)
+                if leftPriority != rightPriority { return leftPriority < rightPriority }
+                if left.host.local != right.host.local { return left.host.local }
+                if left.host.alias != right.host.alias { return left.host.alias < right.host.alias }
+                return left.agent.agentSessionID < right.agent.agentSessionID
+            }
+        workGroups = executionSnapshot.workGroups(pipelineRuns: pipelineRuns)
     }
 
     func createShell() {
@@ -435,29 +762,354 @@ final class AppModel: ObservableObject {
         do {
             if askAgent != agent {
                 askAgent = try await client.selectAskAgent(agent)
+                let snapshot = try await client.listAskConversations()
+                askConversations = snapshot.conversations
+                activeAskConversationID = snapshot.active?.id
             }
-            let entry = try await client.sendAsk(prompt)
+            let provider = MuxaAskProvider(rawValue: agent)
+            let apiKey = provider.flatMap { MuxaProviderCredentialStore.key(for: $0) }
+            let entry = try await client.sendAsk(prompt, agent: agent, apiKey: apiKey)
             askEntries.removeAll { $0.id == entry.id }
             askEntries.insert(entry, at: 0)
+            if let snapshot = try? await client.listAskConversations() {
+                askConversations = snapshot.conversations
+                activeAskConversationID = snapshot.active?.id ?? entry.conversationID
+            } else if let conversationID = entry.conversationID {
+                activeAskConversationID = conversationID
+            }
             return true
         } catch {
             askError = error.localizedDescription
+            if error.localizedDescription.localizedCaseInsensitiveContains("ask is disabled") {
+                askEnabled = false
+            }
             return false
+        }
+    }
+
+    func enableAsk() async {
+        guard !isEnablingAsk else { return }
+        isEnablingAsk = true
+        askError = nil
+        defer { isEnablingAsk = false }
+        do {
+            if !askConfigurationPendingReload {
+                _ = try await Self.runBundledMuxa(
+                    arguments: [
+                        "init",
+                        "--component", "ask",
+                        "--yes",
+                        "--start-daemon=false",
+                    ],
+                    socketPath: client.socketPath
+                )
+                askConfigurationPendingReload = true
+            }
+            askEnabled = false
+            askSettingsStatus = "Global Ask is enabled in config. Reloading muxad applies the grant."
+            if sessions.contains(where: { !$0.exited }) {
+                isConfirmingDaemonReplacement = true
+            } else {
+                replaceRunningDaemon()
+            }
+        } catch {
+            askError = error.localizedDescription
+        }
+    }
+
+    func selectAskAgent(_ agent: String) async {
+        askError = nil
+        do {
+            askAgent = try await client.selectAskAgent(agent)
+            let snapshot = try await client.listAskConversations()
+            askConversations = snapshot.conversations
+            activeAskConversationID = snapshot.active?.id
+        } catch {
+            askError = error.localizedDescription
+        }
+    }
+
+    func selectAskConversation(_ conversationID: String) async {
+        guard activeAskConversationID != conversationID else { return }
+        askError = nil
+        do {
+            let conversation = try await client.selectAskConversation(conversationID)
+            askAgent = conversation.agent
+            activeAskConversationID = conversation.id
+            let snapshot = try await client.listAskConversations()
+            askConversations = snapshot.conversations
+        } catch {
+            askError = error.localizedDescription
         }
     }
 
     func resetAskConversation() async {
         askError = nil
         do {
-            try await client.resetAskConversation()
+            if let conversation = try await client.resetAskConversation() {
+                askConversations.removeAll { $0.id == conversation.id }
+                askConversations.insert(conversation, at: 0)
+                activeAskConversationID = conversation.id
+            } else {
+                activeAskConversationID = nil
+            }
         } catch {
             askError = error.localizedDescription
         }
     }
 
+    func presentAskSettings() {
+        askSettingsError = nil
+        askSettingsStatus = nil
+        isPresentingAskSettings = true
+    }
+
+    func saveProviderKey(_ key: String, provider: MuxaAskProvider) -> Bool {
+        askSettingsError = nil
+        do {
+            try MuxaProviderCredentialStore.save(key, for: provider)
+            askSettingsStatus = "Saved \(provider.title) key in the login Keychain. It will be passed only to the next matching Ask process."
+            return true
+        } catch {
+            askSettingsError = error.localizedDescription
+            return false
+        }
+    }
+
+    func removeProviderKey(_ provider: MuxaAskProvider) {
+        askSettingsError = nil
+        do {
+            try MuxaProviderCredentialStore.remove(for: provider)
+            askSettingsStatus = "Removed the \(provider.title) API key. Future Ask processes will use CLI sign-in or their inherited environment."
+        } catch {
+            askSettingsError = error.localizedDescription
+        }
+    }
+
+    func requestDaemonRestartForProviderSettings() {
+        isPresentingAskSettings = false
+        isConfirmingDaemonReplacement = true
+    }
+
+    func openProviderCLI(_ provider: MuxaAskProvider) async {
+        askSettingsError = nil
+        guard let executable = MuxaExecutableResolver.executablePath(provider.executable) else {
+            askSettingsError = "\(provider.title) CLI was not found in ~/.local/bin, Homebrew, or PATH."
+            return
+        }
+        do {
+            let arguments = provider == .codex ? ["login"] : []
+            let session = try await client.spawnShell(
+                command: executable,
+                arguments: arguments,
+                cwd: FileManager.default.homeDirectoryForCurrentUser.path,
+                name: provider == .codex ? "Codex Login" : "Claude Code Login",
+                environment: MuxaProviderCredentialStore.environment(
+                    ProcessInfo.processInfo.environment,
+                    for: provider
+                )
+            )
+            await refresh()
+            isPresentingAskSettings = false
+            select(.shell(session.id))
+        } catch {
+            askSettingsError = error.localizedDescription
+        }
+    }
+
+    func refreshOperatorInbox(force: Bool = false) async {
+        await refreshOperatorInbox(force: force, hostAliases: nil)
+    }
+
+    private func refreshOperatorInbox(
+        force: Bool,
+        hostAliases: Set<String>?
+    ) async {
+        guard !isRefreshingInbox else { return }
+        if !force, Date().timeIntervalSince(lastInboxRefresh) < 4 { return }
+        isRefreshingInbox = true
+        if hostAliases == nil { lastInboxRefresh = Date() }
+        inboxError = nil
+        defer { isRefreshingInbox = false }
+
+        let allTargets = executionSnapshot.watchHosts.compactMap { host -> MuxaWatchPane? in
+            host.sessions.flatMap(\.windows).flatMap(\.panes).first
+        }
+        let targets = hostAliases.map { aliases in
+            allTargets.filter { aliases.contains($0.host.alias) }
+        } ?? allTargets
+        let liveAliases = Set(targets.map(\.host.alias))
+        var messagesByHost = Dictionary(grouping: operatorMessages) { $0.host.alias }
+        if hostAliases == nil {
+            messagesByHost = messagesByHost.filter { liveAliases.contains($0.key) }
+        }
+        var failures: [String] = []
+
+        let results = await withTaskGroup(of: MuxaInboxFetch.self) { group in
+            for target in targets {
+                group.addTask { [client] in
+                    do {
+                        let mailbox = try await client.collaborationMailbox(
+                            host: target.host,
+                            pane: target.pane
+                        )
+                        return MuxaInboxFetch(target: target, mailbox: mailbox, error: nil)
+                    } catch {
+                        return MuxaInboxFetch(
+                            target: target,
+                            mailbox: nil,
+                            error: error.localizedDescription
+                        )
+                    }
+                }
+            }
+            var fetched: [MuxaInboxFetch] = []
+            for await result in group { fetched.append(result) }
+            return fetched
+        }
+
+        for result in results {
+            let target = result.target
+            if let mailbox = result.mailbox {
+                var seen = Set<String>()
+                messagesByHost[target.host.alias] = mailbox.sent.compactMap { request in
+                    guard seen.insert(request.id).inserted else { return nil }
+                    return MuxaOperatorMessage(
+                        host: target.host,
+                        routePane: target.pane,
+                        request: request
+                    )
+                }
+            } else if let error = result.error {
+                failures.append("\(target.host.alias): \(error)")
+            }
+        }
+
+        let updatedMessages = messagesByHost.values
+            .flatMap { $0 }
+            .sorted { lhs, rhs in
+                if lhs.request.createdAt != rhs.request.createdAt {
+                    return lhs.request.createdAt > rhs.request.createdAt
+                }
+                return lhs.id < rhs.id
+            }
+        if operatorMessages != updatedMessages { operatorMessages = updatedMessages }
+        if !failures.isEmpty { inboxError = failures.joined(separator: "\n") }
+    }
+
+    func openOperatorMessage(_ message: MuxaOperatorMessage) {
+        guard let selection = Self.operatorSelection(
+            for: message,
+            in: executionSnapshot
+        ) else {
+            inboxError = "\(message.request.to.label) is no longer present on \(message.host.alias). The conversation is still available, but its live agent cannot be opened."
+            return
+        }
+        inboxError = nil
+        if case .pane(let pane) = selection {
+            selectWatchPane(pane)
+        } else {
+            select(selection)
+        }
+    }
+
+    /// Collaboration requests retain the agent's stable session identity even
+    /// when tmux reuses or moves its pane. Prefer that identity, then use the
+    /// room alias and pane address only as progressively weaker live fallbacks.
+    /// If the agent really ended, keep the historical conversation actionable
+    /// by opening its surviving window, session, or host instead of failing.
+    static func operatorSelection(
+        for message: MuxaOperatorMessage,
+        in snapshot: MuxaExecutionSnapshot
+    ) -> MuxaSidebarSelection? {
+        let participant = message.request.to
+        let agents = snapshot.hostedAgents.filter {
+            $0.host.alias == message.host.alias && $0.agent.state != "stopped"
+        }
+
+        if let exactAgent = agents.first(where: {
+            $0.agent.agentSessionID == participant.agentSessionID
+        }) {
+            return .agent(exactAgent.id)
+        }
+
+        let participantSocket = participant.socket ?? participant.room.socket
+        func matchesRoom(_ pane: MuxaPaneInfo) -> Bool {
+            pane.stableWindowID == participant.room.windowID
+                && (participantSocket == nil || pane.endpointSocket == participantSocket)
+        }
+
+        if let alias = participant.alias, !alias.isEmpty {
+            let aliasMatches = agents.filter { agent in
+                guard let pane = agent.pane else { return false }
+                return pane.agentAlias == alias && matchesRoom(pane)
+            }
+            if aliasMatches.count == 1, let aliasAgent = aliasMatches.first {
+                return .agent(aliasAgent.id)
+            }
+        }
+
+        let panes = snapshot.watchHosts
+            .first { $0.host.alias == message.host.alias }?
+            .sessions.flatMap(\.windows).flatMap(\.panes) ?? []
+        if let exactPane = panes.first(where: { pane in
+            pane.pane.paneID == participant.pane
+                && (participantSocket == nil || pane.pane.endpointSocket == participantSocket)
+        }) {
+            return .pane(exactPane.id)
+        }
+
+        let roomPanes = panes.filter { matchesRoom($0.pane) }
+        if roomPanes.count == 1, let roomPane = roomPanes.first {
+            return .pane(roomPane.id)
+        }
+
+        let host = snapshot.watchHosts.first { $0.host.alias == message.host.alias }
+        let windows = host?.sessions.flatMap(\.windows) ?? []
+        let roomWindows = windows.filter { window in
+            window.windowID == participant.room.windowID
+                && (participantSocket == nil || window.socket == participantSocket)
+        }
+        if roomWindows.count == 1, let roomWindow = roomWindows.first {
+            return .fleetWindow(roomWindow.identity)
+        }
+
+        if let sessionID = participant.sessionID, !sessionID.isEmpty {
+            let sessions = host?.sessions.filter { session in
+                session.sessionID == sessionID
+                    && (participantSocket == nil || session.socket == participantSocket)
+            } ?? []
+            if sessions.count == 1, let session = sessions.first {
+                return .fleetSession(session.identity)
+            }
+        }
+
+        if host != nil {
+            return .host(message.host.alias)
+        }
+        return nil
+    }
+
+    func markOperatorMessageRead(_ message: MuxaOperatorMessage) async {
+        do {
+            _ = try await client.collaborationRequest(
+                host: message.host,
+                pane: message.routePane,
+                requestID: message.request.id
+            )
+            await refreshOperatorInbox(force: true)
+        } catch {
+            inboxError = error.localizedDescription
+        }
+    }
+
     func presentHostRegistration() {
-        hostRegistrationError = nil
+        prepareHostRegistration()
         isPresentingHostRegistration = true
+    }
+
+    func prepareHostRegistration() {
+        hostRegistrationError = nil
     }
 
     func registerHost(_ request: MuxaHostRegistrationRequest) async -> Bool {
@@ -541,6 +1193,7 @@ final class AppModel: ObservableObject {
             var arguments = [
                 "fleet",
                 "attach",
+                "--fit",
                 pane.host.alias,
                 try Self.exactPaneAddressJSON(pane.pane),
             ]
@@ -551,6 +1204,11 @@ final class AppModel: ObservableObject {
             environment["TERM"] = "xterm-256color"
             environment["COLORTERM"] = "truecolor"
             environment["TERM_PROGRAM"] = "Muxa"
+            // The app owns a fresh PTY. Inheriting a development terminal's
+            // tmux markers would make `muxa fleet attach` switch that other
+            // client instead of attaching inside this Live Pane.
+            environment.removeValue(forKey: "TMUX")
+            environment.removeValue(forKey: "TMUX_PANE")
             let localDirectory = pane.host.local
                 && FileManager.default.fileExists(atPath: pane.pane.currentPath)
                 ? pane.pane.currentPath
@@ -560,7 +1218,9 @@ final class AppModel: ObservableObject {
                 arguments: arguments,
                 cwd: localDirectory,
                 name: "\(pane.host.alias) · \(pane.pane.windowName.isEmpty ? pane.pane.paneID : pane.pane.windowName)",
-                environment: environment
+                environment: environment,
+                columns: 160,
+                rows: 48
             )
             await refresh()
             if selectShell {
@@ -604,14 +1264,25 @@ final class AppModel: ObservableObject {
         select(.pane(id))
     }
 
+    func selectWatchSession(_ id: MuxaWatchSessionIdentity) {
+        select(.fleetSession(id))
+    }
+
+    func selectWatchWindow(_ id: MuxaWatchWindowIdentity) {
+        select(.fleetWindow(id))
+    }
+
     func select(_ selection: MuxaSidebarSelection) {
         switch selection {
         case .workBoard: sidebarMode = .work
         case .watch: sidebarMode = .watch
-        case .ask: sidebarMode = .watch
+        case .inbox: sidebarMode = .inbox
+        case .ask: sidebarMode = .inbox
         case .work: sidebarMode = .work
-        case .agent: sidebarMode = .watch
-        case .host: sidebarMode = .hosts
+        case .agent: sidebarMode = .inbox
+        case .host: sidebarMode = .watch
+        case .fleetSession: sidebarMode = .watch
+        case .fleetWindow: sidebarMode = .watch
         case .shell: sidebarMode = .shells
         case .pane: sidebarMode = .watch
         }
@@ -629,8 +1300,10 @@ final class AppModel: ObservableObject {
         case .pane(let id):
             watchSelection = id
             sidebarMode = .watch
-        case .watch, .ask:
+        case .watch, .fleetSession, .fleetWindow:
             sidebarMode = .watch
+        case .inbox, .ask, .agent:
+            sidebarMode = .inbox
         default:
             break
         }
@@ -678,7 +1351,7 @@ final class AppModel: ObservableObject {
 
     func isSelectionAvailable(_ selection: MuxaSidebarSelection) -> Bool {
         switch selection {
-        case .workBoard, .watch, .ask:
+        case .workBoard, .watch, .inbox, .ask:
             true
         case .work(let key):
             workGroups.contains { $0.identity == key }
@@ -686,6 +1359,10 @@ final class AppModel: ObservableObject {
             hostedAgents.contains { $0.id == id }
         case .host(let id):
             fleetHosts.contains { $0.id == id }
+        case .fleetSession(let id):
+            executionSnapshot.watchSession(id: id) != nil
+        case .fleetWindow(let id):
+            executionSnapshot.watchWindow(id: id) != nil
         case .shell(let id):
             sessions.contains { $0.id == id && !$0.exited }
         case .pane(let id):

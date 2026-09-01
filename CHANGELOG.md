@@ -23,6 +23,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id (or refusal/error) per recipient. Delivered agents lose their marks, while
   refused and failed agents remain marked for a deliberate retry.
 
+## [0.8.41] - 2026-09-01
+
+### Fixed
+
+- **Two terminals on one workspace no longer hide every agent from
+  collaboration.** tmux lists a pane once per session that shows it, and a
+  session *group* shows one window through several sessions — which is exactly
+  what muxa's own `tmux-auto-view` builds, giving each attached client a
+  `<session>~view~<pid>` member of the group. Every pane in such a session was
+  therefore listed twice, and the participant resolver treated the second row
+  as an ambiguity and skipped the pane. With a second terminal attached there
+  were no participants, no origin and no peers: `muxa msg send`, `m` in
+  `muxa watch` and `muxa_call_peer` all refused with *"collaboration origin is
+  not a hook-correlated tracked pane agent"*, advising a restart of an agent
+  that was working fine — and the whole thing healed itself the moment the
+  second terminal detached, which is the worst way for a bug to behave.
+
+  Rows that agree on server, window and pane are now recognised as one pane
+  seen twice, with the durable session naming it rather than a per-client view.
+  The ambiguity that matters — one pane id on two servers — still refuses. The
+  origin resolver, the participant table and the pending-pane resolver all
+  shared the shape and are all fixed.
+
+### Added
+
+- **Muxa for Mac is now a task-oriented Fleet workbench rather than a shell
+  wrapper.** Explore, Work, Operator Inbox, Global Ask, collaboration and
+  detachable Ghostty-backed shell surfaces share stable editor tabs, readable
+  Markdown request/reply views, resumable Claude Code or Codex conversations,
+  host/session/window summaries and exact-pane navigation. Provider API keys
+  remain optional one-turn credentials and are never persisted by muxad.
+
+- **Fleet, Ask, Pipeline, Inbox and native PTY updates are event-driven.** New
+  revision subscriptions replace high-frequency polling, while host-scoped
+  mailbox invalidations fetch only the node whose durable mailbox changed.
+  Terminal readers park on bounded output waits instead of opening 20–125
+  empty reads per second, and detach wakes a parked reader immediately.
+  Coalesced refreshes, immutable snapshot indexes, adaptive selected-pane
+  capture and slow authoritative reconciliation retain correctness after
+  reconnects without paying the old idle cost. Current relays forward mailbox
+  revisions without copying request bodies; older nodes continue through the
+  documented reconciliation fallback until upgraded.
+
 - **`Space` marks agents in `muxa watch`, and `m` then addresses all of
   them.** Composing once for several agents meant sending several times, which
   is both tedious and how the wording drifts between recipients. Marking uses
@@ -39,7 +82,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the error and the fact that nothing was retried. A fan-out that reports "sent
   to 5" cannot say which of the five did not get it.
 
-### Added
+- **Enter reads a full ask answer.** The `A` history could only ever show an
+  answer's first screenful: the detail pane under the list is a few rows tall,
+  `|` grows it to most of a popup and no further, and nothing scrolled. A
+  headless agent's reply is routinely longer than that, and the rest of it —
+  already stored, already paid for — had no reader anywhere in muxa.
+
+  `Enter` (or `o`) now opens the selected entry in a reader that shows the
+  question and the whole answer. `j`/`k` scroll a line, `PgUp`/`PgDn` a page
+  with one line of overlap, `g`/`G` jump to either end, and the foot of the box
+  tracks which lines are on screen. `Esc`, `Enter`, or `q` steps back to the
+  list; `A` closes the panel outright.
+
+  The reader owns every key while it is open, so `d` and `D` cannot delete the
+  answer being read out from under it, and it addresses its entry by id rather
+  than by row: the history is re-fetched from the daemon on a timer, and an
+  index would silently re-point at a neighbour when an answer lands or is
+  deleted. An entry that disappears anyway drops back to the list with a hint
+  instead of painting a blank page.
 
 - **`C` opens a window in watch, where `prefix + c` cannot reach.** Creating a
   plain shell window next to running work meant leaving the console: attach to

@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
@@ -175,6 +175,16 @@ pub trait SessionBackend: Send + Sync + 'static {
     fn resolve_session(&self, id_or_name: &str) -> Option<SessionRef>;
     fn capture(&self, session_id: &str) -> Result<TerminalSnapshot, SessionError>;
     fn read_output(&self, session_id: &str, offset: u64) -> Result<SessionOutput, SessionError>;
+    /// Wait until output advances, the retained buffer truncates past
+    /// `offset`, the child exits, or `timeout` elapses. This is the native
+    /// terminal client's event-driven read path; the bounded deadline keeps
+    /// cancellation/reconciliation straightforward without a busy poll.
+    fn read_output_wait(
+        &self,
+        session_id: &str,
+        offset: u64,
+        timeout: Duration,
+    ) -> Result<SessionOutput, SessionError>;
     fn send_input(&self, session_id: &str, bytes: &[u8]) -> Result<(), SessionError>;
     fn resize(&self, session_id: &str, cols: u16, rows: u16) -> Result<(), SessionError>;
     fn set_attached(
@@ -267,6 +277,8 @@ impl PtySessionBackend {
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
             buffer: Mutex::new(OutputBuffer::new(MAX_BUFFER_BYTES)),
+            activity: Mutex::new(0),
+            activity_changed: Condvar::new(),
         });
 
         let session_for_reader = session.clone();
@@ -287,6 +299,7 @@ impl PtySessionBackend {
                 meta.exit_status = exit_status;
                 meta.exited_at = Some(SystemTime::now());
             }
+            session_for_wait.publish_activity();
         });
 
         let reference = session.reference();
@@ -368,6 +381,16 @@ impl SessionBackend for PtySessionBackend {
         session.read_output(offset)
     }
 
+    fn read_output_wait(
+        &self,
+        session_id: &str,
+        offset: u64,
+        timeout: Duration,
+    ) -> Result<SessionOutput, SessionError> {
+        let session = self.get(session_id)?;
+        session.read_output_wait(offset, timeout)
+    }
+
     fn send_input(&self, session_id: &str, bytes: &[u8]) -> Result<(), SessionError> {
         let session = self.get(session_id)?;
         if session.reference().exited {
@@ -436,6 +459,11 @@ impl SessionBackend for PtySessionBackend {
             meta.attached_clients = meta.attached_clients.saturating_sub(1);
         }
         meta.has_been_attached |= attached;
+        drop(meta);
+        // Attachment changes are also cancellation signals for a client that
+        // has a read_output_wait parked on this session. In particular, a
+        // detach should not have to wait for the 15-second output deadline.
+        session.publish_activity();
         Ok(())
     }
 
@@ -457,6 +485,12 @@ struct PtySession {
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     buffer: Mutex<OutputBuffer>,
+    /// Independent generation lock closes the read-then-sleep race without
+    /// imposing a buffer/meta lock order. Producers increment while holding
+    /// this lock; a waiter holds it across its authoritative read and
+    /// `Condvar::wait_timeout` hand-off.
+    activity: Mutex<u64>,
+    activity_changed: Condvar,
 }
 
 impl PtySession {
@@ -510,6 +544,33 @@ impl PtySession {
             exited: reference.exited,
             exit_status: reference.exit_status,
         })
+    }
+
+    fn read_output_wait(
+        &self,
+        offset: u64,
+        timeout: Duration,
+    ) -> Result<SessionOutput, SessionError> {
+        let activity = self
+            .activity
+            .lock()
+            .map_err(|_| SessionError::Pty("session activity lock poisoned".into()))?;
+        let output = self.read_output(offset)?;
+        if output.next_offset != offset || output.truncated || output.exited || timeout.is_zero() {
+            return Ok(output);
+        }
+        let (_activity, _wait) = self
+            .activity_changed
+            .wait_timeout(activity, timeout)
+            .map_err(|_| SessionError::Pty("session activity lock poisoned".into()))?;
+        self.read_output(offset)
+    }
+
+    fn publish_activity(&self) {
+        if let Ok(mut activity) = self.activity.lock() {
+            *activity = activity.wrapping_add(1);
+            self.activity_changed.notify_all();
+        }
     }
 }
 
@@ -592,6 +653,7 @@ fn read_pty_loop(mut reader: Box<dyn Read + Send>, session: Arc<PtySession>) {
                 if let Ok(mut out) = session.buffer.lock() {
                     out.push(&buf[..n]);
                 }
+                session.publish_activity();
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
@@ -657,6 +719,59 @@ mod tests {
         };
 
         assert_eq!(output.data_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn session_wait_wakes_for_output_instead_of_polling() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let backend = PtySessionBackend::default();
+        let session = backend
+            .spawn_session(SpawnSession {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 0.05; printf ready".into()],
+                env: Vec::new(),
+                cwd: None,
+                name: None,
+                cols: Some(80),
+                rows: Some(24),
+            })
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let output = backend
+            .read_output_wait(&session.id, 0, Duration::from_secs(2))
+            .unwrap();
+        assert!(output.data.contains("ready"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn session_wait_has_a_bounded_idle_deadline() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let backend = PtySessionBackend::default();
+        let session = backend
+            .spawn_session(SpawnSession {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 1".into()],
+                env: Vec::new(),
+                cwd: None,
+                name: None,
+                cols: Some(80),
+                rows: Some(24),
+            })
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let output = backend
+            .read_output_wait(&session.id, 0, Duration::from_millis(60))
+            .unwrap();
+        assert!(output.data_bytes().unwrap().is_empty());
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

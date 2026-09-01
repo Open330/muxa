@@ -85,6 +85,20 @@ example `["/nfs/home/june"]` when `/home/june/workspace` points there.
 persistent worker. Reaching it terminates the headless agent process; it is a
 wall-clock safety limit, not an inactivity detector.
 
+The same daemon-owned history is available without opening the TUI:
+
+```bash
+muxa ask --agent codex "summarize the current implementation"
+muxa ask --agent claude --detach --json "review the deployment plan"
+security find-generic-password -w -s my-codex-key \
+  | muxa ask --agent codex --api-key-stdin "review this repository"
+```
+
+`--api-key-stdin` refuses an interactive terminal, crosses only the owner-only
+Unix socket, and supplies the key to one matching provider child. It is never
+stored in muxa config/history or placed in argv. Without it, the headless CLI
+uses its existing login or provider environment as before.
+
 ## Collaboration
 
 ```toml

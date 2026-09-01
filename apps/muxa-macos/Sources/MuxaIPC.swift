@@ -159,7 +159,7 @@ struct MuxaDesiredAgent: Decodable, Hashable, Sendable {
     let after: [String]?
 }
 
-struct MuxaPipelineRun: Decodable, Identifiable, Sendable {
+struct MuxaPipelineRun: Decodable, Hashable, Identifiable, Sendable {
     let identity: MuxaWorkIdentity
     let pipeline: String
     let desired: [MuxaDesiredAgent]
@@ -176,7 +176,7 @@ struct MuxaPipelineRun: Decodable, Identifiable, Sendable {
     }
 }
 
-struct MuxaAgent: Decodable, Identifiable, Sendable {
+struct MuxaAgent: Decodable, Hashable, Identifiable, Sendable {
     let kind: String
     let agentSessionID: String
     let pane: String?
@@ -185,6 +185,7 @@ struct MuxaAgent: Decodable, Identifiable, Sendable {
     let cwd: String?
     let state: String
     let lastPrompt: String?
+    let lastPromptAt: String?
     let lastResponse: String?
     let recap: String?
     let aiTitle: String?
@@ -192,6 +193,11 @@ struct MuxaAgent: Decodable, Identifiable, Sendable {
     let model: String?
     let contextUsedPercent: Double?
     let costUSD: Double?
+    let startedAt: String?
+    let lastActivityAt: String?
+    let stateEnteredAt: String?
+    let workload: MuxaAgentWorkload?
+    let subagents: [MuxaAgentSubagent]?
 
     var id: String { agentSessionID }
 
@@ -201,11 +207,69 @@ struct MuxaAgent: Decodable, Identifiable, Sendable {
         case tmuxSocket = "tmux_socket"
         case tmuxSession = "tmux_session"
         case lastPrompt = "last_prompt"
+        case lastPromptAt = "last_prompt_at"
         case lastResponse = "last_response"
         case aiTitle = "ai_title"
         case lastNotification = "last_notification"
         case contextUsedPercent = "context_used_pct"
         case costUSD = "cost_usd"
+        case startedAt = "started_at"
+        case lastActivityAt = "last_activity_at"
+        case stateEnteredAt = "state_entered_at"
+        case workload, subagents
+    }
+}
+
+struct MuxaAgentWorkload: Decodable, Hashable, Sendable {
+    let processCount: Int
+    let shellCount: Int
+    let subagentCount: Int
+    let helperCount: Int
+    let preview: [MuxaAgentProcess]
+
+    enum CodingKeys: String, CodingKey {
+        case preview
+        case processCount = "process_count"
+        case shellCount = "shell_count"
+        case subagentCount = "subagent_count"
+        case helperCount = "helper_count"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        processCount = try values.decodeIfPresent(Int.self, forKey: .processCount) ?? 0
+        shellCount = try values.decodeIfPresent(Int.self, forKey: .shellCount) ?? 0
+        subagentCount = try values.decodeIfPresent(Int.self, forKey: .subagentCount) ?? 0
+        helperCount = try values.decodeIfPresent(Int.self, forKey: .helperCount) ?? 0
+        preview = try values.decodeIfPresent([MuxaAgentProcess].self, forKey: .preview) ?? []
+    }
+}
+
+struct MuxaAgentProcess: Decodable, Hashable, Identifiable, Sendable {
+    let pid: UInt32
+    let parentPID: UInt32
+    let depth: UInt8
+    let kind: String
+    let command: String
+
+    var id: UInt32 { pid }
+
+    enum CodingKeys: String, CodingKey {
+        case pid, depth, kind, command
+        case parentPID = "parent_pid"
+    }
+}
+
+struct MuxaAgentSubagent: Decodable, Hashable, Identifiable, Sendable {
+    let kind: String
+    let description: String?
+    let startedAt: String
+
+    var id: String { "\(kind):\(startedAt):\(description ?? "")" }
+
+    enum CodingKeys: String, CodingKey {
+        case kind, description
+        case startedAt = "started_at"
     }
 }
 
@@ -221,6 +285,8 @@ struct MuxaPaneInfo: Decodable, Hashable, Sendable {
     let title: String
     let currentPath: String
     let socket: String?
+    let workspaceID: String?
+    let workID: String?
     let agentRole: String?
     let agentAlias: String?
 
@@ -234,8 +300,16 @@ struct MuxaPaneInfo: Decodable, Hashable, Sendable {
         case paneIndex = "pane_index"
         case currentCommand = "current_command"
         case currentPath = "current_path"
+        case workspaceID = "workspace_id"
+        case workID = "work_id"
         case agentRole = "agent_role"
         case agentAlias = "agent_alias"
+    }
+
+    var workIdentity: MuxaWorkIdentity? {
+        guard let workspaceID, !workspaceID.isEmpty,
+              let workID, !workID.isEmpty else { return nil }
+        return MuxaWorkIdentity(workspaceID: workspaceID, workID: workID)
     }
 
     var hostKind: String {
@@ -262,35 +336,130 @@ struct MuxaPaneInfo: Decodable, Hashable, Sendable {
 
 struct MuxaExecutionSnapshot: Sendable {
     let hosts: [MuxaFleetHost]
+    let agents: [MuxaAgent]
+    let panes: [MuxaPaneInfo]
+    let hostedAgents: [MuxaHostedAgent]
+    let watchHosts: [MuxaWatchHost]
+
+    private let panesByAgentSessionID: [String: [MuxaPaneInfo]]
+    private let agentsByPaneID: [String: [MuxaAgent]]
+    private let watchPanesByID: [MuxaWatchPaneIdentity: MuxaWatchPane]
+    private let watchSessionsByID: [MuxaWatchSessionIdentity: MuxaWatchSession]
+    private let watchWindowsByID: [MuxaWatchWindowIdentity: MuxaWatchWindow]
+    private let watchWindowsByPaneID: [MuxaWatchPaneIdentity: MuxaWatchWindow]
 
     static let empty = MuxaExecutionSnapshot(hosts: [])
 
-    var agents: [MuxaAgent] {
-        hosts.flatMap { $0.remote?.agents ?? [] }
-    }
+    init(hosts: [MuxaFleetHost]) {
+        self.hosts = hosts
+        agents = hosts.flatMap { $0.remote?.agents ?? [] }
+        panes = hosts.flatMap { $0.remote?.panes ?? [] }
 
-    var panes: [MuxaPaneInfo] {
-        hosts.flatMap { $0.remote?.panes ?? [] }
-    }
+        var hosted: [MuxaHostedAgent] = []
+        var panesByAgent: [String: [MuxaPaneInfo]] = [:]
+        var agentsByPane: [String: [MuxaAgent]] = [:]
+        var builtWatchHosts: [MuxaWatchHost] = []
+        var paneIndex: [MuxaWatchPaneIdentity: MuxaWatchPane] = [:]
+        var sessionIndex: [MuxaWatchSessionIdentity: MuxaWatchSession] = [:]
+        var windowIndex: [MuxaWatchWindowIdentity: MuxaWatchWindow] = [:]
+        var windowByPaneIndex: [MuxaWatchPaneIdentity: MuxaWatchWindow] = [:]
 
-    var hostedAgents: [MuxaHostedAgent] {
-        hosts.flatMap { host -> [MuxaHostedAgent] in
-            guard let remote = host.remote else { return [] }
-            return remote.agents.map { agent in
-                MuxaHostedAgent(
-                    host: host.identity,
-                    agent: agent,
-                    pane: Self.pane(for: agent, among: remote.panes)
+        for host in hosts {
+            let hostPanes = host.remote?.panes ?? []
+            let hostAgents = host.remote?.agents ?? []
+            let hostAgentsByPane = Dictionary(grouping: hostAgents.compactMap { agent in
+                agent.pane.map { ($0, agent) }
+            }, by: { $0.0 }).mapValues { $0.map(\.1) }
+
+            for agent in hostAgents {
+                let pane = Self.pane(for: agent, among: hostPanes)
+                hosted.append(MuxaHostedAgent(host: host.identity, agent: agent, pane: pane))
+                if let pane {
+                    panesByAgent[agent.agentSessionID, default: []].append(pane)
+                }
+                if let paneID = agent.pane {
+                    agentsByPane[paneID, default: []].append(agent)
+                }
+            }
+
+            let groupedSessions = Dictionary(grouping: hostPanes) { pane in
+                "\(pane.endpointSocket)\u{0}\(pane.stableSessionID)"
+            }
+            let sessions = groupedSessions.values.map { sessionPanes -> MuxaWatchSession in
+                let first = sessionPanes[0]
+                let groupedWindows = Dictionary(grouping: sessionPanes, by: \.stableWindowID)
+                let windows = groupedWindows.values.map { windowPanes -> MuxaWatchWindow in
+                    let firstWindow = windowPanes[0]
+                    let nodes = windowPanes.map { pane -> MuxaWatchPane in
+                        let candidates = (hostAgentsByPane[pane.paneID] ?? []).filter {
+                            $0.tmuxSocket == nil || $0.tmuxSocket == pane.socket
+                        }
+                        return MuxaWatchPane(
+                            host: host.identity,
+                            pane: pane,
+                            agent: candidates.count == 1 ? candidates[0] : nil
+                        )
+                    }.sorted {
+                        Self.numericIndex($0.pane.paneIndex) < Self.numericIndex($1.pane.paneIndex)
+                    }
+                    return MuxaWatchWindow(
+                        hostAlias: host.alias,
+                        socket: firstWindow.endpointSocket,
+                        sessionID: firstWindow.stableSessionID,
+                        windowID: firstWindow.stableWindowID,
+                        name: firstWindow.windowName,
+                        index: firstWindow.windowIndex,
+                        panes: nodes
+                    )
+                }.sorted { left, right in
+                    let leftIndex = Self.numericIndex(left.index)
+                    let rightIndex = Self.numericIndex(right.index)
+                    return leftIndex == rightIndex
+                        ? left.name.localizedStandardCompare(right.name) == .orderedAscending
+                        : leftIndex < rightIndex
+                }
+                return MuxaWatchSession(
+                    hostAlias: host.alias,
+                    socket: first.endpointSocket,
+                    sessionID: first.stableSessionID,
+                    name: first.session,
+                    windows: windows
                 )
+            }.sorted {
+                $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            }
+            builtWatchHosts.append(MuxaWatchHost(host: host, sessions: sessions))
+        }
+
+        builtWatchHosts.sort { left, right in
+            if left.host.local != right.host.local { return left.host.local }
+            return left.host.alias.localizedStandardCompare(right.host.alias) == .orderedAscending
+        }
+        for host in builtWatchHosts {
+            for session in host.sessions {
+                sessionIndex[session.identity] = session
+                for window in session.windows {
+                    windowIndex[window.identity] = window
+                    for pane in window.panes {
+                        paneIndex[pane.id] = pane
+                        windowByPaneIndex[pane.id] = window
+                    }
+                }
             }
         }
+
+        hostedAgents = hosted
+        watchHosts = builtWatchHosts
+        panesByAgentSessionID = panesByAgent
+        agentsByPaneID = agentsByPane
+        watchPanesByID = paneIndex
+        watchSessionsByID = sessionIndex
+        watchWindowsByID = windowIndex
+        watchWindowsByPaneID = windowByPaneIndex
     }
 
     func pane(for agent: MuxaAgent) -> MuxaPaneInfo? {
-        let matches = hosts.compactMap { host -> MuxaPaneInfo? in
-            guard let panes = host.remote?.panes else { return nil }
-            return Self.pane(for: agent, among: panes)
-        }
+        let matches = panesByAgentSessionID[agent.agentSessionID] ?? []
         return matches.count == 1 ? matches[0] : nil
     }
 
@@ -305,10 +474,34 @@ struct MuxaExecutionSnapshot: Sendable {
     }
 
     func agent(for pane: MuxaPaneInfo) -> MuxaAgent? {
-        let exact = agents.filter {
+        let exact = (agentsByPaneID[pane.paneID] ?? []).filter {
             $0.pane == pane.paneID && ($0.tmuxSocket == nil || $0.tmuxSocket == pane.socket)
         }
         return exact.count == 1 ? exact[0] : nil
+    }
+
+    func watchPane(id: MuxaWatchPaneIdentity) -> MuxaWatchPane? {
+        watchPanesByID[id]
+    }
+
+    func watchSession(id: MuxaWatchSessionIdentity) -> MuxaWatchSession? {
+        watchSessionsByID[id]
+    }
+
+    func watchWindow(containing id: MuxaWatchPaneIdentity) -> MuxaWatchWindow? {
+        watchWindowsByPaneID[id]
+    }
+
+    func watchWindow(id: MuxaWatchWindowIdentity) -> MuxaWatchWindow? {
+        watchWindowsByID[id]
+    }
+
+    func hasSameSource(as other: MuxaExecutionSnapshot) -> Bool {
+        hosts == other.hosts
+    }
+
+    private static func numericIndex(_ value: String) -> Int {
+        Int(value) ?? Int.max
     }
 }
 
@@ -331,7 +524,20 @@ struct MuxaFleetSnapshot: Decodable, Sendable {
     let hosts: [MuxaFleetHost]
 }
 
-struct MuxaFleetHost: Decodable, Identifiable, Sendable {
+struct MuxaFleetUpdate: Decodable, Sendable {
+    let host: String
+    let state: String
+    let revision: UInt64?
+    let resync: Bool?
+    let mailboxRevision: UInt64?
+
+    enum CodingKeys: String, CodingKey {
+        case host, state, revision, resync
+        case mailboxRevision = "mailbox_revision"
+    }
+}
+
+struct MuxaFleetHost: Decodable, Hashable, Identifiable, Sendable {
     let alias: String
     let local: Bool
     let sshTarget: String?
@@ -339,6 +545,8 @@ struct MuxaFleetHost: Decodable, Identifiable, Sendable {
     let state: String
     let latencyMS: UInt64?
     let error: String?
+    let muxaVersion: String?
+    let daemonGeneration: UInt64?
     let labels: [String: String]?
     let annotations: [String: String]?
     let remote: MuxaRemoteSnapshot?
@@ -352,10 +560,12 @@ struct MuxaFleetHost: Decodable, Identifiable, Sendable {
         case alias, local, mode, state, error, labels, annotations, remote
         case sshTarget = "ssh_target"
         case latencyMS = "latency_ms"
+        case muxaVersion = "muxa_version"
+        case daemonGeneration = "daemon_generation"
     }
 }
 
-struct MuxaRemoteSnapshot: Decodable, Sendable {
+struct MuxaRemoteSnapshot: Decodable, Hashable, Sendable {
     let agents: [MuxaAgent]
     let panes: [MuxaPaneInfo]
 }
@@ -365,8 +575,9 @@ struct MuxaPaneCapture: Sendable {
     let rawBytes: Data?
 }
 
-struct MuxaAskEntry: Decodable, Identifiable, Sendable {
+struct MuxaAskEntry: Decodable, Hashable, Identifiable, Sendable {
     let id: String
+    let conversationID: String?
     let prompt: String
     let answer: String
     let status: String
@@ -380,6 +591,7 @@ struct MuxaAskEntry: Decodable, Identifiable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, prompt, answer, status, agent, cwd, error
+        case conversationID = "conversation_id"
         case agentSessionID = "agent_session_id"
         case askedAt = "asked_at"
         case answeredAt = "answered_at"
@@ -387,7 +599,28 @@ struct MuxaAskEntry: Decodable, Identifiable, Sendable {
     }
 }
 
-struct MuxaCollaborationRoom: Decodable, Sendable {
+struct MuxaAskConversation: Decodable, Hashable, Identifiable, Sendable {
+    let id: String
+    let title: String
+    let agent: String
+    let agentSessionID: String?
+    let createdAt: String
+    let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, agent
+        case agentSessionID = "agent_session_id"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+}
+
+struct MuxaAskConversationSnapshot: Sendable {
+    let conversations: [MuxaAskConversation]
+    let active: MuxaAskConversation?
+}
+
+struct MuxaCollaborationRoom: Decodable, Hashable, Sendable {
     let host: String
     let socket: String?
     let windowID: String
@@ -398,7 +631,7 @@ struct MuxaCollaborationRoom: Decodable, Sendable {
     }
 }
 
-struct MuxaCollaborationParticipant: Decodable, Sendable {
+struct MuxaCollaborationParticipant: Decodable, Hashable, Sendable {
     let agentKind: String
     let agentSessionID: String
     let pane: String
@@ -407,11 +640,17 @@ struct MuxaCollaborationParticipant: Decodable, Sendable {
     let alias: String?
     let roles: [String]?
     let console: Bool?
+    let sessionID: String?
+    let sessionName: String?
+    let windowName: String?
 
     enum CodingKeys: String, CodingKey {
         case pane, socket, room, alias, roles, console
         case agentKind = "agent_kind"
         case agentSessionID = "agent_session_id"
+        case sessionID = "tmux_session_id"
+        case sessionName = "tmux_session_name"
+        case windowName = "window_name"
     }
 
     var label: String {
@@ -421,13 +660,13 @@ struct MuxaCollaborationParticipant: Decodable, Sendable {
     }
 }
 
-struct MuxaCollaborationReply: Decodable, Sendable {
+struct MuxaCollaborationReply: Decodable, Hashable, Sendable {
     let status: String
     let body: String
     let at: String
 }
 
-struct MuxaCollaborationRequest: Decodable, Identifiable, Sendable {
+struct MuxaCollaborationRequest: Decodable, Identifiable, Hashable, Sendable {
     let id: String
     let from: MuxaCollaborationParticipant
     let to: MuxaCollaborationParticipant
@@ -438,12 +677,26 @@ struct MuxaCollaborationRequest: Decodable, Identifiable, Sendable {
     let status: String
     let createdAt: String
     let reply: MuxaCollaborationReply?
+    let threadID: String?
+    let parentRequestID: String?
+    let workspaceID: String?
+    let workID: String?
+    let runID: String?
+    let claimedAt: String?
+    let replyReadAt: String?
 
     enum CodingKeys: String, CodingKey {
         case id, from, to, kind, body, status, reply
         case expectsReply = "expects_reply"
         case workMode = "work_mode"
         case createdAt = "created_at"
+        case threadID = "thread_id"
+        case parentRequestID = "parent_request_id"
+        case workspaceID = "workspace_id"
+        case workID = "work_id"
+        case runID = "run_id"
+        case claimedAt = "claimed_at"
+        case replyReadAt = "reply_read_at"
     }
 }
 
@@ -487,7 +740,10 @@ private struct MuxaIPCResponse: Decodable, Sendable {
     let workOperation: MuxaWorkOperation?
     let askEntries: [MuxaAskEntry]?
     let askEntry: MuxaAskEntry?
+    let askConversations: [MuxaAskConversation]?
+    let askConversation: MuxaAskConversation?
     let askAgent: String?
+    let askEnabled: Bool?
 
     enum CodingKeys: String, CodingKey {
         case ok, error, capabilities, agents, sessions, session, output, capture, fleet
@@ -498,11 +754,23 @@ private struct MuxaIPCResponse: Decodable, Sendable {
         case workOperation = "work_operation"
         case askEntries = "ask_entries"
         case askEntry = "ask_entry"
+        case askConversations = "ask_conversations"
+        case askConversation = "ask_conversation"
         case askAgent = "ask_agent"
+        case askEnabled = "ask_enabled"
     }
 }
 
+private struct MuxaRevisionUpdate: Decodable, Sendable {
+    let revision: UInt64
+}
+
 typealias MuxaIPCRequestHandler = @Sendable (String, Data) throws -> Data
+fileprivate typealias MuxaIPCTimedRequestHandler = @Sendable (
+    String,
+    Data,
+    TimeInterval
+) throws -> Data
 
 /// Runs the blocking Unix-socket exchange on one serial queue.
 ///
@@ -512,23 +780,33 @@ typealias MuxaIPCRequestHandler = @Sendable (String, Data) throws -> Data
 /// Keeping exactly one blocking exchange active bounds thread and descriptor
 /// use while preserving wire order.
 final class SerializedIPCTransport: @unchecked Sendable {
-    private let queue = DispatchQueue(
-        label: "dev.muxa.mac.ipc-transport",
-        qos: .userInitiated
-    )
-    private let handler: MuxaIPCRequestHandler
+    private let queue: DispatchQueue
+    private let handler: MuxaIPCTimedRequestHandler
 
-    init(handler: @escaping MuxaIPCRequestHandler) {
-        self.handler = handler
+    init(
+        label: String = "dev.muxa.mac.ipc-transport",
+        handler: @escaping MuxaIPCRequestHandler
+    ) {
+        queue = DispatchQueue(label: label, qos: .userInitiated)
+        self.handler = { path, payload, _ in try handler(path, payload) }
     }
 
-    func request(path: String, payload: Data) async throws -> Data {
+    fileprivate init(label: String, timedHandler: @escaping MuxaIPCTimedRequestHandler) {
+        queue = DispatchQueue(label: label, qos: .userInitiated)
+        handler = timedHandler
+    }
+
+    func request(
+        path: String,
+        payload: Data,
+        timeout: TimeInterval = 3
+    ) async throws -> Data {
         try Task.checkCancellation()
         let handler = self.handler
         return try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 do {
-                    continuation.resume(returning: try handler(path, payload))
+                    continuation.resume(returning: try handler(path, payload, timeout))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -542,21 +820,47 @@ actor MuxaIPCClient {
     static let byteSafeCapability = "session_bytes_v1"
     static let attachmentIdentityCapability = "session_attachment_identity_v1"
     static let workControlCapability = "work_control_v1"
+    static let askCredentialCapability = "ask_one_turn_credential_v1"
+    static let askConversationCapability = "ask_conversations_v1"
+    static let fleetSubscribeCapability = "fleet_subscribe"
+    static let sessionWaitCapability = "session_wait_v1"
+    static let askSubscribeCapability = "ask_subscribe"
+    static let pipelineSubscribeCapability = "pipeline_subscribe"
 
     let socketPath: String
     private(set) var capabilities: Set<String> = []
     private let transport: SerializedIPCTransport
+    private let timedRequestHandler: MuxaIPCTimedRequestHandler
+    private var terminalReadTransports: [String: SerializedIPCTransport] = [:]
+    private let fleetReadTransports: [SerializedIPCTransport]
     private let attachmentClientID: String
 
     init(socketPath: String = MuxaIPCClient.defaultSocketPath()) {
         self.socketPath = socketPath
-        transport = SerializedIPCTransport(handler: UnixSocket.request)
+        timedRequestHandler = UnixSocket.request
+        transport = SerializedIPCTransport(
+            label: "dev.muxa.mac.ipc-control",
+            timedHandler: UnixSocket.request
+        )
+        fleetReadTransports = (0..<4).map { index in
+            SerializedIPCTransport(
+                label: "dev.muxa.mac.ipc-fleet-read-\(index)",
+                timedHandler: UnixSocket.request
+            )
+        }
         attachmentClientID = "muxa-macos:\(getuid())"
     }
 
     init(socketPath: String, request: @escaping MuxaIPCRequestHandler) {
         self.socketPath = socketPath
-        transport = SerializedIPCTransport(handler: request)
+        timedRequestHandler = { path, payload, _ in try request(path, payload) }
+        transport = SerializedIPCTransport(label: "dev.muxa.mac.ipc-control-test", handler: request)
+        fleetReadTransports = (0..<4).map { index in
+            SerializedIPCTransport(
+                label: "dev.muxa.mac.ipc-fleet-read-test-\(index)",
+                handler: request
+            )
+        }
         attachmentClientID = "muxa-macos-test:\(getpid())"
     }
 
@@ -672,6 +976,8 @@ actor MuxaIPCClient {
             state: "online",
             latencyMS: nil,
             error: nil,
+            muxaVersion: nil,
+            daemonGeneration: nil,
             labels: nil,
             annotations: nil,
             remote: MuxaRemoteSnapshot(agents: response.agents ?? [], panes: [])
@@ -681,15 +987,18 @@ actor MuxaIPCClient {
 
     func captureFleetPane(host: MuxaFleetHostIdentity, pane: MuxaPaneInfo) async throws -> MuxaPaneCapture {
         if capabilities.contains("fleet_v1") {
-            let response = try await call([
-                "protocol": Self.protocolVersion,
-                "kind": "fleet_command",
-                "host": host.alias,
-                "operation": [
-                    "kind": "capture",
-                    "pane": Self.paneKey(pane),
+            let response = try await call(
+                [
+                    "protocol": Self.protocolVersion,
+                    "kind": "fleet_command",
+                    "host": host.alias,
+                    "operation": [
+                        "kind": "capture",
+                        "pane": Self.paneKey(pane),
+                    ],
                 ],
-            ])
+                using: fleetReadTransport(for: host.alias)
+            )
             guard let result = response.fleetResult else {
                 throw MuxaIPCError.missingField("fleet_result")
             }
@@ -753,6 +1062,48 @@ actor MuxaIPCClient {
         return response.askEntries ?? []
     }
 
+    func listAskConversations() async throws -> MuxaAskConversationSnapshot {
+        guard capabilities.contains(Self.askConversationCapability) else {
+            return MuxaAskConversationSnapshot(conversations: [], active: nil)
+        }
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "ask_conversation_list",
+        ])
+        return MuxaAskConversationSnapshot(
+            conversations: response.askConversations ?? [],
+            active: response.askConversation
+        )
+    }
+
+    func selectAskConversation(_ conversationID: String) async throws -> MuxaAskConversation {
+        guard capabilities.contains(Self.askConversationCapability) else {
+            throw MuxaIPCError.server(
+                "The running muxad does not support resumable Ask conversations; update muxa or choose Use Bundled muxad"
+            )
+        }
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "ask_conversation_select",
+            "conversation_id": conversationID,
+        ])
+        guard let conversation = response.askConversation else {
+            throw MuxaIPCError.missingField("ask_conversation")
+        }
+        return conversation
+    }
+
+    func askStatus() async throws -> Bool {
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "ask_status",
+        ])
+        guard let enabled = response.askEnabled else {
+            throw MuxaIPCError.missingField("ask_enabled")
+        }
+        return enabled
+    }
+
     func selectedAskAgent() async throws -> String {
         let response = try await call([
             "protocol": Self.protocolVersion,
@@ -770,23 +1121,37 @@ actor MuxaIPCClient {
         return response.askAgent ?? agent
     }
 
-    func sendAsk(_ prompt: String) async throws -> MuxaAskEntry {
-        let response = try await call([
+    func sendAsk(
+        _ prompt: String,
+        agent: String? = nil,
+        apiKey: String? = nil
+    ) async throws -> MuxaAskEntry {
+        var request: [String: Any] = [
             "protocol": Self.protocolVersion,
             "kind": "ask_send",
             "prompt": prompt,
-        ])
+        ]
+        if let agent, let apiKey, !apiKey.isEmpty {
+            guard capabilities.contains(Self.askCredentialCapability) else {
+                throw MuxaIPCError.server(
+                    "The running muxad is too old for Keychain API keys; choose Use Bundled muxad and retry"
+                )
+            }
+            request["credential"] = ["agent": agent, "api_key": apiKey]
+        }
+        let response = try await call(request)
         guard let entry = response.askEntry else {
             throw MuxaIPCError.missingField("ask_entry")
         }
         return entry
     }
 
-    func resetAskConversation() async throws {
-        _ = try await call([
+    func resetAskConversation() async throws -> MuxaAskConversation? {
+        let response = try await call([
             "protocol": Self.protocolVersion,
             "kind": "ask_reset",
         ])
+        return response.askConversation
     }
 
     func sendCollaboration(
@@ -827,12 +1192,32 @@ actor MuxaIPCClient {
             operation: [
                 "kind": "collaboration_mailbox",
                 "pane": Self.paneKey(pane),
-            ]
+            ],
+            requestTransport: fleetReadTransport(for: host.alias)
         )
         return MuxaCollaborationMailbox(
             incoming: result.collaborationIncoming ?? [],
             sent: result.collaborationSent ?? []
         )
+    }
+
+    func collaborationRequest(
+        host: MuxaFleetHostIdentity,
+        pane: MuxaPaneInfo,
+        requestID: String
+    ) async throws -> MuxaCollaborationRequest {
+        let result = try await fleetCommand(
+            host: host,
+            operation: [
+                "kind": "collaboration_get",
+                "pane": Self.paneKey(pane),
+                "request_id": requestID,
+            ]
+        )
+        guard let request = result.collaborationRequest else {
+            throw MuxaIPCError.missingField("fleet_result.collaboration_request")
+        }
+        return request
     }
 
     func claimCollaboration(
@@ -897,21 +1282,94 @@ actor MuxaIPCClient {
         return session
     }
 
-    func readSession(id: String, offset: UInt64) async throws -> MuxaSessionOutput {
+    func readSession(
+        id: String,
+        offset: UInt64,
+        waitForChanges: Bool = false
+    ) async throws -> MuxaSessionOutput {
         try requireNativeSessionCapabilities()
-        let response = try await call([
-            "protocol": Self.protocolVersion,
-            "kind": "read_session",
-            "session_id": id,
-            "offset": offset,
-        ])
+        let eventDriven = waitForChanges && capabilities.contains(Self.sessionWaitCapability)
+        let response = try await call(
+            [
+                "protocol": Self.protocolVersion,
+                "kind": eventDriven ? "read_session_wait" : "read_session",
+                "session_id": id,
+                "offset": offset,
+                "timeout_ms": 15_000,
+            ],
+            using: terminalReadTransport(for: id),
+            timeout: eventDriven ? 18 : 3
+        )
         guard let output = response.output else {
             throw MuxaIPCError.missingField("output")
         }
         guard output.bytes != nil else {
             throw MuxaIPCError.invalidBase64
         }
+        // Compatibility for a daemon predating session_wait_v1. Keep the old
+        // bounded cadence inside the client so render models never grow their
+        // own polling loops again.
+        if waitForChanges, !eventDriven, output.bytes?.isEmpty == true, !output.exited {
+            try await Task.sleep(for: .milliseconds(45))
+        }
+        if output.exited {
+            terminalReadTransports.removeValue(forKey: id)
+        }
         return output
+    }
+
+    func fleetUpdates() throws -> AsyncThrowingStream<MuxaFleetUpdate, Error> {
+        guard capabilities.contains(Self.fleetSubscribeCapability) else {
+            throw MuxaIPCError.server(
+                "muxad does not support Fleet invalidation subscriptions; update muxa and restart muxad"
+            )
+        }
+        let hello = try JSONSerialization.data(withJSONObject: [
+            "protocol": Self.protocolVersion,
+            "kind": "hello",
+            "client": "muxa-macos-fleet-stream",
+        ])
+        let subscribe = try JSONSerialization.data(withJSONObject: [
+            "protocol": Self.protocolVersion,
+            "kind": "fleet_subscribe",
+        ])
+        let path = socketPath
+        return AsyncThrowingStream { continuation in
+            let subscription = UnixSocket.subscribe(
+                path: path,
+                hello: hello,
+                request: subscribe,
+                onLine: { data in
+                    continuation.yield(try JSONDecoder().decode(MuxaFleetUpdate.self, from: data))
+                },
+                onFinish: { error in
+                    if let error {
+                        continuation.finish(throwing: error)
+                    } else {
+                        continuation.finish()
+                    }
+                }
+            )
+            continuation.onTermination = { @Sendable [weak subscription] _ in
+                subscription?.cancel()
+            }
+            subscription.start()
+        }
+    }
+
+    func askUpdates() throws -> AsyncThrowingStream<UInt64, Error> {
+        try revisionUpdates(kind: "ask_subscribe", capability: Self.askSubscribeCapability)
+    }
+
+    func supports(_ capability: String) -> Bool {
+        capabilities.contains(capability)
+    }
+
+    func pipelineUpdates() throws -> AsyncThrowingStream<UInt64, Error> {
+        try revisionUpdates(
+            kind: "pipeline_subscribe",
+            capability: Self.pipelineSubscribeCapability
+        )
     }
 
     func writeSession(id: String, bytes: Data) async throws {
@@ -953,6 +1411,7 @@ actor MuxaIPCClient {
             "kind": "terminate_session",
             "session_id": id,
         ])
+        terminalReadTransports.removeValue(forKey: id)
     }
 
     private func requireNativeSessionCapabilities() throws {
@@ -968,19 +1427,64 @@ actor MuxaIPCClient {
         }
     }
 
+    private func revisionUpdates(
+        kind: String,
+        capability: String
+    ) throws -> AsyncThrowingStream<UInt64, Error> {
+        guard capabilities.contains(capability) else {
+            throw MuxaIPCError.server("muxad does not support \(kind); update muxa and restart muxad")
+        }
+        let hello = try JSONSerialization.data(withJSONObject: [
+            "protocol": Self.protocolVersion,
+            "kind": "hello",
+            "client": "muxa-macos-\(kind)",
+        ])
+        let subscribe = try JSONSerialization.data(withJSONObject: [
+            "protocol": Self.protocolVersion,
+            "kind": kind,
+        ])
+        let path = socketPath
+        return AsyncThrowingStream { continuation in
+            let subscription = UnixSocket.subscribe(
+                path: path,
+                hello: hello,
+                request: subscribe,
+                onLine: { data in
+                    let update = try JSONDecoder().decode(MuxaRevisionUpdate.self, from: data)
+                    continuation.yield(update.revision)
+                },
+                onFinish: { error in
+                    if let error {
+                        continuation.finish(throwing: error)
+                    } else {
+                        continuation.finish()
+                    }
+                }
+            )
+            continuation.onTermination = { @Sendable [weak subscription] _ in
+                subscription?.cancel()
+            }
+            subscription.start()
+        }
+    }
+
     private func fleetCommand(
         host: MuxaFleetHostIdentity,
-        operation: [String: Any]
+        operation: [String: Any],
+        requestTransport: SerializedIPCTransport? = nil
     ) async throws -> MuxaFleetCommandResult {
         guard capabilities.contains("fleet_v1") else {
             throw MuxaIPCError.server("This operation requires muxad Fleet support")
         }
-        let response = try await call([
-            "protocol": Self.protocolVersion,
-            "kind": "fleet_command",
-            "host": host.alias,
-            "operation": operation,
-        ])
+        let response = try await call(
+            [
+                "protocol": Self.protocolVersion,
+                "kind": "fleet_command",
+                "host": host.alias,
+                "operation": operation,
+            ],
+            using: requestTransport
+        )
         guard let result = response.fleetResult else {
             throw MuxaIPCError.missingField("fleet_result")
         }
@@ -990,9 +1494,37 @@ actor MuxaIPCClient {
         return result
     }
 
-    private func call(_ object: [String: Any]) async throws -> MuxaIPCResponse {
+    private func fleetReadTransport(for host: String) -> SerializedIPCTransport {
+        let hash = host.utf8.reduce(0) { (partial: Int, byte: UInt8) in
+            (partial &* 31) &+ Int(byte)
+        }
+        return fleetReadTransports[abs(hash % fleetReadTransports.count)]
+    }
+
+    private func terminalReadTransport(for sessionID: String) -> SerializedIPCTransport {
+        if let existing = terminalReadTransports[sessionID] { return existing }
+        let hash = sessionID.utf8.reduce(0) { (partial: Int, byte: UInt8) in
+            (partial &* 31) &+ Int(byte)
+        }
+        let created = SerializedIPCTransport(
+            label: "dev.muxa.mac.ipc-terminal-read-\(String(hash, radix: 16))",
+            timedHandler: timedRequestHandler
+        )
+        terminalReadTransports[sessionID] = created
+        return created
+    }
+
+    private func call(
+        _ object: [String: Any],
+        using requestTransport: SerializedIPCTransport? = nil,
+        timeout: TimeInterval = 3
+    ) async throws -> MuxaIPCResponse {
         let request = try JSONSerialization.data(withJSONObject: object)
-        let data = try await transport.request(path: socketPath, payload: request)
+        let data = try await (requestTransport ?? transport).request(
+            path: socketPath,
+            payload: request,
+            timeout: timeout
+        )
         let response = try JSONDecoder().decode(MuxaIPCResponse.self, from: data)
         if !response.ok {
             throw MuxaIPCError.server(response.error ?? "muxad rejected the request")
@@ -1024,12 +1556,39 @@ actor MuxaIPCClient {
 enum UnixSocket {
     private static let maximumResponseBytes = 8 * 1024 * 1024
 
-    static func request(path: String, payload: Data) throws -> Data {
+    static func request(
+        path: String,
+        payload: Data,
+        timeout: TimeInterval = 3
+    ) throws -> Data {
+        let descriptor = try connect(path: path, timeout: timeout)
+        defer { Darwin.close(descriptor) }
+        try writeLine(descriptor: descriptor, payload: payload)
+        var buffered = Data()
+        return try readLine(descriptor: descriptor, buffered: &buffered)
+    }
+
+    static func subscribe(
+        path: String,
+        hello: Data,
+        request: Data,
+        onLine: @escaping @Sendable (Data) throws -> Void,
+        onFinish: @escaping @Sendable (Error?) -> Void
+    ) -> UnixSocketSubscription {
+        UnixSocketSubscription(
+            path: path,
+            hello: hello,
+            request: request,
+            onLine: onLine,
+            onFinish: onFinish
+        )
+    }
+
+    fileprivate static func connect(path: String, timeout: TimeInterval) throws -> Int32 {
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else {
             throw MuxaIPCError.posix(operation: "socket", code: errno)
         }
-        defer { Darwin.close(descriptor) }
 
         var noSignal: Int32 = 1
         let noSignalSize = socklen_t(MemoryLayout<Int32>.size)
@@ -1037,12 +1596,17 @@ enum UnixSocket {
             setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, $0, noSignalSize)
         }
 
-        var timeout = timeval(tv_sec: 3, tv_usec: 0)
+        let boundedTimeout = max(0.1, timeout)
+        let seconds = floor(boundedTimeout)
+        var socketTimeout = timeval(
+            tv_sec: Int(seconds),
+            tv_usec: Int32((boundedTimeout - seconds) * 1_000_000)
+        )
         let timeoutSize = socklen_t(MemoryLayout<timeval>.size)
-        _ = withUnsafePointer(to: &timeout) {
+        _ = withUnsafePointer(to: &socketTimeout) {
             setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, $0, timeoutSize)
         }
-        _ = withUnsafePointer(to: &timeout) {
+        _ = withUnsafePointer(to: &socketTimeout) {
             setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, $0, timeoutSize)
         }
 
@@ -1051,6 +1615,7 @@ enum UnixSocket {
         let pathBytes = Array(path.utf8CString)
         let capacity = MemoryLayout.size(ofValue: address.sun_path)
         guard pathBytes.count <= capacity else {
+            Darwin.close(descriptor)
             throw MuxaIPCError.invalidSocketPath(path)
         }
         path.withCString { source in
@@ -1069,9 +1634,14 @@ enum UnixSocket {
             }
         }
         guard connected == 0 else {
-            throw MuxaIPCError.posix(operation: "connect", code: errno)
+            let code = errno
+            Darwin.close(descriptor)
+            throw MuxaIPCError.posix(operation: "connect", code: code)
         }
+        return descriptor
+    }
 
+    fileprivate static func writeLine(descriptor: Int32, payload: Data) throws {
         var framed = payload
         framed.append(0x0A)
         try framed.withUnsafeBytes { rawBuffer in
@@ -1090,26 +1660,120 @@ enum UnixSocket {
                 written += count
             }
         }
+    }
 
-        var response = Data()
+    fileprivate static func readLine(descriptor: Int32, buffered: inout Data) throws -> Data {
         var buffer = [UInt8](repeating: 0, count: 16 * 1024)
         while true {
+            if let newline = buffered.firstIndex(of: 0x0A) {
+                let line = Data(buffered.prefix(upTo: newline))
+                buffered.removeSubrange(...newline)
+                return line
+            }
             let count = Darwin.read(descriptor, &buffer, buffer.count)
             if count < 0, errno == EINTR { continue }
             if count < 0 {
                 throw MuxaIPCError.posix(operation: "read", code: errno)
             }
             if count == 0 { break }
-            response.append(contentsOf: buffer.prefix(count))
-            if response.count > maximumResponseBytes {
+            buffered.append(contentsOf: buffer.prefix(count))
+            if buffered.count > maximumResponseBytes {
                 throw MuxaIPCError.responseTooLarge
-            }
-            if let newline = response.firstIndex(of: 0x0A) {
-                return response.prefix(upTo: newline)
             }
         }
 
-        guard !response.isEmpty else { throw MuxaIPCError.emptyResponse }
-        return response
+        guard !buffered.isEmpty else { throw MuxaIPCError.emptyResponse }
+        let trailing = buffered
+        buffered.removeAll(keepingCapacity: true)
+        return trailing
+    }
+}
+
+final class UnixSocketSubscription: @unchecked Sendable {
+    private let path: String
+    private let hello: Data
+    private let request: Data
+    private let onLine: @Sendable (Data) throws -> Void
+    private let onFinish: @Sendable (Error?) -> Void
+    private let queue = DispatchQueue(label: "dev.muxa.mac.ipc-fleet-stream", qos: .utility)
+    private let lock = NSLock()
+    private var descriptor: Int32 = -1
+    private var cancelled = false
+
+    init(
+        path: String,
+        hello: Data,
+        request: Data,
+        onLine: @escaping @Sendable (Data) throws -> Void,
+        onFinish: @escaping @Sendable (Error?) -> Void
+    ) {
+        self.path = path
+        self.hello = hello
+        self.request = request
+        self.onLine = onLine
+        self.onFinish = onFinish
+    }
+
+    func start() {
+        queue.async { [self] in run() }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let activeDescriptor = descriptor
+        lock.unlock()
+        if activeDescriptor >= 0 {
+            Darwin.shutdown(activeDescriptor, SHUT_RDWR)
+        }
+    }
+
+    private func run() {
+        do {
+            let socket = try UnixSocket.connect(path: path, timeout: 20)
+            lock.lock()
+            descriptor = socket
+            let shouldCancel = cancelled
+            lock.unlock()
+            defer {
+                Darwin.close(socket)
+                lock.lock()
+                descriptor = -1
+                lock.unlock()
+            }
+            if shouldCancel {
+                Darwin.shutdown(socket, SHUT_RDWR)
+                onFinish(nil)
+                return
+            }
+
+            var buffered = Data()
+            try UnixSocket.writeLine(descriptor: socket, payload: hello)
+            try validateAck(UnixSocket.readLine(descriptor: socket, buffered: &buffered))
+            try UnixSocket.writeLine(descriptor: socket, payload: request)
+            try validateAck(UnixSocket.readLine(descriptor: socket, buffered: &buffered))
+
+            while !isCancelled {
+                let line = try UnixSocket.readLine(descriptor: socket, buffered: &buffered)
+                if line.isEmpty { continue }
+                try onLine(line)
+            }
+            onFinish(nil)
+        } catch {
+            onFinish(isCancelled ? nil : error)
+        }
+    }
+
+    private var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    private func validateAck(_ data: Data) throws {
+        let response = try JSONDecoder().decode(MuxaIPCResponse.self, from: data)
+        guard response.ok else {
+            throw MuxaIPCError.server(response.error ?? "muxad rejected the subscription")
+        }
     }
 }

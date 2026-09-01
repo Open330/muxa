@@ -2,7 +2,7 @@ import Foundation
 
 struct MuxaWorkGroup: Identifiable, Sendable {
     let identity: MuxaWorkIdentity
-    let pipelineRun: MuxaPipelineRun
+    let pipelineRun: MuxaPipelineRun?
     let participants: [MuxaHostedAgent]
 
     var id: MuxaWorkIdentity { identity }
@@ -11,6 +11,18 @@ struct MuxaWorkGroup: Identifiable, Sendable {
 
     var title: String {
         return workID
+    }
+
+    var pipelineLabel: String {
+        pipelineRun?.pipeline ?? "Managed Fleet Work"
+    }
+
+    var cwd: String? {
+        if let cwd = pipelineRun?.cwd, !cwd.isEmpty { return cwd }
+        if let cwd = participants.lazy.compactMap({ $0.pane?.currentPath }).first(where: { !$0.isEmpty }) {
+            return cwd
+        }
+        return participants.lazy.compactMap(\.agent.cwd).first(where: { !$0.isEmpty })
     }
 
     var hostAliases: [String] {
@@ -22,9 +34,9 @@ struct MuxaWorkGroup: Identifiable, Sendable {
             ["waiting_input", "waiting_choice", "blocked", "error", "failed"]
                 .contains($0.agent.state)
         }.count
-        let pipelineAttention = pipelineRun.aliases.values.lazy.filter {
+        let pipelineAttention = pipelineRun?.aliases.values.lazy.filter {
             $0.status == "blocked" || $0.status == "failed"
-        }.count
+        }.count ?? 0
         return max(agentAttention, pipelineAttention)
     }
 
@@ -35,14 +47,15 @@ struct MuxaWorkGroup: Identifiable, Sendable {
     }
 
     var completedCount: Int {
-        pipelineRun.aliases.values.lazy.filter { $0.status == "done" }.count
+        pipelineRun?.aliases.values.lazy.filter { $0.status == "done" }.count ?? 0
     }
 
     var totalCount: Int {
-        pipelineRun.desired.count
+        pipelineRun?.desired.count ?? participants.count
     }
 
     func desiredAgent(for participant: MuxaHostedAgent) -> MuxaDesiredAgent? {
+        guard let pipelineRun else { return nil }
         if let alias = participant.pane?.agentAlias,
            let desired = pipelineRun.desired.first(where: { $0.alias == alias }) {
             return desired
@@ -59,6 +72,19 @@ struct MuxaWatchPaneIdentity: Codable, Hashable, Sendable {
     let hostAlias: String
     let socket: String
     let paneID: String
+}
+
+struct MuxaWatchSessionIdentity: Codable, Hashable, Sendable {
+    let hostAlias: String
+    let socket: String
+    let sessionID: String
+}
+
+struct MuxaWatchWindowIdentity: Codable, Hashable, Sendable {
+    let hostAlias: String
+    let socket: String
+    let sessionID: String
+    let windowID: String
 }
 
 enum MuxaModuleRoute: Codable, Hashable, Sendable {
@@ -90,6 +116,15 @@ struct MuxaWatchWindow: Identifiable, Sendable {
     let panes: [MuxaWatchPane]
 
     var id: String { "\(hostAlias):\(socket):\(sessionID):\(windowID)" }
+
+    var identity: MuxaWatchWindowIdentity {
+        MuxaWatchWindowIdentity(
+            hostAlias: hostAlias,
+            socket: socket,
+            sessionID: sessionID,
+            windowID: windowID
+        )
+    }
 }
 
 struct MuxaWatchSession: Identifiable, Sendable {
@@ -100,6 +135,14 @@ struct MuxaWatchSession: Identifiable, Sendable {
     let windows: [MuxaWatchWindow]
 
     var id: String { "\(hostAlias):\(socket):\(sessionID)" }
+
+    var identity: MuxaWatchSessionIdentity {
+        MuxaWatchSessionIdentity(
+            hostAlias: hostAlias,
+            socket: socket,
+            sessionID: sessionID
+        )
+    }
 }
 
 struct MuxaWatchHost: Identifiable, Sendable {
@@ -108,6 +151,22 @@ struct MuxaWatchHost: Identifiable, Sendable {
 
     var id: String { host.alias }
     var paneCount: Int { sessions.reduce(0) { $0 + $1.windows.reduce(0) { $0 + $1.panes.count } } }
+}
+
+struct MuxaOperatorMessage: Identifiable, Hashable, Sendable {
+    let host: MuxaFleetHostIdentity
+    /// Any exact pane on the host. The Fleet mailbox is console-scoped for
+    /// sent requests, so this is a routing endpoint rather than the target.
+    let routePane: MuxaPaneInfo
+    let request: MuxaCollaborationRequest
+
+    var id: String { "\(host.alias):\(request.id)" }
+    var needsReply: Bool { request.expectsReply && request.reply == nil }
+    var hasUnreadReply: Bool { request.reply != nil && request.replyReadAt == nil }
+    var needsHumanDecision: Bool {
+        let terminalStatus = request.reply?.status ?? request.status
+        return ["blocked", "declined", "failed"].contains(terminalStatus)
+    }
 }
 
 extension MuxaExecutionSnapshot {
@@ -124,9 +183,12 @@ extension MuxaExecutionSnapshot {
 
         for run in pipelineRuns {
             let participants = visible.filter { participant in
-                guard participant.host.local,
-                      let pane = participant.pane,
+                guard let pane = participant.pane,
                       !assigned.contains(participant.id) else { return false }
+                if let stamped = pane.workIdentity {
+                    return stamped == run.identity
+                }
+                guard participant.host.local else { return false }
                 if let windowID = run.windowID {
                     guard pane.windowID == windowID,
                           localWindowEndpoints[windowID]?.count == 1 else { return false }
@@ -139,6 +201,21 @@ extension MuxaExecutionSnapshot {
                 MuxaWorkGroup(
                     identity: run.identity,
                     pipelineRun: run,
+                    participants: participants.sorted(by: Self.participantComesBefore)
+                )
+            )
+        }
+        var observed: [MuxaWorkIdentity: [MuxaHostedAgent]] = [:]
+        for participant in visible where !assigned.contains(participant.id) {
+            guard let identity = participant.pane?.workIdentity else { continue }
+            observed[identity, default: []].append(participant)
+        }
+        for (identity, participants) in observed {
+            assigned.formUnion(participants.map(\.id))
+            groups.append(
+                MuxaWorkGroup(
+                    identity: identity,
+                    pipelineRun: nil,
                     participants: participants.sorted(by: Self.participantComesBefore)
                 )
             )
@@ -179,75 +256,4 @@ extension MuxaExecutionSnapshot {
         }
     }
 
-    var watchHosts: [MuxaWatchHost] {
-        hosts.map { host in
-            let panes = host.remote?.panes ?? []
-            let agents = host.remote?.agents ?? []
-            let groupedSessions = Dictionary(grouping: panes) { pane in
-                "\(pane.endpointSocket)\u{0}\(pane.stableSessionID)"
-            }
-            let sessions = groupedSessions.values.map { sessionPanes -> MuxaWatchSession in
-                let first = sessionPanes[0]
-                let groupedWindows = Dictionary(grouping: sessionPanes, by: \.stableWindowID)
-                let windows = groupedWindows.values.map { windowPanes -> MuxaWatchWindow in
-                    let firstWindow = windowPanes[0]
-                    let nodes = windowPanes.map { pane in
-                        MuxaWatchPane(
-                            host: host.identity,
-                            pane: pane,
-                            agent: Self.watchAgent(for: pane, among: agents)
-                        )
-                    }.sorted { Self.paneIndex($0.pane.paneIndex) < Self.paneIndex($1.pane.paneIndex) }
-                    return MuxaWatchWindow(
-                        hostAlias: host.alias,
-                        socket: firstWindow.endpointSocket,
-                        sessionID: firstWindow.stableSessionID,
-                        windowID: firstWindow.stableWindowID,
-                        name: firstWindow.windowName,
-                        index: firstWindow.windowIndex,
-                        panes: nodes
-                    )
-                }.sorted { left, right in
-                    let leftIndex = Self.paneIndex(left.index)
-                    let rightIndex = Self.paneIndex(right.index)
-                    return leftIndex == rightIndex
-                        ? left.name.localizedStandardCompare(right.name) == .orderedAscending
-                        : leftIndex < rightIndex
-                }
-                return MuxaWatchSession(
-                    hostAlias: host.alias,
-                    socket: first.endpointSocket,
-                    sessionID: first.stableSessionID,
-                    name: first.session,
-                    windows: windows
-                )
-            }.sorted { left, right in
-                left.name.localizedStandardCompare(right.name) == .orderedAscending
-            }
-            return MuxaWatchHost(host: host, sessions: sessions)
-        }.sorted { left, right in
-            if left.host.local != right.host.local { return left.host.local }
-            return left.host.alias.localizedStandardCompare(right.host.alias) == .orderedAscending
-        }
-    }
-
-    func watchPane(id: MuxaWatchPaneIdentity) -> MuxaWatchPane? {
-        watchHosts
-            .flatMap(\.sessions)
-            .flatMap(\.windows)
-            .flatMap(\.panes)
-            .first { $0.id == id }
-    }
-
-    private static func watchAgent(for pane: MuxaPaneInfo, among agents: [MuxaAgent]) -> MuxaAgent? {
-        let candidates = agents.filter { agent in
-            guard agent.pane == pane.paneID else { return false }
-            return agent.tmuxSocket == nil || agent.tmuxSocket == pane.socket
-        }
-        return candidates.count == 1 ? candidates[0] : nil
-    }
-
-    private static func paneIndex(_ value: String) -> Int {
-        Int(value) ?? Int.max
-    }
 }

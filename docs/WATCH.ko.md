@@ -46,7 +46,7 @@ window였던 것처럼 보이지 않도록 전체 session → window → pane an
 | `w` | pipeline 실행: work id를 입력하면 `muxa work up`을 실행하는 window로 넘어갑니다. |
 | `R` / `:rename` | 선택한 tmux session/window 이름 또는 pane title 변경. |
 | `\|` | list/inspector 분할 순환: 50/50 → 70/30 → 30/70. |
-| `a` / `A` | 설정한 agent에게 headless 질의 / 답변 이력 보기. |
+| `a` / `A` | 설정한 agent에게 headless 질의 / 답변 이력 보기. `Enter`로 선택한 답변 전문 읽기. |
 | `m` / `M` | resolve된 agent에게 request 보내기 / 선택 topology scope 이력 열기. |
 | `b` | `M`의 이전 alias. mailbox 안에서 `i`는 claim, `e`는 reply. |
 | `v` | collaboration 화면에서 table / 시간순 sequence 전환. |
@@ -190,14 +190,21 @@ claude ↔ codex를 바꾸고, `Ctrl-V`로 붙여넣으며, 초안 어느 위치
 print 모드로 실행해 답변을 수집하므로 pane에 입력하지 않고 관리할 세션도 없습니다.
 `Esc`로 취소하며, 입력이 이미 비어 있을 때는 `Backspace`로도 닫을 수 있습니다.
 
-`A`는 이력을 엽니다. `j`/`k` 선택, `|` 상세 영역 확대, `Tab` agent 필터(all →
-claude → codex), `n` 새 대화. `n` 전까지는 하나의 대화라 질문마다 직전 대화를
+`A`는 이력을 엽니다. `j`/`k` 선택, `Enter` 선택한 답변 전문 열기, `|` 상세 영역
+확대, `Tab` agent 필터(all → claude → codex), `n` 새 대화. `n` 전까지는 하나의 대화라 질문마다 직전 대화를
 resume하며, 두 번째부터는 첫 질문이 지불한 캐시 컨텍스트를 재사용합니다. 대화는
 agent별로 분리돼 있어 되돌아오면 그 대화가 이어집니다.
 
 실행 주체는 daemon입니다. 팝업을 닫아도 답변이 이력에 도착하고, 이력은
 `$XDG_DATA_HOME/muxa/ask.json`에 남아 재시작 후에도 조회됩니다. `[ask] enabled =
 true`가 필요합니다 — [CONFIGURATION.ko.md](CONFIGURATION.ko.md) 참고.
+
+목록 아래 상세 영역은 답변의 첫 화면분만 보여줍니다. `Enter`(또는 `o`)를 누르면
+질문과 답변 전문을 담은 reader가 열립니다. `j`/`k` 한 줄, `PgUp`/`PgDn` 한 페이지,
+`g`/`G` 처음/끝으로 이동하며, 상자 아래쪽에 지금 보고 있는 줄 범위가 표시됩니다.
+`Esc`·`Enter`·`q`는 목록으로 돌아가고 `A`는 패널을 닫습니다. reader는 읽기 전용이라
+`d`/`D`가 읽는 중인 답변을 지우지 않으며, 항목 자체를 따라가므로 열어 둔 상태에서
+도착한 답변도 다시 열 필요 없이 나타납니다.
 
 Ask 이력 안에서 `n`은 이력을 지우지 않고 새 대화를 시작합니다. `D`는 확인창을 연
 뒤 모든 agent filter의 완료 이력을 지웁니다. 소문자 `d`는 선택한 완료 이력 하나만
@@ -212,6 +219,13 @@ Ask는 headless session이 승인 prompt에 응답할 수 없고 무인 skill �
 삽입된 스킬은 질문 본문일 뿐입니다. 선택한 agent, `permission_mode`, cwd,
 additional directories, timeout은 바꾸지 않으며 daemon이 가진 기존 `[ask]` 계약을
 그대로 사용합니다.
+
+macOS 앱의 Inbox는 Ask 이력뿐 아니라 operator console이 Fleet 각 host에 보낸
+Collaboration 명령을 한곳에 모읍니다. Waiting/New reply 상태, Markdown reply,
+Work와 window 위치를 함께 보여주며, 명령을 열면 정확한 대상 agent pane으로
+돌아갑니다. Provider 설정에서는 기존 CLI 로그인을 그대로 쓰거나 API key를 macOS
+login Keychain에 저장할 수 있습니다. 저장된 키는 선택한 다음 Ask child에만
+one-turn credential로 전달되고 이력에는 남지 않습니다.
 
 ## Agent 협업
 

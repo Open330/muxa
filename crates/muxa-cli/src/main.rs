@@ -126,6 +126,27 @@ enum Cmd {
         #[command(subcommand)]
         action: MsgCmd,
     },
+    /// Ask Claude Code or Codex headlessly and print the durable reply.
+    Ask {
+        /// Question or task for the selected headless provider.
+        prompt: String,
+        /// Override the daemon's selected provider for this and later asks.
+        #[arg(long, value_enum)]
+        agent: Option<AskAgentArg>,
+        /// Read one API key from piped stdin and use it only for this turn.
+        /// The key is never stored in config, history, logs, or argv.
+        #[arg(long)]
+        api_key_stdin: bool,
+        /// Queue the Ask and return immediately instead of waiting for its answer.
+        #[arg(long)]
+        detach: bool,
+        /// Print the stored Ask entry as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Maximum time this CLI waits for the durable answer.
+        #[arg(long, default_value_t = 1800)]
+        timeout_secs: u64,
+    },
     /// Register reusable `/` templates for the interactive message composer.
     Skill(message_skill::Args),
     /// Manage local/SSH host inventory and Kubernetes-style metadata.
@@ -283,7 +304,11 @@ enum Cmd {
     },
     /// Exact remote pane attach endpoint used by `muxa fleet attach`.
     #[command(hide = true)]
-    FleetRemoteAttach { token: String },
+    FleetRemoteAttach {
+        token: String,
+        #[arg(long)]
+        fit: bool,
+    },
     /// Jump to the agent that needs you — focus the pane of whichever
     /// agent has been blocked on input/choice/error longest. `--cycle`
     /// rotates through them (bind it to a tmux key); `--list` prints the
@@ -461,6 +486,21 @@ enum MsgCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AskAgentArg {
+    Claude,
+    Codex,
+}
+
+impl AskAgentArg {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -714,6 +754,92 @@ fn collaboration_client_kind(command: &Cmd) -> CollaborationClientKind {
     }
 }
 
+async fn cmd_ask(
+    client: &Client,
+    prompt: String,
+    agent: Option<AskAgentArg>,
+    api_key_stdin: bool,
+    detach: bool,
+    json: bool,
+    timeout_secs: u64,
+) -> Result<()> {
+    let selected = match agent {
+        Some(agent) => client.ask_agent(Some(agent.label())).await?,
+        None => client.ask_agent(None).await?,
+    };
+    let api_key = if api_key_stdin {
+        anyhow::ensure!(
+            !std::io::stdin().is_terminal(),
+            "--api-key-stdin requires a pipe; refusing to echo a secret in the terminal"
+        );
+        let mut value = String::new();
+        std::io::stdin().read_to_string(&mut value)?;
+        let value = value.trim().to_string();
+        anyhow::ensure!(!value.is_empty(), "stdin did not contain an API key");
+        let hello = client.hello(Duration::from_secs(2)).await?;
+        anyhow::ensure!(
+            hello
+                .capabilities
+                .iter()
+                .any(|value| value == "ask_one_turn_credential_v1"),
+            "the running muxad is too old for one-turn API keys; restart it from this muxa version"
+        );
+        Some(value)
+    } else {
+        None
+    };
+    let pending = client
+        .ask_send_with_credential(&prompt, Some(&selected), api_key.as_deref())
+        .await?;
+    if detach {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&pending)?);
+        } else {
+            println!("queued {} via {}", pending.id, pending.agent);
+        }
+        return Ok(());
+    }
+
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(timeout_secs.clamp(1, 24 * 60 * 60));
+    loop {
+        let entry = client
+            .ask_list()
+            .await?
+            .into_iter()
+            .find(|entry| entry.id == pending.id)
+            .context("the queued Ask disappeared from durable history")?;
+        match entry.status {
+            muxa::ask::AskStatus::Running => {
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for {}; the Ask remains queued in muxad history",
+                    entry.id
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            muxa::ask::AskStatus::Answered => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entry)?);
+                } else {
+                    println!("{}", entry.answer);
+                }
+                return Ok(());
+            }
+            muxa::ask::AskStatus::Failed => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entry)?);
+                    anyhow::bail!("Ask {} failed", entry.id);
+                }
+                anyhow::bail!(
+                    "{}",
+                    entry.error.as_deref().unwrap_or("headless provider failed")
+                );
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)] // top-level CLI subcommand wiring
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -765,6 +891,25 @@ async fn main() -> Result<()> {
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Peers { json } => cmd_peers(&client, json).await,
         Cmd::Msg { action } => cmd_msg(&client, action).await,
+        Cmd::Ask {
+            prompt,
+            agent,
+            api_key_stdin,
+            detach,
+            json,
+            timeout_secs,
+        } => {
+            cmd_ask(
+                &client,
+                prompt,
+                agent,
+                api_key_stdin,
+                detach,
+                json,
+                timeout_secs,
+            )
+            .await
+        }
         Cmd::Skill(a) => message_skill::run(a, &cfg.message, skill_path.as_deref()),
         Cmd::Host(a) => fleet_cli::run_host(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Fleet(a) => fleet_cli::run_fleet(a, &client, &cfg, config_path.as_deref()).await,
@@ -861,7 +1006,7 @@ async fn main() -> Result<()> {
             }
             relay::run(client).await
         }
-        Cmd::FleetRemoteAttach { token } => relay::remote_attach(&token),
+        Cmd::FleetRemoteAttach { token, fit } => relay::remote_attach(&token, fit),
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket, config_path).await,
@@ -3295,6 +3440,37 @@ mod tests {
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
 
+    #[test]
+    fn ask_command_supports_headless_provider_and_stdin_key() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "ask",
+            "summarize this window",
+            "--agent",
+            "codex",
+            "--api-key-stdin",
+            "--detach",
+            "--json",
+        ])
+        .unwrap();
+        let Cmd::Ask {
+            prompt,
+            agent,
+            api_key_stdin,
+            detach,
+            json,
+            ..
+        } = args.cmd
+        else {
+            panic!("expected ask command");
+        };
+        assert_eq!(prompt, "summarize this window");
+        assert_eq!(agent.unwrap().label(), "codex");
+        assert!(api_key_stdin);
+        assert!(detach);
+        assert!(json);
+    }
+
     fn started(kind: AgentKind, pane: Option<&str>) -> muxa::event::AgentEvent {
         muxa::event::AgentEvent::Started {
             id: muxa::event::AgentId {
@@ -3540,6 +3716,7 @@ mod tests {
             cwd: None,
             state,
             last_prompt: Some(prompt.into()),
+            last_prompt_at: None,
             last_response: None,
             recap: None,
             ai_title: None,
@@ -4125,6 +4302,22 @@ mod tests {
         assert_eq!(onboard.tour, onboarding::Tour::Live);
         assert!(Args::try_parse_from(["muxa", "onboard", "--tour", "live"]).is_ok());
         assert!(Args::try_parse_from(["muxa", "onboard", "--tour", "simulated"]).is_err());
+    }
+
+    #[test]
+    fn fleet_attach_accepts_app_fit_mode() {
+        assert!(Args::try_parse_from([
+            "muxa",
+            "fleet",
+            "attach",
+            "--fit",
+            "rtzr",
+            r#"{"window":{"session":{"host":"tmux","socket":"default","session_id":"$1"},"window_id":"@2"},"pane_id":"%3"}"#,
+        ])
+        .is_ok());
+        assert!(
+            Args::try_parse_from(["muxa", "fleet-remote-attach", "0123abcd", "--fit",]).is_ok()
+        );
     }
 
     #[test]

@@ -344,12 +344,14 @@ private struct WorkCommandCard: View {
                     .font(.caption.weight(.medium))
                     .foregroundStyle(work.attentionCount > 0 ? .orange : work.workingCount > 0 ? .blue : .green)
                 }
-                Text(work.pipelineRun.pipeline)
+                Text(work.pipelineLabel)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 14) {
                     Label("\(work.participants.count)", systemImage: "person.2")
-                    Label("\(work.completedCount)/\(work.totalCount)", systemImage: "checkmark.circle")
+                    if work.pipelineRun != nil {
+                        Label("\(work.completedCount)/\(work.totalCount)", systemImage: "checkmark.circle")
+                    }
                     if !work.hostAliases.isEmpty {
                         Label(work.hostAliases.joined(separator: ", "), systemImage: "network")
                     }
@@ -426,7 +428,11 @@ private struct FleetPaneWorkspace: View {
                             openInShell: { openInShell() }
                         )
                     case .collaborate:
-                        MuxaCollaborationView(pane: pane, client: model.client)
+                        MuxaCollaborationView(
+                            pane: pane,
+                            client: model.client,
+                            mailboxRevision: model.mailboxRevisions[pane.host.alias]
+                        )
                     }
                 }
                 .frame(minHeight: 180)
@@ -446,33 +452,64 @@ private struct FleetPaneWorkspace: View {
     }
 
     private var paneHeader: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                paneIdentity(showsLocation: true)
+                Spacer(minLength: 8)
+                modulePicker(width: 210)
+                Button {
+                    Task { await model.refresh() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+            }
+
+            HStack(spacing: 8) {
+                paneIdentity(showsLocation: false)
+                Spacer(minLength: 4)
+                modulePicker(width: 150)
+                Button {
+                    Task { await model.refresh() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Refresh")
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 48)
+    }
+
+    private func paneIdentity(showsLocation: Bool) -> some View {
         HStack(spacing: 10) {
             HostIdentityBadge(identity: pane.host, size: 28)
             VStack(alignment: .leading, spacing: 1) {
                 Text(pane.agent?.aiTitle ?? pane.pane.agentAlias.map { "@\($0)" } ?? pane.pane.windowName)
                     .font(.headline)
-                Text("\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
                     .lineLimit(1)
-            }
-            Spacer(minLength: 8)
-            Picker("Pane module", selection: $module) {
-                ForEach(PaneModule.allCases) { module in
-                    Text(module.rawValue).tag(module)
+                if showsLocation {
+                    Text("\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
             }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .frame(width: 210)
-            Button {
-                Task { await model.refresh() }
-            } label: {
-                Label("Refresh", systemImage: "arrow.clockwise")
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func modulePicker(width: CGFloat) -> some View {
+        Picker("Pane module", selection: $module) {
+            ForEach(PaneModule.allCases) { module in
+                Text(module.rawValue).tag(module)
             }
         }
-        .padding(.horizontal, 14)
-        .frame(height: 48)
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .frame(width: width)
     }
 
     private func attachInPanel() {
@@ -512,74 +549,244 @@ struct MuxaAskView: View {
     @State private var prompt = ""
     @State private var agent = "claude"
 
+    private var activeConversation: MuxaAskConversation? {
+        model.askConversations.first { $0.id == model.activeAskConversationID }
+    }
+
+    private var providerConversations: [MuxaAskConversation] {
+        model.askConversations.filter { $0.agent == agent }
+    }
+
+    private var conversationEntries: [MuxaAskEntry] {
+        let entries: [MuxaAskEntry]
+        if let conversationID = model.activeAskConversationID {
+            entries = model.askEntries.filter { $0.conversationID == conversationID }
+        } else {
+            // Compatibility with a daemon from before muxa-owned conversation
+            // ids: retain the prior provider-filtered history until it reloads.
+            entries = model.askEntries.filter { $0.agent == agent }
+        }
+        return entries.sorted { $0.askedAt < $1.askedAt }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Label("Ask", systemImage: "sparkles")
+                Label("Global Ask", systemImage: "sparkles")
                     .font(.headline)
-                Picker("Agent", selection: $agent) {
-                    Text("Claude").tag("claude")
-                    Text("Codex").tag("codex")
+                if let activeConversation {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Text(activeConversation.title)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                .labelsHidden()
-                .frame(width: 120)
                 Spacer()
-                Button {
-                    Task { await model.resetAskConversation() }
-                } label: {
-                    Label("New Thread", systemImage: "plus.bubble")
-                }
-                .help("Start a new conversation without deleting history")
+                Text("Conversations resume their Claude Code or Codex context")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
             }
             .padding(.horizontal, 14)
             .frame(height: 40)
 
             Divider()
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    if model.askEntries.isEmpty {
-                        ConsoleUnavailableView(
-                            title: "No Ask history",
-                            systemImage: "bubble.left.and.bubble.right",
-                            description: "Ask a headless agent a question. Answers remain available after this view closes."
+            if model.askEnabled == false {
+                HStack(alignment: .center, spacing: 12) {
+                    Image(systemName: "sparkles.rectangle.stack")
+                        .font(.title3)
+                        .foregroundStyle(.tint)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.askConfigurationPendingReload ? "Reload to finish enabling Ask" : "Enable Global Ask")
+                            .font(.subheadline.weight(.semibold))
+                        Text(
+                            model.askConfigurationPendingReload
+                                ? "The grant is saved. Reload muxad to apply it; tmux sessions will remain running."
+                                : "Muxa will run the selected provider CLI headlessly. Provider usage may be billed to your account."
                         )
-                        .frame(minHeight: 150)
-                    } else {
-                        ForEach(model.askEntries) { entry in
-                            AskHistoryCard(entry: entry)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 12)
+                    if model.isEnablingAsk {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Button(model.askConfigurationPendingReload ? "Reload muxad" : "Enable & Reload") {
+                        Task { await model.enableAsk() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isEnablingAsk)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Color.accentColor.opacity(0.07))
+
+                Divider()
+            }
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        if conversationEntries.isEmpty {
+                            ConsoleUnavailableView(
+                                title: activeConversation == nil ? "Start a conversation" : "No messages yet",
+                                systemImage: "bubble.left.and.bubble.right",
+                                description: "Ask a headless agent a question. You can return to this conversation and continue it later."
+                            )
+                            .frame(minHeight: 150)
+                        } else {
+                            ForEach(Array(conversationEntries.enumerated()), id: \.element.id) { index, entry in
+                                AskConversationTurn(entry: entry)
+                                    .id(entry.id)
+                                if index < conversationEntries.count - 1 {
+                                    Divider().padding(.vertical, 6)
+                                }
+                            }
                         }
                     }
+                    .padding(14)
+                    .frame(maxWidth: 980)
+                    .frame(maxWidth: .infinity)
                 }
-                .padding(12)
+                .onAppear { scrollToLatest(proxy) }
+                .onChange(of: conversationEntries.last?.id) { _ in scrollToLatest(proxy) }
             }
 
             Divider()
 
             VStack(alignment: .leading, spacing: 7) {
-                TextEditor(text: $prompt)
-                    .font(.body)
-                    .scrollContentBackground(.hidden)
-                    .padding(7)
-                    .frame(minHeight: 64, maxHeight: 100)
-                    .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 7))
-                HStack {
-                    if let error = model.askError {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .lineLimit(2)
+                AskComposerEditor(
+                    text: $prompt,
+                    placeholder: "Ask about work across your fleet…"
+                )
+                .frame(minHeight: 72, maxHeight: 112)
+                .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                }
+                .disabled(model.askEnabled == false || !model.isConnected)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        askContextControls
+                        Spacer(minLength: 8)
+                        askSendStatus
+                        sendButton
                     }
-                    Spacer()
-                    if model.isSendingAsk { ProgressView().controlSize(.small) }
-                    Button("Ask \(agent.capitalized)") { send() }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(model.isSendingAsk || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            askContextControls
+                            Spacer()
+                        }
+                        HStack {
+                            askSendStatus
+                            Spacer()
+                            sendButton
+                        }
+                    }
                 }
             }
             .padding(12)
         }
         .onAppear { agent = model.askAgent }
+        .onChange(of: model.askAgent) { selected in agent = selected }
+        .onChange(of: agent) { selected in
+            Task { await model.selectAskAgent(selected) }
+        }
+        .sheet(isPresented: $model.isPresentingAskSettings) {
+            AskProviderSettingsView(model: model)
+        }
+    }
+
+    private var askContextControls: some View {
+        HStack(spacing: 7) {
+            Picker("Provider", selection: $agent) {
+                Text("Claude Code").tag("claude")
+                Text("Codex").tag("codex")
+            }
+            .labelsHidden()
+            .frame(width: 132)
+
+            Menu {
+                if providerConversations.isEmpty {
+                    Text("No previous conversations")
+                } else {
+                    ForEach(providerConversations) { conversation in
+                        Button {
+                            Task { await model.selectAskConversation(conversation.id) }
+                        } label: {
+                            if conversation.id == model.activeAskConversationID {
+                                Label(conversation.title, systemImage: "checkmark")
+                            } else {
+                                Text(conversation.title)
+                            }
+                        }
+                    }
+                }
+            } label: {
+                Label(activeConversation?.title ?? "Conversations", systemImage: "bubble.left.and.bubble.right")
+                    .lineLimit(1)
+                    .frame(width: 190, alignment: .leading)
+            }
+            .menuStyle(.borderlessButton)
+
+            Button {
+                Task { await model.resetAskConversation() }
+            } label: {
+                Label("New", systemImage: "plus.bubble")
+            }
+            .help("Start a new conversation without deleting prior conversations")
+
+            Button {
+                model.presentAskSettings()
+            } label: {
+                Label("Providers", systemImage: "gearshape")
+            }
+            .help("Configure Claude Code and Codex authentication")
+        }
+    }
+
+    @ViewBuilder
+    private var askSendStatus: some View {
+        if let error = model.askError {
+            Text(error)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .lineLimit(2)
+        } else {
+            Text("⌘↩ Send")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        if model.isSendingAsk { ProgressView().controlSize(.small) }
+    }
+
+    private var sendButton: some View {
+        Button(action: send) {
+            Label("Send", systemImage: "paperplane.fill")
+        }
+        .buttonStyle(.borderedProminent)
+        .keyboardShortcut(.return, modifiers: [.command])
+        .help("Continue this conversation with the selected provider (⌘↩)")
+        .disabled(
+            model.isSendingAsk
+                || model.askEnabled == false
+                || !model.isConnected
+                || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
+    }
+
+    private func scrollToLatest(_ proxy: ScrollViewProxy) {
+        guard let id = conversationEntries.last?.id else { return }
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.16)) {
+                proxy.scrollTo(id, anchor: .bottom)
+            }
+        }
     }
 
     private func send() {
@@ -592,41 +799,933 @@ struct MuxaAskView: View {
     }
 }
 
-private struct AskHistoryCard: View {
-    let entry: MuxaAskEntry
+private struct AskComposerEditor: View {
+    @Binding var text: String
+    let placeholder: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 7) {
-                Text(entry.agent.capitalized)
-                    .font(.caption.weight(.semibold))
-                Text(entry.status.replacingOccurrences(of: "_", with: " ").capitalized)
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(entry.status == "failed" ? Color.red : entry.status == "running" ? Color.blue : Color.green)
-                if entry.status == "running" { ProgressView().controlSize(.mini) }
-                Spacer()
-                Text(entry.askedAt)
-                    .font(.caption2.monospacedDigit())
+        ZStack(alignment: .topLeading) {
+            TextEditor(text: $text)
+                .font(.body)
+                .scrollContentBackground(.hidden)
+
+            if text.isEmpty {
+                Text(placeholder)
+                    .font(.body)
                     .foregroundStyle(.tertiary)
-                    .lineLimit(1)
+                    // NSTextView uses these insets for its first baseline. Keeping
+                    // the overlay inside the same padded container also gives it
+                    // the exact same wrapping width as the editable text.
+                    .padding(.leading, 5)
+                    .padding(.trailing, 5)
+                    .padding(.top, 8)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .allowsHitTesting(false)
             }
-            MarkdownContent(source: entry.prompt)
-                .font(.subheadline.weight(.medium))
-            if !entry.answer.isEmpty {
-                Divider()
-                MarkdownContent(source: entry.answer)
+        }
+        .padding(7)
+    }
+}
+
+private struct AskProviderSettingsView: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Ask Providers")
+                    .font(.title2.weight(.semibold))
+                Text("Muxa runs the installed CLIs headlessly. Existing CLI sign-in works unchanged; optional API keys are stored only in the macOS login Keychain.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
             }
-            if let error = entry.error, !error.isEmpty {
-                Text(error)
+
+            ForEach(MuxaAskProvider.allCases) { provider in
+                AskProviderCredentialRow(provider: provider, model: model)
+            }
+
+            if let status = model.askSettingsStatus {
+                Label(status, systemImage: "checkmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            }
+            if let error = model.askSettingsError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
             }
+
+            HStack {
+                Text("API keys apply per Ask without restart. Reload muxad only after installing a CLI in a new PATH; native PTY sessions owned by it will end, while tmux sessions remain.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Reload muxad PATH…") {
+                    model.requestDaemonRestartForProviderSettings()
+                }
+                Button("Done") { model.isPresentingAskSettings = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 660)
+    }
+}
+
+struct AskProviderCredentialRow: View {
+    let provider: MuxaAskProvider
+    @ObservedObject var model: AppModel
+    @State private var key = ""
+    @State private var hasKey = false
+
+    private var executablePath: String? {
+        MuxaExecutableResolver.executablePath(provider.executable)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: provider == .claude ? "brain.head.profile" : "chevron.left.forwardslash.chevron.right")
+                    .foregroundStyle(.tint)
+                    .frame(width: 20)
+                Text(provider.title)
+                    .font(.headline)
+                Text(executablePath == nil ? "CLI not found" : "CLI installed")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(executablePath == nil ? Color.red : Color.green)
+                if hasKey {
+                    Text("Keychain API key")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.blue)
+                } else {
+                    Text("CLI sign-in / environment")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button(provider == .codex ? "Open Login" : "Open Claude Code") {
+                    Task { await model.openProviderCLI(provider) }
+                }
+                .disabled(executablePath == nil)
+            }
+
+            if let executablePath {
+                Text(executablePath)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+            }
+
+            HStack(spacing: 8) {
+                SecureField(provider == .claude ? "Anthropic API key" : "OpenAI API key", text: $key)
+                    .textFieldStyle(.roundedBorder)
+                Button("Save to Keychain") {
+                    if model.saveProviderKey(key, provider: provider) {
+                        key = ""
+                        hasKey = true
+                    }
+                }
+                .disabled(key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if hasKey {
+                    Button("Remove", role: .destructive) {
+                        model.removeProviderKey(provider)
+                        hasKey = false
+                    }
+                }
+            }
+            Text("Environment: \(provider.environmentKey). The key is never written to muxa config, Ask history, logs, or command arguments.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(14)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+        .onAppear { hasKey = MuxaProviderCredentialStore.hasKey(for: provider) }
+    }
+}
+
+private struct AskConversationTurn: View {
+    let entry: MuxaAskEntry
+
+    private var providerTitle: String {
+        entry.agent == "claude" ? "Claude Code" : entry.agent == "codex" ? "Codex" : entry.agent.capitalized
+    }
+
+    private var providerIcon: String {
+        entry.agent == "claude" ? "brain.head.profile" : "chevron.left.forwardslash.chevron.right"
+    }
+
+    private var statusColor: Color {
+        switch entry.status {
+        case "failed": .red
+        case "running": .blue
+        default: .green
+        }
+    }
+
+    private var askedDate: Date? {
+        (try? Date(entry.askedAt, strategy: .iso8601))
+            ?? ISO8601DateFormatter().date(from: entry.askedAt)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 7) {
+                Text(askedDate?.formatted(date: .abbreviated, time: .shortened) ?? compactInboxTimestamp(entry.askedAt))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Circle().fill(statusColor).frame(width: 6, height: 6)
+                Text(entry.status == "running" ? "Thinking" : entry.status.capitalized)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(statusColor)
+                if entry.status == "running" { ProgressView().controlSize(.mini) }
+            }
+
+            AskMessageBlock(
+                role: "You",
+                icon: "person.fill",
+                source: entry.prompt,
+                tint: .accentColor,
+                compact: true
+            )
+
+            if entry.status == "running", entry.answer.isEmpty {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Waiting for \(providerTitle)…")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 4)
+            }
+
+            if !entry.answer.isEmpty {
+                AskMessageBlock(
+                    role: providerTitle,
+                    icon: providerIcon,
+                    source: entry.answer,
+                    tint: .primary,
+                    compact: false
+                )
+            }
+
+            if let error = entry.error, !error.isEmpty {
+                Label {
+                    Text(error).textSelection(.enabled)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                }
+                .font(.caption)
+                .foregroundStyle(.red)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
+            }
+        }
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct AskHistoryCard: View {
+    let entry: MuxaAskEntry
+
+    private var providerTitle: String {
+        entry.agent == "claude" ? "Claude Code" : entry.agent == "codex" ? "Codex" : entry.agent.capitalized
+    }
+
+    private var providerIcon: String {
+        entry.agent == "claude" ? "brain.head.profile" : "chevron.left.forwardslash.chevron.right"
+    }
+
+    private var statusColor: Color {
+        switch entry.status {
+        case "failed": .red
+        case "running": .blue
+        default: .green
+        }
+    }
+
+    private var statusLabel: String {
+        switch entry.status {
+        case "running": "Thinking"
+        case "failed": "Failed"
+        default: "Answered"
+        }
+    }
+
+    private var askedDate: Date? {
+        (try? Date(entry.askedAt, strategy: .iso8601))
+            ?? ISO8601DateFormatter().date(from: entry.askedAt)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: providerIcon)
+                    .foregroundStyle(.tint)
+                Text(providerTitle)
+                    .font(.subheadline.weight(.semibold))
+                Label(statusLabel, systemImage: entry.status == "failed" ? "exclamationmark.circle.fill" : "circle.fill")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                    .labelStyle(.titleAndIcon)
+                if entry.status == "running" {
+                    ProgressView()
+                        .controlSize(.mini)
+                }
+                Spacer()
+                if let cost = entry.costUSD, cost > 0 {
+                    Text(cost, format: .currency(code: "USD"))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                if let askedDate {
+                    Text(askedDate, style: .relative)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help(askedDate.formatted(date: .abbreviated, time: .standard))
+                }
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 38)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 12) {
+                AskMessageBlock(
+                    role: "You",
+                    icon: "person.fill",
+                    source: entry.prompt,
+                    tint: .accentColor,
+                    compact: true
+                )
+
+                if entry.status == "running", entry.answer.isEmpty {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Waiting for (providerTitle)…")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 4)
+                }
+
+            if !entry.answer.isEmpty {
+                    AskMessageBlock(
+                        role: providerTitle,
+                        icon: providerIcon,
+                        source: entry.answer,
+                        tint: .primary,
+                        compact: false
+                    )
+            }
+
+            if let error = entry.error, !error.isEmpty {
+                    Label {
+                        Text(error)
+                            .textSelection(.enabled)
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
+                }
+            }
+            .padding(12)
+        }
+        .frame(maxWidth: 980, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.76), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.primary.opacity(0.09), lineWidth: 1)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+}
+
+private struct AskMessageBlock: View {
+    let role: String
+    let icon: String
+    let source: String
+    let tint: Color
+    let compact: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+                Label(role, systemImage: icon)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(compact ? tint : Color.secondary)
+
+            ReadableMarkdownContent(source: source)
         }
         .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .frame(maxWidth: compact ? 780 : .infinity, alignment: .leading)
+        .background(tint.opacity(compact ? 0.075 : 0.035), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(tint.opacity(compact ? 0.7 : 0.28))
+                .frame(width: 3)
+                .padding(.vertical, 8)
+        }
+        .frame(maxWidth: .infinity, alignment: compact ? .trailing : .leading)
     }
+}
+
+struct MuxaOperatorInboxView: View {
+    private enum Scope: String, CaseIterable, Identifiable {
+        case all = "All"
+        case replies = "Replies"
+        case waiting = "Waiting"
+        case action = "Needs Action"
+        case ask = "Ask"
+        var id: Self { self }
+    }
+
+    @ObservedObject var model: AppModel
+    @State private var scope: Scope = .all
+    @State private var search = ""
+    @State private var selectedMessageID: String?
+    @State private var compactShowingDetail = false
+
+    private var visibleMessages: [MuxaOperatorMessage] {
+        model.operatorMessages.filter { message in
+            let scopeMatches = switch scope {
+            case .all: true
+            case .replies: message.request.reply != nil
+            case .waiting: message.needsReply
+            case .action: message.needsHumanDecision
+            case .ask: false
+            }
+            guard scopeMatches else { return false }
+            guard !search.isEmpty else { return true }
+            let request = message.request
+            return [
+                request.body,
+                request.reply?.body,
+                request.to.label,
+                request.to.windowName,
+                request.to.sessionName,
+                request.workspaceID,
+                request.workID,
+                message.host.alias,
+            ].compactMap { $0 }.contains {
+                $0.localizedCaseInsensitiveContains(search)
+            }
+        }
+    }
+
+    private var visibleAsk: [MuxaAskEntry] {
+        guard scope == .ask else { return [] }
+        return model.askEntries
+            .filter { entry in
+                search.isEmpty
+                    || entry.prompt.localizedCaseInsensitiveContains(search)
+                    || entry.answer.localizedCaseInsensitiveContains(search)
+            }
+            .sorted { $0.askedAt > $1.askedAt }
+    }
+
+    private var unreadReplies: Int {
+        model.operatorMessages.lazy.filter(\.hasUnreadReply).count
+    }
+
+    private var waitingReplies: Int {
+        model.operatorMessages.lazy.filter(\.needsReply).count
+    }
+
+    private var humanDecisions: Int {
+        model.operatorMessages.lazy.filter(\.needsHumanDecision).count
+    }
+
+    private var selectedMessage: MuxaOperatorMessage? {
+        visibleMessages.first { $0.id == selectedMessageID }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Label("Operator Inbox", systemImage: "tray.full")
+                    .font(.headline)
+                inboxMetric("New", unreadReplies, color: .orange)
+                inboxMetric("Waiting", waitingReplies, color: .blue)
+                inboxMetric("Action", humanDecisions, color: .red)
+                Spacer(minLength: 8)
+                if model.isRefreshingInbox { ProgressView().controlSize(.small) }
+                Button {
+                    Task { await model.refreshOperatorInbox(force: true) }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 42)
+
+            Divider()
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    inboxScopePicker.frame(maxWidth: 420)
+                    inboxSearchField
+                }
+                VStack(spacing: 8) {
+                    inboxScopePicker
+                    inboxSearchField
+                }
+            }
+            .padding(10)
+
+            if let error = model.inboxError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if scope == .ask {
+                askHistory
+            } else {
+                operatorMasterDetail
+            }
+        }
+        .task {
+            await model.refreshOperatorInbox(force: true)
+            reconcileMessageSelection()
+        }
+        .onChange(of: visibleMessages.map(\.id)) { _ in reconcileMessageSelection() }
+        .onChange(of: scope) { _ in
+            compactShowingDetail = false
+            reconcileMessageSelection()
+        }
+    }
+
+    private func inboxMetric(_ label: String, _ value: Int, color: Color) -> some View {
+        Text("\(value) \(label)")
+            .font(.caption2.weight(.semibold).monospacedDigit())
+            .foregroundStyle(value > 0 ? color : Color.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background((value > 0 ? color : Color.secondary).opacity(0.1), in: Capsule())
+    }
+
+    private var askHistory: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Global Ask").font(.title3.weight(.semibold))
+                    Text("Headless Claude Code and Codex questions owned by muxad")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if visibleAsk.isEmpty {
+                    Text("No matching Ask history")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 18)
+                } else {
+                    ForEach(visibleAsk) { entry in AskHistoryCard(entry: entry) }
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: 1000, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+    }
+
+    private var operatorMasterDetail: some View {
+        GeometryReader { geometry in
+            if geometry.size.width >= 760 {
+                HSplitView {
+                    operatorMessageList
+                        .frame(minWidth: 300, idealWidth: 380, maxWidth: 470)
+                    operatorMessageDetail
+                        .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+                }
+            } else if compactShowingDetail, selectedMessage != nil {
+                VStack(spacing: 0) {
+                    HStack {
+                        Button {
+                            compactShowingDetail = false
+                        } label: {
+                            Label("Inbox", systemImage: "chevron.left")
+                        }
+                        .buttonStyle(.borderless)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .frame(height: 36)
+                    Divider()
+                    operatorMessageDetail
+                }
+            } else {
+                operatorMessageList
+            }
+        }
+    }
+
+    private var operatorMessageList: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Commands and replies")
+                        .font(.subheadline.weight(.semibold))
+                    Text("\(visibleMessages.count) conversations across reachable hosts")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            Divider()
+
+            if visibleMessages.isEmpty {
+                ConsoleUnavailableView(
+                    title: model.operatorMessages.isEmpty ? "No commands sent yet" : "No matching commands",
+                    systemImage: "paperplane",
+                    description: "Use Collaborate on an agent pane. Its reply will appear here without reopening that pane."
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 6) {
+                        ForEach(visibleMessages) { message in
+                            Button {
+                                selectedMessageID = message.id
+                                compactShowingDetail = true
+                                if message.hasUnreadReply {
+                                    Task { await model.markOperatorMessageRead(message) }
+                                }
+                            } label: {
+                                OperatorMessageRow(
+                                    message: message,
+                                    selected: message.id == selectedMessageID
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .contentShape(Rectangle())
+                        }
+                    }
+                    .padding(8)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var operatorMessageDetail: some View {
+        if let selectedMessage {
+            OperatorMessageDetail(message: selectedMessage, model: model)
+        } else {
+            ConsoleUnavailableView(
+                title: "Select a message",
+                systemImage: "rectangle.righthalf.inset.filled",
+                description: "Choose a compact preview to read the full sent message and reply."
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func reconcileMessageSelection() {
+        if let selectedMessageID,
+           visibleMessages.contains(where: { $0.id == selectedMessageID }) {
+            return
+        }
+        selectedMessageID = visibleMessages.first?.id
+    }
+
+    private var inboxScopePicker: some View {
+        Picker("Mailbox", selection: $scope) {
+            ForEach(Scope.allCases) { value in Text(value.rawValue).tag(value) }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .accessibilityLabel("Inbox scope")
+    }
+
+    private var inboxSearchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search command, reply, Work, or agent", text: $search)
+                .textFieldStyle(.plain)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 7))
+    }
+}
+
+private struct OperatorMessageRow: View {
+    let message: MuxaOperatorMessage
+    let selected: Bool
+
+    private var request: MuxaCollaborationRequest { message.request }
+    private var statusColor: Color {
+        if request.reply?.status == "completed" { return .green }
+        if ["blocked", "failed", "declined", "expired", "cancelled"].contains(request.status) {
+            return .red
+        }
+        if request.reply != nil { return .green }
+        return request.expectsReply ? .blue : .secondary
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 7) {
+                Circle().fill(statusColor).frame(width: 7, height: 7)
+                Text(request.to.label)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 6)
+                Text(request.reply?.status.replacingOccurrences(of: "_", with: " ").capitalized
+                    ?? request.status.replacingOccurrences(of: "_", with: " ").capitalized)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                Text(compactInboxTimestamp(request.createdAt))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+
+            HStack(spacing: 8) {
+                Label(message.host.alias, systemImage: "server.rack")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                if let work = request.workID {
+                    Text([request.workspaceID, work].compactMap { $0 }.joined(separator: " / "))
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(Color.accentColor)
+                        .lineLimit(1)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Sent", systemImage: "paperplane.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text(inboxPreview(request.body))
+                    .font(.callout)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+            }
+
+            if let reply = request.reply {
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack {
+                        Label(message.hasUnreadReply ? "New Reply" : "Reply", systemImage: "arrowshape.turn.up.left.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(message.hasUnreadReply ? Color.orange : Color.secondary)
+                        Spacer()
+                        Text(compactInboxTimestamp(reply.at))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                    }
+                    Text(inboxPreview(reply.body))
+                        .font(.callout)
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                }
+                .padding(11)
+                .background(
+                    (message.hasUnreadReply ? Color.orange : Color.primary).opacity(0.06),
+                    in: RoundedRectangle(cornerRadius: 8)
+                )
+            } else if request.expectsReply {
+                Label("Waiting for this agent to reply", systemImage: "clock")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            selected ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.035),
+            in: RoundedRectangle(cornerRadius: 9)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 9)
+                .stroke(
+                    selected
+                        ? Color.accentColor.opacity(0.65)
+                        : message.hasUnreadReply
+                            ? Color.orange.opacity(0.5)
+                            : Color(nsColor: .separatorColor).opacity(0.4),
+                    lineWidth: selected || message.hasUnreadReply ? 1 : 0.5
+                )
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 9))
+    }
+}
+
+private struct OperatorMessageDetail: View {
+    let message: MuxaOperatorMessage
+    @ObservedObject var model: AppModel
+
+    private var request: MuxaCollaborationRequest { message.request }
+    private var openDestination: MuxaSidebarSelection? {
+        AppModel.operatorSelection(for: message, in: model.executionSnapshot)
+    }
+    private var openDestinationLabel: String {
+        switch openDestination {
+        case .agent, .pane: "Open Agent"
+        case .fleetWindow: "Open Window"
+        case .fleetSession: "Open Session"
+        case .host: "Open Host"
+        case nil: "Agent Ended"
+        default: "Open Context"
+        }
+    }
+    private var statusColor: Color {
+        if request.reply?.status == "completed" { return .green }
+        if ["blocked", "failed", "declined", "expired", "cancelled"].contains(request.status) {
+            return .red
+        }
+        if request.reply != nil { return .green }
+        return request.expectsReply ? .blue : .secondary
+    }
+
+    private var location: String {
+        [request.to.sessionName, request.to.windowName, request.to.pane]
+            .compactMap { $0?.isEmpty == false ? $0 : nil }
+            .joined(separator: " › ")
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 9) {
+                Circle().fill(statusColor).frame(width: 8, height: 8)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(request.to.label)
+                        .font(.headline)
+                        .lineLimit(1)
+                    Text("\(message.host.alias) · \(compactInboxTimestamp(request.createdAt))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if message.hasUnreadReply {
+                    Button("Mark Read") {
+                        Task { await model.markOperatorMessageRead(message) }
+                    }
+                }
+                Button {
+                    model.openOperatorMessage(message)
+                } label: {
+                    Label(openDestinationLabel, systemImage: "rectangle.and.hand.point.up.left")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(openDestination == nil)
+            }
+            .padding(.horizontal, 16)
+            .frame(minHeight: 54)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    HStack(spacing: 10) {
+                        Label(message.host.alias, systemImage: "server.rack")
+                        if let work = request.workID {
+                            Label(
+                                [request.workspaceID, work].compactMap { $0 }.joined(separator: " / "),
+                                systemImage: "briefcase"
+                            )
+                        }
+                        if !location.isEmpty {
+                            Label(location, systemImage: "rectangle.split.3x1")
+                                .lineLimit(1)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                    OperatorMessageDetailSection(
+                        title: "Sent",
+                        icon: "paperplane.fill",
+                        timestamp: compactInboxTimestamp(request.createdAt),
+                        source: request.body,
+                        tint: .accentColor
+                    )
+
+                    if let reply = request.reply {
+                        OperatorMessageDetailSection(
+                            title: message.hasUnreadReply ? "New Reply" : "Reply",
+                            icon: "arrowshape.turn.up.left.fill",
+                            timestamp: compactInboxTimestamp(reply.at),
+                            source: reply.body,
+                            tint: message.hasUnreadReply ? .orange : .green
+                        )
+                    } else if request.expectsReply {
+                        Label("Waiting for this agent to reply", systemImage: "clock")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .padding(14)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+                .padding(18)
+                .frame(maxWidth: 860, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+        }
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.28))
+    }
+}
+
+private struct OperatorMessageDetailSection: View {
+    let title: String
+    let icon: String
+    let timestamp: String
+    let source: String
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label(title, systemImage: icon)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(tint)
+                Spacer()
+                Text(timestamp)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+            ReadableMarkdownContent(source: source)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.opacity(0.055), in: RoundedRectangle(cornerRadius: 11))
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(tint.opacity(0.7))
+                .frame(width: 3)
+                .padding(.vertical, 10)
+        }
+    }
+}
+
+private func inboxPreview(_ value: String) -> String {
+    value
+        .replacingOccurrences(of: "\r", with: " ")
+        .replacingOccurrences(of: "\n", with: " ")
+        .split(whereSeparator: \.isWhitespace)
+        .joined(separator: " ")
+}
+
+private func compactInboxTimestamp(_ value: String) -> String {
+    let normalized = value.replacingOccurrences(of: "T", with: " ")
+    return String(normalized.prefix(16))
 }
 
 private struct MuxaCollaborationView: View {
@@ -650,6 +1749,7 @@ private struct MuxaCollaborationView: View {
 
     let pane: MuxaWatchPane
     let client: MuxaIPCClient
+    let mailboxRevision: UInt64?
     @State private var mailbox = MuxaCollaborationMailbox(incoming: [], sent: [])
     @State private var module: ModuleTab = .activity
     @State private var tab: MailboxTab = .sent
@@ -739,7 +1839,7 @@ private struct MuxaCollaborationView: View {
                 collaborationComposer
             }
         }
-        .task(id: pane.id) { await pollMailbox() }
+        .task(id: "\(pane.id)-\(mailboxRevision ?? 0)") { await load() }
         .sheet(item: $replyingTo) { request in
             CollaborationReplyView(request: request, pane: pane, client: client) {
                 replyingTo = nil
@@ -785,13 +1885,6 @@ private struct MuxaCollaborationView: View {
             }
         }
         .padding(14)
-    }
-
-    private func pollMailbox() async {
-        while !Task.isCancelled {
-            await load()
-            try? await Task.sleep(for: .seconds(2))
-        }
     }
 
     private func load() async {
@@ -970,6 +2063,7 @@ private func collaborationStatusColor(_ status: String) -> Color {
 
 struct HostRegistrationView: View {
     @ObservedObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
     @State private var alias = ""
     @State private var ssh = ""
     @State private var mode = "observe"
@@ -988,7 +2082,10 @@ struct HostRegistrationView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Cancel") { model.isPresentingHostRegistration = false }
+                Button("Cancel") {
+                    model.isPresentingHostRegistration = false
+                    dismiss()
+                }
                     .keyboardShortcut(.cancelAction)
                 Button("Register") { register() }
                     .keyboardShortcut(.defaultAction)
@@ -1050,7 +2147,7 @@ struct HostRegistrationView: View {
 
     private func register() {
         Task {
-            _ = await model.registerHost(
+            let registered = await model.registerHost(
                 MuxaHostRegistrationRequest(
                     alias: alias,
                     ssh: ssh,
@@ -1061,6 +2158,7 @@ struct HostRegistrationView: View {
                     overwrite: overwrite
                 )
             )
+            if registered { dismiss() }
         }
     }
 }
@@ -1095,12 +2193,17 @@ private struct WatchLivePanePanel: View {
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                Text(attachedSessionID == nil ? "Read-only" : "Interactive")
+                Text(attachedSessionID == nil ? "Read-only" : "Fitted · Interactive")
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(attachedSessionID == nil ? Color.secondary : Color.green)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
                     .background(Color.primary.opacity(0.07), in: Capsule())
+                    .help(
+                        attachedSessionID == nil
+                            ? "The preview preserves the pane's current tmux dimensions"
+                            : "This pane is temporarily zoomed and follows the Live Pane size; tmux settings are restored on detach"
+                    )
                 Spacer(minLength: 4)
                 if model.isAttachingPane {
                     ProgressView().controlSize(.mini)
@@ -1140,6 +2243,8 @@ private struct WatchLivePanePanel: View {
                     onExit: sessionExited
                 )
                 .id(session.id)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
             } else {
                 PaneCaptureView(
                     client: model.client,
@@ -1147,12 +2252,7 @@ private struct WatchLivePanePanel: View {
                     showsHeader: false
                 )
                 .id(pane.id)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    guard canAttach, !model.isAttachingPane else { return }
-                    startAttach()
-                }
-                .help(canAttach ? "Click anywhere in the preview to attach and type" : "Read-only pane preview")
+                .help(canAttach ? "Use Click to Type to enter interactive mode" : "Read-only pane preview")
                 .task(id: attachedSessionID) {
                     if attachedSessionID != nil, attachedSession?.exited == true {
                         sessionExited()
@@ -1173,7 +2273,8 @@ private struct WatchLivePanePanel: View {
                 .background(MuxaSurfacePalette.sidebar(for: colorScheme))
             }
         }
-        .frame(minHeight: 190)
+        .frame(maxWidth: .infinity, minHeight: 190, maxHeight: .infinity)
+        .clipped()
         .overlay {
             Rectangle()
                 .stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
@@ -1184,6 +2285,11 @@ private struct WatchLivePanePanel: View {
 struct WatchHostTree: View {
     let group: MuxaWatchHost
     let selectedPaneID: MuxaWatchPaneIdentity?
+    let selectedHostAlias: String?
+    let selectedSessionID: MuxaWatchSessionIdentity?
+    let selectHost: (String) -> Void
+    let selectSession: (MuxaWatchSessionIdentity) -> Void
+    let openPinnedSession: (MuxaWatchSessionIdentity) -> Void
     let selectPane: (MuxaWatchPaneIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
     let forceExpanded: Bool
@@ -1206,33 +2312,51 @@ struct WatchHostTree: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button { manualExpansion = !expanded } label: {
-                HStack(spacing: 6) {
+            HStack(spacing: 0) {
+                Button { manualExpansion = !expanded } label: {
                     hierarchyChevron(expanded)
-                    HostIdentityBadge(host: group.host, size: 20)
-                    Text(group.host.alias)
-                        .font(.callout.weight(.semibold))
-                        .lineLimit(1)
-                    Spacer(minLength: 4)
-                    Text("\(group.paneCount)")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                    Circle()
-                        .fill(fleetHostColor(group.host.state))
-                        .frame(width: 6, height: 6)
+                        .frame(width: 30, height: 36)
+                        .contentShape(Rectangle())
                 }
-                .padding(.horizontal, 5)
-                .frame(height: 30)
-                .background(expanded ? Color.primary.opacity(0.035) : Color.clear)
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+
+                Button { selectHost(group.host.alias) } label: {
+                    HStack(spacing: 6) {
+                        HostIdentityBadge(host: group.host, size: 20)
+                        Text(group.host.alias)
+                            .font(.callout.weight(.semibold))
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        Text("\(group.paneCount)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        Circle()
+                            .fill(fleetHostColor(group.host.state))
+                            .frame(width: 6, height: 6)
+                    }
+                    .padding(.horizontal, 7)
+                    .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .simultaneousGesture(
+                    TapGesture(count: 2).onEnded { manualExpansion = !expanded }
+                )
             }
-            .buttonStyle(.plain)
+            .background(
+                selectedHostAlias == group.host.alias
+                    ? Color.accentColor.opacity(0.14)
+                    : expanded ? Color.primary.opacity(0.035) : Color.clear
+            )
 
             if expanded {
                 ForEach(group.sessions) { session in
                     WatchSessionTree(
                         session: session,
                         selectedPaneID: selectedPaneID,
+                        selectedSessionID: selectedSessionID,
+                        selectSession: selectSession,
+                        openPinnedSession: openPinnedSession,
                         selectPane: selectPane,
                         openPinnedPane: openPinnedPane,
                         forceExpanded: forceExpanded,
@@ -1247,6 +2371,9 @@ struct WatchHostTree: View {
 private struct WatchSessionTree: View {
     let session: MuxaWatchSession
     let selectedPaneID: MuxaWatchPaneIdentity?
+    let selectedSessionID: MuxaWatchSessionIdentity?
+    let selectSession: (MuxaWatchSessionIdentity) -> Void
+    let openPinnedSession: (MuxaWatchSessionIdentity) -> Void
     let selectPane: (MuxaWatchPaneIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
     let forceExpanded: Bool
@@ -1261,6 +2388,10 @@ private struct WatchSessionTree: View {
         } ?? false
     }
 
+    private var selected: Bool {
+        selectedSessionID == session.identity
+    }
+
     private var expanded: Bool {
         forceExpanded || (manualExpansion ?? (singleWindow != nil || selectedPath))
     }
@@ -1269,21 +2400,18 @@ private struct WatchSessionTree: View {
         session.windows.count == 1 ? session.windows.first : nil
     }
 
-    private var firstPane: MuxaWatchPane? {
-        session.windows.first?.panes.first
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 0) {
                 explorerIndent(depth: 1)
                 Button { manualExpansion = !expanded } label: {
                     hierarchyChevron(expanded)
-                        .frame(width: 18, height: 26)
+                        .frame(width: 30, height: 34)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 Button {
-                    if let firstPane { selectPane(firstPane.id) }
+                    selectSession(session.identity)
                     if !expanded { manualExpansion = true }
                 } label: {
                     HStack(spacing: 6) {
@@ -1307,17 +2435,22 @@ private struct WatchSessionTree: View {
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
-                    .frame(height: 26)
+                    .padding(.trailing, 7)
+                    .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .simultaneousGesture(
                     TapGesture(count: 2).onEnded {
-                        if let firstPane { openPinnedPane(firstPane.id) }
+                        openPinnedSession(session.identity)
                     }
                 )
             }
-            .background(selectedPath ? Color.accentColor.opacity(0.08) : Color.clear)
+            .background(
+                selected
+                    ? Color.accentColor.opacity(0.18)
+                    : selectedPath ? Color.accentColor.opacity(0.08) : Color.clear
+            )
 
             if expanded {
                 if let singleWindow {
@@ -1370,7 +2503,8 @@ private struct WatchWindowTree: View {
                 explorerIndent(depth: 2)
                 Button { manualExpansion = !expanded } label: {
                     hierarchyChevron(expanded)
-                        .frame(width: 18, height: 26)
+                        .frame(width: 30, height: 34)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 Button {
@@ -1390,7 +2524,8 @@ private struct WatchWindowTree: View {
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
-                    .frame(height: 26)
+                    .padding(.trailing, 7)
+                    .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -1443,7 +2578,7 @@ private struct WatchPaneRow: View {
         Button { selectPane(pane.id) } label: {
             HStack(spacing: 0) {
                 explorerIndent(depth: depth)
-                Color.clear.frame(width: 18)
+                Color.clear.frame(width: 30)
                 HStack(spacing: 6) {
                     Image(systemName: pane.agent == nil ? "terminal" : "person.crop.circle")
                         .font(.caption)
@@ -1465,11 +2600,86 @@ private struct WatchPaneRow: View {
                             .foregroundStyle(.orange)
                     }
                 }
-                .padding(.trailing, 6)
+                .padding(.trailing, 8)
             }
-            .frame(height: 27)
+            .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
             .background(
                 selected ? Color.accentColor.opacity(0.18) : Color.clear
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .simultaneousGesture(
+            TapGesture(count: 2).onEnded { openPinnedPane(pane.id) }
+        )
+        .contextMenu {
+            Button("Open") { selectPane(pane.id) }
+            Button("Open Pinned") { openPinnedPane(pane.id) }
+        }
+    }
+}
+
+/// A globally sortable Explore row. Unlike the topology tree it carries its
+/// host and tmux path in the row, so removing host grouping does not remove the
+/// context needed to identify the pane.
+struct WatchFlatPaneRow: View {
+    let pane: MuxaWatchPane
+    let selected: Bool
+    let selectPane: (MuxaWatchPaneIdentity) -> Void
+    let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
+
+    private var title: String {
+        pane.pane.agentAlias.map { "@\($0)" }
+            ?? pane.agent?.aiTitle
+            ?? pane.pane.title.nonEmpty
+            ?? pane.pane.currentCommand.nonEmpty
+            ?? pane.pane.paneID
+    }
+
+    private var location: String {
+        let window = pane.pane.windowName.nonEmpty ?? pane.pane.stableWindowID
+        return "\(pane.host.alias) · \(pane.pane.session) › \(window)"
+    }
+
+    var body: some View {
+        Button { selectPane(pane.id) } label: {
+            HStack(alignment: .top, spacing: 8) {
+                HostIdentityBadge(identity: pane.host, size: 22)
+                    .padding(.top, 1)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(pane.agent.map { agentStateColor($0.state) } ?? Color.secondary)
+                            .frame(width: 6, height: 6)
+                        Text(title)
+                            .font(.callout.weight(.medium))
+                            .lineLimit(1)
+                        Spacer(minLength: 3)
+                        Text(pane.pane.paneID)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.tertiary)
+                    }
+                    Text(location)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    if let agent = pane.agent {
+                        Text(agentStateLabel(agent.state))
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(agentStateColor(agent.state))
+                    } else {
+                        Text(pane.pane.currentCommand.nonEmpty ?? "Shell")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 7)
+            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+            .background(
+                selected ? Color.accentColor.opacity(0.18) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 6)
             )
             .contentShape(Rectangle())
         }
@@ -1492,7 +2702,7 @@ private func explorerIndent(depth: Int) -> some View {
                 .frame(width: 1)
         }
     }
-    .frame(width: CGFloat(depth) * 12, height: 27, alignment: .trailing)
+    .frame(width: CGFloat(depth) * 14, height: 34, alignment: .trailing)
 }
 
 private func hierarchyChevron(_ expanded: Bool) -> some View {
@@ -1500,7 +2710,7 @@ private func hierarchyChevron(_ expanded: Bool) -> some View {
         .font(.caption2.weight(.semibold))
         .foregroundStyle(.secondary)
         .rotationEffect(.degrees(expanded ? 90 : 0))
-        .frame(width: 10)
+        .frame(width: 12, height: 20)
 }
 
 private struct FleetPaneInspector: View {
@@ -1508,6 +2718,12 @@ private struct FleetPaneInspector: View {
     @ObservedObject var model: AppModel
     let compact: Bool
     let openInShell: () -> Void
+    @State private var showsMetadata = false
+    @State private var agentsExpanded = true
+
+    private var window: MuxaWatchWindow? {
+        model.executionSnapshot.watchWindow(containing: pane.id)
+    }
 
     var body: some View {
         ScrollView {
@@ -1526,22 +2742,10 @@ private struct FleetPaneInspector: View {
                     }
                 }
 
-                if let agent = pane.agent {
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 8) {
-                            agentStatus(agent)
-                        }
-                        VStack(alignment: .leading, spacing: 4) {
-                            agentStatus(agent)
-                        }
-                    }
-                    .font(.caption)
-                    if let summary = agent.recap ?? agent.lastNotification ?? agent.lastResponse,
-                       !summary.isEmpty {
-                        MarkdownContent(source: summary, lineLimit: compact ? 5 : 7)
-                            .padding(12)
-                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-                    }
+                selectedPaneOverview
+
+                if let window {
+                    windowOverview(window)
                 }
 
                 if let error = model.attachError {
@@ -1553,7 +2757,253 @@ private struct FleetPaneInspector: View {
 
             }
             .padding(compact ? 12 : 18)
+            .frame(maxWidth: 1100, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
+    }
+
+    @ViewBuilder
+    private func windowOverview(_ window: MuxaWatchWindow) -> some View {
+        DisclosureGroup(isExpanded: $agentsExpanded) {
+            VStack(spacing: 1) {
+                ForEach(window.panes) { item in
+                    Button {
+                        model.selectWatchPane(item.id)
+                    } label: {
+                        HStack(alignment: .top, spacing: 9) {
+                            Circle()
+                                .fill(item.agent.map { agentStateColor($0.state) } ?? Color.secondary)
+                                .frame(width: 7, height: 7)
+                                .padding(.top, 5)
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text(overviewTitle(item))
+                                        .font(.subheadline.weight(item.id == pane.id ? .semibold : .regular))
+                                    if let agent = item.agent {
+                                        Text(agentStateLabel(agent.state))
+                                            .font(.caption2.weight(.medium))
+                                            .foregroundStyle(agentStateColor(agent.state))
+                                    }
+                                    Spacer(minLength: 4)
+                                    Text(item.pane.paneID)
+                                        .font(.caption2.monospaced())
+                                        .foregroundStyle(.tertiary)
+                                }
+                                Text(overviewSummary(item) ?? "No task summary has been reported for this pane yet.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.leading)
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            item.id == pane.id ? Color.accentColor.opacity(0.1) : Color.primary.opacity(0.025),
+                            in: RoundedRectangle(cornerRadius: 7)
+                        )
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.top, 9)
+        } label: {
+            HStack(spacing: 8) {
+                Label("Agents in this window", systemImage: "person.2")
+                    .font(.headline)
+                if let identity = windowWorkIdentity(window) {
+                    Text("\(identity.workspaceID) / \(identity.workID)")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.accentColor.opacity(0.1), in: Capsule())
+                }
+                Spacer(minLength: 6)
+                Text("\(window.panes.count) panes · \(window.panes.compactMap(\.agent).count) agents")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.4), lineWidth: 0.5)
+        }
+    }
+
+    @ViewBuilder
+    private var selectedPaneOverview: some View {
+        if let agent = pane.agent {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Label("Current context", systemImage: "text.alignleft")
+                        .font(.headline.weight(.semibold))
+                    agentStatus(agent)
+                }
+                .font(.caption)
+
+                if let summary = agent.recap?.nonEmpty,
+                   let response = agent.lastResponse?.nonEmpty,
+                   response != summary {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .top, spacing: 12) {
+                            overviewSection(
+                                "Summary",
+                                systemImage: "list.bullet.rectangle",
+                                summary,
+                                lineLimit: compact ? 5 : 8
+                            )
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            overviewSection(
+                                "Latest response",
+                                systemImage: "text.bubble",
+                                response,
+                                lineLimit: compact ? 6 : 12
+                            )
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                        }
+                        VStack(alignment: .leading, spacing: 10) {
+                            overviewSection(
+                                "Summary",
+                                systemImage: "list.bullet.rectangle",
+                                summary,
+                                lineLimit: compact ? 5 : 8
+                            )
+                            overviewSection(
+                                "Latest response",
+                                systemImage: "text.bubble",
+                                response,
+                                lineLimit: compact ? 6 : 12
+                            )
+                        }
+                    }
+                } else if let summary = agent.recap?.nonEmpty {
+                    overviewSection(
+                        "Summary",
+                        systemImage: "list.bullet.rectangle",
+                        summary,
+                        lineLimit: compact ? 5 : 9
+                    )
+                } else if let response = agent.lastResponse?.nonEmpty {
+                    overviewSection(
+                        "Latest response",
+                        systemImage: "text.bubble",
+                        response,
+                        lineLimit: compact ? 6 : 12
+                    )
+                }
+
+                if let activity = latestActivity(agent) {
+                    overviewSection(
+                        activity.title,
+                        systemImage: activity.systemImage,
+                        activity.source,
+                        lineLimit: compact ? 4 : 7
+                    )
+                }
+            }
+        } else {
+            Label(
+                "No agent session is currently associated with this pane.",
+                systemImage: "person.crop.circle.badge.questionmark"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private func overviewSection(
+        _ title: String,
+        systemImage: String,
+        _ source: String,
+        lineLimit: Int
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Label(title, systemImage: systemImage)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(source, forType: .string)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Copy \(title.lowercased())")
+            }
+            MarkdownContent(source: source, lineLimit: lineLimit, selectable: false)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func latestActivity(_ agent: MuxaAgent) -> (title: String, systemImage: String, source: String)? {
+        if let notice = agent.lastNotification?.nonEmpty,
+           notice != agent.recap,
+           notice != agent.lastResponse {
+            return ("Latest notice", "bell", notice)
+        }
+        if agent.recap == nil,
+           agent.lastResponse == nil,
+           let prompt = agent.lastPrompt?.nonEmpty {
+            return ("Latest activity", "clock.arrow.circlepath", humanReadablePrompt(prompt))
+        }
+        return nil
+    }
+
+    private func metadataRow(_ label: String, _ value: String) -> some View {
+        GridRow {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .fontDesign(.monospaced)
+        }
+    }
+
+    private func windowWorkIdentity(_ window: MuxaWatchWindow) -> MuxaWorkIdentity? {
+        let identities = Set(window.panes.compactMap(\.pane.workIdentity))
+        return identities.count == 1 ? identities.first : nil
+    }
+
+    private func overviewTitle(_ item: MuxaWatchPane) -> String {
+        item.pane.agentAlias.map { "@\($0)" }
+            ?? item.agent?.aiTitle?.nonEmpty
+            ?? item.pane.title.nonEmpty
+            ?? item.pane.currentCommand.nonEmpty
+            ?? item.pane.paneID
+    }
+
+    private func overviewSummary(_ item: MuxaWatchPane) -> String? {
+        guard let agent = item.agent else { return item.pane.currentPath.nonEmpty }
+        return agent.recap?.nonEmpty
+            ?? agent.lastResponse?.nonEmpty
+            ?? agent.lastNotification?.nonEmpty
+            ?? agent.lastPrompt?.nonEmpty.map(humanReadablePrompt)
+    }
+
+    private func humanReadablePrompt(_ prompt: String) -> String {
+        if prompt.hasPrefix("[muxa:req_") {
+            if prompt.contains("Completed reply") {
+                return "A collaborator reply is ready for this agent."
+            }
+            if prompt.contains("New ") && prompt.contains(" request") {
+                return "A collaboration request is waiting for this agent."
+            }
+            return "Recent Muxa collaboration activity."
+        }
+        if prompt.hasPrefix("<task-notification>") {
+            return "A background task reported an update."
+        }
+        return prompt
     }
 
     private var inspectorIdentity: some View {
@@ -1563,16 +3013,29 @@ private struct FleetPaneInspector: View {
                 Text(pane.agent?.aiTitle ?? pane.pane.agentAlias.map { "@\($0)" } ?? pane.pane.title.nonEmpty ?? pane.pane.currentCommand)
                     .font(.title2.weight(.semibold))
                     .lineLimit(2)
-                Text("\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                HStack(spacing: 7) {
+                    Text(pane.host.alias)
+                    if let agent = pane.agent {
+                        Text("·")
+                        Text(agentStateLabel(agent.state))
+                            .foregroundStyle(agentStateColor(agent.state))
+                    }
+                    if let identity = pane.pane.workIdentity {
+                        Text("·")
+                        Text("\(identity.workspaceID) / \(identity.workID)")
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
             }
         }
     }
 
     private var inspectorActions: some View {
         HStack(spacing: 8) {
+            metadataButton(label: "Details")
             Button {
                 openInShell()
             } label: {
@@ -1583,11 +3046,39 @@ private struct FleetPaneInspector: View {
 
     private var compactInspectorActions: some View {
         HStack(spacing: 8) {
+            metadataButton(label: "Info")
             Button {
                 openInShell()
             } label: {
                 Label("Shell", systemImage: "rectangle.on.rectangle")
             }
+        }
+    }
+
+    private func metadataButton(label: String) -> some View {
+        Button {
+            showsMetadata.toggle()
+        } label: {
+            Label(label, systemImage: "info.circle")
+        }
+        .popover(isPresented: $showsMetadata, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Execution location")
+                    .font(.headline)
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+                    metadataRow("Host", pane.host.alias)
+                    metadataRow("Session", pane.pane.session.nonEmpty ?? pane.pane.stableSessionID)
+                    metadataRow("Window", pane.pane.windowName.nonEmpty ?? pane.pane.stableWindowID)
+                    metadataRow("Pane", "\(pane.pane.paneID) · \(pane.pane.currentCommand)")
+                    if let path = pane.pane.currentPath.nonEmpty {
+                        metadataRow("Directory", path)
+                    }
+                }
+                .font(.caption)
+                .textSelection(.enabled)
+            }
+            .padding(16)
+            .frame(minWidth: 420, maxWidth: 560, alignment: .leading)
         }
     }
 

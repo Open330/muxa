@@ -1987,6 +1987,7 @@ async fn enrich_from_history(
             subagents: Vec::new(),
             state: muxa::AgentState::Idle,
             last_prompt: Some(entry.prompt),
+            last_prompt_at: Some(entry.at),
             last_response: None,
             recap: None,
             ai_title: None,

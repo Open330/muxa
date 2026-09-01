@@ -237,6 +237,14 @@ relay. Keepalives detect a silent transport, while each host's state machine,
 backoff, and task remain independent so one slow host cannot stall the fleet.
 `max_parallel_connects` caps simultaneous SSH handshakes.
 
+Durable mailbox changes are propagated as an optional, content-free revision
+on the existing relay keepalive frame. The controller publishes that revision
+as a host-scoped Fleet invalidation; request bodies remain on the owning node
+and are fetched through the normal operator mailbox route. Ordinary liveness
+keepalives update controller timestamps silently and do not invalidate UI
+snapshots. Periodic authoritative scans likewise publish only when agent,
+pane, session, or backend payloads actually differ.
+
 The central TUI subscribes to compact, selector-scoped Fleet cache
 invalidations and coalesces bursts before fetching one coherent filtered
 snapshot. The server installs the stream before acknowledging it and the

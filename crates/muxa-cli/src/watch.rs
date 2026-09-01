@@ -63,8 +63,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState,
-    Wrap,
+    Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Table,
+    TableState, Wrap,
 };
 use ratatui::{Frame, Terminal};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -1874,7 +1874,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         // clipped by the terminal, so a row added here pushes the last
         // binding off a short screen.
         "  C / n / w / R  shell window / agent pane / work up / rename the row",
-        "  a / A          ask / history; d deletes one · D clears all in A",
+        "  a / A          ask / history; Enter reads one · d/D delete one/all",
         "",
         "Commands & inspection",
         "  :              command palette (Tab completes)",
@@ -2072,6 +2072,60 @@ struct AskPanelState {
     selected: usize,
     detail: MailboxDetail,
     filter: AskFilter,
+    /// Enter opens the selected answer full-height and scrollable. The
+    /// detail pane under the list can only ever show its first screenful,
+    /// and an agent's answer is routinely longer than that.
+    reader: Option<AskReader>,
+}
+
+impl AskPanelState {
+    /// `A` and a finished ask both land on the newest row — never inside a
+    /// reader left open from the last visit.
+    fn open_at(&mut self, selected: usize) {
+        self.open = true;
+        self.selected = selected;
+        self.reader = None;
+    }
+
+    fn close(&mut self) {
+        self.open = false;
+        self.reader = None;
+    }
+}
+
+/// The full-answer view opened from the ask history.
+#[derive(Debug, Clone, Default)]
+struct AskReader {
+    /// The entry being read, addressed by id rather than by row: the
+    /// history is re-fetched from the daemon on a timer, so an index would
+    /// silently re-point at another answer when one arrives or is deleted.
+    id: String,
+    /// Body lines scrolled past the top.
+    scroll: usize,
+    /// Wrapped body length and viewport height from the last paint, so the
+    /// key handler clamps against real content instead of a guess — the
+    /// same render-to-input handoff as `table_page_rows`.
+    total_lines: usize,
+    view_height: usize,
+}
+
+impl AskReader {
+    fn max_scroll(&self) -> usize {
+        self.total_lines.saturating_sub(self.view_height)
+    }
+
+    fn scroll_by(&mut self, delta: isize) {
+        self.scroll = self
+            .scroll
+            .saturating_add_signed(delta)
+            .min(self.max_scroll());
+    }
+
+    /// One screenful less a line of overlap, so a page turn keeps the
+    /// sentence the eye was on.
+    fn page(&self) -> isize {
+        isize::try_from(self.view_height.saturating_sub(1).max(1)).unwrap_or(1)
+    }
 }
 
 /// Which agent CLI the spawn form launches. `Left`/`Right` cycle it.
@@ -6948,6 +7002,9 @@ fn merge_agent_for_ui(prior: &Agent, incoming: &Agent) -> Agent {
     if merged.last_prompt.is_none() {
         merged.last_prompt.clone_from(&prior.last_prompt);
     }
+    if merged.last_prompt_at.is_none() {
+        merged.last_prompt_at = prior.last_prompt_at;
+    }
     if merged.last_response.is_none() {
         merged.last_response.clone_from(&prior.last_response);
     }
@@ -7871,11 +7928,10 @@ pub async fn run(
                                     HintLevel::Ok,
                                 );
                                 refresh_ask_entries(client, &mut app).await;
-                                app.ask_panel.open = true;
                                 // Land on the question just asked, whatever
                                 // the filter currently shows.
-                                app.ask_panel.selected =
-                                    visible_ask_entries(&app).len().saturating_sub(1);
+                                let newest = visible_ask_entries(&app).len().saturating_sub(1);
+                                app.ask_panel.open_at(newest);
                             }
                             Err(e) => {
                                 app.set_hint(format!("ask failed: {e}"), HintLevel::Err);
@@ -7885,8 +7941,8 @@ pub async fn run(
                 }
                 Action::OpenAskPanel => {
                     refresh_ask_entries(client, &mut app).await;
-                    app.ask_panel.open = true;
-                    app.ask_panel.selected = visible_ask_entries(&app).len().saturating_sub(1);
+                    let newest = visible_ask_entries(&app).len().saturating_sub(1);
+                    app.ask_panel.open_at(newest);
                 }
                 Action::CycleAskAgent => {
                     // Two agents, so "cycle" is a swap. Naming the next one
@@ -7906,7 +7962,7 @@ pub async fn run(
                     }
                 }
                 Action::ResetAskThread => match client.ask_reset().await {
-                    Ok(()) => app.set_hint("ask: new conversation", HintLevel::Ok),
+                    Ok(_) => app.set_hint("ask: new conversation", HintLevel::Ok),
                     Err(e) => app.set_hint(format!("ask reset failed: {e}"), HintLevel::Err),
                 },
                 Action::OpenCollaborationMessage => {
@@ -10635,9 +10691,19 @@ fn handle_ask_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut A
 /// selected completed entry, and uppercase `D` confirms clearing all completed
 /// history. `r` remains the global refresh.
 fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
+    if app.ask_panel.reader.is_some() {
+        return handle_ask_reader_event(code, app);
+    }
     match code {
         KeyCode::Esc | KeyCode::Char('q' | 'A') => {
-            app.ask_panel.open = false;
+            app.ask_panel.close();
+            Action::None
+        }
+        // Enter needs no target argument — the row is already selected, and
+        // the answer is the thing the panel exists to deliver. `o` mirrors
+        // the table's "open whatever is under the cursor".
+        KeyCode::Enter | KeyCode::Char('o') => {
+            open_ask_reader(app);
             Action::None
         }
         KeyCode::Char('a') => Action::OpenAsk,
@@ -10724,6 +10790,54 @@ fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
         }
         _ => Action::None,
     }
+}
+
+/// Pin the selected row's answer into the reader.
+fn open_ask_reader(app: &mut App) {
+    let Some(id) = visible_ask_entries(app)
+        .get(app.ask_panel.selected)
+        .map(|entry| entry.id.clone())
+    else {
+        app.set_hint("ask history: no entry selected", HintLevel::Warn);
+        return;
+    };
+    app.ask_panel.reader = Some(AskReader {
+        id,
+        ..AskReader::default()
+    });
+}
+
+/// The reader owns every key while it is open. It is a reading surface,
+/// and `d`/`D` deleting the entry on screen from under the cursor is
+/// exactly the surprise a reading surface must not have.
+fn handle_ask_reader_event(code: KeyCode, app: &mut App) -> Action {
+    match code {
+        // Esc/Enter/q step back to the list; `A` closes the panel outright,
+        // the same key that would have closed it from the list.
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'o') => {
+            app.ask_panel.reader = None;
+            return Action::None;
+        }
+        KeyCode::Char('A') => {
+            app.ask_panel.close();
+            return Action::None;
+        }
+        _ => {}
+    }
+    let Some(reader) = app.ask_panel.reader.as_mut() else {
+        return Action::None;
+    };
+    let page = reader.page();
+    match code {
+        KeyCode::Down | KeyCode::Char('j') => reader.scroll_by(1),
+        KeyCode::Up | KeyCode::Char('k') => reader.scroll_by(-1),
+        KeyCode::PageDown | KeyCode::Char(' ') => reader.scroll_by(page),
+        KeyCode::PageUp => reader.scroll_by(-page),
+        KeyCode::Home | KeyCode::Char('g') => reader.scroll = 0,
+        KeyCode::End | KeyCode::Char('G') => reader.scroll = reader.max_scroll(),
+        _ => {}
+    }
+    Action::None
 }
 
 /// The spawn form: three fields, Tab-ordered; `Left`/`Right` cycle the
@@ -11845,7 +11959,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         render_collaboration_composer(f, popup_area, app);
     }
-    render_ask_panel_overlay(f, chunks[1], app);
+    render_ask_overlay(f, chunks[1], app);
     render_broadcast_report_overlay(f, chunks[1], app);
     render_work_composer_overlay(f, chunks[1], app);
     render_rename_overlay(f, chunks[1], app);
@@ -12365,6 +12479,140 @@ fn render_ask_panel(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(detail).block(detail_block), chunks[1]);
 }
 
+/// The ask history and its reader share one popup slot: the reader is
+/// opened from the list and returns to it, so only one is ever on screen.
+fn render_ask_overlay(f: &mut Frame, area: Rect, app: &mut App) {
+    if !app.ask_panel.open {
+        return;
+    }
+    // The reader takes more of the screen than the list it came from:
+    // giving a long answer somewhere to be read is the entire point.
+    let reading = app.ask_panel.reader.is_some();
+    let popup_area = if reading {
+        centered_rect(92, 88, area)
+    } else {
+        centered_rect(86, 78, area)
+    };
+    f.render_widget(Clear, popup_area);
+    if reading {
+        render_ask_reader(f, popup_area, app);
+    } else {
+        render_ask_panel(f, popup_area, app);
+    }
+}
+
+/// The whole answer, scrollable. Everything the detail pane has to cut —
+/// a long reply, a stack trace, a numbered plan — is here in full, and the
+/// geometry is written back so the key handler can clamp the scroll.
+fn render_ask_reader(f: &mut Frame, area: Rect, app: &mut App) {
+    use std::fmt::Write as _;
+
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let Some((id, scroll)) = app
+        .ask_panel
+        .reader
+        .as_ref()
+        .map(|reader| (reader.id.clone(), reader.scroll))
+    else {
+        return;
+    };
+    let Some(index) = app.ask_entries.iter().position(|entry| entry.id == id) else {
+        // Deleted out from under the reader — by `D` elsewhere, or by the
+        // daemon aging the history out. Fall back to the list rather than
+        // paint a blank page.
+        app.ask_panel.reader = None;
+        app.set_hint("ask history: that entry is gone", HintLevel::Warn);
+        return;
+    };
+    let entry = &app.ask_entries[index];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        // A gutter on both sides: prose set flush against a box rule is
+        // the difference between a pane you skim and one you read.
+        .padding(Padding::horizontal(1))
+        .title(Line::from(vec![
+            Span::styled(" answer ", theme.accent_badge()),
+            ask_status_badge(entry, theme),
+            Span::styled(format!(" {} ", entry.agent), theme.table_header_style()),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    // One line at the foot for the scroll position: without it a reader
+    // cannot tell a short answer from the top of a long one.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let width = usize::from(chunks[0].width).max(8);
+
+    let mut meta = format!("{} · {}", entry.agent, entry.cwd);
+    if let Some(d) = entry.duration() {
+        let _ = write!(meta, " · {}s", d.as_secs());
+    }
+    if let Some(cost) = entry.cost_usd {
+        let _ = write!(meta, " · ${cost:.4}");
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        truncate_chars(&meta, width),
+        theme.dim_style(),
+    ))];
+    // No budget on either wrap: the reader is the surface that does not
+    // truncate, which is why it exists.
+    lines.extend(
+        wrap_detail_text("ask: ", &entry.prompt, width, usize::MAX)
+            .into_iter()
+            .map(Line::from),
+    );
+    lines.push(Line::from(""));
+    let body = match entry.status {
+        muxa::ask::AskStatus::Running => "…waiting for the agent".to_string(),
+        muxa::ask::AskStatus::Failed => entry
+            .error
+            .clone()
+            .unwrap_or_else(|| "failed with no detail".into()),
+        muxa::ask::AskStatus::Answered => entry.answer.clone(),
+    };
+    // The detail pane paints an answer green to mark it as the reply; a
+    // whole page of green is a wall to read. The status badge in the title
+    // carries that signal here, so only a failure keeps its colour.
+    let style = match entry.status {
+        muxa::ask::AskStatus::Failed => Style::default().fg(Color::Red),
+        muxa::ask::AskStatus::Running => theme.dim_style(),
+        muxa::ask::AskStatus::Answered => Style::default(),
+    };
+    lines.extend(
+        wrap_detail_text("", &body, width, usize::MAX)
+            .into_iter()
+            .map(|row| Line::from(Span::styled(row, style))),
+    );
+
+    let total = lines.len();
+    let view = usize::from(chunks[0].height).max(1);
+    let scroll = scroll.min(total.saturating_sub(view));
+    let visible: Vec<Line> = lines.into_iter().skip(scroll).take(view).collect();
+    f.render_widget(Paragraph::new(visible), chunks[0]);
+
+    let position = if total <= view {
+        format!("{total} lines")
+    } else {
+        format!("{}–{} / {total}", scroll + 1, (scroll + view).min(total))
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(position, theme.dim_style())))
+            .alignment(Alignment::Right),
+        chunks[1],
+    );
+
+    if let Some(reader) = app.ask_panel.reader.as_mut() {
+        reader.total_lines = total;
+        reader.view_height = view;
+        reader.scroll = scroll;
+    }
+}
+
 fn ask_detail_lines(
     entry: &muxa::ask::AskEntry,
     width: usize,
@@ -12756,15 +13004,6 @@ fn render_message_skill_editor(f: &mut Frame, area: Rect, app: &App) {
     if x < inner.x.saturating_add(inner.width) && y < inner.y.saturating_add(inner.height) {
         f.set_cursor_position((x, y));
     }
-}
-
-fn render_ask_panel_overlay(f: &mut Frame, area: Rect, app: &App) {
-    if !app.ask_panel.open {
-        return;
-    }
-    let popup_area = centered_rect(86, 78, area);
-    f.render_widget(Clear, popup_area);
-    render_ask_panel(f, popup_area, app);
 }
 
 fn render_broadcast_report_overlay(f: &mut Frame, area: Rect, app: &App) {
@@ -17309,10 +17548,29 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
         return true;
     }
 
+    if app.ask_panel.reader.is_some() {
+        let spans = vec![
+            Span::styled(" j/k ", theme.key_badge()),
+            Span::raw("scroll  "),
+            Span::styled(" PgUp/PgDn ", theme.key_badge()),
+            Span::raw("page  "),
+            Span::styled(" g/G ", theme.key_badge()),
+            Span::raw("top/bottom  "),
+            Span::styled(" Esc/⏎ ", theme.key_badge()),
+            Span::raw("back to the list  "),
+            Span::styled(" A ", theme.key_badge()),
+            Span::raw("close"),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return true;
+    }
+
     if app.ask_panel.open {
         let spans = vec![
             Span::styled(" a ", theme.action_badge()),
             Span::raw("ask  "),
+            Span::styled(" ⏎ ", theme.action_badge()),
+            Span::raw("full answer  "),
             Span::styled(" j/k ", theme.key_badge()),
             Span::raw("select  "),
             Span::styled(" | ", theme.key_badge()),
@@ -17746,6 +18004,7 @@ mod tests {
             cwd: None,
             state,
             last_prompt: prompt.map(Into::into),
+            last_prompt_at: None,
             last_response: None,
             recap: None,
             ai_title: None,
@@ -20391,6 +20650,7 @@ mod tests {
     fn the_history_filter_selects_by_agent() {
         let mut app = app_with_paneless_and_pane();
         let mk = |agent: &str, prompt: &str| muxa::ask::AskEntry {
+            conversation_id: None,
             id: format!("ask_{prompt}"),
             prompt: prompt.into(),
             answer: String::new(),
@@ -20416,11 +20676,183 @@ mod tests {
         assert_eq!(visible_ask_entries(&app).len(), 1);
     }
 
+    /// One long answer, so the reader has something to scroll through and
+    /// the detail pane provably cannot show all of it.
+    fn app_with_long_answer(lines: usize) -> App {
+        let mut app = app_with_paneless_and_pane();
+        let now = OffsetDateTime::now_utc();
+        app.ask_entries = vec![muxa::ask::AskEntry {
+            conversation_id: None,
+            id: "ask_long".into(),
+            prompt: "explain the reconciler".into(),
+            answer: (0..lines)
+                .map(|i| format!("answer line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            status: muxa::ask::AskStatus::Answered,
+            agent: "claude".into(),
+            agent_session_id: None,
+            cwd: "/repo/muxa".into(),
+            asked_at: now,
+            answered_at: Some(now),
+            cost_usd: None,
+            error: None,
+        }];
+        app.ask_panel.open = true;
+        app
+    }
+
+    fn ask_key(app: &mut App, code: KeyCode) -> Action {
+        handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), app)
+    }
+
+    #[test]
+    fn enter_opens_the_full_answer_and_esc_returns_to_the_list() {
+        // The panel could only ever show the first screenful of an answer,
+        // with no way to reach the rest — the reader is that way.
+        let mut app = app_with_long_answer(40);
+
+        assert!(matches!(ask_key(&mut app, KeyCode::Enter), Action::None));
+        let reader = app.ask_panel.reader.as_ref().expect("Enter opens a reader");
+        assert_eq!(reader.id, "ask_long");
+        assert_eq!(reader.scroll, 0, "a reader opens at the top");
+
+        assert!(matches!(ask_key(&mut app, KeyCode::Esc), Action::None));
+        assert!(app.ask_panel.reader.is_none(), "Esc steps back one level");
+        assert!(app.ask_panel.open, "…without closing the history itself");
+
+        // `A` from inside the reader leaves the panel altogether.
+        let _ = ask_key(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            ask_key(&mut app, KeyCode::Char('A')),
+            Action::None
+        ));
+        assert!(!app.ask_panel.open);
+        assert!(app.ask_panel.reader.is_none());
+    }
+
+    #[test]
+    fn the_reader_swallows_the_delete_keys() {
+        // `d` deletes the selected entry from the list. Inside a reader the
+        // same keystroke would delete the very answer being read.
+        let mut app = app_with_long_answer(40);
+        let _ = ask_key(&mut app, KeyCode::Enter);
+
+        for key in ['d', 'D', 'n'] {
+            assert!(
+                matches!(ask_key(&mut app, KeyCode::Char(key)), Action::None),
+                "{key} must not act while the reader is open"
+            );
+        }
+        assert!(app.ask_panel.reader.is_some());
+    }
+
+    #[test]
+    fn reader_scrolling_clamps_to_the_answer() {
+        let mut app = app_with_long_answer(40);
+        let _ = ask_key(&mut app, KeyCode::Enter);
+        // Stand in for a paint: the renderer is what measures the wrapped
+        // body and the viewport, and the key handler clamps against it.
+        {
+            let reader = app.ask_panel.reader.as_mut().unwrap();
+            reader.total_lines = 44;
+            reader.view_height = 10;
+        }
+
+        let _ = ask_key(&mut app, KeyCode::Char('k'));
+        assert_eq!(
+            app.ask_panel.reader.as_ref().unwrap().scroll,
+            0,
+            "no scrolling above the top"
+        );
+
+        let _ = ask_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.ask_panel.reader.as_ref().unwrap().scroll, 1);
+
+        let _ = ask_key(&mut app, KeyCode::PageDown);
+        assert_eq!(
+            app.ask_panel.reader.as_ref().unwrap().scroll,
+            10,
+            "a page keeps one line of overlap"
+        );
+
+        let _ = ask_key(&mut app, KeyCode::Char('G'));
+        assert_eq!(
+            app.ask_panel.reader.as_ref().unwrap().scroll,
+            34,
+            "the last screenful stays full instead of scrolling into blank"
+        );
+        let _ = ask_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.ask_panel.reader.as_ref().unwrap().scroll, 34);
+
+        let _ = ask_key(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.ask_panel.reader.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn the_reader_paints_the_answer_and_scrolls_to_its_end() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_with_long_answer(60);
+        let _ = ask_key(&mut app, KeyCode::Enter);
+
+        let dump = |terminal: &Terminal<TestBackend>| -> String {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect()
+        };
+
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let top = dump(&terminal);
+        assert!(
+            top.contains("explain the reconciler"),
+            "the question heads the reader"
+        );
+        assert!(top.contains("answer line 0"), "missing the answer: {top:?}");
+        assert!(
+            !top.contains("answer line 59"),
+            "the tail must need scrolling, or this proves nothing"
+        );
+
+        // The paint measured the body; G can now reach the end of it.
+        let _ = ask_key(&mut app, KeyCode::Char('G'));
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let bottom = dump(&terminal);
+        assert!(
+            bottom.contains("answer line 59"),
+            "the end of the answer stayed out of reach: {bottom:?}"
+        );
+    }
+
+    #[test]
+    fn the_reader_falls_back_when_its_entry_disappears() {
+        // The history is re-fetched on a timer, so the row under the reader
+        // can be deleted by another surface while it is open.
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_with_long_answer(20);
+        let _ = ask_key(&mut app, KeyCode::Enter);
+        app.ask_entries.clear();
+
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        assert!(app.ask_panel.reader.is_none(), "the reader closed itself");
+        assert!(app.ask_panel.open, "back to the list, not out of the panel");
+        assert!(app
+            .footer_hint
+            .as_ref()
+            .is_some_and(|hint| hint.message.contains("gone")));
+    }
+
     #[test]
     fn ask_history_delete_keys_distinguish_one_from_all() {
         let mut app = app_with_paneless_and_pane();
         let now = OffsetDateTime::now_utc();
         let entry = |id: &str, status: muxa::ask::AskStatus| muxa::ask::AskEntry {
+            conversation_id: None,
             id: id.into(),
             prompt: id.into(),
             answer: String::new(),
@@ -26919,7 +27351,7 @@ sort = ["state"]
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
         assert!(body.contains("m / M / Space  message selected or marked / mailbox / mark agent"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
-        assert!(body.contains("a / A          ask / history; d deletes one · D clears all in A"));
+        assert!(body.contains("a / A          ask / history; Enter reads one · d/D delete one/all"));
         assert!(
             body.contains("C / n / w / R  shell window / agent pane / work up / rename the row")
         );

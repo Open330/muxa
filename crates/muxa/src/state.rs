@@ -199,6 +199,15 @@ pub struct Agent {
     pub subagents: Vec<Subagent>,
     pub state: AgentState,
     pub last_prompt: Option<String>,
+    /// Wall-clock of the most recent user prompt. Kept separately from
+    /// `last_activity_at` so Fleet clients can sort by operator input even
+    /// after tools and assistant output have advanced general activity.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub last_prompt_at: Option<OffsetDateTime>,
     /// Last assistant response captured for this agent. Populated by the
     /// `TurnStopped` ingest path when the adapter could read the
     /// transcript; remains `None` for adapters that don't expose response
@@ -331,6 +340,7 @@ impl Agent {
             subagents: Vec::new(),
             state: AgentState::Starting,
             last_prompt: None,
+            last_prompt_at: None,
             last_response: None,
             recap: None,
             ai_title: None,
@@ -614,6 +624,7 @@ impl Store {
         let mut agent = Agent::new(AgentKind::Task, key.clone(), surface, pane, cwd, now);
         agent.state = AgentState::Working;
         agent.pid = pid;
+        agent.last_prompt_at = command.as_ref().map(|_| now);
         agent.last_prompt = command;
         agents.insert(key.clone(), agent);
         drop(agents);
@@ -686,6 +697,7 @@ fn mutate_for_event(
         }
         AgentEvent::PromptSubmitted { prompt, .. } => {
             agent.last_prompt = Some(prompt.clone());
+            agent.last_prompt_at = Some(at);
             agent.state = AgentState::Working;
             prompt_record = Some(PromptRecord {
                 id: id.clone(),
@@ -2134,6 +2146,7 @@ mod tests {
             cwd: None,
             state,
             last_prompt: None,
+            last_prompt_at: None,
             last_response: None,
             recap: None,
             ai_title: None,
@@ -4892,6 +4905,7 @@ mod tests {
                     cwd: None,
                     state: AgentState::Stopped,
                     last_prompt: None,
+                    last_prompt_at: None,
                     last_response: None,
                     recap: None,
                     ai_title: None,
@@ -4926,6 +4940,7 @@ mod tests {
                     cwd: None,
                     state: AgentState::Working,
                     last_prompt: None,
+                    last_prompt_at: None,
                     last_response: None,
                     recap: None,
                     ai_title: None,
@@ -4989,6 +5004,7 @@ mod tests {
                         cwd: None,
                         state: AgentState::Working,
                         last_prompt: None,
+                        last_prompt_at: None,
                         last_response: None,
                         recap: None,
                         ai_title: None,
@@ -5057,6 +5073,7 @@ mod tests {
             cwd: None,
             state: AgentState::Idle,
             last_prompt: Some(prompt.into()),
+            last_prompt_at: None,
             last_response: None,
             recap: None,
             ai_title: None,
@@ -5119,6 +5136,11 @@ mod tests {
         assert_eq!(
             a.state_entered_at, t1,
             "PromptSubmitted (Idle → Working) must reset state_entered_at"
+        );
+        assert_eq!(
+            a.last_prompt_at,
+            Some(t1),
+            "the user-input clock must remain independently sortable"
         );
     }
 

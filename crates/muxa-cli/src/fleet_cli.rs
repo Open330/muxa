@@ -185,7 +185,14 @@ enum FleetCommand {
         submit: bool,
     },
     /// Attach to one exact pane directly when local, or through a separate SSH TTY.
-    Attach { host: String, pane: String },
+    Attach {
+        host: String,
+        pane: String,
+        /// Temporarily fit and zoom a tmux pane to this terminal, restoring
+        /// the previous window policy and zoom state on detach.
+        #[arg(long)]
+        fit: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -511,7 +518,7 @@ pub(crate) async fn run_fleet(
             }
             Ok(())
         }
-        FleetCommand::Attach { host, pane } => attach(client, cfg, &host, &pane).await,
+        FleetCommand::Attach { host, pane, fit } => attach(client, cfg, &host, &pane, fit).await,
     }
 }
 
@@ -581,7 +588,7 @@ async fn pane_records(
         .collect())
 }
 
-async fn attach(client: &Client, cfg: &Config, host: &str, pane: &str) -> Result<()> {
+async fn attach(client: &Client, cfg: &Config, host: &str, pane: &str, fit: bool) -> Result<()> {
     let key = resolve_pane(client, host, pane).await?;
     let snapshot = client.fleet_snapshot(None).await?;
     let live = snapshot
@@ -597,19 +604,32 @@ async fn attach(client: &Client, cfg: &Config, host: &str, pane: &str) -> Result
         pane: key,
         agent_session_id: None,
     };
-    attach_exact(cfg, host, &target)
+    attach_exact(cfg, host, &target, fit)
 }
 
-pub(crate) fn attach_exact(cfg: &Config, host: &str, target: &GlobalPaneRef) -> Result<()> {
+pub(crate) fn attach_exact(
+    cfg: &Config,
+    host: &str,
+    target: &GlobalPaneRef,
+    fit: bool,
+) -> Result<()> {
     let token = crate::relay::encode_attach_token(target)?;
     if host == LOCAL_HOST_ALIAS {
-        return crate::relay::remote_attach(&token);
+        return crate::relay::remote_attach(&token, fit);
     }
     let configured = cfg
         .fleet
         .hosts
         .get(host)
         .with_context(|| format!("host '{host}' is not configured locally"))?;
+    // Fit from the controlling host so an app update also works with Fleet
+    // nodes that have not learned the additive hidden `--fit` endpoint yet.
+    // The guard spans the blocking SSH attach and restores remote tmux state
+    // when the client detaches or the attach command fails.
+    let _fit_guard = fit
+        .then(|| RemoteTmuxFitGuard::begin(configured, &target.pane))
+        .transpose()?
+        .flatten();
     let mut command = std::process::Command::new("ssh");
     command.args([
         "-t",
@@ -624,11 +644,242 @@ pub(crate) fn attach_exact(cfg: &Config, host: &str, target: &GlobalPaneRef) -> 
     if let Some(socket) = &configured.remote_socket {
         command.arg("--socket").arg(socket);
     }
-    let status = command.args(["fleet-remote-attach", &token]).status()?;
+    command.args(["fleet-remote-attach", &token]);
+    let status = command.status()?;
     if !status.success() {
         bail!("remote attach exited with {status}");
     }
     Ok(())
+}
+
+struct RemoteTmuxFitGuard {
+    host: FleetHostConfig,
+    socket: String,
+    window_target: String,
+    pane: String,
+    previous_pane: String,
+    previous_dimensions: Option<(String, String)>,
+    previous_window_size: Option<String>,
+    zoomed_by_us: bool,
+}
+
+impl RemoteTmuxFitGuard {
+    fn begin(host: &FleetHostConfig, pane: &PaneKey) -> Result<Option<Self>> {
+        if pane.window.session.endpoint.host != muxa::HostKind::Tmux {
+            return Ok(None);
+        }
+        let socket = pane.window.session.endpoint.socket.clone();
+        let window_target = format!(
+            "{}:{}",
+            pane.window.session.session_id, pane.window.window_id
+        );
+        let previous_window_size = remote_tmux_capture(
+            host,
+            &socket,
+            &[
+                "show-options",
+                "-w",
+                "-q",
+                "-v",
+                "-t",
+                &window_target,
+                "window-size",
+            ],
+        )?
+        .trim()
+        .to_string();
+        let previous_window_size =
+            (!previous_window_size.is_empty()).then_some(previous_window_size);
+        let previous_pane = remote_tmux_capture(
+            host,
+            &socket,
+            &["display-message", "-p", "-t", &window_target, "#{pane_id}"],
+        )?
+        .trim()
+        .to_string();
+        let previous_dimensions = remote_tmux_capture(
+            host,
+            &socket,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                &window_target,
+                "#{window_width} #{window_height}",
+            ],
+        )?;
+        let mut dimensions = previous_dimensions.split_whitespace();
+        let previous_dimensions = dimensions
+            .next()
+            .zip(dimensions.next())
+            .map(|(width, height)| (width.to_string(), height.to_string()));
+        let was_zoomed = remote_tmux_capture(
+            host,
+            &socket,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                &pane.pane_id,
+                "#{window_zoomed_flag}",
+            ],
+        )?
+        .trim()
+            == "1";
+        let mut guard = Self {
+            host: host.clone(),
+            socket,
+            window_target,
+            pane: pane.pane_id.clone(),
+            previous_pane,
+            previous_dimensions,
+            previous_window_size,
+            zoomed_by_us: false,
+        };
+        remote_tmux_control(
+            &guard.host,
+            &guard.socket,
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                &guard.window_target,
+                "window-size",
+                "latest",
+            ],
+        )?;
+        remote_tmux_control(
+            &guard.host,
+            &guard.socket,
+            &["select-pane", "-t", &guard.pane],
+        )?;
+        if !was_zoomed {
+            remote_tmux_control(
+                &guard.host,
+                &guard.socket,
+                &["resize-pane", "-Z", "-t", &guard.pane],
+            )?;
+            guard.zoomed_by_us = true;
+        }
+        Ok(Some(guard))
+    }
+}
+
+impl Drop for RemoteTmuxFitGuard {
+    fn drop(&mut self) {
+        if self.zoomed_by_us {
+            let _ = remote_tmux_control(
+                &self.host,
+                &self.socket,
+                &["resize-pane", "-Z", "-t", &self.pane],
+            );
+        }
+        if !self.previous_pane.is_empty() && self.previous_pane != self.pane {
+            let _ = remote_tmux_control(
+                &self.host,
+                &self.socket,
+                &["select-pane", "-t", &self.previous_pane],
+            );
+        }
+        if let Some((width, height)) = self.previous_dimensions.as_ref() {
+            let _ = remote_tmux_control(
+                &self.host,
+                &self.socket,
+                &[
+                    "resize-window",
+                    "-t",
+                    &self.window_target,
+                    "-x",
+                    width,
+                    "-y",
+                    height,
+                ],
+            );
+        }
+        if let Some(previous) = self.previous_window_size.as_deref() {
+            let _ = remote_tmux_control(
+                &self.host,
+                &self.socket,
+                &[
+                    "set-option",
+                    "-w",
+                    "-t",
+                    &self.window_target,
+                    "window-size",
+                    previous,
+                ],
+            );
+        } else {
+            let _ = remote_tmux_control(
+                &self.host,
+                &self.socket,
+                &[
+                    "set-option",
+                    "-w",
+                    "-u",
+                    "-t",
+                    &self.window_target,
+                    "window-size",
+                ],
+            );
+        }
+    }
+}
+
+fn remote_tmux_capture(host: &FleetHostConfig, socket: &str, args: &[&str]) -> Result<String> {
+    let output = remote_tmux_command(host, socket, args)
+        .output()
+        .context("running remote tmux control over OpenSSH")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("remote tmux control failed: {}", stderr.trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn remote_tmux_control(host: &FleetHostConfig, socket: &str, args: &[&str]) -> Result<()> {
+    let status = remote_tmux_command(host, socket, args)
+        .status()
+        .context("running remote tmux control over OpenSSH")?;
+    if !status.success() {
+        bail!("remote tmux control exited with {status}");
+    }
+    Ok(())
+}
+
+fn remote_tmux_command(
+    host: &FleetHostConfig,
+    socket: &str,
+    args: &[&str],
+) -> std::process::Command {
+    let mut words = vec!["tmux".to_string()];
+    if Path::new(socket).is_absolute() {
+        words.extend(["-S".into(), socket.into()]);
+    } else {
+        words.extend(["-L".into(), socket.into()]);
+    }
+    words.extend(args.iter().map(|arg| (*arg).to_string()));
+    let remote = words
+        .iter()
+        .map(|word| shell_quote(word))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut command = std::process::Command::new("ssh");
+    command.args([
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ClearAllForwardings=yes",
+        "--",
+        &host.ssh,
+        &remote,
+    ]);
+    command
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 async fn doctor(client: &Client, cfg: &Config, alias: &str, timeout: Duration) -> Result<()> {
@@ -1546,6 +1797,33 @@ mod tests {
     fn pair_parser_accepts_annotation_urls_but_not_label_urls() {
         assert!(parse_pairs(&["docs=https://example.com/a".into()], true).is_ok());
         assert!(parse_pairs(&["docs=https://example.com/a".into()], false).is_err());
+    }
+
+    #[test]
+    fn remote_tmux_fit_command_quotes_exact_targets_for_the_login_shell() {
+        let host = FleetHostConfig {
+            ssh: "devbox".into(),
+            ..FleetHostConfig::default()
+        };
+        let command = remote_tmux_command(
+            &host,
+            "default",
+            &[
+                "select-pane",
+                "-t",
+                "$107:@107.%3; printf unsafe",
+                "owner's pane",
+            ],
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args[args.len() - 2], "devbox");
+        assert_eq!(
+            args.last().unwrap(),
+            "'tmux' '-L' 'default' 'select-pane' '-t' '$107:@107.%3; printf unsafe' 'owner'\\''s pane'"
+        );
     }
 
     #[test]
