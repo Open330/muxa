@@ -852,6 +852,42 @@ struct MuxaIPCTests {
         #expect(selection == .agent("local:agent-17"))
     }
 
+    @Test @MainActor
+    func operatorInboxOpensRecordedSessionWhenAgentAndWindowEnded() async throws {
+        let probe = IPCProbe()
+        let client = MuxaIPCClient(socketPath: "/tmp/muxa-test.sock", request: probe.request)
+        try await client.hello()
+        let execution = try await client.executionSnapshot()
+        let route = try #require(
+            execution.watchHosts.first(where: { $0.host.alias == "local" })?
+                .sessions.first?.windows.first?.panes.first
+        )
+        let request = try JSONDecoder().decode(
+            MuxaCollaborationRequest.self,
+            from: Data(#"""
+            {
+              "id":"request-ended-agent",
+              "from":{"agent_kind":"unknown","agent_session_id":"__muxa_console__","pane":"console","room":{"host":"tmux","window_id":"@4"},"console":true},
+              "to":{"agent_kind":"claude_code","agent_session_id":"ended-agent","pane":"%999","socket":"default","room":{"host":"tmux","socket":"default","window_id":"@999"},"alias":"claude","tmux_session_id":"$4","tmux_session_name":"muxa","window_name":"ended"},
+              "kind":"task","body":"Historical request","expects_reply":true,"work_mode":"read_only","status":"completed","created_at":"2026-08-31T10:00:00Z"
+            }
+            """#.utf8)
+        )
+        let message = MuxaOperatorMessage(
+            host: route.host,
+            routePane: route.pane,
+            request: request
+        )
+
+        let selection = AppModel.operatorSelection(for: message, in: execution)
+
+        #expect(selection == .fleetSession(MuxaWatchSessionIdentity(
+            hostAlias: "local",
+            socket: "default",
+            sessionID: "$4"
+        )))
+    }
+
     @Test
     func operatorInboxSeparatesHumanDecisionsFromOrdinaryReplies() throws {
         func message(replyStatus: String) throws -> MuxaOperatorMessage {
