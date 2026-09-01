@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="muxa" width="260" />
+<img src="assets/logo.svg" alt="Muxa 로고" width="144" />
 
 **tmux를 작업 단위로 구성하는 AI agent 관측·오케스트레이션 도구.**
 

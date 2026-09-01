@@ -3179,6 +3179,7 @@ mod tests {
             cwd: cwd.map(str::to_string),
             state,
             last_prompt: None,
+            last_prompt_at: None,
             last_response: None,
             recap: None,
             ai_title: None,

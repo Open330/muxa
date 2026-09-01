@@ -45,6 +45,20 @@ pub(crate) async fn run(client: Client) -> Result<()> {
         .subscribe()
         .await
         .context("subscribing to local muxad")?;
+    let mut mailbox_updates = if daemon
+        .capabilities
+        .iter()
+        .any(|capability| capability == "collaboration_subscribe")
+    {
+        Some(
+            client
+                .collaboration_subscribe()
+                .await
+                .context("subscribing to local collaboration changes")?,
+        )
+    } else {
+        None
+    };
     let revision = Arc::new(AtomicU64::new(0));
     let (output_tx, mut output_rx) = mpsc::channel::<RelayFrame>(RELAY_OUTPUT_CAPACITY);
 
@@ -123,6 +137,26 @@ pub(crate) async fn run(client: Client) -> Result<()> {
         }
     });
 
+    let mailbox_task = mailbox_updates.take().map(|mut mailbox_updates| {
+        let mailbox_tx = output_tx.clone();
+        let mailbox_topology_revision = Arc::clone(&revision);
+        tokio::spawn(async move {
+            while let Ok(Some(mailbox_revision)) = mailbox_updates.recv().await {
+                if mailbox_tx
+                    .send(RelayFrame::Keepalive {
+                        revision: mailbox_topology_revision.load(Ordering::SeqCst),
+                        observed_at: OffsetDateTime::now_utc(),
+                        mailbox_revision: Some(mailbox_revision),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    });
+
     let keepalive_tx = output_tx.clone();
     let keepalive_revision = Arc::clone(&revision);
     let keepalive_task = tokio::spawn(async move {
@@ -135,6 +169,7 @@ pub(crate) async fn run(client: Client) -> Result<()> {
                 .send(RelayFrame::Keepalive {
                     revision: keepalive_revision.load(Ordering::SeqCst),
                     observed_at: OffsetDateTime::now_utc(),
+                    mailbox_revision: None,
                 })
                 .await
                 .is_err()
@@ -199,6 +234,9 @@ pub(crate) async fn run(client: Client) -> Result<()> {
 
     drop(output_tx);
     transition_task.abort();
+    if let Some(mailbox_task) = mailbox_task {
+        mailbox_task.abort();
+    }
     keepalive_task.abort();
     writer.await.context("joining relay writer")??;
     Ok(())
@@ -568,7 +606,164 @@ fn decode_attach_token(token: &str) -> Result<GlobalPaneRef> {
     serde_json::from_slice(&bytes).context("decoding remote attach target")
 }
 
-pub(crate) fn remote_attach(token: &str) -> Result<()> {
+struct TmuxFitGuard {
+    socket: String,
+    window_target: String,
+    pane: String,
+    previous_pane: String,
+    previous_dimensions: Option<(String, String)>,
+    previous_window_size: Option<String>,
+    zoomed_by_us: bool,
+}
+
+impl TmuxFitGuard {
+    fn begin(pane: &PaneKey) -> Result<Option<Self>> {
+        if pane.window.session.endpoint.host != HostKind::Tmux {
+            return Ok(None);
+        }
+        let socket = pane.window.session.endpoint.socket.clone();
+        let window_target = format!(
+            "{}:{}",
+            pane.window.session.session_id, pane.window.window_id
+        );
+        let previous_window_size = muxa::tmux::capture_control_on(
+            Some(&socket),
+            &[
+                "show-options",
+                "-w",
+                "-q",
+                "-v",
+                "-t",
+                &window_target,
+                "window-size",
+            ],
+        )?
+        .trim()
+        .to_string();
+        let previous_window_size =
+            (!previous_window_size.is_empty()).then_some(previous_window_size);
+        let previous_pane = muxa::tmux::capture_control_on(
+            Some(&socket),
+            &["display-message", "-p", "-t", &window_target, "#{pane_id}"],
+        )?
+        .trim()
+        .to_string();
+        let previous_dimensions = muxa::tmux::capture_control_on(
+            Some(&socket),
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                &window_target,
+                "#{window_width} #{window_height}",
+            ],
+        )?;
+        let mut dimensions = previous_dimensions.split_whitespace();
+        let previous_dimensions = dimensions
+            .next()
+            .zip(dimensions.next())
+            .map(|(width, height)| (width.to_string(), height.to_string()));
+        let was_zoomed = muxa::tmux::capture_control_on(
+            Some(&socket),
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                &pane.pane_id,
+                "#{window_zoomed_flag}",
+            ],
+        )?
+        .trim()
+            == "1";
+        let mut guard = Self {
+            socket,
+            window_target,
+            pane: pane.pane_id.clone(),
+            previous_pane,
+            previous_dimensions,
+            previous_window_size,
+            zoomed_by_us: false,
+        };
+        muxa::tmux::run_control_on(
+            Some(&guard.socket),
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                &guard.window_target,
+                "window-size",
+                "latest",
+            ],
+        )?;
+        muxa::tmux::run_control_on(Some(&guard.socket), &["select-pane", "-t", &guard.pane])?;
+        if !was_zoomed {
+            muxa::tmux::run_control_on(
+                Some(&guard.socket),
+                &["resize-pane", "-Z", "-t", &guard.pane],
+            )?;
+            guard.zoomed_by_us = true;
+        }
+        Ok(Some(guard))
+    }
+}
+
+impl Drop for TmuxFitGuard {
+    fn drop(&mut self) {
+        if self.zoomed_by_us {
+            let _ = muxa::tmux::run_control_on(
+                Some(&self.socket),
+                &["resize-pane", "-Z", "-t", &self.pane],
+            );
+        }
+        if !self.previous_pane.is_empty() && self.previous_pane != self.pane {
+            let _ = muxa::tmux::run_control_on(
+                Some(&self.socket),
+                &["select-pane", "-t", &self.previous_pane],
+            );
+        }
+        if let Some((width, height)) = self.previous_dimensions.as_ref() {
+            let _ = muxa::tmux::run_control_on(
+                Some(&self.socket),
+                &[
+                    "resize-window",
+                    "-t",
+                    &self.window_target,
+                    "-x",
+                    width,
+                    "-y",
+                    height,
+                ],
+            );
+        }
+        if let Some(previous) = self.previous_window_size.as_deref() {
+            let _ = muxa::tmux::run_control_on(
+                Some(&self.socket),
+                &[
+                    "set-option",
+                    "-w",
+                    "-t",
+                    &self.window_target,
+                    "window-size",
+                    previous,
+                ],
+            );
+        } else {
+            let _ = muxa::tmux::run_control_on(
+                Some(&self.socket),
+                &[
+                    "set-option",
+                    "-w",
+                    "-u",
+                    "-t",
+                    &self.window_target,
+                    "window-size",
+                ],
+            );
+        }
+    }
+}
+
+pub(crate) fn remote_attach(token: &str, fit: bool) -> Result<()> {
     let target = decode_attach_token(token)?;
     let id_path = muxa::paths::default_node_id_file()
         .context("no data directory is available for the fleet host id")?;
@@ -590,6 +785,10 @@ pub(crate) fn remote_attach(token: &str) -> Result<()> {
     {
         bail!("exact pane target is stale or no longer exists");
     }
+    let _fit_guard = fit
+        .then(|| TmuxFitGuard::begin(&target.pane))
+        .transpose()?
+        .flatten();
     crate::jump_to_topology_pane(&target.pane);
     Ok(())
 }

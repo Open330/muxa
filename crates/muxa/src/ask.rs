@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 
 use crate::config::{AskPermissionMode, DEFAULT_ASK_TIMEOUT_SECS};
 
@@ -39,8 +39,14 @@ pub enum AskError {
     Disabled,
     #[error("ask prompt is empty")]
     EmptyPrompt,
+    #[error("this conversation is still answering; wait for the current reply before sending another message")]
+    ConversationBusy,
+    #[error("ask conversation {0:?} was not found")]
+    ConversationNotFound(String),
     #[error("ask agent {0:?} is not supported (use claude or codex)")]
     UnsupportedAgent(String),
+    #[error("the supplied API key is for {supplied}, but the selected ask agent is {selected}")]
+    CredentialAgentMismatch { supplied: String, selected: String },
     #[error("{0}")]
     Io(String),
 }
@@ -59,6 +65,25 @@ pub struct AskOptions {
     pub timeout_secs: u64,
     pub path: Option<PathBuf>,
     pub keep: usize,
+}
+
+/// One-turn provider credential. It is accepted only over the owner-only IPC
+/// socket, moved directly into the selected child process environment, and is
+/// never retained in [`AskEntry`] or [`AskSnapshot`].
+#[derive(Clone, Deserialize)]
+pub struct AskCredential {
+    pub agent: String,
+    pub api_key: String,
+}
+
+impl std::fmt::Debug for AskCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AskCredential")
+            .field("agent", &self.agent)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Default for AskOptions {
@@ -90,6 +115,10 @@ pub enum AskStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AskEntry {
     pub id: String,
+    /// Muxa-owned conversation id. Unlike `agent_session_id`, this is stable
+    /// before the first provider turn and is safe to expose as a UI identity.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
     pub prompt: String,
     #[serde(default)]
     pub answer: String,
@@ -110,6 +139,22 @@ pub struct AskEntry {
     pub error: Option<String>,
 }
 
+/// A resumable Global Ask conversation. Provider session ids remain an
+/// implementation detail while this muxa-owned id gives native clients a
+/// durable conversation picker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskConversation {
+    pub id: String,
+    pub title: String,
+    pub agent: String,
+    #[serde(default)]
+    pub agent_session_id: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
 impl AskEntry {
     /// Wall-clock the query took, once it has finished.
     #[must_use]
@@ -127,13 +172,110 @@ struct AskSnapshot {
     #[serde(default)]
     threads: std::collections::HashMap<String, String>,
     #[serde(default)]
+    conversations: Vec<AskConversation>,
+    #[serde(default)]
+    active_conversations: std::collections::HashMap<String, String>,
+    #[serde(default)]
     entries: Vec<AskEntry>,
+}
+
+impl AskSnapshot {
+    /// Upgrade the former provider -> session snapshot in place. Completed
+    /// entries already retain the provider session id, so old resets naturally
+    /// become separate conversations without discarding any history.
+    fn migrate_conversations(&mut self) {
+        for entry in &mut self.entries {
+            let existing = entry.conversation_id.as_ref().and_then(|id| {
+                self.conversations
+                    .iter()
+                    .position(|conversation| &conversation.id == id)
+            });
+            let matching_session = entry.agent_session_id.as_ref().and_then(|session| {
+                self.conversations.iter().position(|conversation| {
+                    conversation.agent == entry.agent
+                        && conversation.agent_session_id.as_ref() == Some(session)
+                })
+            });
+            let index = existing.or(matching_session).unwrap_or_else(|| {
+                let conversation = AskConversation {
+                    id: format!("conversation_{:x}", next_id()),
+                    title: conversation_title(&entry.prompt),
+                    agent: entry.agent.clone(),
+                    agent_session_id: entry.agent_session_id.clone(),
+                    created_at: entry.asked_at,
+                    updated_at: entry.answered_at.unwrap_or(entry.asked_at),
+                };
+                self.conversations.push(conversation);
+                self.conversations.len() - 1
+            });
+            let conversation = &mut self.conversations[index];
+            if conversation.title.trim().is_empty() || conversation.title == "New conversation" {
+                conversation.title = conversation_title(&entry.prompt);
+            }
+            if entry.agent_session_id.is_some() {
+                conversation
+                    .agent_session_id
+                    .clone_from(&entry.agent_session_id);
+            }
+            conversation.created_at = conversation.created_at.min(entry.asked_at);
+            conversation.updated_at = conversation
+                .updated_at
+                .max(entry.answered_at.unwrap_or(entry.asked_at));
+            entry.conversation_id = Some(conversation.id.clone());
+        }
+
+        for (agent, session) in self.threads.clone() {
+            let existing_id = self
+                .conversations
+                .iter()
+                .filter(|conversation| {
+                    conversation.agent == agent
+                        && conversation.agent_session_id.as_deref() == Some(session.as_str())
+                })
+                .max_by_key(|conversation| conversation.updated_at)
+                .map(|conversation| conversation.id.clone());
+            let id = existing_id.unwrap_or_else(|| {
+                let now = OffsetDateTime::now_utc();
+                let conversation = AskConversation {
+                    id: format!("conversation_{:x}", next_id()),
+                    title: "Previous conversation".into(),
+                    agent: agent.clone(),
+                    agent_session_id: Some(session),
+                    created_at: now,
+                    updated_at: now,
+                };
+                let id = conversation.id.clone();
+                self.conversations.push(conversation);
+                id
+            });
+            self.active_conversations.entry(agent).or_insert(id);
+        }
+
+        for agent in ["claude", "codex"] {
+            if self.active_conversations.contains_key(agent) {
+                continue;
+            }
+            if let Some(id) = self
+                .conversations
+                .iter()
+                .filter(|conversation| conversation.agent == agent)
+                .max_by_key(|conversation| conversation.updated_at)
+                .map(|conversation| conversation.id.clone())
+            {
+                self.active_conversations.insert(agent.into(), id);
+            }
+        }
+    }
 }
 
 /// Durable ask history plus the id of the conversation still in progress.
 pub struct AskStore {
     opts: AskOptions,
     entries: RwLock<Vec<AskEntry>>,
+    conversations: RwLock<Vec<AskConversation>>,
+    active_conversations: RwLock<std::collections::HashMap<String, String>>,
+    /// Kept in the snapshot for rollback compatibility with older muxad
+    /// builds. New code derives it from the currently selected conversation.
     threads: RwLock<std::collections::HashMap<String, String>>,
     /// Agent the next question goes to. Starts at the configured one and
     /// follows whatever the user picks in the panel.
@@ -141,18 +283,24 @@ pub struct AskStore {
     /// Serializes each mutation with its snapshot write, so a reader
     /// never sees an entry the file does not have.
     write_lock: Mutex<()>,
+    /// Monotonic content-free invalidation for native Ask clients.
+    changes: watch::Sender<u64>,
 }
 
 impl AskStore {
     #[must_use]
     pub fn in_memory(opts: AskOptions) -> Arc<Self> {
         let agent = opts.agent.clone();
+        let (changes, _) = watch::channel(0);
         Arc::new(Self {
             opts: AskOptions { path: None, ..opts },
             entries: RwLock::new(Vec::new()),
+            conversations: RwLock::new(Vec::new()),
+            active_conversations: RwLock::new(std::collections::HashMap::new()),
             threads: RwLock::new(std::collections::HashMap::new()),
             agent: RwLock::new(agent),
             write_lock: Mutex::new(()),
+            changes,
         })
     }
 
@@ -178,14 +326,24 @@ impl AskStore {
                 entry.answered_at = Some(OffsetDateTime::now_utc());
             }
         }
+        snapshot.migrate_conversations();
         let agent = opts.agent.clone();
-        Arc::new(Self {
+        let (changes, _) = watch::channel(0);
+        let store = Arc::new(Self {
             opts,
             entries: RwLock::new(snapshot.entries),
+            conversations: RwLock::new(snapshot.conversations),
+            active_conversations: RwLock::new(snapshot.active_conversations),
             threads: RwLock::new(snapshot.threads),
             agent: RwLock::new(agent),
             write_lock: Mutex::new(()),
-        })
+            changes,
+        });
+        // Persist the normalized shape immediately. Otherwise a legacy file
+        // with no subsequent Ask mutation would mint different muxa-owned
+        // conversation ids on every daemon restart.
+        store.persist().await;
+        store
     }
 
     #[must_use]
@@ -193,8 +351,39 @@ impl AskStore {
         self.opts.enabled
     }
 
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn publish_change(&self) {
+        self.changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
     pub async fn list(&self) -> Vec<AskEntry> {
         self.entries.read().await.clone()
+    }
+
+    pub async fn list_conversations(&self) -> Vec<AskConversation> {
+        let mut conversations = self.conversations.read().await.clone();
+        conversations.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        conversations
+    }
+
+    pub async fn active_conversation(&self) -> Option<AskConversation> {
+        let agent = self.agent.read().await.clone();
+        let id = self
+            .active_conversations
+            .read()
+            .await
+            .get(&agent)
+            .cloned()?;
+        self.conversations
+            .read()
+            .await
+            .iter()
+            .find(|conversation| conversation.id == id)
+            .cloned()
     }
 
     /// Agent the next question goes to.
@@ -209,18 +398,69 @@ impl AskStore {
         let parsed =
             AskAgent::parse(agent).ok_or_else(|| AskError::UnsupportedAgent(agent.to_string()))?;
         let label = parsed.label().to_string();
-        self.agent.write().await.clone_from(&label);
+        let mut selected = self.agent.write().await;
+        let changed = *selected != label;
+        selected.clone_from(&label);
+        drop(selected);
+        if changed {
+            self.publish_change();
+        }
         Ok(label)
     }
 
-    /// Drop the current agent's conversation id so its next question
-    /// starts fresh. History is kept — resetting a thread is not
-    /// forgetting — and the other agent's thread is left alone.
-    pub async fn reset_thread(&self) {
+    /// Create and select a fresh conversation. History is kept and can be
+    /// selected again later, including the provider session needed to resume.
+    pub async fn reset_thread(&self) -> AskConversation {
         let _guard = self.write_lock.lock().await;
         let agent = self.agent.read().await.clone();
         self.threads.write().await.remove(&agent);
+        let now = OffsetDateTime::now_utc();
+        let conversation = AskConversation {
+            id: format!("conversation_{:x}", next_id()),
+            title: "New conversation".into(),
+            agent: agent.clone(),
+            agent_session_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.conversations.write().await.push(conversation.clone());
+        self.active_conversations
+            .write()
+            .await
+            .insert(agent, conversation.id.clone());
         self.persist().await;
+        self.publish_change();
+        conversation
+    }
+
+    pub async fn select_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<AskConversation, AskError> {
+        let _guard = self.write_lock.lock().await;
+        let conversation = self
+            .conversations
+            .read()
+            .await
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+            .cloned()
+            .ok_or_else(|| AskError::ConversationNotFound(conversation_id.to_string()))?;
+        self.agent.write().await.clone_from(&conversation.agent);
+        self.active_conversations
+            .write()
+            .await
+            .insert(conversation.agent.clone(), conversation.id.clone());
+        let mut threads = self.threads.write().await;
+        if let Some(session) = &conversation.agent_session_id {
+            threads.insert(conversation.agent.clone(), session.clone());
+        } else {
+            threads.remove(&conversation.agent);
+        }
+        drop(threads);
+        self.persist().await;
+        self.publish_change();
+        Ok(conversation)
     }
 
     /// Remove completed history while preserving active asks and conversation
@@ -235,6 +475,9 @@ impl AskStore {
         let removed = before.saturating_sub(entries.len());
         drop(entries);
         self.persist().await;
+        if removed > 0 {
+            self.publish_change();
+        }
         removed
     }
 
@@ -253,6 +496,7 @@ impl AskStore {
         entries.remove(index);
         drop(entries);
         self.persist().await;
+        self.publish_change();
         true
     }
 
@@ -260,6 +504,17 @@ impl AskStore {
     /// immediately. The caller gets an id to watch; the answer arrives in
     /// the store when the child exits.
     pub async fn ask(self: &Arc<Self>, prompt: &str) -> Result<AskEntry, AskError> {
+        self.ask_with_credential(prompt, None).await
+    }
+
+    /// Queue a question with an optional one-turn API key. The key lives only
+    /// in the worker future and the child environment; persistence happens
+    /// before it is moved into that future and contains no credential field.
+    pub async fn ask_with_credential(
+        self: &Arc<Self>,
+        prompt: &str,
+        credential: Option<AskCredential>,
+    ) -> Result<AskEntry, AskError> {
         if !self.opts.enabled {
             return Err(AskError::Disabled);
         }
@@ -271,32 +526,66 @@ impl AskStore {
         let Some(agent) = AskAgent::parse(&selected) else {
             return Err(AskError::UnsupportedAgent(selected));
         };
+        let api_key = match credential {
+            Some(credential) if credential.agent == agent.label() => Some(credential.api_key),
+            Some(credential) => {
+                return Err(AskError::CredentialAgentMismatch {
+                    supplied: credential.agent,
+                    selected: agent.label().to_string(),
+                });
+            }
+            None => None,
+        };
 
-        let resume = self.threads.read().await.get(agent.label()).cloned();
+        let write_guard = self.write_lock.lock().await;
+        let conversation = self.ensure_active_conversation(agent.label()).await;
+        let conversation_id = conversation.id.clone();
+        if self.entries.read().await.iter().any(|entry| {
+            entry.conversation_id.as_deref() == Some(conversation_id.as_str())
+                && entry.status == AskStatus::Running
+        }) {
+            return Err(AskError::ConversationBusy);
+        }
+        let resume = conversation.agent_session_id.clone();
+        let now = OffsetDateTime::now_utc();
         let entry = AskEntry {
             id: format!("ask_{:x}", next_id()),
+            conversation_id: Some(conversation_id.clone()),
             prompt: prompt.to_string(),
             answer: String::new(),
             status: AskStatus::Running,
             agent: agent.label().to_string(),
             agent_session_id: resume.clone(),
             cwd: self.opts.cwd.display().to_string(),
-            asked_at: OffsetDateTime::now_utc(),
+            asked_at: now,
             answered_at: None,
             cost_usd: None,
             error: None,
         };
 
         {
-            let _guard = self.write_lock.lock().await;
             let mut entries = self.entries.write().await;
             entries.push(entry.clone());
             let keep = self.opts.keep.max(1);
             let excess = entries.len().saturating_sub(keep);
             entries.drain(..excess);
             drop(entries);
+            if let Some(active) = self
+                .conversations
+                .write()
+                .await
+                .iter_mut()
+                .find(|item| item.id == conversation_id)
+            {
+                if active.title == "New conversation" {
+                    active.title = conversation_title(prompt);
+                }
+                active.updated_at = now;
+            }
             self.persist().await;
         }
+        self.publish_change();
+        drop(write_guard);
 
         let store = Arc::clone(self);
         let id = entry.id.clone();
@@ -310,6 +599,7 @@ impl AskStore {
                     store.opts.permission_mode,
                     &store.opts.additional_dirs,
                     Duration::from_secs(store.opts.timeout_secs.max(5)),
+                    api_key.as_deref(),
                 )
                 .await;
             store.finish(&id, outcome).await;
@@ -350,12 +640,70 @@ impl AskStore {
                 .iter()
                 .find(|e| e.id == id)
                 .filter(|e| e.status == AskStatus::Answered)
-                .and_then(|e| e.agent_session_id.clone().map(|s| (e.agent.clone(), s)))
+                .and_then(|e| {
+                    e.agent_session_id.clone().map(|session| {
+                        (
+                            e.conversation_id.clone(),
+                            e.agent.clone(),
+                            session,
+                            e.answered_at.unwrap_or(e.asked_at),
+                        )
+                    })
+                })
         };
-        if let Some((agent, session)) = advanced {
-            self.threads.write().await.insert(agent, session);
+        if let Some((Some(conversation_id), agent, session, updated_at)) = advanced {
+            if let Some(conversation) = self
+                .conversations
+                .write()
+                .await
+                .iter_mut()
+                .find(|conversation| conversation.id == conversation_id)
+            {
+                conversation.agent_session_id = Some(session.clone());
+                conversation.updated_at = updated_at;
+            }
+            if self
+                .active_conversations
+                .read()
+                .await
+                .get(&agent)
+                .is_some_and(|active| active == &conversation_id)
+            {
+                self.threads.write().await.insert(agent, session);
+            }
         }
         self.persist().await;
+        self.publish_change();
+    }
+
+    async fn ensure_active_conversation(&self, agent: &str) -> AskConversation {
+        if let Some(id) = self.active_conversations.read().await.get(agent).cloned() {
+            if let Some(conversation) = self
+                .conversations
+                .read()
+                .await
+                .iter()
+                .find(|conversation| conversation.id == id)
+                .cloned()
+            {
+                return conversation;
+            }
+        }
+        let now = OffsetDateTime::now_utc();
+        let conversation = AskConversation {
+            id: format!("conversation_{:x}", next_id()),
+            title: "New conversation".into(),
+            agent: agent.to_string(),
+            agent_session_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.conversations.write().await.push(conversation.clone());
+        self.active_conversations
+            .write()
+            .await
+            .insert(agent.to_string(), conversation.id.clone());
+        conversation
     }
 
     /// Snapshot to disk. Best-effort: an unwritable path degrades to an
@@ -366,6 +714,8 @@ impl AskStore {
         };
         let snapshot = AskSnapshot {
             threads: self.threads.read().await.clone(),
+            conversations: self.conversations.read().await.clone(),
+            active_conversations: self.active_conversations.read().await.clone(),
             entries: self.entries.read().await.clone(),
         };
         let Ok(text) = serde_json::to_string_pretty(&snapshot) else {
@@ -379,6 +729,18 @@ impl AskStore {
         if std::fs::write(&tmp, text).is_ok() {
             let _ = std::fs::rename(&tmp, path);
         }
+    }
+}
+
+fn conversation_title(prompt: &str) -> String {
+    let flattened = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = flattened.chars().take(56).collect::<String>();
+    if title.is_empty() {
+        "New conversation".into()
+    } else if flattened.chars().count() > 56 {
+        format!("{title}…")
+    } else {
+        title
     }
 }
 
@@ -457,6 +819,7 @@ pub async fn one_shot(request: OneShot<'_>) -> Result<AskAnswer, AskError> {
             request.permission_mode,
             request.additional_dirs,
             request.timeout.max(Duration::from_secs(5)),
+            None,
         )
         .await
         .map_err(AskError::Io)
@@ -545,6 +908,7 @@ impl AskAgent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         self,
         prompt: &str,
@@ -553,6 +917,7 @@ impl AskAgent {
         permission_mode: AskPermissionMode,
         additional_dirs: &[PathBuf],
         timeout: Duration,
+        api_key: Option<&str>,
     ) -> Result<AskAnswer, String> {
         let (bin, args) = self.argv(prompt, resume, permission_mode, additional_dirs);
         let mut cmd = tokio::process::Command::new(bin);
@@ -560,6 +925,9 @@ impl AskAgent {
             .current_dir(cwd)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
+        if let Some(api_key) = api_key {
+            cmd.env(self.api_key_environment(), api_key);
+        }
         let output = tokio::time::timeout(timeout, cmd.output())
             .await
             .map_err(|_| {
@@ -578,6 +946,13 @@ impl AskAgent {
         match self {
             Self::Claude => parse_claude_json(&stdout),
             Self::Codex => parse_codex_jsonl(&stdout),
+        }
+    }
+
+    fn api_key_environment(self) -> &'static str {
+        match self {
+            Self::Claude => "ANTHROPIC_API_KEY",
+            Self::Codex => "CODEX_API_KEY",
         }
     }
 }
@@ -663,6 +1038,7 @@ fn find_str(value: &serde_json::Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn claude_json_yields_text_session_and_cost() {
@@ -763,6 +1139,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prior_conversations_can_be_selected_and_resumed() {
+        let store = AskStore::in_memory(AskOptions::default());
+        let first = store.reset_thread().await;
+        assert_eq!(first.agent, "claude");
+
+        store.set_agent("codex").await.unwrap();
+        let second = store.reset_thread().await;
+        assert_eq!(second.agent, "codex");
+
+        let selected = store.select_conversation(&first.id).await.unwrap();
+        assert_eq!(selected.id, first.id);
+        assert_eq!(store.agent().await, "claude");
+        assert_eq!(store.active_conversation().await.unwrap().id, first.id);
+        assert!(store
+            .list_conversations()
+            .await
+            .iter()
+            .any(|conversation| conversation.id == second.id));
+    }
+
+    #[test]
+    fn legacy_provider_threads_migrate_into_durable_conversations() {
+        let now = OffsetDateTime::now_utc();
+        let mut snapshot = AskSnapshot {
+            threads: std::collections::HashMap::from([("claude".into(), "session-1".into())]),
+            entries: vec![AskEntry {
+                id: "legacy".into(),
+                conversation_id: None,
+                prompt: "Review the release plan".into(),
+                answer: "Ready".into(),
+                status: AskStatus::Answered,
+                agent: "claude".into(),
+                agent_session_id: Some("session-1".into()),
+                cwd: "/tmp".into(),
+                asked_at: now,
+                answered_at: Some(now),
+                cost_usd: None,
+                error: None,
+            }],
+            ..AskSnapshot::default()
+        };
+
+        snapshot.migrate_conversations();
+
+        assert_eq!(snapshot.conversations.len(), 1);
+        let conversation = &snapshot.conversations[0];
+        assert_eq!(conversation.title, "Review the release plan");
+        assert_eq!(conversation.agent_session_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            snapshot.entries[0].conversation_id.as_deref(),
+            Some(conversation.id.as_str())
+        );
+        assert_eq!(
+            snapshot
+                .active_conversations
+                .get("claude")
+                .map(String::as_str),
+            Some(conversation.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn loading_a_legacy_snapshot_persists_stable_conversation_ids() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ask.json");
+        let legacy = serde_json::json!({
+            "threads": { "claude": "session-1" },
+            "entries": [{
+                "id": "legacy",
+                "prompt": "Keep this conversation",
+                "answer": "Kept",
+                "status": "answered",
+                "agent": "claude",
+                "agent_session_id": "session-1",
+                "cwd": "/tmp",
+                "asked_at": "2026-08-31T10:00:00Z",
+                "answered_at": "2026-08-31T10:00:03Z"
+            }]
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let options = AskOptions {
+            path: Some(path.clone()),
+            ..AskOptions::default()
+        };
+        let first = AskStore::load(options.clone()).await;
+        let first_id = first.active_conversation().await.unwrap().id;
+        drop(first);
+
+        let second = AskStore::load(options).await;
+        assert_eq!(second.active_conversation().await.unwrap().id, first_id);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(persisted["conversations"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn clearing_history_keeps_running_asks_and_conversation_ids() {
         let store = AskStore::in_memory(AskOptions::default());
         store
@@ -773,6 +1246,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let entry = |id: &str, status: AskStatus| AskEntry {
             id: id.into(),
+            conversation_id: None,
             prompt: id.into(),
             answer: String::new(),
             status,
@@ -807,6 +1281,7 @@ mod tests {
         *store.entries.write().await = vec![
             AskEntry {
                 id: "done".into(),
+                conversation_id: None,
                 prompt: "done".into(),
                 answer: String::new(),
                 status: AskStatus::Answered,
@@ -820,6 +1295,7 @@ mod tests {
             },
             AskEntry {
                 id: "running".into(),
+                conversation_id: None,
                 prompt: "running".into(),
                 answer: String::new(),
                 status: AskStatus::Running,
@@ -851,6 +1327,39 @@ mod tests {
         let store = AskStore::in_memory(AskOptions::default());
         assert!(store.set_agent("gemini").await.is_err());
         assert_eq!(store.agent().await, "claude");
+    }
+
+    #[test]
+    fn one_turn_credentials_redact_the_secret_from_debug_output() {
+        let credential = AskCredential {
+            agent: "codex".into(),
+            api_key: "must-never-appear".into(),
+        };
+        let debug = format!("{credential:?}");
+        assert!(!debug.contains("must-never-appear"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn a_key_for_the_wrong_provider_is_refused_before_spawn() {
+        let store = AskStore::in_memory(AskOptions {
+            enabled: true,
+            ..AskOptions::default()
+        });
+        let result = store
+            .ask_with_credential(
+                "hello",
+                Some(AskCredential {
+                    agent: "codex".into(),
+                    api_key: "secret".into(),
+                }),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(AskError::CredentialAgentMismatch { .. })
+        ));
+        assert!(store.list().await.is_empty());
     }
 
     #[tokio::test]

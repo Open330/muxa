@@ -82,6 +82,20 @@ sandbox/자동 검토를 유지한 채 workspace 편집을 허용하고, `defaul
 이 제한에 도달하면 headless agent 프로세스가 종료됩니다. inactivity timeout이 아닌
 전체 wall-clock 안전 제한입니다.
 
+TUI를 열지 않아도 동일한 daemon 소유 이력을 사용할 수 있습니다.
+
+```bash
+muxa ask --agent codex "현재 구현을 요약해줘"
+muxa ask --agent claude --detach --json "배포 계획을 검토해줘"
+security find-generic-password -w -s my-codex-key \
+  | muxa ask --agent codex --api-key-stdin "이 저장소를 검토해줘"
+```
+
+`--api-key-stdin`은 interactive terminal 입력을 거부합니다. 키는 owner-only Unix
+socket을 거쳐 선택한 provider의 단 한 번의 child process에만 전달되며 muxa
+config/history나 argv에는 저장되지 않습니다. 이 옵션이 없으면 기존 Claude
+Code/Codex 로그인 또는 provider 환경을 그대로 사용합니다.
+
 ## Collaboration
 
 ```toml

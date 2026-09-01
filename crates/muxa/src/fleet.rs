@@ -552,6 +552,10 @@ pub enum RelayFrame {
         revision: u64,
         #[serde(with = "time::serde::rfc3339")]
         observed_at: OffsetDateTime,
+        /// Optional durable mailbox invalidation. Keeping it on the existing
+        /// keepalive frame is additive for mixed Fleet versions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mailbox_revision: Option<u64>,
     },
     Result {
         request_id: String,
@@ -766,6 +770,8 @@ pub struct FleetUpdate {
     /// selected snapshot rather than infer anything from `host`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resync: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox_revision: Option<u64>,
 }
 
 /// Central cache. Remote snapshots remain isolated per node and are never
@@ -848,6 +854,7 @@ impl FleetStore {
             state,
             revision,
             resync: false,
+            mailbox_revision: None,
         });
     }
 
@@ -862,6 +869,36 @@ impl FleetStore {
             state: host.state,
             revision: host.remote.as_ref().map(|remote| remote.revision),
             resync: false,
+            mailbox_revision: None,
+        };
+        drop(hosts);
+        let _ = self.updates.send(update);
+    }
+
+    /// Update controller-only bookkeeping (last-seen timestamps) without
+    /// waking snapshot consumers whose UI-visible topology did not change.
+    pub async fn mutate_host_silent(
+        &self,
+        alias: &str,
+        mutate: impl FnOnce(&mut FleetHostSnapshot),
+    ) {
+        let mut hosts = self.hosts.write().await;
+        if let Some(host) = hosts.get_mut(alias) {
+            mutate(host);
+        }
+    }
+
+    /// Publish a content-free mailbox invalidation without rebuilding or
+    /// mutating the host topology snapshot.
+    pub async fn notify_mailbox(&self, alias: &str, mailbox_revision: u64) {
+        let hosts = self.hosts.read().await;
+        let Some(host) = hosts.get(alias) else { return };
+        let update = FleetUpdate {
+            host: alias.to_string(),
+            state: host.state,
+            revision: host.remote.as_ref().map(|remote| remote.revision),
+            resync: false,
+            mailbox_revision: Some(mailbox_revision),
         };
         drop(hosts);
         let _ = self.updates.send(update);

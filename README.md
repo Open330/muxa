@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="muxa" width="260" />
+<img src="assets/logo.svg" alt="Muxa logo" width="144" />
 
 **Work-oriented AI-agent observability & orchestration for tmux.**
 

@@ -55,6 +55,14 @@ multi-node path subscribes to `FleetStore` invalidations over IPC, coalesces
 them, and reconstructs only revision-changed host topologies while retaining a
 slow full-snapshot reconciliation poll.
 
+Native clients use the same invalidation-first rule for durable subsystems:
+Fleet topology, pipeline runs, Ask history, and collaboration mailboxes expose
+content-free monotonic revision streams. A revision grants no read authority;
+the client re-reads the normal scoped API after coalescing. muxa-owned PTYs use
+`read_session_wait`, which sleeps on an output/exit condition variable with a
+bounded deadline. Control writes and resize requests use a separate client IPC
+lane, so a waiting terminal read cannot head-of-line block input.
+
 ## Components
 
 | Component | Role |

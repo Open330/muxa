@@ -3,6 +3,46 @@ import Darwin
 import Testing
 @testable import Muxa
 
+@Test func readableMarkdownKeepsConversationStructure() {
+    let document = ReadableMarkdownDocument(source: """
+    # Result
+
+    A readable paragraph with **emphasis**.
+
+    - first
+    - second
+
+    > important note
+
+    ```swift
+    let value = 42
+    ```
+    """)
+
+    #expect(document.blocks == [
+        .heading(level: 1, text: "Result"),
+        .paragraph("A readable paragraph with **emphasis**."),
+        .list(ordered: false, items: [
+            .init(marker: "•", text: "first", depth: 0),
+            .init(marker: "•", text: "second", depth: 0),
+        ]),
+        .quote("important note"),
+        .code(language: "swift", source: "let value = 42"),
+    ])
+}
+
+@Test func readableMarkdownGroupsOrderedListsAndNormalizesNewlines() {
+    let document = ReadableMarkdownDocument(source: "1. one\r\n2. two\r\n\r\nnext line")
+
+    #expect(document.blocks == [
+        .list(ordered: true, items: [
+            .init(marker: "1.", text: "one", depth: 0),
+            .init(marker: "2.", text: "two", depth: 0),
+        ]),
+        .paragraph("next line"),
+    ])
+}
+
 private final class IPCProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var activeRequests = 0
@@ -20,6 +60,7 @@ private final class IPCProbe: @unchecked Sendable {
     private var fleetCaptureAddress: (host: String, backend: String, socket: String, pane: String)?
     private var fleetPrompt: (host: String, pane: String, text: String, submit: Bool)?
     private var workStart: (work: String, workspace: String, cwd: String, noTicket: Bool)?
+    private var requestKinds: [String] = []
 
     init(
         firstAttachDelayMicroseconds: useconds_t = 0,
@@ -42,6 +83,9 @@ private final class IPCProbe: @unchecked Sendable {
 
         let object = try JSONSerialization.jsonObject(with: payload) as? [String: Any]
         let kind = object?["kind"] as? String
+        lock.lock()
+        if let kind { requestKinds.append(kind) }
+        lock.unlock()
         switch kind {
         case "hello":
             usleep(20_000)
@@ -52,10 +96,14 @@ private final class IPCProbe: @unchecked Sendable {
                 "capabilities": [
                     "session_bytes_v1",
                     "session_attachment_identity_v1",
+                    "session_wait_v1",
                     "pipeline_runs_v1",
+                    "pipeline_subscribe",
                     "fleet_v1",
                     "fleet_raw_capture_v1",
+                    "fleet_subscribe",
                     "work_control_v1",
+                    "ask_subscribe",
                 ],
             ])
         case "spawn_session":
@@ -162,6 +210,27 @@ private final class IPCProbe: @unchecked Sendable {
                                     "tmux_socket": "default",
                                     "tmux_session": "muxa",
                                     "state": "working",
+                                    "last_prompt": "Implement native window reporting",
+                                    "last_prompt_at": "2026-08-31T09:59:00Z",
+                                    "last_response": "Implemented the native window report.",
+                                    "model": "gpt-5-codex",
+                                    "context_used_pct": 42.5,
+                                    "cost_usd": 0.12,
+                                    "started_at": "2026-08-31T09:00:00Z",
+                                    "last_activity_at": "2026-08-31T10:00:00Z",
+                                    "state_entered_at": "2026-08-31T09:59:00Z",
+                                    "workload": [
+                                        "process_count": 3,
+                                        "shell_count": 1,
+                                        "subagent_count": 1,
+                                        "helper_count": 1,
+                                        "preview": [],
+                                    ],
+                                    "subagents": [[
+                                        "kind": "reviewer",
+                                        "description": "Review the window report",
+                                        "started_at": "2026-08-31T09:58:00Z",
+                                    ]],
                                 ],
                                 [
                                     "kind": "claude_code",
@@ -186,6 +255,8 @@ private final class IPCProbe: @unchecked Sendable {
                                     "title": "muxa",
                                     "current_path": "/tmp/muxa",
                                     "socket": "default",
+                                    "workspace_id": "muxa",
+                                    "work_id": "native-app",
                                 ],
                                 [
                                     "pane_id": "%18",
@@ -229,6 +300,8 @@ private final class IPCProbe: @unchecked Sendable {
                                 "title": "deploy",
                                 "current_path": "/srv/platform",
                                 "socket": "default",
+                                "workspace_id": "platform",
+                                "work_id": "DEPLOY-1",
                             ]],
                         ],
                     ]],
@@ -285,7 +358,7 @@ private final class IPCProbe: @unchecked Sendable {
             lock.unlock()
             if delay > 0 { usleep(delay) }
             return Self.json(["ok": true])
-        case "read_session":
+        case "read_session", "read_session_wait":
             let offset = (object?["offset"] as? NSNumber)?.uint64Value ?? 0
             lock.lock()
             offsets.append(offset)
@@ -344,6 +417,12 @@ private final class IPCProbe: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return resizes.last
+    }
+
+    func didRequest(_ kind: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestKinds.contains(kind)
     }
 
     private static func output(
@@ -414,6 +493,18 @@ struct MuxaIPCTests {
     }
 
     @Test
+    func terminalReadUsesEventDrivenWaitWhenDaemonAdvertisesIt() async throws {
+        let probe = IPCProbe()
+        let client = MuxaIPCClient(socketPath: "/tmp/muxa-test.sock", request: probe.request)
+        try await client.hello()
+
+        _ = try await client.readSession(id: "pty:test", offset: 0, waitForChanges: true)
+
+        #expect(probe.didRequest("read_session_wait"))
+        #expect(!probe.didRequest("read_session"))
+    }
+
+    @Test
     func rawTerminalFormatterMakesControlsVisibleWithoutExecutingThem() {
         let bytes = Data("A\u{001B}[31mB\r\n\t한글".utf8)
         let dump = terminalRawDescription(bytes)
@@ -460,11 +551,19 @@ struct MuxaIPCTests {
         #expect(runs[0].identity.id == "muxa/native-app")
         #expect(runs[0].aliases["impl"]?.pane == "%17")
         #expect(execution.agents.count == 3)
+        #expect(execution.agents[0].lastActivityAt == "2026-08-31T10:00:00Z")
+        #expect(execution.agents[0].lastPromptAt == "2026-08-31T09:59:00Z")
+        #expect(execution.agents[0].workload?.processCount == 3)
+        #expect(execution.agents[0].subagents?.first?.kind == "reviewer")
         #expect(execution.pane(for: execution.agents[0])?.windowID == "@4")
 
         let workGroups = execution.workGroups(pipelineRuns: runs)
-        #expect(workGroups.count == 1)
+        #expect(workGroups.count == 2)
         #expect(workGroups[0].participants.count == 1)
+        #expect(workGroups[0].pipelineRun != nil)
+        #expect(workGroups[1].identity.id == "platform/DEPLOY-1")
+        #expect(workGroups[1].pipelineRun == nil)
+        #expect(workGroups[1].hostAliases == ["dev"])
         #expect(execution.hostedAgents.count == 3)
         #expect(Set(execution.hostedAgents.map(\.id)).count == 3)
         #expect(execution.hostedAgents.filter { $0.pane?.windowName == "deploy" }.count == 2)
@@ -474,8 +573,11 @@ struct MuxaIPCTests {
         #expect(watchHosts[0].sessions.count == 2)
         #expect(watchHosts[0].paneCount == 2)
         #expect(watchHosts[1].sessions.first?.windows.first?.panes.first?.host.alias == "dev")
+        let remoteWindow = try #require(watchHosts[1].sessions.first?.windows.first)
+        let remoteWatchPane = try #require(remoteWindow.panes.first)
+        #expect(execution.watchWindow(containing: remoteWatchPane.id)?.id == remoteWindow.id)
 
-        let remotePane = try #require(watchHosts[1].sessions.first?.windows.first?.panes.first?.pane)
+        let remotePane = remoteWatchPane.pane
         let exactAddress = try AppModel.exactPaneAddressJSON(remotePane)
         let address = try #require(
             JSONSerialization.jsonObject(with: Data(exactAddress.utf8)) as? [String: Any]
@@ -531,6 +633,8 @@ struct MuxaIPCTests {
                         "session_bytes_v1",
                         "session_attachment_identity_v1",
                         "work_control_v1",
+                        "ask_one_turn_credential_v1",
+                        "ask_conversations_v1",
                     ],
                 ])
             case "ask_agent":
@@ -538,7 +642,15 @@ struct MuxaIPCTests {
                     "ok": true,
                     "ask_agent": object["agent"] as? String ?? "claude",
                 ])
+            case "ask_status":
+                return try JSONSerialization.data(withJSONObject: [
+                    "ok": true,
+                    "ask_enabled": true,
+                ])
             case "ask_send":
+                let credential = try #require(object["credential"] as? [String: Any])
+                #expect(credential["agent"] as? String == "codex")
+                #expect(credential["api_key"] as? String == "test-only-secret")
                 return try JSONSerialization.data(withJSONObject: [
                     "ok": true,
                     "ask_entry": [
@@ -565,6 +677,33 @@ struct MuxaIPCTests {
                         "answered_at": "2026-08-31T10:00:03Z",
                     ]],
                 ])
+            case "ask_conversation_list":
+                let conversation: [String: Any] = [
+                    "id": "conversation-1",
+                    "title": "Review the plan",
+                    "agent": "codex",
+                    "agent_session_id": "codex-session-1",
+                    "created_at": "2026-08-31T10:00:00Z",
+                    "updated_at": "2026-08-31T10:00:03Z",
+                ]
+                return try JSONSerialization.data(withJSONObject: [
+                    "ok": true,
+                    "ask_conversations": [conversation],
+                    "ask_conversation": conversation,
+                ])
+            case "ask_conversation_select":
+                #expect(object["conversation_id"] as? String == "conversation-1")
+                return try JSONSerialization.data(withJSONObject: [
+                    "ok": true,
+                    "ask_conversation": [
+                        "id": "conversation-1",
+                        "title": "Review the plan",
+                        "agent": "codex",
+                        "agent_session_id": "codex-session-1",
+                        "created_at": "2026-08-31T10:00:00Z",
+                        "updated_at": "2026-08-31T10:00:03Z",
+                    ],
+                ])
             default:
                 return try JSONSerialization.data(withJSONObject: ["ok": true])
             }
@@ -572,12 +711,22 @@ struct MuxaIPCTests {
         let client = MuxaIPCClient(socketPath: "/tmp/muxa-ask-test.sock", request: handler)
         try await client.hello()
 
+        #expect(try await client.askStatus())
         #expect(try await client.selectAskAgent("codex") == "codex")
-        let pending = try await client.sendAsk("Review the plan")
+        let pending = try await client.sendAsk(
+            "Review the plan",
+            agent: "codex",
+            apiKey: "test-only-secret"
+        )
         #expect(pending.prompt == "Review the plan")
         #expect(pending.status == "running")
         let history = try await client.listAskEntries()
         #expect(history.first?.answer == "Looks good.")
+        let conversations = try await client.listAskConversations()
+        #expect(conversations.active?.id == "conversation-1")
+        #expect(conversations.conversations.first?.agentSessionID == "codex-session-1")
+        let resumed = try await client.selectAskConversation("conversation-1")
+        #expect(resumed.title == "Review the plan")
     }
 
     @Test
@@ -651,6 +800,8 @@ struct MuxaIPCTests {
             title: "muxa",
             currentPath: "/tmp/muxa",
             socket: "default",
+            workspaceID: nil,
+            workID: nil,
             agentRole: "implementer",
             agentAlias: "impl"
         )
@@ -667,6 +818,81 @@ struct MuxaIPCTests {
         let mailbox = try await client.collaborationMailbox(host: host, pane: pane)
         #expect(mailbox.incoming.first?.to.label == "@impl")
         #expect(mailbox.sent.first?.from.label == "operator")
+    }
+
+    @Test @MainActor
+    func operatorInboxOpensStableAgentWhenItsRecordedPaneIsStale() async throws {
+        let probe = IPCProbe()
+        let client = MuxaIPCClient(socketPath: "/tmp/muxa-test.sock", request: probe.request)
+        try await client.hello()
+        let execution = try await client.executionSnapshot()
+        let route = try #require(
+            execution.watchHosts.first(where: { $0.host.alias == "local" })?
+                .sessions.first?.windows.first?.panes.first
+        )
+        let request = try JSONDecoder().decode(
+            MuxaCollaborationRequest.self,
+            from: Data(#"""
+            {
+              "id":"request-stale-pane",
+              "from":{"agent_kind":"unknown","agent_session_id":"__muxa_console__","pane":"console","room":{"host":"tmux","window_id":"@4"},"console":true},
+              "to":{"agent_kind":"codex","agent_session_id":"agent-17","pane":"%999","socket":"old-socket","room":{"host":"tmux","window_id":"@999"},"alias":"impl"},
+              "kind":"question","body":"Choose a release target","expects_reply":true,"work_mode":"read_only","status":"queued","created_at":"2026-08-31T10:00:00Z"
+            }
+            """#.utf8)
+        )
+        let message = MuxaOperatorMessage(
+            host: route.host,
+            routePane: route.pane,
+            request: request
+        )
+
+        let selection = AppModel.operatorSelection(for: message, in: execution)
+
+        #expect(selection == .agent("local:agent-17"))
+    }
+
+    @Test
+    func operatorInboxSeparatesHumanDecisionsFromOrdinaryReplies() throws {
+        func message(replyStatus: String) throws -> MuxaOperatorMessage {
+            let request = try JSONDecoder().decode(
+                MuxaCollaborationRequest.self,
+                from: Data("""
+                {
+                  "id":"request-\(replyStatus)",
+                  "from":{"agent_kind":"unknown","agent_session_id":"__muxa_console__","pane":"console","room":{"host":"tmux","window_id":"@4"},"console":true},
+                  "to":{"agent_kind":"codex","agent_session_id":"agent-17","pane":"%17","room":{"host":"tmux","window_id":"@4"},"alias":"impl"},
+                  "kind":"review","body":"Review this","expects_reply":true,"work_mode":"read_only","status":"\(replyStatus)","created_at":"2026-08-31T10:00:00Z",
+                  "reply":{"status":"\(replyStatus)","body":"Result","at":"2026-08-31T10:01:00Z"}
+                }
+                """.utf8)
+            )
+            return MuxaOperatorMessage(
+                host: MuxaFleetHostIdentity(alias: "local", local: true, state: "online", mode: "control"),
+                routePane: MuxaPaneInfo(
+                    paneID: "%17",
+                    sessionID: "$4",
+                    session: "muxa",
+                    windowID: "@4",
+                    windowName: "native-app",
+                    windowIndex: "1",
+                    paneIndex: "0",
+                    currentCommand: "codex",
+                    title: "muxa",
+                    currentPath: "/tmp/muxa",
+                    socket: "default",
+                    workspaceID: nil,
+                    workID: nil,
+                    agentRole: "implementer",
+                    agentAlias: "impl"
+                ),
+                request: request
+            )
+        }
+
+        #expect(try message(replyStatus: "blocked").needsHumanDecision)
+        #expect(try message(replyStatus: "declined").needsHumanDecision)
+        #expect(!(try message(replyStatus: "completed").needsHumanDecision))
     }
 
     @Test
@@ -903,14 +1129,14 @@ struct MuxaIPCTests {
     }
 
     @Test @MainActor
-    func activityBarSwitchDoesNotReplaceActiveEditorSelection() {
+    func activityBarSeparatesOutcomesTopologyInboxAndShells() {
         let model = AppModel()
-        model.select(.workBoard)
+        #expect(MuxaSidebarMode.allCases == [.work, .watch, .inbox, .shells])
 
-        model.show(.hosts)
+        model.select(.host("rtzr"))
 
-        #expect(model.sidebarMode == .hosts)
-        #expect(model.sidebarSelection == .workBoard)
+        #expect(model.sidebarMode == .watch)
+        #expect(model.sidebarSelection == .host("rtzr"))
     }
 
     @Test @MainActor
@@ -936,7 +1162,17 @@ struct MuxaIPCTests {
         model.select(.ask)
 
         #expect(model.sidebarSelection == .ask)
-        #expect(model.sidebarMode == .watch)
+        #expect(model.sidebarMode == .inbox)
+    }
+
+    @Test @MainActor
+    func operatorInboxIsAnIndependentEditorRoute() {
+        let model = AppModel()
+
+        model.select(.inbox)
+
+        #expect(model.sidebarSelection == .inbox)
+        #expect(model.sidebarMode == .inbox)
     }
 
     @Test @MainActor
@@ -954,12 +1190,49 @@ struct MuxaIPCTests {
     }
 
     @Test @MainActor
-    func agentSelectionUsesTheUnifiedWatchExplorer() {
+    func agentSelectionUsesTheAttentionInbox() {
         let model = AppModel()
         model.select(.agent("local:agent-17"))
 
-        #expect(model.sidebarMode == .watch)
+        #expect(model.sidebarMode == .inbox)
         #expect(model.sidebarSelection == .agent("local:agent-17"))
         #expect(!MuxaSidebarMode.allCases.map(\.rawValue).contains("agents"))
+    }
+
+    @Test @MainActor
+    func fleetSessionSelectionOpensAResourceSummaryWithoutChangingPane() {
+        let model = AppModel()
+        let pane = MuxaWatchPaneIdentity(hostAlias: "local", socket: "default", paneID: "%1")
+        let session = MuxaWatchSessionIdentity(
+            hostAlias: "rtzr",
+            socket: "default",
+            sessionID: "$107"
+        )
+        model.selectWatchPane(pane)
+
+        model.selectWatchSession(session)
+
+        #expect(model.sidebarMode == .watch)
+        #expect(model.sidebarSelection == .fleetSession(session))
+        #expect(model.watchSelection == pane)
+    }
+
+    @Test @MainActor
+    func fleetWindowSelectionOpensAResourceSummaryWithoutChangingPane() {
+        let model = AppModel()
+        let pane = MuxaWatchPaneIdentity(hostAlias: "local", socket: "default", paneID: "%1")
+        let window = MuxaWatchWindowIdentity(
+            hostAlias: "rtzr",
+            socket: "default",
+            sessionID: "$107",
+            windowID: "@213"
+        )
+        model.selectWatchPane(pane)
+
+        model.selectWatchWindow(window)
+
+        #expect(model.sidebarMode == .watch)
+        #expect(model.sidebarSelection == .fleetWindow(window))
+        #expect(model.watchSelection == pane)
     }
 }

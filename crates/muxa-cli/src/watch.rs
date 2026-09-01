@@ -7002,6 +7002,9 @@ fn merge_agent_for_ui(prior: &Agent, incoming: &Agent) -> Agent {
     if merged.last_prompt.is_none() {
         merged.last_prompt.clone_from(&prior.last_prompt);
     }
+    if merged.last_prompt_at.is_none() {
+        merged.last_prompt_at = prior.last_prompt_at;
+    }
     if merged.last_response.is_none() {
         merged.last_response.clone_from(&prior.last_response);
     }
@@ -7959,7 +7962,7 @@ pub async fn run(
                     }
                 }
                 Action::ResetAskThread => match client.ask_reset().await {
-                    Ok(()) => app.set_hint("ask: new conversation", HintLevel::Ok),
+                    Ok(_) => app.set_hint("ask: new conversation", HintLevel::Ok),
                     Err(e) => app.set_hint(format!("ask reset failed: {e}"), HintLevel::Err),
                 },
                 Action::OpenCollaborationMessage => {
@@ -18001,6 +18004,7 @@ mod tests {
             cwd: None,
             state,
             last_prompt: prompt.map(Into::into),
+            last_prompt_at: None,
             last_response: None,
             recap: None,
             ai_title: None,
@@ -20646,6 +20650,7 @@ mod tests {
     fn the_history_filter_selects_by_agent() {
         let mut app = app_with_paneless_and_pane();
         let mk = |agent: &str, prompt: &str| muxa::ask::AskEntry {
+            conversation_id: None,
             id: format!("ask_{prompt}"),
             prompt: prompt.into(),
             answer: String::new(),
@@ -20677,6 +20682,7 @@ mod tests {
         let mut app = app_with_paneless_and_pane();
         let now = OffsetDateTime::now_utc();
         app.ask_entries = vec![muxa::ask::AskEntry {
+            conversation_id: None,
             id: "ask_long".into(),
             prompt: "explain the reconciler".into(),
             answer: (0..lines)
@@ -20846,6 +20852,7 @@ mod tests {
         let mut app = app_with_paneless_and_pane();
         let now = OffsetDateTime::now_utc();
         let entry = |id: &str, status: muxa::ask::AskStatus| muxa::ask::AskEntry {
+            conversation_id: None,
             id: id.into(),
             prompt: id.into(),
             answer: String::new(),

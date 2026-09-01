@@ -291,12 +291,26 @@ impl LocalTask {
     async fn run(mut self) {
         let mut refresh = tokio::time::interval(Duration::from_secs(self.fleet.refresh_secs));
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut mailbox_retry = tokio::time::interval(Duration::from_secs(2));
+        mailbox_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut mailbox_updates: Option<muxa::ipc::CollaborationUpdateStream> = None;
         // The initial snapshot was collected before the manager was exposed.
         refresh.tick().await;
         loop {
             tokio::select! {
                 _ = self.shutdown.recv() => break,
                 _ = refresh.tick() => self.refresh().await,
+                _ = mailbox_retry.tick(), if mailbox_updates.is_none() => {
+                    mailbox_updates = self.client.collaboration_subscribe().await.ok();
+                }
+                mailbox = next_mailbox_update(&mut mailbox_updates), if mailbox_updates.is_some() => {
+                    match mailbox {
+                        Ok(Some(revision)) => {
+                            self.store.notify_mailbox(LOCAL_HOST_ALIAS, revision).await;
+                        }
+                        Ok(None) | Err(_) => mailbox_updates = None,
+                    }
+                }
                 transition = self.transitions.recv() => {
                     match transition {
                         Ok(transition) => {
@@ -330,19 +344,35 @@ impl LocalTask {
             collect_local_snapshot(&self.agents, &self.backends, Arc::clone(&self.revision)).await;
         let observed = snapshot.observed_at;
         let identity_error = self.identity_error.clone();
-        self.store
-            .mutate_host(LOCAL_HOST_ALIAS, |host| {
-                host.remote = Some(merge_remote_snapshot(host.remote.take(), snapshot));
-                host.state = if identity_error.is_some() {
-                    FleetHostState::Degraded
-                } else {
-                    FleetHostState::Online
-                };
-                host.last_seen_at = Some(observed);
-                host.received_at = Some(OffsetDateTime::now_utc());
-                host.error = identity_error;
-            })
-            .await;
+        let current = self
+            .store
+            .snapshot()
+            .await
+            .hosts
+            .into_iter()
+            .find(|host| host.local);
+        let changed = current
+            .as_ref()
+            .and_then(|host| host.remote.as_ref())
+            .is_none_or(|remote| remote_payload_changed(remote, &snapshot));
+        let update = |host: &mut FleetHostSnapshot| {
+            host.remote = Some(merge_remote_snapshot(host.remote.take(), snapshot));
+            host.state = if identity_error.is_some() {
+                FleetHostState::Degraded
+            } else {
+                FleetHostState::Online
+            };
+            host.last_seen_at = Some(observed);
+            host.received_at = Some(OffsetDateTime::now_utc());
+            host.error = identity_error;
+        };
+        if changed {
+            self.store.mutate_host(LOCAL_HOST_ALIAS, update).await;
+        } else {
+            self.store
+                .mutate_host_silent(LOCAL_HOST_ALIAS, update)
+                .await;
+        }
     }
 
     #[allow(clippy::too_many_lines)] // one exhaustive local Fleet operation table
@@ -448,6 +478,31 @@ impl LocalTask {
                     .map_err(|error| error.to_string())
             }
         }
+    }
+}
+
+async fn next_mailbox_update(
+    updates: &mut Option<muxa::ipc::CollaborationUpdateStream>,
+) -> Result<Option<u64>, muxa::ipc::RuntimeError> {
+    match updates {
+        Some(updates) => updates.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Ignore observation timestamps/revision churn when deciding whether a
+/// periodic authoritative scan needs to invalidate native clients.
+fn remote_payload_changed(left: &RemoteSnapshot, right: &RemoteSnapshot) -> bool {
+    let left = serde_json::to_vec(&(&left.agents, &left.panes, &left.sessions, &left.backends));
+    let right = serde_json::to_vec(&(
+        &right.agents,
+        &right.panes,
+        &right.sessions,
+        &right.backends,
+    ));
+    match (left, right) {
+        (Ok(left), Ok(right)) => left != right,
+        _ => true,
     }
 }
 
@@ -1279,19 +1334,33 @@ impl HostTask {
             } => {
                 let observed = snapshot.observed_at;
                 let revision = snapshot.revision;
-                self.store
-                    .mutate_host(&self.alias, |host| {
-                        // Never regress a newer transition that raced a slow
-                        // full scan. Pane/session inventories are still fresh,
-                        // but agent state and revision remain monotonic.
-                        let snapshot = merge_remote_snapshot(host.remote.take(), snapshot);
-                        host.remote = Some(snapshot);
-                        host.state = FleetHostState::Online;
-                        host.last_seen_at = Some(observed);
-                        host.received_at = Some(OffsetDateTime::now_utc());
-                        host.error = None;
-                    })
-                    .await;
+                let current = self
+                    .store
+                    .snapshot()
+                    .await
+                    .hosts
+                    .into_iter()
+                    .find(|host| host.alias == self.alias);
+                let changed = current
+                    .as_ref()
+                    .and_then(|host| host.remote.as_ref())
+                    .is_none_or(|remote| remote_payload_changed(remote, &snapshot));
+                let update = |host: &mut FleetHostSnapshot| {
+                    // Never regress a newer transition that raced a slow
+                    // full scan. Pane/session inventories are still fresh,
+                    // but agent state and revision remain monotonic.
+                    let snapshot = merge_remote_snapshot(host.remote.take(), snapshot);
+                    host.remote = Some(snapshot);
+                    host.state = FleetHostState::Online;
+                    host.last_seen_at = Some(observed);
+                    host.received_at = Some(OffsetDateTime::now_utc());
+                    host.error = None;
+                };
+                if changed {
+                    self.store.mutate_host(&self.alias, update).await;
+                } else {
+                    self.store.mutate_host_silent(&self.alias, update).await;
+                }
                 if let Some(request) = pending.remove(&request_id) {
                     match request.reply {
                         PendingReply::Refresh(reply) | PendingReply::Command(reply) => {
@@ -1313,10 +1382,11 @@ impl HostTask {
             RelayFrame::Keepalive {
                 revision,
                 observed_at,
+                mailbox_revision,
             } => {
                 let mut needs_resync = false;
                 self.store
-                    .mutate_host(&self.alias, |host| {
+                    .mutate_host_silent(&self.alias, |host| {
                         host.last_seen_at = Some(observed_at);
                         host.received_at = Some(OffsetDateTime::now_utc());
                         if host
@@ -1330,7 +1400,13 @@ impl HostTask {
                         }
                     })
                     .await;
+                if let Some(mailbox_revision) = mailbox_revision {
+                    self.store
+                        .notify_mailbox(&self.alias, mailbox_revision)
+                        .await;
+                }
                 if needs_resync {
+                    self.store.mutate_host(&self.alias, |_| {}).await;
                     send_request(
                         &mut connected.stdin,
                         &RelayRequest::Snapshot {

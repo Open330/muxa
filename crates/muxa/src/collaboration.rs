@@ -868,7 +868,7 @@ fn secure_database_files(_path: &Path) -> Result<(), CollaborationError> {
     Ok(())
 }
 
-/// Create the main database with owner-only permissions before SQLite opens
+/// Create the main database with owner-only permissions before `SQLite` opens
 /// it. Chmod existing files as well: relying on the process umask would leave
 /// a short first-open window where collaboration bodies could be world-readable.
 #[cfg(unix)]
@@ -1468,12 +1468,12 @@ fn request_latest_activity(request: &CollaborationRequest) -> OffsetDateTime {
     .fold(request.created_at, std::cmp::max)
 }
 
-/// In-memory mailbox projection backed by indexed SQLite row updates when a
+/// In-memory mailbox projection backed by indexed `SQLite` row updates when a
 /// durable path is configured. The projection keeps wake and routing reads
 /// cheap while `transaction_lock` preserves atomic durable visibility.
 pub struct CollaborationStore {
     opts: CollaborationOptions,
-    /// Indexed SQLite sidecar. The configured JSON path remains the migration
+    /// Indexed `SQLite` sidecar. The configured JSON path remains the migration
     /// source and is deliberately retained as a recoverable backup.
     database_path: Option<PathBuf>,
     requests: RwLock<HashMap<String, CollaborationRequest>>,

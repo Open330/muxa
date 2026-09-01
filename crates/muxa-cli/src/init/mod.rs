@@ -85,7 +85,13 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
     ui::intro(mode);
 
     let detect = Detection::run();
-    if !preflight_ok(mode, &detect, args.uninstall) {
+    // A native client may request only the Ask config grant after muxa is
+    // already installed. That edit neither builds muxa nor wires a terminal,
+    // so requiring cargo/tmux here would make the app's Enable action fail on
+    // otherwise valid headless-provider installations.
+    let ask_grant_only =
+        !args.component.is_empty() && args.component.iter().all(|component| component == "ask");
+    if !preflight_ok(mode, &detect, args.uninstall, ask_grant_only) {
         anyhow::bail!("pre-flight blockers");
     }
 
@@ -191,8 +197,17 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
 
 /// Render pre-flight, surface warnings, and signal whether we should
 /// proceed. `false` means a hard blocker fired (caller bails).
-fn preflight_ok(mode: Mode, detect: &Detection, uninstall: bool) -> bool {
-    let blockers = detect.blockers();
+fn preflight_ok(
+    mode: Mode,
+    detect: &Detection,
+    uninstall: bool,
+    skip_bootstrap_tools: bool,
+) -> bool {
+    let blockers = if skip_bootstrap_tools {
+        Vec::new()
+    } else {
+        detect.blockers()
+    };
     if !blockers.is_empty() && !uninstall {
         for b in &blockers {
             ui::error_line(mode, b);
