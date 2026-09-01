@@ -284,14 +284,23 @@ impl Sandbox {
         // saw it. `printf` always writes one line, empty or not, and
         // `ran_command` still finds the text when there is text.
         //
+        // A shell's *own* first prompt is not one of those lines. Nothing has
+        // run yet, so it stands for no action of theirs — and counting it made
+        // the Enter step satisfiable by a shell starting up. Splitting a pane
+        // starts one: whether its prompt landed before the split was noticed or
+        // after decided whether the step waited for the learner or walked past
+        // them, which is a race with how fast bash starts. `_muxa_prompted`
+        // skips it, so every line in the log is a prompt the learner caused.
+        //
         // The reminder goes through `PROMPT_COMMAND` rather than `PS1`:
         // `$(cat …)` strips trailing newlines, so a reminder rendered in the
         // prompt ran straight into `muxa-onboarding $` on the same line.
         // Inside tmux the status bar already says all this.
         let _ = writeln!(
             body,
-            "export PROMPT_COMMAND='printf \"%s\\n\" \"$(history 1 | sed \"s/^ *[0-9]* *//\")\" >> {}; \
-             [ -z \"$TMUX\" ] && cat {} 2>/dev/null'",
+            "export PROMPT_COMMAND='[ -n \"$_muxa_prompted\" ] && \
+             printf \"%s\\n\" \"$(history 1 | sed \"s/^ *[0-9]* *//\")\" >> {}; \
+             _muxa_prompted=1; [ -z \"$TMUX\" ] && cat {} 2>/dev/null'",
             self.history.display(),
             self.cue.display()
         );
@@ -1137,7 +1146,9 @@ impl Sandbox {
     ///
     /// Their `PROMPT_COMMAND` appends a line each time, so this counts
     /// keystrokes at the prompt — including the bare Enter that a step can ask
-    /// for without asking for a command.
+    /// for without asking for a command. A shell's own first prompt is not
+    /// counted: see `write_rcfile`, where a pane's startup would otherwise
+    /// press Enter on the learner's behalf.
     fn prompt_count(&self) -> usize {
         std::fs::read_to_string(&self.history).map_or(0, |log| log.lines().count())
     }
