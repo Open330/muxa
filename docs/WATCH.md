@@ -67,7 +67,7 @@ children keep their aggregate state markers.
 | `w` | Run a pipeline: type a work id and hand off to a window running `muxa work up`. |
 | `R` / `:rename` | Rename the selected tmux session or window, or set the selected pane title. |
 | `\|` | Cycle the list/inspector split: 50/50 → 70/30 → 30/70. |
-| `a` / `A` | Ask the configured agent a headless question / browse the answers. |
+| `a` / `A` | Ask the configured agent a headless question / browse the answers. `Enter` reads the selected answer in full. |
 | `m` / `M` | Message the resolved agent — or every marked one — / open history for the selected topology scope. |
 | `Space` | Mark or unmark the agent under the cursor. With marks set, `m` composes once and sends one ordinary request to each; the result popup keeps a row per recipient. |
 | `b` | Legacy alias for `M`; `i` claims and `e` replies inside the mailbox. |
@@ -245,9 +245,9 @@ muxad runs the agent in print mode and captures the answer, so nothing is
 typed into a pane and no session has to be managed. `Esc` cancels; Backspace
 also cancels when the input is already empty.
 
-`A` opens the history: `j`/`k` selects, `|` grows the detail pane, `Tab`
-filters by agent (all → claude → codex), and `n` starts a fresh
-conversation. Everything before that `n` is one thread — each question
+`A` opens the history: `j`/`k` selects, `Enter` opens the selected answer
+in a full reader, `|` grows the detail pane, `Tab` filters by agent
+(all → claude → codex), and `n` starts a fresh conversation. Everything before that `n` is one thread — each question
 resumes the last, so the second onward reuses the cached context the first
 paid for. Threads are per agent, so switching back picks that conversation
 up where it left off.
@@ -256,6 +256,15 @@ The daemon owns execution: an answer lands in the history whether or not
 the popup is still open, and the history outlives restarts in
 `$XDG_DATA_HOME/muxa/ask.json`. Requires `[ask] enabled = true` — see
 [CONFIGURATION.md](CONFIGURATION.md).
+
+The detail pane under the list only ever shows an answer's first screenful.
+`Enter` (or `o`) opens the selected entry in a reader that shows the question
+and the whole answer: `j`/`k` scroll a line, `PgUp`/`PgDn` a page, `g`/`G`
+jump to the top/bottom, and the foot of the box tracks which lines are on
+screen. `Esc`, `Enter`, or `q` returns to the list; `A` closes the panel. The
+reader is read-only — `d` and `D` do not delete the answer being read — and it
+follows the entry itself, so an answer that arrives while it is open appears
+without reopening it.
 
 Inside ask history, `n` starts a fresh conversation without deleting entries.
 `d` confirms deletion of the selected completed entry. `D` confirms clearing

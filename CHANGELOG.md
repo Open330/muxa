@@ -25,7 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the error and the fact that nothing was retried. A fan-out that reports "sent
   to 5" cannot say which of the five did not get it.
 
-### Added
+- **Enter reads a full ask answer.** The `A` history could only ever show an
+  answer's first screenful: the detail pane under the list is a few rows tall,
+  `|` grows it to most of a popup and no further, and nothing scrolled. A
+  headless agent's reply is routinely longer than that, and the rest of it —
+  already stored, already paid for — had no reader anywhere in muxa.
+
+  `Enter` (or `o`) now opens the selected entry in a reader that shows the
+  question and the whole answer. `j`/`k` scroll a line, `PgUp`/`PgDn` a page
+  with one line of overlap, `g`/`G` jump to either end, and the foot of the box
+  tracks which lines are on screen. `Esc`, `Enter`, or `q` steps back to the
+  list; `A` closes the panel outright.
+
+  The reader owns every key while it is open, so `d` and `D` cannot delete the
+  answer being read out from under it, and it addresses its entry by id rather
+  than by row: the history is re-fetched from the daemon on a timer, and an
+  index would silently re-point at a neighbour when an answer lands or is
+  deleted. An entry that disappears anyway drops back to the list with a hint
+  instead of painting a blank page.
 
 - **`C` opens a window in watch, where `prefix + c` cannot reach.** Creating a
   plain shell window next to running work meant leaving the console: attach to

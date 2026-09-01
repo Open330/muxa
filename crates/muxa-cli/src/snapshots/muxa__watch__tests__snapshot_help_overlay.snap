@@ -16,7 +16,7 @@ j/k move  ·  / filter  ·  : commands  ·  ? help
 │                           │  PgUp/PgDn       page; Ctrl-U/Ctrl-D half page                                   │                           │
 │                           │  Enter          attach via active window/pane or exact pane                      │                           │
 │                           │  C / n / w / R  shell window / agent pane / work up / rename the row             │                           │
-│                           │  a / A          ask / history; d deletes one · D clears all in A                 │                           │
+│                           │  a / A          ask / history; Enter reads one · d/D delete one/all              │                           │
 │                           │                                                                                  │                           │
 │                           │Commands & inspection                                                             │                           │
 │                           │  :              command palette (Tab completes)                                  │                           │
