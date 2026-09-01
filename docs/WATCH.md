@@ -55,15 +55,14 @@ children keep their aggregate state markers.
 
 | Key | Action |
 | --- | --- |
-| Printable text | Immediately filter by workspace, work, agent, cwd, model, or prompt. |
-| `/` | Explicitly start filtering, including queries beginning with a reserved key. |
+| `/` | Start filtering — the only way in. Typed characters then narrow by workspace, work, agent, cwd, model, or prompt, and every browse key is an ordinary character while the filter is armed. |
 | `Backspace` / `Ctrl-W` / `Ctrl-U` | Delete a character / word / the whole filter. |
 | `j` / `k`, `↑` / `↓` | In focus mode, move between siblings at the current hierarchy level; otherwise move visible rows. |
 | `h` / `l`, `←` / `→` | Return to the parent / descend into the first child. |
 | `gg` / `G`, `Home` / `End` | Jump to the first / last sibling in focus mode, or visible row otherwise. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | Move half / full pages while browsing. |
 | `Enter` | Attach to the selected pane. |
-| `c` | Open a plain shell window in the selected row's session and jump into it — `prefix + c` without attaching first. |
+| `C` | Open a plain shell window in the selected row's session and jump into it — `prefix + c` without attaching first. |
 | `n` | Create/reuse a workspace session and work window, then add an agent pane. |
 | `w` | Run a pipeline: type a work id and hand off to a window running `muxa work up`. |
 | `R` / `:rename` | Rename the selected tmux session or window, or set the selected pane title. |

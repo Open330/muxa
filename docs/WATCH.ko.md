@@ -34,15 +34,14 @@ window였던 것처럼 보이지 않도록 전체 session → window → pane an
 
 | Key | Action |
 | --- | --- |
-| 일반 문자 입력 | workspace, work, agent, cwd, model, prompt를 즉시 필터링. |
-| `/` | 예약 단축키로 시작하는 검색어까지 입력할 수 있는 명시적 검색 시작. |
+| `/` | 검색 시작. 검색으로 들어가는 유일한 키이며, 이후 입력한 문자가 workspace, work, agent, cwd, model, prompt를 필터링합니다. 검색 중에는 예약 단축키도 평범한 문자입니다. |
 | `Backspace` / `Ctrl-W` / `Ctrl-U` | 문자 / 단어 / 전체 검색어 삭제. |
 | `j` / `k`, `↑` / `↓` | work 사이 이동. 자식 진입 후에는 agent 사이 이동. |
 | `h` / `l`, `←` / `→` | 부모 work로 복귀 / 첫 번째 자식 agent 선택. |
 | `gg` / `G`, `Home` / `End` | 첫 번째 / 마지막 선택 가능 행으로 이동. |
 | `Ctrl-U` / `Ctrl-D`, `PageUp` / `PageDown` | 탐색 중 반 페이지 / 한 페이지 이동. |
 | `Enter` | 선택한 pane에 바로 attach. |
-| `c` | 선택한 행이 속한 session에 shell window를 만들고 바로 이동. attach 후 `prefix + c`를 누르는 것과 같습니다. |
+| `C` | 선택한 행이 속한 session에 shell window를 만들고 바로 이동. attach 후 `prefix + c`를 누르는 것과 같습니다. |
 | `n` | workspace session과 work window를 생성/재사용하고 agent pane 추가. |
 | `w` | pipeline 실행: work id를 입력하면 `muxa work up`을 실행하는 window로 넘어갑니다. |
 | `R` / `:rename` | 선택한 tmux session/window 이름 또는 pane title 변경. |

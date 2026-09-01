@@ -9,13 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`c` opens a window in watch, where `prefix + c` cannot reach.** Creating a
+- **`C` opens a window in watch, where `prefix + c` cannot reach.** Creating a
   plain shell window next to running work meant leaving the console: attach to
   the session, press `prefix + c`, then find your way back. Watch already knows
   which session every row belongs to, so the round trip was the only thing
   standing in the way.
 
-  `c` now creates one bare shell window in the session the cursor is inside —
+  `C` now creates one bare shell window in the session the cursor is inside —
   session, window, or pane row, since all three name a session — and hands the
   terminal to it, exactly as `prefix + c` does from inside an attached session.
   No agent and no composer: the window is named by tmux and starts in the
@@ -23,8 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   happened to be launched from. A directory that has since been removed is
   dropped instead of failing the command.
 
-  Reserving another browse letter costs the filter its bare leading `c`; `/c…`
-  still searches for one, the same escape every other reserved key has.
+  Shifted, like `R`: creating a window and renaming one both reshape the
+  session rather than move through it, and neither belongs one stray keystroke
+  away from the navigation keys.
+
+### Changed
+
+- **The `muxa watch` filter opens on `/`, not on any keystroke.** A letter no
+  binding had claimed used to start a search under the cursor. That made typing
+  ambiguous in both directions: a mistyped key silently filtered the table down
+  to nothing, and every binding added since took a character away from the
+  filter it could never start with.
+
+  `/` is now the only way in. Before it, a letter is either a binding or a
+  no-op that answers `press / to filter`; after it, every key — `q`, `j`, `C`,
+  the whole reserved set — is an ordinary filter character, so no search term
+  is out of reach. Esc and Ctrl-U still clear the filter and back out.
 
 ## [0.8.40] - 2026-09-01
 

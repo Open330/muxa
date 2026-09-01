@@ -4,12 +4,12 @@
 //! live-updating table of tracked agents. Input is handled via crossterm
 //! events:
 //!
-//! - Direct filtering: printable characters immediately narrow the row set;
-//!   `/` explicitly arms the filter so queries may start with a reserved key.
-//!   Backspace edits and Esc clears before quitting.
+//! - Filtering: `/` arms the filter and printable characters narrow the row
+//!   set from there. A bare letter is always a binding, never the first
+//!   character of a query. Backspace edits and Esc clears before quitting.
 //! - Navigation: arrows always move between sessions. While the filter is
-//!   empty, `hjkl`, `gg` / `G`, Home / End, page keys, and Ctrl-U / Ctrl-D add
-//!   conventional TUI navigation. Enter jumps through the selected node's
+//!   disarmed, `hjkl`, `gg` / `G`, Home / End, page keys, and Ctrl-U / Ctrl-D
+//!   add conventional TUI navigation. Enter jumps through the selected node's
 //!   active descendants; `m` owns prompt/message composition.
 //! - Inspection: `Alt-P` opens preview, `Alt-I` toggles the responsive split
 //!   inspector, and `Alt-E` opens the persistent transition inbox.
@@ -1862,7 +1862,7 @@ pub(crate) fn apply_outcome_to_app(app: &mut App, outcome: ActionOutcome) {
 pub(crate) fn help_overlay_text() -> Vec<&'static str> {
     vec![
         "Filter & navigation",
-        "  type or /       filter; / allows reserved first characters",
+        "  /               filter rows; any key types into it once armed",
         "  Backspace/C-W   edit filter / delete previous word",
         "  Ctrl-U / Esc    clear filter; Esc again backs out / quits",
         "  ↑/↓ · j/k       move siblings in focus mode; visible nodes otherwise",
@@ -1873,7 +1873,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         // One line, not two: the overlay is sized to its line count and
         // clipped by the terminal, so a row added here pushes the last
         // binding off a short screen.
-        "  c / n / w / R  shell window / agent pane / work up / rename the row",
+        "  C / n / w / R  shell window / agent pane / work up / rename the row",
         "  a / A          ask / history; d deletes one · D clears all in A",
         "",
         "Commands & inspection",
@@ -2886,11 +2886,11 @@ pub(crate) struct App {
     /// Active transition pulses, same `(kind, session_id)` key. Pruned as they
     /// expire past [`PULSE_WINDOW`].
     pulses: HashMap<(AgentKind, String), Pulse>,
-    /// Incremental filter entered directly from table mode.
+    /// Incremental filter typed into the table once `/` has armed it.
     pub search_query: String,
-    /// True after `/` explicitly arms filter input. Unlike implicit direct
-    /// typing, this remains true when the query is empty so reserved browse
-    /// keys (`q`, `g`, `h`, …) can be used as the first search character.
+    /// True after `/` armed filter input — the only way in, since typing on
+    /// its own stays bound to the browse keys. It remains true while the
+    /// query is empty so reserved keys (`q`, `g`, `h`, …) can open a search.
     pub explicit_search: bool,
     /// First half of the conventional `gg` jump. Any non-`g` key clears it.
     pending_g: bool,
@@ -9732,10 +9732,10 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             });
             Action::None
         }
-        // `c` is tmux's own `prefix + c`, minus the attach that normally has
-        // to come first. Reserving another browse letter costs the filter its
-        // bare leading `c`, which `/` still allows.
-        KeyCode::Char('c') if app.browse_keys_active() => match app.new_window_context() {
+        // tmux's own `prefix + c`, minus the attach that normally has to come
+        // first. Shifted like `R`: both reshape the session rather than move
+        // through it, and neither should be one stray keystroke away.
+        KeyCode::Char('C') if app.browse_keys_active() => match app.new_window_context() {
             Some((session, cwd)) => Action::NewWindow { session, cwd },
             None => Action::NotApplicable("select a row first — a new window needs a session"),
         },
@@ -9790,8 +9790,16 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             app.move_up();
             Action::None
         }
+        // A keystroke is text only after `/` armed the filter. Before that
+        // every letter is a binding, so an unbound one does nothing — and
+        // says where the filter went, because typing used to open it and
+        // that reflex outlives the change.
         KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
-            app.edit_search(|query| query.push(c));
+            if app.browse_keys_active() {
+                app.set_hint("press / to filter", HintLevel::Warn);
+            } else {
+                app.edit_search(|query| query.push(c));
+            }
             Action::None
         }
         _ => Action::None,
@@ -13836,7 +13844,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&[Tr
         ))
     } else {
         Line::from(Span::styled(
-            "j/k move  ·  type or / filter  ·  : commands  ·  ? help",
+            "j/k move  ·  / filter  ·  : commands  ·  ? help",
             theme.dim_style().add_modifier(Modifier::DIM),
         ))
     };
@@ -17559,7 +17567,7 @@ mod tests {
     }
 
     /// Two windows so the single-window compaction does not fold the window
-    /// row into its session — the `c` binding has to answer from either.
+    /// row into its session — the `C` binding has to answer from either.
     fn two_window_topology_fixture() -> (Vec<Agent>, Vec<PaneInfo>) {
         let panes = vec![
             fake_topology_pane("default", "$1", "muxa", "@1", "TEST-1", 0, "%1", 0),
@@ -17572,15 +17580,17 @@ mod tests {
         (agents, panes)
     }
 
-    fn press_c(app: &mut App) -> Action {
+    /// The shift the terminal actually reports alongside the capital, so the
+    /// binding is exercised the way a keyboard delivers it.
+    fn press_new_window(app: &mut App) -> Action {
         handle_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT)),
             app,
         )
     }
 
     #[test]
-    fn c_creates_a_window_in_the_session_the_cursor_is_inside() {
+    fn shift_c_creates_a_window_in_the_session_the_cursor_is_inside() {
         // `prefix + c` works from any window of a session; the watch binding
         // has to behave the same whichever level the cursor stopped on.
         let (agents, panes) = two_window_topology_fixture();
@@ -17595,7 +17605,7 @@ mod tests {
             TopologyNodeKey::Pane(pane_key),
         ] {
             select_tree_key(&mut app, &target);
-            match press_c(&mut app) {
+            match press_new_window(&mut app) {
                 Action::NewWindow { session, cwd } => {
                     assert_eq!(session, session_key, "wrong session for {target:?}");
                     // The window opens where the selected row works, not
@@ -17611,26 +17621,47 @@ mod tests {
     }
 
     #[test]
-    fn c_takes_the_exact_window_the_cursor_names() {
+    fn shift_c_takes_the_exact_window_the_cursor_names() {
         let (agents, panes) = two_window_topology_fixture();
         let mut app = topology_watch(WatchView::Pane, agents, panes);
         let window_key = app.topology.sessions[0].windows[1].key.clone();
         select_tree_key(&mut app, &TopologyNodeKey::Window(window_key));
         assert!(matches!(
-            press_c(&mut app),
+            press_new_window(&mut app),
             Action::NewWindow { cwd: Some(ref dir), .. } if dir == "/repo/muxa/TEST-2"
         ));
     }
 
     #[test]
-    fn c_is_a_filter_character_once_a_search_is_armed() {
-        // Reserved browse letters give way to typing, the same rule n/w/o
-        // follow — otherwise `/` would be the only way to search for "codex".
+    fn shift_c_is_a_filter_character_once_a_search_is_armed() {
+        // Every browse key gives way to typing once `/` is down — otherwise
+        // the filter could never match a name that starts with one.
         let (agents, panes) = two_window_topology_fixture();
         let mut app = topology_watch(WatchView::Pane, agents, panes);
         app.arm_explicit_search();
-        assert!(matches!(press_c(&mut app), Action::None));
-        assert_eq!(app.search_query, "c");
+        assert!(matches!(press_new_window(&mut app), Action::None));
+        assert_eq!(app.search_query, "C");
+    }
+
+    #[test]
+    fn typing_does_not_start_a_filter_until_slash_arms_it() {
+        // `/` is the only entrance: an unbound letter used to open a search
+        // under the cursor, which made every future binding a breaking change.
+        let (agents, panes) = two_window_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+
+        assert!(matches!(key_action(&mut app, 'x'), Action::None));
+        assert!(app.search_query.is_empty(), "a bare letter must not filter");
+        let hint = app.footer_hint.as_ref().expect("a hint names the way in");
+        assert!(
+            hint.message.contains('/'),
+            "unexpected hint: {}",
+            hint.message
+        );
+
+        assert!(matches!(key_action(&mut app, '/'), Action::None));
+        assert!(matches!(key_action(&mut app, 'x'), Action::None));
+        assert_eq!(app.search_query, "x", "typing filters once armed");
     }
 
     #[test]
@@ -26246,7 +26277,7 @@ sort = ["state"]
         // reference, so any drift between the keybinding matrix and
         // the help text should land here loud and clear.
         let body = help_overlay_text().join("\n");
-        assert!(body.contains("type or /       filter"));
+        assert!(body.contains("/               filter rows"));
         assert!(body.contains("gg/G · Home/End first / last selectable row"));
         assert!(
             body.contains("↑/↓ · j/k       move siblings in focus mode; visible nodes otherwise")
@@ -26259,7 +26290,7 @@ sort = ["state"]
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains("a / A          ask / history; d deletes one · D clears all in A"));
         assert!(
-            body.contains("c / n / w / R  shell window / agent pane / work up / rename the row")
+            body.contains("C / n / w / R  shell window / agent pane / work up / rename the row")
         );
         // The exit keys deliberately live in the overlay's border rather
         // than the matrix — the body is clipped by terminal height, and
@@ -26300,7 +26331,7 @@ sort = ["state"]
 
     #[test]
     fn help_overlay_swallows_other_keys() {
-        // While help is open, K / R / c shouldn't fire — the user is
+        // While help is open, K / R / C shouldn't fire — the user is
         // reading docs, not driving actions.
         let mut app = app_with_paneless_and_pane();
         app.help_open = true;
@@ -26308,7 +26339,7 @@ sort = ["state"]
         for key in [
             KeyCode::Char('K'),
             KeyCode::Char('R'),
-            KeyCode::Char('c'),
+            KeyCode::Char('C'),
             KeyCode::Char('p'),
             KeyCode::Char('r'),
         ] {
@@ -26466,7 +26497,7 @@ sort = ["state"]
     }
 
     #[test]
-    fn j_and_k_navigate_until_another_letter_starts_filtering() {
+    fn j_and_k_navigate_until_slash_starts_filtering() {
         let mut app = app_with_paneless_and_pane();
         let pane_idx = app
             .rows
@@ -26479,15 +26510,14 @@ sort = ["state"]
         assert!(matches!(action, Action::None));
         assert!(app.search_query.is_empty());
 
-        let action = key_action(&mut app, 'e');
-        assert!(matches!(action, Action::None));
-        let action = key_action(&mut app, 'r');
-        assert!(matches!(action, Action::None));
-        let action = key_action(&mut app, 'k');
-        assert!(matches!(action, Action::None));
+        // Movement keeps `j`/`k` until `/` hands the keyboard to the filter.
+        assert!(matches!(key_action(&mut app, '/'), Action::None));
+        for c in "erk".chars() {
+            assert!(matches!(key_action(&mut app, c), Action::None));
+        }
         assert_eq!(app.search_query, "erk");
 
-        app.edit_search(String::clear);
+        app.clear_search();
         assert!(matches!(alt_key_action(&mut app, 'r'), Action::Refresh));
         assert!(matches!(
             alt_key_action(&mut app, 'k'),
@@ -26528,21 +26558,23 @@ sort = ["state"]
         assert_eq!(app.selected_pane().as_deref(), Some("%2"));
         assert!(app.search_query.is_empty());
 
-        assert!(matches!(key_action(&mut app, 'e'), Action::None));
-        assert!(matches!(key_action(&mut app, 'j'), Action::None));
-        assert!(matches!(key_action(&mut app, 'k'), Action::None));
+        assert!(matches!(key_action(&mut app, '/'), Action::None));
+        for c in "ejk".chars() {
+            assert!(matches!(key_action(&mut app, c), Action::None));
+        }
         assert_eq!(app.search_query, "ejk");
 
-        app.edit_search(String::clear);
+        app.clear_search();
         assert!(matches!(key_action(&mut app, 'k'), Action::None));
         assert!(app.search_query.is_empty());
     }
 
     #[test]
-    fn direct_typing_filters_and_escape_clears_before_quit() {
+    fn slash_filters_and_escape_clears_before_quit() {
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
         app.table_state.select(Some(0));
 
+        assert!(matches!(key_action(&mut app, '/'), Action::None));
         for c in "eta".chars() {
             assert!(matches!(key_action(&mut app, c), Action::None));
         }
@@ -26660,8 +26692,8 @@ sort = ["state"]
             Action::Quick(QuickAction::ShowHelp)
         ));
 
-        assert!(matches!(key_action(&mut app, 'e'), Action::None));
-        for c in ['r', 'o', 'q', '?'] {
+        assert!(matches!(key_action(&mut app, '/'), Action::None));
+        for c in ['e', 'r', 'o', 'q', '?'] {
             assert!(matches!(key_action(&mut app, c), Action::None));
         }
         assert_eq!(app.search_query, "eroq?");
