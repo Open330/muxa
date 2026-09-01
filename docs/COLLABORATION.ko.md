@@ -323,6 +323,10 @@ revision과 발신 pane의 Idle 전환에 반응해 짧은 알림 prompt를 한 
 Muxa가 관리하는 peer를 `sleep`, raw `tmux capture-pane`, 반복 status/capture 호출로
 모니터링하지 마세요.
 
+Codex에서는 blocking call이 host의 30초 실행 경계를 넘으면 background cell로
+돌아올 수 있습니다. 같은 작업에 새 Muxa wait를 시작하지 말고 host wait 함수의
+`yield_time_ms=60000`으로 그 cell 자체를 이어서 기다립니다.
+
 일반적인 흐름:
 
 ```text
@@ -364,9 +368,10 @@ agent가 상당한 작업을 시작할 때 권장 순서는 다음과 같습니�
 
 `muxa_send_message`와 `muxa_call_peer`는 동일한 causal/Work metadata인
 `thread_id`, `parent_request_id`, `workspace_id`, `work_id`, `run_id`와
-`artifacts`, `links`를 optional 입력으로 받습니다. MCP가 반환하는 저장 request에도
-이 필드가 포함되므로 메시지 본문에서 관계를 추측하지 말고 다음 호출에 정확한
-request id를 parent로 넘길 수 있습니다.
+`artifacts`, `links`를 optional 입력으로 받습니다. Mutation receipt는 model이 방금
+보낸 body를 되돌려 주지 않고 correlation field만 반환하며, mailbox/report 조회는
+저장 request를 그대로 반환합니다. 메시지 본문에서 관계를 추측하지 말고 반환된
+request id를 다음 호출의 parent로 넘길 수 있습니다.
 
 ## AIR artifact 전달과 시각화
 

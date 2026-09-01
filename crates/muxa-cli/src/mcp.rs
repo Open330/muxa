@@ -67,60 +67,24 @@ const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
 const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team control plane. \
-    For managed tmux work, treat one session as one workspace/project, one window as the current \
-    Run of a durable Work, and one pane as an agent session. External issues are references, not Work ids. \
-    Use muxa_start_agent with a work id instead \
-    of delegating tmux setup to another model; use muxa_manage_tmux for lifecycle \
-    control and never invent raw tmux commands. \
-    To staff a whole Work rather than one pane, call muxa_start_work: it optionally resolves an \
-    external issue, routes the Work, and creates only the pipeline agents the window is missing, so \
-    re-running converges instead of duplicating the team. Several muxa_start_agent calls \
-    cannot do that. Pass what the work is as body (with an optional /skill and context), \
-    the same phrasing muxa_call_peer takes; the same body steers agents already running. \
-    Wait once through muxa_wait_reply for durable peer work, or muxa_wait_for_change for \
-    pane work. Never monitor a Muxa-managed agent with sleep, raw tmux capture-pane, or \
-    repeated status/capture calls; elapsed wait time does not require model turns. \
-    Reserved routing: @peer and @muxa-peer always mean Muxa collaboration, never \
-    a GitHub user, pull-request reviewer, issue, or review thread. A request for \
-    @peer's report, reply, previous findings, or conversation must call \
-    muxa_peer_report first. A request that asks @peer, @codex, @claude, @gemini, \
-    an explicit @alias, or a colleague to do new work must call muxa_call_peer. \
-    If these Muxa tools are unavailable, tell the user to restart the agent so \
-    its MCP process reloads; never substitute a GitHub workflow. Use GitHub PR or \
-    review tools only when the user or already-grounded context provides an \
-    explicit PR number or GitHub PR URL; a repository or cwd alone is not enough. \
-    Never invent a PR, issue, or review thread. Resolving peer \
-    feedback means adjudicating the Muxa report and recording accepted/rejected \
-    findings unless an explicit PR establishes GitHub review threads. A /name in \
-    a new peer request selects a registered Muxa message skill; pass the remaining \
-    request-specific details as body or context. Never \
-    set execute=true unless the user explicitly authorizes edits, and never set \
-    spawn_if_missing=true until the user explicitly confirms creating a new \
-    bypass-permission agent pane. By default peer calls are review + read_only. \
-    At the start of substantial work, call muxa_collaboration_guide (or \
-    muxa_room_context) to discover available peer agents. Improve important work \
-    with a peer when useful: use review + read_only after implementation and tests \
-    for an independent critique; question + read_only for focused analysis; task + \
-    execute + narrow paths only for bounded, non-overlapping delegated edits. Keep \
-    primary ownership: continue useful work while the peer runs, wait for its \
-    structured reply, then verify and integrate the result yourself. Avoid \
-    overlapping edits unless separate worktrees isolate them. When notified of an \
-    incoming request, call muxa_inbox promptly, honor kind/work_mode/paths, and \
-    always finish with muxa_reply using completed, blocked, declined, or failed. \
-    When work is already represented by a validated AIR 1 workflow, plan, or trace, \
-    attach its typed air_artifacts reference for shared identity and visualization; \
-    AIR Workbench remains the validator/editor and muxa never implies conformance. \
-    For causal follow-up requests, pass parent_request_id from the request being answered; \
-    muxa inherits and validates its canonical thread_id. Carry workspace_id, work_id, and \
-    run_id when the enclosing Work is known so history and graph views can group the exchange. \
-    Fleet operations are a separate physical-host control plane whose always-present \
-    local host needs no SSH configuration: discover hosts \
-    with muxa_fleet_status, always name the host and pane explicitly for capture or \
-    prompt delivery, and remember that observe-mode hosts reject control actions. \
-    For durable structured work on an explicitly authorized remote agent, use \
-    muxa_fleet_call_peer; if its bounded wait expires, continue with \
-    muxa_fleet_wait_reply using the returned exact pane_key. Never substitute raw \
-    prompt delivery when a structured reply is required.";
+    Use muxa_room_context for identity/peers and muxa_collaboration_guide only when \
+    detailed workflow guidance is needed. Reserved @peer/@muxa-peer requests for new \
+    work use muxa_call_peer; requests for an existing report use muxa_peer_report. \
+    Never substitute a GitHub/PR workflow without an explicit PR number or URL. Peer \
+    calls default to review + read_only. Never set execute=true or \
+    spawn_if_missing=true without explicit user authorization; keep primary ownership \
+    and verify replies. Use muxa_start_work for a configured Work pipeline, \
+    muxa_start_agent for one agent, and muxa_manage_tmux for lifecycle; never invent \
+    raw tmux commands. Prefer pane-scoped muxa_status; no-argument status is compact \
+    unless full=true. For pane work, use one muxa_wait_for_change with until=settled \
+    and include_capture instead of polling status/capture. On Codex, if a long call \
+    yields a background cell, resume that same cell with the host wait function using \
+    yield_time_ms=60000; never start a second Muxa wait. For durable peer work prefer \
+    muxa_call_peer with wait=false: muxa wakes the idle sender when the reply is ready, \
+    then read it with muxa_wait_reply. Incoming notifications require muxa_inbox and \
+    exactly one terminal muxa_reply. A /name selects a registered message skill. \
+    muxa_fleet_call_peer/muxa_fleet_wait_reply are a separate physical-host plane: \
+    name host/pane explicitly and respect observe mode.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -412,14 +376,15 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "muxa_status",
             "description": "Focused observation of muxa agents. With no arguments, \
-                snapshot every agent plus the managed workspace > work > agent tmux topology. \
-                Set pane to avoid loading the whole fleet; \
+                return a compact fleet summary; set full=true only when the complete managed \
+                workspace > work > agent topology is necessary. Set pane for one agent; \
                 optionally include its visible screen and recent prompt history in \
                 the same result to save MCP round trips and model context.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": { "type": "string", "description": "Optional exact pane id." },
+                    "full": { "type": "boolean", "description": "Return the complete topology when pane is omitted. Default false." },
                     "include_capture": { "type": "boolean", "description": "Include the pane's visible screen; requires pane." },
                     "history_limit": { "type": "integer", "minimum": 0, "maximum": 20, "description": "Recent prompts for this pane. Default 0; requires pane." },
                     "max_capture_lines": { "type": "integer", "minimum": 1, "maximum": 400, "description": "Trim capture to the newest N lines. Default 120." }
@@ -646,11 +611,13 @@ fn tool_definitions() -> Vec<Value> {
             "description": "Block until an agent changes state. Set until=settled \
                 to ignore intermediate working transitions and return only when the \
                 agent is idle, blocked, errored, or stopped. A focused wait can also \
-                include the final pane capture, avoiding polling loops and extra calls.",
+                include the final pane capture, avoiding polling loops and extra calls. \
+                If a Codex host yields a background cell, resume that same cell with \
+                yield_time_ms=60000 instead of starting another Muxa wait.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "timeout_secs": { "type": "integer", "minimum": 1, "description": "Max seconds to wait. Default 30, max 600." },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Max seconds to wait. Default 30." },
                     "pane": { "type": "string", "description": "Only report changes on this pane id. Omit for any pane." },
                     "until": { "type": "string", "enum": ["any", "settled", "idle", "blocked", "stopped"], "description": "Target after at least one state change. Default any; non-any values require pane." },
                     "include_capture": { "type": "boolean", "description": "Include the newest visible pane screen when returning; requires pane." },
@@ -844,6 +811,7 @@ async fn call_tool(
     match name {
         "muxa_status" => {
             let pane = args.get("pane").and_then(Value::as_str);
+            let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
             let include_capture = args
                 .get("include_capture")
                 .and_then(Value::as_bool)
@@ -887,7 +855,11 @@ async fn call_tool(
                 .await
                 {
                     Ok(topology) => {
-                        payload = json!({ "topology": topology });
+                        payload = if full {
+                            json!({ "topology": topology })
+                        } else {
+                            topology_summary(&topology)
+                        };
                     }
                     Err(error) => payload["topology_error"] = json!(error.to_string()),
                 }
@@ -1206,7 +1178,7 @@ async fn call_tool(
             };
             Ok(
                 match client.collaboration_send(&origin, target, &request).await {
-                    Ok(request) => json_result(&json!(request)),
+                    Ok(request) => json_result(&request_ack(&request)),
                     Err(error) => error_result(&format!("send_message failed: {error}")),
                 },
             )
@@ -1267,7 +1239,7 @@ async fn call_tool(
                     )
                     .await
                 {
-                    Ok(request) => json_result(&json!(request)),
+                    Ok(request) => json_result(&request_ack(&request)),
                     Err(error) => error_result(&format!("reply failed: {error}")),
                 },
             )
@@ -1285,13 +1257,143 @@ async fn call_tool(
             };
             Ok(
                 match client.collaboration_cancel(&origin, request_id).await {
-                    Ok(request) => json_result(&json!(request)),
+                    Ok(request) => json_result(&request_ack(&request)),
                     Err(error) => error_result(&format!("cancel_message failed: {error}")),
                 },
             )
         }
         other => Ok(error_result(&format!("unknown tool: {other}"))),
     }
+}
+
+/// Keep the default fleet view useful for routing without embedding every
+/// agent's prompts, responses, workload tree, and backend metadata. Callers
+/// can request `full=true` when they genuinely need the canonical topology.
+fn topology_summary(topology: &muxa::TopologySnapshot) -> Value {
+    let mut agents = Vec::new();
+    let mut states = [0_usize; 7];
+    let mut window_count = 0_usize;
+    let mut pane_count = 0_usize;
+
+    for session in &topology.sessions {
+        window_count += session.windows.len();
+        for window in &session.windows {
+            pane_count += window.panes.len();
+            for pane in &window.panes {
+                if let Some(agent) = &pane.agent {
+                    states[state_index(agent.state)] += 1;
+                    let endpoint = &pane.key.window.session.endpoint;
+                    agents.push(agent_status_summary(
+                        agent,
+                        agent.pane.as_deref().or(Some(&pane.key.pane_id)),
+                        Some(&session.name),
+                        Some(&window.name),
+                        Some(endpoint.host),
+                        Some(&endpoint.socket),
+                    ));
+                }
+            }
+        }
+    }
+
+    let unassigned_agents = topology
+        .unassigned_agents
+        .iter()
+        .map(|agent| {
+            states[state_index(agent.state)] += 1;
+            let host = agent
+                .pane
+                .as_deref()
+                .and_then(muxa::backend::pane_id_host_kind);
+            agent_status_summary(
+                agent,
+                agent.pane.as_deref(),
+                None,
+                None,
+                host,
+                agent.tmux_socket.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "summary": {
+            "sessions": topology.sessions.len(),
+            "windows": window_count,
+            "panes": pane_count,
+            "agents": agents.len() + unassigned_agents.len(),
+            "states": {
+                "starting": states[0],
+                "working": states[1],
+                "idle": states[2],
+                "waiting_input": states[3],
+                "waiting_choice": states[4],
+                "error": states[5],
+                "stopped": states[6],
+            },
+            "unmapped_panes": topology.unmapped_panes.len(),
+            "unassigned_agents": unassigned_agents.len(),
+        },
+        "agents": agents,
+        "unassigned_agents": unassigned_agents,
+        "next_step": "Use muxa_status with pane for details, or full=true only for the complete topology."
+    })
+}
+
+fn state_index(state: AgentState) -> usize {
+    match state {
+        AgentState::Starting => 0,
+        AgentState::Working => 1,
+        AgentState::Idle => 2,
+        AgentState::WaitingInput => 3,
+        AgentState::WaitingChoice => 4,
+        AgentState::Error => 5,
+        AgentState::Stopped => 6,
+    }
+}
+
+fn agent_status_summary(
+    agent: &Agent,
+    pane: Option<&str>,
+    session: Option<&str>,
+    window: Option<&str>,
+    host: Option<muxa::HostKind>,
+    socket: Option<&str>,
+) -> Value {
+    let mut value = json!({
+        "pane": pane,
+        "kind": agent.kind,
+        "state": agent.state,
+        "last_activity_at": agent.last_activity_at,
+    });
+    if let Some(session) = session {
+        value["session"] = json!(session);
+    }
+    if let Some(window) = window {
+        value["window"] = json!(window);
+    }
+    if let Some(host) = host {
+        value["host"] = json!(host);
+    }
+    if let Some(socket) = socket {
+        value["socket"] = json!(socket);
+    }
+    if let Some(cwd) = &agent.cwd {
+        value["cwd"] = json!(cwd);
+    }
+    if let Some(model) = &agent.model {
+        value["model"] = json!(model);
+    }
+    if let Some(title) = &agent.ai_title {
+        value["title"] = json!(crate::truncate_cell(title, 160));
+    }
+    if let Some(notification) = &agent.last_notification {
+        value["attention"] = json!(crate::truncate_cell(notification, 160));
+    }
+    if let Some(context_used_pct) = agent.context_used_pct {
+        value["context_used_pct"] = json!(context_used_pct);
+    }
+    value
 }
 
 fn collaboration_guide(room: RoomContext) -> Value {
@@ -1590,7 +1692,6 @@ async fn call_peer(
         let mut payload = common;
         payload["completed"] = json!(false);
         payload["reason"] = json!("sent_without_waiting");
-        payload["request"] = json!(sent);
         return json_result(&payload);
     }
 
@@ -1603,7 +1704,8 @@ async fn call_peer(
         Ok(Some(request)) => {
             let mut payload = common;
             payload["completed"] = json!(true);
-            payload["request"] = json!(request);
+            payload["status"] = json!(request.status);
+            payload["reply"] = json!(request.reply);
             json_result(&payload)
         }
         Ok(None) => {
@@ -1611,7 +1713,7 @@ async fn call_peer(
             payload["completed"] = json!(false);
             payload["reason"] = json!("timeout");
             payload["timeout_secs"] = json!(timeout_secs);
-            payload["request"] = json!(sent);
+            payload["status"] = json!(sent.status);
             payload["next_step"] = json!(format!(
                 "the request stays queued for {}; call muxa_wait_reply with request_id {} to keep \
                  waiting, or muxa_peer_report later. Do not poll the pane.",
@@ -1712,7 +1814,6 @@ async fn fleet_call_peer(
         let mut payload = common;
         payload["completed"] = json!(false);
         payload["reason"] = json!("sent_without_waiting");
-        payload["request"] = json!(sent);
         return json_result(&payload);
     }
 
@@ -1725,7 +1826,8 @@ async fn fleet_call_peer(
         Ok(Some(request)) if request.status.is_terminal() => {
             let mut payload = common;
             payload["completed"] = json!(true);
-            payload["request"] = json!(request);
+            payload["status"] = json!(request.status);
+            payload["reply"] = json!(request.reply);
             json_result(&payload)
         }
         Ok(current) => {
@@ -1733,7 +1835,7 @@ async fn fleet_call_peer(
             payload["completed"] = json!(false);
             payload["reason"] = json!("timeout");
             payload["timeout_secs"] = json!(timeout_secs);
-            payload["request"] = json!(current.unwrap_or(sent));
+            payload["status"] = json!(current.as_ref().unwrap_or(&sent).status);
             payload["next_step"] = json!({
                 "tool": "muxa_fleet_wait_reply",
                 "arguments": {
@@ -1754,7 +1856,7 @@ async fn fleet_call_peer(
             payload["completed"] = json!(false);
             payload["reason"] = json!("wait_failed");
             payload["error"] = json!(error);
-            payload["request"] = json!(sent);
+            payload["status"] = json!(sent.status);
             payload["next_step"] = json!({
                 "tool": "muxa_fleet_wait_reply",
                 "arguments": {
@@ -1812,7 +1914,9 @@ async fn fleet_wait_reply(client: &Client, args: &Value) -> Value {
             "completed": true,
             "host": host,
             "pane_key": pane_key,
-            "request": request,
+            "request_id": request.id,
+            "status": request.status,
+            "reply": request.reply,
         })),
         Ok(current) => json_result(&json!({
             "completed": false,
@@ -1821,7 +1925,7 @@ async fn fleet_wait_reply(client: &Client, args: &Value) -> Value {
             "host": host,
             "pane_key": pane_key,
             "request_id": request_id,
-            "request": current,
+            "status": current.map(|request| request.status),
         })),
         Err(error) => error_result(&format!("fleet_wait_reply failed: {error}")),
     }
@@ -2601,7 +2705,7 @@ async fn wait_for_reply(client: &Client, args: &Value) -> Value {
         .collaboration_wait(&origin, request_id, timeout_secs)
         .await
     {
-        Ok(request) if request.status.is_terminal() => json_result(&json!(request)),
+        Ok(request) if request.status.is_terminal() => json_result(&request_outcome(&request)),
         Ok(_) => json_result(&json!({
             "completed": false,
             "reason": "timeout",
@@ -3103,10 +3207,35 @@ fn text_result(text: &str) -> Value {
     json!({ "content": [ { "type": "text", "text": text } ] })
 }
 
-/// A tools/call result wrapping a JSON value, serialized as pretty text
-/// (MCP content is text; the model reads the JSON).
+/// A compact acknowledgement for mutations. The caller already supplied the
+/// request body and attachments, so echoing the full durable record only
+/// consumes context; retain the correlation and routing fields it needs next.
+fn request_ack(request: &CollaborationRequest) -> Value {
+    json!({
+        "request_id": request.id,
+        "thread_id": request.thread_id,
+        "parent_request_id": request.parent_request_id,
+        "workspace_id": request.workspace_id,
+        "work_id": request.work_id,
+        "run_id": request.run_id,
+        "status": request.status,
+        "to": request.to,
+    })
+}
+
+/// Terminal request result without re-embedding the original prompt, sender,
+/// provenance, and timestamps. The structured reply is the new information.
+fn request_outcome(request: &CollaborationRequest) -> Value {
+    let mut value = request_ack(request);
+    value["completed"] = json!(true);
+    value["reply"] = json!(request.reply);
+    value
+}
+
+/// A tools/call result wrapping compact JSON text. Whitespace has no MCP
+/// semantics and becomes input tokens on every model turn that carries it.
 fn json_result(value: &Value) -> Value {
-    let text = serde_json::to_string_pretty(value)
+    let text = serde_json::to_string(value)
         .unwrap_or_else(|_| "{\"error\":\"serialize failed\"}".to_string());
     text_result(&text)
 }
@@ -3360,26 +3489,20 @@ mod tests {
         assert_eq!(init["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert!(init["result"]["capabilities"]["tools"].is_object());
         let instructions = init["result"]["instructions"].as_str().unwrap();
-        assert!(instructions.contains("start of substantial work"));
-        assert!(instructions.contains("one session as one workspace/project"));
-        assert!(instructions.contains("one window as the current Run"));
-        assert!(instructions.contains("External issues are references"));
+        assert!(instructions.len() < 2_048, "instructions: {instructions}");
         assert!(instructions.contains("muxa_manage_tmux"));
-        assert!(instructions.contains("raw tmux capture-pane"));
+        assert!(instructions.contains("raw tmux commands"));
         assert!(instructions.contains("review + read_only"));
-        assert!(instructions.contains("task + execute + narrow paths"));
-        assert!(instructions.contains("verify and integrate the result yourself"));
         assert!(instructions.contains("@peer"));
         assert!(instructions.contains("@muxa-peer"));
         assert!(instructions.contains("muxa_call_peer"));
         assert!(instructions.contains("muxa_peer_report"));
-        assert!(instructions.contains("never substitute a GitHub workflow"));
-        assert!(instructions.contains("a repository or cwd alone is not enough"));
-        assert!(instructions.contains("Never invent a PR"));
+        assert!(instructions.contains("explicit PR number or URL"));
         assert!(instructions.contains("execute=true"));
         assert!(instructions.contains("spawn_if_missing=true"));
-        assert!(instructions.contains("muxa_fleet_status"));
-        assert!(instructions.contains("observe-mode hosts"));
+        assert!(instructions.contains("yield_time_ms=60000"));
+        assert!(instructions.contains("wait=false"));
+        assert!(instructions.contains("respect observe mode"));
 
         let list = dispatch(
             &client,
@@ -3448,6 +3571,24 @@ mod tests {
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn status_and_wait_tool_definitions_bound_context() {
+        let tools = tool_definitions();
+        let status = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_status")
+            .unwrap();
+        assert!(status["inputSchema"]["properties"]["full"].is_object());
+        let wait = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_wait_for_change")
+            .unwrap();
+        assert_eq!(
+            wait["inputSchema"]["properties"]["timeout_secs"]["maximum"],
+            600
+        );
     }
 
     fn assert_fleet_tool_definitions(tools: &[Value], instructions: &str) {
@@ -3909,8 +4050,8 @@ mod tests {
         let sock = dir.path().join("mcp-call.sock");
         let (client, sends, tx, handle) = spawn_daemon(&sock).await;
 
-        // Fleet-wide muxa_status returns the canonical nested topology, even
-        // when the runner has no live multiplexer sessions.
+        // The default is deliberately compact so a discovery call cannot
+        // inject every agent's full prompts and responses into model context.
         let status = dispatch(
             &client,
             &json!({
@@ -3922,12 +4063,10 @@ mod tests {
         .unwrap();
         let text = status["result"]["content"][0]["text"].as_str().unwrap();
         let status_payload: Value = serde_json::from_str(text).unwrap();
+        assert!(status_payload["summary"].is_object(), "status text: {text}");
+        assert!(status_payload["agents"].is_array(), "status text: {text}");
         assert!(
-            status_payload["topology"]["sessions"].is_array(),
-            "status text: {text}"
-        );
-        assert!(
-            status_payload.get("agents").is_none(),
+            status_payload.get("topology").is_none(),
             "status text: {text}"
         );
 
@@ -3948,8 +4087,9 @@ mod tests {
         .await
         .unwrap();
         let focused_text = focused["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(focused_text.contains("\"capture\": \"screen of %1\""));
-        assert!(focused_text.contains("\"prompts\""));
+        let focused_payload: Value = serde_json::from_str(focused_text).unwrap();
+        assert_eq!(focused_payload["capture"], "screen of %1");
+        assert!(focused_payload["prompts"].is_array());
 
         let refused_terminate = dispatch(
             &client,
@@ -4038,6 +4178,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_status_is_an_explicit_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("mcp-full-status.sock");
+        let (client, _sends, tx, handle) = spawn_daemon(&sock).await;
+
+        let status = dispatch(
+            &client,
+            &json!({
+                "jsonrpc": "2.0", "id": 30, "method": "tools/call",
+                "params": { "name": "muxa_status", "arguments": { "full": true } },
+            }),
+        )
+        .await
+        .unwrap();
+        let text = status["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert!(payload["topology"]["sessions"].is_array(), "{text}");
+        assert!(payload.get("agents").is_none(), "{text}");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn wait_for_change_times_out_cleanly() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("mcp-wait.sock");
@@ -4056,8 +4220,9 @@ mod tests {
         .await
         .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("\"changed\": false"), "{text}");
-        assert!(text.contains("timeout"), "{text}");
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["changed"], false, "{text}");
+        assert_eq!(payload["reason"], "timeout", "{text}");
 
         tx.send(()).unwrap();
         handle.await.unwrap();
@@ -4105,9 +4270,10 @@ mod tests {
 
         let result = waiter.await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("\"matched\": true"), "{text}");
-        assert!(text.contains("\"to\": \"idle\""), "{text}");
-        assert!(text.contains("\"capture\": \"screen of %1\""), "{text}");
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["matched"], true, "{text}");
+        assert_eq!(payload["to"], "idle", "{text}");
+        assert_eq!(payload["capture"], "screen of %1", "{text}");
 
         tx.send(()).unwrap();
         daemon.await.unwrap();
@@ -4129,6 +4295,47 @@ mod tests {
         }
         let event: AgentEvent = serde_json::from_value(ev).unwrap();
         client.ingest(&event).await.unwrap();
+    }
+
+    #[test]
+    fn json_results_are_compact() {
+        let result = json_result(&json!({ "answer": [1, 2], "ok": true }));
+        assert_eq!(
+            result["content"][0]["text"],
+            r#"{"answer":[1,2],"ok":true}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_summary_keeps_endpoint_but_drops_prompt_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("mcp-agent-summary.sock");
+        let (client, _sends, tx, daemon) = spawn_daemon(&sock).await;
+        ingest(
+            &client,
+            "%7",
+            "prompt_submitted",
+            json!({ "prompt": "a large prompt that must not be repeated" }),
+        )
+        .await;
+        let agent = client.by_pane("%7").await.unwrap().remove(0);
+
+        let summary = agent_status_summary(
+            &agent,
+            Some("%7"),
+            Some("workspace"),
+            Some("work"),
+            Some(HostKind::Tmux),
+            Some("custom-socket"),
+        );
+        assert_eq!(summary["pane"], "%7");
+        assert_eq!(summary["host"], "tmux");
+        assert_eq!(summary["socket"], "custom-socket");
+        assert!(summary.get("last_prompt").is_none());
+        assert!(summary.get("last_response").is_none());
+
+        tx.send(()).unwrap();
+        daemon.await.unwrap();
     }
 
     /// `render_send_result` tolerates the unknown/legacy shape and the newer
@@ -4298,9 +4505,10 @@ mod tests {
             .await
             .expect("reconcile should detect the state move");
         let text = v["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("\"reconciled\": true"), "{text}");
-        assert!(text.contains("\"from\": \"working\""), "{text}");
-        assert!(text.contains("\"to\": \"idle\""), "{text}");
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["reconciled"], true, "{text}");
+        assert_eq!(payload["from"], "working", "{text}");
+        assert_eq!(payload["to"], "idle", "{text}");
 
         tx.send(()).unwrap();
         daemon.await.unwrap();

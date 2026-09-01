@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.42] - 2026-09-01
+
+### Fixed
+
+- **Long MCP waits now use fewer host continuation turns.** A 24-hour audit
+  on an actively used machine found 849 Codex host
+  continuation turns around 523 long `muxa_wait_for_change` cells. Those
+  continuations alone carried 124 million input tokens, almost all cached.
+  Muxa now tells Codex to resume the same yielded cell in 60-second intervals,
+  warns against starting a second Muxa wait, and steers durable peer work
+  through `wait=false` plus muxad's existing idle-gated reply wake.
+
+- **MCP results are compact and stop echoing data the model just supplied.**
+  JSON results no longer contain pretty-print whitespace. Send, reply, cancel,
+  local/Fleet peer-call, and reply-wait receipts keep correlation ids, status,
+  resolved routing, and the new structured reply without copying the original
+  request body, provenance, and timestamps back into later model turns.
+
+### Changed
+
+- **A no-argument `muxa_status` is now a bounded fleet summary.** It preserves
+  pane, host, socket, session/window, state, model, and attention information
+  needed for routing without embedding every agent's prompt, response, and
+  workload tree. Pass `full=true` for the canonical complete topology, or
+  `pane` for focused detail. On the audited machine this reduced the default
+  status payload by more than 90 percent.
+
+- **MCP startup guidance now fits below Claude Code's 2 KiB instruction
+  boundary.** Safety and routing rules remain in the startup contract while
+  detailed reviewer/subagent/AIR workflows stay available on demand through
+  `muxa_collaboration_guide`.
+
 ## [0.8.41] - 2026-09-01
 
 ### Fixed
@@ -2909,7 +2941,9 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.40...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.42...HEAD
+[0.8.42]: https://github.com/Open330/muxa/compare/v0.8.41...v0.8.42
+[0.8.41]: https://github.com/Open330/muxa/compare/v0.8.40...v0.8.41
 [0.8.26]: https://github.com/Open330/muxa/compare/v0.8.25...v0.8.26
 [0.8.25]: https://github.com/Open330/muxa/compare/v0.8.24...v0.8.25
 [0.8.24]: https://github.com/Open330/muxa/compare/v0.8.23...v0.8.24

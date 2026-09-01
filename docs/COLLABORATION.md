@@ -247,9 +247,11 @@ worktrees remain the safest choice for concurrent edits.
 
 `muxa_send_message` and `muxa_call_peer` accept the same optional causal and
 Work metadata (`thread_id`, `parent_request_id`, `workspace_id`, `work_id`,
-`run_id`) plus `artifacts` and `links`. Stored request objects returned by MCP
-include these fields, so an orchestrator can pass a request id as the next
-call's parent instead of inferring a thread from message text.
+`run_id`) plus `artifacts` and `links`. Mutation receipts return these
+correlation fields without echoing the body the model just supplied; mailbox
+and report reads still return the stored request. An orchestrator can pass the
+returned request id as the next call's parent instead of inferring a thread
+from message text.
 
 ## Natural calls from an agent conversation
 
@@ -309,6 +311,10 @@ call is sent with `wait=false`, the sender can continue independently; muxad
 reacts to the reply and injects one short notification after the sender becomes
 idle. Agents should not monitor Muxa-managed peers with `sleep`, raw
 `tmux capture-pane`, or repeated status/capture calls.
+
+On Codex, a blocking call may cross the host's 30-second execution boundary
+and yield a background cell. Resume that exact cell with the host wait function
+and `yield_time_ms=60000`; do not issue another Muxa wait for the same work.
 
 ## Reviewers and delegated subagents
 

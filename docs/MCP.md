@@ -106,6 +106,9 @@ interleave in time; that is expected for concurrent JSON-RPC, and the `id`
 echoed on each response lets the client correlate. Output framing stays
 strict: the shared stdout writer is locked across each whole `write` + newline,
 so two concurrent responses never splice mid-line (one JSON object per line).
+Codex may hand a call lasting over 30 seconds back as a background cell; resume
+that same cell with the host wait function and `yield_time_ms=60000`. The cell
+yield is a host transport boundary, not a reason to start another Muxa wait.
 
 Framing is robust against non-conforming input rather than silently dropping
 it:
@@ -124,7 +127,7 @@ it:
 
 | Tool | Arguments | Does |
 | --- | --- | --- |
-| `muxa_status` | `pane?`, `include_capture?`, `history_limit?`, `max_capture_lines?` | Snapshot all agents plus managed workspace → work → agent topology, or observe one pane. |
+| `muxa_status` | `pane?`, `full?`, `include_capture?`, `history_limit?`, `max_capture_lines?` | Return a compact fleet/agent summary by default, the complete topology with `full=true`, or one focused pane. |
 | `muxa_recent_prompts` | `pane?`, `limit?` | Recent prompt-history entries (newest first), optionally scoped to one pane. |
 | `muxa_start_agent` | `agent`, `workspace?`, `work?`, `role?`, `task?`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Create/reuse a workspace session and work window, or start an allowlisted agent in a lower-level tmux surface. |
 | `muxa_start_work` | `work`, `pipeline?`, `workspace?`, `cwd?`, `body?`, `skill?`, `context?`, `no_ticket?`, `refresh?`, `dry_run?` | Bring a work item's window to the state its pipeline declares: resolve the ticket, route it, create the missing agent panes, and deliver `body` to the ones already running. |
@@ -207,7 +210,7 @@ Registered message skills can be selected with or without a leading slash:
 ```text
 muxa_call_peer(target="auto", intent="review",
                skill="review-plan-feedback",
-               context="Review commit abc123", wait=true)
+               context="Review commit abc123", wait=false)
 
 muxa_call_peer(target="@codex", intent="task", execute=true,
                body="Add regression tests only",
@@ -217,6 +220,13 @@ muxa_call_peer(target="@codex", intent="task", execute=true,
 The MCP process reads `[message.skills]` at startup. Restart an already-running
 agent after `muxa skill add/remove`, after editing the table, or after upgrading
 Muxa so it loads the current skills and tool definitions.
+
+Mutation results are intentionally receipts, not copies of the durable request:
+they return correlation ids, status, and resolved routing, while terminal waits
+add only the new structured reply. Use `muxa_inbox`, `muxa_list_messages`, or
+`muxa_peer_report` when the stored body and history are actually needed. All
+JSON tool results are compact on the wire. This prevents a body the model just
+sent from being charged again as tool output and retained in later turns.
 
 ### Staffing a whole ticket
 
