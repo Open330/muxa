@@ -6,12 +6,15 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
         // Muxa has a persistent menu-bar scene, so AppKit can otherwise treat
         // a previously closed/off-screen workbench as the desired launch
         // state and create no visible window at all.
+        MuxaPreferences.registerDefaults()
         UserDefaults.standard.set(true, forKey: "ApplePersistenceIgnoreState")
         super.init()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        presentWorkbench(remainingAttempts: 50)
+        if UserDefaults.standard.bool(forKey: MuxaPreferences.showWorkbenchOnLaunchKey) {
+            presentWorkbench(remainingAttempts: 50)
+        }
     }
 
     func applicationShouldHandleReopen(
@@ -44,6 +47,7 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
 struct MuxaApp: App {
     @NSApplicationDelegateAdaptor(MuxaApplicationDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
+    @AppStorage(MuxaPreferences.appearanceKey) private var appearance = MuxaAppearance.system.rawValue
 
     var body: some Scene {
         workbenchWindow
@@ -52,13 +56,20 @@ struct MuxaApp: App {
             if let route {
                 DetachedModuleView(route: route, model: model)
                     .environmentObject(model)
+                    .preferredColorScheme(preferredColorScheme)
                     .frame(minWidth: 720, minHeight: 520)
             }
         }
         .defaultSize(width: 980, height: 720)
 
+        Settings {
+            MuxaSettingsView(model: model)
+                .preferredColorScheme(preferredColorScheme)
+        }
+
         MenuBarExtra("Muxa", systemImage: menuBarIcon) {
             MenuBarContent(model: model)
+                .preferredColorScheme(preferredColorScheme)
         }
         .menuBarExtraStyle(.window)
     }
@@ -74,6 +85,7 @@ struct MuxaApp: App {
         WindowGroup("Muxa", id: "main") {
             ContentView()
                 .environmentObject(model)
+                .preferredColorScheme(preferredColorScheme)
         }
         .defaultSize(width: 1120, height: 760)
         .commands {
@@ -96,6 +108,10 @@ struct MuxaApp: App {
         case .failed, .upgradeRequired: "terminal.fill"
         case .connecting, .connected: "terminal"
         }
+    }
+
+    private var preferredColorScheme: ColorScheme? {
+        MuxaAppearance(rawValue: appearance)?.colorScheme
     }
 }
 
@@ -174,6 +190,28 @@ private struct MenuBarContent: View {
                 NSApp.activate(ignoringOtherApps: true)
             }
             Divider()
+            if #available(macOS 14.0, *) {
+                SettingsLink {
+                    Label("Settings…", systemImage: "gearshape")
+                }
+            } else {
+                Button {
+                    let opened = NSApp.sendAction(
+                        Selector(("showSettingsWindow:")),
+                        to: nil,
+                        from: nil
+                    )
+                    if !opened {
+                        NSApp.sendAction(
+                            Selector(("showPreferencesWindow:")),
+                            to: nil,
+                            from: nil
+                        )
+                    }
+                } label: {
+                    Label("Settings…", systemImage: "gearshape")
+                }
+            }
             Button("Quit") { NSApp.terminate(nil) }
         }
         .padding(12)
