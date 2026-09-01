@@ -1104,8 +1104,12 @@ final class AppModel: ObservableObject {
     }
 
     func presentHostRegistration() {
-        hostRegistrationError = nil
+        prepareHostRegistration()
         isPresentingHostRegistration = true
+    }
+
+    func prepareHostRegistration() {
+        hostRegistrationError = nil
     }
 
     func registerHost(_ request: MuxaHostRegistrationRequest) async -> Bool {

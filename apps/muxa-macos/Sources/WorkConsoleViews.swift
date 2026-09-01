@@ -873,7 +873,7 @@ private struct AskProviderSettingsView: View {
     }
 }
 
-private struct AskProviderCredentialRow: View {
+struct AskProviderCredentialRow: View {
     let provider: MuxaAskProvider
     @ObservedObject var model: AppModel
     @State private var key = ""
@@ -2063,6 +2063,7 @@ private func collaborationStatusColor(_ status: String) -> Color {
 
 struct HostRegistrationView: View {
     @ObservedObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
     @State private var alias = ""
     @State private var ssh = ""
     @State private var mode = "observe"
@@ -2081,7 +2082,10 @@ struct HostRegistrationView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Cancel") { model.isPresentingHostRegistration = false }
+                Button("Cancel") {
+                    model.isPresentingHostRegistration = false
+                    dismiss()
+                }
                     .keyboardShortcut(.cancelAction)
                 Button("Register") { register() }
                     .keyboardShortcut(.defaultAction)
@@ -2143,7 +2147,7 @@ struct HostRegistrationView: View {
 
     private func register() {
         Task {
-            _ = await model.registerHost(
+            let registered = await model.registerHost(
                 MuxaHostRegistrationRequest(
                     alias: alias,
                     ssh: ssh,
@@ -2154,6 +2158,7 @@ struct HostRegistrationView: View {
                     overwrite: overwrite
                 )
             )
+            if registered { dismiss() }
         }
     }
 }

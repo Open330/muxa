@@ -545,6 +545,8 @@ struct MuxaFleetHost: Decodable, Hashable, Identifiable, Sendable {
     let state: String
     let latencyMS: UInt64?
     let error: String?
+    let muxaVersion: String?
+    let daemonGeneration: UInt64?
     let labels: [String: String]?
     let annotations: [String: String]?
     let remote: MuxaRemoteSnapshot?
@@ -558,6 +560,8 @@ struct MuxaFleetHost: Decodable, Hashable, Identifiable, Sendable {
         case alias, local, mode, state, error, labels, annotations, remote
         case sshTarget = "ssh_target"
         case latencyMS = "latency_ms"
+        case muxaVersion = "muxa_version"
+        case daemonGeneration = "daemon_generation"
     }
 }
 
@@ -972,6 +976,8 @@ actor MuxaIPCClient {
             state: "online",
             latencyMS: nil,
             error: nil,
+            muxaVersion: nil,
+            daemonGeneration: nil,
             labels: nil,
             annotations: nil,
             remote: MuxaRemoteSnapshot(agents: response.agents ?? [], panes: [])
