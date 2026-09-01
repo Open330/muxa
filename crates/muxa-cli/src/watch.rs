@@ -2713,6 +2713,10 @@ struct BroadcastReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BroadcastRow {
+    /// Which pane this row is about. Carried so a delivered recipient can
+    /// lose its mark while a failed one keeps it — retrying a partial
+    /// failure should not mean re-marking the ones that already went.
+    pane: String,
     label: String,
     outcome: Result<String, String>,
 }
@@ -7926,10 +7930,20 @@ pub async fn run(
                     if let Some(composer) = app.collaboration_composer.take() {
                         let (outcome, report) =
                             run_watch_collaboration_composer(client, composer).await;
-                        if report.is_some() {
-                            // A delivered broadcast consumes its marks: leaving
-                            // them set invites a second, unintended send.
-                            app.collaboration_marks.clear();
+                        if let Some(report) = report.as_ref() {
+                            // A delivered recipient consumes its mark; a failed
+                            // one keeps it, so the retry is the same key press
+                            // rather than a re-selection. Clearing everything
+                            // would make a partial failure look like a clean
+                            // slate.
+                            let delivered: std::collections::HashSet<&str> = report
+                                .rows
+                                .iter()
+                                .filter(|row| row.outcome.is_ok())
+                                .map(|row| row.pane.as_str())
+                                .collect();
+                            app.collaboration_marks
+                                .retain(|mark| !delivered.contains(mark.pane.as_str()));
                         }
                         app.broadcast_report = report;
                         apply_outcome_to_app(&mut app, outcome);
@@ -8933,8 +8947,8 @@ fn toggle_collaboration_mark(app: &mut App) -> ActionOutcome {
 ///
 /// Marks are pruned rather than trusted: a pane that went away, or one whose
 /// agent session was replaced, is dropped here instead of being addressed.
-/// Ordering follows the current row order so the confirmation reads like the
-/// screen.
+/// Ordering follows the room's peer list, which is what the confirmation and
+/// the report both render — one order, so the two always agree.
 fn resolved_marks(app: &App) -> Vec<(String, String)> {
     let mut resolved = Vec::new();
     let Some(room) = app.collaboration.room.as_ref() else {
@@ -8978,12 +8992,19 @@ fn open_watch_collaboration_composer(app: &mut App) {
             format!("{} marked agents ({stale} gone)", marked.len())
         };
         let defaults = app.collaboration_compose_defaults;
+        // just-send types into one pane; a marked set has no pane to type
+        // into. Opening in a mode that cannot send would leave Enter refusing
+        // and Ctrl-E the only way out, so the set opens read-only instead.
+        let mode = match defaults.mode {
+            ComposeSendMode::JustSend => ComposeSendMode::ReadOnly,
+            mode => mode,
+        };
         app.collaboration_composer = Some(CollaborationComposer::new(
             CollaborationComposeTarget::Broadcast {
                 origin,
                 recipients: marked,
                 kind: defaults.kind,
-                mode: defaults.mode,
+                mode,
             },
             label,
         ));
@@ -9071,6 +9092,7 @@ async fn run_watch_collaboration_broadcast(
     };
     let mut rows = Vec::with_capacity(recipients.len());
     for (pane, label) in recipients {
+        let pane = pane.clone();
         let request = NewRequest {
             kind,
             body: body.clone(),
@@ -9091,7 +9113,11 @@ async fn run_watch_collaboration_broadcast(
             .await
             .map(|sent| short_collaboration_request_id(&sent.id).clone())
             .map_err(|error| error.to_string());
-        rows.push(BroadcastRow { label, outcome });
+        rows.push(BroadcastRow {
+            pane,
+            label,
+            outcome,
+        });
     }
     let report = BroadcastReport { rows };
     let outcome = if report.failed() == 0 {
@@ -10836,13 +10862,6 @@ fn composer_cycle_option(app: &mut App) -> bool {
             hint = Some("kind applies to requests — Ctrl-E to leave just-send");
             None
         }
-        CollaborationComposeTarget::Broadcast {
-            mode: ComposeSendMode::JustSend,
-            ..
-        } => {
-            hint = Some("a marked set is addressed as requests — Ctrl-E to leave just-send");
-            None
-        }
         CollaborationComposeTarget::Send { kind, mode, .. }
         | CollaborationComposeTarget::Broadcast { kind, mode, .. } => {
             *kind = match *kind {
@@ -10892,6 +10911,19 @@ fn composer_cycle_mode(app: &mut App) -> bool {
                 ComposeSendMode::ReadOnly => ComposeSendMode::Execute,
                 ComposeSendMode::Execute => ComposeSendMode::JustSend,
                 ComposeSendMode::JustSend => ComposeSendMode::ReadOnly,
+            };
+            Some(CollaborationComposeDefaults {
+                kind: *kind,
+                mode: *mode,
+            })
+        }
+        Some(CollaborationComposeTarget::Broadcast { kind, mode, .. }) => {
+            // Two modes, not three: keystrokes cannot address a set, so the
+            // cycle skips just-send rather than offering a state Enter would
+            // then refuse.
+            *mode = match *mode {
+                ComposeSendMode::Execute => ComposeSendMode::ReadOnly,
+                ComposeSendMode::ReadOnly | ComposeSendMode::JustSend => ComposeSendMode::Execute,
             };
             Some(CollaborationComposeDefaults {
                 kind: *kind,
@@ -20673,6 +20705,58 @@ mod tests {
         assert_eq!(stale_mark_count(&app), 1);
     }
 
+    /// A set cannot be addressed by keystrokes, so a composer opened against
+    /// marks never starts in the one mode `Enter` would refuse. Without this
+    /// a persisted just-send default left the operator with a hint pointing
+    /// at Ctrl-E and no way to send.
+    #[test]
+    fn a_marked_composer_never_opens_in_a_mode_it_cannot_send_from() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let peer = fake_collaboration_participant("%1", "agent-1", None);
+        app.collaboration.origin = Some(CollaborationOrigin {
+            pane: "console".into(),
+            socket: Some("default".into()),
+            console: true,
+        });
+        app.collaboration.room = Some(RoomContext {
+            current: peer.clone(),
+            peers: vec![peer.clone()],
+            unread: 0,
+            unread_replies: 0,
+        });
+        app.collaboration_compose_defaults = CollaborationComposeDefaults {
+            kind: RequestKind::Question,
+            mode: ComposeSendMode::JustSend,
+        };
+        app.collaboration_marks.insert(CollaborationMark {
+            pane: "%1".into(),
+            agent_session_id: Some("agent-1".into()),
+        });
+
+        open_watch_collaboration_composer(&mut app);
+        let Some(CollaborationComposeTarget::Broadcast { mode, .. }) = app
+            .collaboration_composer
+            .as_ref()
+            .map(|composer| composer.target.clone())
+        else {
+            panic!("marks should open a broadcast composer");
+        };
+        assert_eq!(mode, ComposeSendMode::ReadOnly);
+
+        // And Ctrl-E cycles between the two modes a set can be sent in,
+        // rather than doing nothing.
+        assert!(composer_cycle_mode(&mut app));
+        let Some(CollaborationComposeTarget::Broadcast { mode, .. }) = app
+            .collaboration_composer
+            .as_ref()
+            .map(|composer| composer.target.clone())
+        else {
+            panic!("still a broadcast composer");
+        };
+        assert_eq!(mode, ComposeSendMode::Execute);
+    }
+
     /// Every recipient keeps its own row. A partial failure that renders as
     /// "sent" is the shape of bug this repo spent the week removing.
     #[test]
@@ -20680,10 +20764,12 @@ mod tests {
         let report = BroadcastReport {
             rows: vec![
                 BroadcastRow {
+                    pane: "%1".into(),
                     label: "codex@%1".into(),
                     outcome: Ok("req_ab".into()),
                 },
                 BroadcastRow {
+                    pane: "%2".into(),
                     label: "claude@%2".into(),
                     outcome: Err("target \"pane:%2\" is not a peer in this tmux window".into()),
                 },
