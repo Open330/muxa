@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Space` marks agents in `muxa watch`, and `m` then addresses all of
+  them.** Composing once for several agents meant sending several times, which
+  is both tedious and how the wording drifts between recipients. Marking uses
+  the same resolution `m` does, so what you mark is what you would have
+  messaged, and a mark names the agent *session* — a pane whose agent was
+  replaced is dropped rather than quietly addressed, and the composer says how
+  many marks it could not account for.
+
+  Each recipient gets its own ordinary request rather than a new broadcast
+  primitive: per-recipient authorization, provenance, idle-gated wake and reply
+  threading only exist per request, and one send that fans out inside the
+  daemon would have none of them. Delivery is sequential, a failure stops
+  nothing, and the result popup keeps one row per recipient — request id, or
+  the error and the fact that nothing was retried. A fan-out that reports "sent
+  to 5" cannot say which of the five did not get it.
+
+### Added
+
 - **`C` opens a window in watch, where `prefix + c` cannot reach.** Creating a
   plain shell window next to running work meant leaving the console: attach to
   the session, press `prefix + c`, then find your way back. Watch already knows

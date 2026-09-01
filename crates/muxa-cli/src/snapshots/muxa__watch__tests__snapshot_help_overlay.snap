@@ -26,7 +26,7 @@ j/k move  ·  / filter  ·  : commands  ·  ? help
 │                           │  Alt-A          attention-only filter                                            │                           │
 │                           │  [/] · f/c      (in preview) agent / geometry / content                          │                           │
 │                           │  Enter          (in preview) jump to pinned pane                                 │                           │
-│                           │  m / M          message selected agent / mailbox (b alias)                       │                           │
+│                           │  m / M / Space  message selected or marked / mailbox / mark agent                │                           │
 │                           │  Alt-1/2 · W    screen topology / collab · W is the work table                   │                           │
 │                           │  v              (in collab) toggle table / sequence history                      │                           │
 │                           │  i / e          (in mailbox) claim inbox / reply                                 │                           │
