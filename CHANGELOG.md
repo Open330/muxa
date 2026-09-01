@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.41] - 2026-09-01
+
 ### Fixed
 
 - **Two terminals on one workspace no longer hide every agent from
@@ -29,6 +31,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared the shape and are all fixed.
 
 ### Added
+
+- **Muxa for Mac is now a task-oriented Fleet workbench rather than a shell
+  wrapper.** Explore, Work, Operator Inbox, Global Ask, collaboration and
+  detachable Ghostty-backed shell surfaces share stable editor tabs, readable
+  Markdown request/reply views, resumable Claude Code or Codex conversations,
+  host/session/window summaries and exact-pane navigation. Provider API keys
+  remain optional one-turn credentials and are never persisted by muxad.
+
+- **Fleet, Ask, Pipeline, Inbox and native PTY updates are event-driven.** New
+  revision subscriptions replace high-frequency polling, while host-scoped
+  mailbox invalidations fetch only the node whose durable mailbox changed.
+  Terminal readers park on bounded output waits instead of opening 20–125
+  empty reads per second, and detach wakes a parked reader immediately.
+  Coalesced refreshes, immutable snapshot indexes, adaptive selected-pane
+  capture and slow authoritative reconciliation retain correctness after
+  reconnects without paying the old idle cost. Current relays forward mailbox
+  revisions without copying request bodies; older nodes continue through the
+  documented reconciliation fallback until upgraded.
 
 - **`Space` marks agents in `muxa watch`, and `m` then addresses all of
   them.** Composing once for several agents meant sending several times, which
