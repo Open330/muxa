@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two terminals on one workspace no longer hide every agent from
+  collaboration.** tmux lists a pane once per session that shows it, and a
+  session *group* shows one window through several sessions — which is exactly
+  what muxa's own `tmux-auto-view` builds, giving each attached client a
+  `<session>~view~<pid>` member of the group. Every pane in such a session was
+  therefore listed twice, and the participant resolver treated the second row
+  as an ambiguity and skipped the pane. With a second terminal attached there
+  were no participants, no origin and no peers: `muxa msg send`, `m` in
+  `muxa watch` and `muxa_call_peer` all refused with *"collaboration origin is
+  not a hook-correlated tracked pane agent"*, advising a restart of an agent
+  that was working fine — and the whole thing healed itself the moment the
+  second terminal detached, which is the worst way for a bug to behave.
+
+  Rows that agree on server, window and pane are now recognised as one pane
+  seen twice, with the durable session naming it rather than a per-client view.
+  The ambiguity that matters — one pane id on two servers — still refuses. The
+  origin resolver, the participant table and the pending-pane resolver all
+  shared the shape and are all fixed.
+
 ### Added
 
 - **`Space` marks agents in `muxa watch`, and `m` then addresses all of
