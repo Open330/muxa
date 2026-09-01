@@ -238,6 +238,7 @@ mod tests {
             cwd: None,
             state,
             last_prompt: Some("refactor the ipc module to use tokio io_uring".into()),
+            last_prompt_at: Some(datetime!(2026-04-24 12:00:00 UTC)),
             last_response: None,
             recap: None,
             ai_title: None,

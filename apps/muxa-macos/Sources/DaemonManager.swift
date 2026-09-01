@@ -220,6 +220,12 @@ final class DaemonManager {
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
+        // A GUI launch does not inherit the user's interactive-shell PATH.
+        // Credentials are passed only to an individual Ask child over the
+        // owner-only IPC socket, never installed daemon-wide.
+        process.environment = MuxaProviderCredentialStore.augmentPath(
+            ProcessInfo.processInfo.environment
+        )
         try process.run()
         launchedProcess = process
 

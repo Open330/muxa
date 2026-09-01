@@ -14,6 +14,9 @@ private final class PaneCaptureModel: ObservableObject {
 
     private let client: MuxaIPCClient
     private let target: MuxaPaneTarget
+    private var isVisible = true
+    private var isApplicationActive = NSApp.isActive
+    private var hasLoaded = false
 
     init(client: MuxaIPCClient, target: MuxaPaneTarget) {
         self.client = client
@@ -21,29 +24,63 @@ private final class PaneCaptureModel: ObservableObject {
     }
 
     func run() async {
+        var unchangedReads = 0
         while !Task.isCancelled {
-            await refresh()
+            guard isVisible, isApplicationActive else {
+                do {
+                    try await Task.sleep(for: .seconds(5))
+                } catch {
+                    return
+                }
+                continue
+            }
+            let changed = await refresh()
+            unchangedReads = changed ? 0 : min(unchangedReads + 1, 8)
+            let interval: Duration = switch unchangedReads {
+            case 0: .milliseconds(750)
+            case 1...2: .milliseconds(1500)
+            case 3...5: .seconds(3)
+            default: .seconds(5)
+            }
             do {
-                try await Task.sleep(for: .seconds(1))
+                try await Task.sleep(for: interval)
             } catch {
                 return
             }
         }
     }
 
-    private func refresh() async {
-        guard !isRefreshing else { return }
-        isRefreshing = true
-        defer { isRefreshing = false }
+    func setVisible(_ visible: Bool) {
+        isVisible = visible
+    }
+
+    func setApplicationActive(_ active: Bool) {
+        isApplicationActive = active
+    }
+
+    private func refresh() async -> Bool {
+        guard !isRefreshing else { return false }
+        if !hasLoaded { isRefreshing = true }
+        defer {
+            hasLoaded = true
+            if isRefreshing { isRefreshing = false }
+        }
         do {
             let capture = try await client.captureFleetPane(host: target.host, pane: target.pane)
-            screenText = capture.screenText.map(sanitizeTerminalCapture)
+            let nextScreenText = capture.screenText.map(sanitizeTerminalCapture)
                 ?? "This backend cannot capture the selected pane."
-            errorMessage = nil
+            let changed = nextScreenText != screenText
+            if changed {
+                screenText = nextScreenText
+            }
+            if errorMessage != nil { errorMessage = nil }
+            return changed
         } catch is CancellationError {
-            return
+            return false
         } catch {
-            errorMessage = error.localizedDescription
+            let message = error.localizedDescription
+            if errorMessage != message { errorMessage = message }
+            return false
         }
     }
 }
@@ -53,6 +90,7 @@ struct PaneCaptureView: View {
     private let target: MuxaPaneTarget
     private let showsHeader: Bool
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.scenePhase) private var scenePhase
 
     init(client: MuxaIPCClient, target: MuxaPaneTarget, showsHeader: Bool = true) {
         self.target = target
@@ -90,13 +128,21 @@ struct PaneCaptureView: View {
                 Divider()
             }
 
-            ScrollView([.horizontal, .vertical]) {
-                Text(verbatim: model.screenText)
-                    .font(.system(size: 12, weight: .regular, design: .monospaced))
-                    .foregroundStyle(colorScheme == .dark ? Color(white: 0.92) : Color(white: 0.12))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                    .padding(12)
+            GeometryReader { proxy in
+                ScrollView([.horizontal, .vertical]) {
+                    Text(verbatim: model.screenText)
+                        .font(.system(size: 12, weight: .regular, design: .monospaced))
+                        .foregroundStyle(colorScheme == .dark ? Color(white: 0.92) : Color(white: 0.12))
+                        .textSelection(.disabled)
+                        .fixedSize(horizontal: true, vertical: true)
+                        .frame(
+                            minWidth: max(0, proxy.size.width - 24),
+                            minHeight: max(0, proxy.size.height - 24),
+                            alignment: .topLeading
+                        )
+                        .padding(12)
+                }
+                .frame(width: proxy.size.width, height: proxy.size.height)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(MuxaSurfacePalette.terminal(for: colorScheme))
@@ -110,7 +156,8 @@ struct PaneCaptureView: View {
                     .background(MuxaSurfacePalette.sidebar(for: colorScheme))
             }
         }
-        .frame(minHeight: 180)
+        .frame(maxWidth: .infinity, minHeight: 180, maxHeight: .infinity)
+        .clipped()
         .overlay {
             if showsHeader {
                 Rectangle()
@@ -118,6 +165,14 @@ struct PaneCaptureView: View {
             }
         }
         .task { await model.run() }
+        .onAppear {
+            model.setVisible(true)
+            model.setApplicationActive(scenePhase == .active)
+        }
+        .onDisappear { model.setVisible(false) }
+        .onChange(of: scenePhase) { phase in
+            model.setApplicationActive(phase == .active)
+        }
     }
 
     private var copyButton: some View {

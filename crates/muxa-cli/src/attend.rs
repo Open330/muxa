@@ -436,6 +436,7 @@ mod tests {
             cwd: None,
             state,
             last_prompt: None,
+            last_prompt_at: None,
             last_response: None,
             recap: None,
             ai_title: None,

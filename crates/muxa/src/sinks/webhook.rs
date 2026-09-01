@@ -495,6 +495,7 @@ mod tests {
             cwd: None,
             state: AgentState::WaitingInput,
             last_prompt: prompt.map(str::to_string),
+            last_prompt_at: prompt.map(|_| datetime!(2026-04-30 12:00:00 UTC)),
             last_response: None,
             recap: None,
             ai_title: None,

@@ -28,8 +28,12 @@ session backed by a muxad-owned PTY.
 The native workspace follows two proven desktop navigation patterns:
 
 - VS Code's Activity Bar switches one contextual sidebar at a time while the
-  editor area remains stable. Muxa applies that to **Work**, **Agents**,
-  **Hosts**, and **Shells**, with a filter scoped to the active context.
+  editor area remains stable. Muxa applies that to **Work**, **Explore**,
+  **Inbox**, and **Shells**, with a filter scoped to the active context.
+  Explore owns topology and host registration, while Inbox owns the operator's
+  sent commands, durable replies, global Ask, and agents that require operator
+  attention. Explore already uses hosts as its
+  roots, so it does not duplicate them in a separate Hosts activity.
 - Lens separates resource navigation from contextual details and supports
   drilling into a resource without flattening infrastructure identity. Muxa
   keeps each fleet agent session independent and treats host, tmux session,
@@ -37,13 +41,27 @@ The native workspace follows two proven desktop navigation patterns:
 
 The detail area is deliberately task-oriented:
 
-- **Work** exists only for a durable managed run with an explicit
-  `workspace_id/work_id`; names observed from tmux do not create fake Work.
+- **Work** exists for a pipeline run or for panes carrying an explicit complete
+  `workspace_id/work_id` stamp, including Fleet panes started by `muxa work` on
+  another host. Session and window names alone never create fake Work.
 - **Agent** opens on a Markdown summary and provides separate
   **Conversation** and read-only live **Shell** tabs. The Shell tab can switch
   between a safe screen capture and an escaped **Raw** byte view.
-- **Host** summarizes multi-host connectivity, latency, panes, and the
-  independent agent sessions running there.
+- **Host** leads with execution-session cards and their retained agent
+  summaries. Selecting a session opens a second resource summary grouped by
+  window; connection strings and topology identifiers remain available behind
+  a Details disclosure instead of competing with the work context.
+- **Window** has its own editor resource. It combines recap, latest response,
+  prompt/notification fallbacks, activity and state timestamps, model/context/
+  cost, live subagents, process workload, and the window's collaboration
+  replies. The small session cards lead with the most urgent/current outcome
+  and open this report instead of truncating a multi-agent window into two
+  indistinguishable pane rows.
+- **Inbox** is an operator queue rather than another agent list. It reads the
+  console's sent mailbox once per reachable Fleet host, deduplicates requests,
+  and exposes waiting, replied, and unread states together with Global Ask
+  history. Opening a command returns to its exact agent pane; reading a reply
+  uses the durable collaboration get operation.
 - **Shell** is the interactive native Ghostty surface owned by a muxad PTY.
   It also has a read-only **Raw** mode for the bounded PTY output stream.
 
@@ -61,15 +79,19 @@ opens the canonical interactive `muxa work init` wizard in a native Shell tab;
 after setup, the same sheet can start or dry-run the Work directly.
 
 **Live Watch** is the native replacement for the common `muxa watch` operator
-loop. It nests **Host → workspace/session → Work/window → agent/pane**, orders
-the local host first, and keeps each host's stable laptop/server badge visible.
-Selecting a pane opens an inspector with Markdown summary, exact execution
-metadata, prompt control, and a bottom **Live Pane**. The Live Pane starts as a
-clearly marked read-only screen preview. Clicking the preview or **Click to
-Type** attaches the exact pane in place, swaps the bottom panel to an
-interactive Ghostty surface, and focuses it for immediate keyboard input. Raw
-bytes are intentionally not exposed in Live Pane. Agents in the sidebar are
-likewise grouped by host instead of flattened into one ambiguous fleet list.
+loop. It nests **Host → Session → Window → Pane**, labels windows with their
+logical Work identity when one exists, orders the local host first, and keeps
+each host's stable laptop/server badge visible. A one-window session expands
+straight to its panes. Selecting a host summarizes its sessions; selecting a
+session summarizes each window; selecting a pane opens the working inspector.
+The pane Overview leads with the selected agent's Markdown summary and latest
+response, keeps the other agents in that window in a compact disclosure, and
+moves exact host/session/window/pane identifiers into a Details popover. The
+bottom **Live Pane** starts as a clearly marked read-only screen preview and
+uses an explicit copy action so clicking text cannot switch renderers or alter
+wrapping. **Click to Type** attaches the exact pane in place, swaps the panel to
+an interactive Ghostty surface, and focuses it for immediate keyboard input.
+Raw bytes are intentionally not exposed in Live Pane.
 
 Shells and monitored Fleet panes are workspace modules. They participate in
 preview/pin tabs and can be detached into independent macOS windows. Attaching
@@ -77,14 +99,23 @@ from Live Watch runs the bundled `muxa fleet attach` inside a muxad-owned PTY
 and reuses the bottom Live Pane instead of navigating away. **Open in Shell**
 remains available when a dedicated Shell tab is useful. A tmux detach returns
 the bottom panel to its read-only preview; in a dedicated Shell tab, the same
-detach closes the ended tab. This keeps the monitoring safety boundary while
-still making exact local and remote panes directly usable.
+detach closes the ended tab. Interactive app attach temporarily applies tmux's
+`latest` window sizing and zooms the exact pane, making it follow the Live Pane
+viewport instead of retaining a narrow split width. Detach restores the prior
+window dimensions, sizing policy, zoom state, and active pane. The controller
+applies this over SSH for remote nodes, so it remains compatible with a Fleet
+host running the previous additive CLI endpoint. This keeps the monitoring
+safety boundary while still making exact local and remote panes directly
+usable.
 
 Selecting a new item opens it as a replaceable preview tab. Pinning preserves
 the tab while another Work, Agent, Host, or Shell is inspected. `Command-Shift-P`
 opens the workspace command palette, and each sidebar context supports text and
-status filters (`All`, `Attention`, `Active`). Attention counts remain visible
-on the activity rail even when another context is selected.
+status filters (`All`, `Attention`, `Active`). The Inbox activity badge keeps
+agent attention, waiting commands, unread replies, and running Ask counts
+visible even when another context is selected. Editor tab
+close controls and all Explorer disclosure/row targets use full-size hit areas
+rather than relying on the visible glyph alone.
 
 Raw Fleet captures are carried as a bounded `capture_raw_base64` field. The UI
 never sends those bytes to a terminal parser or renders control sequences:
@@ -139,6 +170,27 @@ apps/muxa-macos/Scripts/smoke-test.sh
 Set `MUXA_SOCKET` before opening from a shell to select a non-default daemon
 socket. Otherwise, the app uses `/tmp/muxa-<uid>.sock`, matching muxa's macOS
 fallback.
+
+## Headless providers and API keys
+
+Global Ask uses the installed `claude` and `codex` CLIs in their structured
+non-interactive modes. The app augments a GUI-launched muxad PATH with
+`~/.local/bin`, `~/.cargo/bin`, and Homebrew locations, while preserving
+normal Claude Code/Codex CLI sign-in.
+
+When `[ask].enabled` is absent or false, the Ask view shows an explicit
+**Enable & Reload** action instead of allowing the first question to fail.
+This writes the same opt-in grant as `muxa init --component ask` and reloads
+muxad; native PTY sessions require confirmation before replacement, while tmux
+sessions remain running. Submit from the composer with **Command-Return** or
+the provider-neutral **Send** button.
+
+The Providers sheet can optionally store `ANTHROPIC_API_KEY` or
+`CODEX_API_KEY` in the macOS login Keychain. A key is fetched only when its
+matching provider is selected and crosses the owner-only muxad socket as a
+one-turn credential. muxad puts it in only that child process environment; it
+is redacted from debug output and never appears in config, Ask history, logs,
+or command arguments.
 
 ## Local QA helper
 
@@ -216,7 +268,8 @@ not committed.
 
 The existing newline-delimited JSON control protocol remains compatible with
 older clients. Native terminal clients require the additive
-`session_bytes_v1` capability:
+`session_bytes_v1` capability. Current clients also prefer the additive
+`session_wait_v1` path:
 
 - `read_session` includes `data_base64`, whose decoded bytes correspond
   exactly to `offset..<next_offset`;
@@ -228,6 +281,35 @@ older clients. Native terminal clients require the additive
   terminal negotiation;
 - `truncated: true` explicitly tells the UI that the requested offset fell
   behind muxad's bounded retention window.
+
+`read_session_wait` blocks on the PTY output/exit signal for at most 15
+seconds, replacing the former 8–45 ms empty-read loop. MuxaIPCClient assigns
+terminal reads their own serialized lane; keyboard input, attachment changes,
+and resize control remain responsive while that lane waits.
+
+## Event-driven refresh and render budget
+
+Muxa.app opens compact `fleet_subscribe`, `pipeline_subscribe`, and
+`ask_subscribe` streams after its initial coherent load. Fleet bursts are
+coalesced for 75 ms and capped at four snapshot reads per second. A slow
+15-second full reconciliation repairs stream disconnects and lag gaps; it is
+not the primary freshness path. Collaboration revisions travel per host, so
+the operator inbox and an open Collaborate module re-read only the affected
+host rather than polling every mailbox every two seconds. Inbox safety
+reconciliation runs at most once per minute while it is visible, and equal
+mailboxes do not republish SwiftUI state.
+
+Execution snapshots build the host/session/window/pane tree, agent-to-pane
+matches, and selection indexes once at decode time. Work and hosted-agent
+projections are rebuilt only when their source snapshot or pipeline runs
+change. Equal snapshots do not reassign `@Published` properties or increment
+`workspaceRevision`, avoiding an otherwise full SwiftUI text/layout pass.
+
+Live Pane capture remains selected-only because tmux exposes capture as a
+snapshot operation rather than an output event. It runs at 750 ms while the
+screen changes, backs off through 1.5/3/5 seconds when stable, and suspends
+capture while its view or the application is inactive. Only changed text or
+error values are published.
 
 Native Work launch uses the additive `work_control_v1` capability. `work_up`
 returns a bounded operation immediately, and `work_up_status` reports

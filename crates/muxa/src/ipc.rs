@@ -19,7 +19,7 @@
 //! can call `Store::apply` afterwards, so the daemon's final flush
 //! captures every state change the user actually triggered.
 
-use crate::ask::{AskEntry, AskStore};
+use crate::ask::{AskConversation, AskCredential, AskEntry, AskStore};
 use crate::backend::{default_backend, HostKind, SharedBackend};
 use crate::collaboration::{
     self, AirArtifactReference, CollaborationClientKind, CollaborationOptions, CollaborationOrigin,
@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinSet;
 
 /// Maximum time `Server::run` will wait for in-flight handlers to finish
@@ -88,6 +88,10 @@ const IDLE_CONN_TIMEOUT: Duration = Duration::from_secs(10);
 /// pipe) instead of lingering until the next real transition — bounding a
 /// dead stream's fd lifetime to roughly one interval.
 const STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+const fn default_session_wait_ms() -> u64 {
+    15_000
+}
 
 /// Overall deadline for a client request/response round trip (connect +
 /// hello + write + read). No caller should ever block forever against a
@@ -164,6 +168,7 @@ enum RequestBody {
     },
     /// Durable desired graph and per-alias execution state for every Work Run.
     PipelineRuns,
+    PipelineSubscribe,
     /// Start the canonical `muxa work up` implementation as a bounded daemon
     /// operation. The initial call returns immediately; native clients poll
     /// `work_up_status` so a ticket lookup never freezes their state stream.
@@ -324,8 +329,25 @@ enum RequestBody {
     /// the answer lands in the store when the agent exits.
     AskSend {
         prompt: String,
+        /// Optional one-turn credential. The socket is owner-only (0600);
+        /// the daemon moves this directly into the child environment and the
+        /// Ask store never persists it.
+        #[serde(default)]
+        credential: Option<AskCredential>,
     },
+    AskSubscribe,
+    /// Report whether the daemon accepted the explicit `[ask].enabled`
+    /// grant at startup. This lets native clients present setup before a
+    /// typed question fails with a configuration error.
+    AskStatus {},
     AskList {},
+    /// List durable conversations and identify the selected one for the
+    /// current provider.
+    AskConversationList {},
+    /// Resume a prior muxa conversation, switching provider when needed.
+    AskConversationSelect {
+        conversation_id: String,
+    },
     /// Point the next question at a different agent, or read back which
     /// one is selected when `agent` is omitted.
     AskAgent {
@@ -343,6 +365,10 @@ enum RequestBody {
     CollaborationInbox {
         origin: CollaborationOrigin,
     },
+    /// Long-lived, content-free durable-mailbox invalidation stream. Reading
+    /// actual requests still goes through the normal participant/operator
+    /// authorization paths.
+    CollaborationSubscribe,
     CollaborationList {
         origin: CollaborationOrigin,
         #[serde(default)]
@@ -413,6 +439,15 @@ enum RequestBody {
     ReadSession {
         session_id: String,
         offset: u64,
+    },
+    /// Bounded event-driven terminal read. The daemon waits on the PTY
+    /// session's output/exit signal instead of requiring native clients to
+    /// issue 20-125 empty reads per second.
+    ReadSessionWait {
+        session_id: String,
+        offset: u64,
+        #[serde(default = "default_session_wait_ms")]
+        timeout_ms: u64,
     },
     WriteSession {
         session_id: String,
@@ -487,6 +522,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_mailbox",
     "collaboration_lifecycle",
     "collaboration_wait",
+    "collaboration_subscribe",
     "collaboration_identity",
     "collaboration_provenance",
     "collaboration_scope",
@@ -494,10 +530,16 @@ const CAPABILITIES: &[&str] = &[
     "fleet_raw_capture_v1",
     "fleet_subscribe",
     "pipeline_runs_v1",
+    "pipeline_subscribe",
     "work_control_v1",
     "handle_namespace_v1",
     "session_bytes_v1",
     "session_attachment_identity_v1",
+    "session_wait_v1",
+    "ask_one_turn_credential_v1",
+    "ask_status_v1",
+    "ask_conversations_v1",
+    "ask_subscribe",
 ];
 
 /// Advertised only when the server has the controller required to come back
@@ -587,7 +629,13 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ask_entry: Option<AskEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_conversations: Option<Vec<AskConversation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_conversation: Option<AskConversation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ask_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fleet: Option<FleetSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -637,7 +685,10 @@ impl Response {
             collaboration_request: None,
             ask_entries: None,
             ask_entry: None,
+            ask_conversations: None,
+            ask_conversation: None,
             ask_agent: None,
+            ask_enabled: None,
             fleet: None,
             fleet_result: None,
             pipeline_runs: None,
@@ -773,6 +824,11 @@ impl Response {
         r.ask_entries = Some(entries);
         r
     }
+    fn with_ask_status(enabled: bool) -> Self {
+        let mut response = Self::ok();
+        response.ask_enabled = Some(enabled);
+        response
+    }
     fn with_ask_agent(agent: String) -> Self {
         let mut r = Self::ok();
         r.ask_agent = Some(agent);
@@ -782,6 +838,20 @@ impl Response {
         let mut r = Self::ok();
         r.ask_entry = Some(entry);
         r
+    }
+    fn with_ask_conversations(
+        conversations: Vec<AskConversation>,
+        active: Option<AskConversation>,
+    ) -> Self {
+        let mut response = Self::ok();
+        response.ask_conversations = Some(conversations);
+        response.ask_conversation = active;
+        response
+    }
+    fn with_ask_conversation(conversation: AskConversation) -> Self {
+        let mut response = Self::ok();
+        response.ask_conversation = Some(conversation);
+        response
     }
     fn hello(restart: Option<&RestartController>) -> Self {
         let mut r = Self::ok();
@@ -1576,6 +1646,7 @@ async fn stream_fleet_updates(
                         state: crate::fleet::FleetHostState::Degraded,
                         revision: None,
                         resync: true,
+                        mailbox_revision: None,
                     };
                     let bytes = encode_line(&update, protocol)?;
                     if writer.write_all(&bytes).await.is_err()
@@ -1585,6 +1656,42 @@ async fn stream_fleet_updates(
                     }
                 }
             },
+            _ = keepalive.tick() => {
+                if writer.write_all(b"\n").await.is_err()
+                    || writer.flush().await.is_err()
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// Stream only the monotonic durable-mailbox revision. This signal contains
+/// no request content or participant identity; it is safe to propagate
+/// through Fleet as a cache invalidation while mailbox reads remain scoped.
+async fn stream_revision_updates(
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    mut changes: watch::Receiver<u64>,
+    protocol: u32,
+) -> Result<(), RuntimeError> {
+    let mut keepalive = tokio::time::interval(STREAM_KEEPALIVE_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    keepalive.tick().await;
+    loop {
+        tokio::select! {
+            signal = changes.changed() => {
+                if signal.is_err() {
+                    return Ok(());
+                }
+                let frame = serde_json::json!({ "revision": *changes.borrow_and_update() });
+                let bytes = encode_line(&frame, protocol)?;
+                if writer.write_all(&bytes).await.is_err()
+                    || writer.flush().await.is_err()
+                {
+                    return Ok(());
+                }
+            }
             _ = keepalive.tick() => {
                 if writer.write_all(b"\n").await.is_err()
                     || writer.flush().await.is_err()
@@ -2195,6 +2302,15 @@ async fn handle(
                     kind = "pipeline_runs";
                     Response::with_pipeline_runs(pipeline_runs.list().await)
                 }
+                RequestBody::PipelineSubscribe => {
+                    let changes = pipeline_runs.subscribe();
+                    let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
+                    let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
+                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                        return Ok(());
+                    }
+                    return stream_revision_updates(writer, changes, stream_proto).await;
+                }
                 RequestBody::WorkUp { request } => {
                     kind = "work_up";
                     match work_up.start(request).await {
@@ -2614,16 +2730,43 @@ async fn handle(
                     .await;
                     response
                 }
-                RequestBody::AskSend { prompt } => {
+                RequestBody::AskSend { prompt, credential } => {
                     kind = "ask_send";
-                    match ask.ask(&prompt).await {
+                    match ask.ask_with_credential(&prompt, credential).await {
                         Ok(entry) => Response::with_ask_entry(entry),
                         Err(error) => Response::err(error.to_string()),
                     }
                 }
+                RequestBody::AskSubscribe => {
+                    let changes = ask.subscribe();
+                    let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
+                    let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
+                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                        return Ok(());
+                    }
+                    return stream_revision_updates(writer, changes, stream_proto).await;
+                }
+                RequestBody::AskStatus {} => {
+                    kind = "ask_status";
+                    Response::with_ask_status(ask.enabled())
+                }
                 RequestBody::AskList {} => {
                     kind = "ask_list";
                     Response::with_ask_entries(ask.list().await)
+                }
+                RequestBody::AskConversationList {} => {
+                    kind = "ask_conversation_list";
+                    Response::with_ask_conversations(
+                        ask.list_conversations().await,
+                        ask.active_conversation().await,
+                    )
+                }
+                RequestBody::AskConversationSelect { conversation_id } => {
+                    kind = "ask_conversation_select";
+                    match ask.select_conversation(&conversation_id).await {
+                        Ok(conversation) => Response::with_ask_conversation(conversation),
+                        Err(error) => Response::err(error.to_string()),
+                    }
                 }
                 RequestBody::AskAgent { agent } => {
                     kind = "ask_agent";
@@ -2637,8 +2780,7 @@ async fn handle(
                 }
                 RequestBody::AskReset {} => {
                     kind = "ask_reset";
-                    ask.reset_thread().await;
-                    Response::ok()
+                    Response::with_ask_conversation(ask.reset_thread().await)
                 }
                 RequestBody::AskClear {} => {
                     kind = "ask_clear";
@@ -2724,6 +2866,22 @@ async fn handle(
                     )
                     .await;
                     response
+                }
+                RequestBody::CollaborationSubscribe => {
+                    kind = "collaboration_subscribe";
+                    let changes = collaboration.subscribe();
+                    let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
+                    let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
+                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                        return Ok(());
+                    }
+                    tracing::debug!(
+                        elapsed_us =
+                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        kind,
+                        "ipc.handle (collaboration stream takeover)",
+                    );
+                    return stream_revision_updates(writer, changes, stream_proto).await;
                 }
                 RequestBody::CollaborationList {
                     origin,
@@ -2957,6 +3115,24 @@ async fn handle(
                     match sessions.read_output(&session_id, offset) {
                         Ok(output) => Response::with_output(output),
                         Err(e) => Response::err(e.to_string()),
+                    }
+                }
+                RequestBody::ReadSessionWait {
+                    session_id,
+                    offset,
+                    timeout_ms,
+                } => {
+                    kind = "read_session_wait";
+                    let sessions = Arc::clone(&sessions);
+                    let timeout = Duration::from_millis(timeout_ms.clamp(1, 30_000));
+                    match tokio::task::spawn_blocking(move || {
+                        sessions.read_output_wait(&session_id, offset, timeout)
+                    })
+                    .await
+                    {
+                        Ok(Ok(output)) => Response::with_output(output),
+                        Ok(Err(e)) => Response::err(e.to_string()),
+                        Err(e) => Response::err(format!("session wait task failed: {e}")),
                     }
                 }
                 RequestBody::WriteSession { session_id, data } => {
@@ -3252,6 +3428,12 @@ pub struct FleetUpdateStream {
     line: String,
 }
 
+/// Content-free durable mailbox revision stream.
+pub struct CollaborationUpdateStream {
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    line: String,
+}
+
 /// Whether a subscribe-stream line is the daemon's `lagged` control marker
 /// (`{"event":"lagged",…}`) rather than a `Transition`. Kept cheap: a real
 /// `Transition` is tagged by `from`/`to`, never an `event` field, so a
@@ -3422,6 +3604,28 @@ impl FleetUpdateStream {
     }
 }
 
+impl CollaborationUpdateStream {
+    pub async fn recv(&mut self) -> Result<Option<u64>, RuntimeError> {
+        loop {
+            self.line.clear();
+            let n = read_limited_line(&mut self.reader, &mut self.line).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            let trimmed = self.line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let frame: serde_json::Value = serde_json::from_str(trimmed)?;
+            return frame["revision"].as_u64().map(Some).ok_or_else(|| {
+                RuntimeError::Json(serde::de::Error::custom(
+                    "collaboration update is missing revision",
+                ))
+            });
+        }
+    }
+}
+
 impl Client {
     pub fn new(socket_path: PathBuf) -> Self {
         Self {
@@ -3543,6 +3747,80 @@ impl Client {
         }
         drop(writer);
         Ok(FleetUpdateStream {
+            reader,
+            line: String::new(),
+        })
+    }
+
+    /// Subscribe to content-free durable collaboration invalidations. This
+    /// does not grant mailbox read access and is primarily used by Fleet
+    /// relays to wake native operator inboxes.
+    pub async fn collaboration_subscribe(&self) -> Result<CollaborationUpdateStream, RuntimeError> {
+        tokio::time::timeout(CLIENT_CALL_TIMEOUT, self.collaboration_subscribe_inner())
+            .await
+            .map_err(|_| RuntimeError::Timeout(CLIENT_CALL_TIMEOUT))?
+    }
+
+    async fn collaboration_subscribe_inner(
+        &self,
+    ) -> Result<CollaborationUpdateStream, RuntimeError> {
+        self.revision_subscribe_inner("collaboration_subscribe")
+            .await
+    }
+
+    pub async fn ask_subscribe(&self) -> Result<CollaborationUpdateStream, RuntimeError> {
+        tokio::time::timeout(
+            CLIENT_CALL_TIMEOUT,
+            self.revision_subscribe_inner("ask_subscribe"),
+        )
+        .await
+        .map_err(|_| RuntimeError::Timeout(CLIENT_CALL_TIMEOUT))?
+    }
+
+    pub async fn pipeline_subscribe(&self) -> Result<CollaborationUpdateStream, RuntimeError> {
+        tokio::time::timeout(
+            CLIENT_CALL_TIMEOUT,
+            self.revision_subscribe_inner("pipeline_subscribe"),
+        )
+        .await
+        .map_err(|_| RuntimeError::Timeout(CLIENT_CALL_TIMEOUT))?
+    }
+
+    async fn revision_subscribe_inner(
+        &self,
+        kind: &str,
+    ) -> Result<CollaborationUpdateStream, RuntimeError> {
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
+                    RuntimeError::NotConnected(self.socket_path.clone())
+                }
+                _ => RuntimeError::Io(error),
+            })?;
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        self.send_hello(&mut reader, &mut writer).await?;
+
+        let mut request = serde_json::to_vec(&serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": kind,
+        }))?;
+        request.push(b'\n');
+        writer.write_all(&request).await?;
+        writer.flush().await?;
+
+        let mut ack = String::new();
+        read_limited_line(&mut reader, &mut ack).await?;
+        let ack: serde_json::Value = serde_json::from_str(ack.trim())?;
+        if !ack["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(format!(
+                "{kind} rejected: {}",
+                ack["error"].as_str().unwrap_or("(no error message)")
+            ))));
+        }
+        drop(writer);
+        Ok(CollaborationUpdateStream {
             reader,
             line: String::new(),
         })
@@ -3794,10 +4072,26 @@ impl Client {
 
     /// Queue a headless question; the returned entry is `Running`.
     pub async fn ask_send(&self, prompt: &str) -> Result<AskEntry, RuntimeError> {
+        self.ask_send_with_credential(prompt, None, None).await
+    }
+
+    /// Queue a headless question with an optional one-turn API key. The key
+    /// is serialized only on the owner-only socket and is absent from the
+    /// response and durable Ask history.
+    pub async fn ask_send_with_credential(
+        &self,
+        prompt: &str,
+        agent: Option<&str>,
+        api_key: Option<&str>,
+    ) -> Result<AskEntry, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "ask_send",
             "prompt": prompt,
+            "credential": agent.zip(api_key).map(|(agent, api_key)| serde_json::json!({
+                "agent": agent,
+                "api_key": api_key,
+            })),
         });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["ask_entry"].clone()).map_err(RuntimeError::Json)
@@ -3807,6 +4101,43 @@ impl Client {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_list" });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["ask_entries"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn ask_conversation_list(
+        &self,
+    ) -> Result<(Vec<AskConversation>, Option<AskConversation>), RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_conversation_list",
+        });
+        let resp = self.call_checked(&req).await?;
+        let conversations = serde_json::from_value(resp["ask_conversations"].clone())
+            .map_err(RuntimeError::Json)?;
+        let active =
+            serde_json::from_value(resp["ask_conversation"].clone()).map_err(RuntimeError::Json)?;
+        Ok((conversations, active))
+    }
+
+    pub async fn ask_conversation_select(
+        &self,
+        conversation_id: &str,
+    ) -> Result<AskConversation, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_conversation_select",
+            "conversation_id": conversation_id,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_conversation"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Return the daemon's startup-time Global Ask grant.
+    pub async fn ask_status(&self) -> Result<bool, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_status" });
+        let resp = self.call_checked(&req).await?;
+        resp["ask_enabled"]
+            .as_bool()
+            .ok_or_else(|| RuntimeError::Json(serde::de::Error::custom("missing ask_enabled")))
     }
 
     /// Read the selected agent (`None`) or switch to another (`Some`).
@@ -3820,9 +4151,10 @@ impl Client {
         serde_json::from_value(resp["ask_agent"].clone()).map_err(RuntimeError::Json)
     }
 
-    pub async fn ask_reset(&self) -> Result<(), RuntimeError> {
+    pub async fn ask_reset(&self) -> Result<AskConversation, RuntimeError> {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_reset" });
-        self.call_checked(&req).await.map(|_| ())
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_conversation"].clone()).map_err(RuntimeError::Json)
     }
 
     /// Delete completed ask history while leaving active work and the current
@@ -5808,9 +6140,89 @@ mod tests {
         assert!(caps.contains(&"session_bytes_v1"));
         assert!(caps.contains(&"work_control_v1"));
         assert!(caps.contains(&"session_attachment_identity_v1"));
+        assert!(caps.contains(&"session_wait_v1"));
+        assert!(caps.contains(&"collaboration_subscribe"));
+        assert!(caps.contains(&"pipeline_subscribe"));
+        assert!(caps.contains(&"ask_subscribe"));
+        assert!(caps.contains(&"ask_one_turn_credential_v1"));
+        assert!(caps.contains(&"ask_status_v1"));
+        assert!(caps.contains(&"ask_conversations_v1"));
         assert!(!caps.contains(&RESTART_CAPABILITY));
         assert!(!caps.contains(&STOP_CAPABILITY));
         assert!(resp["generation"].is_null());
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_subscription_wakes_on_store_revision_without_polling() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-subscribe.sock");
+        let ask = crate::ask::AskStore::in_memory(crate::ask::AskOptions::default());
+        let server = Server::new(sock.clone(), Store::shared()).with_ask(Arc::clone(&ask));
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let mut updates = Client::new(sock.clone()).ask_subscribe().await.unwrap();
+        let next_agent = if ask.agent().await == "claude" {
+            "codex"
+        } else {
+            "claude"
+        };
+        ask.set_agent(next_agent).await.unwrap();
+        let revision = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .expect("ask revision should be pushed")
+            .unwrap()
+            .expect("stream should remain open");
+        assert_eq!(revision, 1);
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_status_reports_the_explicit_runtime_grant() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-status.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let client = Client::new(sock);
+        assert!(!client.ask_status().await.unwrap());
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_conversations_can_be_created_listed_and_reselected_over_ipc() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-conversations.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let client = Client::new(sock);
+        let first = client.ask_reset().await.unwrap();
+        let second = client.ask_reset().await.unwrap();
+        assert_ne!(first.id, second.id);
+
+        let (conversations, active) = client.ask_conversation_list().await.unwrap();
+        assert_eq!(conversations.len(), 2);
+        assert_eq!(active.unwrap().id, second.id);
+
+        let selected = client.ask_conversation_select(&first.id).await.unwrap();
+        assert_eq!(selected.id, first.id);
+        let (_, active) = client.ask_conversation_list().await.unwrap();
+        assert_eq!(active.unwrap().id, first.id);
 
         tx.send(()).unwrap();
         handle.await.unwrap();

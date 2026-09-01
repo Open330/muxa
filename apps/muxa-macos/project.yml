@@ -26,6 +26,7 @@ targets:
     dependencies:
       - package: GhosttyKit
         product: GhosttyTerminal
+      - sdk: Security.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.muxa.mac

@@ -79,23 +79,34 @@ final class TerminalPaneModel: ObservableObject {
         task.cancel()
         self.pollingTask = nil
         let previousDetach = detachTask
-        detachTask = Task { [client, ioPump, sessionID] in
+        detachTask = Task { [ioPump] in
             await ioPump.setActive(false)
             await previousDetach?.value
+            // Detach an established attachment first. muxad treats this as a
+            // cancellation signal for the parked event read, so the reader
+            // drains without waiting for its bounded deadline.
+            await detach(ifGeneration: generation)
             await task.value
-            guard attachedGeneration == generation else { return }
-            attachedGeneration = nil
-            do {
-                try await client.setAttached(
-                    id: sessionID,
-                    clientID: attachmentClientID,
-                    attached: false
-                )
-            } catch {
-                MuxaLog.terminal.error(
-                    "terminal detach failed: \(error.localizedDescription, privacy: .public)"
-                )
-            }
+            // An attach request can finish after Task cancellation. Re-check
+            // after the reader drains so a rapid stop/start can never leak or
+            // overlap an attachment generation.
+            await detach(ifGeneration: generation)
+        }
+    }
+
+    private func detach(ifGeneration generation: UInt64) async {
+        guard attachedGeneration == generation else { return }
+        attachedGeneration = nil
+        do {
+            try await client.setAttached(
+                id: sessionID,
+                clientID: attachmentClientID,
+                attached: false
+            )
+        } catch {
+            MuxaLog.terminal.error(
+                "terminal detach failed: \(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 
@@ -126,7 +137,12 @@ final class TerminalPaneModel: ObservableObject {
         var offset: UInt64 = 0
         while !Task.isCancelled, lifecycleGeneration == generation {
             do {
-                let output = try await client.readSession(id: sessionID, offset: offset)
+                let output = try await client.readSession(
+                    id: sessionID,
+                    offset: offset,
+                    waitForChanges: true
+                )
+                try Task.checkCancellation()
                 guard let bytes = output.bytes else {
                     throw MuxaIPCError.invalidBase64
                 }
@@ -163,7 +179,6 @@ final class TerminalPaneModel: ObservableObject {
                     if rawDisplayEnabled { publishRawOutput() }
                     break
                 }
-                try await Task.sleep(for: bytes.isEmpty ? .milliseconds(45) : .milliseconds(8))
             } catch is CancellationError {
                 break
             } catch {

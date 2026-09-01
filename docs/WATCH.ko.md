@@ -220,6 +220,13 @@ Ask는 headless session이 승인 prompt에 응답할 수 없고 무인 skill �
 additional directories, timeout은 바꾸지 않으며 daemon이 가진 기존 `[ask]` 계약을
 그대로 사용합니다.
 
+macOS 앱의 Inbox는 Ask 이력뿐 아니라 operator console이 Fleet 각 host에 보낸
+Collaboration 명령을 한곳에 모읍니다. Waiting/New reply 상태, Markdown reply,
+Work와 window 위치를 함께 보여주며, 명령을 열면 정확한 대상 agent pane으로
+돌아갑니다. Provider 설정에서는 기존 CLI 로그인을 그대로 쓰거나 API key를 macOS
+login Keychain에 저장할 수 있습니다. 저장된 키는 선택한 다음 Ask child에만
+one-turn credential로 전달되고 이력에는 남지 않습니다.
+
 ## Agent 협업
 
 어디서든 `prefix+s`로 watch를 열고, agent를 선택한 뒤 `m`을 누릅니다. watch는
