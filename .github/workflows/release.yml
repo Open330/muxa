@@ -13,6 +13,13 @@ on:
         required: false
         default: v0.0.0-dryrun
 
+# GitHub can occasionally deliver the same tag push more than once. Keep only
+# the newest run for a ref so duplicate matrix jobs cannot race while uploading
+# identically named release assets or updating the Homebrew tap.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
