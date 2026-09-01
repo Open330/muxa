@@ -67,6 +67,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused, so the one command that resolved the skew could not be run against a
   daemon skewed far enough to need it.
 
+- **Selecting two components that share a file no longer throws one of them
+  away.** Each component planned its edit by reading the file from disk, which
+  is right for the first one to touch a path and wrong for every one after it:
+  `apply` writes each result in turn, so the second edit — computed from text
+  that had never seen the first one's block — silently overwrote it. Nothing
+  looked wrong, because every component's own plan was accurate: the dry-run
+  reported `~ edit ~/.tmux.conf (tmux-popup) [+9 lines]`, the user confirmed
+  it, and the block was not there afterwards. A stale `prefix + s` binding
+  could survive any number of reinstalls that way, and `doctor` then blamed a
+  stray `bind-key` that did not exist.
+
+  `~/.tmux.conf` is the reported case (`tmux-popup` with `tmux-statusline`,
+  which `--preset standard` selects together), and `config.toml` has the same
+  shape: `ask`, `collaboration` and `dashboard` each own one table in it. Every
+  planner now folds onto what the plan already holds for that path — which
+  `plan_tmux_env` was alone in doing — and records that as its `before`, so the
+  backup `apply` takes is the file as it stood a moment earlier rather than as
+  it stood before the whole run.
+
 ## [0.8.39] - 2026-08-31
 
 ### Fixed
