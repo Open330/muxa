@@ -29,13 +29,20 @@ struct PipelineEditorView: View {
     private var problems: [String] {
         var problems = definition.problems()
         if !MuxaPipelineDefinition.isValidName(name.trimmingCharacters(in: .whitespaces)) {
-            problems.insert("Name may only use letters, digits, - and _.", at: 0)
+            problems.insert(String(localized: "Name may only use letters, digits, - and _."), at: 0)
         }
         return problems
     }
 
     private var routesUsingPipeline: [MuxaWorkOptions.Route] {
         model.workOptions(for: target.host)?.routes.filter { $0.pipeline == target.pipeline?.name } ?? []
+    }
+
+    /// The TOML section name shown in the header before a name is typed.
+    private var sectionName: String { name.isEmpty ? "name" : name }
+
+    private var configLabel: String {
+        model.workOptions(for: target.host)?.configPath ?? String(localized: "the muxa config")
     }
 
     var body: some View {
@@ -47,7 +54,7 @@ struct PipelineEditorView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(isNew ? "New pipeline" : "Edit pipeline \(target.pipeline?.name ?? "")")
                         .font(.title2.weight(.semibold))
-                    Text("Saved as [pipeline.\(name.isEmpty ? "name" : name)] in \(model.workOptions(for: target.host)?.configPath ?? "the muxa config") on \(target.host ?? model.localHostAlias).")
+                    Text("Saved as [pipeline.\(sectionName)] in \(configLabel) on \(target.host ?? model.localHostAlias).")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
@@ -98,7 +105,7 @@ struct PipelineEditorView: View {
                         HStack {
                             Text("Agents")
                             Spacer()
-                            Text("\(definition.agents.count)")
+                            Text(verbatim: "\(definition.agents.count)")
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -120,7 +127,7 @@ struct PipelineEditorView: View {
                         .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
 
                     if !routesUsingPipeline.isEmpty {
-                        Text("Selected by \(routesUsingPipeline.map { "match \($0.match)" }.joined(separator: ", "))")
+                        Text("Selected by \(routesUsingPipeline.map { String(localized: "match \($0.match)") }.joined(separator: ", "))")
                             .font(.caption2.monospaced())
                             .foregroundStyle(.tertiary)
                     }
@@ -173,7 +180,7 @@ struct PipelineEditorView: View {
             Text(
                 routesUsingPipeline.isEmpty
                     ? "The [pipeline.\(name)] section is removed from the config. Running agents are not affected."
-                    : "\(routesUsingPipeline.count) route(s) select this pipeline; they will keep their match but lose the pipeline."
+                    : "\(routesUsingPipeline.count) routes select this pipeline; they will keep their match but lose the pipeline."
             )
         }
     }
@@ -188,17 +195,17 @@ struct PipelineEditorView: View {
             // about 460 points, so alias + program + role + direction on a
             // single line overflowed and clipped the role field.
             HStack(spacing: 8) {
-                TextField("", text: agent.alias, prompt: Text("alias"))
+                TextField("Alias", text: agent.alias, prompt: Text("alias"))
                     .labelsHidden()
                     .frame(width: 120)
-                Picker("", selection: agent.program) {
+                Picker("Program", selection: agent.program) {
                     ForEach(MuxaPipelineDefinition.allowedPrograms, id: \.self) { program in
                         Text(program).tag(program)
                     }
                 }
                 .labelsHidden()
                 .frame(width: 104)
-                Picker("", selection: agent.direction) {
+                Picker("Split direction", selection: agent.direction) {
                     Text("split right").tag("")
                     Text("split down").tag("down")
                 }
@@ -216,9 +223,9 @@ struct PipelineEditorView: View {
                 .menuStyle(.borderlessButton)
                 .fixedSize()
             }
-            TextField("", text: agent.role, prompt: Text("role, for example implementer or reviewer"))
+            TextField("Role", text: agent.role, prompt: Text("role, for example implementer or reviewer"))
                 .labelsHidden()
-            TextField("", text: agent.task, prompt: Text("task label shown in muxa watch (optional)"))
+            TextField("Task", text: agent.task, prompt: Text("task label shown in muxa watch (optional)"))
                 .labelsHidden()
             if !others.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -227,7 +234,7 @@ struct PipelineEditorView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     ForEach(others, id: \.self) { other in
-                        Toggle(other, isOn: Binding(
+                        Toggle(String(other), isOn: Binding(
                             get: { agent.wrappedValue.after.contains(other) },
                             set: { on in
                                 if on {

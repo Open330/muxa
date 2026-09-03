@@ -229,7 +229,7 @@ enum MuxaProviderCredentialStore {
     static func save(_ value: String, for provider: MuxaAskProvider) throws {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            throw MuxaIPCError.server("API key cannot be empty")
+            throw MuxaIPCError.server(String(localized: "API key cannot be empty"))
         }
         let selector: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -280,7 +280,7 @@ enum MuxaProviderCredentialStore {
 
     private static func keychainError(_ status: OSStatus) -> Error {
         let detail = SecCopyErrorMessageString(status, nil) as String? ?? "status \(status)"
-        return MuxaIPCError.server("Keychain: \(detail)")
+        return MuxaIPCError.server(String(localized: "Keychain: \(detail)"))
     }
 }
 

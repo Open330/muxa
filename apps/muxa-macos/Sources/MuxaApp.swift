@@ -16,6 +16,9 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["MUXA_TERMINAL_DEBUG"] == "1" {
             TerminalDebugLog.enable(.all)
         }
+        // Remember which language override this process started with so the
+        // Settings pane can ask for a relaunch only when it actually changed.
+        _ = MuxaLanguagePreference.atLaunch
         super.init()
     }
 
@@ -190,13 +193,13 @@ private struct MenuBarContent: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Muxa")
                 .font(.headline)
-            Text("\(liveAgentCount) agent\(liveAgentCount == 1 ? "" : "s") · \(model.pipelineRuns.count) work item\(model.pipelineRuns.count == 1 ? "" : "s")")
+            Text("\(liveAgentCount) agents · \(model.pipelineRuns.count) work items")
                 .foregroundStyle(.secondary)
             if attentionCount > 0 {
                 Label("\(attentionCount) need attention", systemImage: "exclamationmark.circle.fill")
                     .foregroundStyle(.orange)
             }
-            Text("\(liveSessionCount) native shell\(liveSessionCount == 1 ? "" : "s")")
+            Text("\(liveSessionCount) native shells")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
             Divider()

@@ -14,7 +14,7 @@ struct MuxaWorkGroup: Identifiable, Sendable {
     }
 
     var pipelineLabel: String {
-        pipelineRun?.pipeline ?? "Observed Work"
+        pipelineRun?.pipeline ?? String(localized: "Observed Work")
     }
 
     var cwd: String? {
@@ -194,12 +194,12 @@ struct MuxaOperatorMessage: Identifiable, Hashable, Sendable {
 /// the plain `[hostAlias: reason]` dictionary `AppModel.inboxHostFailures`, so
 /// the Inbox editor and, later, the sidebar render the same wording.
 enum MuxaInboxHostFailureText {
-    /// One compact line, e.g. "2 hosts unreachable: jiun-mbp, rtzr".
+    /// One compact line, e.g. "2 hosts unreachable: jiun-mbp, rtzr". The
+    /// singular/plural form comes from the String Catalog.
     static func summary(_ failures: [String: String]) -> String? {
         guard !failures.isEmpty else { return nil }
         let hosts = failures.keys.sorted()
-        let noun = hosts.count == 1 ? "host" : "hosts"
-        return "\(hosts.count) \(noun) unreachable: \(hosts.joined(separator: ", "))"
+        return String(localized: "\(hosts.count) hosts unreachable: \(hosts.joined(separator: ", "))")
     }
 
     /// One "alias: reason" line per host, sorted by alias.

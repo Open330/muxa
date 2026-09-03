@@ -15,8 +15,8 @@ private final class PaneCaptureModel: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var isRefreshing = false
 
-    private static let openingPlaceholder = "Opening live screen…"
-    private static let unavailablePlaceholder = "This backend cannot capture the selected pane."
+    private static let openingPlaceholder = String(localized: "Opening live screen…")
+    private static let unavailablePlaceholder = String(localized: "This backend cannot capture the selected pane.")
 
     /// What the last capture returned. Change detection compares this, not
     /// the rendered `AttributedString`.
@@ -148,7 +148,7 @@ struct PaneCaptureView: View {
                     Label("Live Pane", systemImage: "terminal")
                         .font(.caption.weight(.semibold))
                         .fixedSize()
-                    Text("\(target.host.alias) · \(target.pane.session) › \(target.pane.windowName) › \(target.pane.paneID)")
+                    Text(verbatim: "\(target.host.alias) · \(target.pane.session) › \(target.pane.windowName) › \(target.pane.paneID)")
                         .font(.caption2.monospaced())
                         .foregroundStyle(.secondary)
                         .lineLimit(1)

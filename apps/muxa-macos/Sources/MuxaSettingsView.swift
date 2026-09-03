@@ -10,9 +10,9 @@ enum MuxaAppearance: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .system: "System"
-        case .light: "Light"
-        case .dark: "Dark"
+        case .system: String(localized: "System")
+        case .light: String(localized: "Light")
+        case .dark: String(localized: "Dark")
         }
     }
 
@@ -99,6 +99,8 @@ private struct MuxaGeneralSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            MuxaLanguageSettingsSection()
+
             Section("Startup") {
                 Toggle("Show the Workbench when Muxa launches", isOn: $showWorkbenchOnLaunch)
                 Text("When disabled, Muxa starts in the menu bar and keeps host monitoring available.")
@@ -141,8 +143,8 @@ private struct MuxaGeneralSettingsView: View {
 
     private func chooseWorkDirectory() {
         let panel = NSOpenPanel()
-        panel.title = "Choose the default Muxa Work folder"
-        panel.prompt = "Choose"
+        panel.title = String(localized: "Choose the default Muxa Work folder")
+        panel.prompt = String(localized: "Choose")
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
@@ -240,21 +242,41 @@ private struct MuxaFleetSettingsRow: View {
                 HStack(spacing: 7) {
                     Circle().fill(stateColor).frame(width: 7, height: 7)
                     Text(host.alias).font(.headline)
-                    Text(host.local ? "Local" : host.mode.capitalized)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
-                Text(host.sshTarget ?? (host.local ? "local://" : "SSH target unavailable"))
-                    .font(.caption.monospaced())
+                    Group {
+                        if host.local {
+                            Text("Local")
+                        } else {
+                            Text(fleetHostModeLabel(host.mode))
+                        }
+                    }
+                    .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                }
+                Group {
+                    if let target = host.sshTarget {
+                        Text(target)
+                    } else if host.local {
+                        Text(verbatim: "local://")
+                    } else {
+                        Text("SSH target unavailable")
+                    }
+                }
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
             }
 
             Spacer()
 
             VStack(alignment: .trailing, spacing: 4) {
-                Text(host.muxaVersion.map { "muxa \($0)" } ?? "Version unavailable")
-                    .font(.caption.monospacedDigit())
+                Group {
+                    if let version = host.muxaVersion {
+                        Text("muxa \(version)")
+                    } else {
+                        Text("Version unavailable")
+                    }
+                }
+                .font(.caption.monospacedDigit())
                 Text("\(host.remote?.agents.count ?? 0) agents · \(host.remote?.panes.count ?? 0) panes")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -275,10 +297,10 @@ private struct MuxaRuntimeSettingsPane: View {
 
     private var connectionTitle: String {
         switch model.connectionState {
-        case .connecting: "Connecting"
-        case .connected: "Connected"
-        case .upgradeRequired: "Upgrade required"
-        case .failed: "Connection failed"
+        case .connecting: String(localized: "Connecting")
+        case .connected: String(localized: "Connected")
+        case .upgradeRequired: String(localized: "Upgrade required")
+        case .failed: String(localized: "Connection failed")
         }
     }
 
@@ -312,11 +334,24 @@ private struct MuxaRuntimeSettingsPane: View {
 
             Section("Runtime") {
                 LabeledContent("muxa") {
-                    Text(localHost?.muxaVersion ?? "Unavailable").monospacedDigit()
+                    Group {
+                        if let version = localHost?.muxaVersion {
+                            Text(version)
+                        } else {
+                            Text("Unavailable")
+                        }
+                    }
+                    .monospacedDigit()
                 }
                 LabeledContent("Daemon generation") {
-                    Text(localHost?.daemonGeneration.map(String.init) ?? "Unavailable")
-                        .monospacedDigit()
+                    Group {
+                        if let generation = localHost?.daemonGeneration {
+                            Text(verbatim: String(generation))
+                        } else {
+                            Text("Unavailable")
+                        }
+                    }
+                    .monospacedDigit()
                 }
                 LabeledContent("Native shells") {
                     Text("\(model.sessions.lazy.filter { !$0.exited }.count) active")
@@ -346,14 +381,14 @@ private struct MuxaRuntimeSettingsPane: View {
             Button("Cancel", role: .cancel) {}
             Button("Reload", role: .destructive) { model.replaceRunningDaemon() }
         } message: {
-            Text("\(model.sessions.lazy.filter { !$0.exited }.count) active native shell(s) will end. tmux sessions are not terminated.")
+            Text("\(model.sessions.lazy.filter { !$0.exited }.count) active native shells will end. tmux sessions are not terminated.")
         }
     }
 }
 
 /// Shared by the settings panes, including `AskProvidersSettingsPane`.
 @ViewBuilder
-func settingsHeading(_ title: String, detail: String) -> some View {
+func settingsHeading(_ title: LocalizedStringKey, detail: LocalizedStringKey) -> some View {
     VStack(alignment: .leading, spacing: 3) {
         Text(title).font(.title2.weight(.semibold))
         Text(detail).font(.subheadline).foregroundStyle(.secondary)

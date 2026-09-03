@@ -141,13 +141,15 @@ struct WorkStartView: View {
                         }
                     }
                     if folderBinding.wrappedValue.trimmingCharacters(in: .whitespaces).isEmpty, options != nil {
-                        Text(
-                            routePinsDirectory
-                                ? "The route decides the folder."
-                                : isLocalHost
-                                    ? "Defaults to your home folder because the route names none; choose the project you want the agents to work in."
-                                    : "The route on \(host) names no folder; type the project path on that host."
-                        )
+                        Group {
+                            if routePinsDirectory {
+                                Text("The route decides the folder.")
+                            } else if isLocalHost {
+                                Text("Defaults to your home folder because the route names none; choose the project you want the agents to work in.")
+                            } else {
+                                Text("The route on \(host) names no folder; type the project path on that host.")
+                            }
+                        }
                         .font(.caption)
                         .foregroundStyle(routePinsDirectory ? Color.secondary : Color.orange)
                     }
@@ -271,8 +273,14 @@ struct WorkStartView: View {
         if hosts.count > 1 {
             Picker("Host", selection: $host) {
                 ForEach(hosts) { candidate in
-                    Text(candidate.local ? "\(candidate.alias) (this Mac)" : candidate.alias)
-                        .tag(candidate.local ? "" : candidate.alias)
+                    Group {
+                        if candidate.local {
+                            Text("\(candidate.alias) (this Mac)")
+                        } else {
+                            Text(candidate.alias)
+                        }
+                    }
+                    .tag(candidate.local ? "" : candidate.alias)
                 }
             }
             if !isLocalHost, !model.supportsHostWorkCommands {
@@ -313,13 +321,17 @@ struct WorkStartView: View {
     }
 
     private func routeDescription(_ route: MuxaWorkOptions.Route) -> String {
-        var parts = ["Route \(route.match)"]
-        if let name = route.pipeline, !name.isEmpty { parts.append("pipeline \(name)") }
-        if let workspace = route.workspace, !workspace.isEmpty { parts.append("workspace \(workspace)") }
+        var parts = [String(localized: "Route \(route.match)")]
+        if let name = route.pipeline, !name.isEmpty {
+            parts.append(String(localized: "pipeline \(name)"))
+        }
+        if let workspace = route.workspace, !workspace.isEmpty {
+            parts.append(String(localized: "workspace \(workspace)"))
+        }
         if route.worktree {
-            parts.append("own git worktree")
+            parts.append(String(localized: "own git worktree"))
         } else if let cwd = route.cwd, !cwd.isEmpty {
-            parts.append("cwd \(cwd)")
+            parts.append(String(localized: "cwd \(cwd)"))
         }
         return parts.joined(separator: " → ")
     }
@@ -370,9 +382,15 @@ struct WorkStartView: View {
                 .textSelection(.enabled)
         } else {
             TextField("Pipeline (use configured route when empty)", text: $pipeline)
-            Text("Reading pipelines from \(isLocalHost ? "the muxa config" : host)…")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Group {
+                if isLocalHost {
+                    Text("Reading pipelines from the muxa config…")
+                } else {
+                    Text("Reading pipelines from \(host)…")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
     }
 
@@ -385,11 +403,11 @@ struct WorkStartView: View {
 
     private var defaultPipelineLabel: String {
         if let name = matchedRoute?.pipeline, !name.isEmpty {
-            return "Route default (\(name))"
+            return String(localized: "Route default (\(name))")
         }
         return work.trimmingCharacters(in: .whitespaces).isEmpty
-            ? "Route default"
-            : "Route default (none)"
+            ? String(localized: "Route default")
+            : String(localized: "Route default (none)")
     }
 
     @ViewBuilder
@@ -398,7 +416,7 @@ struct WorkStartView: View {
             Picker("Message skill", selection: $skill) {
                 Text("None").tag("")
                 ForEach(skills) { candidate in
-                    Text(candidate.summary.map { "\(candidate.name) — \($0)" } ?? candidate.name)
+                    Text(verbatim: candidate.summary.map { "\(candidate.name) — \($0)" } ?? candidate.name)
                         .tag(candidate.name)
                 }
             }
@@ -503,7 +521,7 @@ struct WorkCommandCenterView: View {
                                         HostIdentityBadge(host: host, size: 30)
                                         VStack(alignment: .leading, spacing: 1) {
                                             Text(host.alias).fontWeight(.medium)
-                                            Text("\(host.remote?.agents.filter { $0.state != "stopped" }.count ?? 0) agents · \(host.state)")
+                                            Text("\(host.remote?.agents.filter { $0.state != "stopped" }.count ?? 0) agents · \(fleetHostStateLabel(host.state))")
                                                 .font(.caption2)
                                                 .foregroundStyle(.secondary)
                                         }
@@ -687,7 +705,11 @@ struct WorkCommandCenterView: View {
                     remoteOnlyPipelinesRow
                     if !syncFailures.isEmpty {
                         ForEach(syncFailures.keys.sorted(), id: \.self) { key in
-                            Label("\(key): \(syncFailures[key] ?? "")", systemImage: "exclamationmark.triangle.fill")
+                            Label {
+                                Text(verbatim: "\(key): \(syncFailures[key] ?? "")")
+                            } icon: {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                            }
                                 .font(.caption)
                                 .foregroundStyle(.orange)
                                 .textSelection(.enabled)
@@ -759,7 +781,7 @@ struct WorkCommandCenterView: View {
                     HStack(spacing: 10) {
                         Text(entry.pipeline.name)
                             .font(.callout.weight(.medium))
-                        Text("on \(entry.host)")
+                        Text("on host \(entry.host)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         PipelineStagesView(agents: entry.pipeline.agents, compact: true)
@@ -796,8 +818,14 @@ struct WorkCommandCenterView: View {
             if model.workCapableHosts.count > 1 {
                 Picker("Routes on", selection: $routesHost) {
                     ForEach(model.workCapableHosts) { candidate in
-                        Text(candidate.local ? "\(candidate.alias) (this Mac)" : candidate.alias)
-                            .tag(candidate.local ? "" : candidate.alias)
+                        Group {
+                            if candidate.local {
+                                Text("\(candidate.alias) (this Mac)")
+                            } else {
+                                Text(candidate.alias)
+                            }
+                        }
+                        .tag(candidate.local ? "" : candidate.alias)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -807,7 +835,11 @@ struct WorkCommandCenterView: View {
             if let options = model.workOptions(for: routesHostAlias) {
                 WorkRoutesEditor(options: options, host: routesHostAlias, model: model)
             } else if let error = model.workOptionsError(for: routesHostAlias) {
-                Label("\(routesHost): \(error)", systemImage: "exclamationmark.triangle.fill")
+                Label {
+                    Text(verbatim: "\(routesHost): \(error)")
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                }
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .textSelection(.enabled)
@@ -850,13 +882,13 @@ struct WorkCommandCenterView: View {
 }
 
 private struct CommandCenterMetric: View {
-    let title: String
+    let title: LocalizedStringKey
     let value: Int
     let color: Color
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("\(value)")
+            Text(verbatim: "\(value)")
                 .font(.title.weight(.semibold).monospacedDigit())
                 .foregroundStyle(color)
             Text(title)
@@ -873,6 +905,16 @@ private struct WorkCommandCard: View {
     let work: MuxaWorkGroup
     let open: () -> Void
 
+    private var statusText: Text {
+        if work.attentionCount > 0 {
+            Text("Attention")
+        } else if work.workingCount > 0 {
+            Text("Running")
+        } else {
+            Text("Ready")
+        }
+    }
+
     var body: some View {
         Button(action: open) {
             VStack(alignment: .leading, spacing: 12) {
@@ -885,10 +927,11 @@ private struct WorkCommandCard: View {
                             .font(.headline)
                     }
                     Spacer()
-                    Label(
-                        work.attentionCount > 0 ? "Attention" : work.workingCount > 0 ? "Running" : "Ready",
-                        systemImage: "circle.fill"
-                    )
+                    Label {
+                        statusText
+                    } icon: {
+                        Image(systemName: "circle.fill")
+                    }
                     .font(.caption.weight(.medium))
                     .foregroundStyle(work.attentionCount > 0 ? .orange : work.workingCount > 0 ? .blue : .green)
                 }
@@ -896,9 +939,17 @@ private struct WorkCommandCard: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 14) {
-                    Label("\(work.participants.count)", systemImage: "person.2")
+                    Label {
+                        Text(verbatim: "\(work.participants.count)")
+                    } icon: {
+                        Image(systemName: "person.2")
+                    }
                     if work.pipelineRun != nil {
-                        Label("\(work.completedCount)/\(work.totalCount)", systemImage: "checkmark.circle")
+                        Label {
+                            Text(verbatim: "\(work.completedCount)/\(work.totalCount)")
+                        } icon: {
+                            Image(systemName: "checkmark.circle")
+                        }
                     }
                     if !work.hostAliases.isEmpty {
                         Label(work.hostAliases.joined(separator: ", "), systemImage: "network")
@@ -949,11 +1000,18 @@ struct NativeWatchView: View {
 }
 
 private struct FleetPaneWorkspace: View {
-    private enum PaneModule: String, CaseIterable, Identifiable {
-        case overview = "Overview"
-        case collaborate = "Collaborate"
+    private enum PaneModule: CaseIterable, Identifiable {
+        case overview
+        case collaborate
 
         var id: Self { self }
+
+        var title: LocalizedStringKey {
+            switch self {
+            case .overview: "Overview"
+            case .collaborate: "Collaborate"
+            }
+        }
     }
 
     let pane: MuxaWatchPane
@@ -1039,7 +1097,7 @@ private struct FleetPaneWorkspace: View {
                     .font(.headline)
                     .lineLimit(1)
                 if showsLocation {
-                    Text("\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
+                    Text(verbatim: "\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
                         .font(.caption2.monospaced())
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -1052,7 +1110,7 @@ private struct FleetPaneWorkspace: View {
     private func modulePicker(width: CGFloat) -> some View {
         Picker("Pane module", selection: $module) {
             ForEach(PaneModule.allCases) { module in
-                Text(module.rawValue).tag(module)
+                Text(module.title).tag(module)
             }
         }
         .labelsHidden()
@@ -1149,23 +1207,37 @@ struct MuxaAskView: View {
                         .font(.title3)
                         .foregroundStyle(.tint)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(model.askConfigurationPendingReload ? "Reload to finish enabling Ask" : "Enable Global Ask")
-                            .font(.subheadline.weight(.semibold))
-                        Text(
-                            model.askConfigurationPendingReload
-                                ? "The grant is saved. Reload muxad to apply it; tmux sessions will remain running."
-                                : "Muxa will run the selected provider CLI headlessly. Provider usage may be billed to your account."
-                        )
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Group {
+                            if model.askConfigurationPendingReload {
+                                Text("Reload to finish enabling Ask")
+                            } else {
+                                Text("Enable Global Ask")
+                            }
+                        }
+                        .font(.subheadline.weight(.semibold))
+                        Group {
+                            if model.askConfigurationPendingReload {
+                                Text("The grant is saved. Reload muxad to apply it; tmux sessions will remain running.")
+                            } else {
+                                Text("Muxa will run the selected provider CLI headlessly. Provider usage may be billed to your account.")
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 12)
                     if model.isEnablingAsk {
                         ProgressView()
                             .controlSize(.small)
                     }
-                    Button(model.askConfigurationPendingReload ? "Reload muxad" : "Enable & Reload") {
+                    Button {
                         Task { await model.enableAsk() }
+                    } label: {
+                        if model.askConfigurationPendingReload {
+                            Text("Reload muxad")
+                        } else {
+                            Text("Enable & Reload")
+                        }
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(model.isEnablingAsk)
@@ -1290,9 +1362,17 @@ struct MuxaAskView: View {
                     }
                 }
             } label: {
-                Label(activeConversation?.title ?? "Conversations", systemImage: "bubble.left.and.bubble.right")
-                    .lineLimit(1)
-                    .frame(width: 190, alignment: .leading)
+                Label {
+                    if let activeConversation {
+                        Text(activeConversation.title)
+                    } else {
+                        Text("Conversations")
+                    }
+                } icon: {
+                    Image(systemName: "bubble.left.and.bubble.right")
+                }
+                .lineLimit(1)
+                .frame(width: 190, alignment: .leading)
             }
             .menuStyle(.borderlessButton)
 
@@ -1353,7 +1433,7 @@ struct MuxaAskView: View {
 
 private struct AskComposerEditor: View {
     @Binding var text: String
-    let placeholder: String
+    let placeholder: LocalizedStringKey
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -1411,14 +1491,14 @@ private struct AskConversationTurn: View {
                     .foregroundStyle(.tertiary)
                 Spacer()
                 Circle().fill(statusColor).frame(width: 6, height: 6)
-                Text(entry.status == "running" ? "Thinking" : entry.status.capitalized)
+                Text(askStatusLabel(entry.status))
                     .font(.caption.weight(.medium))
                     .foregroundStyle(statusColor)
                 if entry.status == "running" { ProgressView().controlSize(.mini) }
             }
 
             AskMessageBlock(
-                role: "You",
+                role: String(localized: "You"),
                 icon: "person.fill",
                 source: entry.prompt,
                 tint: .accentColor,
@@ -1483,11 +1563,7 @@ private struct AskHistoryCard: View {
     }
 
     private var statusLabel: String {
-        switch entry.status {
-        case "running": "Thinking"
-        case "failed": "Failed"
-        default: "Answered"
-        }
+        askStatusLabel(entry.status)
     }
 
     private var askedDate: Date? {
@@ -1530,7 +1606,7 @@ private struct AskHistoryCard: View {
 
             VStack(alignment: .leading, spacing: 12) {
                 AskMessageBlock(
-                    role: "You",
+                    role: String(localized: "You"),
                     icon: "person.fill",
                     source: entry.prompt,
                     tint: .accentColor,
@@ -1584,6 +1660,15 @@ private struct AskHistoryCard: View {
     }
 }
 
+/// Display wording for a Global Ask entry `status` as muxad reports it.
+private func askStatusLabel(_ status: String) -> String {
+    switch status {
+    case "running": String(localized: "Thinking")
+    case "failed": String(localized: "Failed")
+    default: String(localized: "Answered")
+    }
+}
+
 private struct AskMessageBlock: View {
     let role: String
     let icon: String
@@ -1613,13 +1698,23 @@ private struct AskMessageBlock: View {
 }
 
 struct MuxaOperatorInboxView: View {
-    private enum Scope: String, CaseIterable, Identifiable {
-        case all = "All"
-        case replies = "Replies"
-        case waiting = "Waiting"
-        case action = "Needs Action"
-        case ask = "Ask"
+    private enum Scope: CaseIterable, Identifiable {
+        case all
+        case replies
+        case waiting
+        case action
+        case ask
         var id: Self { self }
+
+        var title: LocalizedStringKey {
+            switch self {
+            case .all: "All"
+            case .replies: "Replies"
+            case .waiting: "Waiting"
+            case .action: "Needs Action"
+            case .ask: "Ask"
+            }
+        }
     }
 
     @ObservedObject var model: AppModel
@@ -1696,9 +1791,9 @@ struct MuxaOperatorInboxView: View {
             HStack(spacing: 10) {
                 Label("Operator Inbox", systemImage: "tray.full")
                     .font(.headline)
-                inboxMetric("New", unreadReplies, color: .orange)
-                inboxMetric("Waiting", waitingReplies, color: .blue)
-                inboxMetric("Action", humanDecisions, color: .red)
+                inboxMetric(Text("\(unreadReplies) New"), unreadReplies, color: .orange)
+                inboxMetric(Text("\(waitingReplies) Waiting"), waitingReplies, color: .blue)
+                inboxMetric(Text("\(humanDecisions) Action"), humanDecisions, color: .red)
                 Spacer(minLength: 8)
                 if model.isRefreshingInbox { ProgressView().controlSize(.small) }
                 Button {
@@ -1800,8 +1895,8 @@ struct MuxaOperatorInboxView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func inboxMetric(_ label: String, _ value: Int, color: Color) -> some View {
-        Text("\(value) \(label)")
+    private func inboxMetric(_ text: Text, _ value: Int, color: Color) -> some View {
+        text
             .font(.caption2.weight(.semibold).monospacedDigit())
             .foregroundStyle(value > 0 ? color : Color.secondary)
             .padding(.horizontal, 7)
@@ -1882,7 +1977,7 @@ struct MuxaOperatorInboxView: View {
 
             if visibleMessages.isEmpty {
                 ConsoleUnavailableView(
-                    title: model.operatorMessages.isEmpty ? "No commands sent yet" : "No matching commands",
+                    title: model.operatorMessages.isEmpty ? LocalizedStringKey("No commands sent yet") : LocalizedStringKey("No matching commands"),
                     systemImage: "paperplane",
                     description: "Use Collaborate on an agent pane. Its reply will appear here without reopening that pane."
                 )
@@ -1937,7 +2032,7 @@ struct MuxaOperatorInboxView: View {
 
     private var inboxScopePicker: some View {
         Picker("Mailbox", selection: $scope) {
-            ForEach(Scope.allCases) { value in Text(value.rawValue).tag(value) }
+            ForEach(Scope.allCases) { value in Text(value.title).tag(value) }
         }
         .pickerStyle(.segmented)
         .labelsHidden()
@@ -1979,8 +2074,7 @@ private struct OperatorMessageRow: View {
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
                 Spacer(minLength: 6)
-                Text(request.reply?.status.replacingOccurrences(of: "_", with: " ").capitalized
-                    ?? request.status.replacingOccurrences(of: "_", with: " ").capitalized)
+                Text(collaborationStatusLabel(request.reply?.status ?? request.status))
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(statusColor)
                 Text(compactInboxTimestamp(request.createdAt))
@@ -2080,12 +2174,12 @@ private struct OperatorMessageDetail: View {
     }
     private var openDestinationLabel: String {
         switch openDestination {
-        case .agent, .pane: "Open Agent"
-        case .fleetWindow: "Open Window"
-        case .fleetSession: "Open Session"
-        case .host: "Open Host"
-        case nil: "Agent Ended"
-        default: "Open Context"
+        case .agent, .pane: String(localized: "Open Agent")
+        case .fleetWindow: String(localized: "Open Window")
+        case .fleetSession: String(localized: "Open Session")
+        case .host: String(localized: "Open Host")
+        case nil: String(localized: "Agent Ended")
+        default: String(localized: "Open Context")
         }
     }
     private var statusColor: Color {
@@ -2111,7 +2205,7 @@ private struct OperatorMessageDetail: View {
                     Text(request.to.label)
                         .font(.headline)
                         .lineLimit(1)
-                    Text("\(message.host.alias) · \(compactInboxTimestamp(request.createdAt))")
+                    Text(verbatim: "\(message.host.alias) · \(compactInboxTimestamp(request.createdAt))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -2197,7 +2291,7 @@ private struct OperatorMessageDetail: View {
 }
 
 private struct OperatorMessageDetailSection: View {
-    let title: String
+    let title: LocalizedStringKey
     let icon: String
     let timestamp: String
     let source: String
@@ -2234,7 +2328,7 @@ private func inboxPreview(_ value: String) -> String {
 
 /// "waiting_reply" -> "Waiting Reply", matching the status pill wording.
 private func inboxStatusTitle(_ status: String) -> String {
-    status.replacingOccurrences(of: "_", with: " ").capitalized
+    collaborationStatusLabel(status)
 }
 
 private func compactInboxTimestamp(_ value: String) -> String {
@@ -2243,22 +2337,36 @@ private func compactInboxTimestamp(_ value: String) -> String {
 }
 
 private struct MuxaCollaborationView: View {
-    private enum ModuleTab: String, CaseIterable, Identifiable {
-        case activity = "Activity"
-        case compose = "Compose"
+    private enum ModuleTab: CaseIterable, Identifiable {
+        case activity
+        case compose
+        var id: Self { self }
+
+        var title: LocalizedStringKey {
+            switch self {
+            case .activity: "Activity"
+            case .compose: "Compose"
+            }
+        }
+    }
+
+    private enum MailboxTab: CaseIterable, Identifiable {
+        case incoming
+        case sent
         var id: Self { self }
     }
 
-    private enum MailboxTab: String, CaseIterable, Identifiable {
-        case incoming = "Incoming"
-        case sent = "Sent"
+    private enum DisplayMode: CaseIterable, Identifiable {
+        case compact
+        case detailed
         var id: Self { self }
-    }
 
-    private enum DisplayMode: String, CaseIterable, Identifiable {
-        case compact = "Compact"
-        case detailed = "Detailed"
-        var id: Self { self }
+        var title: LocalizedStringKey {
+            switch self {
+            case .compact: "Compact"
+            case .detailed: "Detailed"
+            }
+        }
     }
 
     let pane: MuxaWatchPane
@@ -2286,7 +2394,7 @@ private struct MuxaCollaborationView: View {
                 Label("Collaborate", systemImage: "person.2.wave.2")
                     .font(.headline)
                 Picker("Collaborate module", selection: $module) {
-                    ForEach(ModuleTab.allCases) { item in Text(item.rawValue).tag(item) }
+                    ForEach(ModuleTab.allCases) { item in Text(item.title).tag(item) }
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
@@ -2307,17 +2415,15 @@ private struct MuxaCollaborationView: View {
             case .activity:
                 HStack(spacing: 10) {
                     Picker("Mailbox", selection: $tab) {
-                        ForEach(MailboxTab.allCases) { item in
-                            Text("\(item.rawValue) \(item == .incoming ? mailbox.incoming.count : mailbox.sent.count)")
-                                .tag(item)
-                        }
+                        Text("Incoming \(mailbox.incoming.count)").tag(MailboxTab.incoming)
+                        Text("Sent \(mailbox.sent.count)").tag(MailboxTab.sent)
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
                     .frame(width: 220)
                     Spacer()
                     Picker("Density", selection: $displayMode) {
-                        ForEach(DisplayMode.allCases) { item in Text(item.rawValue).tag(item) }
+                        ForEach(DisplayMode.allCases) { item in Text(item.title).tag(item) }
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
@@ -2457,16 +2563,16 @@ private struct CollaborationRequestCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
-                Text(request.kind.capitalized)
+                Text(collaborationKindLabel(request.kind))
                     .font(.caption.weight(.semibold))
                 Text(request.workMode == "execute" ? "Execute" : "Read only")
                     .font(.caption2)
                     .foregroundStyle(request.workMode == "execute" ? Color.orange : Color.secondary)
-                Text(request.status.capitalized)
+                Text(collaborationStatusLabel(request.status))
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(collaborationStatusColor(request.status))
                 Spacer()
-                Text("\(request.from.label) → \(request.to.label)")
+                Text(verbatim: "\(request.from.label) → \(request.to.label)")
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -2477,7 +2583,7 @@ private struct CollaborationRequestCard: View {
                     Divider()
                     MarkdownContent(source: response.body)
                 }
-                Label(response.status.capitalized, systemImage: "arrowshape.turn.up.left.fill")
+                Label(collaborationStatusLabel(response.status), systemImage: "arrowshape.turn.up.left.fill")
                     .font(.caption2)
                     .foregroundStyle(collaborationStatusColor(response.status))
             }
@@ -2575,6 +2681,33 @@ private func collaborationStatusColor(_ status: String) -> Color {
     }
 }
 
+/// Display wording for a collaboration request or reply `status`.
+func collaborationStatusLabel(_ status: String) -> String {
+    switch status {
+    case "queued": String(localized: "Queued")
+    case "claimed": String(localized: "Claimed")
+    case "completed": String(localized: "Completed")
+    case "blocked": String(localized: "Blocked")
+    case "declined": String(localized: "Declined")
+    case "failed": String(localized: "Failed")
+    case "expired": String(localized: "Expired")
+    case "cancelled": String(localized: "Cancelled")
+    case "waiting_reply": String(localized: "Waiting Reply")
+    default: status.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+}
+
+/// Display wording for a collaboration request `kind`.
+func collaborationKindLabel(_ kind: String) -> String {
+    switch kind {
+    case "question": String(localized: "Question")
+    case "review": String(localized: "Review")
+    case "task": String(localized: "Task")
+    case "notice": String(localized: "Notice")
+    default: kind.capitalized
+    }
+}
+
 struct HostRegistrationView: View {
     @ObservedObject var model: AppModel
     @Environment(\.dismiss) private var dismiss
@@ -2612,7 +2745,7 @@ struct HostRegistrationView: View {
 
             Form {
                 Section("Identity") {
-                    TextField("Alias", text: $alias, prompt: Text("build-mac"))
+                    TextField("Alias", text: $alias, prompt: Text(verbatim: "build-mac"))
                     TextField("SSH target", text: $ssh, prompt: Text("user@host or ~/.ssh/config alias"))
                     Picker("Access", selection: $mode) {
                         Text("Observe only").tag("observe")
@@ -2687,7 +2820,7 @@ private struct WatchLivePanePanel: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var prompt = ""
     @State private var sending = false
-    @State private var feedback: String?
+    @State private var feedback: PromptFeedback?
 
     private var attachedSession: MuxaSession? {
         attachedSessionID.flatMap { id in model.sessions.first(where: { $0.id == id }) }
@@ -2703,7 +2836,7 @@ private struct WatchLivePanePanel: View {
                 Label("Live Pane", systemImage: "terminal")
                     .font(.caption.weight(.semibold))
                     .fixedSize()
-                Text("\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
+                Text(verbatim: "\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -2903,7 +3036,7 @@ struct WatchHostTree: View {
                             .font(.callout.weight(.semibold))
                             .lineLimit(1)
                         Spacer(minLength: 4)
-                        Text("\(group.paneCount)")
+                        Text(verbatim: "\(group.paneCount)")
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.secondary)
                         Circle()
@@ -3013,7 +3146,7 @@ private struct WatchSessionTree: View {
                                 .lineLimit(1)
                         }
                         Spacer(minLength: 3)
-                        Text(singleWindow.map { "\($0.panes.count)" } ?? "\(session.windows.count)")
+                        Text(verbatim: singleWindow.map { "\($0.panes.count)" } ?? "\(session.windows.count)")
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
@@ -3101,7 +3234,7 @@ private struct WatchWindowTree: View {
                             .fontWeight(logicalWork == nil ? .regular : .medium)
                             .lineLimit(1)
                         Spacer(minLength: 3)
-                        Text("#\(window.index) · \(window.panes.count)")
+                        Text(verbatim: "#\(window.index) · \(window.panes.count)")
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
@@ -3257,8 +3390,12 @@ struct WatchFlatPaneRow: View {
                         Text(agentStateLabel(agent.state))
                             .font(.caption2.weight(.medium))
                             .foregroundStyle(agentStateColor(agent.state))
+                    } else if let command = pane.pane.currentCommand.nonEmpty {
+                        Text(command)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
                     } else {
-                        Text(pane.pane.currentCommand.nonEmpty ?? "Shell")
+                        Text("Shell")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }
@@ -3380,7 +3517,7 @@ private struct FleetPaneInspector: View {
                                         .font(.caption2.monospaced())
                                         .foregroundStyle(.tertiary)
                                 }
-                                Text(overviewSummary(item) ?? "No task summary has been reported for this pane yet.")
+                                Text(overviewSummary(item) ?? String(localized: "No task summary has been reported for this pane yet."))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(2)
@@ -3405,7 +3542,7 @@ private struct FleetPaneInspector: View {
                 Label("Agents in this window", systemImage: "person.2")
                     .font(.headline)
                 if let identity = windowWorkIdentity(window) {
-                    Text("\(identity.workspaceID) / \(identity.workID)")
+                    Text(verbatim: "\(identity.workspaceID) / \(identity.workID)")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(Color.accentColor)
                         .padding(.horizontal, 7)
@@ -3443,14 +3580,14 @@ private struct FleetPaneInspector: View {
                     ViewThatFits(in: .horizontal) {
                         HStack(alignment: .top, spacing: 12) {
                             overviewSection(
-                                "Summary",
+                                String(localized: "Summary"),
                                 systemImage: "list.bullet.rectangle",
                                 summary,
                                 lineLimit: compact ? 5 : 8
                             )
                             .frame(maxWidth: .infinity, alignment: .topLeading)
                             overviewSection(
-                                "Latest response",
+                                String(localized: "Latest response"),
                                 systemImage: "text.bubble",
                                 response,
                                 lineLimit: compact ? 6 : 12
@@ -3459,13 +3596,13 @@ private struct FleetPaneInspector: View {
                         }
                         VStack(alignment: .leading, spacing: 10) {
                             overviewSection(
-                                "Summary",
+                                String(localized: "Summary"),
                                 systemImage: "list.bullet.rectangle",
                                 summary,
                                 lineLimit: compact ? 5 : 8
                             )
                             overviewSection(
-                                "Latest response",
+                                String(localized: "Latest response"),
                                 systemImage: "text.bubble",
                                 response,
                                 lineLimit: compact ? 6 : 12
@@ -3474,14 +3611,14 @@ private struct FleetPaneInspector: View {
                     }
                 } else if let summary = agent.recap?.nonEmpty {
                     overviewSection(
-                        "Summary",
+                        String(localized: "Summary"),
                         systemImage: "list.bullet.rectangle",
                         summary,
                         lineLimit: compact ? 5 : 9
                     )
                 } else if let response = agent.lastResponse?.nonEmpty {
                     overviewSection(
-                        "Latest response",
+                        String(localized: "Latest response"),
                         systemImage: "text.bubble",
                         response,
                         lineLimit: compact ? 6 : 12
@@ -3541,17 +3678,17 @@ private struct FleetPaneInspector: View {
         if let notice = agent.lastNotification?.nonEmpty,
            notice != agent.recap,
            notice != agent.lastResponse {
-            return ("Latest notice", "bell", notice)
+            return (String(localized: "Latest notice"), "bell", notice)
         }
         if agent.recap == nil,
            agent.lastResponse == nil,
            let prompt = agent.lastPrompt?.nonEmpty {
-            return ("Latest activity", "clock.arrow.circlepath", humanReadablePrompt(prompt))
+            return (String(localized: "Latest activity"), "clock.arrow.circlepath", humanReadablePrompt(prompt))
         }
         return nil
     }
 
-    private func metadataRow(_ label: String, _ value: String) -> some View {
+    private func metadataRow(_ label: LocalizedStringKey, _ value: String) -> some View {
         GridRow {
             Text(label)
                 .foregroundStyle(.secondary)
@@ -3584,15 +3721,15 @@ private struct FleetPaneInspector: View {
     private func humanReadablePrompt(_ prompt: String) -> String {
         if prompt.hasPrefix("[muxa:req_") {
             if prompt.contains("Completed reply") {
-                return "A collaborator reply is ready for this agent."
+                return String(localized: "A collaborator reply is ready for this agent.")
             }
             if prompt.contains("New ") && prompt.contains(" request") {
-                return "A collaboration request is waiting for this agent."
+                return String(localized: "A collaboration request is waiting for this agent.")
             }
-            return "Recent Muxa collaboration activity."
+            return String(localized: "Recent Muxa collaboration activity.")
         }
         if prompt.hasPrefix("<task-notification>") {
-            return "A background task reported an update."
+            return String(localized: "A background task reported an update.")
         }
         return prompt
     }
@@ -3607,13 +3744,13 @@ private struct FleetPaneInspector: View {
                 HStack(spacing: 7) {
                     Text(pane.host.alias)
                     if let agent = pane.agent {
-                        Text("·")
+                        Text(verbatim: "·")
                         Text(agentStateLabel(agent.state))
                             .foregroundStyle(agentStateColor(agent.state))
                     }
                     if let identity = pane.pane.workIdentity {
-                        Text("·")
-                        Text("\(identity.workspaceID) / \(identity.workID)")
+                        Text(verbatim: "·")
+                        Text(verbatim: "\(identity.workspaceID) / \(identity.workID)")
                             .foregroundStyle(Color.accentColor)
                     }
                 }
@@ -3646,7 +3783,7 @@ private struct FleetPaneInspector: View {
         }
     }
 
-    private func metadataButton(label: String) -> some View {
+    private func metadataButton(label: LocalizedStringKey) -> some View {
         Button {
             showsMetadata.toggle()
         } label: {
@@ -3679,7 +3816,8 @@ private struct FleetPaneInspector: View {
             .foregroundStyle(agentStateColor(agent.state))
         if let modelName = agent.model { Text(modelName) }
         if let context = agent.contextUsedPercent {
-            Text("context \(context, format: .number.precision(.fractionLength(0)))%")
+            let percent = "\(context.formatted(.number.precision(.fractionLength(0))))%"
+            Text("context \(percent)")
         }
     }
 }
@@ -3693,13 +3831,20 @@ struct FleetPaneModuleView: View {
     }
 }
 
+/// The outcome line under a prompt composer: the wording and whether the
+/// send succeeded, so the colour never depends on the wording's language.
+struct PromptFeedback: Equatable {
+    let message: String
+    let succeeded: Bool
+}
+
 private struct PanePromptComposer: View {
     let host: MuxaFleetHostIdentity
     let pane: MuxaPaneInfo
     let client: MuxaIPCClient
     @Binding var prompt: String
     @Binding var sending: Bool
-    @Binding var feedback: String?
+    @Binding var feedback: PromptFeedback?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -3718,9 +3863,9 @@ private struct PanePromptComposer: View {
                     .font(.caption2)
                     .foregroundStyle(.orange)
             } else if let feedback {
-                Text(feedback)
+                Text(feedback.message)
                     .font(.caption2)
-                    .foregroundStyle(feedback.hasPrefix("Sent") ? .green : .red)
+                    .foregroundStyle(feedback.succeeded ? .green : .red)
             }
         }
     }
@@ -3748,9 +3893,9 @@ private struct PanePromptComposer: View {
             do {
                 try await client.sendFleetPrompt(host: host, pane: pane, text: text)
                 prompt = ""
-                feedback = "Sent and submitted"
+                feedback = PromptFeedback(message: String(localized: "Sent and submitted"), succeeded: true)
             } catch {
-                feedback = error.localizedDescription
+                feedback = PromptFeedback(message: error.localizedDescription, succeeded: false)
             }
         }
     }
@@ -3761,7 +3906,7 @@ struct WorkPromptComposer: View {
     @ObservedObject var model: AppModel
     @State private var prompt = ""
     @State private var sending = false
-    @State private var feedback: String?
+    @State private var feedback: PromptFeedback?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -3778,9 +3923,9 @@ struct WorkPromptComposer: View {
                 }
             }
             if let feedback {
-                Text(feedback)
+                Text(feedback.message)
                     .font(.caption)
-                    .foregroundStyle(feedback.hasPrefix("Sent") ? .green : .red)
+                    .foregroundStyle(feedback.succeeded ? .green : .red)
             }
         }
         .padding(14)
@@ -3810,9 +3955,12 @@ struct WorkPromptComposer: View {
             do {
                 let count = try await model.prompt(work: work, text: text)
                 prompt = ""
-                feedback = "Sent to \(count) collaborator\(count == 1 ? "" : "s")"
+                feedback = PromptFeedback(
+                    message: String(localized: "Sent to \(count) collaborators"),
+                    succeeded: true
+                )
             } catch {
-                feedback = error.localizedDescription
+                feedback = PromptFeedback(message: error.localizedDescription, succeeded: false)
             }
         }
     }
@@ -3854,7 +4002,7 @@ struct HostIdentityBadge: View {
                 .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 1.5))
                 .offset(x: 2, y: 2)
         }
-        .help("\(alias) · \(state)")
+        .help(Text(verbatim: "\(alias) · \(fleetHostStateLabel(state))"))
     }
 
     /// A stable per-host accent makes a host recognizable even when every
@@ -3892,7 +4040,7 @@ struct DetachedModuleView: View {
         }
     }
 
-    private func moduleMissing(_ text: String) -> some View {
+    private func moduleMissing(_ text: LocalizedStringKey) -> some View {
         ConsoleUnavailableView(
             title: "Module unavailable",
             systemImage: "terminal.fill",
@@ -3909,9 +4057,9 @@ private func paneNeedsAttention(_ pane: MuxaWatchPane) -> Bool {
 }
 
 private struct ConsoleUnavailableView: View {
-    let title: String
+    let title: LocalizedStringKey
     let systemImage: String
-    let description: String
+    let description: LocalizedStringKey
 
     var body: some View {
         VStack(spacing: 9) {

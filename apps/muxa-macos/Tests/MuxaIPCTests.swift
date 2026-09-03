@@ -230,20 +230,23 @@ import Testing
     let decoded = try JSONDecoder().decode(MuxaPipelineDefinition.self, from: Data(json.utf8))
     #expect(decoded.agents.map(\.alias) == ["plan", "impl"])
 
+    // The wording is localized (the test host may run in Korean), so compare
+    // against the same catalog keys the editor uses.
     definition.agents.append(MuxaPipelineDefinition.Agent(alias: "impl", program: "gemini"))
-    #expect(definition.problems().contains { $0.contains("used twice") })
+    #expect(definition.problems().contains(String(localized: "Alias \"\("impl")\" is used twice.")))
     definition.agents.removeLast()
 
     definition.agents[1].program = "bash"
-    #expect(definition.problems().contains { $0.contains("program must be one of") })
+    let allowed = MuxaPipelineDefinition.allowedPrograms.joined(separator: ", ")
+    #expect(definition.problems().contains(String(localized: "@\("impl"): program must be one of \(allowed).")))
     definition.agents[1].program = "claude"
 
     definition.agents[1].after = ["ghost"]
-    #expect(definition.problems().contains { $0.contains("unknown alias") })
+    #expect(definition.problems().contains(String(localized: "@\("impl") waits for unknown alias \"\("ghost")\".")))
 
     definition.agents[0].after = ["impl"]
     definition.agents[1].after = ["plan"]
-    #expect(definition.problems().contains { $0.contains("cycle") })
+    #expect(definition.problems().contains(String(localized: "The after edges form a cycle, so some agents would never start.")))
 
     #expect(!MuxaPipelineDefinition(agents: []).problems().isEmpty)
 }
@@ -1877,7 +1880,10 @@ struct MuxaOperatorInboxRefreshTests {
     @Test
     func hostFailureSummaryIsOneCompactLine() {
         #expect(MuxaInboxHostFailureText.summary([:]) == nil)
-        #expect(MuxaInboxHostFailureText.summary(["jiun-mbp": "ssh timed out"]) == "1 host unreachable: jiun-mbp")
+        #expect(
+            MuxaInboxHostFailureText.summary(["jiun-mbp": "ssh timed out"])
+                == String(localized: "\(1) hosts unreachable: \("jiun-mbp")")
+        )
         #expect(
             MuxaInboxHostFailureText.summary(["rtzr": "ssh timed out", "jiun-mbp": "remote request_failed"])
                 == "2 hosts unreachable: jiun-mbp, rtzr"

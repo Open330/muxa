@@ -56,7 +56,7 @@ struct PipelineAgentChip: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
-                Text("@\(agent.alias)")
+                Text(verbatim: "@\(agent.alias)")
                     .font(compact ? .caption.weight(.semibold) : .subheadline.weight(.semibold))
                     .lineLimit(1)
                 Text(agent.program)
@@ -118,7 +118,7 @@ struct WorkPipelineCard: View {
                     }
                 }
                 Spacer(minLength: 6)
-                Text("\(pipeline.agents.count) agent\(pipeline.agents.count == 1 ? "" : "s")")
+                Text("\(pipeline.agents.count) agents")
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
@@ -180,9 +180,11 @@ struct WorkPipelineCard: View {
     }
 
     private func routeSummary(_ route: MuxaWorkOptions.Route) -> String {
-        var parts = ["match \(route.match)"]
-        if let workspace = route.workspace, !workspace.isEmpty { parts.append("workspace \(workspace)") }
-        if route.worktree { parts.append("worktree") }
+        var parts = [String(localized: "match \(route.match)")]
+        if let workspace = route.workspace, !workspace.isEmpty {
+            parts.append(String(localized: "workspace \(workspace)"))
+        }
+        if route.worktree { parts.append(String(localized: "worktree")) }
         return parts.joined(separator: " → ")
     }
 }
@@ -194,10 +196,14 @@ struct PipelineHostBadge: View {
 
     private var symbol: (name: String, tint: Color, help: String) {
         switch state.state {
-        case .inSync: ("checkmark.circle.fill", .green, "Same definition on \(state.host)")
-        case .differs: ("exclamationmark.circle.fill", .orange, "\(state.host) has a different definition; Sync overwrites it")
-        case .missing: ("circle.dashed", .secondary, "Not on \(state.host) yet")
-        case .unavailable: ("questionmark.circle", .secondary, "\(state.host)'s config could not be read")
+        case .inSync:
+            ("checkmark.circle.fill", .green, String(localized: "Same definition on \(state.host)"))
+        case .differs:
+            ("exclamationmark.circle.fill", .orange, String(localized: "\(state.host) has a different definition; Sync overwrites it"))
+        case .missing:
+            ("circle.dashed", .secondary, String(localized: "Not on \(state.host) yet"))
+        case .unavailable:
+            ("questionmark.circle", .secondary, String(localized: "\(state.host)'s config could not be read"))
         }
     }
 
@@ -303,7 +309,7 @@ struct WorkPresetGallery: View {
                             Text(preset.name)
                                 .font(.headline)
                             Spacer(minLength: 4)
-                            Text("\(preset.agents.count) agent\(preset.agents.count == 1 ? "" : "s")")
+                            Text("\(preset.agents.count) agents")
                                 .font(.caption2.monospacedDigit())
                                 .foregroundStyle(.tertiary)
                         }
@@ -343,7 +349,7 @@ struct WorkPresetGallery: View {
             HStack(spacing: 8) {
                 if model.isApplyingWorkPreset {
                     ProgressView().controlSize(.small)
-                    Text("Writing the preset into \(options.configPath ?? "the muxa config")…")
+                    Text("Writing the preset into \(options.configPath ?? String(localized: "the muxa config"))…")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -425,7 +431,9 @@ struct WorkPlanView: View {
 
     private var planSummary: String {
         var parts = ["\(result.workspace) / \(result.work)"]
-        if let pipeline = result.pipeline, !pipeline.isEmpty { parts.append("pipeline \(pipeline)") }
+        if let pipeline = result.pipeline, !pipeline.isEmpty {
+            parts.append(String(localized: "pipeline \(pipeline)"))
+        }
         if let cwd = result.cwd, !cwd.isEmpty { parts.append(cwd) }
         return parts.joined(separator: " · ")
     }
@@ -448,17 +456,18 @@ private struct WorkPlanStepRow: View {
 
     private var headline: String {
         switch step.action {
-        case "launch": "Launch @\(step.alias)"
-        case "reprompt": "Send the request to @\(step.alias)"
-        case "keep": "Keep @\(step.alias) as is"
-        case "waiting": "@\(step.alias) waits for \(step.waitingOn.map { "@\($0)" }.joined(separator: ", "))"
-        case "attention": "@\(step.alias) needs a person first"
+        case "launch": String(localized: "Launch @\(step.alias)")
+        case "reprompt": String(localized: "Send the request to @\(step.alias)")
+        case "keep": String(localized: "Keep @\(step.alias) as is")
+        case "waiting":
+            String(localized: "@\(step.alias) waits for \(step.waitingOn.map { "@\($0)" }.joined(separator: ", "))")
+        case "attention": String(localized: "@\(step.alias) needs a person first")
         default: "@\(step.alias): \(step.action)"
         }
     }
 
     private var detail: String? {
-        let parts = [step.program, step.role, step.task, step.pane.map { "pane \($0)" }, step.state]
+        let parts = [step.program, step.role, step.task, step.pane.map { String(localized: "pane \($0)") }, step.state]
             .compactMap { $0 }
             .filter { !$0.isEmpty }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
@@ -572,7 +581,7 @@ struct WorkRoutesEditor: View {
 
     private func routeRow(_ route: MuxaWorkOptions.Route, position: Int) -> some View {
         HStack(spacing: 10) {
-            Text("\(position + 1)")
+            Text(verbatim: "\(position + 1)")
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.tertiary)
                 .frame(width: 18, alignment: .trailing)
@@ -582,9 +591,15 @@ struct WorkRoutesEditor: View {
             Image(systemName: "arrow.right")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
-            Text(route.pipeline ?? "no pipeline")
-                .font(.callout.weight(route.pipeline == nil ? .regular : .medium))
-                .foregroundStyle(route.pipeline == nil ? Color.orange : Color.primary)
+            if let pipeline = route.pipeline {
+                Text(pipeline)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(Color.primary)
+            } else {
+                Text("no pipeline")
+                    .font(.callout)
+                    .foregroundStyle(Color.orange)
+            }
             if let workspace = route.workspace, !workspace.isEmpty {
                 Text("workspace \(workspace)")
                     .font(.caption)
@@ -639,7 +654,7 @@ struct WorkRoutesEditor: View {
     private func routeForm(position: Int) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                TextField("", text: $draft.match, prompt: Text("match (regex, for example ^cal- or .*)"))
+                TextField("Match", text: $draft.match, prompt: Text("match (regex, for example ^cal- or .*)"))
                     .labelsHidden()
                     .font(.callout.monospaced())
                     .disabled(draft.existing)
@@ -653,9 +668,9 @@ struct WorkRoutesEditor: View {
                 .frame(width: 170)
             }
             HStack(spacing: 8) {
-                TextField("", text: $draft.workspace, prompt: Text("workspace (optional)"))
+                TextField("Workspace", text: $draft.workspace, prompt: Text("workspace (optional)"))
                     .labelsHidden()
-                TextField("", text: $draft.cwd, prompt: Text("folder on the host (optional)"))
+                TextField("Folder", text: $draft.cwd, prompt: Text("folder on the host (optional)"))
                     .labelsHidden()
             }
             HStack {

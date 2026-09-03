@@ -446,32 +446,33 @@ struct MuxaPipelineDefinition: Codable, Equatable, Sendable {
     /// Problems the CLI would refuse, in the order an operator can fix them.
     func problems() -> [String] {
         var problems: [String] = []
-        if agents.isEmpty { problems.append("Add at least one agent.") }
+        if agents.isEmpty { problems.append(String(localized: "Add at least one agent.")) }
         var seen = Set<String>()
         let aliases = agents.map { $0.alias.trimmingCharacters(in: .whitespaces).lowercased() }
         for (index, alias) in aliases.enumerated() {
             if alias.isEmpty {
-                problems.append("Agent \(index + 1) needs an alias.")
+                problems.append(String(localized: "Agent \(index + 1) needs an alias."))
             } else if !Self.isValidName(alias) {
-                problems.append("Alias \"\(alias)\" may only use letters, digits, - and _.")
+                problems.append(String(localized: "Alias \"\(alias)\" may only use letters, digits, - and _."))
             } else if !seen.insert(alias).inserted {
-                problems.append("Alias \"\(alias)\" is used twice.")
+                problems.append(String(localized: "Alias \"\(alias)\" is used twice."))
             }
         }
         for agent in agents {
             let program = agent.program.trimmingCharacters(in: .whitespaces).lowercased()
             if !Self.allowedPrograms.contains(program) {
-                problems.append("@\(agent.alias): program must be one of \(Self.allowedPrograms.joined(separator: ", ")).")
+                let allowed = Self.allowedPrograms.joined(separator: ", ")
+                problems.append(String(localized: "@\(agent.alias): program must be one of \(allowed)."))
             }
             if !["", "down"].contains(Agent.canonicalDirection(agent.direction)) {
-                problems.append("@\(agent.alias): direction must be right or down.")
+                problems.append(String(localized: "@\(agent.alias): direction must be right or down."))
             }
             for dependency in agent.after where !aliases.contains(dependency) {
-                problems.append("@\(agent.alias) waits for unknown alias \"\(dependency)\".")
+                problems.append(String(localized: "@\(agent.alias) waits for unknown alias \"\(dependency)\"."))
             }
         }
         if problems.isEmpty, hasCycle() {
-            problems.append("The after edges form a cycle, so some agents would never start.")
+            problems.append(String(localized: "The after edges form a cycle, so some agents would never start."))
         }
         return problems
     }

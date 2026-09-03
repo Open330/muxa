@@ -6,7 +6,7 @@ struct IncompatibleMuxadError: LocalizedError {
     let detail: String
 
     var errorDescription: String? {
-        "An older muxad is already serving \(socketPath). \(detail)"
+        String(localized: "An older muxad is already serving \(socketPath). \(detail)")
     }
 }
 

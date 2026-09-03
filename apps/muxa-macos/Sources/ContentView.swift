@@ -415,13 +415,13 @@ private struct WorkspaceTabBar: View {
     private func tabLabel(for selection: MuxaSidebarSelection) -> String {
         switch selection {
         case .workBoard:
-            "Work Command Center"
+            String(localized: "Work Command Center")
         case .watch:
-            "Live Watch"
+            String(localized: "Live Watch")
         case .inbox:
-            "Inbox"
+            String(localized: "Inbox")
         case .ask:
-            "Ask"
+            String(localized: "Ask")
         case .work(let identity):
             model.workGroups.first { $0.identity == identity }?.title ?? identity.workID
         case .agent(let id):
@@ -429,24 +429,24 @@ private struct WorkspaceTabBar: View {
                 $0.agent.aiTitle
                     ?? $0.pane?.agentAlias.map { "@\($0)" }
                     ?? $0.agent.kind.replacingOccurrences(of: "_", with: " ")
-            } ?? "Agent"
+            } ?? String(localized: "Agent")
         case .host(let id):
-            model.fleetHosts.first { $0.id == id }?.alias ?? "Host"
+            model.fleetHosts.first { $0.id == id }?.alias ?? String(localized: "Host")
         case .fleetSession(let id):
             model.executionSnapshot.watchSession(id: id).map {
                 "\($0.hostAlias) · \($0.name.isEmpty ? $0.sessionID : $0.name)"
-            } ?? "Session"
+            } ?? String(localized: "Session")
         case .fleetWindow(let id):
             model.executionSnapshot.watchWindow(id: id).map {
                 $0.name.isEmpty ? $0.windowID : $0.name
-            } ?? "Window"
+            } ?? String(localized: "Window")
         case .shell(let id):
             model.sessions.first { $0.id == id }.map { $0.displayName ?? $0.id }
-                ?? "Shell"
+                ?? String(localized: "Shell")
         case .pane(let id):
             model.executionSnapshot.watchPane(id: id).map {
                 "\($0.host.alias) · \($0.pane.windowName.isEmpty ? $0.pane.paneID : $0.pane.windowName)"
-            } ?? "Pane"
+            } ?? String(localized: "Pane")
         }
     }
 
@@ -541,7 +541,7 @@ private struct EditorTab: View {
                 .frame(width: 1)
         }
         .onHover { hovering = $0 }
-        .help(preview ? "Preview — double-click to keep open" : title)
+        .help(preview ? Text("Preview — double-click to keep open") : Text(title))
         .contextMenu {
             if preview { Button("Keep Open", action: pin) }
             Button("Close", action: close)
@@ -558,17 +558,30 @@ private struct EditorTab: View {
 }
 
 private struct CommandPaletteView: View {
-    private enum PaletteCommand: String, CaseIterable, Identifiable {
-        case startWork = "Start configured Work"
-        case workCommandCenter = "Open Work Command Center"
-        case liveWatch = "Open native Live Watch"
-        case ask = "Open global Ask"
-        case newShell = "New native shell"
-        case showWork = "Show managed work"
-        case showShells = "Show native shells"
-        case refresh = "Refresh workspace"
+    private enum PaletteCommand: CaseIterable, Identifiable {
+        case startWork
+        case workCommandCenter
+        case liveWatch
+        case ask
+        case newShell
+        case showWork
+        case showShells
+        case refresh
 
         var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .startWork: String(localized: "Start configured Work")
+            case .workCommandCenter: String(localized: "Open Work Command Center")
+            case .liveWatch: String(localized: "Open native Live Watch")
+            case .ask: String(localized: "Open global Ask")
+            case .newShell: String(localized: "New native shell")
+            case .showWork: String(localized: "Show managed work")
+            case .showShells: String(localized: "Show native shells")
+            case .refresh: String(localized: "Refresh workspace")
+            }
+        }
 
         var systemImage: String {
             switch self {
@@ -592,7 +605,7 @@ private struct CommandPaletteView: View {
     private var commands: [PaletteCommand] {
         guard !query.isEmpty else { return PaletteCommand.allCases }
         return PaletteCommand.allCases.filter {
-            $0.rawValue.localizedCaseInsensitiveContains(query)
+            $0.title.localizedCaseInsensitiveContains(query)
         }
     }
 
@@ -617,7 +630,7 @@ private struct CommandPaletteView: View {
                 Button {
                     run(command)
                 } label: {
-                    Label(command.rawValue, systemImage: command.systemImage)
+                    Label(command.title, systemImage: command.systemImage)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
                 }
@@ -657,12 +670,20 @@ private struct CommandPaletteView: View {
 }
 
 private struct MuxaSidebar: View {
-    private enum StatusScope: String, CaseIterable, Identifiable {
-        case all = "All"
-        case attention = "Attention"
-        case active = "Active"
+    private enum StatusScope: CaseIterable, Identifiable {
+        case all
+        case attention
+        case active
 
         var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .all: String(localized: "All")
+            case .attention: String(localized: "Attention")
+            case .active: String(localized: "Active")
+            }
+        }
 
         var systemImage: String {
             switch self {
@@ -682,9 +703,9 @@ private struct MuxaSidebar: View {
 
         var title: String {
             switch self {
-            case .host: "Host tree"
-            case .status: "Status groups"
-            case .none: "No groups"
+            case .host: String(localized: "Host tree")
+            case .status: String(localized: "Status groups")
+            case .none: String(localized: "No groups")
             }
         }
 
@@ -707,10 +728,10 @@ private struct MuxaSidebar: View {
 
         var title: String {
             switch self {
-            case .attention: "Needs attention"
-            case .active: "Active"
-            case .idle: "Idle agents"
-            case .shell: "Shell panes"
+            case .attention: String(localized: "Needs attention")
+            case .active: String(localized: "Active")
+            case .idle: String(localized: "Idle agents")
+            case .shell: String(localized: "Shell panes")
             }
         }
     }
@@ -732,19 +753,19 @@ private struct MuxaSidebar: View {
 
         var title: String {
             switch self {
-            case .topology: "Topology"
-            case .recent: "Latest activity"
-            case .myPrompt: "My latest prompt"
-            case .agentActivity: "Agent latest update"
+            case .topology: String(localized: "Topology")
+            case .recent: String(localized: "Latest activity")
+            case .myPrompt: String(localized: "My latest prompt")
+            case .agentActivity: String(localized: "Agent latest update")
             }
         }
 
         var compactTitle: String {
             switch self {
-            case .topology: "Topology"
-            case .recent: "Last activity"
-            case .myPrompt: "My prompt"
-            case .agentActivity: "Agent update"
+            case .topology: String(localized: "Topology")
+            case .recent: String(localized: "Last activity")
+            case .myPrompt: String(localized: "My prompt")
+            case .agentActivity: String(localized: "Agent update")
             }
         }
 
@@ -837,7 +858,7 @@ private struct MuxaSidebar: View {
                             .disabled(!model.isConnected || isOpeningRemoteShell)
                             .help("New shell on a fleet host")
                         }
-                        Text(sidebarCountLabel)
+                        Text(verbatim: sidebarCountLabel)
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
@@ -848,12 +869,12 @@ private struct MuxaSidebar: View {
                     HStack(spacing: 6) {
                         Image(systemName: "magnifyingglass")
                             .foregroundStyle(.secondary)
-                        TextField("Filter \(model.sidebarMode.title.lowercased())", text: $filterText)
+                        TextField(model.sidebarMode.filterPrompt, text: $filterText)
                             .textFieldStyle(.plain)
                         Menu {
                             Picker("Status", selection: $statusScope) {
                                 ForEach(StatusScope.allCases) { scope in
-                                    Label(scope.rawValue, systemImage: scope.systemImage)
+                                    Label(scope.title, systemImage: scope.systemImage)
                                         .tag(scope)
                                 }
                             }
@@ -1418,7 +1439,7 @@ private struct MuxaSidebar: View {
                 }
             case .status:
                 ForEach(filteredStatusPaneGroups) { group in
-                    Section("\(group.bucket.title) · \(group.panes.count)") {
+                    Section {
                         ForEach(group.panes) { pane in
                             WatchFlatPaneRow(
                                 pane: pane,
@@ -1432,6 +1453,8 @@ private struct MuxaSidebar: View {
                             .listRowInsets(EdgeInsets(top: 1, leading: 5, bottom: 1, trailing: 5))
                             .listRowBackground(Color.clear)
                         }
+                    } header: {
+                        Text(verbatim: "\(group.bucket.title) · \(group.panes.count)")
                     }
                 }
             case .none:
@@ -1500,7 +1523,7 @@ private struct SidebarActivityRail: View {
                         .overlay(alignment: .topTrailing) {
                             let count = attentionCount(for: mode)
                             if count > 0 {
-                                Text(count > 99 ? "99+" : "\(count)")
+                                Text(verbatim: count > 99 ? "99+" : "\(count)")
                                     .font(.system(size: 8, weight: .bold, design: .rounded))
                                     .foregroundStyle(.white)
                                     .padding(.horizontal, count > 9 ? 4 : 3)
@@ -1546,7 +1569,7 @@ private struct SidebarActivityRail: View {
 }
 
 private struct SidebarEmptyRow: View {
-    let title: String
+    let title: LocalizedStringKey
     let systemImage: String
 
     var body: some View {
@@ -1593,7 +1616,7 @@ private struct GlobalAskRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Global Ask")
                     .fontWeight(.medium)
-                Text("@\(agent) · \(conversationCount) \(conversationCount == 1 ? "conversation" : "conversations")")
+                Text("@\(agent) · \(conversationCount) conversations")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -1650,7 +1673,7 @@ private struct InboxAgentRow: View {
         presentText(participant.agent.recap)
             ?? presentText(participant.agent.lastNotification)
             ?? presentText(participant.agent.lastPrompt)
-            ?? "Waiting for input"
+            ?? String(localized: "Waiting for input")
     }
 
     var body: some View {
@@ -1781,7 +1804,7 @@ private struct SidebarConnectionStatus: View {
 
     @ViewBuilder
     private func statusMessage(
-        title: String,
+        title: LocalizedStringKey,
         message: String,
         systemImage: String
     ) -> some View {
@@ -1836,7 +1859,7 @@ private struct NativeWatchRow: View {
             }
             Spacer()
             if attentionCount > 0 {
-                Text("\(attentionCount)")
+                Text(verbatim: "\(attentionCount)")
                     .font(.caption2.bold().monospacedDigit())
                     .foregroundStyle(.white)
                     .padding(.horizontal, 6)
@@ -1896,7 +1919,7 @@ private struct WorkRow: View {
                 HStack(spacing: 5) {
                     Text(work.workspaceID)
                     if !work.hostAliases.isEmpty {
-                        Text("· \(work.hostAliases.joined(separator: ", "))")
+                        Text(verbatim: "· \(work.hostAliases.joined(separator: ", "))")
                     }
                 }
                     .font(.caption2)
@@ -1904,13 +1927,15 @@ private struct WorkRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
-            Text(
-                work.pipelineRun == nil
-                    ? "\(work.participants.count) agents"
-                    : "\(work.completedCount)/\(work.totalCount)"
-            )
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(work.attentionCount > 0 ? .orange : .secondary)
+            Group {
+                if work.pipelineRun == nil {
+                    Text("\(work.participants.count) agents")
+                } else {
+                    Text(verbatim: "\(work.completedCount)/\(work.totalCount)")
+                }
+            }
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(work.attentionCount > 0 ? .orange : .secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
@@ -1928,7 +1953,7 @@ private struct FleetAgentRow: View {
     }
 
     private var executionLocation: String {
-        guard let pane = participant.pane else { return "no pane binding" }
+        guard let pane = participant.pane else { return String(localized: "no pane binding") }
         let window = pane.windowName.isEmpty ? pane.stableWindowID : pane.windowName
         return "\(pane.session) › \(window) › \(pane.paneID)"
     }
@@ -1944,7 +1969,7 @@ private struct FleetAgentRow: View {
                     Text(title)
                         .lineLimit(1)
                 }
-                Text("\(participant.host.alias) · \(participant.agent.agentSessionID)")
+                Text(verbatim: "\(participant.host.alias) · \(participant.agent.agentSessionID)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -1992,7 +2017,7 @@ private struct WorkDetailView: View {
                             Text("observed from tmux metadata")
                         }
                         if !work.hostAliases.isEmpty {
-                            Text("·")
+                            Text(verbatim: "·")
                             Label(work.hostAliases.joined(separator: ", "), systemImage: "network")
                         }
                     }
@@ -2080,13 +2105,13 @@ private struct WorkDetailView: View {
 }
 
 private struct WorkMetric: View {
-    let title: String
+    let title: LocalizedStringKey
     let value: String
     let color: Color
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(value)
+            Text(verbatim: value)
                 .font(.title2.weight(.semibold).monospacedDigit())
                 .foregroundStyle(color)
             Text(title)
@@ -2122,7 +2147,7 @@ private struct WorkParticipantCard: View {
                     Text(title)
                         .font(.headline)
                         .lineLimit(1)
-                    Text("\(participant.host.alias) · \(desired?.role ?? participant.agent.kind)")
+                    Text(verbatim: "\(participant.host.alias) · \(desired?.role ?? participant.agent.kind)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -2182,7 +2207,7 @@ private struct WorkParticipantCard: View {
             parts.append("\(pane.session) › \(pane.windowName.isEmpty ? pane.stableWindowID : pane.windowName) › \(pane.paneID)")
         }
         if let model = participant.agent.model { parts.append(model) }
-        return parts.isEmpty ? "No execution binding" : parts.joined(separator: " · ")
+        return parts.isEmpty ? String(localized: "No execution binding") : parts.joined(separator: " · ")
     }
 }
 
@@ -2194,7 +2219,7 @@ private struct PipelinePlaceholderCard: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("@\(desired.alias)")
+                    Text(verbatim: "@\(desired.alias)")
                         .font(.headline)
                         .lineLimit(1)
                     Text(desired.role ?? desired.program)
@@ -2238,12 +2263,13 @@ private struct PipelinePlaceholderCard: View {
 }
 
 private struct MarkdownSection: View {
-    let title: String
+    let title: LocalizedStringKey
     let source: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(title.uppercased())
+            Text(title)
+                .textCase(.uppercase)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
             if let source, !source.isEmpty {
@@ -2306,12 +2332,20 @@ struct MarkdownContent: View {
 }
 
 private struct FleetAgentDetailView: View {
-    private enum DetailTab: String, CaseIterable, Identifiable {
-        case summary = "Summary"
-        case conversation = "Conversation"
-        case shell = "Shell"
+    private enum DetailTab: CaseIterable, Identifiable {
+        case summary
+        case conversation
+        case shell
 
         var id: Self { self }
+
+        var title: LocalizedStringKey {
+            switch self {
+            case .summary: "Summary"
+            case .conversation: "Conversation"
+            case .shell: "Shell"
+            }
+        }
     }
 
     let participant: MuxaHostedAgent
@@ -2385,7 +2419,7 @@ private struct FleetAgentDetailView: View {
 
                 Picker("Agent detail", selection: $selectedTab) {
                     ForEach(availableTabs) { tab in
-                        Text(tab.rawValue).tag(tab)
+                        Text(tab.title).tag(tab)
                     }
                 }
                 .labelsHidden()
@@ -2503,8 +2537,14 @@ private struct FleetHostDetailView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(host.alias)
                             .font(.largeTitle.weight(.semibold))
-                        Text(host.local ? "Local host" : host.state.replacingOccurrences(of: "_", with: " ").capitalized)
-                            .foregroundStyle(fleetHostColor(host.state))
+                        Group {
+                            if host.local {
+                                Text("Local host")
+                            } else {
+                                Text(fleetHostStateLabel(host.state))
+                            }
+                        }
+                        .foregroundStyle(fleetHostColor(host.state))
                     }
                 }
 
@@ -2548,9 +2588,9 @@ private struct FleetHostDetailView: View {
 
                 DisclosureGroup("Connection details", isExpanded: $connectionExpanded) {
                     Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 8) {
-                        AgentFact(label: "Mode", value: host.mode)
-                        AgentFact(label: "State", value: host.state)
-                        AgentFact(label: "Scope", value: host.local ? "local" : "remote")
+                        AgentFact(label: "Mode", value: fleetHostModeLabel(host.mode))
+                        AgentFact(label: "State", value: fleetHostStateLabel(host.state))
+                        AgentFact(label: "Scope", value: host.local ? String(localized: "local") : String(localized: "remote"))
                         if let target = host.sshTarget, !host.local {
                             AgentFact(label: "SSH target", value: target)
                         }
@@ -2599,9 +2639,13 @@ private struct FleetSessionSummaryCard: View {
                         .lineLimit(1)
                     Spacer(minLength: 4)
                     if attentionCount > 0 {
-                        Label("\(attentionCount)", systemImage: "exclamationmark.circle.fill")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.orange)
+                        Label {
+                            Text(verbatim: "\(attentionCount)")
+                        } icon: {
+                            Image(systemName: "exclamationmark.circle.fill")
+                        }
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.orange)
                     }
                     Image(systemName: "chevron.right")
                         .font(.caption2.weight(.semibold))
@@ -2773,7 +2817,7 @@ private struct FleetWindowDetailView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Collaboration in this window")
                             .font(.title2.weight(.semibold))
-                        Text("\(relatedMessages.count) operator command\(relatedMessages.count == 1 ? "" : "s") and their durable replies")
+                        Text("\(relatedMessages.count) operator commands and their durable replies")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                         ForEach(relatedMessages.prefix(5)) { message in
@@ -2806,7 +2850,7 @@ private struct FleetWindowDetailView: View {
                     Text("\(window.hostAlias) · \(window.panes.count) panes")
                         .foregroundStyle(.secondary)
                     if let workIdentity {
-                        Text("\(workIdentity.workspaceID) / \(workIdentity.workID)")
+                        Text(verbatim: "\(workIdentity.workspaceID) / \(workIdentity.workID)")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(Color.accentColor)
                             .padding(.horizontal, 7)
@@ -2942,7 +2986,7 @@ private struct WindowAgentReportCard: View {
             HStack(spacing: 6) {
                 Image(systemName: "terminal")
                 Text(pane.pane.currentCommand)
-                Text("·")
+                Text(verbatim: "·")
                 Text(pane.pane.currentPath)
                     .lineLimit(1)
             }
@@ -2961,9 +3005,10 @@ private struct WindowAgentReportCard: View {
         }
     }
 
-    private func reportSection(_ label: String, source: String, lineLimit: Int) -> some View {
+    private func reportSection(_ label: LocalizedStringKey, source: String, lineLimit: Int) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(label.uppercased())
+            Text(label)
+                .textCase(.uppercase)
                 .font(.caption2.weight(.bold))
                 .foregroundStyle(.secondary)
             MarkdownContent(source: source, lineLimit: lineLimit, selectable: false, font: .callout)
@@ -2985,11 +3030,18 @@ private struct WindowAgentReportCard: View {
         }
     }
 
-    private func detailChip(_ label: String, _ value: String, systemImage: String) -> some View {
-        Label("\(label) \(value)", systemImage: systemImage)
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
+    private func detailChip(_ label: LocalizedStringKey, _ value: String, systemImage: String) -> some View {
+        Label {
+            HStack(spacing: 3) {
+                Text(label)
+                Text(value)
+            }
+        } icon: {
+            Image(systemName: systemImage)
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
     }
 }
 
@@ -3085,9 +3137,16 @@ private struct FleetWindowSummaryCard: View {
 
             if let focusPane, let summary = fleetPaneSummary(focusPane) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(paneNeedsAttentionForSummary(focusPane) ? "NEEDS ATTENTION" : "CURRENT PICTURE")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(paneNeedsAttentionForSummary(focusPane) ? Color.orange : Color.secondary)
+                    Group {
+                        if paneNeedsAttentionForSummary(focusPane) {
+                            Text("Needs attention")
+                        } else {
+                            Text("Current picture")
+                        }
+                    }
+                    .textCase(.uppercase)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(paneNeedsAttentionForSummary(focusPane) ? Color.orange : Color.secondary)
                     MarkdownContent(source: summary, lineLimit: 3, selectable: false, font: .caption)
                 }
                 .padding(8)
@@ -3155,7 +3214,7 @@ private struct FleetResourceSummaryRow: View {
                     }
                 }
                 MarkdownContent(
-                    source: fleetPaneSummary(pane) ?? "No summary reported",
+                    source: fleetPaneSummary(pane) ?? String(localized: "No summary reported"),
                     lineLimit: 2,
                     selectable: false,
                     font: .caption
@@ -3201,17 +3260,17 @@ private func presentText(_ value: String?) -> String? {
 }
 
 private struct HostMetric: View {
-    let title: String
+    let title: LocalizedStringKey
     let value: UInt64
     var suffix = ""
 
-    init(title: String, value: Int, suffix: String = "") {
+    init(title: LocalizedStringKey, value: Int, suffix: String = "") {
         self.title = title
         self.value = UInt64(value)
         self.suffix = suffix
     }
 
-    init(title: String, value: UInt64, suffix: String = "") {
+    init(title: LocalizedStringKey, value: UInt64, suffix: String = "") {
         self.title = title
         self.value = value
         self.suffix = suffix
@@ -3219,7 +3278,7 @@ private struct HostMetric: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text("\(value)\(suffix)")
+            Text(verbatim: "\(value)\(suffix)")
                 .font(.title2.weight(.semibold).monospacedDigit())
             Text(title)
                 .font(.caption)
@@ -3230,7 +3289,7 @@ private struct HostMetric: View {
 }
 
 private struct AgentFact: View {
-    let label: String
+    let label: LocalizedStringKey
     let value: String
 
     var body: some View {
@@ -3276,17 +3335,40 @@ private struct MuxaEmptyDetail: View {
 
 func agentStateLabel(_ state: String) -> String {
     switch state {
-    case "waiting_input": "Waiting for input"
-    case "waiting_choice": "Waiting for choice"
-    case "working": "Working"
-    case "starting": "Starting"
-    case "idle": "Idle"
-    case "error", "failed": "Error"
-    case "blocked": "Blocked"
-    case "done": "Done"
-    case "pending": "Pending"
-    case "stopped": "Stopped"
+    case "waiting_input": String(localized: "Waiting for input")
+    case "waiting_choice": String(localized: "Waiting for choice")
+    case "working": String(localized: "Working")
+    case "starting": String(localized: "Starting")
+    case "idle": String(localized: "Idle")
+    case "error", "failed": String(localized: "Error")
+    case "blocked": String(localized: "Blocked")
+    case "done": String(localized: "Done")
+    case "pending": String(localized: "Pending")
+    case "stopped": String(localized: "Stopped")
     default: state.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+}
+
+/// Display wording for a fleet host `state` as muxad reports it.
+func fleetHostStateLabel(_ state: String) -> String {
+    switch state {
+    case "online": String(localized: "Online")
+    case "offline": String(localized: "Offline")
+    case "connecting": String(localized: "Connecting")
+    case "degraded": String(localized: "Degraded")
+    case "version_skew": String(localized: "Version skew")
+    case "auth_failed": String(localized: "Authentication failed")
+    case "disabled": String(localized: "Disabled")
+    default: state.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+}
+
+/// Display wording for a fleet host access `mode` (`observe` or `control`).
+func fleetHostModeLabel(_ mode: String) -> String {
+    switch mode {
+    case "observe": String(localized: "Observe")
+    case "control": String(localized: "Control")
+    default: mode.capitalized
     }
 }
 
@@ -3379,10 +3461,15 @@ struct TerminalPane: View {
                     .background(.ultraThinMaterial, in: Capsule())
                     .padding(8)
             } else if pane.exited {
-                Label(
-                    pane.exitStatus.map { "Session ended (status \($0))" } ?? "Session ended",
-                    systemImage: pane.exitStatus == 0 ? "checkmark.circle" : "stop.circle"
-                )
+                Label {
+                    if let status = pane.exitStatus {
+                        Text("Session ended (status \(status))")
+                    } else {
+                        Text("Session ended")
+                    }
+                } icon: {
+                    Image(systemName: pane.exitStatus == 0 ? "checkmark.circle" : "stop.circle")
+                }
                 .font(.caption)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 7)

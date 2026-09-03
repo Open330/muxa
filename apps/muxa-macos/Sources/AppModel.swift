@@ -24,10 +24,20 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .work: "Work"
-        case .watch: "Explore"
-        case .inbox: "Inbox"
-        case .shells: "Shells"
+        case .work: String(localized: "Work")
+        case .watch: String(localized: "Explore")
+        case .inbox: String(localized: "Inbox")
+        case .shells: String(localized: "Shells")
+        }
+    }
+
+    /// Placeholder of the sidebar filter field while this container is shown.
+    var filterPrompt: String {
+        switch self {
+        case .work: String(localized: "Filter work")
+        case .watch: String(localized: "Filter Explore")
+        case .inbox: String(localized: "Filter inbox")
+        case .shells: String(localized: "Filter shells")
         }
     }
 
@@ -729,15 +739,19 @@ final class AppModel: ObservableObject {
             )
             guard output.exitCode == 0 else {
                 let detail = output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                let command = arguments.prefix(3).joined(separator: " ")
                 throw MuxaIPCError.server(
-                    detail.isEmpty ? "muxa \(arguments.prefix(3).joined(separator: " ")) exited with \(output.exitCode)" : detail
+                    detail.isEmpty
+                        ? String(localized: "muxa \(command) exited with \(output.exitCode)")
+                        : detail
                 )
             }
             return output.stdout
         }
         guard local else {
+            let target = host ?? String(localized: "a remote host")
             throw MuxaIPCError.server(
-                "Running Work commands on \(host ?? "a remote host") needs the updated muxad; choose Use Bundled muxad or restart it"
+                String(localized: "Running Work commands on \(target) needs the updated muxad; choose Use Bundled muxad or restart it")
             )
         }
         return try await Self.runBundledMuxa(
@@ -851,7 +865,7 @@ final class AppModel: ObservableObject {
         let definition = MuxaPipelineDefinition(pipeline)
         for host in targets {
             if !(await savePipeline(definition, named: pipeline.name, host: host)) {
-                failures[host] = pipelineEditorError ?? "unknown error"
+                failures[host] = pipelineEditorError ?? String(localized: "unknown error")
             }
         }
         pipelineEditorError = nil
@@ -979,7 +993,9 @@ final class AppModel: ObservableObject {
         isStartingWork = true
         workStartError = nil
         workStartPlan = nil
-        workStartStatus = request.dryRun ? "Building the Work plan…" : "Submitting Work to muxad…"
+        workStartStatus = request.dryRun
+            ? String(localized: "Building the Work plan…")
+            : String(localized: "Submitting Work to muxad…")
         defer { isStartingWork = false }
         do {
             var operation = try await client.startWork(request)
@@ -1016,7 +1032,7 @@ final class AppModel: ObservableObject {
             }
             return true
         } catch is CancellationError {
-            workStartError = "The app stopped waiting, but muxad may still be running this Work operation."
+            workStartError = String(localized: "The app stopped waiting, but muxad may still be running this Work operation.")
             return false
         } catch {
             MuxaLog.app.error(
@@ -1034,7 +1050,7 @@ final class AppModel: ObservableObject {
         guard isConnected, !isCreatingSession else { return false }
         isCreatingSession = true
         workStartError = nil
-        workStartStatus = "Opening the Work pipeline setup wizard…"
+        workStartStatus = String(localized: "Opening the Work pipeline setup wizard…")
         defer { isCreatingSession = false }
         do {
             let bundled = Bundle.main.bundleURL
@@ -1156,7 +1172,7 @@ final class AppModel: ObservableObject {
                 askConfigurationPendingReload = true
             }
             askEnabled = false
-            askSettingsStatus = "Global Ask is enabled in config. Reloading muxad applies the grant."
+            askSettingsStatus = String(localized: "Global Ask is enabled in config. Reloading muxad applies the grant.")
             if sessions.contains(where: { !$0.exited }) {
                 isConfirmingDaemonReplacement = true
             } else {
@@ -1212,7 +1228,7 @@ final class AppModel: ObservableObject {
         askSettingsError = nil
         do {
             try MuxaProviderCredentialStore.save(key, for: provider)
-            askSettingsStatus = "Saved \(provider.title) key in the login Keychain. It will be passed only to the next matching Ask process."
+            askSettingsStatus = String(localized: "Saved \(provider.title) key in the login Keychain. It will be passed only to the next matching Ask process.")
             return true
         } catch {
             askSettingsError = error.localizedDescription
@@ -1224,7 +1240,7 @@ final class AppModel: ObservableObject {
         askSettingsError = nil
         do {
             try MuxaProviderCredentialStore.remove(for: provider)
-            askSettingsStatus = "Removed the \(provider.title) API key. Future Ask processes will use CLI sign-in or their inherited environment."
+            askSettingsStatus = String(localized: "Removed the \(provider.title) API key. Future Ask processes will use CLI sign-in or their inherited environment.")
         } catch {
             askSettingsError = error.localizedDescription
         }
@@ -1367,7 +1383,7 @@ final class AppModel: ObservableObject {
             for: message,
             in: executionSnapshot
         ) else {
-            inboxError = "\(message.request.to.label) is no longer present on \(message.host.alias). The conversation is still available, but its live agent cannot be opened."
+            inboxError = String(localized: "\(message.request.to.label) is no longer present on \(message.host.alias). The conversation is still available, but its live agent cannot be opened.")
             return
         }
         inboxError = nil
@@ -1495,7 +1511,7 @@ final class AppModel: ObservableObject {
         let alias = request.alias.trimmingCharacters(in: .whitespacesAndNewlines)
         let ssh = request.ssh.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !alias.isEmpty, !ssh.isEmpty else {
-            hostRegistrationError = "Host alias and SSH target are required."
+            hostRegistrationError = String(localized: "Host alias and SSH target are required.")
             return false
         }
         isRegisteringHost = true
@@ -1556,8 +1572,9 @@ final class AppModel: ObservableObject {
             let errorMessage = String(data: standardError, encoding: .utf8) ?? ""
             guard process.terminationStatus == 0 else {
                 let reason = errorMessage.isEmpty ? message : errorMessage
+                let command = arguments.prefix(2).joined(separator: " ")
                 throw MuxaIPCError.server(
-                    reason.isEmpty ? "muxa \(arguments.prefix(2).joined(separator: " ")) failed" : reason
+                    reason.isEmpty ? String(localized: "muxa \(command) failed") : reason
                 )
             }
             return message
