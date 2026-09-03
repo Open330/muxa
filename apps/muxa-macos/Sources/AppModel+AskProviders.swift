@@ -270,33 +270,3 @@ enum MuxaSettingsOpener {
     }
 }
 
-/// Small gear button that opens Settings › Providers.
-struct AskProvidersSettingsButton: View {
-    var body: some View {
-        if #available(macOS 14.0, *) {
-            AskProvidersSettingsButtonModern()
-        } else {
-            Button {
-                MuxaSettingsOpener.select(.providers)
-                MuxaSettingsOpener.openLegacySettingsWindow()
-            } label: {
-                Label("Provider Settings", systemImage: "gearshape")
-            }
-        }
-    }
-}
-
-@available(macOS 14.0, *)
-private struct AskProvidersSettingsButtonModern: View {
-    @Environment(\.openSettings) private var openSettings
-
-    var body: some View {
-        Button {
-            MuxaSettingsOpener.select(.providers)
-            openSettings()
-            NSApp.activate(ignoringOtherApps: true)
-        } label: {
-            Label("Provider Settings", systemImage: "gearshape")
-        }
-    }
-}

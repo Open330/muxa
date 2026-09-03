@@ -1325,6 +1325,7 @@ struct MuxaAskView: View {
 
     private var askContextControls: some View {
         HStack(spacing: 7) {
+            conversationMenu
             Picker("Provider", selection: $agent) {
                 ForEach(providers.providers) { provider in
                     Text(provider.title)
@@ -1339,47 +1340,48 @@ struct MuxaAskView: View {
             .frame(width: 150)
             .help("Provider for new conversations; disabled entries need a CLI install or an API key in Settings")
 
-            Menu {
-                Button {
-                    Task { await model.resetAskConversation() }
-                } label: {
-                    Label("New Conversation", systemImage: "plus.bubble")
-                }
-                Divider()
-                if providerConversations.isEmpty {
-                    Text("No previous conversations")
-                } else {
-                    ForEach(providerConversations) { conversation in
-                        Button {
-                            Task { await model.selectAskConversation(conversation.id) }
-                        } label: {
-                            if conversation.id == model.activeAskConversationID {
-                                Label(conversation.title, systemImage: "checkmark")
-                            } else {
-                                Text(conversation.title)
-                            }
+        }
+    }
+
+    /// Conversations first: starting a new one is the most common action in
+    /// this bar, so it leads. Provider setup lives in Settings › Providers.
+    private var conversationMenu: some View {
+        Menu {
+            Button {
+                Task { await model.resetAskConversation() }
+            } label: {
+                Label("New Conversation", systemImage: "plus.bubble")
+            }
+            Divider()
+            if providerConversations.isEmpty {
+                Text("No previous conversations")
+            } else {
+                ForEach(providerConversations) { conversation in
+                    Button {
+                        Task { await model.selectAskConversation(conversation.id) }
+                    } label: {
+                        if conversation.id == model.activeAskConversationID {
+                            Label(conversation.title, systemImage: "checkmark")
+                        } else {
+                            Text(conversation.title)
                         }
                     }
                 }
-            } label: {
-                Label {
-                    if let activeConversation {
-                        Text(activeConversation.title)
-                    } else {
-                        Text("Conversations")
-                    }
-                } icon: {
-                    Image(systemName: "bubble.left.and.bubble.right")
-                }
-                .lineLimit(1)
-                .frame(width: 190, alignment: .leading)
             }
-            .menuStyle(.borderlessButton)
-
-            AskProvidersSettingsButton()
-                .labelStyle(.iconOnly)
-                .help("Open Settings › Providers")
+        } label: {
+            Label {
+                if let activeConversation {
+                    Text(activeConversation.title)
+                } else {
+                    Text("Conversations")
+                }
+            } icon: {
+                Image(systemName: "bubble.left.and.bubble.right")
+            }
+            .lineLimit(1)
+            .frame(width: 190, alignment: .leading)
         }
+        .menuStyle(.borderlessButton)
     }
 
     @ViewBuilder
