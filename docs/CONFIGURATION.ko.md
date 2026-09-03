@@ -49,6 +49,31 @@ interval_secs = 5
 tmux foreground sampler입니다. 새 activity ledger interval이 쌓이기 전까지
 compatibility source이자 stats fallback으로 사용됩니다.
 
+## MCP 오케스트레이션 가이드
+
+```toml
+[mcp.guide]
+placement = "window" # pane(기본값) | window | session
+agent = "codex"      # claude | codex | gemini | agy | opencode
+options = ["--model", "preferred-model"]
+direction = "right"  # right(기본값) | down
+instructions = "작업 하나당 window 하나를 쓰고, 무관한 프로젝트는 session을 분리한다."
+```
+
+사용자가 평소 agent 작업을 배치하는 방식을 기록하는 설정입니다. Muxa는 이 값을
+MCP 초기화 안내에 넣고 `muxa_guide`로 다시 제공하므로, 연결된 agent가 새 작업을
+pane, window, 별도 session 중 어디에 둘지 추측하지 않아도 됩니다.
+`muxa_start_agent`에서 대응하는 인자를 생략하면 같은 값이 실제 기본값으로
+적용됩니다. `agent`를 설정하지 않은 경우에는 호출자가 agent를 직접 지정해야 합니다.
+
+`options`는 설정된 agent에 추가할 개별 CLI 인자입니다. Muxa의 내장 provider
+profile 뒤, 최초 prompt 앞에 들어가며 각 값은 독립적으로 shell quote됩니다.
+`muxa_start_agent`에서 `options`를 명시하면 설정 배열을 대체하고, 빈 배열을 넘기면
+설정된 추가 옵션을 사용하지 않습니다. 호출자가 다른 agent를 명시하면 이 옵션도
+적용되지 않습니다. Managed Work의 Workspace=session/Run=window/Agent=pane 구조와
+collaboration peer의 현재 window 내 pane 배치는 그대로 유지됩니다. 이 설정은 MCP
+stdio process 시작 시 읽으므로 변경 후에는 MCP가 연결된 agent를 재시작하세요.
+
 ## Ask
 
 ```toml

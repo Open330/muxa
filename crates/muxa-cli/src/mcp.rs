@@ -34,6 +34,7 @@ use muxa::ipc::{Client, SendPromptOutcome, TransitionStream};
 use muxa::state::{Agent, Transition};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -67,8 +68,9 @@ const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
 const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team control plane. \
-    Use muxa_room_context for identity/peers and muxa_collaboration_guide only when \
-    detailed workflow guidance is needed. Reserved @peer/@muxa-peer requests for new \
+    Use muxa_guide for the user's surface/agent launch preferences, muxa_room_context \
+    for identity/peers, and muxa_collaboration_guide only when detailed collaboration \
+    guidance is needed. Reserved @peer/@muxa-peer requests for new \
     work use muxa_call_peer; requests for an existing report use muxa_peer_report. \
     Never substitute a GitHub/PR workflow without an explicit PR number or URL. Peer \
     calls default to review + read_only. Never set execute=true or \
@@ -291,9 +293,9 @@ async fn dispatch_object(
     };
 
     let response = match method {
-        "initialize" => success(&id, initialize_result(&config.message.skills)),
+        "initialize" => success(&id, initialize_result(config)),
         "ping" => success(&id, json!({})),
-        "tools/list" => success(&id, json!({ "tools": tool_definitions() })),
+        "tools/list" => success(&id, json!({ "tools": tool_definitions(config) })),
         "tools/call" => match call_tool(client, req.get("params"), config).await {
             Ok(result) => success(&id, result),
             // A malformed `tools/call` (missing name / bad args) is a
@@ -306,17 +308,37 @@ async fn dispatch_object(
     Some(response)
 }
 
-fn initialize_result(message_skills: &BTreeMap<String, String>) -> Value {
-    let instructions = if message_skills.is_empty() {
-        MCP_SERVER_INSTRUCTIONS.to_string()
-    } else {
-        let names = message_skills
+fn initialize_result(config: &muxa::config::Config) -> Value {
+    let mut instructions = format!(
+        "{MCP_SERVER_INSTRUCTIONS} {}",
+        launch_guide_summary(&config.mcp.guide)
+    );
+    if !config.message.skills.is_empty() {
+        let names = config
+            .message
+            .skills
             .keys()
             .map(|name| format!("/{name}"))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("{MCP_SERVER_INSTRUCTIONS} Registered Muxa message skills available to muxa_call_peer: {names}.")
-    };
+        let _ = write!(
+            instructions,
+            " Registered Muxa message skills available to muxa_call_peer: {names}."
+        );
+    }
+    if let Some(user_instructions) = config
+        .mcp
+        .guide
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|instructions| !instructions.is_empty())
+    {
+        let _ = write!(
+            instructions,
+            " User-defined Muxa guide: {user_instructions}"
+        );
+    }
     json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
         "capabilities": { "tools": {} },
@@ -325,6 +347,44 @@ fn initialize_result(message_skills: &BTreeMap<String, String>) -> Value {
             "version": env!("CARGO_PKG_VERSION"),
         },
         "instructions": instructions,
+    })
+}
+
+fn launch_guide_summary(guide: &muxa::config::McpGuideConfig) -> String {
+    let agent = guide.agent.as_deref().unwrap_or("caller must choose");
+    let options = if guide.options.is_empty() {
+        "none".to_string()
+    } else {
+        serde_json::to_string(&guide.options).unwrap_or_else(|_| "[]".into())
+    };
+    format!(
+        "User launch preferences (use when the request is silent): placement={}, agent={}, \
+         additional agent options={}, pane direction={}. Managed Work keeps its required \
+         workspace-session/work-window/agent-pane layout, and collaboration peer spawning \
+         stays in the current window.",
+        guide.placement.as_str(),
+        agent,
+        options,
+        guide.direction.as_str()
+    )
+}
+
+fn launch_guide_value(guide: &muxa::config::McpGuideConfig) -> Value {
+    json!({
+        "launch_defaults": {
+            "placement": guide.placement,
+            "agent": guide.agent,
+            "options": guide.options,
+            "direction": guide.direction,
+        },
+        "instructions": guide.instructions,
+        "semantics": {
+            "placement": "Applied to unmanaged muxa_start_agent calls when placement is omitted.",
+            "agent": "Applied when agent is omitted. Without a configured value, callers must choose an agent.",
+            "options": "Additional arguments after Muxa's built-in provider profile and before the initial prompt. Explicit tool options replace these defaults.",
+            "managed_work": "Managed Work always uses workspace=session, current Run=window, and agent=pane.",
+            "peer_spawn": "Collaboration peer spawning always creates a pane in the current window; agent/options/direction preferences still apply when compatible."
+        }
     })
 }
 
@@ -371,7 +431,18 @@ fn air_artifact_reference_schema() -> Value {
 /// The control and collaboration tools this server exposes, with JSON-Schema
 /// `inputSchema`s.
 #[allow(clippy::too_many_lines)] // declarative JSON schemas are clearest kept beside tool names
-fn tool_definitions() -> Vec<Value> {
+fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
+    let start_required = if config.mcp.guide.agent.is_some() {
+        json!([])
+    } else {
+        json!(["agent"])
+    };
+    let start_description = format!(
+        "Create a detached tmux pane, window, or session and start one allowlisted coding agent in it. \
+         Use this deterministic tool instead of spending another agent turn on tmux setup. The codex \
+         profile expands the local cx behavior to codex --yolo. Returns the exact new pane id. {}",
+        launch_guide_summary(&config.mcp.guide)
+    );
     vec![
         json!({
             "name": "muxa_status",
@@ -406,17 +477,19 @@ fn tool_definitions() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "muxa_guide",
+            "description": "Return the user's configured Muxa orchestration preferences: pane/window/session placement, default agent, additional CLI options, split direction, and free-form guidance. Consult it before choosing a surface when the user did not specify one.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        }),
+        json!({
             "name": "muxa_start_agent",
-            "description": "Create a detached tmux pane, window, or session and \
-                start one allowlisted coding agent in it. Use this deterministic \
-                tool instead of spending another agent turn on tmux setup. The \
-                codex profile expands the local cx behavior to codex --yolo. \
-                Returns the exact new pane id.",
+            "description": start_description,
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "agent": { "type": "string", "enum": ["claude", "codex", "gemini", "agy", "opencode"] },
-                    "placement": { "type": "string", "enum": ["pane", "window", "session"], "description": "Default pane." },
+                    "agent": { "type": "string", "enum": ["claude", "codex", "gemini", "agy", "opencode"], "description": "Agent provider. May be omitted when mcp.guide.agent is configured." },
+                    "options": { "type": "array", "items": { "type": "string" }, "description": "Additional provider CLI arguments. Overrides mcp.guide.options when present; Muxa shell-quotes every argument." },
+                    "placement": { "type": "string", "enum": ["pane", "window", "session"], "description": "Defaults to mcp.guide.placement (pane when unconfigured). Managed work always uses its workspace window." },
                     "target": { "type": "string", "description": "tmux target for pane/window placement. Defaults to TMUX_PANE." },
                     "cwd": { "type": "string", "description": "Existing working directory. Defaults to the MCP process cwd." },
                     "prompt": { "type": "string", "description": "Optional first task; omit for an empty interactive agent." },
@@ -426,9 +499,9 @@ fn tool_definitions() -> Vec<Value> {
                     "role": { "type": "string", "description": "Optional pane role such as implementer or reviewer." },
                     "alias": { "type": "string", "description": "Stable per-work name for this pane. `muxa work up` diffs on it to tell an agent it already started from one it still has to." },
                     "task": { "type": "string", "description": "Optional short pane task label." },
-                    "direction": { "type": "string", "enum": ["right", "down"], "description": "Pane split direction. Default right." }
+                    "direction": { "type": "string", "enum": ["right", "down"], "description": "Pane split direction. Defaults to mcp.guide.direction (right when unconfigured)." }
                 },
-                "required": ["agent"],
+                "required": start_required,
                 "additionalProperties": false
             },
         }),
@@ -901,29 +974,51 @@ async fn call_tool(
                 Err(e) => error_result(&format!("recent_prompts failed: {e}")),
             })
         }
+        "muxa_guide" => Ok(json_result(&launch_guide_value(&config.mcp.guide))),
         "muxa_start_agent" => {
-            let Some(agent) = args.get("agent").and_then(Value::as_str) else {
-                return Ok(error_result("start_agent requires an agent argument"));
+            let explicit_agent = args.get("agent").and_then(Value::as_str);
+            let Some(agent) = explicit_agent.or(config.mcp.guide.agent.as_deref()) else {
+                return Ok(error_result(
+                    "start_agent requires an agent argument when mcp.guide.agent is not configured",
+                ));
             };
             let agent = match crate::agent_launch::AgentProgram::parse(agent) {
                 Ok(agent) => agent,
                 Err(error) => return Ok(error_result(&error)),
             };
-            let placement = match crate::agent_launch::Placement::parse(
-                args.get("placement").and_then(Value::as_str),
-            ) {
+            let placement_value = args.get("placement").and_then(Value::as_str).or_else(|| {
+                args.get("work")
+                    .and_then(Value::as_str)
+                    .is_none()
+                    .then_some(config.mcp.guide.placement.as_str())
+            });
+            let placement = match crate::agent_launch::Placement::parse(placement_value) {
                 Ok(placement) => placement,
                 Err(error) => return Ok(error_result(&error)),
             };
-            let direction = match crate::agent_launch::SplitDirection::parse(
-                args.get("direction").and_then(Value::as_str),
-            ) {
+            let direction_value = args
+                .get("direction")
+                .and_then(Value::as_str)
+                .or(Some(config.mcp.guide.direction.as_str()));
+            let direction = match crate::agent_launch::SplitDirection::parse(direction_value) {
                 Ok(direction) => direction,
                 Err(error) => return Ok(error_result(&error)),
             };
+            let options = match launch_options(&args, &config.mcp.guide, agent) {
+                Ok(options) => options,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            let reported_options = options.clone();
+            let defaults_applied = json!({
+                "agent": explicit_agent.is_none(),
+                "placement": args.get("placement").is_none() && args.get("work").is_none(),
+                "options": args.get("options").is_none() && !reported_options.is_empty(),
+                "direction": args.get("direction").is_none(),
+            });
             let request = crate::agent_launch::StartRequest {
                 socket: client.socket().to_path_buf(),
                 agent,
+                options,
                 placement,
                 target: args
                     .get("target")
@@ -955,7 +1050,12 @@ async fn call_tool(
             Ok(
                 match tokio::task::spawn_blocking(move || crate::agent_launch::start(request)).await
                 {
-                    Ok(Ok(result)) => json_result(&json!(result)),
+                    Ok(Ok(result)) => {
+                        let mut result = json!(result);
+                        result["options"] = json!(reported_options);
+                        result["defaults_applied"] = defaults_applied;
+                        json_result(&result)
+                    }
                     Ok(Err(error)) => error_result(&format!("start_agent failed: {error}")),
                     Err(error) => error_result(&format!("start_agent worker failed: {error}")),
                 },
@@ -1102,7 +1202,7 @@ async fn call_tool(
                 Err(error) => return Ok(error_result(&error)),
             };
             Ok(match client.collaboration_context(&origin).await {
-                Ok(room) => json_result(&collaboration_guide(room)),
+                Ok(room) => json_result(&collaboration_guide(room, &config.mcp.guide)),
                 Err(error) => error_result(&format!("collaboration guide failed: {error}")),
             })
         }
@@ -1116,7 +1216,7 @@ async fn call_tool(
                 Err(error) => error_result(&format!("room context failed: {error}")),
             })
         }
-        "muxa_call_peer" => Ok(call_peer(client, &args, &config.message.skills).await),
+        "muxa_call_peer" => Ok(call_peer(client, &args, config).await),
         "muxa_start_work" => Ok(start_work(client, &args, config).await),
         "muxa_peer_report" => Ok(peer_report(client, &args).await),
         "muxa_set_identity" => {
@@ -1396,7 +1496,7 @@ fn agent_status_summary(
     value
 }
 
-fn collaboration_guide(room: RoomContext) -> Value {
+fn collaboration_guide(room: RoomContext, launch_guide: &muxa::config::McpGuideConfig) -> Value {
     let next_step = match room.peers.len() {
         0 => "No peer is available. Continue locally or run another agent in this tmux window.",
         1 => "One peer is available; target `peer` or its explicit pane id.",
@@ -1407,6 +1507,7 @@ fn collaboration_guide(room: RoomContext) -> Value {
     json!({
         "purpose": "Use another live agent as an independent reviewer or a bounded delegated subagent to improve important work.",
         "room": room,
+        "user_launch_preferences": launch_guide_value(launch_guide),
         "next_step": next_step,
         "workflows": {
             "reviewer": {
@@ -1582,12 +1683,8 @@ fn peer_report_target_matches(peer: &Participant, target: &str) -> bool {
 /// target selection, contract construction, optional explicit spawn, durable
 /// delivery, and reply correlation.
 #[allow(clippy::too_many_lines)] // keep the security-sensitive call sequence linear and auditable
-async fn call_peer(
-    client: &Client,
-    args: &Value,
-    message_skills: &BTreeMap<String, String>,
-) -> Value {
-    let (body, expanded_skill) = match peer_call_body(args, message_skills) {
+async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config) -> Value {
+    let (body, expanded_skill) = match peer_call_body(args, &config.message.skills) {
         Ok(body) => body,
         Err(error) => return error_result(&error),
     };
@@ -1621,7 +1718,7 @@ async fn call_peer(
     let mut spawned = None;
 
     if selection.is_none() {
-        let suggested = match peer_spawn_program(args, &room.current, target) {
+        let suggested = match peer_spawn_program(args, &room.current, target, &config.mcp.guide) {
             Ok(program) => program,
             Err(error) => return error_result(&error),
         };
@@ -1644,7 +1741,17 @@ async fn call_peer(
                 "available_peers": room.peers,
             }));
         }
-        match spawn_peer(client, &origin, &room, args, target, suggested).await {
+        match spawn_peer(
+            client,
+            &origin,
+            &room,
+            args,
+            target,
+            suggested,
+            &config.mcp.guide,
+        )
+        .await
+        {
             Ok((new_selection, start_result)) => {
                 selection = Some(new_selection);
                 spawned = Some(start_result);
@@ -2290,6 +2397,7 @@ fn peer_spawn_program(
     args: &Value,
     current: &Participant,
     target: &str,
+    guide: &muxa::config::McpGuideConfig,
 ) -> std::result::Result<crate::agent_launch::AgentProgram, String> {
     let requested = args
         .get("spawn_agent")
@@ -2297,6 +2405,11 @@ fn peer_spawn_program(
         .map(crate::agent_launch::AgentProgram::parse)
         .transpose()?;
     let targeted = provider_kind(target).map(agent_program_for_kind);
+    let configured = guide
+        .agent
+        .as_deref()
+        .map(crate::agent_launch::AgentProgram::parse)
+        .transpose()?;
     if let (Some(requested), Some(targeted)) = (requested, targeted) {
         if requested != targeted {
             return Err(format!(
@@ -2318,7 +2431,7 @@ fn peer_spawn_program(
         | AgentKind::Task
         | AgentKind::Unknown => crate::agent_launch::AgentProgram::Codex,
     };
-    Ok(requested.or(targeted).unwrap_or(fallback))
+    Ok(requested.or(targeted).or(configured).unwrap_or(fallback))
 }
 
 fn agent_program_for_kind(kind: AgentKind) -> crate::agent_launch::AgentProgram {
@@ -2343,6 +2456,38 @@ fn agent_program_label(program: crate::agent_launch::AgentProgram) -> &'static s
     }
 }
 
+fn launch_options(
+    args: &Value,
+    guide: &muxa::config::McpGuideConfig,
+    program: crate::agent_launch::AgentProgram,
+) -> std::result::Result<Vec<String>, String> {
+    let options = match args.get("options") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("options[{index}] must be a string"))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        Some(_) => return Err("options must be an array of strings".into()),
+        None if guide.agent.as_deref() == Some(agent_program_label(program)) => {
+            guide.options.clone()
+        }
+        None => Vec::new(),
+    };
+    if let Some((index, _)) = options
+        .iter()
+        .enumerate()
+        .find(|(_, option)| option.contains('\0'))
+    {
+        return Err(format!("options[{index}] must not contain a NUL byte"));
+    }
+    Ok(options)
+}
+
 async fn spawn_peer(
     client: &Client,
     origin: &CollaborationOrigin,
@@ -2350,6 +2495,7 @@ async fn spawn_peer(
     args: &Value,
     target: &str,
     program: crate::agent_launch::AgentProgram,
+    guide: &muxa::config::McpGuideConfig,
 ) -> std::result::Result<(PeerSelection, crate::agent_launch::StartResult), String> {
     if room.current.room.host != "tmux" || !room.current.pane.starts_with('%') {
         return Err("call_peer automatic spawn currently requires a native tmux agent pane".into());
@@ -2357,6 +2503,11 @@ async fn spawn_peer(
     let request = crate::agent_launch::StartRequest {
         socket: client.socket().to_path_buf(),
         agent: program,
+        options: if guide.agent.as_deref() == Some(agent_program_label(program)) {
+            guide.options.clone()
+        } else {
+            Vec::new()
+        },
         placement: crate::agent_launch::Placement::Pane,
         target: Some(room.current.pane.clone()),
         cwd: room.current.cwd.as_deref().map(std::path::PathBuf::from),
@@ -2371,7 +2522,8 @@ async fn spawn_peer(
         // mistaking it for a role it should own.
         alias: None,
         generation: None,
-        direction: crate::agent_launch::SplitDirection::Right,
+        direction: crate::agent_launch::SplitDirection::parse(Some(guide.direction.as_str()))
+            .expect("MCP guide direction has the same closed value set"),
     };
     // Arm the daemon transition subscription before creating the pane. A
     // Started hook can register very quickly; subscribing first ensures the
@@ -3517,6 +3669,7 @@ mod tests {
             vec![
                 "muxa_status",
                 "muxa_recent_prompts",
+                "muxa_guide",
                 "muxa_start_agent",
                 "muxa_start_work",
                 "muxa_manage_tmux",
@@ -3575,7 +3728,7 @@ mod tests {
 
     #[test]
     fn status_and_wait_tool_definitions_bound_context() {
-        let tools = tool_definitions();
+        let tools = tool_definitions(&muxa::config::Config::default());
         let status = tools
             .iter()
             .find(|tool| tool["name"] == "muxa_status")
@@ -3696,7 +3849,8 @@ mod tests {
         }))
         .unwrap();
 
-        let guide = collaboration_guide(room);
+        let launch_guide = muxa::config::McpGuideConfig::default();
+        let guide = collaboration_guide(room, &launch_guide);
         assert_eq!(guide["room"]["peers"][0]["pane"], "%2");
         assert_eq!(guide["workflows"]["reviewer"]["request"]["kind"], "review");
         assert_eq!(
@@ -3716,14 +3870,74 @@ mod tests {
 
     #[test]
     fn initialize_surfaces_registered_peer_call_skills() {
-        let skills = BTreeMap::from([
+        let mut config = muxa::config::Config::default();
+        config.message.skills = BTreeMap::from([
             ("review-plan-feedback".into(), "review it".into()),
             ("summarize".into(), "summarize it".into()),
         ]);
-        let result = initialize_result(&skills);
+        let result = initialize_result(&config);
         let instructions = result["instructions"].as_str().unwrap();
         assert!(instructions.contains("/review-plan-feedback"));
         assert!(instructions.contains("/summarize"));
+    }
+
+    #[test]
+    fn configured_launch_guide_changes_instructions_schema_and_options() {
+        let mut config = muxa::config::Config::default();
+        config.mcp.guide.placement = muxa::config::McpPlacement::Window;
+        config.mcp.guide.agent = Some("codex".into());
+        config.mcp.guide.options = vec!["--model".into(), "gpt-5.3-codex".into()];
+        config.mcp.guide.direction = muxa::config::McpSplitDirection::Down;
+        config.mcp.guide.instructions = Some("Keep one task per window.".into());
+
+        let result = initialize_result(&config);
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(instructions.contains("placement=window"));
+        assert!(instructions.contains("agent=codex"));
+        assert!(instructions.contains("gpt-5.3-codex"));
+        assert!(instructions.contains("pane direction=down"));
+        assert!(instructions.contains("Keep one task per window."));
+
+        let tools = tool_definitions(&config);
+        let start_agent = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_start_agent")
+            .unwrap();
+        assert_eq!(start_agent["inputSchema"]["required"], json!([]));
+        assert!(start_agent["inputSchema"]["properties"]["options"].is_object());
+        assert_eq!(
+            launch_options(
+                &json!({}),
+                &config.mcp.guide,
+                crate::agent_launch::AgentProgram::Codex
+            )
+            .unwrap(),
+            ["--model", "gpt-5.3-codex"]
+        );
+        assert!(launch_options(
+            &json!({ "options": ["--search", 3] }),
+            &config.mcp.guide,
+            crate::agent_launch::AgentProgram::Codex
+        )
+        .is_err());
+        assert!(launch_options(
+            &json!({ "options": [] }),
+            &config.mcp.guide,
+            crate::agent_launch::AgentProgram::Codex
+        )
+        .unwrap()
+        .is_empty());
+        assert!(launch_options(
+            &json!({}),
+            &config.mcp.guide,
+            crate::agent_launch::AgentProgram::Claude
+        )
+        .unwrap()
+        .is_empty());
+
+        let guide = launch_guide_value(&config.mcp.guide);
+        assert_eq!(guide["launch_defaults"]["placement"], "window");
+        assert_eq!(guide["launch_defaults"]["agent"], "codex");
     }
 
     fn peer_participant(kind: AgentKind, pane: &str, state: AgentState) -> Participant {
@@ -3984,14 +4198,41 @@ mod tests {
         let claude = peer_participant(AgentKind::ClaudeCode, "%1", AgentState::Idle);
         let codex = peer_participant(AgentKind::Codex, "%2", AgentState::Idle);
         assert_eq!(
-            peer_spawn_program(&json!({}), &claude, "auto").unwrap(),
+            peer_spawn_program(
+                &json!({}),
+                &claude,
+                "auto",
+                &muxa::config::McpGuideConfig::default()
+            )
+            .unwrap(),
             crate::agent_launch::AgentProgram::Codex
         );
         assert_eq!(
-            peer_spawn_program(&json!({}), &codex, "auto").unwrap(),
+            peer_spawn_program(
+                &json!({}),
+                &codex,
+                "auto",
+                &muxa::config::McpGuideConfig::default()
+            )
+            .unwrap(),
             crate::agent_launch::AgentProgram::Claude
         );
-        assert!(peer_spawn_program(&json!({ "spawn_agent": "claude" }), &codex, "@codex").is_err());
+        assert!(peer_spawn_program(
+            &json!({ "spawn_agent": "claude" }),
+            &codex,
+            "@codex",
+            &muxa::config::McpGuideConfig::default()
+        )
+        .is_err());
+
+        let guide = muxa::config::McpGuideConfig {
+            agent: Some("gemini".into()),
+            ..muxa::config::McpGuideConfig::default()
+        };
+        assert_eq!(
+            peer_spawn_program(&json!({}), &codex, "auto", &guide).unwrap(),
+            crate::agent_launch::AgentProgram::Gemini
+        );
     }
 
     #[test]

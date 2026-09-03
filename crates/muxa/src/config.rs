@@ -99,6 +99,9 @@ pub enum ConfigError {
 
     #[error("{path}: {message}")]
     InvalidFleet { path: String, message: String },
+
+    #[error("{path}: {message}")]
+    InvalidMcp { path: String, message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -119,6 +122,9 @@ pub struct Config {
     pub reconciler: ReconcilerConfig,
     pub screen_detect: ScreenDetectConfig,
     pub collaboration: CollaborationConfig,
+    /// Preferences advertised to MCP-connected agents and used when an MCP
+    /// launch call omits the corresponding arguments.
+    pub mcp: McpConfig,
     /// Reusable text templates for the interactive `m` message composer.
     pub message: MessageConfig,
     #[serde(default)]
@@ -243,6 +249,84 @@ impl Default for FleetHostConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct MessageConfig {
     pub skills: BTreeMap<String, String>,
+}
+
+/// `[mcp]` config — user-authored defaults for agent-driven orchestration.
+///
+/// The actual preferences live below `[mcp.guide]` so the config makes their
+/// purpose explicit: they are sent to MCP hosts during initialization and can
+/// be retrieved again with `muxa_guide`. The deterministic launcher also uses
+/// them when a tool call omits a value, which keeps the written guidance and
+/// the behavior from drifting apart.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    pub guide: McpGuideConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpGuideConfig {
+    /// Preferred surface for an unmanaged `muxa_start_agent` call.
+    pub placement: McpPlacement,
+    /// Default provider. When omitted, MCP callers must still name `agent`.
+    pub agent: Option<String>,
+    /// Additional provider CLI arguments, inserted after Muxa's built-in
+    /// launch profile and before the initial prompt.
+    pub options: Vec<String>,
+    /// Preferred pane split direction.
+    pub direction: McpSplitDirection,
+    /// Optional free-form instructions for conventions not represented by
+    /// the structured fields above.
+    pub instructions: Option<String>,
+}
+
+impl Default for McpGuideConfig {
+    fn default() -> Self {
+        Self {
+            placement: McpPlacement::Pane,
+            agent: None,
+            options: Vec::new(),
+            direction: McpSplitDirection::Right,
+            instructions: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpPlacement {
+    #[default]
+    Pane,
+    Window,
+    Session,
+}
+
+impl McpPlacement {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pane => "pane",
+            Self::Window => "window",
+            Self::Session => "session",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpSplitDirection {
+    #[default]
+    Right,
+    Down,
+}
+
+impl McpSplitDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Right => "right",
+            Self::Down => "down",
+        }
+    }
 }
 
 /// Default wall-clock ceiling for one headless ask turn.
@@ -1253,7 +1337,8 @@ impl Config {
     /// home, and so the always-on / daemon-only split stays legible to
     /// callers.
     pub fn validate(&self) -> std::result::Result<(), ConfigError> {
-        validate_fleet(&self.fleet)
+        validate_fleet(&self.fleet)?;
+        validate_mcp(&self.mcp)
     }
 
     /// Run hard semantic checks that only matter when the daemon is
@@ -1307,6 +1392,41 @@ impl Config {
             );
         }
     }
+}
+
+fn validate_mcp(cfg: &McpConfig) -> std::result::Result<(), ConfigError> {
+    let invalid = |path: &str, message: String| ConfigError::InvalidMcp {
+        path: path.into(),
+        message,
+    };
+    if let Some(agent) = cfg.guide.agent.as_deref() {
+        if !matches!(agent, "claude" | "codex" | "gemini" | "agy" | "opencode") {
+            return Err(invalid(
+                "mcp.guide.agent",
+                format!(
+                    "unknown agent {agent:?}; expected claude, codex, gemini, agy, or opencode"
+                ),
+            ));
+        }
+    } else if !cfg.guide.options.is_empty() {
+        return Err(invalid(
+            "mcp.guide.options",
+            "options require mcp.guide.agent so they cannot be applied to the wrong CLI".into(),
+        ));
+    }
+    if let Some((index, _)) = cfg
+        .guide
+        .options
+        .iter()
+        .enumerate()
+        .find(|(_, option)| option.contains('\0'))
+    {
+        return Err(invalid(
+            &format!("mcp.guide.options[{index}]"),
+            "option must not contain a NUL byte".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_fleet(cfg: &FleetConfig) -> std::result::Result<(), ConfigError> {
@@ -2126,6 +2246,50 @@ agent-review = "create a codex pane and pass our changes for review"
             cfg.message.skills.get("agent-review").map(String::as_str),
             Some("create a codex pane and pass our changes for review")
         );
+    }
+
+    #[test]
+    fn parses_mcp_launch_guide() {
+        let cfg: Config = toml::from_str(
+            r#"
+[mcp.guide]
+placement = "window"
+agent = "codex"
+options = ["--model", "gpt-5.3-codex", "--search"]
+direction = "down"
+instructions = "Keep one task per window."
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.mcp.guide.placement, McpPlacement::Window);
+        assert_eq!(cfg.mcp.guide.agent.as_deref(), Some("codex"));
+        assert_eq!(
+            cfg.mcp.guide.options,
+            ["--model", "gpt-5.3-codex", "--search"]
+        );
+        assert_eq!(cfg.mcp.guide.direction, McpSplitDirection::Down);
+        assert_eq!(
+            cfg.mcp.guide.instructions.as_deref(),
+            Some("Keep one task per window.")
+        );
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn mcp_guide_rejects_unknown_agents_and_unscoped_options() {
+        let mut cfg = Config::default();
+        cfg.mcp.guide.agent = Some("mystery".into());
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidMcp { .. })
+        ));
+
+        cfg.mcp.guide.agent = None;
+        cfg.mcp.guide.options = vec!["--model".into(), "large".into()];
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidMcp { .. })
+        ));
     }
 
     #[test]

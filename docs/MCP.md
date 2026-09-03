@@ -50,12 +50,15 @@ claude mcp add --scope user muxa -e MUXA_SOCKET=/run/user/1000/muxa.sock -- muxa
 ```
 
 Restart agents that were already running, then verify with `claude mcp list`
-or `codex mcp list` (the `muxa` server should list twenty-four tools). Other MCP
+or `codex mcp list` (the `muxa` server should list twenty-five tools). Other MCP
 hosts can run `muxa mcp` as a stdio server command in their config.
 
-At initialization muxa tells the agent how to use same-window peers as a
-reviewer, focused question target, or delegated subagent. The agent can call
-`muxa_collaboration_guide` to retrieve that contract again at any time.
+At initialization muxa tells the agent both the user's configured launch
+preferences and how to use same-window peers as a reviewer, focused question
+target, or delegated subagent. The agent can call `muxa_guide` to retrieve the
+surface/agent defaults and `muxa_collaboration_guide` to retrieve the peer
+contract again at any time. Configure the former under `[mcp.guide]`; see
+[CONFIGURATION.md](CONFIGURATION.md#mcp-orchestration-guide).
 The same instructions map conversational `@peer`, provider mentions, aliases,
 roles, and registered `/skills` to `muxa_call_peer`.
 
@@ -129,7 +132,8 @@ it:
 | --- | --- | --- |
 | `muxa_status` | `pane?`, `full?`, `include_capture?`, `history_limit?`, `max_capture_lines?` | Return a compact fleet/agent summary by default, the complete topology with `full=true`, or one focused pane. |
 | `muxa_recent_prompts` | `pane?`, `limit?` | Recent prompt-history entries (newest first), optionally scoped to one pane. |
-| `muxa_start_agent` | `agent`, `workspace?`, `work?`, `role?`, `task?`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Create/reuse a workspace session and work window, or start an allowlisted agent in a lower-level tmux surface. |
+| `muxa_guide` | — | Return the user's configured surface, agent, option, direction, and free-form orchestration preferences. |
+| `muxa_start_agent` | `agent?`, `options?`, `workspace?`, `work?`, `role?`, `task?`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Create/reuse a workspace session and work window, or start an allowlisted agent in a lower-level tmux surface. `agent` is optional only when configured in `[mcp.guide]`. |
 | `muxa_start_work` | `work`, `pipeline?`, `workspace?`, `cwd?`, `body?`, `skill?`, `context?`, `no_ticket?`, `refresh?`, `dry_run?` | Bring a work item's window to the state its pipeline declares: resolve the ticket, route it, create the missing agent panes, and deliver `body` to the ones already running. |
 | `muxa_manage_tmux` | `action`, `pane?`, `workspace?`, `work?`, `confirm?` | List/show/close managed workspaces and work; interrupt/terminate an agent pane. |
 | `muxa_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
@@ -275,6 +279,13 @@ part of a larger task. The calling model supplies only the agent profile,
 location, and optional first task; muxa handles the exact tmux invocation and
 returns the new pane id for later `muxa_capture_pane`, `muxa_send_prompt`, and
 `muxa_wait_for_change` calls.
+
+When the request does not choose a surface or provider, call `muxa_guide` (or
+use the same preferences already delivered during MCP initialization).
+Configured `placement`, `agent`, `options`, and `direction` become real defaults
+for omitted `muxa_start_agent` arguments. Explicit tool arguments win. Extra
+options are shell-quoted one argument at a time and appended to Muxa's built-in
+provider profile before the initial prompt.
 
 ```text
 muxa_start_agent {

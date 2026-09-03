@@ -52,35 +52,16 @@ impl AgentProgram {
         }
     }
 
-    fn launch_command(self, prompt: Option<&str>) -> String {
-        let quoted = prompt.map(shell_single_quote);
-        match (self, quoted) {
-            (Self::Claude, Some(prompt)) => {
-                format!("claude --dangerously-skip-permissions {prompt}")
-            }
-            (Self::Claude, None) => "claude --dangerously-skip-permissions".into(),
-            // cx in the user's shell is codex --yolo. Invoke the expanded
-            // command so launch behavior does not depend on interactive zsh
-            // alias loading inside tmux.
-            (Self::Codex, Some(prompt)) => format!("codex --yolo {prompt}"),
-            (Self::Codex, None) => "codex --yolo".into(),
-            (Self::Gemini, Some(prompt)) => {
-                format!("gemini --approval-mode yolo --skip-trust -i {prompt}")
-            }
-            (Self::Gemini, None) => "gemini --approval-mode yolo --skip-trust".into(),
-            // agy's own flag spelling: it has no `--approval-mode`/`--skip-trust`,
-            // and `-i` is its `--prompt-interactive` alias (so the pane stays
-            // interactive after the first prompt, matching gemini's behaviour).
-            (Self::Antigravity, Some(prompt)) => {
-                format!("agy --dangerously-skip-permissions -i {prompt}")
-            }
-            (Self::Antigravity, None) => "agy --dangerously-skip-permissions".into(),
-            (Self::Opencode, Some(prompt)) => format!("opencode --prompt {prompt}"),
-            (Self::Opencode, None) => "opencode".into(),
-        }
+    fn launch_command(self, options: &[String], prompt: Option<&str>) -> String {
+        let launch = self.native_launch(options, prompt);
+        std::iter::once(launch.command)
+            .chain(launch.args)
+            .map(|argument| shell_quote_argument(&argument))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
-    fn native_launch(self, prompt: Option<&str>) -> NativeLaunch {
+    fn native_launch(self, options: &[String], prompt: Option<&str>) -> NativeLaunch {
         let mut args = match self {
             Self::Claude | Self::Antigravity => {
                 vec!["--dangerously-skip-permissions".into()]
@@ -93,6 +74,7 @@ impl AgentProgram {
             ],
             Self::Opencode => Vec::new(),
         };
+        args.extend(options.iter().cloned());
         if let Some(prompt) = prompt {
             match self {
                 Self::Claude | Self::Codex => args.push(prompt.into()),
@@ -275,6 +257,9 @@ pub struct WorkStartArgs {
 #[derive(Debug, Clone)]
 pub struct StartRequest {
     pub agent: AgentProgram,
+    /// Additional provider CLI arguments after Muxa's built-in profile and
+    /// before the optional initial prompt.
+    pub options: Vec<String>,
     pub placement: Placement,
     pub target: Option<String>,
     pub cwd: Option<PathBuf>,
@@ -304,6 +289,7 @@ impl StartRequest {
     pub fn from_args(args: &StartArgs, socket: &Path) -> Self {
         Self {
             agent: args.agent,
+            options: Vec::new(),
             placement: args.placement,
             target: args.target.clone(),
             cwd: args.cwd.clone(),
@@ -460,7 +446,7 @@ async fn run_native(args: StartArgs, client: &Client, socket_path: &Path) -> Res
         .prompt
         .as_deref()
         .filter(|prompt| !prompt.trim().is_empty());
-    let launch = args.agent.native_launch(prompt);
+    let launch = args.agent.native_launch(&[], prompt);
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     let session = client
         .spawn_session(muxa::SpawnSession {
@@ -521,6 +507,7 @@ pub fn run_work_start(args: WorkStartArgs, socket: &Path) -> Result<()> {
     let result = start(StartRequest {
         socket: socket.to_path_buf(),
         agent: args.agent,
+        options: Vec::new(),
         placement: Placement::Pane,
         target: None,
         cwd: args.cwd,
@@ -572,7 +559,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         .prompt
         .as_deref()
         .filter(|prompt| !prompt.trim().is_empty());
-    let command = request.agent.launch_command(prompt);
+    let command = request.agent.launch_command(&request.options, prompt);
     let args = tmux_args(&request, &cwd, &command)?;
     let output = muxa::tmux::tmux_command_scoped()
         .args(&args)
@@ -992,8 +979,16 @@ fn tmux_args(request: &StartRequest, cwd: &Path, command: &str) -> Result<Vec<St
     Ok(args)
 }
 
-fn shell_single_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
+fn shell_quote_argument(text: &str) -> String {
+    if !text.is_empty()
+        && text
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "_-+./:=,@%".contains(ch))
+    {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 fn session_base_name(cwd: &str) -> String {
@@ -1076,6 +1071,7 @@ mod tests {
         StartRequest {
             socket: muxa::paths::default_socket(),
             agent,
+            options: Vec::new(),
             placement,
             target: Some("%9".into()),
             cwd: Some(PathBuf::from("/tmp")),
@@ -1094,22 +1090,52 @@ mod tests {
     #[test]
     fn codex_profile_expands_cx_and_quotes_the_prompt() {
         assert_eq!(
-            AgentProgram::Codex.launch_command(Some("review June's changes; don't edit")),
+            AgentProgram::Codex.launch_command(&[], Some("review June's changes; don't edit")),
             "codex --yolo 'review June'\\''s changes; don'\\''t edit'"
         );
     }
 
     #[test]
     fn native_launch_keeps_the_prompt_as_one_argv_value() {
-        let launch = AgentProgram::Codex.native_launch(Some("review June's changes; don't edit"));
+        let launch =
+            AgentProgram::Codex.native_launch(&[], Some("review June's changes; don't edit"));
         assert_eq!(launch.command, "codex");
         assert_eq!(launch.args, ["--yolo", "review June's changes; don't edit"]);
 
-        let gemini = AgentProgram::Gemini.native_launch(Some("review it"));
+        let gemini = AgentProgram::Gemini.native_launch(&[], Some("review it"));
         assert_eq!(gemini.command, "gemini");
         assert_eq!(
             gemini.args,
             ["--approval-mode", "yolo", "--skip-trust", "-i", "review it"]
+        );
+    }
+
+    #[test]
+    fn configured_options_are_quoted_and_precede_the_prompt() {
+        let command = AgentProgram::Codex.launch_command(
+            &["--model".into(), "gpt 5; echo nope".into()],
+            Some("review $HOME"),
+        );
+        assert_eq!(
+            command,
+            "codex --yolo --model 'gpt 5; echo nope' 'review $HOME'"
+        );
+
+        let native = AgentProgram::Gemini.native_launch(
+            &["--model".into(), "gemini-2.5-pro".into()],
+            Some("review it"),
+        );
+        assert_eq!(
+            native.args,
+            [
+                "--approval-mode",
+                "yolo",
+                "--skip-trust",
+                "--model",
+                "gemini-2.5-pro",
+                "-i",
+                "review it"
+            ]
         );
     }
 

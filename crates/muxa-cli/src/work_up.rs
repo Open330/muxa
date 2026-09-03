@@ -437,6 +437,7 @@ pub(crate) async fn apply_durable(
 /// Reconcile one already-registered Run from its persisted desired agents.
 /// This is used immediately after a completion event and by muxad's restart
 /// safety-net worker, so neither path needs to resolve the ticket again.
+#[allow(clippy::too_many_lines)] // claim, launch, and durable report form one reconciliation pass
 pub(crate) async fn reconcile_run(
     client: &muxa::ipc::Client,
     identity: &WorkIdentity,
@@ -479,6 +480,7 @@ pub(crate) async fn reconcile_run(
                     crate::agent_launch::start(StartRequest {
                         socket: client.socket().to_path_buf(),
                         agent: program,
+                        options: Vec::new(),
                         placement: Placement::Pane,
                         target: None,
                         cwd: Some(claim.cwd.clone()),
@@ -1221,6 +1223,7 @@ fn launch(
     let result = crate::agent_launch::start(StartRequest {
         socket: socket.to_path_buf(),
         agent: program,
+        options: Vec::new(),
         placement: Placement::Pane,
         target: None,
         // Supplying a cwd asserts it against the work window's recorded one,

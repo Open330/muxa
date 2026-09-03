@@ -60,6 +60,20 @@
 #                                   # if the previous is still running, and no captures run when
 #                                   # no pane matches a manifest (idle cost ≈ one pane list).
 
+# Defaults and conventions advertised to MCP-connected agents. These values
+# are included in the MCP initialization guide, returned by `muxa_guide`, and
+# used by `muxa_start_agent` when the matching argument is omitted. Without an
+# `agent`, callers still have to choose one. Options are additional arguments
+# after Muxa's built-in provider profile (for example, codex already gets
+# `--yolo`) and before the initial prompt. Restart an MCP-connected agent after
+# changing this section because its stdio server loaded the old config.
+[mcp.guide]
+# placement = "pane"                # pane (default) | window | session
+# agent = "codex"                   # claude | codex | gemini | agy | opencode
+# options = ["--model", "preferred-model"]
+# direction = "right"               # right (default) | down; pane splits only
+# instructions = "Keep one task per window and use a new session for unrelated projects."
+
 # Durable request/reply collaboration between top-level agents in the same
 # tmux window. Opt-in: idle_only delivery types only at a hook-authoritative
 # agent's top-level Idle state. Working / waiting / choice / error panes and

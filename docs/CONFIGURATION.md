@@ -50,6 +50,34 @@ interval_secs = 5
 This tmux foreground sampler remains as a compatibility source and helps
 stats while newer activity ledger intervals are accumulating.
 
+## MCP orchestration guide
+
+```toml
+[mcp.guide]
+placement = "window" # pane (default) | window | session
+agent = "codex"      # claude | codex | gemini | agy | opencode
+options = ["--model", "preferred-model"]
+direction = "right"  # right (default) | down
+instructions = "Keep one task per window; use a new session for unrelated projects."
+```
+
+This section records how the user normally organizes agent work. Muxa includes
+it in the MCP initialization instructions and exposes it through `muxa_guide`,
+so a connected agent does not have to guess whether a new task belongs in a
+pane, window, or separate session. `muxa_start_agent` also uses these values
+when the matching arguments are omitted. If `agent` is not configured, the
+tool still requires the caller to choose one.
+
+`options` are additional individual CLI arguments for the configured agent.
+They are inserted after Muxa's built-in provider profile and before an initial
+prompt, and every value is shell-quoted independently. An explicit `options`
+array in `muxa_start_agent` replaces the configured array; pass an empty array
+to suppress configured extras. Options are not applied when the caller selects
+a different agent. Managed Work still follows its fixed
+Workspace=session/Run=window/Agent=pane layout, and collaboration peer spawning
+still uses a pane in the current window. Restart an MCP-connected agent after
+changing this section because its stdio MCP process loads config at startup.
+
 ## Ask
 
 ```toml
