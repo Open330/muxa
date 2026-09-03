@@ -508,7 +508,7 @@ private struct OnboardingChecklistPage: View {
 
     private var connectionRow: some View {
         OnboardingChecklistRow(status: OnboardingChecklist.connectionStatus(model.connectionState)) {
-            Text("muxad connected")
+            Text("muxad connection")
         } detail: {
             switch model.connectionState {
             case .connected:
@@ -529,7 +529,7 @@ private struct OnboardingChecklistPage: View {
 
     private var tmuxRow: some View {
         OnboardingChecklistRow(status: OnboardingChecklist.toolStatus(named: "tmux", in: detectedTools)) {
-            Text("tmux installed")
+            Text("tmux")
         } detail: {
             if let tmuxTool {
                 OnboardingToolLine(tool: tmuxTool)
@@ -545,7 +545,7 @@ private struct OnboardingChecklistPage: View {
 
     private var agentsRow: some View {
         OnboardingChecklistRow(status: OnboardingChecklist.agentsStatus(in: detectedTools)) {
-            Text("Agent CLIs found")
+            Text("Agent CLIs")
         } detail: {
             if detectedTools == nil {
                 Text("Looking for agent CLIs on your PATH…")
@@ -565,7 +565,7 @@ private struct OnboardingChecklistPage: View {
 
     private var askRow: some View {
         OnboardingChecklistRow(status: OnboardingChecklist.askStatus(model.askEnabled)) {
-            Text("Global Ask enabled")
+            Text("Global Ask")
         } detail: {
             switch model.askEnabled {
             case .some(true):
@@ -592,7 +592,7 @@ private struct OnboardingChecklistPage: View {
 
     private var workFolderRow: some View {
         OnboardingChecklistRow(status: workFolderStatus) {
-            Text("Work folder set")
+            Text("Work folder")
         } detail: {
             if workDirectory.isEmpty {
                 Text("Optional. Choose a default project folder so Start Work opens in the right place.")
@@ -608,7 +608,7 @@ private struct OnboardingChecklistPage: View {
 
     private var hostsRow: some View {
         OnboardingChecklistRow(status: OnboardingChecklist.fleetHostsStatus(remoteHostCount: remoteHosts.count)) {
-            Text("Fleet hosts registered")
+            Text("Fleet hosts")
         } detail: {
             if remoteHosts.isEmpty {
                 Text("Optional. Register SSH hosts to watch panes and run Work on other machines.")

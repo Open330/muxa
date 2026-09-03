@@ -65,3 +65,11 @@ import Testing
 
     #expect(OnboardingPreferences.existingWindow() === guideWindow)
 }
+
+/// tmux only understands `-V`; asking it for `--version` prints usage to
+/// stderr and leaves stdout empty, which showed as "no version information".
+@Test func installedToolsAsksTmuxForItsOwnVersionFlag() {
+    #expect(InstalledTools.versionArguments(for: "tmux").first == ["-V"])
+    #expect(InstalledTools.versionArguments(for: "claude").first == ["--version"])
+    #expect(InstalledTools.versionArguments(for: "tmux").contains(["--version"]))
+}

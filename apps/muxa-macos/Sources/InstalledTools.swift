@@ -42,7 +42,7 @@ enum InstalledTools {
             for (index, name) in names.enumerated() {
                 group.addTask {
                     guard let path = resolve(name, in: directories) else { return (index, nil) }
-                    let version = await probeVersion(at: path)
+                    let version = await probeVersion(named: name, at: path)
                     return (index, InstalledTool(name: name, path: path, version: version))
                 }
             }
@@ -99,9 +99,24 @@ enum InstalledTools {
             .first { !$0.isEmpty }
     }
 
-    private static func probeVersion(at path: String) async -> String? {
-        guard let output = await runCapturing(path, ["--version"], timeout: 3) else { return nil }
-        return versionLine(from: output)
+    /// Version flags to try, in order. Most tools take `--version`; tmux only
+    /// understands `-V` and prints its usage to stderr for anything else.
+    static func versionArguments(for name: String) -> [[String]] {
+        switch name {
+        case "tmux": [["-V"], ["--version"]]
+        default: [["--version"], ["-V"], ["version"]]
+        }
+    }
+
+    private static func probeVersion(named name: String, at path: String) async -> String? {
+        for arguments in versionArguments(for: name) {
+            if let output = await runCapturing(path, arguments, timeout: 3),
+               let line = versionLine(from: output)
+            {
+                return line
+            }
+        }
+        return nil
     }
 
     /// Runs a process with a timeout and returns its stdout; nil on failure
