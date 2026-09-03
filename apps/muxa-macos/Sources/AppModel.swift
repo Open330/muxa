@@ -81,7 +81,18 @@ final class AppModel: ObservableObject {
     @Published private(set) var isAttachingPane = false
     @Published private(set) var attachError: String?
     @Published var isPresentingWorkStart = false
+    /// Pipeline the Start Work sheet should preselect when opened from a
+    /// pipeline card; nil leaves the route default.
+    @Published var workStartPreselectedPipeline: String?
+    /// Routes, pipelines, skills, and presets from `muxa work options`.
+    @Published private(set) var workOptions: MuxaWorkOptions?
+    @Published private(set) var workOptionsError: String?
+    @Published private(set) var isLoadingWorkOptions = false
+    @Published private(set) var isApplyingWorkPreset = false
     @Published private(set) var isStartingWork = false
+    /// The last dry-run result, shown in the sheet so the operator sees the
+    /// exact agents and prompts before launching for real.
+    @Published private(set) var workStartPlan: MuxaWorkStartResult?
     @Published private(set) var workStartStatus: String?
     @Published private(set) var workStartError: String?
     @Published var isConfirmingDaemonReplacement = false
@@ -225,6 +236,7 @@ final class AppModel: ObservableObject {
                 // correct before the Inbox editor is ever opened; later
                 // changes arrive through per-host mailbox revision events.
                 Task { [weak self] in await self?.refreshOperatorInbox(force: true) }
+                Task { [weak self] in await self?.loadWorkOptions() }
                 async let events: Void = runFleetSubscription(ifGeneration: generation)
                 async let askEvents: Void = runAskSubscription(ifGeneration: generation)
                 async let pipelineEvents: Void = runPipelineSubscription(ifGeneration: generation)
@@ -650,17 +662,72 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func presentWorkStart() {
+    func presentWorkStart(pipeline: String? = nil) {
         workStartError = nil
         workStartStatus = nil
+        workStartPlan = nil
+        workStartPreselectedPipeline = pipeline
         isPresentingWorkStart = true
+        Task { [weak self] in await self?.loadWorkOptions() }
+    }
+
+    /// Reads routes, pipelines, message skills, and presets through the
+    /// bundled CLI so the Start Work form and the Command Center can offer
+    /// real choices. The config file is the source of truth, so this is a
+    /// fresh read every time rather than daemon state.
+    func loadWorkOptions() async {
+        guard !isLoadingWorkOptions else { return }
+        isLoadingWorkOptions = true
+        defer { isLoadingWorkOptions = false }
+        do {
+            let output = try await Self.runBundledMuxa(
+                arguments: ["work", "options", "--json"],
+                socketPath: client.socketPath
+            )
+            let decoded = try MuxaWorkOptions.decode(Data(output.utf8))
+            if workOptions != decoded { workOptions = decoded }
+            workOptionsError = nil
+        } catch {
+            MuxaLog.app.warning(
+                "work options unavailable: \(error.localizedDescription, privacy: .public)"
+            )
+            workOptionsError = error.localizedDescription
+        }
+    }
+
+    /// Writes one of muxa's built-in pipeline presets into the config through
+    /// the canonical CLI (`muxa work preset apply`). A catch-all route is
+    /// added only when the config has no route yet, so an existing routing
+    /// table is never reordered from the app.
+    func applyWorkPreset(_ name: String) async -> Bool {
+        guard !isApplyingWorkPreset else { return false }
+        isApplyingWorkPreset = true
+        defer { isApplyingWorkPreset = false }
+        var arguments = ["work", "preset", "apply", name, "--json"]
+        if workOptions?.routes.isEmpty ?? true {
+            arguments += ["--route", ".*"]
+        }
+        do {
+            _ = try await Self.runBundledMuxa(arguments: arguments, socketPath: client.socketPath)
+            workOptionsError = nil
+            workStartError = nil
+            await loadWorkOptions()
+            return true
+        } catch {
+            MuxaLog.app.error(
+                "work preset apply failed: \(error.localizedDescription, privacy: .public)"
+            )
+            workOptionsError = error.localizedDescription
+            return false
+        }
     }
 
     func startWork(_ request: MuxaWorkStartRequest) async -> Bool {
         guard isConnected, !isStartingWork else { return false }
         isStartingWork = true
         workStartError = nil
-        workStartStatus = "Submitting Work to muxad…"
+        workStartPlan = nil
+        workStartStatus = request.dryRun ? "Building the Work plan…" : "Submitting Work to muxad…"
         defer { isStartingWork = false }
         do {
             var operation = try await client.startWork(request)
@@ -675,8 +742,14 @@ final class AppModel: ObservableObject {
                 return false
             }
             await refresh()
-            if operation.result?.dryRun != true,
-               let result = operation.result {
+            if request.dryRun || operation.result?.dryRun == true {
+                // A plan is something to read, not a reason to close the
+                // sheet: keep it open with the steps muxad would take.
+                workStartPlan = operation.result
+                workStartStatus = operation.message
+                return false
+            }
+            if let result = operation.result {
                 let identity = MuxaWorkIdentity(
                     workspaceID: result.workspace,
                     workID: result.work
@@ -1226,7 +1299,9 @@ final class AppModel: ObservableObject {
             let errorMessage = String(data: standardError, encoding: .utf8) ?? ""
             guard process.terminationStatus == 0 else {
                 let reason = errorMessage.isEmpty ? message : errorMessage
-                throw MuxaIPCError.server(reason.isEmpty ? "Host registration failed" : reason)
+                throw MuxaIPCError.server(
+                    reason.isEmpty ? "muxa \(arguments.prefix(2).joined(separator: " ")) failed" : reason
+                )
             }
             return message
         }.value

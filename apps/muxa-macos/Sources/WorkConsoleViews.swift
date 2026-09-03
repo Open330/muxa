@@ -15,6 +15,66 @@ struct WorkStartView: View {
     @State private var dryRun = false
     @AppStorage("nativeWorkDirectory") private var cwd = ""
 
+    private var options: MuxaWorkOptions? { model.workOptions }
+
+    private var matchedRoute: MuxaWorkOptions.Route? {
+        options?.route(matching: work)
+    }
+
+    /// The pipeline the launch would use: the explicit choice, else the
+    /// matching route's pipeline.
+    private var effectivePipeline: MuxaWorkOptions.Pipeline? {
+        guard let options else { return nil }
+        if pipeline.isEmpty { return options.defaultPipeline(for: work) }
+        return options.pipeline(named: pipeline)
+    }
+
+    private var localSessionNames: [String] {
+        model.executionSnapshot.watchHosts
+            .first(where: { $0.host.local })?
+            .sessions
+            .map(\.name)
+            .filter { !$0.isEmpty } ?? []
+    }
+
+    private var workspaceSuggestions: [String] {
+        var seen = Set<String>()
+        var suggestions: [String] = []
+        for candidate in [matchedRoute?.workspace].compactMap({ $0 }) + localSessionNames
+        where seen.insert(candidate).inserted {
+            suggestions.append(candidate)
+        }
+        return suggestions
+    }
+
+    /// Whether the launch directory is pinned by the route (cwd, worktree,
+    /// or a prepare command) rather than by this form.
+    private var routePinsDirectory: Bool {
+        guard let route = matchedRoute else { return false }
+        return route.worktree || route.prepare || (route.cwd?.isEmpty == false)
+    }
+
+    /// muxad runs `muxa work up` from its own working directory, which for a
+    /// GUI-launched daemon is `/`. Never let that become an agent's project
+    /// folder: when neither the form nor the route names one, use home.
+    private var effectiveDirectory: String? {
+        let trimmed = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        if routePinsDirectory { return nil }
+        return FileManager.default.homeDirectoryForCurrentUser.path
+    }
+
+    private var canSubmit: Bool {
+        guard !work.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !model.isStartingWork else {
+            return false
+        }
+        // With a loaded config the launch is predictable: refuse the combos
+        // the CLI would refuse instead of surfacing its error afterwards.
+        guard let options else { return true }
+        if options.pipelines.isEmpty { return false }
+        return effectivePipeline != nil
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(alignment: .top, spacing: 12) {
@@ -24,10 +84,13 @@ struct WorkStartView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Start Work")
                         .font(.title2.weight(.semibold))
-                    Text("Create or converge the configured collaborator pipeline without leaving Muxa.")
+                    Text("Create or converge a collaborator pipeline without leaving Muxa.")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                if model.isLoadingWorkOptions {
+                    ProgressView().controlSize(.small)
+                }
             }
             .padding(20)
 
@@ -36,22 +99,55 @@ struct WorkStartView: View {
             Form {
                 Section("Identity") {
                     TextField("Work ID, for example auth-cleanup", text: $work)
-                    TextField("Workspace (optional)", text: $workspace)
+                    routeSummary
+                    HStack {
+                        TextField("Workspace (optional)", text: $workspace)
+                        if !workspaceSuggestions.isEmpty {
+                            Menu {
+                                ForEach(workspaceSuggestions, id: \.self) { suggestion in
+                                    Button(suggestion) { workspace = suggestion }
+                                }
+                            } label: {
+                                Image(systemName: "chevron.up.chevron.down")
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .help("Use the route's workspace or an existing session")
+                        }
+                    }
                     HStack {
                         TextField("Project folder (use configured route when empty)", text: $cwd)
                         Button("Choose…", action: chooseDirectory)
                     }
+                    if cwd.trimmingCharacters(in: .whitespaces).isEmpty, options != nil {
+                        Text(
+                            routePinsDirectory
+                                ? "The route decides the folder."
+                                : "Defaults to your home folder because the route names none; choose the project you want the agents to work in."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(routePinsDirectory ? Color.secondary : Color.orange)
+                    }
                 }
 
-                Section("Team") {
-                    TextField("Pipeline (use configured route when empty)", text: $pipeline)
+                if let plan = model.workStartPlan {
+                    Section("Plan") {
+                        WorkPlanView(result: plan) {
+                            dryRun = false
+                            submit()
+                        }
+                    }
+                }
+
+                Section("Pipeline") {
+                    pipelineSection
+                }
+
+                Section("Task") {
                     TextField("External issue, for example CAL-1234 (optional)", text: $external)
                     Text("An empty external issue creates a local Muxa Work; the issue never becomes the Work identity.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                }
-
-                Section("Initial task") {
                     TextEditor(text: $taskBody)
                         .font(.body)
                         .frame(minHeight: 86)
@@ -65,7 +161,7 @@ struct WorkStartView: View {
                             }
                         }
                     DisclosureGroup("Advanced context") {
-                        TextField("Message skill (optional)", text: $skill)
+                        skillField
                         TextField("Additional context (optional)", text: $context)
                         Toggle("Plan only — do not create agents", isOn: $dryRun)
                     }
@@ -81,7 +177,7 @@ struct WorkStartView: View {
                         .textSelection(.enabled)
                     if model.needsWorkConfiguration {
                         HStack {
-                            Text("No Work routing is configured yet. Muxa can guide you through it in an interactive Shell tab.")
+                            Text("No Work routing is configured yet. Install a preset above, or let an agent write the config in an interactive Shell tab.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Spacer()
@@ -116,12 +212,135 @@ struct WorkStartView: View {
                     .disabled(model.isStartingWork)
                 Button(dryRun ? "Build Plan" : "Start Work") { submit() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(work.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isStartingWork)
+                    .disabled(!canSubmit)
                     .keyboardShortcut(.defaultAction)
             }
             .padding(16)
         }
-        .frame(width: 650, height: 650)
+        .frame(width: 700, height: 720)
+        .onAppear {
+            if let preselected = model.workStartPreselectedPipeline {
+                pipeline = preselected
+            }
+        }
+        .onChange(of: model.workOptions) { updated in
+            // A preset installed from this sheet becomes the selection; a
+            // previously chosen pipeline that vanished from the config
+            // returns to the route default.
+            guard let updated else { return }
+            if !pipeline.isEmpty, updated.pipeline(named: pipeline) == nil {
+                pipeline = ""
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var routeSummary: some View {
+        if let options, !work.trimmingCharacters(in: .whitespaces).isEmpty {
+            if let route = matchedRoute {
+                Label {
+                    Text(routeDescription(route))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } icon: {
+                    Image(systemName: "arrow.triangle.branch")
+                        .foregroundStyle(.tint)
+                }
+            } else if options.pipelines.isEmpty {
+                EmptyView()
+            } else {
+                Label("No route matches this Work id; choose a pipeline below.", systemImage: "arrow.triangle.branch")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private func routeDescription(_ route: MuxaWorkOptions.Route) -> String {
+        var parts = ["Route \(route.match)"]
+        if let name = route.pipeline, !name.isEmpty { parts.append("pipeline \(name)") }
+        if let workspace = route.workspace, !workspace.isEmpty { parts.append("workspace \(workspace)") }
+        if route.worktree {
+            parts.append("own git worktree")
+        } else if let cwd = route.cwd, !cwd.isEmpty {
+            parts.append("cwd \(cwd)")
+        }
+        return parts.joined(separator: " → ")
+    }
+
+    @ViewBuilder
+    private var pipelineSection: some View {
+        if let options {
+            if options.pipelines.isEmpty {
+                WorkPresetGallery(
+                    options: options,
+                    model: model,
+                    onInstalled: { installed in pipeline = installed },
+                    onDescribe: configureWork
+                )
+            } else {
+                Picker("Pipeline", selection: $pipeline) {
+                    Text(defaultPipelineLabel).tag("")
+                    ForEach(options.pipelines) { candidate in
+                        Text(candidate.name).tag(candidate.name)
+                    }
+                }
+                if let selected = effectivePipeline {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let description = selected.description, !description.isEmpty {
+                            Text(description)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        PipelineStagesView(agents: selected.agents)
+                        if let layout = selected.layout, !layout.isEmpty {
+                            Text("tmux layout \(layout)")
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                } else if pipeline.isEmpty {
+                    Text("The route for this Work id names no pipeline. Pick one to launch.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+        } else if let error = model.workOptionsError {
+            TextField("Pipeline (use configured route when empty)", text: $pipeline)
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .textSelection(.enabled)
+        } else {
+            TextField("Pipeline (use configured route when empty)", text: $pipeline)
+            Text("Reading pipelines from the muxa config…")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var defaultPipelineLabel: String {
+        if let name = matchedRoute?.pipeline, !name.isEmpty {
+            return "Route default (\(name))"
+        }
+        return work.trimmingCharacters(in: .whitespaces).isEmpty
+            ? "Route default"
+            : "Route default (none)"
+    }
+
+    @ViewBuilder
+    private var skillField: some View {
+        if let skills = options?.skills, !skills.isEmpty {
+            Picker("Message skill", selection: $skill) {
+                Text("None").tag("")
+                ForEach(skills) { candidate in
+                    Text(candidate.summary.map { "\(candidate.name) — \($0)" } ?? candidate.name)
+                        .tag(candidate.name)
+                }
+            }
+        } else {
+            TextField("Message skill (optional)", text: $skill)
+        }
     }
 
     private func submit() {
@@ -129,7 +348,7 @@ struct WorkStartView: View {
             work: work,
             workspace: workspace,
             pipeline: pipeline,
-            cwd: cwd,
+            cwd: effectiveDirectory,
             external: external,
             skill: skill,
             body: taskBody,
@@ -234,6 +453,8 @@ struct WorkCommandCenterView: View {
                     }
                 }
 
+                pipelinesSection
+
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Active Work")
                         .font(.title2.weight(.semibold))
@@ -269,6 +490,89 @@ struct WorkCommandCenterView: View {
             .frame(maxWidth: .infinity, alignment: .top)
         }
         .background(MuxaSurfacePalette.workspace(for: colorScheme).ignoresSafeArea())
+        .task { await model.loadWorkOptions() }
+    }
+
+    private let pipelineColumns = [
+        GridItem(.adaptive(minimum: 300, maximum: 460), spacing: 12, alignment: .top),
+    ]
+
+    /// The configured pipelines drawn as launchable presets. This is where a
+    /// GUI earns its place over the CLI: the stage picture is visible before
+    /// a single agent exists, and an empty config offers muxa's built-in
+    /// presets instead of an error.
+    @ViewBuilder
+    private var pipelinesSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("Pipelines")
+                    .font(.title2.weight(.semibold))
+                if let path = model.workOptions?.configPath {
+                    Text(path)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(path)
+                }
+                Spacer()
+                if model.isLoadingWorkOptions {
+                    ProgressView().controlSize(.small)
+                }
+                Button {
+                    Task { await model.loadWorkOptions() }
+                } label: {
+                    Label("Reload", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Re-read routes and pipelines from the muxa config")
+            }
+
+            if let options = model.workOptions {
+                if options.pipelines.isEmpty {
+                    WorkPresetGallery(
+                        options: options,
+                        model: model,
+                        onInstalled: { installed in model.presentWorkStart(pipeline: installed) },
+                        onDescribe: { Task { await model.configureWork(cwd: nil) } }
+                    )
+                    .padding(16)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                } else {
+                    LazyVGrid(columns: pipelineColumns, alignment: .leading, spacing: 12) {
+                        ForEach(options.pipelines) { pipeline in
+                            WorkPipelineCard(
+                                pipeline: pipeline,
+                                routes: options.routes.filter { $0.pipeline == pipeline.name }
+                            ) {
+                                model.presentWorkStart(pipeline: pipeline.name)
+                            }
+                        }
+                    }
+                    if let error = model.workOptionsError {
+                        Label(error, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .textSelection(.enabled)
+                    }
+                }
+            } else if let error = model.workOptionsError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            } else {
+                Text("Reading pipelines from the muxa config…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            }
+        }
     }
 
     private var commandCenterTitle: some View {

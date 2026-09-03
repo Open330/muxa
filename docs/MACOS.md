@@ -65,18 +65,35 @@ The detail area is deliberately task-oriented:
 - **Shell** is the interactive native Ghostty surface owned by a muxad PTY.
   It also has a read-only **Raw** mode for the bounded PTY output stream.
 
-The app now opens on a **Work Command Center**, not a terminal list. **Start
-Work** collects the stable Work id, project folder, optional workspace,
-pipeline, external issue reference, and initial task. muxad runs the canonical
-bundled `muxa work up` implementation as an asynchronous operation, so ticket
-resolution cannot freeze refreshes or terminal I/O. The resulting Work opens
-as the same logical `{workspace_id, work_id}` used by CLI and dashboard
-surfaces.
+The app now opens on a **Work Command Center**, not a terminal list. Its
+**Pipelines** section reads `muxa work options --json` through the bundled
+CLI and draws every configured pipeline as a launchable card: the agents are
+laid out in the stages muxa will start them in (one column per `after`
+level), with the routes that select the pipeline underneath and a **Start…**
+button that opens the sheet with that pipeline preselected. The config file
+stays the source of truth; the app never keeps its own copy of routes or
+pipelines.
 
-If no `[[route]]` or pipeline is configured yet, the Start Work sheet does
-not strand the user on the CLI error. It offers **Configure Work…**, which
-opens the canonical interactive `muxa work init` wizard in a native Shell tab;
-after setup, the same sheet can start or dry-run the Work directly.
+**Start Work** collects the stable Work id, project folder, optional
+workspace, pipeline, external issue reference, and initial task. Typing a
+Work id shows the route it would take (`Route ^cal- → pipeline triad →
+workspace callabo → own git worktree`), the workspace field suggests the
+route's workspace and existing local sessions, the pipeline is a picker whose
+default is the route's choice, the selected pipeline's stage diagram is shown
+before launch, and message skills come from `[message.skills]`. The Start
+button is enabled only for combinations the CLI would accept. muxad then runs
+the canonical bundled `muxa work up` implementation as an asynchronous
+operation, so ticket resolution cannot freeze refreshes or terminal I/O. The
+resulting Work opens as the same logical `{workspace_id, work_id}` used by
+CLI and dashboard surfaces.
+
+When the config has no pipeline yet, both the Command Center and the sheet
+show muxa's built-in presets (`solo`, `pair`, `triad`) with their stage
+diagrams. **Install** writes the preset through `muxa work preset apply`
+(adding a catch-all route only when no route exists), and **Describe with an
+agent…** opens the canonical interactive `muxa work init` wizard in a native
+Shell tab for a custom setup. An older bundled CLI without `work options`
+falls back to the free-text fields.
 
 **Live Watch** is the native replacement for the common `muxa watch` operator
 loop. It nests **Host → Session → Window → Pane**, labels windows with their

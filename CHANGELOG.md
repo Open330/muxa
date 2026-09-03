@@ -60,6 +60,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure clears when the host recovers, and blocked/declined requests are
   listed as decisions instead of waits.
 
+### Added
+
+- **Muxa.app Start Work shows real choices and the pipeline picture.** The
+  Command Center lists configured pipelines as launchable cards drawn in
+  launch stages, the Start Work sheet previews the matching route, suggests
+  workspaces, offers pipelines and message skills as pickers, and an empty
+  config offers muxa's built-in presets (`solo`, `pair`, `triad`) with
+  one-click install through `muxa work preset apply`.
+
+- **`muxa work options` and `muxa work preset`.** `muxa work options
+  [--json]` prints the routes, pipelines, message skills, built-in presets,
+  and ticket agent a Work launcher needs, so Muxa.app and other GUIs never
+  parse `config.toml` themselves. `muxa work preset list` shows the built-in
+  `solo`, `pair`, and `triad` line-ups, and `muxa work preset apply <name>
+  [--route <regex>] [--overwrite]` writes one as `[pipeline.<name>]` through
+  `toml_edit` — validated as a full `Config` first, refusing to replace an
+  existing pipeline without `--overwrite`, and appending a `[[route]]` only
+  when no route with that `match` exists — so a fresh config becomes
+  launchable without spending an agent turn.
+
 ### Changed
 
 - **Muxa.app says "Hosts" everywhere the user can see it.** "Fleet" remains

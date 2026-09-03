@@ -112,6 +112,29 @@ final class QACommandHandler {
             } catch {
                 return .failure(error.localizedDescription)
             }
+        case "scroll":
+            guard AXIsProcessTrusted() else {
+                return .failure("Accessibility permission is required")
+            }
+            guard let x = request.x, let y = request.y, let deltaY = request.deltaY,
+                  abs(deltaY) <= 4000
+            else {
+                return .failure("x, y, and delta_y (|delta_y| <= 4000) are required")
+            }
+            do {
+                _ = try await focusMuxa()
+                let window = try await muxaWindow()
+                guard x >= 0, y >= 0, x <= window.frame.width, y <= window.frame.height else {
+                    return .failure("scroll point is outside the Muxa window")
+                }
+                try postScroll(
+                    at: CGPoint(x: window.frame.minX + x, y: window.frame.minY + y),
+                    deltaY: deltaY
+                )
+                return .success()
+            } catch {
+                return .failure(error.localizedDescription)
+            }
         case "resize":
             guard AXIsProcessTrusted() else {
                 return .failure("Accessibility permission is required")
@@ -351,6 +374,24 @@ final class QACommandHandler {
 
     private func postReturn(targetPID: pid_t) throws {
         try postKey(virtualKey: 36, targetPID: targetPID)
+    }
+
+    /// Posts a pixel-precise scroll wheel event at `point`. Positive
+    /// `deltaY` scrolls content up (like dragging the wheel toward you on
+    /// a natural-scrolling Mac), negative scrolls it down.
+    private func postScroll(at point: CGPoint, deltaY: Double) throws {
+        guard let event = CGEvent(
+            scrollWheelEvent2Source: nil,
+            units: .pixel,
+            wheelCount: 1,
+            wheel1: Int32(deltaY.rounded()),
+            wheel2: 0,
+            wheel3: 0
+        ) else {
+            throw QAHelperError.eventCreationFailed
+        }
+        event.location = point
+        event.post(tap: .cghidEventTap)
     }
 
     private func postClick(at point: CGPoint) throws {

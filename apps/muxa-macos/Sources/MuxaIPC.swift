@@ -110,15 +110,56 @@ struct MuxaWorkStartRequest: Hashable, Sendable {
     let dryRun: Bool
 }
 
-struct MuxaWorkStartResult: Decodable, Sendable {
+/// One step of `muxa work up`'s reconciliation plan: `launch` a missing
+/// pane, `reprompt` or `keep` a live one, `waiting` on an `after` edge, or
+/// `attention` when a person has to act first.
+struct MuxaWorkPlanStep: Decodable, Equatable, Sendable, Identifiable {
+    let action: String
+    let alias: String
+    let program: String?
+    let role: String?
+    let task: String?
+    let prompt: String?
+    let pane: String?
+    let state: String?
+    let waitingOn: [String]
+
+    var id: String { "\(action):\(alias)" }
+
+    enum CodingKeys: String, CodingKey {
+        case action, alias, program, role, task, prompt, pane, state
+        case waitingOn = "waiting_on"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        action = try values.decodeIfPresent(String.self, forKey: .action) ?? "launch"
+        alias = try values.decodeIfPresent(String.self, forKey: .alias) ?? ""
+        program = try values.decodeIfPresent(String.self, forKey: .program)
+        role = try values.decodeIfPresent(String.self, forKey: .role)
+        task = try values.decodeIfPresent(String.self, forKey: .task)
+        prompt = try values.decodeIfPresent(String.self, forKey: .prompt)
+        pane = try values.decodeIfPresent(String.self, forKey: .pane)
+        state = try values.decodeIfPresent(String.self, forKey: .state)
+        waitingOn = try values.decodeIfPresent([String].self, forKey: .waitingOn) ?? []
+    }
+}
+
+struct MuxaWorkPlan: Decodable, Equatable, Sendable {
+    let steps: [MuxaWorkPlanStep]
+}
+
+struct MuxaWorkStartResult: Decodable, Equatable, Sendable {
     let work: String
     let workspace: String
     let pipeline: String?
     let cwd: String?
     let dryRun: Bool?
+    let layout: String?
+    let plan: MuxaWorkPlan?
 
     enum CodingKeys: String, CodingKey {
-        case work, workspace, pipeline, cwd
+        case work, workspace, pipeline, cwd, layout, plan
         case dryRun = "dry_run"
     }
 }

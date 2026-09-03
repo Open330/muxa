@@ -120,6 +120,94 @@ import Testing
     )
 }
 
+@Test func workOptionsDecodeAndSelectRoutesLikeTheCLI() throws {
+    let json = """
+    {
+      "config_path": "/tmp/config.toml",
+      "configured": true,
+      "routes": [
+        {"match": "^cal-", "workspace": "callabo", "pipeline": "triad", "worktree": true, "prepare": false},
+        {"match": "", "pipeline": "never"},
+        {"match": "[", "pipeline": "broken"},
+        {"match": ".*", "cwd": "{{cwd}}", "pipeline": "solo"}
+      ],
+      "pipelines": [
+        {"name": "solo", "agents": [{"alias": "claude", "program": "claude"}]},
+        {"name": "triad", "description": "planner → implementer → reviewer", "layout": "main-vertical",
+         "agents": [
+           {"alias": "plan", "program": "codex", "role": "planner", "after": []},
+           {"alias": "impl", "program": "codex", "role": "implementer", "after": ["plan"], "direction": "down"},
+           {"alias": "review", "program": "claude", "role": "reviewer", "after": ["impl"]}
+         ]}
+      ],
+      "skills": [{"name": "review", "summary": "Review the current diff"}],
+      "presets": [{"name": "pair", "description": "implementer → reviewer", "agents": [
+        {"alias": "impl", "program": "claude"}, {"alias": "review", "program": "codex", "after": ["impl"]}]}],
+      "ticket_agent": "claude"
+    }
+    """
+
+    let options = try MuxaWorkOptions.decode(Data(json.utf8))
+
+    #expect(options.configured)
+    #expect(options.pipelines.map(\.name) == ["solo", "triad"])
+    #expect(options.route(matching: "cal-123")?.pipeline == "triad")
+    #expect(options.route(matching: "CAL-9")?.workspace == "callabo")
+    #expect(options.route(matching: "auth-cleanup")?.match == ".*")
+    #expect(options.route(matching: "   ") == nil)
+    #expect(options.defaultPipeline(for: "cal-1")?.name == "triad")
+    #expect(options.defaultPipeline(for: "misc")?.name == "solo")
+    #expect(options.skills.first?.summary == "Review the current diff")
+    #expect(options.presets.first?.stages.map { $0.map(\.alias) } == [["impl"], ["review"]])
+    #expect(options.pipeline(named: "triad")?.agents[1].direction == "down")
+}
+
+@Test func workOptionsDecodeToleratesAnEmptyConfig() throws {
+    let options = try MuxaWorkOptions.decode(Data(#"{"config_path": "/tmp/c.toml", "routes": [], "pipelines": [], "presets": []}"#.utf8))
+    #expect(!options.configured)
+    #expect(options.route(matching: "x") == nil)
+    #expect(options.skills.isEmpty)
+}
+
+@Test func pipelineStagesFollowAfterEdges() {
+    typealias Agent = MuxaWorkOptions.Agent
+    let agents = [
+        Agent(alias: "plan", program: "codex"),
+        Agent(alias: "impl", program: "codex", after: ["plan"]),
+        Agent(alias: "review", program: "claude", after: ["impl"]),
+        Agent(alias: "docs", program: "claude", after: ["plan"]),
+    ]
+    #expect(MuxaPipelineStages.stages(for: agents).map { $0.map(\.alias) } == [["plan"], ["impl", "docs"], ["review"]])
+
+    let cyclic = [
+        Agent(alias: "a", program: "claude", after: ["b"]),
+        Agent(alias: "b", program: "codex", after: ["a"]),
+    ]
+    #expect(MuxaPipelineStages.stages(for: cyclic).map { $0.map(\.alias) } == [["a", "b"]])
+
+    let unknownDependency = [Agent(alias: "a", program: "claude", after: ["ghost"])]
+    #expect(MuxaPipelineStages.stages(for: unknownDependency).map { $0.map(\.alias) } == [["a"]])
+    #expect(MuxaPipelineStages.stages(for: []).isEmpty)
+}
+
+@Test func workStartResultDecodesTheDryRunPlan() throws {
+    let json = """
+    {"work": "MUXA-APP-DRYRUN", "workspace": "muxa", "pipeline": "pair", "cwd": "/tmp/muxa", "dry_run": true,
+     "layout": null, "graph": [{"alias": "impl", "after": [], "depth": 0}],
+     "plan": {"steps": [
+       {"action": "launch", "alias": "impl", "program": "claude", "role": "implementer", "task": "Implement the request", "prompt": "You own it."},
+       {"action": "waiting", "alias": "review", "waiting_on": ["impl"]},
+       {"action": "keep", "alias": "docs", "pane": "%4", "state": "idle"}
+     ], "unclaimed": []}}
+    """
+    let result = try JSONDecoder().decode(MuxaWorkStartResult.self, from: Data(json.utf8))
+    #expect(result.dryRun == true)
+    #expect(result.plan?.steps.map(\.action) == ["launch", "waiting", "keep"])
+    #expect(result.plan?.steps[0].prompt == "You own it.")
+    #expect(result.plan?.steps[1].waitingOn == ["impl"])
+    #expect(result.plan?.steps[2].pane == "%4")
+}
+
 @Test func readableMarkdownGroupsOrderedListsAndNormalizesNewlines() {
     let document = ReadableMarkdownDocument(source: "1. one\r\n2. two\r\n\r\nnext line")
 

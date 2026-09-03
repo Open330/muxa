@@ -8,6 +8,7 @@ struct QARequest: Codable, Sendable {
     let y: Double?
     let width: Double?
     let height: Double?
+    let deltaY: Double?
     /// `key` command: a single character or a named key
     /// (return/escape/tab/space/up/down/left/right/delete).
     let key: String?
@@ -19,6 +20,7 @@ struct QARequest: Codable, Sendable {
         case text
         case pressReturn = "press_return"
         case x, y, width, height
+        case deltaY = "delta_y"
         case key
         case modifiers
     }
@@ -32,7 +34,8 @@ struct QARequest: Codable, Sendable {
         width: Double? = nil,
         height: Double? = nil,
         key: String? = nil,
-        modifiers: [String]? = nil
+        modifiers: [String]? = nil,
+        deltaY: Double? = nil
     ) {
         self.command = command
         self.text = text
@@ -41,6 +44,7 @@ struct QARequest: Codable, Sendable {
         self.y = y
         self.width = width
         self.height = height
+        self.deltaY = deltaY
         self.key = key
         self.modifiers = modifiers
     }

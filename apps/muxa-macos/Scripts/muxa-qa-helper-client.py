@@ -45,6 +45,11 @@ def main() -> int:
     click.add_argument("--x", required=True, type=float, help="x coordinate inside the Muxa window")
     click.add_argument("--y", required=True, type=float, help="y coordinate inside the Muxa window")
 
+    scroll = commands.add_parser("scroll")
+    scroll.add_argument("--x", required=True, type=float, help="x coordinate inside the Muxa window")
+    scroll.add_argument("--y", required=True, type=float, help="y coordinate inside the Muxa window")
+    scroll.add_argument("--dy", required=True, type=float, help="pixels; negative scrolls content down")
+
     resize = commands.add_parser("resize")
     resize.add_argument("--width", required=True, type=float, help="window width in points")
     resize.add_argument("--height", required=True, type=float, help="window height in points")
@@ -97,6 +102,8 @@ def main() -> int:
         result = request({"command": "key", "key": args.key, "modifiers": args.modifiers})
     elif args.command == "click":
         result = request({"command": "click", "x": args.x, "y": args.y})
+    elif args.command == "scroll":
+        result = request({"command": "scroll", "x": args.x, "y": args.y, "delta_y": args.dy})
     elif args.command == "resize":
         payload = {"command": "resize", "width": args.width, "height": args.height}
         if args.x is not None and args.y is not None:

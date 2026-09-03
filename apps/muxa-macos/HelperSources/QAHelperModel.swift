@@ -48,7 +48,7 @@ final class QAHelperModel: ObservableObject {
         activityMessage = "Capturing Muxa…"
         Task {
             let response = await commandHandler.handle(
-                QARequest(command: "capture", text: nil, pressReturn: nil, x: nil, y: nil, width: nil, height: nil)
+                QARequest(command: "capture")
             )
             if response.ok,
                let encoded = response.pngBase64,

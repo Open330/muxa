@@ -8,6 +8,13 @@ HELPERS_DIR="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers"
 DAEMON_PATH="$HELPERS_DIR/muxad"
 CLI_PATH="$HELPERS_DIR/muxa"
 
+# Local UI iteration: keep the helpers already embedded in this build
+# product instead of rebuilding the Rust runtime for every Swift change.
+if [ "${MUXA_SKIP_EMBED:-}" = "1" ] && [ -x "$DAEMON_PATH" ] && [ -x "$CLI_PATH" ]; then
+    echo "MUXA_SKIP_EMBED=1: keeping the existing helpers in $HELPERS_DIR"
+    exit 0
+fi
+
 CARGO_BIN=$(command -v cargo || true)
 if [ -z "$CARGO_BIN" ] && [ -x "${HOME:-}/.cargo/bin/cargo" ]; then
     CARGO_BIN="${HOME}/.cargo/bin/cargo"
