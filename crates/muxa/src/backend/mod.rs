@@ -275,7 +275,7 @@ fn active_kinds_from(
     }
 
     // 3. Auto-detect. The env-preferred host — whatever `detect_from`
-    // resolves the current shell to (rmux > zellij > herdr > cmux > tmux on a nested-env
+    // resolves the current shell to (rmux > zellij > herdr > tmux > cmux on a nested-env
     // tie) — leads the set so `backends[0]` is the host the shell actually
     // lives in; consumers (dashboard, watch initial cursor) treat the first
     // backend as primary. The remaining detected hosts follow in a stable
@@ -612,16 +612,26 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
 /// 2. **`RMUX` / `RMUX_PANE`** set → [`HostKind::Rmux`].
 /// 3. **`ZELLIJ`** set → [`HostKind::Zellij`].
 /// 4. **`HERDR_PANE_ID` / `HERDR_ENV`** set → [`HostKind::Herdr`].
-/// 5. **`CMUX_SURFACE_ID` / `CMUX_WORKSPACE_ID`** set → [`HostKind::Cmux`].
-/// 6. **`TMUX`** set → [`HostKind::Tmux`].
+/// 5. **`TMUX`** set → [`HostKind::Tmux`].
+/// 6. **`CMUX_SURFACE_ID` / `CMUX_WORKSPACE_ID`** set → [`HostKind::Cmux`].
 ///
 /// The tie-break for nested hosts (all ancestors' vars are inherited) is
-/// **native rmux first**, then zellij, herdr, and tmux. rmux must precede tmux
-/// because it intentionally exports tmux compatibility variables. Launching herdr *from*
-/// a tmux shell is the common migration path, so herdr beats tmux on a
-/// presence tie — matching the hook adapter's `host_pane_env` so the pane a
-/// hook is stamped onto and the backend that observes it always agree. The
-/// rarer nesting (tmux inside a herdr pane) is served by `MUXA_HOST=tmux`.
+/// **native rmux first**, then zellij, herdr, tmux, and finally cmux. rmux must
+/// precede tmux because it intentionally exports tmux compatibility variables.
+/// Launching herdr *from* a tmux shell is the common migration path, so herdr
+/// beats tmux on a presence tie — matching the hook adapter's `host_pane_env`
+/// so the pane a hook is stamped onto and the backend that observes it always
+/// agree. The rarer nesting (tmux inside a herdr pane) is served by
+/// `MUXA_HOST=tmux`.
+///
+/// cmux is the exception to "newer host wins": it is a GUI terminal
+/// application, so it can only ever be the *outermost* layer. A tmux server
+/// started from a cmux tab inherits every `CMUX_*` variable (workspace, tab,
+/// socket path) and hands them to each pane shell, while cmux itself can never
+/// run inside a tmux pane. A present `$TMUX` next to cmux variables therefore
+/// always means "tmux inside cmux", and tmux wins. cmux is detected only when
+/// no tmux env is present (a process directly in a cmux surface) or when
+/// `MUXA_HOST=cmux` forces it.
 ///
 /// Returns `None` outside all hosts; callers fall through to a no-op
 /// backend in that case.
@@ -652,8 +662,8 @@ fn detect_from(read: impl Fn(&str) -> Option<String>) -> Option<HostKind> {
         }
     }
 
-    // 2.–5. Auto-detect from host-set env vars. Ordering is a tie-break
-    // for nested hosts (all ancestors' vars are inherited): newer hosts
+    // 2.–6. Auto-detect from host-set env vars. Ordering is a tie-break
+    // for nested hosts (all ancestors' vars are inherited): newer CLI hosts
     // are checked before tmux because launching herdr/zellij *from* a tmux
     // shell is the common migration path — and the inner shell inherits the
     // outer `$TMUX`, so it can't be disambiguated by presence alone. The
@@ -670,11 +680,14 @@ fn detect_from(read: impl Fn(&str) -> Option<String>) -> Option<HostKind> {
     if read("HERDR_PANE_ID").is_some() || read("HERDR_ENV").is_some() {
         return Some(HostKind::Herdr);
     }
-    if read("CMUX_SURFACE_ID").is_some() || read("CMUX_WORKSPACE_ID").is_some() {
-        return Some(HostKind::Cmux);
-    }
     if read("TMUX").is_some() {
         return Some(HostKind::Tmux);
+    }
+    // cmux last: a GUI terminal is always the outermost host, so the
+    // variables it hands down must not shadow a real tmux pane (see the
+    // doc comment on `detect_host_env`).
+    if read("CMUX_SURFACE_ID").is_some() || read("CMUX_WORKSPACE_ID").is_some() {
+        return Some(HostKind::Cmux);
     }
     None
 }
@@ -783,12 +796,76 @@ mod tests {
             detect_from(env_reader(&[("CMUX_SURFACE_ID", "surface-7")])),
             Some(HostKind::Cmux),
         );
+    }
+
+    /// tmux beats cmux on a presence tie. cmux is a GUI terminal, so the only
+    /// way both sets of variables coexist is a tmux server started from a cmux
+    /// tab: every pane shell inherits `CMUX_WORKSPACE_ID` / `CMUX_TAB_ID` /
+    /// `CMUX_SOCKET_PATH` (and, depending on the cmux build, `CMUX_SURFACE_ID`)
+    /// next to the real `$TMUX`. Attributing those agents to cmux stamped hook
+    /// rows with the cmux socket, which no tmux pane scan could ever match.
+    #[test]
+    fn detect_prefers_tmux_over_inherited_cmux_env() {
+        // The shape observed in the wild: no surface id, but workspace/tab ids.
+        assert_eq!(
+            detect_from(env_reader(&[
+                ("TMUX", "/private/tmp/tmux-501/default,3338,4"),
+                ("TMUX_PANE", "%31"),
+                ("CMUX_WORKSPACE_ID", "FF3584C5-3BC7-4049-ACFF-A446D775037D"),
+                ("CMUX_TAB_ID", "FF3584C5-3BC7-4049-ACFF-A446D775037D"),
+                ("CMUX_SOCKET_PATH", "/Users/me/.local/state/cmux/cmux.sock"),
+            ])),
+            Some(HostKind::Tmux),
+            "a tmux pane inside a cmux tab belongs to tmux",
+        );
+        // A cmux build that also exports a surface id changes nothing.
         assert_eq!(
             detect_from(env_reader(&[
                 ("CMUX_SURFACE_ID", "surface-7"),
                 ("TMUX", "/tmp/outer,1,0"),
             ])),
+            Some(HostKind::Tmux),
+        );
+    }
+
+    /// Directly inside a cmux surface (no tmux env at all) cmux still wins, on
+    /// either of its identifying variables.
+    #[test]
+    fn detect_picks_cmux_without_tmux_env() {
+        assert_eq!(
+            detect_from(env_reader(&[("CMUX_SURFACE_ID", "surface-7")])),
             Some(HostKind::Cmux),
+        );
+        assert_eq!(
+            detect_from(env_reader(&[
+                ("CMUX_WORKSPACE_ID", "workspace-2"),
+                ("CMUX_SOCKET_PATH", "/tmp/cmux.sock"),
+            ])),
+            Some(HostKind::Cmux),
+        );
+    }
+
+    /// `MUXA_HOST` stays the escape hatch in both directions of the
+    /// cmux/tmux tie.
+    #[test]
+    fn detect_muxa_host_overrides_cmux_tmux_tie() {
+        assert_eq!(
+            detect_from(env_reader(&[
+                ("MUXA_HOST", "cmux"),
+                ("CMUX_WORKSPACE_ID", "workspace-2"),
+                ("TMUX", "/tmp/outer,1,0"),
+            ])),
+            Some(HostKind::Cmux),
+            "MUXA_HOST=cmux must beat a present TMUX env var",
+        );
+        assert_eq!(
+            detect_from(env_reader(&[
+                ("MUXA_HOST", "tmux"),
+                ("CMUX_SURFACE_ID", "surface-7"),
+                ("TMUX", "/tmp/outer,1,0"),
+            ])),
+            Some(HostKind::Tmux),
+            "MUXA_HOST=tmux must beat a present CMUX env var",
         );
     }
 
@@ -1183,6 +1260,30 @@ mod tests {
                 HostKind::Cmux,
                 HostKind::Herdr
             ],
+        );
+    }
+
+    /// A tmux pane inside a cmux tab leads with tmux: the daemon's primary
+    /// backend is the host the shell actually lives in, and cmux stays in the
+    /// set as the usual partial observer. Directly in a cmux surface, cmux
+    /// leads and tmux is the unconditional trailer.
+    #[test]
+    fn active_kinds_tmux_inside_cmux_leads_with_tmux() {
+        assert_eq!(
+            active_kinds_from(
+                &env_reader(&[
+                    ("TMUX", "/private/tmp/tmux-501/default,3338,4"),
+                    ("TMUX_PANE", "%31"),
+                    ("CMUX_WORKSPACE_ID", "workspace-2"),
+                    ("CMUX_SOCKET_PATH", "/Users/me/.local/state/cmux/cmux.sock"),
+                ]),
+                &|_| false,
+            ),
+            vec![HostKind::Tmux, HostKind::Cmux],
+        );
+        assert_eq!(
+            active_kinds_from(&env_reader(&[("CMUX_SURFACE_ID", "surface-7")]), &|_| false),
+            vec![HostKind::Cmux, HostKind::Tmux],
         );
     }
 
