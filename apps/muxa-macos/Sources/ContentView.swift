@@ -3313,19 +3313,10 @@ func fleetHostColor(_ state: String) -> Color {
 }
 
 struct TerminalPane: View {
-    private enum DisplayMode: String, CaseIterable, Identifiable {
-        case terminal = "Terminal"
-        case raw = "Raw"
-
-        var id: Self { self }
-    }
-
     @StateObject private var pane: TerminalPaneModel
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.openWindow) private var openWindow
-    @State private var displayMode: DisplayMode = .terminal
     private let sessionID: String
-    private let allowsRaw: Bool
     private let showsToolbar: Bool
     private let onExit: () -> Void
 
@@ -3333,12 +3324,10 @@ struct TerminalPane: View {
         client: MuxaIPCClient,
         sessionID: String,
         replayInitialHistory: Bool,
-        allowsRaw: Bool = true,
         showsToolbar: Bool = true,
         onExit: @escaping () -> Void = {}
     ) {
         self.sessionID = sessionID
-        self.allowsRaw = allowsRaw
         self.showsToolbar = showsToolbar
         self.onExit = onExit
         _pane = StateObject(
@@ -3359,40 +3348,11 @@ struct TerminalPane: View {
                 .background(MuxaSurfacePalette.terminal(for: colorScheme))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .clipped()
-                .opacity(displayMode == .terminal ? 1 : 0)
-                .allowsHitTesting(displayMode == .terminal)
-
-            if displayMode == .raw {
-                ScrollView([.horizontal, .vertical]) {
-                    Text(verbatim: pane.rawOutputText)
-                        .font(.system(size: 12, weight: .regular, design: .monospaced))
-                        .foregroundStyle(colorScheme == .dark ? Color(white: 0.92) : Color(white: 0.12))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                        .padding(16)
-                }
-                .background(MuxaSurfacePalette.terminal(for: colorScheme))
-            }
 
             if showsToolbar {
                 VStack {
                     HStack(spacing: 8) {
-                        if displayMode == .raw {
-                            Text("\(pane.rawOutputByteCount) bytes retained · controls escaped")
-                                .font(.caption2.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                        }
                         Spacer()
-                        if allowsRaw {
-                            Picker("Shell display", selection: $displayMode) {
-                                ForEach(DisplayMode.allCases) { mode in
-                                    Text(mode.rawValue).tag(mode)
-                                }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.segmented)
-                            .frame(width: 170)
-                        }
                         Button {
                             openWindow(value: MuxaModuleRoute.shell(sessionID))
                         } label: {
@@ -3432,10 +3392,7 @@ struct TerminalPane: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
-        .onAppear {
-            pane.start()
-            pane.setRawDisplayEnabled(displayMode == .raw)
-        }
+        .onAppear { pane.start() }
         .task(id: sessionID) {
             // The embedded Live Pane is inserted after the attach request
             // completes. Give AppKit one run-loop turn to put the native
@@ -3444,16 +3401,10 @@ struct TerminalPane: View {
             // the inspector or sidebar that initiated the attach.
             await Task.yield()
             try? await Task.sleep(for: .milliseconds(120))
-            guard !Task.isCancelled, displayMode == .terminal else { return }
+            guard !Task.isCancelled else { return }
             pane.focus()
         }
-        .onDisappear {
-            pane.setRawDisplayEnabled(false)
-            pane.stop()
-        }
-        .onChange(of: displayMode) { mode in
-            pane.setRawDisplayEnabled(mode == .raw)
-        }
+        .onDisappear { pane.stop() }
         .onChange(of: pane.exited) { exited in
             if exited { onExit() }
         }

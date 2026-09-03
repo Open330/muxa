@@ -47,7 +47,7 @@ final class QACommandHandler {
                 return .failure("text is missing or exceeds 64 KiB")
             }
             do {
-                let targetPID = try await focusMuxa()
+                let targetPID = try await focusMuxaIfPossible()
                 try postText(text, targetPID: targetPID)
                 if request.pressReturn == true { try postReturn(targetPID: targetPID) }
                 return .success()
@@ -59,7 +59,7 @@ final class QACommandHandler {
                 return .failure("Accessibility permission is required")
             }
             do {
-                let targetPID = try await focusMuxa()
+                let targetPID = try await focusMuxaIfPossible()
                 try postKey(
                     virtualKey: 45,
                     flags: [.maskCommand, .maskShift],
@@ -82,7 +82,7 @@ final class QACommandHandler {
             }
             do {
                 let resolved = try QAKeyResolver.resolve(key: key, modifiers: modifiers)
-                let targetPID = try await focusMuxa()
+                let targetPID = try await focusMuxaIfPossible()
                 try postKey(
                     virtualKey: resolved.virtualKey,
                     flags: resolved.flags,
@@ -145,7 +145,10 @@ final class QACommandHandler {
                 return .failure("width and height between 200 and 8192 are required")
             }
             do {
-                let targetPID = try await focusMuxa()
+                // Resizing goes through the Accessibility API, which does not
+                // need the app to be frontmost. Staying out of the way lets a
+                // layout check run while the operator uses another app.
+                let targetPID = try muxaProcessIdentifier()
                 try resizeMuxaWindow(
                     pid: targetPID,
                     x: request.x,
@@ -243,6 +246,30 @@ final class QACommandHandler {
             .filter { $0.frame.intersects(frame) }
             .max(by: { $0.backingScaleFactor < $1.backingScaleFactor })?
             .backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+    }
+
+    /// Activates Muxa when macOS allows it, but never fails for a command
+    /// whose events are posted straight to the process: key, text, and the
+    /// new-shell chord reach Muxa even while the operator works elsewhere.
+    /// Clicks and scrolls still need the real focus, because those are HID
+    /// events at screen coordinates.
+    private func focusMuxaIfPossible() async throws -> pid_t {
+        do {
+            return try await focusMuxa()
+        } catch QAHelperError.muxaActivationFailed {
+            return try muxaProcessIdentifier()
+        }
+    }
+
+    /// Muxa's pid without activating it.
+    private func muxaProcessIdentifier() throws -> pid_t {
+        guard let application = NSRunningApplication
+            .runningApplications(withBundleIdentifier: Self.muxaBundleIdentifier)
+            .first
+        else {
+            throw QAHelperError.muxaNotRunning
+        }
+        return application.processIdentifier
     }
 
     private func focusMuxa() async throws -> pid_t {

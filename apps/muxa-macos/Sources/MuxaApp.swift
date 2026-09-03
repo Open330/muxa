@@ -1,3 +1,4 @@
+import GhosttyTerminal
 import SwiftUI
 
 @MainActor
@@ -8,6 +9,13 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
         // state and create no visible window at all.
         MuxaPreferences.registerDefaults()
         UserDefaults.standard.set(true, forKey: "ApplePersistenceIgnoreState")
+        // `MUXA_TERMINAL_DEBUG=1 open -a Muxa` (or launching the binary
+        // directly) prints libghostty's lifecycle, metrics, and IO tracing to
+        // stdout, which is how a terminal that stops following the window
+        // size gets diagnosed.
+        if ProcessInfo.processInfo.environment["MUXA_TERMINAL_DEBUG"] == "1" {
+            TerminalDebugLog.enable(.all)
+        }
         super.init()
     }
 

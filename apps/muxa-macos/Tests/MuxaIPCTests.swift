@@ -835,16 +835,6 @@ struct MuxaIPCTests {
     }
 
     @Test
-    func rawTerminalFormatterMakesControlsVisibleWithoutExecutingThem() {
-        let bytes = Data("A\u{001B}[31mB\r\n\t한글".utf8)
-        let dump = terminalRawDescription(bytes)
-        #expect(dump.contains("00000000"))
-        #expect(dump.contains("41 1B 5B 33 31 6D 42 0D"))
-        #expect(dump.contains("A.[31mB."))
-        #expect(!dump.contains("\u{001B}"))
-    }
-
-    @Test
     func shellSpawnCarriesTerminalContractAndConservativeInitialGrid() async throws {
         let probe = IPCProbe()
         let client = MuxaIPCClient(socketPath: "/tmp/muxa-test.sock", request: probe.request)

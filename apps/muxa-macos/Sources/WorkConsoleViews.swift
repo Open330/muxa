@@ -2752,7 +2752,6 @@ private struct WatchLivePanePanel: View {
                     client: model.client,
                     sessionID: session.id,
                     replayInitialHistory: session.hasBeenAttached == true,
-                    allowsRaw: false,
                     showsToolbar: false,
                     onExit: sessionExited
                 )
