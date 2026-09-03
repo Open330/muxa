@@ -69,6 +69,29 @@ final class QACommandHandler {
             } catch {
                 return .failure(error.localizedDescription)
             }
+        case "key":
+            guard AXIsProcessTrusted() else {
+                return .failure("Accessibility permission is required")
+            }
+            guard let key = request.key, !key.isEmpty, key.utf8.count <= 32 else {
+                return .failure("key is missing or exceeds 32 bytes")
+            }
+            let modifiers = request.modifiers ?? []
+            guard modifiers.count <= 4 else {
+                return .failure("at most 4 modifiers are allowed")
+            }
+            do {
+                let resolved = try QAKeyResolver.resolve(key: key, modifiers: modifiers)
+                let targetPID = try await focusMuxa()
+                try postKey(
+                    virtualKey: resolved.virtualKey,
+                    flags: resolved.flags,
+                    targetPID: targetPID
+                )
+                return .success(keyCode: Int(resolved.virtualKey))
+            } catch {
+                return .failure(error.localizedDescription)
+            }
         case "click":
             guard AXIsProcessTrusted() else {
                 return .failure("Accessibility permission is required")
@@ -86,6 +109,30 @@ final class QACommandHandler {
                     at: CGPoint(x: window.frame.minX + x, y: window.frame.minY + y)
                 )
                 return .success()
+            } catch {
+                return .failure(error.localizedDescription)
+            }
+        case "resize":
+            guard AXIsProcessTrusted() else {
+                return .failure("Accessibility permission is required")
+            }
+            guard let width = request.width, let height = request.height,
+                  width >= 200, height >= 200, width <= 8192, height <= 8192
+            else {
+                return .failure("width and height between 200 and 8192 are required")
+            }
+            do {
+                let targetPID = try await focusMuxa()
+                try resizeMuxaWindow(
+                    pid: targetPID,
+                    x: request.x,
+                    y: request.y,
+                    width: width,
+                    height: height
+                )
+                try await Task.sleep(for: .milliseconds(400))
+                let window = try await muxaWindow()
+                return .success(window: Self.info(for: window))
             } catch {
                 return .failure(error.localizedDescription)
             }
@@ -208,6 +255,67 @@ final class QACommandHandler {
         return application.processIdentifier
     }
 
+    /// Move and resize the largest Muxa window through the Accessibility API.
+    /// SwiftUI still enforces the window's minimum size, so the reported
+    /// geometry after the change is returned to the caller.
+    private func resizeMuxaWindow(
+        pid: pid_t,
+        x: Double?,
+        y: Double?,
+        width: Double,
+        height: Double
+    ) throws {
+        let application = AXUIElementCreateApplication(pid)
+        var windowsValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            application,
+            kAXWindowsAttribute as CFString,
+            &windowsValue
+        ) == .success,
+            let windows = windowsValue as? [AXUIElement]
+        else {
+            throw QAHelperError.muxaWindowNotFound
+        }
+
+        var target: AXUIElement?
+        var largestArea = 0.0
+        for window in windows {
+            var sizeValue: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                window,
+                kAXSizeAttribute as CFString,
+                &sizeValue
+            ) == .success,
+                let axValue = sizeValue,
+                CFGetTypeID(axValue) == AXValueGetTypeID()
+            else { continue }
+            var size = CGSize.zero
+            // swiftlint:disable:next force_cast
+            AXValueGetValue(axValue as! AXValue, .cgSize, &size)
+            let area = size.width * size.height
+            if area > largestArea {
+                largestArea = area
+                target = window
+            }
+        }
+        guard let target else { throw QAHelperError.muxaWindowNotFound }
+
+        if let x, let y {
+            var point = CGPoint(x: x, y: y)
+            guard let value = AXValueCreate(.cgPoint, &point) else {
+                throw QAHelperError.eventCreationFailed
+            }
+            let moved = AXUIElementSetAttributeValue(target, kAXPositionAttribute as CFString, value)
+            guard moved == .success else { throw QAHelperError.resizeFailed(moved.rawValue) }
+        }
+        var size = CGSize(width: width, height: height)
+        guard let value = AXValueCreate(.cgSize, &size) else {
+            throw QAHelperError.eventCreationFailed
+        }
+        let resized = AXUIElementSetAttributeValue(target, kAXSizeAttribute as CFString, value)
+        guard resized == .success else { throw QAHelperError.resizeFailed(resized.rawValue) }
+    }
+
     private func postText(_ text: String, targetPID: pid_t) throws {
         for chunk in text.qaChunks(maxCharacters: 64) {
             let utf16 = Array(chunk.utf16)
@@ -311,6 +419,7 @@ private enum QAHelperError: LocalizedError {
     case captureTooLarge
     case captureFailed
     case eventCreationFailed
+    case resizeFailed(Int32)
 
     var errorDescription: String? {
         switch self {
@@ -321,6 +430,7 @@ private enum QAHelperError: LocalizedError {
         case .captureTooLarge: "The captured PNG exceeds the 32 MiB safety limit"
         case .captureFailed: "Muxa window capture failed"
         case .eventCreationFailed: "A keyboard event could not be created"
+        case .resizeFailed(let code): "The Muxa window could not be resized (AXError \(code))"
         }
     }
 }

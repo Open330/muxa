@@ -45,12 +45,33 @@ def main() -> int:
     click.add_argument("--x", required=True, type=float, help="x coordinate inside the Muxa window")
     click.add_argument("--y", required=True, type=float, help="y coordinate inside the Muxa window")
 
+    resize = commands.add_parser("resize")
+    resize.add_argument("--width", required=True, type=float, help="window width in points")
+    resize.add_argument("--height", required=True, type=float, help="window height in points")
+    resize.add_argument("--x", type=float, help="optional new window x origin")
+    resize.add_argument("--y", type=float, help="optional new window y origin")
+
     capture = commands.add_parser("capture")
     capture.add_argument("--output", required=True, type=Path)
 
     type_command = commands.add_parser("type")
     type_command.add_argument("--text", required=True)
     type_command.add_argument("--return", dest="press_return", action="store_true")
+
+    key = commands.add_parser("key", help="press one key, optionally with modifiers")
+    key.add_argument(
+        "--key",
+        required=True,
+        help="a single character or one of return/escape/tab/space/up/down/left/right/delete",
+    )
+    key.add_argument(
+        "--mod",
+        dest="modifiers",
+        action="append",
+        default=[],
+        choices=["command", "shift", "option", "control"],
+        help="modifier to hold while pressing the key; repeat for chords",
+    )
 
     args = parser.parse_args()
     if args.command == "prompt-permissions":
@@ -72,8 +93,15 @@ def main() -> int:
         )
     elif args.command == "new-shell":
         result = request({"command": "new_shell"})
+    elif args.command == "key":
+        result = request({"command": "key", "key": args.key, "modifiers": args.modifiers})
     elif args.command == "click":
         result = request({"command": "click", "x": args.x, "y": args.y})
+    elif args.command == "resize":
+        payload = {"command": "resize", "width": args.width, "height": args.height}
+        if args.x is not None and args.y is not None:
+            payload.update({"x": args.x, "y": args.y})
+        result = request(payload)
     else:
         result = request({"command": args.command})
 
