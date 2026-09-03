@@ -201,7 +201,7 @@ struct PipelineComposerView: View {
                     .disabled(session.isDrafting)
                 Spacer()
                 if let draft = session.draft {
-                    Text("\(draft.agents.count) agent\(draft.agents.count == 1 ? "" : "s")")
+                    Text("\(draft.agents.count) agents")
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
@@ -251,7 +251,7 @@ struct PipelineComposerView: View {
             }
 
             HStack(spacing: 8) {
-                TextField("", text: $session.refinement, prompt: Text("Refine: for example make the reviewer use gemini"))
+                TextField("Refinement", text: $session.refinement, prompt: Text("Refine: for example make the reviewer use gemini"))
                     .labelsHidden()
                     .onSubmit { session.refine() }
                     .disabled(session.isDrafting)
@@ -379,7 +379,7 @@ private struct ComposerAgentRow: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("@\(agent.alias)")
+            Text(verbatim: "@\(agent.alias)")
                 .font(.subheadline.weight(.semibold))
                 .frame(width: 110, alignment: .leading)
                 .lineLimit(1)

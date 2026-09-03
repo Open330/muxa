@@ -100,7 +100,7 @@ struct AskProvidersSettingsPane: View {
                 Picker("Default provider", selection: defaultProviderSelection) {
                     ForEach(store.providers) { provider in
                         if let reason = store.usability(provider).reason {
-                            Text("\(provider.title) (\(reason))")
+                            Text(verbatim: "\(provider.title) (\(reason))")
                                 .tag(provider.id)
                                 .disabled(true)
                         } else {
