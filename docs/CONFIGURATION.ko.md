@@ -79,16 +79,23 @@ stdio process 시작 시 읽으므로 변경 후에는 MCP가 연결된 agent를
 ```toml
 [ask]
 enabled = true
-agent = "claude"     # claude | codex | gemini | anthropic | openai
+agent = "claude"     # provider id. 내장 id이거나 아래에서 직접 추가한 id
 cwd = "~"            # headless 프로세스가 실행될 위치. 기본값 $HOME
 permission_mode = "bypass" # bypass(기본값) | edit | plan | default
 additional_dirs = [] # 추가 real path. 예: ["/nfs/home/june"]
 timeout_secs = 1800    # wall-clock 제한 30분
 keep = 200           # 보관할 답변 수. 넘으면 오래된 것부터 버립니다
 
-[ask.providers.anthropic]           # 선택. provider id마다 테이블 하나
+[ask.providers.anthropic]           # 내장 provider 조정. id가 곧 engine
 model = "claude-opus-5"             # 기본값: claude-sonnet-5(anthropic), gpt-5(openai). CLI는 자체 기본값
 api_key_env = "WORK_ANTHROPIC_KEY"  # 키를 담은 환경 변수의 *이름*. 키 자체는 절대 아님
+
+[ask.providers.anthropic-work]      # 또는 원하는 id로 직접 추가
+engine = "anthropic"                # 내장 id가 아니면 필수
+title = "Anthropic (work)"          # 선택. 기본값은 id를 사람이 읽게 다듬은 이름
+model = "claude-opus-5"             # 선택
+api_key_env = "WORK_ANTHROPIC_KEY"  # 선택. 이 provider 전용 키
+executable = "/opt/homebrew/bin/claude"  # 선택. CLI engine에만 적용
 ```
 
 `muxa watch`에서 보내는 headless 질의입니다. `a`로 묻고 `A`로 이력을 봅니다.
@@ -113,17 +120,39 @@ sandbox/자동 검토를 유지한 채 workspace 편집을 허용하고, `defaul
 `--permission-mode plan`, codex `--sandbox read-only`, gemini `--approval-mode
 plan`). `muxa work compose`는 항상 이 모드로 초안을 만듭니다.
 
-`agent`는 provider를 고릅니다. `claude`, `codex`, `gemini`는 agent CLI를 print
-모드(`claude -p`, `codex exec --json`, `gemini -p --output-format json`)로
-실행하고 질문 사이에 자체 세션을 resume합니다. `anthropic`과 `openai`는 Messages
-API와 Chat Completions API를 HTTPS로 직접 호출합니다. resume할 세션이 없으므로
-muxad가 자기 이력에서 그 대화의 이전 턴(최근 40턴 또는 60k자)을 질문 앞에
-다시 넣어 보내며, `cwd`·`additional_dirs`·`permission_mode`는 적용되지 않습니다.
-API 키는 순서대로 client가 보낸 1회용 키, muxad 환경의 provider 고유 변수
+### Provider
+
+**engine**은 provider를 구동하는 코드입니다. CLI가 받는 argv, API가 돌려주는
+JSON, 키가 담긴 환경 변수가 여기에 있습니다. 다섯 개로 고정되어 있습니다.
+`claude`, `codex`, `gemini`는 agent CLI를 print 모드(`claude -p`, `codex exec
+--json`, `gemini -p --output-format json`)로 실행하고 질문 사이에 자체 세션을
+resume합니다. `anthropic`과 `openai`는 Messages API와 Chat Completions API를
+HTTPS로 직접 호출합니다. API engine은 resume할 세션이 없으므로 muxad가 자기
+이력에서 그 대화의 이전 턴(최근 40턴 또는 60k자)을 질문 앞에 다시 넣어 보내며,
+`cwd`·`additional_dirs`·`permission_mode`는 적용되지 않습니다.
+
+**provider**는 직접 구성하는 `[ask.providers.<id>]` 테이블입니다. id는 원하는
+대로 정하고(TOML bare key: 영숫자, `-`, `_`), `engine`이 다섯 중 무엇으로
+구동할지 정합니다. 여러 provider가 같은 engine을 공유할 수 있어 업무용과 개인용
+OpenAI 계정, Anthropic 키 두 개, 두 번째 `claude` 바이너리를 나란히 둘 수
+있습니다. 각각 자기 대화를 따로 유지하므로 provider를 바꿔도 새로 시작하지 않고
+이어집니다. `[ask] agent`와 `muxa ask --agent`는 engine이 아니라 provider id를
+가리킵니다.
+
+다섯 engine id는 그 자체로도 provider라서 `[ask.providers]`가 아예 없어도 새로
+설치한 muxa가 그대로 동작합니다. `muxa ask providers`는 직접 구성한 provider를
+먼저, 그다음 아직 가려지지 않은 내장 provider를 보여줍니다. 내장 id로 만든
+테이블에 `engine`이 없으면 그 내장 provider를 조정하는 뜻입니다. 예전에 쓴
+`[ask.providers.anthropic] model = "…"`이 지금도 같은 의미인 이유입니다. 그런
+테이블을 제거하면 설정만 지워지고 내장 provider는 그대로 남습니다.
+
+API 키는 순서대로 client가 보낸 1회용 키, muxad 환경의 engine 고유 변수
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`; CLI는 `CODEX_API_KEY`, `GEMINI_API_KEY`),
-그다음 `[ask.providers.<id>] api_key_env`가 가리키는 변수에서 읽습니다. 키 자체는
-config.toml에 절대 쓰지 않습니다. `[ask.providers.<id>] model`은 CLI를 포함한
-모든 provider의 모델을 바꿉니다.
+그다음 그 provider의 `api_key_env`가 가리키는 변수에서 읽습니다. 키 자체는
+config.toml에 절대 쓰지 않습니다. 같은 engine을 쓰는 provider 둘은 engine 변수를
+공유하므로, 서로 다른 계정을 써야 한다면 각각 `api_key_env`를 지정하세요(또는
+1회용 키를 보내세요). `model`은 CLI를 포함한 모든 provider의 모델을 바꾸고,
+`executable`은 CLI engine이 실행할 바이너리를 지정합니다.
 
 TUI를 열지 않아도 동일한 daemon 소유 이력을 사용할 수 있습니다.
 
@@ -133,10 +162,22 @@ muxa ask --agent claude --detach --json "배포 계획을 검토해줘"
 muxa ask --agent anthropic "reaper가 건드리는 파일은?"
 security find-generic-password -w -s my-codex-key \
   | muxa ask --agent codex --api-key-stdin "이 저장소를 검토해줘"
-muxa ask providers [--json]           # 모든 provider: 종류, 모델, 키 확보 여부, 선택 상태
+muxa ask --agent anthropic-work "…"   # 직접 추가한 provider를 id로 지정
+muxa ask providers [--json]           # 모든 provider: engine, 종류, 모델, 키 확보 여부, 선택 상태
+muxa ask provider add anthropic-work --engine anthropic \
+  --title "Anthropic (work)" --api-key-env WORK_ANTHROPIC_KEY
+muxa ask provider add claude-work --engine claude --executable /opt/homebrew/bin/claude
 muxa ask provider set anthropic --model claude-opus-5 --api-key-env WORK_ANTHROPIC_KEY
 muxa ask provider set anthropic --clear-model         # 생략한 플래그의 키는 그대로 둡니다
+muxa ask provider remove anthropic-work               # 내장 id는 설정만 지워집니다
 ```
+
+`add`는 이미 있는 id, TOML bare key가 아닌 id, 다섯 중에 없는 engine, 그리고 다른
+engine을 쓰려는 내장 id를 거부합니다. engine은 추가 시점에 고정됩니다. `set`은
+title·model·키 변수·바이너리를 바꾸고, engine을 바꾸려면 provider를 제거한 뒤 다시
+추가해야 합니다. 진행 중인 대화가 `claude` 세션 id를 `codex`에서 resume할 수는
+없기 때문입니다. `[ask] agent`가 가리키던 provider를 제거하면 선택이 남은 첫
+provider로 넘어갑니다.
 
 `--api-key-stdin`은 interactive terminal 입력을 거부합니다. 키는 owner-only Unix
 socket을 거쳐 선택한 provider의 단 한 번의 child process에만 전달되며 muxa

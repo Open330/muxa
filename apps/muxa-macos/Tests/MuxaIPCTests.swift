@@ -3307,3 +3307,1416 @@ func inboxAttentionRowSelectsWithoutLeavingInbox() throws {
     // agents and other hosts never appear.
     #expect(open.map(\.request.id) == ["unread", "waiting"])
 }
+
+// MARK: - Ask provider instances (providers-ui)
+
+/// `ask_providers` from a daemon that understands instances: two Anthropic
+/// accounts and a pinned second Claude Code binary in config, then the
+/// built-in engines no config entry covers.
+private func askProviderInstanceFixture() -> [[String: Any]] {
+    [
+        [
+            "id": "anthropic-work", "title": "Anthropic (work)", "engine": "anthropic",
+            "kind": "api", "executable": NSNull(), "credential_env": "ANTHROPIC_API_KEY",
+            "credential_required": true, "credential_present": true,
+            "model": "claude-opus-5", "selected": true, "builtin": false,
+        ],
+        [
+            "id": "anthropic-personal", "title": "Anthropic (personal)", "engine": "anthropic",
+            "kind": "api", "executable": NSNull(), "credential_env": "ANTHROPIC_API_KEY",
+            "credential_required": true, "credential_present": false,
+            "model": "claude-sonnet-5", "selected": false, "builtin": false,
+        ],
+        [
+            "id": "claude", "title": "Claude Code", "engine": "claude", "kind": "cli",
+            "executable": "/opt/homebrew/bin/claude", "credential_env": "ANTHROPIC_API_KEY",
+            "credential_required": false, "credential_present": false,
+            "model": NSNull(), "selected": false, "builtin": true,
+        ],
+        [
+            "id": "codex", "title": "Codex CLI", "engine": "codex", "kind": "cli",
+            "executable": "codex", "credential_env": "CODEX_API_KEY",
+            "credential_required": false, "credential_present": false,
+            "model": NSNull(), "selected": false, "builtin": true,
+        ],
+        [
+            "id": "anthropic", "title": "Anthropic API", "engine": "anthropic", "kind": "api",
+            "executable": NSNull(), "credential_env": "ANTHROPIC_API_KEY",
+            "credential_required": true, "credential_present": false,
+            "model": "claude-sonnet-5", "selected": false, "builtin": true,
+        ],
+    ]
+}
+
+@Test
+func askProvidersCarryEngineAndSeparateTwoInstancesOfIt() async throws {
+    let handler: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        switch object["kind"] as? String {
+        case "hello":
+            return try askProviderHello(capabilities: ["ask_providers_v1"])
+        case "ask_providers":
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true,
+                "ask_providers": askProviderInstanceFixture(),
+            ])
+        default:
+            return try JSONSerialization.data(withJSONObject: ["ok": true])
+        }
+    }
+    let client = MuxaIPCClient(socketPath: "/tmp/muxa-ask-instances.sock", request: handler)
+    try await client.hello()
+    let providers = try await client.listAskProviders()
+    #expect(providers.map(\.id) == ["anthropic-work", "anthropic-personal", "claude", "codex", "anthropic"])
+
+    // Two instances of one engine are separate providers everywhere it
+    // matters: id, title, model and — the point of the exercise — the
+    // Keychain account their API key is stored under.
+    let work = try #require(providers.first { $0.id == "anthropic-work" })
+    let personal = try #require(providers.first { $0.id == "anthropic-personal" })
+    #expect(work.engine == "anthropic")
+    #expect(personal.engine == "anthropic")
+    #expect(work.engineDescriptor == .anthropic)
+    #expect(work != personal)
+    #expect(work.keychainAccount == "anthropic-work-api-key")
+    #expect(personal.keychainAccount == "anthropic-personal-api-key")
+    #expect(work.title == "Anthropic (work)")
+    #expect(work.model == "claude-opus-5")
+    #expect(personal.model == "claude-sonnet-5")
+    // They share the engine's environment variable, which is exactly why
+    // each one needs its own Keychain entry.
+    #expect(work.environmentKey == personal.environmentKey)
+    #expect(work.symbolName == personal.symbolName)
+    #expect(work.selected)
+    #expect(!personal.selected)
+
+    // Configured rows lead; the built-in engines no entry covers follow.
+    #expect(providers.filter(\.isConfigured).map(\.id) == ["anthropic-work", "anthropic-personal", "claude"])
+    #expect(providers.filter { !$0.isConfigured }.map(\.id) == ["codex", "anthropic"])
+    // `claude` is a shipped id, so muxad keeps it flagged built-in even
+    // though the operator pinned a second binary for it.
+    let claude = try #require(providers.first { $0.id == "claude" })
+    #expect(claude.builtin)
+    #expect(claude.isConfigured)
+    #expect(claude.cliExecutable == "/opt/homebrew/bin/claude")
+    #expect(providers.allSatisfy { $0.declaresEngine })
+
+    // `credential_present` says muxad can already resolve a key.
+    #expect(work.credentialPresent)
+    #expect(!personal.credentialPresent)
+}
+
+@Test
+func askProviderAddAndRemoveSendTheContractedBodies() async throws {
+    let handler: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        switch object["kind"] as? String {
+        case "hello":
+            return try askProviderHello(capabilities: ["ask_providers_v1"])
+        case "ask_provider_add":
+            #expect(object["id"] as? String == "anthropic-work")
+            #expect(object["engine"] as? String == "anthropic")
+            #expect(object["title"] as? String == "Anthropic (work)")
+            #expect(object["model"] as? String == "claude-opus-5")
+            // Blank optional fields are left out, never sent as "".
+            #expect(object["executable"] == nil)
+            #expect(object["api_key_env"] == nil)
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true,
+                "ask_providers": askProviderInstanceFixture(),
+            ])
+        case "ask_provider_remove":
+            #expect(object["id"] as? String == "anthropic-work")
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true,
+                "ask_providers": askProviderFixture(),
+            ])
+        default:
+            return try JSONSerialization.data(withJSONObject: ["ok": true])
+        }
+    }
+    let client = MuxaIPCClient(socketPath: "/tmp/muxa-ask-add-remove.sock", request: handler)
+    try await client.hello()
+
+    let added = try await client.addAskProvider(
+        id: "anthropic-work",
+        engine: "anthropic",
+        title: "Anthropic (work)",
+        model: "claude-opus-5",
+        apiKeyEnv: "   ",
+        executable: nil
+    )
+    #expect(added.map(\.id).contains("anthropic-work"))
+
+    let removed = try await client.removeAskProvider("anthropic-work")
+    #expect(!removed.map(\.id).contains("anthropic-work"))
+
+    // A CLI instance carries its pinned binary through.
+    let pinning: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        switch object["kind"] as? String {
+        case "hello":
+            return try askProviderHello(capabilities: ["ask_providers_v1"])
+        case "ask_provider_add":
+            #expect(object["engine"] as? String == "claude")
+            #expect(object["executable"] as? String == "/opt/homebrew/bin/claude")
+            #expect(object["title"] == nil)
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true,
+                "ask_providers": askProviderInstanceFixture(),
+            ])
+        default:
+            return try JSONSerialization.data(withJSONObject: ["ok": true])
+        }
+    }
+    let cli = MuxaIPCClient(socketPath: "/tmp/muxa-ask-add-cli.sock", request: pinning)
+    try await cli.hello()
+    _ = try await cli.addAskProvider(
+        id: "claude-brew",
+        engine: "claude",
+        title: "  ",
+        executable: " /opt/homebrew/bin/claude "
+    )
+}
+
+@Test
+func askProviderAddAndRemoveSurfaceTheDaemonsRefusals() async throws {
+    let refusing: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        switch object["kind"] as? String {
+        case "hello":
+            return try askProviderHello(capabilities: ["ask_providers_v1"])
+        case "ask_provider_add":
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": false,
+                "error": "provider \"anthropic\" already exists",
+            ])
+        case "ask_provider_remove":
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": false,
+                "error": "\"gemini\" is a built-in provider with no configuration to remove",
+            ])
+        default:
+            return try JSONSerialization.data(withJSONObject: ["ok": true])
+        }
+    }
+    let client = MuxaIPCClient(socketPath: "/tmp/muxa-ask-refusals.sock", request: refusing)
+    try await client.hello()
+    await #expect(throws: (any Error).self) {
+        _ = try await client.addAskProvider(id: "anthropic", engine: "anthropic")
+    }
+    await #expect(throws: (any Error).self) {
+        _ = try await client.removeAskProvider("gemini")
+    }
+
+    // A reply that forgets the refreshed list is a protocol error, not an
+    // empty provider list the pane would render.
+    let silent: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        if object["kind"] as? String == "hello" {
+            return try askProviderHello(capabilities: ["ask_providers_v1"])
+        }
+        return try JSONSerialization.data(withJSONObject: ["ok": true])
+    }
+    let quiet = MuxaIPCClient(socketPath: "/tmp/muxa-ask-silent.sock", request: silent)
+    try await quiet.hello()
+    await #expect(throws: (any Error).self) {
+        _ = try await quiet.addAskProvider(id: "anthropic-work", engine: "anthropic")
+    }
+
+    // An older daemon never receives the new requests at all.
+    let legacy: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        if object["kind"] as? String == "hello" {
+            return try askProviderHello(capabilities: ["ask_conversations_v1"])
+        }
+        Issue.record("a daemon without ask_providers_v1 must not receive add or remove")
+        return try JSONSerialization.data(withJSONObject: ["ok": false, "error": "unknown kind"])
+    }
+    let old = MuxaIPCClient(socketPath: "/tmp/muxa-ask-add-legacy.sock", request: legacy)
+    try await old.hello()
+    await #expect(throws: (any Error).self) {
+        _ = try await old.addAskProvider(id: "anthropic-work", engine: "anthropic")
+    }
+    await #expect(throws: (any Error).self) {
+        _ = try await old.removeAskProvider("anthropic-work")
+    }
+}
+
+@Test
+func askProviderRowsFromADaemonWithoutInstancesStayUsable() throws {
+    // The shape muxad sent before instances existed: no `engine`, no
+    // `builtin`, no `configured`.
+    let rows = try JSONDecoder().decode(
+        [MuxaAskProvider].self,
+        from: JSONSerialization.data(withJSONObject: askProviderFixture())
+    )
+    #expect(rows.map(\.id) == ["claude", "codex", "anthropic", "openai"])
+    #expect(rows.allSatisfy { !$0.declaresEngine })
+    // Engine defaults from the id, so symbols and install hints still work…
+    #expect(rows.map(\.engine) == ["claude", "codex", "anthropic", "openai"])
+    #expect(rows[0].engineDescriptor == .claude)
+    #expect(rows[0].installCommand == "npm install -g @anthropic-ai/claude-code")
+    #expect(rows[2].symbolName == "brain")
+    // …and every row reads as a built-in with nothing to remove, which is
+    // what hides Add and Remove behind `supportsInstances`.
+    #expect(rows.allSatisfy { $0.builtin })
+    #expect(rows.allSatisfy { $0.configured == nil })
+    #expect(rows.allSatisfy { !$0.isConfigured })
+
+    // A daemon that does send `configured` overrides the inference in both
+    // directions, so this app never has to guess again.
+    let explicit = try JSONDecoder().decode(
+        MuxaAskProvider.self,
+        from: Data(#"{"id":"anthropic","engine":"anthropic","builtin":true,"configured":true}"#.utf8)
+    )
+    #expect(explicit.builtin)
+    #expect(explicit.isConfigured)
+    let bare = try JSONDecoder().decode(
+        MuxaAskProvider.self,
+        from: Data(#"{"id":"custom","engine":"openai","builtin":false,"configured":false}"#.utf8)
+    )
+    #expect(!bare.isConfigured)
+    // Without the flag, an id muxa does not ship can only come from config.
+    let composed = try JSONDecoder().decode(
+        MuxaAskProvider.self,
+        from: Data(#"{"id":"openai-work","engine":"openai","builtin":false}"#.utf8)
+    )
+    #expect(composed.isConfigured)
+    #expect(composed.engineDescriptor == .openai)
+}
+
+@Test
+func askProviderUsabilityAcceptsTheDaemonsCredential() {
+    let tool = InstalledTool(name: "claude", path: "/opt/homebrew/bin/claude", version: "2.1.0")
+    // An API instance whose key muxad already reads from `api_key_env` is
+    // usable with nothing in this Mac's Keychain.
+    #expect(
+        AskProviderStore.usability(kind: .api, detection: .notInstalled, hasKey: false, credentialPresent: true)
+            == .usable
+    )
+    #expect(
+        AskProviderStore.usability(kind: .api, detection: .notInstalled, hasKey: false, credentialPresent: false)
+            == .missingKey
+    )
+    #expect(
+        AskProviderStore.usability(kind: .api, detection: .notInstalled, hasKey: true, credentialPresent: false)
+            == .usable
+    )
+    // A CLI still needs its binary; a key on either side does not conjure one.
+    #expect(
+        AskProviderStore.usability(kind: .cli, detection: .notInstalled, hasKey: true, credentialPresent: true)
+            == .notInstalled
+    )
+    #expect(
+        AskProviderStore.usability(kind: .cli, detection: .installed(tool), hasKey: false, credentialPresent: false)
+            == .usable
+    )
+}
+
+@Test
+func askProviderExecutablePathDetectionSkipsThePathProbe() throws {
+    // An instance that pins an absolute binary is checked on disk; PATH
+    // never enters into it.
+    let present = AskProviderStore.pathDetection(for: "/opt/homebrew/bin/claude") { path in
+        path == "/opt/homebrew/bin/claude"
+    }
+    let tool = try #require(present?.tool)
+    #expect(tool.name == "claude")
+    #expect(tool.path == "/opt/homebrew/bin/claude")
+    #expect(AskProviderStore.pathDetection(for: "/nope/claude") { _ in false } == .notInstalled)
+    // A bare command name is left to the PATH probe.
+    #expect(AskProviderStore.pathDetection(for: "claude") { _ in true } == nil)
+}
+
+@Test
+func askProviderDraftValidatesIdsTheWayTheDaemonDoes() {
+    #expect(AskProviderDraft.isValidIdentifier("anthropic-work"))
+    #expect(AskProviderDraft.isValidIdentifier("openai_2"))
+    #expect(AskProviderDraft.isValidIdentifier("A1"))
+    #expect(!AskProviderDraft.isValidIdentifier(""))
+    #expect(!AskProviderDraft.isValidIdentifier("anthropic work"))
+    #expect(!AskProviderDraft.isValidIdentifier("anthropic.work"))
+    #expect(!AskProviderDraft.isValidIdentifier("anthropic/work"))
+    #expect(!AskProviderDraft.isValidIdentifier("업무"))
+
+    // The prefill is the engine id until it is taken, then -2, -3, …
+    let none: Set<String> = []
+    #expect(AskProviderDraft.suggestedIdentifier(for: .anthropic, taken: none) == "anthropic")
+    #expect(AskProviderDraft.suggestedIdentifier(for: .anthropic, taken: ["anthropic"]) == "anthropic-2")
+    #expect(
+        AskProviderDraft.suggestedIdentifier(for: .anthropic, taken: ["anthropic", "anthropic-2"])
+            == "anthropic-3"
+    )
+    #expect(AskProviderDraft.uniqueIdentifier(base: "claude", taken: ["codex"]) == "claude")
+
+    var draft = AskProviderDraft()
+    #expect(draft.engine.kind == .api)
+    #expect(!draft.isReady(taken: none))
+    draft.id = "  anthropic-work  "
+    #expect(draft.trimmedID == "anthropic-work")
+    #expect(draft.isReady(taken: none))
+    #expect(draft.validationMessage(taken: none) == nil)
+    #expect(draft.validationMessage(taken: ["anthropic-work"])?.isEmpty == false)
+    #expect(!draft.isReady(taken: ["anthropic-work"]))
+    draft.id = "anthropic work"
+    #expect(draft.validationMessage(taken: none)?.isEmpty == false)
+
+    // The engine supplies every default the sheet only hints at.
+    #expect(AskProviderEngine.allCases.map(\.rawValue) == ["claude", "codex", "gemini", "anthropic", "openai"])
+    #expect(AskProviderEngine.gemini.defaultExecutable == "gemini")
+    #expect(AskProviderEngine.gemini.defaultCredentialEnv == "GEMINI_API_KEY")
+    #expect(AskProviderEngine.anthropic.defaultExecutable == nil)
+    #expect(AskProviderEngine.anthropic.defaultModel == "claude-sonnet-5")
+    #expect(AskProviderEngine.openai.defaultModel == "gpt-5")
+    #expect(AskProviderEngine.claude.defaultModel == nil)
+    #expect(AskProviderEngine.claude.credentialRequired == false)
+    #expect(AskProviderEngine.openai.credentialRequired)
+}
+
+@Test
+func askProviderKeychainAccountsAreOnePerInstance() throws {
+    // A new instance gets its own account under the shared service, and the
+    // two ids earlier builds wrote are byte-identical.
+    #expect(MuxaProviderCredentialStore.service == "dev.muxa.mac.ask-provider")
+    #expect(MuxaAskProvider.claude.keychainAccount == "claude-api-key")
+    #expect(MuxaAskProvider.codex.keychainAccount == "codex-api-key")
+    let work = try #require(MuxaAskProvider(rawValue: "anthropic-work"))
+    #expect(work.keychainAccount == "anthropic-work-api-key")
+    #expect(work.engine == "anthropic-work")
+    // `sendAsk` looks a provider up by the conversation's agent id, so an
+    // instance this build never listed still resolves to its own key.
+    let personal = try #require(MuxaAskProvider(rawValue: "anthropic-personal"))
+    #expect(personal.keychainAccount != work.keychainAccount)
+}
+
+@Test
+func askProviderExecutableResolutionAcceptsAPinnedBinary() {
+    // An instance may pin a second install that is on nobody's PATH, so
+    // "Log In…" has to take an absolute path as given.
+    #expect(MuxaExecutableResolver.executablePath("/bin/sh") == "/bin/sh")
+    #expect(MuxaExecutableResolver.executablePath("/bin/there-is-no-such-binary") == nil)
+    // A bare name still goes through the augmented PATH.
+    #expect(MuxaExecutableResolver.executablePath("sh")?.hasSuffix("/sh") == true)
+    #expect(MuxaExecutableResolver.augmentedPath(nil).contains("/usr/bin"))
+}
+
+// MARK: - Settings › Automations, Behaviour and Advanced
+
+/// Collects the raw request payloads a fake handler saw. The handler is
+/// `@Sendable`, so the collection needs its own lock.
+private final class SettingsPaneRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    func record(_ payload: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        storage.append(String(decoding: payload, as: UTF8.self))
+    }
+
+    var payloads: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    /// Every recorded request's `kind`, in order.
+    var kinds: [String] {
+        payloads.map { payload in
+            let decoded = try? JSONSerialization.jsonObject(with: Data(payload.utf8))
+            return ((decoded as? [String: Any])?["kind"] as? String) ?? "?"
+        }
+    }
+
+    func object(at index: Int) throws -> [String: Any] {
+        try #require(
+            JSONSerialization.jsonObject(with: Data(payloads[index].utf8)) as? [String: Any]
+        )
+    }
+}
+
+/// `hello` with the baseline the client requires plus the given extras.
+private func settingsPaneHello(capabilities: [String]) throws -> Data {
+    try JSONSerialization.data(withJSONObject: [
+        "ok": true,
+        "min_protocol": 1,
+        "max_protocol": 6,
+        "capabilities": [
+            "session_bytes_v1", "session_attachment_identity_v1", "work_control_v1",
+        ] + capabilities,
+    ])
+}
+
+/// The `automation_rules` payload muxad documents: engine state plus rows
+/// that are complete descriptions — filters and action payload verbatim,
+/// timing and guards with defaults already resolved.
+private func automationRulesFixture(pausedUntil: Any = NSNull()) -> [String: Any] {
+    [
+        "enabled": true,
+        "paused_until": pausedUntil,
+        "rules": [
+            [
+                "name": "resume-after-limit",
+                "on": "rate_limited",
+                "enabled": true,
+                "action": "send_prompt",
+
+                "agent": ["claude_code", "codex"],
+                "workspace": "callabo",
+                "work": "^CAL-",
+                "pane": "%42",
+                "host": "local",
+                "scope": ["five_hour"],
+
+                "text": "continue",
+                "submit": true,
+
+                "wait": "reset+2m",
+                "fallback": "20m",
+                "jitter": "30s",
+                "cooldown": "5m",
+                "max_per_hour": 2,
+                "only_if_still": "rate_limited",
+
+                "filters": "agent=claude_code,codex work=^CAL- scope=five_hour",
+                "fired_last_hour": 1,
+                "last_fired_at": "2026-09-03T13:42:11Z",
+            ],
+            [
+                "name": "tell-me",
+                "on": "waiting_input",
+                "enabled": true,
+                "action": "notify",
+                "message": "an agent needs you",
+                "submit": true,
+                "wait": "0s",
+                "fallback": "15m",
+                "jitter": "15s",
+                "cooldown": "2m",
+                "max_per_hour": 3,
+                "only_if_still": "waiting_input",
+                "filters": "any",
+                "fired_last_hour": 0,
+            ],
+            [
+                "name": "from-the-future",
+                "on": "context_exhausted",
+                "enabled": false,
+                "action": "compact",
+                "wait": "0s",
+                "fallback": "15m",
+                "jitter": "15s",
+                "cooldown": "2m",
+                "max_per_hour": 3,
+                "only_if_still": "whenever",
+                "filters": "any",
+                "fired_last_hour": 0,
+            ],
+        ],
+    ]
+}
+
+@Test
+func automationListDecodesRulesSwitchesAndUnknownVariants() async throws {
+    let handler: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        #expect(object["kind"] as? String == "automation_list")
+        return try JSONSerialization.data(withJSONObject: [
+            "ok": true,
+            "automation_rules": automationRulesFixture(pausedUntil: "2026-09-03T18:00:00Z"),
+        ])
+    }
+    let client = MuxaAutomationClient(socketPath: "/tmp/muxa-automation-test.sock", request: handler)
+    let snapshot = try await client.list()
+
+    #expect(snapshot.enabled)
+    #expect(snapshot.rules.map(\.name) == ["resume-after-limit", "tell-me", "from-the-future"])
+
+    let full = try #require(snapshot.rules.first)
+    #expect(full.on == .rateLimited)
+    #expect(full.action == .sendPrompt)
+    #expect(full.agent == ["claude_code", "codex"])
+    #expect(full.scope == ["five_hour"])
+    #expect(full.workspace == "callabo")
+    #expect(full.work == "^CAL-")
+    #expect(full.pane == "%42")
+    #expect(full.host == "local")
+    #expect(full.wait == "reset+2m")
+    #expect(full.fallback == "20m")
+    #expect(full.jitter == "30s")
+    #expect(full.text == "continue")
+    #expect(full.message == nil)
+    #expect(full.submit)
+    #expect(full.maxPerHour == 2)
+    #expect(full.cooldown == "5m")
+    #expect(full.onlyIfStill == .rateLimited)
+    // The derived columns the row carries for the table.
+    #expect(full.filters == "agent=claude_code,codex work=^CAL- scope=five_hour")
+    #expect(full.firedLastHour == 1)
+    #expect(MuxaAutomationTime.parse(full.lastFiredAt) != nil)
+
+    // A `notify` rule carries `message` and no `text`.
+    let notify = snapshot.rules[1]
+    #expect(notify.action == .notify)
+    #expect(notify.message == "an agent needs you")
+    #expect(notify.text == nil)
+    #expect(notify.firedLastHour == 0)
+    #expect(notify.lastFiredAt == nil)
+
+    // A newer daemon's event, action and condition survive the round trip
+    // instead of failing the whole list.
+    let future = snapshot.rules[2]
+    #expect(future.on == .other("context_exhausted"))
+    #expect(future.action == .other("compact"))
+    #expect(future.onlyIfStill == .other("whenever"))
+    #expect(future.on.rawValue == "context_exhausted")
+    #expect(!future.enabled)
+
+    // The pause is honoured until it expires, then the engine is live again.
+    #expect(snapshot.isPaused(now: Date(timeIntervalSince1970: 1_772_000_000)))
+    #expect(!snapshot.isPaused(now: Date(timeIntervalSince1970: 2_000_000_000)))
+    #expect(!MuxaAutomationSnapshot.empty.isPaused())
+}
+
+@Test
+func automationLogDecodesFiringsSkipsAndFailures() async throws {
+    let handler: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        #expect(object["kind"] as? String == "automation_log")
+        #expect(object["limit"] as? Int == 50)
+        return try JSONSerialization.data(withJSONObject: [
+            "ok": true,
+            "automation_log": [
+                [
+                    "rule": "resume-after-limit",
+                    "pane": "%42",
+                    "agent": "claude_code",
+                    "fired_at": "2026-09-03T17:02:11Z",
+                    "action": "send_prompt",
+                    "outcome": "fired",
+                    "detail": "continue",
+                    "episode": "error@2026-09-03T12:40:02Z",
+                ],
+                [
+                    "rule": "resume-after-limit",
+                    "pane": "%42",
+                    "agent": "claude_code",
+                    "fired_at": "2026-09-03T16:02:11.250Z",
+                    "action": "send_prompt",
+                    "outcome": "skipped",
+                    "detail": "condition_cleared",
+                ],
+                [
+                    "rule": "resume-after-limit",
+                    "pane": "%9",
+                    "agent": "codex",
+                    "fired_at": "2026-09-03T15:02:11Z",
+                    "action": "send_prompt",
+                    "outcome": "failed",
+                    "detail": "pane refused input",
+                ],
+            ],
+        ])
+    }
+    let client = MuxaAutomationClient(socketPath: "/tmp/muxa-automation-log.sock", request: handler)
+    let entries = try await client.log(limit: AutomationStore.logLimit)
+
+    #expect(entries.map(\.outcome) == [.fired, .skipped, .failed])
+    #expect(entries[0].action == .sendPrompt)
+    #expect(entries[0].episode == "error@2026-09-03T12:40:02Z")
+    // A firing's detail is the operator's own text, so it is not a reason…
+    #expect(entries[0].skipReason == nil)
+    #expect(entries[0].firedDate != nil)
+    // …a skip's is a token the pane can say in words. Fractional seconds parse.
+    #expect(entries[1].skipReason == "condition_cleared")
+    #expect(entries[1].firedDate != nil)
+    #expect(
+        automationSkipReasonTitle("condition_cleared") == "The agent recovered before it fired"
+    )
+    // An unknown token is shown as it arrived rather than hidden.
+    #expect(automationSkipReasonTitle("brand_new_reason") == "brand_new_reason")
+    // A failure is not a skip.
+    #expect(entries[2].skipReason == nil)
+    #expect(automationOutcomeTitle(.other("weird")) == "weird")
+}
+
+@Test
+func automationRequestBodiesMatchTheDocumentedWireShapes() throws {
+    #expect(MuxaAutomationClient.listRequest()["kind"] as? String == "automation_list")
+    #expect(MuxaAutomationClient.logRequest(limit: 25)["limit"] as? Int == 25)
+
+    let toggle = MuxaAutomationClient.setEnabledRequest(name: "resume-after-limit", enabled: false)
+    #expect(toggle["kind"] as? String == "automation_set_enabled")
+    #expect(toggle["name"] as? String == "resume-after-limit")
+    #expect(toggle["enabled"] as? Bool == false)
+
+    // Resuming sends an explicit null, not an absent key.
+    #expect(MuxaAutomationClient.pauseRequest(until: nil)["until"] is NSNull)
+    #expect(
+        MuxaAutomationClient.pauseRequest(until: "2026-09-04T09:00:00Z")["until"] as? String
+            == "2026-09-04T09:00:00Z"
+    )
+
+    let remove = MuxaAutomationClient.removeRuleRequest(name: "tell-me")
+    #expect(remove["kind"] as? String == "automation_remove_rule")
+    #expect(remove["name"] as? String == "tell-me")
+
+    let test = MuxaAutomationClient.testRequest(name: "resume-after-limit")
+    #expect(test["kind"] as? String == "automation_test")
+    #expect(test["name"] as? String == "resume-after-limit")
+
+    let request = MuxaAutomationClient.setRuleRequest(MuxaAutomationRule.sessionLimitRecommendation)
+    #expect(request["kind"] as? String == "automation_set_rule")
+    let rule = try #require(request["rule"] as? [String: Any])
+    #expect(rule["name"] as? String == "resume-after-limit")
+    #expect(rule["on"] as? String == "rate_limited")
+    #expect(rule["action"] as? String == "send_prompt")
+    #expect(rule["text"] as? String == "continue")
+    #expect(rule["submit"] as? Bool == true)
+    #expect(rule["wait"] as? String == "reset+2m")
+    #expect(rule["fallback"] as? String == "20m")
+    #expect(rule["max_per_hour"] as? Int == 2)
+    #expect(rule["cooldown"] as? String == "5m")
+    // No filters were set, so none are sent; nor is a condition the daemon
+    // would rather default for itself.
+    #expect(rule["agent"] == nil)
+    #expect(rule["scope"] == nil)
+    #expect(rule["workspace"] == nil)
+    #expect(rule["only_if_still"] == nil)
+    // The body has to survive JSONSerialization; a stray Swift type here
+    // would only fail at runtime against the real daemon.
+    #expect(JSONSerialization.isValidJSONObject(request))
+}
+
+@Test
+func automationWireObjectCarriesExactlyOneActionPayload() throws {
+    // The daemon refuses `message` on a send_prompt rule and `text`/`submit`
+    // on anything else, so the payload keys have to be exclusive.
+    var rule = MuxaAutomationRule(
+        name: "poke-me",
+        on: .waitingInput,
+        scope: ["five_hour"],
+        idleFor: "10m",
+        fallback: "20m",
+        action: .notify,
+        text: "continue",
+        message: "an agent needs you",
+        submit: false
+    )
+    var object = rule.wireObject
+    #expect(object["message"] as? String == "an agent needs you")
+    #expect(object["text"] == nil)
+    #expect(object["submit"] == nil)
+    // `scope` and `fallback` belong to the rate-limit event; `for` to
+    // `idle_for`.
+    #expect(object["scope"] == nil)
+    #expect(object["fallback"] == nil)
+    #expect(object["for"] == nil)
+
+    rule.action = .interrupt
+    object = rule.wireObject
+    #expect(object["text"] == nil)
+    #expect(object["message"] == nil)
+    #expect(object["submit"] == nil)
+
+    rule.on = .idleFor
+    object = rule.wireObject
+    #expect(object["for"] as? String == "10m")
+
+    rule.on = .rateLimited
+    rule.action = .sendPrompt
+    object = rule.wireObject
+    #expect(object["scope"] as? [String] == ["five_hour"])
+    #expect(object["fallback"] as? String == "20m")
+    #expect(object["text"] as? String == "continue")
+    #expect(object["submit"] as? Bool == false)
+    #expect(object["message"] == nil)
+    #expect(object["for"] == nil)
+}
+
+@Test
+func automationMutationsAndTestGoThroughTheDaemon() async throws {
+    let seen = SettingsPaneRecorder()
+    let handler: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        seen.record(payload)
+        if object["kind"] as? String == "automation_test" {
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true,
+                "automation_test": [
+                    "rule": "resume-after-limit",
+                    "enabled": true,
+                    "engine_enabled": true,
+                    "paused_until": NSNull(),
+                    "candidates": [
+                        [
+                            "pane": "%42",
+                            "agent_session_id": "sess-1",
+                            "agent": "claude_code",
+                            "state": "error",
+                            "decision": "fire",
+                            "fire_at": "2026-09-03T14:42:00Z",
+                            "detail": "continue",
+                        ],
+                        [
+                            "agent_session_id": "sess-2",
+                            "agent": "codex",
+                            "state": "working",
+                            "decision": "event_mismatch",
+                        ],
+                    ],
+                ],
+            ])
+        }
+        return try JSONSerialization.data(withJSONObject: [
+            "ok": true,
+            "automation_rules": automationRulesFixture(),
+        ])
+    }
+    let client = MuxaAutomationClient(socketPath: "/tmp/muxa-automation-mutate.sock", request: handler)
+
+    #expect(try await client.setEnabled(name: "tell-me", enabled: false).rules.count == 3)
+    #expect(try await client.pause(until: nil).pausedUntilText == nil)
+    #expect(try await client.setRule(.sessionLimitRecommendation).enabled)
+    #expect(try await client.removeRule(name: "tell-me").rules.count == 3)
+
+    let report = try await client.test(name: "resume-after-limit")
+    #expect(report.rule == "resume-after-limit")
+    #expect(report.engineEnabled)
+    #expect(report.candidates.count == 2)
+    #expect(report.firing.map(\.pane) == ["%42"])
+    #expect(report.candidates[0].wouldFire)
+    #expect(report.candidates[0].fireDate != nil)
+    #expect(!report.candidates[1].wouldFire)
+    #expect(report.candidates[1].pane == nil)
+    #expect(automationDecisionTitle("fire") == "Would fire")
+    #expect(automationDecisionTitle("event_mismatch") == "The agent is not in this rule's state")
+
+    #expect(seen.kinds == [
+        "automation_set_enabled", "automation_pause", "automation_set_rule",
+        "automation_remove_rule", "automation_test",
+    ])
+
+    // A reply without the payload is a protocol error, not an empty table.
+    let empty = MuxaAutomationClient(socketPath: "/tmp/muxa-automation-empty.sock") { _, _ in
+        try JSONSerialization.data(withJSONObject: ["ok": true])
+    }
+    await #expect(throws: (any Error).self) { _ = try await empty.list() }
+    await #expect(throws: (any Error).self) { _ = try await empty.test(name: "x") }
+
+    let refusing = MuxaAutomationClient(socketPath: "/tmp/muxa-automation-refuse.sock") { _, _ in
+        try JSONSerialization.data(withJSONObject: [
+            "ok": false,
+            "error": #"automation.rule "x": `action = "notify"` requires `message`"#,
+        ])
+    }
+    do {
+        _ = try await refusing.setRule(.sessionLimitRecommendation)
+        Issue.record("a rejected rule must throw")
+    } catch {
+        #expect(
+            error.localizedDescription
+                == #"automation.rule "x": `action = "notify"` requires `message`"#
+        )
+    }
+}
+
+@Test
+func automationRequestsNeedTheCapability() async throws {
+    let legacy: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        if object["kind"] as? String == "hello" {
+            return try settingsPaneHello(capabilities: [])
+        }
+        Issue.record("an old daemon must not receive automation requests")
+        return try JSONSerialization.data(withJSONObject: ["ok": false, "error": "unknown kind"])
+    }
+    let old = MuxaIPCClient(socketPath: "/tmp/muxa-automation-legacy.sock", request: legacy)
+    try await old.hello()
+    #expect(await !old.supports(MuxaIPCClient.automationCapability))
+    await #expect(throws: (any Error).self) { _ = try await old.automationList() }
+    await #expect(throws: (any Error).self) { _ = try await old.automationLog(limit: 10) }
+    await #expect(throws: (any Error).self) { _ = try await old.automationPause(until: nil) }
+    await #expect(throws: (any Error).self) { _ = try await old.automationTest(name: "x") }
+    await #expect(throws: (any Error).self) {
+        _ = try await old.automationSetEnabled(name: "x", enabled: true)
+    }
+    await #expect(throws: (any Error).self) {
+        _ = try await old.automationSetRule(.sessionLimitRecommendation)
+    }
+    await #expect(throws: (any Error).self) { _ = try await old.automationRemoveRule(name: "x") }
+    await #expect(throws: (any Error).self) { _ = try await old.readDaemonConfig() }
+    await #expect(throws: (any Error).self) {
+        _ = try await old.writeDaemonConfig(text: "", expectedText: nil)
+    }
+
+    let current = MuxaIPCClient(socketPath: "/tmp/muxa-automation-current.sock") { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        #expect(object["kind"] as? String == "hello")
+        return try settingsPaneHello(capabilities: ["automation_v1", "config_edit_v1"])
+    }
+    try await current.hello()
+    #expect(await current.supports(MuxaIPCClient.automationCapability))
+    #expect(await current.supports(MuxaIPCClient.configEditCapability))
+}
+
+@Test
+func automationDurationGrammarMatchesTheDaemons() {
+    #expect(MuxaAutomationDuration.parse("45s") == 45)
+    #expect(MuxaAutomationDuration.parse("5m") == 300)
+    #expect(MuxaAutomationDuration.parse("2h") == 7200)
+    #expect(MuxaAutomationDuration.parse("1d") == 86_400)
+    #expect(MuxaAutomationDuration.parse(" 90s ") == 90)
+    // A bare `0` is the one number that needs no unit.
+    #expect(MuxaAutomationDuration.parse("0") == 0)
+    // Any other bare number is refused on purpose: `20` reads as seconds to
+    // one operator and minutes to the next.
+    #expect(MuxaAutomationDuration.parse("20") == nil)
+    #expect(MuxaAutomationDuration.parse("2w") == nil)
+    #expect(MuxaAutomationDuration.parse("") == nil)
+    #expect(MuxaAutomationDuration.parse("m") == nil)
+    #expect(MuxaAutomationDuration.parse("2.5m") == nil)
+    #expect(MuxaAutomationDuration.parse("-5m") == nil)
+
+    // `wait` adds the reset anchor, in both directions.
+    #expect(MuxaAutomationDuration.parseWait("reset") == .afterReset(0))
+    #expect(MuxaAutomationDuration.parseWait("reset+2m") == .afterReset(120))
+    #expect(MuxaAutomationDuration.parseWait("reset-30s") == .afterReset(-30))
+    #expect(MuxaAutomationDuration.parseWait("reset + 2m") == .afterReset(120))
+    #expect(MuxaAutomationDuration.parseWait("10m") == .delay(600))
+    #expect(MuxaAutomationDuration.parseWait("0") == .delay(0))
+    #expect(MuxaAutomationDuration.parseWait("") == nil)
+    #expect(MuxaAutomationDuration.parseWait("reset+") == nil)
+    #expect(MuxaAutomationDuration.parseWait("reset2m") == nil)
+    #expect(MuxaAutomationDuration.parseWait("resets") == nil)
+    #expect(MuxaAutomationDuration.parseWait("reset+2m").map(\.needsResetTime) == true)
+    #expect(MuxaAutomationDuration.parseWait("10m").map(\.needsResetTime) == false)
+
+    // The compact spelling the daemon renders back, so a value round-trips
+    // through config.toml unchanged.
+    #expect(MuxaAutomationDuration.render(0) == "0s")
+    #expect(MuxaAutomationDuration.render(45) == "45s")
+    #expect(MuxaAutomationDuration.render(300) == "5m")
+    #expect(MuxaAutomationDuration.render(7200) == "2h")
+    #expect(MuxaAutomationDuration.render(86_400) == "1d")
+    #expect(MuxaAutomationDuration.render(90) == "90s")
+}
+
+@Test
+func automationRuleDraftValidationTable() {
+    let taken: Set<String> = ["resume-after-limit"]
+
+    // The shortcut fills in a rule that is ready to save as-is.
+    let recommended = MuxaAutomationRuleDraft.sessionLimitDraft
+    #expect(recommended.originalName == nil)
+    #expect(recommended.isReady(existingNames: []))
+    #expect(recommended.rule.name == "resume-after-limit")
+    #expect(recommended.rule.wait == "reset+2m")
+    #expect(recommended.rule.maxPerHour == 2)
+    #expect(recommended.timing == .afterReset(120))
+    #expect(recommended.fallbackSeconds == 1200)
+    #expect(!recommended.fallbackIsDefault)
+
+    // …but not over a rule that already has that name.
+    #expect(recommended.issues(existingNames: taken) == [.duplicateName])
+    // Editing that same rule keeps its own name.
+    var editing = recommended
+    editing.originalName = "resume-after-limit"
+    #expect(editing.isReady(existingNames: taken))
+
+    var draft = MuxaAutomationRuleDraft()
+    #expect(draft.issues(existingNames: []) == [.missingName, .missingText])
+
+    draft.name = "no spaces please"
+    #expect(draft.issues(existingNames: []).contains(.invalidName))
+    // Dots are part of the daemon's key grammar; 64 characters is its cap.
+    draft.name = "resume.after-limit_2"
+    draft.text = "continue"
+    #expect(draft.isReady(existingNames: []))
+    draft.name = String(repeating: "a", count: 65)
+    #expect(draft.issues(existingNames: []) == [.nameTooLong])
+    draft.name = String(repeating: "a", count: 64)
+    #expect(draft.isReady(existingNames: []))
+
+    // Each action carries its own payload, and only its own.
+    draft.text = "   "
+    #expect(draft.issues(existingNames: []) == [.missingText])
+    draft.text = "continue\u{1B}[31m"
+    #expect(draft.issues(existingNames: []) == [.textNotTerminalSafe])
+    draft.text = "line one\nline two\tindented"
+    #expect(draft.isReady(existingNames: []))
+    draft.text = String(repeating: "x", count: 4097)
+    #expect(draft.issues(existingNames: []) == [.textTooLong])
+    draft.text = "continue"
+
+    draft.action = .notify
+    #expect(draft.issues(existingNames: []) == [.missingMessage])
+    draft.message = "an agent needs you"
+    #expect(draft.isReady(existingNames: []))
+    draft.action = .interrupt
+    #expect(draft.isReady(existingNames: []))
+    draft.action = .sendPrompt
+
+    // Every duration field is optional, but must parse and stay under 24h.
+    draft.cooldown = "soon"
+    #expect(draft.issues(existingNames: []) == [.invalidDuration(.cooldown)])
+    draft.cooldown = "2d"
+    #expect(draft.issues(existingNames: []) == [.durationTooLong(.cooldown)])
+    draft.cooldown = ""
+    #expect(draft.isReady(existingNames: []))
+    draft.jitter = "30"
+    #expect(draft.issues(existingNames: []) == [.invalidDuration(.jitter)])
+    draft.jitter = ""
+    draft.wait = "reset+soon"
+    #expect(draft.issues(existingNames: []) == [.invalidWait])
+    draft.wait = "reset-30s"
+    #expect(draft.isReady(existingNames: []))
+    #expect(draft.timing == .afterReset(-30))
+    draft.fallback = "later"
+    #expect(draft.issues(existingNames: []) == [.invalidDuration(.fallback)])
+    draft.fallback = ""
+
+    // Only a rate limit carries a reset time, so a reset anchor needs it —
+    // and a fallback means nothing without one, so it is neither validated
+    // nor sent.
+    draft.event = .waitingInput
+    #expect(draft.issues(existingNames: []) == [.resetWaitNeedsRateLimit])
+    draft.fallback = "later"
+    #expect(draft.issues(existingNames: []) == [.resetWaitNeedsRateLimit])
+    draft.fallback = ""
+    draft.wait = "5m"
+    #expect(draft.isReady(existingNames: []))
+    #expect(draft.rule.fallback == nil)
+
+    // An empty `wait` is the event's own default, not "immediately".
+    draft.wait = ""
+    #expect(draft.timing == .delay(0))
+    draft.event = .rateLimited
+    #expect(draft.timing == .afterReset(0))
+    // …and an empty fallback or jitter previews muxad's default.
+    #expect(draft.fallbackIsDefault)
+    #expect(draft.fallbackSeconds == 900)
+    #expect(draft.jitterIsDefault)
+    #expect(draft.jitterSeconds == 15)
+
+    // `idle_for` is the one event that requires its own duration.
+    draft.event = .idleFor
+    #expect(draft.issues(existingNames: []) == [.missingDuration(.idleFor)])
+    draft.idleFor = "ages"
+    #expect(draft.issues(existingNames: []) == [.invalidDuration(.idleFor)])
+    draft.idleFor = "0"
+    #expect(draft.issues(existingNames: []) == [.zeroIdleDuration])
+    draft.idleFor = "10m"
+    #expect(draft.isReady(existingNames: []))
+
+    // Filters the daemon parses are checked here too, so the sheet says it
+    // rather than the round trip.
+    draft.work = "^CAL-("
+    #expect(draft.issues(existingNames: []) == [.invalidWorkRegex])
+    draft.work = "^CAL-"
+    draft.host = "elsewhere"
+    #expect(draft.issues(existingNames: []) == [.invalidHost])
+    draft.host = "tmux"
+    #expect(draft.isReady(existingNames: []))
+
+    draft.maxPerHour = 0
+    #expect(draft.issues(existingNames: []) == [.invalidMaxPerHour])
+    draft.maxPerHour = 61
+    #expect(draft.issues(existingNames: []) == [.invalidMaxPerHour])
+    draft.maxPerHour = 3
+    #expect(draft.isReady(existingNames: []))
+
+    // An empty cooldown falls back to the daemon's default rather than
+    // writing an empty string into the file.
+    #expect(draft.rule.cooldown == MuxaAutomationRule.defaultCooldown)
+}
+
+@Test
+func automationRuleDraftRoundTripsThroughEditing() {
+    let original = MuxaAutomationRule(
+        name: "tell-me",
+        on: .waitingInput,
+        enabled: false,
+        agent: ["codex", "claude_code"],
+        workspace: "callabo",
+        host: "tmux",
+        action: .notify,
+        message: "an agent needs you",
+        submit: false,
+        maxPerHour: 2,
+        cooldown: "5m",
+        onlyIfStill: .any
+    )
+    let draft = MuxaAutomationRuleDraft.draft(editing: original)
+    #expect(draft.originalName == "tell-me")
+    // The set is sorted on the way back out, so the wire order is stable.
+    #expect(draft.rule.agent == ["claude_code", "codex"])
+    #expect(draft.rule.enabled == false)
+    #expect(draft.rule.onlyIfStill == .any)
+    #expect(draft.rule.message == "an agent needs you")
+    #expect(draft.rule.text == nil)
+    #expect(draft.rule.host == "tmux")
+    #expect(draft.rule.wireObject["only_if_still"] as? String == "any")
+    #expect(draft.rule.wireObject["submit"] == nil)
+}
+
+@Test
+func automationRuleRendersAsAPastableTOMLBlock() {
+    #expect(MuxaAutomationRule.sessionLimitRecommendation.tomlSnippet == """
+    [[automation.rule]]
+    name = "resume-after-limit"
+    on = "rate_limited"
+    enabled = true
+    wait = "reset+2m"
+    fallback = "20m"
+    action = "send_prompt"
+    text = "continue"
+    submit = true
+    max_per_hour = 2
+    cooldown = "5m"
+
+    """)
+
+    // A notify rule writes `message`, never `text` or `submit`.
+    let notify = MuxaAutomationRule(
+        name: "tell-me",
+        on: .waitingInput,
+        action: .notify,
+        message: "an agent needs you",
+        onlyIfStill: .any
+    )
+    #expect(notify.tomlSnippet == """
+    [[automation.rule]]
+    name = "tell-me"
+    on = "waiting_input"
+    enabled = true
+    action = "notify"
+    message = "an agent needs you"
+    max_per_hour = 3
+    cooldown = "2m"
+    only_if_still = "any"
+
+    """)
+
+    // Quotes and newlines in prompt text stay valid TOML.
+    let awkward = MuxaAutomationRule(
+        name: "quote",
+        on: .error,
+        action: .sendPrompt,
+        text: "say \"hi\"\nthen stop"
+    )
+    #expect(awkward.tomlSnippet.contains(#"text = "say \"hi\"\nthen stop""#))
+}
+
+@Test
+func automationTextSafetyMatchesTheDaemonsRule() {
+    // Only printable text, tabs and newlines reach a live TUI.
+    #expect(MuxaAutomationRule.isTerminalSafe("continue"))
+    #expect(MuxaAutomationRule.isTerminalSafe("line one\nline two\ttabbed"))
+    #expect(MuxaAutomationRule.isTerminalSafe("계속 진행해 주세요"))
+    #expect(!MuxaAutomationRule.isTerminalSafe("continue\u{1B}[31m"))
+    #expect(!MuxaAutomationRule.isTerminalSafe("continue\u{07}"))
+    #expect(!MuxaAutomationRule.isTerminalSafe("continue\r"))
+}
+
+@Test
+func automationPauseUntilTomorrowIsTheNextMorning() throws {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = try #require(TimeZone(identifier: "Asia/Seoul"))
+    let now = try #require(calendar.date(from: DateComponents(
+        year: 2026, month: 9, day: 3, hour: 22, minute: 40
+    )))
+    let until = MuxaAutomationTime.tomorrowMorning(from: now, calendar: calendar)
+    let parts = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: until)
+    #expect(parts.year == 2026)
+    #expect(parts.month == 9)
+    #expect(parts.day == 4)
+    #expect(parts.hour == 9)
+    #expect(parts.minute == 0)
+
+    // The text the pause request carries round-trips back to the same moment.
+    let text = MuxaAutomationTime.text(until)
+    #expect(MuxaAutomationTime.parse(text) == until)
+    #expect(MuxaAutomationTime.parse(nil) == nil)
+    #expect(MuxaAutomationTime.parse("not a date") == nil)
+}
+
+@Test
+func configReadAndWriteCarryTheExpectedText() async throws {
+    let document = """
+    [notifier]
+    enabled = true
+
+    """
+    let seen = SettingsPaneRecorder()
+    let handler: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        seen.record(payload)
+        let text = object["kind"] as? String == "config_write"
+            ? (object["text"] as? String ?? "")
+            : document
+        return try JSONSerialization.data(withJSONObject: [
+            "ok": true,
+            "config": ["path": "/Users/june/.config/muxa/config.toml", "text": text, "exists": true],
+        ])
+    }
+    let client = MuxaConfigClient(socketPath: "/tmp/muxa-config-test.sock", request: handler)
+
+    let read = try await client.read()
+    #expect(read.path == "/Users/june/.config/muxa/config.toml")
+    #expect(read.text == document)
+    #expect(read.exists)
+    #expect(read.url?.lastPathComponent == "config.toml")
+
+    let updated = document + "\n[collaboration]\nenabled = true\n"
+    let saved = try await client.write(text: updated, expectedText: read.text)
+    #expect(saved.text == updated)
+
+    #expect(seen.kinds == ["config_read", "config_write"])
+    #expect(try seen.object(at: 1)["expected_text"] as? String == document)
+
+    // A first write to a file that does not exist yet sends an explicit
+    // null rather than pretending to know what is on disk.
+    #expect(MuxaConfigClient.writeRequest(text: "x", expectedText: nil)["expected_text"] is NSNull)
+
+    // The daemon's validation message reaches the pane verbatim.
+    let refusing = MuxaConfigClient(socketPath: "/tmp/muxa-config-refuse.sock") { _, _ in
+        try JSONSerialization.data(withJSONObject: [
+            "ok": false,
+            "error": "config.toml: unknown field `enabld` at line 2",
+        ])
+    }
+    do {
+        _ = try await refusing.write(text: "", expectedText: nil)
+        Issue.record("a rejected write must throw")
+    } catch {
+        #expect(
+            error.localizedDescription == "config.toml: unknown field `enabld` at line 2"
+        )
+    }
+
+    // A missing `config` object is a protocol error, not an empty document.
+    let silent = MuxaConfigClient(socketPath: "/tmp/muxa-config-silent.sock") { _, _ in
+        try JSONSerialization.data(withJSONObject: ["ok": true])
+    }
+    await #expect(throws: (any Error).self) { _ = try await silent.read() }
+}
+
+@Test
+func configReadHandlesAFileThatDoesNotExistYet() async throws {
+    let client = MuxaConfigClient(socketPath: "/tmp/muxa-config-absent.sock") { _, _ in
+        try JSONSerialization.data(withJSONObject: [
+            "ok": true,
+            "config": ["path": "/Users/june/.config/muxa/config.toml", "text": "", "exists": false],
+        ])
+    }
+    let document = try await client.read()
+    #expect(!document.exists)
+    #expect(document.text.isEmpty)
+    #expect(document.path.hasSuffix("config.toml"))
+    // The first write to a file that is not there has no text to match on.
+    #expect(MuxaConfigClient.writeRequest(text: "x", expectedText: nil)["expected_text"] is NSNull)
+}
+
+@Test
+func configWriteConflictCarriesTheFileAsItNowStands() async throws {
+    let onDisk = """
+    [notifier]
+    enabled = true
+    backend = "libnotify"
+
+    """
+    let conflicting = MuxaConfigClient(socketPath: "/tmp/muxa-config-conflict.sock") { _, _ in
+        try JSONSerialization.data(withJSONObject: [
+            "ok": false,
+            "error": "config.toml changed on disk since it was read; reload it and apply the edit again",
+            "config": [
+                "path": "/Users/june/.config/muxa/config.toml", "text": onDisk, "exists": true,
+            ],
+        ])
+    }
+    do {
+        _ = try await conflicting.write(text: "[notifier]\nenabled = false\n", expectedText: "")
+        Issue.record("a stale expected_text must throw")
+    } catch let conflict as MuxaConfigConflict {
+        // The message reaches the pane verbatim, and the document it came
+        // with is what a retry has to be built on.
+        #expect(
+            conflict.message
+                == "config.toml changed on disk since it was read; reload it and apply the edit again"
+        )
+        #expect(conflict.localizedDescription == conflict.message)
+        #expect(conflict.current.text == onDisk)
+        #expect(conflict.current.exists)
+        // Re-applying the same edit lands on top of what is on disk rather
+        // than reverting someone else's change.
+        let merged = MuxaTOMLPatcher.apply(
+            [MuxaTOMLEdit("notifier", "enabled", .bool(false))],
+            to: conflict.current.text
+        )
+        #expect(MuxaTOMLPatcher.bool(section: "notifier", key: "enabled", in: merged, default: true) == false)
+        #expect(MuxaTOMLPatcher.string(section: "notifier", key: "backend", in: merged) == "libnotify")
+    }
+
+    // A refusal that carries no document is a bad document, not a conflict:
+    // nothing changed, so there is nothing to rebase onto.
+    let invalid = MuxaConfigClient(socketPath: "/tmp/muxa-config-invalid.sock") { _, _ in
+        try JSONSerialization.data(withJSONObject: [
+            "ok": false,
+            "error": "config.toml: unknown field `enabld` at line 2",
+        ])
+    }
+    await #expect(throws: MuxaIPCError.self) {
+        _ = try await invalid.write(text: "", expectedText: "")
+    }
+}
+
+/// A config file with the shapes the patcher has to survive: comments,
+/// an array-of-tables, and a multi-line string that looks like a section.
+private let behaviourConfigFixture = """
+# muxa configuration
+[notifier]
+enabled = false   # quiet by default
+backend = "none"
+
+[ui]
+banner = \"\"\"
+[notifier]
+enabled = true
+\"\"\"
+
+[collaboration]
+enabled = true
+wake = "idle_only"
+
+[[automation.rule]]
+name = "resume-after-limit"
+enabled = true
+
+"""
+
+@Test
+func tomlPatcherRewritesOneKeyAndLeavesTheRestAlone() {
+    let text = behaviourConfigFixture
+
+    #expect(MuxaTOMLPatcher.bool(section: "notifier", key: "enabled", in: text, default: true) == false)
+    #expect(MuxaTOMLPatcher.string(section: "notifier", key: "backend", in: text) == "none")
+    #expect(MuxaTOMLPatcher.bool(section: "collaboration", key: "enabled", in: text, default: false))
+    #expect(MuxaTOMLPatcher.string(section: "collaboration", key: "wake", in: text) == "idle_only")
+    // Absent keys and absent sections read as absent, not as a wrong value.
+    #expect(MuxaTOMLPatcher.value(section: "collaboration", key: "scope", in: text) == nil)
+    #expect(MuxaTOMLPatcher.value(section: "automation", key: "enabled", in: text) == nil)
+
+    // Rewriting a value keeps the trailing comment and the whole document.
+    let flipped = MuxaTOMLPatcher.apply(
+        [MuxaTOMLEdit("notifier", "enabled", .bool(true))],
+        to: text
+    )
+    #expect(flipped.contains("enabled = true   # quiet by default"))
+    #expect(flipped.contains("backend = \"none\""))
+    // The `enabled` inside the multi-line string and the one in the
+    // array-of-tables are different keys and stay untouched: only the
+    // notifier line, which carries the comment, was rewritten.
+    #expect(flipped.contains("banner = \"\"\"\n[notifier]\nenabled = true\n\"\"\""))
+    #expect(flipped.contains("name = \"resume-after-limit\"\nenabled = true\n"))
+    #expect(flipped.components(separatedBy: "enabled = true").count == 5)
+    #expect(MuxaTOMLPatcher.bool(section: "notifier", key: "enabled", in: flipped, default: false))
+
+    // A missing key joins its table instead of splitting it.
+    let scoped = MuxaTOMLPatcher.apply(
+        [MuxaTOMLEdit("collaboration", "scope", .string("host"))],
+        to: text
+    )
+    #expect(scoped.contains("wake = \"idle_only\"\nscope = \"host\"\n\n[[automation.rule]]"))
+    #expect(MuxaTOMLPatcher.string(section: "collaboration", key: "scope", in: scoped) == "host")
+
+    // A missing table is appended whole, after the existing document.
+    let created = MuxaTOMLPatcher.apply(
+        [MuxaTOMLEdit("automation", "enabled", .bool(false))],
+        to: text
+    )
+    #expect(created.hasSuffix("[automation]\nenabled = false\n"))
+    #expect(MuxaTOMLPatcher.bool(section: "automation", key: "enabled", in: created, default: true) == false)
+    // …and writing into an empty document creates the table too.
+    #expect(
+        MuxaTOMLPatcher.apply([MuxaTOMLEdit("automation", "enabled", .bool(true))], to: "")
+            == "[automation]\nenabled = true\n"
+    )
+
+    // Several edits compose.
+    let both = MuxaTOMLPatcher.apply(
+        [
+            MuxaTOMLEdit("notifier", "backend", .string("libnotify")),
+            MuxaTOMLEdit("notifier", "enabled", .bool(true)),
+        ],
+        to: text
+    )
+    #expect(MuxaTOMLPatcher.string(section: "notifier", key: "backend", in: both) == "libnotify")
+    #expect(MuxaTOMLPatcher.bool(section: "notifier", key: "enabled", in: both, default: false))
+}
+
+@Test
+func tomlPatcherReadsTheScalarsTheFormsWrite() {
+    #expect(MuxaTOMLPatcher.scalar(from: " true ") == .bool(true))
+    #expect(MuxaTOMLPatcher.scalar(from: "false") == .bool(false))
+    #expect(MuxaTOMLPatcher.scalar(from: #""idle_only""#) == .string("idle_only"))
+    #expect(MuxaTOMLPatcher.scalar(from: "'idle_only'") == .string("idle_only"))
+    #expect(MuxaTOMLPatcher.scalar(from: #""a \"b\"""#) == .string("a \"b\""))
+    #expect(MuxaTOMLPatcher.scalar(from: "16_384") == .integer(16384))
+    #expect(MuxaTOMLPatcher.scalar(from: "[1, 2]") == nil)
+
+    #expect(MuxaTOMLScalar.bool(true).literal == "true")
+    #expect(MuxaTOMLScalar.integer(2).literal == "2")
+    #expect(MuxaTOMLScalar.string("a\"b").literal == #""a\"b""#)
+
+    // A quoted key spelling still matches, and an unrelated key does not.
+    #expect(MuxaTOMLPatcher.assignment(in: #""enabled" = true"#, key: "enabled")?.value == "true")
+    #expect(MuxaTOMLPatcher.assignment(in: "enabled_extra = true", key: "enabled") == nil)
+    // A `#` inside a string is not the start of a comment.
+    let assignment = MuxaTOMLPatcher.assignment(in: ##"text = "a # b"  # note"##, key: "text")
+    #expect(assignment?.value == #""a # b""#)
+    #expect(assignment?.comment == "  # note")
+}
+
+@Test
+func behaviourSettingsReadDefaultsAndWriteOnlyWhatChanged() {
+    // A document naming none of these keys reads back as the daemon runs.
+    let defaults = MuxaBehaviourSettings.read(from: "[ask]\nenabled = true\n")
+    #expect(defaults == MuxaBehaviourSettings.daemonDefaults)
+    #expect(!defaults.notifierEnabled)
+    #expect(defaults.notifierBackend == .none)
+    #expect(!defaults.collaborationEnabled)
+    #expect(defaults.collaborationWake == .idleOnly)
+    #expect(defaults.collaborationWakePayload == .operatorFull)
+    #expect(defaults.collaborationScope == .window)
+
+    let current = MuxaBehaviourSettings.read(from: behaviourConfigFixture)
+    #expect(!current.notifierEnabled)
+    #expect(current.collaborationEnabled)
+    #expect(current.collaborationWake == .idleOnly)
+
+    // Nothing changed means nothing written.
+    #expect(current.edits(against: current).isEmpty)
+
+    var wanted = current
+    wanted.notifierEnabled = true
+    wanted.notifierBackend = .libnotify
+    wanted.collaborationScope = .host
+    let edits = wanted.edits(against: current)
+    #expect(edits.count == 3)
+    #expect(edits.contains(MuxaTOMLEdit("notifier", "enabled", .bool(true))))
+    #expect(edits.contains(MuxaTOMLEdit("notifier", "backend", .string("libnotify"))))
+    // The daemon's key is `scope`, not `pane_scope`.
+    #expect(edits.contains(MuxaTOMLEdit("collaboration", "scope", .string("host"))))
+
+    let patched = MuxaTOMLPatcher.apply(edits, to: behaviourConfigFixture)
+    #expect(MuxaBehaviourSettings.read(from: patched) == wanted)
+    // Everything the form does not own is byte-identical.
+    #expect(patched.contains("name = \"resume-after-limit\""))
+    #expect(patched.contains("banner = \"\"\""))
+
+    // A value muxa does not know is left alone rather than silently reset.
+    let odd = MuxaBehaviourSettings.read(from: "[collaboration]\nwake = \"whenever\"\n")
+    #expect(odd.collaborationWake == .idleOnly)
+}

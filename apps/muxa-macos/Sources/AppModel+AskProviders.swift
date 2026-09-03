@@ -37,6 +37,66 @@ enum AskProviderDetection: Equatable, Sendable {
     }
 }
 
+/// A provider instance being composed in the Add Provider sheet.
+///
+/// The engine is closed (muxad drives it); everything else is the user's,
+/// including the id, which is the config key, the Ask agent name and the
+/// Keychain account. The rules below are pure so they can be unit-tested.
+struct AskProviderDraft: Equatable, Sendable {
+    var engine: AskProviderEngine = .anthropic
+    var id: String = ""
+    var title: String = ""
+    var model: String = ""
+    var executable: String = ""
+    var apiKey: String = ""
+
+    var trimmedID: String { id.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    /// A TOML bare key: ASCII letters, digits, `-` and `_`, at least one.
+    static func isValidIdentifier(_ id: String) -> Bool {
+        !id.isEmpty && id.allSatisfy { character in
+            character.isASCII
+                && (character.isLetter || character.isNumber || character == "_" || character == "-")
+        }
+    }
+
+    /// `base`, or `base-2`, `base-3`, … until it is free.
+    static func uniqueIdentifier(base: String, taken: Set<String>) -> String {
+        guard taken.contains(base) else { return base }
+        var suffix = 2
+        while taken.contains("\(base)-\(suffix)") {
+            suffix += 1
+        }
+        return "\(base)-\(suffix)"
+    }
+
+    /// Prefill for a freshly picked engine: its id, made unique against the
+    /// instances already in config.
+    static func suggestedIdentifier(for engine: AskProviderEngine, taken: Set<String>) -> String {
+        uniqueIdentifier(base: engine.rawValue, taken: taken)
+    }
+
+    /// Why the sheet cannot save yet, or nil when the draft is ready. The
+    /// daemon enforces the same rules; this keeps the button honest.
+    func validationMessage(taken: Set<String>) -> String? {
+        let id = trimmedID
+        if id.isEmpty {
+            return String(localized: "Give this provider an id.")
+        }
+        if !Self.isValidIdentifier(id) {
+            return String(localized: "Ids may contain letters, digits, hyphens and underscores only.")
+        }
+        if taken.contains(id) {
+            return String(localized: "A provider with this id is already configured.")
+        }
+        return nil
+    }
+
+    func isReady(taken: Set<String>) -> Bool {
+        validationMessage(taken: taken) == nil
+    }
+}
+
 /// Provider list, CLI detection and Keychain presence for the Ask surfaces.
 ///
 /// `@Published` state cannot live in an `AppModel` extension, so the views
@@ -49,6 +109,10 @@ final class AskProviderStore: ObservableObject {
     @Published private(set) var providers: [MuxaAskProvider] = MuxaAskProvider.builtIn
     /// True once `ask_providers` succeeded; false while on the built-in list.
     @Published private(set) var providersFromDaemon = false
+    /// True when the daemon's rows carry `engine`, i.e. it understands
+    /// `ask_provider_add` / `ask_provider_remove`. Older daemons keep the
+    /// read-only pane.
+    @Published private(set) var supportsInstances = false
     @Published private(set) var isLoading = false
     @Published private(set) var isConfiguring = false
     @Published private(set) var loadError: String?
@@ -79,17 +143,15 @@ final class AskProviderStore: ObservableObject {
         if await model.client.supports(MuxaIPCClient.askProvidersCapability) {
             do {
                 let listed = try await model.client.listAskProviders()
-                providers = listed.isEmpty ? Self.fallbackProviders(selected: model.askAgent) : listed
-                providersFromDaemon = !listed.isEmpty
+                adopt(listed, selected: model.askAgent)
             } catch {
                 loadError = error.localizedDescription
                 if !providersFromDaemon {
-                    providers = Self.fallbackProviders(selected: model.askAgent)
+                    adopt([], selected: model.askAgent)
                 }
             }
         } else {
-            providersFromDaemon = false
-            providers = Self.fallbackProviders(selected: model.askAgent)
+            adopt([], selected: model.askAgent)
         }
         refreshKeyPresence()
         await detectInstalledTools()
@@ -120,6 +182,22 @@ final class AskProviderStore: ObservableObject {
         }
     }
 
+    /// Takes a fresh `ask_providers` list, falling back to the built-ins
+    /// when the daemon sent none, and re-derives everything keyed off it.
+    private func adopt(_ listed: [MuxaAskProvider], selected: String) {
+        providers = listed.isEmpty ? Self.fallbackProviders(selected: selected) : listed
+        providersFromDaemon = !listed.isEmpty
+        supportsInstances = listed.contains(where: \.declaresEngine)
+        refreshKeyPresence()
+    }
+
+    /// Drops the status and error lines, so a sheet opened after a failed
+    /// attempt does not lead with the previous complaint.
+    func clearStatus() {
+        configureStatus = nil
+        configureError = nil
+    }
+
     func refreshKeyPresence() {
         keyPresence = Dictionary(
             providers.map { ($0.id, MuxaProviderCredentialStore.hasKey(for: $0)) },
@@ -131,6 +209,23 @@ final class AskProviderStore: ObservableObject {
 
     func provider(id: String) -> MuxaAskProvider? {
         providers.first { $0.id == id }
+    }
+
+    /// Instances the user has written into config: the ones that can be
+    /// renamed, re-keyed and removed.
+    var configuredProviders: [MuxaAskProvider] {
+        providers.filter(\.isConfigured)
+    }
+
+    /// Built-in engines no config entry covers yet; "Add" writes one of them
+    /// into config so it can carry its own title, model and key.
+    var detectedProviders: [MuxaAskProvider] {
+        providers.filter { !$0.isConfigured }
+    }
+
+    /// Ids already in config, which the Add sheet must not reuse.
+    var configuredIdentifiers: Set<String> {
+        Set(configuredProviders.map(\.id))
     }
 
     /// Display title for a provider id, even one this build never listed.
@@ -148,22 +243,34 @@ final class AskProviderStore: ObservableObject {
 
     func detection(for provider: MuxaAskProvider) -> AskProviderDetection {
         guard provider.kind == .cli, let executable = provider.cliExecutable else { return .notInstalled }
+        if let direct = Self.pathDetection(for: executable, isExecutable: {
+            FileManager.default.isExecutableFile(atPath: $0)
+        }) {
+            return direct
+        }
         return detections[executable] ?? .probing
     }
 
     func usability(_ provider: MuxaAskProvider) -> AskProviderUsability {
-        Self.usability(kind: provider.kind, detection: detection(for: provider), hasKey: hasKey(provider))
+        Self.usability(
+            kind: provider.kind,
+            detection: detection(for: provider),
+            hasKey: hasKey(provider),
+            credentialPresent: provider.credentialPresent
+        )
     }
 
     func isUsable(_ provider: MuxaAskProvider) -> Bool {
         usability(provider).isUsable
     }
 
+    /// Bare command names to probe on PATH. An instance that pins an
+    /// absolute `executable` is checked directly instead.
     private var cliExecutables: [String] {
         var seen = Set<String>()
         return providers.compactMap { provider in
             guard provider.kind == .cli, let executable = provider.cliExecutable,
-                  seen.insert(executable).inserted else { return nil }
+                  !executable.hasPrefix("/"), seen.insert(executable).inserted else { return nil }
             return executable
         }
     }
@@ -183,27 +290,36 @@ final class AskProviderStore: ObservableObject {
         keyPresence[provider.id] = MuxaProviderCredentialStore.hasKey(for: provider)
     }
 
-    /// Persists the model for an API provider through `ask_provider_configure`.
-    /// A blank model clears the override so the daemon's default applies.
-    func configure(provider: MuxaAskProvider, model modelName: String?, using appModel: AppModel) async -> Bool {
+    /// Persists `[ask.providers.<id>]` keys through `ask_provider_configure`.
+    /// `.keep` leaves a key untouched; a blank value clears the override so
+    /// the daemon's default applies.
+    func configure(
+        provider: MuxaAskProvider,
+        title: MuxaAskProviderFieldUpdate = .keep,
+        model: MuxaAskProviderFieldUpdate = .keep,
+        executable: MuxaAskProviderFieldUpdate = .keep,
+        using appModel: AppModel
+    ) async -> Bool {
         guard !isConfiguring else { return false }
         isConfiguring = true
         defer { isConfiguring = false }
         configureError = nil
         configureStatus = nil
-        let update = MuxaAskProviderFieldUpdate(modelName)
         do {
-            let updated = try await appModel.client.configureAskProvider(provider.id, model: update)
-            if !updated.isEmpty {
-                providers = updated
-                providersFromDaemon = true
-                refreshKeyPresence()
-            }
-            switch update {
+            let updated = try await appModel.client.configureAskProvider(
+                provider.id,
+                title: title,
+                model: model,
+                executable: executable
+            )
+            adopt(updated, selected: appModel.askAgent)
+            switch model {
             case .set(let value):
                 configureStatus = String(localized: "\(provider.title) will answer with \(value).")
-            case .clear, .keep:
+            case .clear:
                 configureStatus = String(localized: "\(provider.title) will use the daemon's default model.")
+            case .keep:
+                configureStatus = String(localized: "Updated \(provider.title).")
             }
             return true
         } catch {
@@ -212,18 +328,94 @@ final class AskProviderStore: ObservableObject {
         }
     }
 
+    /// Writes a new `[ask.providers.<id>]` entry and, when the sheet
+    /// collected one, saves its API key under the new id so instances that
+    /// share an engine keep separate keys.
+    func addProvider(
+        id providerID: String,
+        engine: String,
+        title: String? = nil,
+        model: String? = nil,
+        executable: String? = nil,
+        apiKey: String? = nil,
+        using appModel: AppModel
+    ) async -> Bool {
+        guard !isConfiguring else { return false }
+        isConfiguring = true
+        defer { isConfiguring = false }
+        configureError = nil
+        configureStatus = nil
+        do {
+            let updated = try await appModel.client.addAskProvider(
+                id: providerID,
+                engine: engine,
+                title: title,
+                model: model,
+                executable: executable
+            )
+            adopt(updated, selected: appModel.askAgent)
+            if let apiKey, !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let saved = provider(id: providerID) ?? MuxaAskProvider(rawValue: providerID) {
+                _ = saveKey(apiKey, for: saved, model: appModel)
+            }
+            configureStatus = String(localized: "Added \(provider(id: providerID)?.title ?? providerID).")
+            await detectInstalledTools()
+            await adoptDaemonSelection(using: appModel)
+            return true
+        } catch {
+            configureError = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Deletes the instance from config. `deletingKey` also drops its
+    /// Keychain entry, which nothing else would ever read again.
+    func removeProvider(
+        _ provider: MuxaAskProvider,
+        deletingKey: Bool,
+        using appModel: AppModel
+    ) async -> Bool {
+        guard !isConfiguring else { return false }
+        isConfiguring = true
+        defer { isConfiguring = false }
+        configureError = nil
+        configureStatus = nil
+        do {
+            let updated = try await appModel.client.removeAskProvider(provider.id)
+            if deletingKey {
+                appModel.removeProviderKey(provider)
+            }
+            adopt(updated, selected: appModel.askAgent)
+            configureStatus = String(localized: "Removed \(provider.title).")
+            await adoptDaemonSelection(using: appModel)
+            return true
+        } catch {
+            configureError = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Removing the default provider makes the daemon pick another one;
+    /// follow it so the pickers and the Ask bar agree with config.
+    private func adoptDaemonSelection(using appModel: AppModel) async {
+        guard let selected = providers.first(where: \.selected), selected.id != appModel.askAgent else { return }
+        await appModel.selectAskAgent(selected.id)
+    }
+
     // MARK: Pure rules (unit-tested)
 
-    /// The "usable" rule table: API providers need a saved key; CLI
-    /// providers need the executable on PATH.
+    /// The "usable" rule table: API providers need a key the app can hand
+    /// over, or one muxad already has in its environment
+    /// (`credential_present`); CLI providers need the executable on PATH.
     nonisolated static func usability(
         kind: MuxaAskProvider.Kind,
         detection: AskProviderDetection,
-        hasKey: Bool
+        hasKey: Bool,
+        credentialPresent: Bool = false
     ) -> AskProviderUsability {
         switch kind {
         case .api:
-            return hasKey ? .usable : .missingKey
+            return hasKey || credentialPresent ? .usable : .missingKey
         case .cli:
             switch detection {
             case .installed: return .usable
@@ -233,20 +425,27 @@ final class AskProviderStore: ObservableObject {
         }
     }
 
+    /// Detection for an instance that pins an absolute `executable`: the
+    /// file decides, PATH is irrelevant. Returns nil for a bare command
+    /// name, which is probed on PATH instead.
+    nonisolated static func pathDetection(
+        for executable: String,
+        isExecutable: (String) -> Bool
+    ) -> AskProviderDetection? {
+        guard executable.hasPrefix("/") else { return nil }
+        guard isExecutable(executable) else { return .notInstalled }
+        return .installed(
+            InstalledTool(
+                name: (executable as NSString).lastPathComponent,
+                path: executable,
+                version: nil
+            )
+        )
+    }
+
     /// The built-in list with `selected` mirroring the daemon's agent.
     nonisolated static func fallbackProviders(selected: String) -> [MuxaAskProvider] {
-        MuxaAskProvider.builtIn.map { provider in
-            MuxaAskProvider(
-                id: provider.id,
-                title: provider.title,
-                kind: provider.kind,
-                cliExecutable: provider.cliExecutable,
-                credentialEnv: provider.credentialEnv,
-                credentialRequired: provider.credentialRequired,
-                model: provider.model,
-                selected: provider.id == selected
-            )
-        }
+        MuxaAskProvider.builtIn.map { $0.selecting($0.id == selected) }
     }
 }
 

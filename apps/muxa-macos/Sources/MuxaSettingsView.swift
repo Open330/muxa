@@ -28,8 +28,11 @@ enum MuxaAppearance: String, CaseIterable, Identifiable {
 enum MuxaSettingsTab: String, CaseIterable, Identifiable {
     case general
     case providers
+    case automations
+    case behaviour
     case fleet
     case runtime
+    case advanced
 
     var id: Self { self }
 }
@@ -63,6 +66,18 @@ struct MuxaSettingsView: View {
                 .tabItem { Label("Providers", systemImage: "brain.head.profile") }
                 .tag(MuxaSettingsTab.providers.rawValue)
 
+            AutomationSettingsPane(
+                model: model,
+                store: AutomationStore.shared,
+                configStore: MuxaConfigStore.shared
+            )
+            .tabItem { Label("Automations", systemImage: "wand.and.rays") }
+            .tag(MuxaSettingsTab.automations.rawValue)
+
+            BehaviourSettingsPane(model: model, store: MuxaConfigStore.shared)
+                .tabItem { Label("Behaviour", systemImage: "bell.badge") }
+                .tag(MuxaSettingsTab.behaviour.rawValue)
+
             MuxaFleetSettingsPane(model: model)
                 .tabItem { Label("Hosts", systemImage: "server.rack") }
                 .tag(MuxaSettingsTab.fleet.rawValue)
@@ -70,8 +85,12 @@ struct MuxaSettingsView: View {
             MuxaRuntimeSettingsPane(model: model)
                 .tabItem { Label("Runtime", systemImage: "terminal") }
                 .tag(MuxaSettingsTab.runtime.rawValue)
+
+            AdvancedSettingsPane(model: model, store: MuxaConfigStore.shared)
+                .tabItem { Label("Advanced", systemImage: "gearshape.2") }
+                .tag(MuxaSettingsTab.advanced.rawValue)
         }
-        .frame(width: 700, height: 560)
+        .frame(width: 760, height: 640)
     }
 }
 
@@ -289,7 +308,6 @@ private struct MuxaFleetSettingsRow: View {
 
 private struct MuxaRuntimeSettingsPane: View {
     @ObservedObject var model: AppModel
-    @State private var confirmsReload = false
 
     private var localHost: MuxaFleetHost? {
         model.fleetHosts.first(where: \.local)
@@ -368,7 +386,7 @@ private struct MuxaRuntimeSettingsPane: View {
                     Button("Retry Connection") { model.retryConnection() }
                         .disabled(model.connectionState == .connecting)
                     Spacer()
-                    Button("Reload Bundled muxad…") { confirmsReload = true }
+                    MuxaDaemonReloadButton(model: model, title: "Reload Bundled muxad…")
                 }
                 Text("Reloading replaces the process on the owner-only socket. tmux sessions remain, but native PTY sessions end.")
                     .font(.caption)
@@ -377,12 +395,24 @@ private struct MuxaRuntimeSettingsPane: View {
         }
         .formStyle(.grouped)
         .padding(.top, 8)
-        .alert("Reload the bundled muxad?", isPresented: $confirmsReload) {
-            Button("Cancel", role: .cancel) {}
-            Button("Reload", role: .destructive) { model.replaceRunningDaemon() }
-        } message: {
-            Text("\(model.sessions.lazy.filter { !$0.exited }.count) active native shells will end. tmux sessions are not terminated.")
-        }
+    }
+}
+
+/// The Runtime tab's daemon reload, shared by every pane that has to say a
+/// change only applies after muxad restarts. One button, one confirmation.
+struct MuxaDaemonReloadButton: View {
+    @ObservedObject var model: AppModel
+    var title: LocalizedStringKey = "Reload muxad…"
+    @State private var confirmsReload = false
+
+    var body: some View {
+        Button(title) { confirmsReload = true }
+            .alert("Reload the bundled muxad?", isPresented: $confirmsReload) {
+                Button("Cancel", role: .cancel) {}
+                Button("Reload", role: .destructive) { model.replaceRunningDaemon() }
+            } message: {
+                Text("\(model.sessions.lazy.filter { !$0.exited }.count) active native shells will end. tmux sessions are not terminated.")
+            }
     }
 }
 

@@ -20,7 +20,12 @@
 //! captures every state change the user actually triggered.
 
 use crate::ask::{
-    AskConversation, AskCredential, AskEntry, AskProviderEdit, AskProviderInfo, AskStore,
+    AskConversation, AskCredential, AskEntry, AskProviderAdd, AskProviderEdit, AskProviderInfo,
+    AskStore,
+};
+use crate::automation::{
+    AutomationLedgerEntry, AutomationRule, AutomationRules, AutomationStore, AutomationSubject,
+    AutomationTestReport,
 };
 use crate::backend::{default_backend, HostKind, SharedBackend};
 use crate::collaboration::{
@@ -394,23 +399,109 @@ enum RequestBody {
     AskDelete {
         id: String,
     },
-    /// Every provider the daemon can ask — CLIs and APIs — with the
-    /// effective model and which one is selected.
+    /// Every provider instance the daemon can ask — the ones the operator
+    /// composed plus the built-ins — with the engine behind each, the
+    /// effective model, and which one is selected.
     AskProviders {},
+    /// Hand out the daemon's `config.toml` as text, so a client can edit
+    /// the sections that have no typed request of their own.
+    ConfigRead {},
+    /// Replace `config.toml` with `text`. Refused unless the document
+    /// parses and validates, and unless `expected_text` (when given) still
+    /// matches what is on disk, so two editors cannot clobber each other.
+    ConfigWrite {
+        text: String,
+        #[serde(default)]
+        expected_text: Option<String>,
+    },
     /// Edit `[ask.providers.<provider>]`. Each key is tri-state: absent
     /// from the request leaves it unchanged, `null` clears it, a string
-    /// sets it — so a client sends only what it changed. Answers with the
-    /// updated provider list.
+    /// sets it — so a client sends only what it changed. `engine` is not
+    /// among them: it is what the instance is, not a setting. Answers with
+    /// the updated provider list.
     AskProviderConfigure {
         provider: String,
         // `Option<Option<_>>` is the point: the outer level is "was the key
         // sent", the inner is "null or a value", and clients rely on both.
         #[allow(clippy::option_option)]
         #[serde(default, deserialize_with = "double_option")]
+        title: Option<Option<String>>,
+        #[allow(clippy::option_option)]
+        #[serde(default, deserialize_with = "double_option")]
         model: Option<Option<String>>,
         #[allow(clippy::option_option)]
         #[serde(default, deserialize_with = "double_option")]
         api_key_env: Option<Option<String>>,
+        #[allow(clippy::option_option)]
+        #[serde(default, deserialize_with = "double_option")]
+        executable: Option<Option<String>>,
+    },
+    /// Add an `[ask.providers.<id>]` instance driven by `engine`, so the
+    /// operator can keep two accounts of one provider side by side.
+    /// Answers with the updated provider list.
+    AskProviderAdd {
+        id: String,
+        engine: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+        /// The *name* of an environment variable holding the key, never
+        /// the key: this is written to config.toml.
+        #[serde(default)]
+        api_key_env: Option<String>,
+        /// Binary a CLI engine spawns for this instance.
+        #[serde(default)]
+        executable: Option<String>,
+    },
+    /// Remove an `[ask.providers.<id>]` instance. A built-in id keeps its
+    /// row and only loses its overrides. Answers with the updated list.
+    AskProviderRemove {
+        id: String,
+    },
+    // --- automation_v1 ---------------------------------------------------
+    /// Every `[[automation.rule]]` with its effective timing, its guards,
+    /// and how often it has fired lately, plus the engine's master switch
+    /// and pause. Answers in `automation_rules`.
+    AutomationList {},
+    /// The firing ledger, newest first. Answers in `automation_log`.
+    AutomationLog {
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Flip one rule's `enabled`, or the whole engine's when `name` is
+    /// absent or null. Takes effect immediately and is written back to
+    /// `config.toml`. Answers with the refreshed rule list.
+    AutomationSetEnabled {
+        #[serde(default)]
+        name: Option<String>,
+        enabled: bool,
+    },
+    /// Hold every rule until `until`, or lift the hold with `null`.
+    /// Answers with the refreshed rule list.
+    AutomationPause {
+        #[serde(default, with = "time::serde::rfc3339::option")]
+        until: Option<time::OffsetDateTime>,
+    },
+    /// Write one rule into `config.toml`, replacing the `[[automation.rule]]`
+    /// with the same `name` in place or appending it. Validated exactly as
+    /// the loader validates it, and the merged document has to read back as
+    /// a full `Config` before anything touches disk. Answers with the
+    /// refreshed rule list.
+    AutomationSetRule {
+        rule: AutomationRule,
+    },
+    /// Remove one rule. An unknown name is refused rather than silently
+    /// succeeding — an editor that lost sync should be told. Answers with
+    /// the refreshed rule list.
+    AutomationRemoveRule {
+        name: String,
+    },
+    /// Evaluate one rule against the live registry and report what it
+    /// *would* do, firing nothing and recording nothing. Answers in
+    /// `automation_test`.
+    AutomationTest {
+        name: String,
     },
     CollaborationInbox {
         origin: CollaborationOrigin,
@@ -604,11 +695,17 @@ const CAPABILITIES: &[&str] = &[
     "ask_subscribe",
     "ask_providers_v1",
     "work_compose_v1",
+    "automation_v1",
+    "config_edit_v1",
 ];
 
 /// Advertised only when the server has the controller required to come back
 /// after draining. A server without one refuses `restart`.
 const RESTART_CAPABILITY: &str = "restart";
+/// Refusal for the config requests when muxad was started without a config
+/// file path (`--config` absent and no default location).
+const NO_CONFIG_PATH: &str =
+    "this daemon has no config file path; start muxad with --config or a default config location";
 /// Advertised only by a server with a lifecycle controller, which can flush
 /// durable writers and remove the socket before exiting.
 const STOP_CAPABILITY: &str = "stop";
@@ -703,6 +800,8 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ask_providers: Option<Vec<AskProviderInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<crate::config_file::ConfigDocument>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fleet: Option<FleetSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fleet_result: Option<FleetCommandResult>,
@@ -718,6 +817,15 @@ pub struct Response {
     pub work_command: Option<WorkCommandOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_compose: Option<WorkComposeOutput>,
+    /// `automation_v1`: the rule list plus the engine's switch/pause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automation_rules: Option<AutomationRules>,
+    /// `automation_v1`: the firing ledger, newest first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automation_log: Option<Vec<AutomationLedgerEntry>>,
+    /// `automation_v1`: what one rule would do right now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automation_test: Option<AutomationTestReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -760,6 +868,7 @@ impl Response {
             ask_agent: None,
             ask_enabled: None,
             ask_providers: None,
+            config: None,
             fleet: None,
             fleet_result: None,
             pipeline_runs: None,
@@ -768,6 +877,9 @@ impl Response {
             work_operation: None,
             work_command: None,
             work_compose: None,
+            automation_rules: None,
+            automation_log: None,
+            automation_test: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -936,9 +1048,30 @@ impl Response {
         response.ask_conversation = Some(conversation);
         response
     }
+    fn with_config(document: crate::config_file::ConfigDocument) -> Self {
+        let mut response = Self::ok();
+        response.config = Some(document);
+        response
+    }
+
     fn with_ask_providers(providers: Vec<AskProviderInfo>) -> Self {
         let mut response = Self::ok();
         response.ask_providers = Some(providers);
+        response
+    }
+    fn with_automation_rules(rules: AutomationRules) -> Self {
+        let mut response = Self::ok();
+        response.automation_rules = Some(rules);
+        response
+    }
+    fn with_automation_log(entries: Vec<AutomationLedgerEntry>) -> Self {
+        let mut response = Self::ok();
+        response.automation_log = Some(entries);
+        response
+    }
+    fn with_automation_test(report: AutomationTestReport) -> Self {
+        let mut response = Self::ok();
+        response.automation_test = Some(report);
         response
     }
     fn hello(restart: Option<&RestartController>) -> Self {
@@ -1333,10 +1466,14 @@ pub struct Server {
     collaboration: Arc<CollaborationStore>,
     collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
+    automation: Arc<AutomationStore>,
     restart: Option<Arc<RestartController>>,
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
     work_up: Arc<WorkUpManager>,
+    /// The daemon's `config.toml`, for the requests that read and replace it
+    /// whole. `None` when muxad was started without one.
+    config_path: Option<PathBuf>,
     handler_limit: usize,
 }
 
@@ -1353,10 +1490,12 @@ impl Server {
             collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
             collaboration_audit: CollaborationAuditLog::in_memory(),
             ask: crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
+            automation: AutomationStore::in_memory(crate::automation::AutomationConfig::default()),
             restart: None,
             fleet: None,
             pipeline_runs: PipelineRunStore::in_memory(),
             work_up,
+            config_path: None,
             handler_limit: MAX_INFLIGHT_HANDLERS,
         }
     }
@@ -1387,6 +1526,14 @@ impl Server {
         self
     }
 
+    /// Thread the daemon's config file path in so `config_read` /
+    /// `config_write` can serve it. Without one, both refuse.
+    #[must_use]
+    pub fn with_config_path(mut self, path: Option<PathBuf>) -> Self {
+        self.config_path = path;
+        self
+    }
+
     #[must_use]
     pub fn with_sessions(mut self, sessions: SharedSessionBackend) -> Self {
         self.sessions = sessions;
@@ -1396,6 +1543,14 @@ impl Server {
     #[must_use]
     pub fn with_ask(mut self, ask: Arc<AskStore>) -> Self {
         self.ask = ask;
+        self
+    }
+
+    /// Install the live automation engine state. Optional so embedders and
+    /// tests keep an in-memory store with no rules — which does nothing.
+    #[must_use]
+    pub fn with_automation(mut self, automation: Arc<AutomationStore>) -> Self {
+        self.automation = automation;
         self
     }
 
@@ -1532,10 +1687,12 @@ impl Server {
                     let collaboration = self.collaboration.clone();
                     let collaboration_audit = self.collaboration_audit.clone();
                     let ask = self.ask.clone();
+                    let automation = self.automation.clone();
                     let restart = self.restart.clone();
                     let fleet = self.fleet.clone();
                     let pipeline_runs = self.pipeline_runs.clone();
                     let work_up = self.work_up.clone();
+                    let config_path = self.config_path.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
@@ -1549,10 +1706,12 @@ impl Server {
                                 collaboration,
                                 collaboration_audit,
                                 ask,
+                                automation,
                                 restart,
                                 fleet,
                                 pipeline_runs,
                                 work_up,
+                                config_path,
                             ))
                             .await
                         {
@@ -2079,6 +2238,27 @@ impl CollaborationTopology {
     }
 }
 
+/// Every live agent as a rule sees it: the registry row, plus the
+/// workspace/work stamped on its pane when a pane scan can supply them.
+/// The daemon's automation task builds subjects the same way, so
+/// `muxa automation test` and a real firing evaluate identical inputs.
+async fn automation_subjects(
+    store: &SharedStore,
+    backends: &[SharedBackend],
+) -> Vec<AutomationSubject> {
+    let agents = store.snapshot().await;
+    let listed = backends.to_vec();
+    let panes = tokio::task::spawn_blocking(move || {
+        listed
+            .iter()
+            .flat_map(|backend| backend.list_panes())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    crate::automation::subjects_from(&agents, &panes)
+}
+
 async fn collaboration_participants(
     store: &SharedStore,
     backends: &[SharedBackend],
@@ -2353,6 +2533,7 @@ async fn record_collaboration_audit(
         collaboration,
         collaboration_audit,
         ask,
+        automation,
         restart,
         fleet,
         pipeline_runs,
@@ -2369,10 +2550,12 @@ async fn handle(
     collaboration: Arc<CollaborationStore>,
     collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
+    automation: Arc<AutomationStore>,
     restart: Option<Arc<RestartController>>,
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
     work_up: Arc<WorkUpManager>,
+    config_path: Option<PathBuf>,
 ) -> Result<(), RuntimeError> {
     let mut collaboration_actor = observe_collaboration_actor(&stream);
     let (reader, mut writer) = stream.into_split();
@@ -3070,20 +3253,166 @@ async fn handle(
                     kind = "ask_delete";
                     Response::with_pruned(usize::from(ask.delete_history_entry(&id).await))
                 }
+                RequestBody::ConfigRead {} => {
+                    kind = "config_read";
+                    match config_path.as_deref() {
+                        Some(path) => match crate::config_file::read(path) {
+                            Ok(document) => Response::with_config(document),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        None => Response::err(NO_CONFIG_PATH.to_string()),
+                    }
+                }
+                RequestBody::ConfigWrite {
+                    text,
+                    expected_text,
+                } => {
+                    kind = "config_write";
+                    match config_path.as_deref() {
+                        Some(path) => {
+                            match crate::config_file::write(path, &text, expected_text.as_deref()) {
+                                Ok(document) => Response::with_config(document),
+                                Err(crate::config_file::ConfigFileError::Conflict { current }) => {
+                                    // Hand the current text back with the
+                                    // refusal so the editor can merge instead
+                                    // of asking for it again.
+                                    let mut response = Response::err(
+                                        crate::config_file::ConfigFileError::Conflict {
+                                            current: current.clone(),
+                                        }
+                                        .to_string(),
+                                    );
+                                    response.config = Some(crate::config_file::ConfigDocument {
+                                        path: path.to_path_buf(),
+                                        exists: true,
+                                        text: current,
+                                    });
+                                    response
+                                }
+                                Err(error) => Response::err(error.to_string()),
+                            }
+                        }
+                        None => Response::err(NO_CONFIG_PATH.to_string()),
+                    }
+                }
                 RequestBody::AskProviders {} => {
                     kind = "ask_providers";
                     Response::with_ask_providers(ask.providers().await)
                 }
                 RequestBody::AskProviderConfigure {
                     provider,
+                    title,
                     model,
                     api_key_env,
+                    executable,
                 } => {
                     kind = "ask_provider_configure";
-                    let edit = AskProviderEdit { model, api_key_env };
+                    let edit = AskProviderEdit {
+                        title,
+                        model,
+                        api_key_env,
+                        executable,
+                    };
                     match ask.configure_provider(&provider, edit).await {
                         Ok(providers) => Response::with_ask_providers(providers),
                         Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::AskProviderAdd {
+                    id,
+                    engine,
+                    title,
+                    model,
+                    api_key_env,
+                    executable,
+                } => {
+                    kind = "ask_provider_add";
+                    let request = AskProviderAdd {
+                        id,
+                        engine,
+                        title,
+                        model,
+                        api_key_env,
+                        executable,
+                    };
+                    match ask.add_provider(request).await {
+                        Ok(providers) => Response::with_ask_providers(providers),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::AskProviderRemove { id } => {
+                    kind = "ask_provider_remove";
+                    match ask.remove_provider(&id).await {
+                        Ok(providers) => Response::with_ask_providers(providers),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::AutomationList {} => {
+                    kind = "automation_list";
+                    Response::with_automation_rules(
+                        automation.views(time::OffsetDateTime::now_utc()).await,
+                    )
+                }
+                RequestBody::AutomationLog { limit } => {
+                    kind = "automation_log";
+                    Response::with_automation_log(
+                        automation
+                            .ledger()
+                            .recent(limit.unwrap_or(crate::automation::MAX_LEDGER_ENTRIES))
+                            .await,
+                    )
+                }
+                RequestBody::AutomationSetEnabled { name, enabled } => {
+                    kind = "automation_set_enabled";
+                    // No name is the master switch: the whole engine, rather
+                    // than one rule.
+                    let applied = match name.as_deref() {
+                        Some(name) => automation.set_rule_enabled(name, enabled).await,
+                        None => automation.set_master_enabled(enabled).await,
+                    };
+                    match applied {
+                        Ok(()) => Response::with_automation_rules(
+                            automation.views(time::OffsetDateTime::now_utc()).await,
+                        ),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                RequestBody::AutomationPause { until } => {
+                    kind = "automation_pause";
+                    match automation.set_paused_until(until).await {
+                        Ok(()) => Response::with_automation_rules(
+                            automation.views(time::OffsetDateTime::now_utc()).await,
+                        ),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                RequestBody::AutomationSetRule { rule } => {
+                    kind = "automation_set_rule";
+                    match automation.upsert_rule(rule).await {
+                        Ok(()) => Response::with_automation_rules(
+                            automation.views(time::OffsetDateTime::now_utc()).await,
+                        ),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                RequestBody::AutomationRemoveRule { name } => {
+                    kind = "automation_remove_rule";
+                    match automation.remove_rule(&name).await {
+                        Ok(()) => Response::with_automation_rules(
+                            automation.views(time::OffsetDateTime::now_utc()).await,
+                        ),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                RequestBody::AutomationTest { name } => {
+                    kind = "automation_test";
+                    let subjects = automation_subjects(&store, &backends).await;
+                    match automation
+                        .test_rule(&name, &subjects, time::OffsetDateTime::now_utc())
+                        .await
+                    {
+                        Ok(report) => Response::with_automation_test(report),
+                        Err(error) => Response::err(error),
                     }
                 }
                 RequestBody::CollaborationSend {
@@ -4505,8 +4834,38 @@ impl Client {
         Ok(removed == 1)
     }
 
-    /// Every provider the daemon can ask, with its effective model and
-    /// which one is selected. Requires the `ask_providers_v1` capability.
+    /// The daemon's `config.toml` as text. Requires the `config_edit_v1`
+    /// capability.
+    pub async fn config_read(&self) -> Result<crate::config_file::ConfigDocument, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "config_read" });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["config"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Replace `config.toml`. `expected` pins the text the caller edited, so
+    /// a concurrent change is refused instead of overwritten. The daemon
+    /// parses and validates before writing, so a refusal leaves the file
+    /// exactly as it was. Requires the `config_edit_v1` capability.
+    pub async fn config_write(
+        &self,
+        text: &str,
+        expected: Option<&str>,
+    ) -> Result<crate::config_file::ConfigDocument, RuntimeError> {
+        let mut req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "config_write",
+            "text": text,
+        });
+        if let Some(expected) = expected {
+            req["expected_text"] = serde_json::Value::String(expected.to_string());
+        }
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["config"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Every provider instance the daemon can ask, with the engine behind
+    /// it, its effective model, and which one is selected. Requires the
+    /// `ask_providers_v1` capability.
     pub async fn ask_providers(&self) -> Result<Vec<AskProviderInfo>, RuntimeError> {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_providers" });
         let resp = self.call_checked(&req).await?;
@@ -4514,29 +4873,181 @@ impl Client {
     }
 
     /// Edit `[ask.providers.<provider>]` and read back the updated provider
-    /// list. Each key is tri-state: `None` is not sent and leaves the key
-    /// unchanged, `Some(None)` sends `null` to clear it, `Some(Some(v))`
-    /// sets it. Requires the `ask_providers_v1` capability.
-    #[allow(clippy::option_option)]
+    /// list. Each key of `edit` is tri-state: `None` is not sent and leaves
+    /// the key unchanged, `Some(None)` sends `null` to clear it,
+    /// `Some(Some(v))` sets it. Requires the `ask_providers_v1` capability.
     pub async fn ask_provider_configure(
         &self,
         provider: &str,
-        model: Option<Option<&str>>,
-        api_key_env: Option<Option<&str>>,
+        edit: &AskProviderEdit,
     ) -> Result<Vec<AskProviderInfo>, RuntimeError> {
         let mut req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "ask_provider_configure",
             "provider": provider,
         });
-        if let Some(model) = model {
-            req["model"] = serde_json::json!(model);
-        }
-        if let Some(api_key_env) = api_key_env {
-            req["api_key_env"] = serde_json::json!(api_key_env);
+        for (key, change) in [
+            ("title", edit.title.as_ref()),
+            ("model", edit.model.as_ref()),
+            ("api_key_env", edit.api_key_env.as_ref()),
+            ("executable", edit.executable.as_ref()),
+        ] {
+            if let Some(change) = change {
+                req[key] = serde_json::json!(change);
+            }
         }
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["ask_providers"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Add an `[ask.providers.<id>]` instance and read back the updated
+    /// list. Requires the `ask_providers_v1` capability.
+    pub async fn ask_provider_add(
+        &self,
+        request: &AskProviderAdd,
+    ) -> Result<Vec<AskProviderInfo>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_provider_add",
+            "id": request.id,
+            "engine": request.engine,
+            "title": request.title,
+            "model": request.model,
+            "api_key_env": request.api_key_env,
+            "executable": request.executable,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_providers"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Remove an `[ask.providers.<id>]` instance and read back the updated
+    /// list. Requires the `ask_providers_v1` capability.
+    pub async fn ask_provider_remove(
+        &self,
+        id: &str,
+    ) -> Result<Vec<AskProviderInfo>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_provider_remove",
+            "id": id,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_providers"].clone()).map_err(RuntimeError::Json)
+    }
+
+    // --- automation_v1 -----------------------------------------------------
+
+    /// Every automation rule with its effective timing, guards, and recent
+    /// activity, plus the engine's master switch and pause.
+    pub async fn automation_list(&self) -> Result<AutomationRules, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "automation_list" });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_rules"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// The firing ledger, newest first.
+    pub async fn automation_log(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<AutomationLedgerEntry>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "automation_log",
+            "limit": limit,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_log"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Flip one rule's `enabled`, live and in `config.toml`.
+    pub async fn automation_set_enabled(
+        &self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<AutomationRules, RuntimeError> {
+        self.automation_set_enabled_target(Some(name), enabled)
+            .await
+    }
+
+    /// `None` flips the engine's own `[automation] enabled`; a name flips
+    /// that rule.
+    pub async fn automation_set_enabled_target(
+        &self,
+        name: Option<&str>,
+        enabled: bool,
+    ) -> Result<AutomationRules, RuntimeError> {
+        let mut req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "automation_set_enabled",
+            "enabled": enabled,
+        });
+        if let Some(name) = name {
+            req["name"] = serde_json::Value::String(name.to_string());
+        }
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_rules"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Hold every rule until `until`; `None` lifts the hold.
+    pub async fn automation_pause(
+        &self,
+        until: Option<time::OffsetDateTime>,
+    ) -> Result<AutomationRules, RuntimeError> {
+        let until = until
+            .map(|until| until.format(&time::format_description::well_known::Rfc3339))
+            .transpose()
+            .map_err(|error| {
+                RuntimeError::Json(serde::de::Error::custom(format!(
+                    "formatting pause deadline: {error}"
+                )))
+            })?;
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "automation_pause",
+            "until": until,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_rules"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Upsert one rule into `config.toml` — replacing the one with the same
+    /// name in place, appending otherwise.
+    pub async fn automation_set_rule(
+        &self,
+        rule: &AutomationRule,
+    ) -> Result<AutomationRules, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "automation_set_rule",
+            "rule": rule,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_rules"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Remove one rule. An unknown name is an error.
+    pub async fn automation_remove_rule(
+        &self,
+        name: &str,
+    ) -> Result<AutomationRules, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "automation_remove_rule",
+            "name": name,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_rules"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Evaluate one rule against the live registry without firing it.
+    pub async fn automation_test(&self, name: &str) -> Result<AutomationTestReport, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "automation_test",
+            "name": name,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_test"].clone()).map_err(RuntimeError::Json)
     }
 
     /// Draft one pipeline from a description with a read-only headless
@@ -6351,10 +6862,12 @@ mod tests {
             CollaborationStore::in_memory(CollaborationOptions::default()),
             CollaborationAuditLog::in_memory(),
             crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
+            AutomationStore::in_memory(crate::automation::AutomationConfig::default()),
             None,
             None,
             PipelineRunStore::in_memory(),
             WorkUpManager::new(PathBuf::from("/tmp/muxa-disconnect-test.sock")),
+            None,
         ));
 
         let req = serde_json::json!({
@@ -6614,6 +7127,174 @@ mod tests {
     }
 
     #[test]
+    fn automation_requests_deserialize_from_their_documented_shapes() {
+        let list: RequestBody =
+            serde_json::from_value(serde_json::json!({"kind": "automation_list"})).unwrap();
+        assert!(matches!(list, RequestBody::AutomationList {}));
+
+        let log: RequestBody =
+            serde_json::from_value(serde_json::json!({"kind": "automation_log", "limit": 20}))
+                .unwrap();
+        assert!(matches!(
+            log,
+            RequestBody::AutomationLog { limit: Some(20) }
+        ));
+        // `limit` is optional; absent means "the whole retained ledger".
+        let log: RequestBody =
+            serde_json::from_value(serde_json::json!({"kind": "automation_log"})).unwrap();
+        assert!(matches!(log, RequestBody::AutomationLog { limit: None }));
+
+        let toggle: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "automation_set_enabled",
+            "name": "resume-after-limit",
+            "enabled": false,
+        }))
+        .unwrap();
+        match toggle {
+            RequestBody::AutomationSetEnabled { name, enabled } => {
+                assert_eq!(name.as_deref(), Some("resume-after-limit"));
+                assert!(!enabled);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let pause: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "automation_pause",
+            "until": "2026-09-03T13:00:00Z",
+        }))
+        .unwrap();
+        match pause {
+            RequestBody::AutomationPause { until } => assert_eq!(
+                until,
+                Some(time::macros::datetime!(2026-09-03 13:00:00 UTC))
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
+        // `null` is how a client lifts the hold.
+        let resume: RequestBody =
+            serde_json::from_value(serde_json::json!({"kind": "automation_pause", "until": null}))
+                .unwrap();
+        assert!(matches!(
+            resume,
+            RequestBody::AutomationPause { until: None }
+        ));
+
+        let set: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "automation_set_rule",
+            "rule": {
+                "name": "resume-after-limit",
+                "on": "rate_limited",
+                "action": "send_prompt",
+                "text": "continue",
+                "wait": "reset+2m",
+                "agent": ["claude", "codex"],
+            },
+        }))
+        .unwrap();
+        match set {
+            RequestBody::AutomationSetRule { rule } => {
+                assert_eq!(rule.name, "resume-after-limit");
+                assert_eq!(rule.text.as_deref(), Some("continue"));
+                assert_eq!(rule.agent.len(), 2);
+                rule.validate().unwrap();
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let remove: RequestBody = serde_json::from_value(
+            serde_json::json!({"kind": "automation_remove_rule", "name": "resume-after-limit"}),
+        )
+        .unwrap();
+        assert!(
+            matches!(remove, RequestBody::AutomationRemoveRule { name } if name == "resume-after-limit")
+        );
+
+        let test: RequestBody = serde_json::from_value(
+            serde_json::json!({"kind": "automation_test", "name": "resume-after-limit"}),
+        )
+        .unwrap();
+        assert!(
+            matches!(test, RequestBody::AutomationTest { name } if name == "resume-after-limit")
+        );
+
+        // Clients feature-gate on the tag, not the protocol number.
+        assert!(CAPABILITIES.contains(&"automation_v1"));
+    }
+
+    #[tokio::test]
+    async fn automation_rules_can_be_written_toggled_and_removed_over_ipc() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-automation.sock");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "# muxa\n").unwrap();
+        let automation = crate::automation::AutomationStore::new(
+            crate::automation::AutomationConfig::default(),
+            Some(config_path.clone()),
+            crate::automation::AutomationLedger::in_memory(),
+        );
+        let server = Server::new(sock.clone(), Store::shared()).with_automation(automation);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let client = Client::new(sock);
+
+        // A fresh install ships no rules.
+        let rules = client.automation_list().await.unwrap();
+        assert!(rules.enabled);
+        assert!(rules.rules.is_empty());
+
+        let mut rule = crate::automation::AutomationRule::new(
+            "resume-after-limit",
+            crate::automation::AutomationEvent::RateLimited,
+            crate::automation::AutomationAction::SendPrompt,
+        );
+        rule.text = Some("continue".into());
+        rule.wait = Some(crate::automation::parse_wait("reset+2m").unwrap());
+        let rules = client.automation_set_rule(&rule).await.unwrap();
+        assert_eq!(rules.rules.len(), 1);
+        assert_eq!(rules.rules[0].wait, "reset+2m");
+        assert!(std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("[[automation.rule]]"));
+
+        // Same name upserts rather than duplicating.
+        rule.text = Some("keep going".into());
+        let rules = client.automation_set_rule(&rule).await.unwrap();
+        assert_eq!(rules.rules.len(), 1);
+        assert_eq!(rules.rules[0].text.as_deref(), Some("keep going"));
+
+        let rules = client
+            .automation_set_enabled("resume-after-limit", false)
+            .await
+            .unwrap();
+        assert!(!rules.rules[0].enabled);
+
+        let until = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let rules = client.automation_pause(Some(until)).await.unwrap();
+        assert!(rules.paused_until.is_some());
+        let rules = client.automation_pause(None).await.unwrap();
+        assert!(rules.paused_until.is_none());
+
+        // Nothing has fired, so the ledger is empty and `test` finds no
+        // capped agent in an empty registry.
+        assert!(client.automation_log(Some(10)).await.unwrap().is_empty());
+        let report = client.automation_test("resume-after-limit").await.unwrap();
+        assert!(report.candidates.is_empty());
+
+        let rules = client
+            .automation_remove_rule("resume-after-limit")
+            .await
+            .unwrap();
+        assert!(rules.rules.is_empty());
+        // An unknown name is refused rather than silently succeeding.
+        assert!(client.automation_remove_rule("nope").await.is_err());
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[allow(clippy::too_many_lines)] // one documented wire shape per block
+    #[test]
     fn provider_and_compose_requests_deserialize_from_their_documented_shapes() {
         let providers: RequestBody =
             serde_json::from_value(serde_json::json!({"kind": "ask_providers"})).unwrap();
@@ -6624,18 +7305,24 @@ mod tests {
             "provider": "anthropic",
             "model": "claude-opus-5",
             "api_key_env": null,
+            "title": "Anthropic (work)",
+            "executable": null,
         }))
         .unwrap();
         match configure {
             RequestBody::AskProviderConfigure {
                 provider,
+                title,
                 model,
                 api_key_env,
+                executable,
             } => {
                 assert_eq!(provider, "anthropic");
                 // A string sets, `null` clears…
                 assert_eq!(model, Some(Some("claude-opus-5".to_string())));
+                assert_eq!(title, Some(Some("Anthropic (work)".to_string())));
                 assert_eq!(api_key_env, Some(None));
+                assert_eq!(executable, Some(None));
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -6650,10 +7337,67 @@ mod tests {
             partial,
             RequestBody::AskProviderConfigure {
                 model: Some(Some(_)),
+                title: None,
                 api_key_env: None,
+                executable: None,
                 ..
             }
         ));
+
+        // `add` carries the engine and whatever settings came with it…
+        let add: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "ask_provider_add",
+            "id": "anthropic-work",
+            "engine": "anthropic",
+            "title": "Anthropic (work)",
+            "api_key_env": "WORK_ANTHROPIC_KEY",
+        }))
+        .unwrap();
+        match add {
+            RequestBody::AskProviderAdd {
+                id,
+                engine,
+                title,
+                model,
+                api_key_env,
+                executable,
+            } => {
+                assert_eq!(id, "anthropic-work");
+                assert_eq!(engine, "anthropic");
+                assert_eq!(title.as_deref(), Some("Anthropic (work)"));
+                assert_eq!(model, None);
+                assert_eq!(api_key_env.as_deref(), Some("WORK_ANTHROPIC_KEY"));
+                assert_eq!(executable, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // …with only the id and engine required.
+        let minimal: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "ask_provider_add",
+            "id": "personal",
+            "engine": "openai",
+        }))
+        .unwrap();
+        assert!(matches!(
+            minimal,
+            RequestBody::AskProviderAdd {
+                title: None,
+                model: None,
+                api_key_env: None,
+                executable: None,
+                ..
+            }
+        ));
+
+        let remove: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "ask_provider_remove",
+            "id": "anthropic-work",
+        }))
+        .unwrap();
+        match remove {
+            RequestBody::AskProviderRemove { id } => assert_eq!(id, "anthropic-work"),
+            other => panic!("unexpected {other:?}"),
+        }
 
         let compose: RequestBody = serde_json::from_value(serde_json::json!({
             "kind": "work_compose",
@@ -6727,8 +7471,119 @@ mod tests {
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["ask_providers"][0]["id"], "claude");
         assert_eq!(value["ask_providers"][0]["kind"], "cli");
+        assert_eq!(value["ask_providers"][0]["engine"], "claude");
+        assert_eq!(value["ask_providers"][0]["builtin"], true);
+        assert_eq!(value["ask_providers"][0]["configured"], false);
         assert_eq!(value["ask_providers"][3]["kind"], "api");
         assert!(value["ask_providers"][3]["credential_present"].is_boolean());
+    }
+
+    #[tokio::test]
+    async fn automation_set_enabled_without_a_name_flips_the_engine() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-automation-master.sock");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[automation]\nenabled = true\n").unwrap();
+        let automation = crate::automation::AutomationStore::new(
+            crate::automation::AutomationConfig::default(),
+            Some(config_path.clone()),
+            crate::automation::AutomationLedger::in_memory(),
+        );
+        let server = Server::new(sock.clone(), Store::shared()).with_automation(automation);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let client = Client::new(sock);
+
+        client
+            .automation_set_enabled_target(None, false)
+            .await
+            .unwrap();
+
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(text.contains("enabled = false"), "{text}");
+
+        // A named target still means that one rule, and an unknown name is
+        // refused rather than silently treated as the engine.
+        let error = client
+            .automation_set_enabled("no-such-rule", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no automation rule"), "{error}");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_read_and_write_serve_the_daemons_config_file() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-config.sock");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[ask]\nenabled = true\n").unwrap();
+        let server =
+            Server::new(sock.clone(), Store::shared()).with_config_path(Some(config_path.clone()));
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let client = Client::new(sock);
+
+        let document = client.config_read().await.unwrap();
+        assert!(document.exists);
+        assert_eq!(document.text, "[ask]\nenabled = true\n");
+        assert_eq!(document.path, config_path);
+
+        let written = client
+            .config_write("[ask]\nenabled = false\n", Some(&document.text))
+            .await
+            .unwrap();
+        assert_eq!(written.text, "[ask]\nenabled = false\n");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "[ask]\nenabled = false\n"
+        );
+
+        // A document that would not load is refused, and the file it would
+        // have replaced is untouched.
+        let error = client
+            .config_write("[ask]\nnot_a_key = 1\n", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not written"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "[ask]\nenabled = false\n"
+        );
+
+        // A stale editor is refused rather than allowed to clobber.
+        let stale = client
+            .config_write("[ui]\n", Some("[ask]\nenabled = true\n"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(stale.contains("changed on disk"), "{stale}");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_requests_refuse_a_daemon_without_a_config_path() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-config-none.sock");
+        let server = Server::new(sock.clone(), Store::shared());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let client = Client::new(sock);
+
+        let error = client.config_read().await.unwrap_err().to_string();
+        assert!(error.contains("no config file path"), "{error}");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -6788,8 +7643,15 @@ mod tests {
         )
         .await;
         assert_eq!(resp["ok"], true, "{resp}");
-        let anthropic = &resp["ask_providers"][3];
+        // A configured id leads the list; the untouched built-ins follow.
+        let anthropic = &resp["ask_providers"][0];
         assert_eq!(anthropic["id"], "anthropic");
+        assert_eq!(anthropic["engine"], "anthropic");
+        assert_eq!(anthropic["builtin"], true);
+        assert_eq!(
+            anthropic["configured"], true,
+            "the write gave the built-in a table"
+        );
         assert_eq!(anthropic["model"], "claude-opus-5");
         let text = std::fs::read_to_string(&config_path).unwrap();
         assert!(text.starts_with("[watch]\nspinner = false\n"), "{text}");
@@ -6802,10 +7664,20 @@ mod tests {
         // Sending only `model` leaves `api_key_env` as it was.
         let client = Client::new(sock.clone());
         let providers = client
-            .ask_provider_configure("anthropic", Some(None), None)
+            .ask_provider_configure(
+                "anthropic",
+                &AskProviderEdit {
+                    model: Some(None),
+                    ..AskProviderEdit::default()
+                },
+            )
             .await
             .unwrap();
-        assert_eq!(providers[3].model.as_deref(), Some("claude-sonnet-5"));
+        let anthropic = providers
+            .iter()
+            .find(|provider| provider.id == "anthropic")
+            .unwrap();
+        assert_eq!(anthropic.model.as_deref(), Some("claude-sonnet-5"));
         let text = std::fs::read_to_string(&config_path).unwrap();
         assert!(!text.contains("model ="), "{text}");
         assert!(
@@ -6814,14 +7686,20 @@ mod tests {
         );
         // An empty edit is a no-op that still answers with the list.
         let providers = client
-            .ask_provider_configure("anthropic", None, None)
+            .ask_provider_configure("anthropic", &AskProviderEdit::default())
             .await
             .unwrap();
         assert_eq!(providers.len(), crate::ask::supported_agents().len());
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), text);
         // `null` clears the last key and the table goes with it.
         client
-            .ask_provider_configure("anthropic", None, Some(None))
+            .ask_provider_configure(
+                "anthropic",
+                &AskProviderEdit {
+                    api_key_env: Some(None),
+                    ..AskProviderEdit::default()
+                },
+            )
             .await
             .unwrap();
         assert!(!std::fs::read_to_string(&config_path)
@@ -6829,11 +7707,129 @@ mod tests {
             .contains("providers"));
 
         let refused = client
-            .ask_provider_configure("bard", Some(Some("x")), None)
+            .ask_provider_configure(
+                "bard",
+                &AskProviderEdit {
+                    model: Some(Some("x".into())),
+                    ..AskProviderEdit::default()
+                },
+            )
             .await
             .unwrap_err()
             .to_string();
-        assert!(refused.contains("is not supported"), "{refused}");
+        assert!(refused.contains("is not configured"), "{refused}");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[allow(clippy::too_many_lines)] // one add/refuse/remove lifecycle, in order
+    #[tokio::test]
+    async fn ask_provider_add_and_remove_compose_the_list_over_the_wire() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-compose.sock");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[ask]\nenabled = true\n").unwrap();
+        let ask = crate::ask::AskStore::in_memory(crate::ask::AskOptions {
+            config_path: Some(config_path.clone()),
+            ..crate::ask::AskOptions::default()
+        });
+        let server = Server::new(sock.clone(), Store::shared()).with_ask(ask);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let client = Client::new(sock.clone());
+
+        // Two instances of one engine, each with its own key variable.
+        for (id, env) in [
+            ("anthropic-work", "WORK_ANTHROPIC_KEY"),
+            ("anthropic-personal", "HOME_ANTHROPIC_KEY"),
+        ] {
+            let providers = client
+                .ask_provider_add(&crate::ask::AskProviderAdd {
+                    id: id.into(),
+                    engine: "anthropic".into(),
+                    api_key_env: Some(env.into()),
+                    ..crate::ask::AskProviderAdd::default()
+                })
+                .await
+                .unwrap();
+            let added = providers.iter().find(|info| info.id == id).unwrap();
+            assert_eq!(added.engine, "anthropic");
+            assert_eq!(added.kind, crate::ask::AskProviderKind::Api);
+            assert!(!added.builtin && added.configured);
+        }
+        let providers = client.ask_providers().await.unwrap();
+        let ids: Vec<&str> = providers.iter().map(|info| info.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "anthropic-personal",
+                "anthropic-work",
+                "claude",
+                "codex",
+                "gemini",
+                "anthropic",
+                "openai",
+            ],
+            "composed instances lead, then the built-ins they do not cover"
+        );
+        // And they are selectable by their own ids.
+        assert_eq!(
+            client.ask_agent(Some("anthropic-work")).await.unwrap(),
+            "anthropic-work"
+        );
+
+        // The refusals all come back as daemon errors, not silent no-ops.
+        for (id, engine, expected) in [
+            ("anthropic-work", "anthropic", "already exists"),
+            ("has a space", "anthropic", "TOML bare key"),
+            ("mine", "bard", "is not supported"),
+            ("claude", "codex", "built-in provider"),
+        ] {
+            let error = client
+                .ask_provider_add(&crate::ask::AskProviderAdd {
+                    id: id.into(),
+                    engine: engine.into(),
+                    ..crate::ask::AskProviderAdd::default()
+                })
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{id}/{engine}: {error}");
+        }
+
+        // Removing the selected instance hands the selection to the first
+        // provider that is left.
+        let providers = client.ask_provider_remove("anthropic-work").await.unwrap();
+        assert!(!providers.iter().any(|info| info.id == "anthropic-work"));
+        assert_eq!(
+            providers
+                .iter()
+                .find(|info| info.selected)
+                .map(|info| info.id.as_str()),
+            Some("anthropic-personal")
+        );
+        // A built-in with no config entry has nothing to remove — which is
+        // exactly what `configured` tells a client before it offers to.
+        assert!(providers
+            .iter()
+            .filter(|info| info.builtin)
+            .all(|info| !info.configured));
+        let error = client
+            .ask_provider_remove("gemini")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nothing to remove"), "{error}");
+
+        client
+            .ask_provider_remove("anthropic-personal")
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!text.contains("providers"), "{text}");
+        assert!(text.contains("enabled = true"), "{text}");
 
         tx.send(()).unwrap();
         handle.await.unwrap();
@@ -6878,7 +7874,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("is not supported"), "{error}");
+        assert!(error.contains("is not configured"), "{error}");
 
         // A key for the wrong provider is refused the same way `ask_send`
         // refuses it.

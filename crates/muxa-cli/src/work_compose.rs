@@ -23,7 +23,7 @@ pub struct ComposeArgs {
     /// What you want, in your own words. With `--current` it is the change
     /// to make to that draft.
     pub description: String,
-    /// Provider to draft with: claude, codex, gemini, anthropic, or openai.
+    /// Provider to draft with: any id from `muxa ask providers`.
     /// Defaults to `[ask].agent`.
     #[arg(long)]
     pub agent: Option<String>,

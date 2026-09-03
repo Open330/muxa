@@ -83,16 +83,23 @@ changing this section because its stdio MCP process loads config at startup.
 ```toml
 [ask]
 enabled = true
-agent = "claude"     # claude | codex | gemini | anthropic | openai
+agent = "claude"     # any provider id: a built-in or one you added below
 cwd = "~"            # where the headless process runs; defaults to $HOME
 permission_mode = "bypass" # bypass (default) | edit | plan | default
 additional_dirs = [] # extra real paths, e.g. ["/nfs/home/june"]
 timeout_secs = 1800    # 30-minute wall-clock limit
 keep = 200           # answers retained before the oldest are dropped
 
-[ask.providers.anthropic]           # optional, one table per provider id
+[ask.providers.anthropic]           # tune a built-in: the id is the engine
 model = "claude-opus-5"             # defaults: claude-sonnet-5 (anthropic), gpt-5 (openai); CLIs use their own
 api_key_env = "WORK_ANTHROPIC_KEY"  # the NAME of a variable holding the key — never the key itself
+
+[ask.providers.anthropic-work]      # or add your own, under any id you like
+engine = "anthropic"                # required for an id that is not built in
+title = "Anthropic (work)"          # optional; defaults to a humanized id
+model = "claude-opus-5"             # optional
+api_key_env = "WORK_ANTHROPIC_KEY"  # optional; this instance's own key
+executable = "/opt/homebrew/bin/claude"  # optional; CLI engines only
 ```
 
 Opt-in headless questions from `muxa watch`: `a` composes one, `A` browses
@@ -119,20 +126,44 @@ wall-clock safety limit, not an inactivity detector. `plan` is a read-only
 mode (claude `--permission-mode plan`, codex `--sandbox read-only`, gemini
 `--approval-mode plan`); `muxa work compose` always drafts under it.
 
-`agent` names a provider. `claude`, `codex`, and `gemini` drive the agent
-CLIs in print mode (`claude -p`, `codex exec --json`, `gemini -p
---output-format json`) and resume their own sessions between questions.
+### Providers
+
+An **engine** is the code that drives a provider: the argv a CLI takes, the
+JSON an API answers with, the environment variable its key lives in. There
+are five and they are fixed — `claude`, `codex`, and `gemini` drive the
+agent CLIs in print mode (`claude -p`, `codex exec --json`, `gemini -p
+--output-format json`) and resume their own sessions between questions;
 `anthropic` and `openai` call the Messages and Chat Completions APIs
-directly over HTTPS. They have no session to resume, so muxad replays the
-conversation's earlier turns from its own history — the most recent 40
-turns or 60k characters — ahead of each question; `cwd`, `additional_dirs`,
-and `permission_mode` do not apply to them. An API key comes from, in
-order: the one-turn key a client sends, the provider's own variable in
-muxad's environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`; `CODEX_API_KEY`
-and `GEMINI_API_KEY` for the CLIs), then the variable `[ask.providers.<id>]
-api_key_env` names. The key itself is never written to config.toml.
-`[ask.providers.<id>] model` overrides the model for any provider, CLIs
-included.
+directly over HTTPS. API engines have no session to resume, so muxad
+replays the conversation's earlier turns from its own history — the most
+recent 40 turns or 60k characters — ahead of each question; `cwd`,
+`additional_dirs`, and `permission_mode` do not apply to them.
+
+A **provider** is an `[ask.providers.<id>]` table you compose. The id is
+yours to pick (a TOML bare key: letters, digits, `-`, `_`), and `engine`
+says which of the five drives it. Several providers may share one engine —
+a work and a personal OpenAI account, two Anthropic keys, a second `claude`
+binary — and each keeps its own conversation, so switching between them
+resumes rather than restarts. `[ask] agent` and `muxa ask --agent` name a
+provider id, not an engine.
+
+The five engine ids are also providers of themselves, so a fresh install
+works with no `[ask.providers]` at all: `muxa ask providers` lists what you
+composed first, then every built-in no id of yours has taken over. A table
+named after a built-in and *without* `engine` tunes that built-in — which
+is why an `[ask.providers.anthropic] model = "…"` written before any of
+this still means what it always did. Removing such a table clears the
+settings; the built-in itself stays.
+
+An API key comes from, in order: the one-turn key a client sends, the
+engine's own variable in muxad's environment (`ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`; `CODEX_API_KEY` and `GEMINI_API_KEY` for the CLIs), then
+the variable that provider's `api_key_env` names. The key itself is never
+written to config.toml. Two providers on one engine share the engine's
+variable, so give each its own `api_key_env` (or send a one-turn key) when
+they must not use the same account. `model` overrides the model for any
+provider, CLIs included, and `executable` points a CLI engine at a
+particular binary.
 
 The same daemon-owned history is available without opening the TUI:
 
@@ -142,10 +173,23 @@ muxa ask --agent claude --detach --json "review the deployment plan"
 muxa ask --agent anthropic "which files does the reaper touch?"
 security find-generic-password -w -s my-codex-key \
   | muxa ask --agent codex --api-key-stdin "review this repository"
-muxa ask providers [--json]           # every provider: kind, model, whether a key resolves, selected
+muxa ask --agent anthropic-work "…"   # a provider you added, by its id
+muxa ask providers [--json]           # every provider: engine, kind, model, whether a key resolves, selected
+muxa ask provider add anthropic-work --engine anthropic \
+  --title "Anthropic (work)" --api-key-env WORK_ANTHROPIC_KEY
+muxa ask provider add claude-work --engine claude --executable /opt/homebrew/bin/claude
 muxa ask provider set anthropic --model claude-opus-5 --api-key-env WORK_ANTHROPIC_KEY
 muxa ask provider set anthropic --clear-model         # flags you omit leave that key unchanged
+muxa ask provider remove anthropic-work               # a built-in id only loses its settings
 ```
+
+`add` refuses an id that already exists, an id that is not a TOML bare key,
+an engine that is not one of the five, and a built-in id asked to run
+someone else's engine. The engine is fixed once added — `set` changes the
+title, model, key variable, and binary, and to change the engine you remove
+the provider and add it again, because a live conversation cannot resume a
+`claude` session id against `codex`. Removing the provider `[ask] agent`
+points at hands the selection to the first one left.
 
 `--api-key-stdin` refuses an interactive terminal, crosses only the owner-only
 Unix socket, and supplies the key to one matching provider child. It is never

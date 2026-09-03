@@ -3,7 +3,9 @@
 mod activity_query;
 mod agent_launch;
 mod attend;
+mod automation;
 mod collab_screen;
+mod config_cmd;
 mod daemon;
 mod dashboard_tui;
 mod doctor;
@@ -130,17 +132,20 @@ enum Cmd {
         #[command(subcommand)]
         action: MsgCmd,
     },
-    /// Ask a headless provider (claude, codex, gemini, anthropic, openai)
-    /// and print the durable reply. `muxa ask providers` lists them.
+    /// Ask a headless provider and print the durable reply. The five
+    /// built-ins are claude, codex, gemini, anthropic, and openai; add your
+    /// own with `muxa ask provider add`, and `muxa ask providers` lists
+    /// every one the daemon can drive.
     #[command(args_conflicts_with_subcommands = true)]
     Ask {
         #[command(subcommand)]
         action: Option<AskCmd>,
         /// Question or task for the selected headless provider.
         prompt: Option<String>,
-        /// Override the daemon's selected provider for this and later asks.
-        #[arg(long, value_enum)]
-        agent: Option<AskAgentArg>,
+        /// Override the daemon's selected provider for this and later
+        /// asks. Any provider id from `muxa ask providers`.
+        #[arg(long, value_name = "ID")]
+        agent: Option<String>,
         /// Read one API key from piped stdin and use it only for this turn.
         /// The key is never stored in config, history, logs, or argv.
         #[arg(long)]
@@ -157,6 +162,12 @@ enum Cmd {
     },
     /// Register reusable `/` templates for the interactive message composer.
     Skill(message_skill::Args),
+    /// Rules that watch agent state and act on it — resuming a session
+    /// after a usage cap resets, for one. See docs/AUTOMATION.md.
+    Automation(automation::Args),
+    /// Read and replace the daemon's config.toml, the same way Muxa.app's
+    /// Advanced settings does.
+    Config(config_cmd::Args),
     /// Manage local/SSH host inventory and Kubernetes-style metadata.
     Host(fleet_cli::HostArgs),
     /// Observe and control this node plus SSH-connected Muxa hosts.
@@ -496,8 +507,11 @@ enum MsgCmd {
     },
 }
 
+/// The closed set of engines an instance can be built on. Adding a
+/// provider is config; adding an engine is code, which is why this is a
+/// `ValueEnum` and provider ids are free strings.
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum AskAgentArg {
+enum AskEngineArg {
     Claude,
     Codex,
     Gemini,
@@ -506,7 +520,7 @@ enum AskAgentArg {
     OpenAi,
 }
 
-impl AskAgentArg {
+impl AskEngineArg {
     fn label(self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -520,13 +534,13 @@ impl AskAgentArg {
 
 #[derive(Debug, Subcommand)]
 enum AskCmd {
-    /// List every provider the daemon can ask: kind, model, credential
-    /// status, and which one is selected.
+    /// List every provider the daemon can ask: engine, kind, model,
+    /// credential status, and which one is selected.
     Providers {
         #[arg(long)]
         json: bool,
     },
-    /// Configure one provider's `[ask.providers.<id>]` settings.
+    /// Add, remove, or configure an `[ask.providers.<id>]` instance.
     Provider {
         #[command(subcommand)]
         action: AskProviderCmd,
@@ -535,11 +549,50 @@ enum AskCmd {
 
 #[derive(Debug, Subcommand)]
 enum AskProviderCmd {
-    /// Set or clear a provider's model and the environment variable its
-    /// API key is read from. Flags you omit leave the key unchanged.
-    Set {
-        /// Provider id: claude, codex, gemini, anthropic, or openai.
+    /// Add a provider instance under an id of your choosing. Several
+    /// instances may share an engine, so a work and a personal account of
+    /// the same API can sit side by side, each with its own key.
+    Add {
+        /// New provider id. A TOML bare key: letters, digits, `-`, `_`.
         id: String,
+        /// Engine that drives it.
+        #[arg(long, value_enum)]
+        engine: AskEngineArg,
+        /// Display name. Defaults to a humanized id.
+        #[arg(long)]
+        title: Option<String>,
+        /// Model name for this instance.
+        #[arg(long)]
+        model: Option<String>,
+        /// Name of an environment variable holding the API key. The key
+        /// itself is never written to config.
+        #[arg(long, value_name = "VAR")]
+        api_key_env: Option<String>,
+        /// Binary a CLI engine spawns for this instance.
+        #[arg(long, value_name = "PATH")]
+        executable: Option<String>,
+        /// Print the updated provider list as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a provider instance. A built-in id keeps its row and only
+    /// loses the settings you gave it.
+    Remove {
+        /// Provider id to remove.
+        id: String,
+        /// Print the updated provider list as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set or clear a provider's title, model, key variable, and binary.
+    /// Flags you omit leave that key unchanged. The engine is fixed at
+    /// `add` time; to change it, remove the instance and add it again.
+    Set {
+        /// Provider id from `muxa ask providers`.
+        id: String,
+        /// Display name for this provider.
+        #[arg(long, conflicts_with = "clear_title")]
+        title: Option<String>,
         /// Model name for this provider.
         #[arg(long, conflicts_with = "clear_model")]
         model: Option<String>,
@@ -547,12 +600,21 @@ enum AskProviderCmd {
         /// itself is never written to config.
         #[arg(long, value_name = "VAR", conflicts_with = "clear_api_key_env")]
         api_key_env: Option<String>,
+        /// Binary a CLI engine spawns for this provider.
+        #[arg(long, value_name = "PATH", conflicts_with = "clear_executable")]
+        executable: Option<String>,
+        /// Remove `title` so the default name applies.
+        #[arg(long)]
+        clear_title: bool,
         /// Remove `model` so the provider's default applies.
         #[arg(long)]
         clear_model: bool,
         /// Remove `api_key_env`.
         #[arg(long)]
         clear_api_key_env: bool,
+        /// Remove `executable` so the engine's own binary applies.
+        #[arg(long)]
+        clear_executable: bool,
         /// Print the updated provider list as JSON.
         #[arg(long)]
         json: bool,
@@ -855,48 +917,101 @@ async fn cmd_ask_admin(client: &Client, action: AskCmd) -> Result<()> {
             action:
                 AskProviderCmd::Set {
                     id,
+                    title,
                     model,
                     api_key_env,
+                    executable,
+                    clear_title,
                     clear_model,
                     clear_api_key_env,
+                    clear_executable,
                     json,
                 },
         } => {
             // Only the flags given travel: an omitted key stays as it is.
-            let model = if clear_model {
-                Some(None)
-            } else {
-                model.as_deref().map(Some)
+            let key = |set: Option<String>, clear: bool| {
+                if clear {
+                    Some(None)
+                } else {
+                    set.map(Some)
+                }
             };
-            let api_key_env = if clear_api_key_env {
-                Some(None)
-            } else {
-                api_key_env.as_deref().map(Some)
+            let edit = muxa::ask::AskProviderEdit {
+                title: key(title, clear_title),
+                model: key(model, clear_model),
+                api_key_env: key(api_key_env, clear_api_key_env),
+                executable: key(executable, clear_executable),
             };
-            let providers = client
-                .ask_provider_configure(&id, model, api_key_env)
-                .await?;
+            let providers = client.ask_provider_configure(&id, &edit).await?;
+            report_provider_change(&providers, &id, json)?;
+        }
+        AskCmd::Provider {
+            action:
+                AskProviderCmd::Add {
+                    id,
+                    engine,
+                    title,
+                    model,
+                    api_key_env,
+                    executable,
+                    json,
+                },
+        } => {
+            let request = muxa::ask::AskProviderAdd {
+                id: id.clone(),
+                engine: engine.label().to_string(),
+                title,
+                model,
+                api_key_env,
+                executable,
+            };
+            let providers = client.ask_provider_add(&request).await?;
+            report_provider_change(&providers, &id, json)?;
+        }
+        AskCmd::Provider {
+            action: AskProviderCmd::Remove { id, json },
+        } => {
+            let providers = client.ask_provider_remove(&id).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&providers)?);
+            } else if providers.iter().any(|provider| provider.id == id) {
+                println!("{id}: settings cleared; the built-in provider stands again");
             } else {
-                let changed = providers
-                    .iter()
-                    .find(|provider| provider.id == id)
-                    .context("the daemon did not echo the provider back")?;
-                println!(
-                    "{}: model {}, key from {}{}",
-                    changed.id,
-                    changed.model.as_deref().unwrap_or("(provider default)"),
-                    changed.credential_env,
-                    if changed.credential_present {
-                        " (present)"
-                    } else {
-                        ""
-                    }
-                );
+                println!("{id}: removed");
             }
         }
     }
+    Ok(())
+}
+
+/// One line describing the provider a write just touched, or the whole
+/// list as JSON.
+fn report_provider_change(
+    providers: &[muxa::ask::AskProviderInfo],
+    id: &str,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(providers)?);
+        return Ok(());
+    }
+    let changed = providers
+        .iter()
+        .find(|provider| provider.id == id)
+        .context("the daemon did not echo the provider back")?;
+    println!(
+        "{}: {} on {}, model {}, key from {}{}",
+        changed.id,
+        changed.title,
+        changed.engine,
+        changed.model.as_deref().unwrap_or("(provider default)"),
+        changed.credential_env,
+        if changed.credential_present {
+            " (present)"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 
@@ -919,10 +1034,11 @@ fn render_ask_providers(providers: &[muxa::ask::AskProviderInfo]) -> String {
         };
         let _ = writeln!(
             out,
-            "{} {:<10} {:<12} {:<6} {:<18} {}",
+            "{} {:<16} {:<18} {:<10} {:<10} {:<18} {}",
             if provider.selected { "*" } else { " " },
             provider.id,
             provider.title,
+            provider.engine,
             via,
             provider.model.as_deref().unwrap_or("-"),
             credential
@@ -934,16 +1050,13 @@ fn render_ask_providers(providers: &[muxa::ask::AskProviderInfo]) -> String {
 async fn cmd_ask(
     client: &Client,
     prompt: String,
-    agent: Option<AskAgentArg>,
+    agent: Option<String>,
     api_key_stdin: bool,
     detach: bool,
     json: bool,
     timeout_secs: u64,
 ) -> Result<()> {
-    let selected = match agent {
-        Some(agent) => client.ask_agent(Some(agent.label())).await?,
-        None => client.ask_agent(None).await?,
-    };
+    let selected = client.ask_agent(agent.as_deref()).await?;
     let api_key = if api_key_stdin {
         anyhow::ensure!(
             !std::io::stdin().is_terminal(),
@@ -1096,6 +1209,8 @@ async fn main() -> Result<()> {
             .await
         }
         Cmd::Skill(a) => message_skill::run(a, &cfg.message, skill_path.as_deref()),
+        Cmd::Automation(a) => automation::run(a, &client).await,
+        Cmd::Config(a) => config_cmd::run(a, socket.clone()).await,
         Cmd::Host(a) => fleet_cli::run_host(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Fleet(a) => fleet_cli::run_fleet(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Agent { action } => run_agent_cmd(action, &client, &socket).await,
@@ -3650,20 +3765,62 @@ mod tests {
         };
         assert!(action.is_none());
         assert_eq!(prompt.as_deref(), Some("summarize this window"));
-        assert_eq!(agent.unwrap().label(), "codex");
+        assert_eq!(agent.as_deref(), Some("codex"));
         assert!(api_key_stdin);
         assert!(detach);
         assert!(json);
     }
 
     #[test]
+    fn the_provider_table_names_the_engine_behind_each_instance() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "anthropic-work".to_string(),
+            muxa::config::AskProviderConfig {
+                engine: Some("anthropic".into()),
+                title: Some("Anthropic (work)".into()),
+                api_key_env: Some("WORK_ANTHROPIC_KEY".into()),
+                ..muxa::config::AskProviderConfig::default()
+            },
+        );
+        let env = |name: &str| (name == "WORK_ANTHROPIC_KEY").then(|| "k".to_string());
+        let rendered = render_ask_providers(&muxa::ask::provider_infos(
+            &providers,
+            "anthropic-work",
+            env,
+        ));
+        let mut lines = rendered.lines();
+        let work = lines.next().expect("the composed instance leads");
+        assert!(work.starts_with('*'), "{work}");
+        assert!(work.contains("anthropic-work"), "{work}");
+        assert!(work.contains("Anthropic (work)"), "{work}");
+        // The engine is its own column, so two instances of one engine are
+        // told apart by id while still showing what drives them.
+        assert!(work.contains("anthropic"), "{work}");
+        assert!(work.contains("ANTHROPIC_API_KEY present"), "{work}");
+        // Every built-in still follows it, unselected.
+        let rest: Vec<&str> = lines.collect();
+        assert_eq!(rest.len(), muxa::ask::supported_agents().len());
+        assert!(rest.iter().all(|line| line.starts_with(' ')), "{rest:?}");
+        let claude = rest.first().expect("claude leads the built-ins");
+        assert!(claude.contains("Claude Code"), "{claude}");
+        assert!(claude.contains("ANTHROPIC_API_KEY optional"), "{claude}");
+    }
+
+    #[allow(clippy::too_many_lines)] // one parse assertion per ask subcommand
+    #[test]
     fn ask_accepts_every_provider_id_and_its_admin_subcommands() {
-        for id in muxa::ask::supported_agents() {
+        // Built-in ids and composed ones alike: `--agent` names a provider
+        // instance, so it cannot be a closed value set.
+        for id in muxa::ask::supported_agents()
+            .iter()
+            .chain(["anthropic-work", "openai_personal"].iter())
+        {
             let args = Args::try_parse_from(["muxa", "ask", "--agent", id, "hello"]).unwrap();
             let Cmd::Ask { agent, .. } = args.cmd else {
                 panic!("expected ask command");
             };
-            assert_eq!(agent.unwrap().label(), *id);
+            assert_eq!(agent.as_deref(), Some(*id));
         }
 
         let args = Args::try_parse_from(["muxa", "ask", "providers", "--json"]).unwrap();
@@ -3723,6 +3880,78 @@ mod tests {
             "--clear-model"
         ])
         .is_err());
+        // Composing a provider: the id is free text, the engine is not.
+        let args = Args::try_parse_from([
+            "muxa",
+            "ask",
+            "provider",
+            "add",
+            "anthropic-work",
+            "--engine",
+            "anthropic",
+            "--title",
+            "Anthropic (work)",
+            "--api-key-env",
+            "WORK_ANTHROPIC_KEY",
+            "--executable",
+            "/opt/homebrew/bin/claude",
+        ])
+        .unwrap();
+        let Cmd::Ask {
+            action:
+                Some(AskCmd::Provider {
+                    action:
+                        AskProviderCmd::Add {
+                            id,
+                            engine,
+                            title,
+                            model,
+                            api_key_env,
+                            executable,
+                            json,
+                        },
+                }),
+            ..
+        } = args.cmd
+        else {
+            panic!("expected ask provider add");
+        };
+        assert_eq!(id, "anthropic-work");
+        assert_eq!(engine.label(), "anthropic");
+        assert_eq!(title.as_deref(), Some("Anthropic (work)"));
+        assert_eq!(model, None);
+        assert_eq!(api_key_env.as_deref(), Some("WORK_ANTHROPIC_KEY"));
+        assert_eq!(executable.as_deref(), Some("/opt/homebrew/bin/claude"));
+        assert!(!json);
+        // The engine is required, and only the five muxa ships are accepted.
+        assert!(Args::try_parse_from(["muxa", "ask", "provider", "add", "mine"]).is_err());
+        assert!(Args::try_parse_from([
+            "muxa", "ask", "provider", "add", "mine", "--engine", "bard"
+        ])
+        .is_err());
+
+        let args = Args::try_parse_from([
+            "muxa",
+            "ask",
+            "provider",
+            "remove",
+            "anthropic-work",
+            "--json",
+        ])
+        .unwrap();
+        let Cmd::Ask {
+            action:
+                Some(AskCmd::Provider {
+                    action: AskProviderCmd::Remove { id, json },
+                }),
+            ..
+        } = args.cmd
+        else {
+            panic!("expected ask provider remove");
+        };
+        assert_eq!(id, "anthropic-work");
+        assert!(json);
+
         // A question that is not a subcommand name still asks.
         let args = Args::try_parse_from(["muxa", "ask", "what providers exist?"]).unwrap();
         let Cmd::Ask {

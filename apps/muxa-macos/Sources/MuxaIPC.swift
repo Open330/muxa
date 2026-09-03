@@ -1281,13 +1281,16 @@ actor MuxaIPCClient {
         return providers
     }
 
-    /// Writes `model` / `api_key_env` under `[ask.providers.<id>]` in the
-    /// daemon's config and returns the refreshed provider list. `.keep`
-    /// leaves the key out of the request so the daemon does not touch it.
+    /// Writes `title` / `model` / `api_key_env` / `executable` under
+    /// `[ask.providers.<id>]` in the daemon's config and returns the
+    /// refreshed provider list. `.keep` leaves the key out of the request so
+    /// the daemon does not touch it, `.clear` sends null so it is removed.
     func configureAskProvider(
         _ providerID: String,
+        title: MuxaAskProviderFieldUpdate = .keep,
         model: MuxaAskProviderFieldUpdate = .keep,
-        apiKeyEnv: MuxaAskProviderFieldUpdate = .keep
+        apiKeyEnv: MuxaAskProviderFieldUpdate = .keep,
+        executable: MuxaAskProviderFieldUpdate = .keep
     ) async throws -> [MuxaAskProvider] {
         guard capabilities.contains(Self.askProvidersCapability) else {
             throw MuxaIPCError.server(
@@ -1299,9 +1302,71 @@ actor MuxaIPCClient {
             "kind": "ask_provider_configure",
             "provider": providerID,
         ]
+        title.apply(to: &request, key: "title")
         model.apply(to: &request, key: "model")
         apiKeyEnv.apply(to: &request, key: "api_key_env")
+        executable.apply(to: &request, key: "executable")
         let response = try await call(request, timeout: 10)
+        guard let providers = response.askProviders else {
+            throw MuxaIPCError.missingField("ask_providers")
+        }
+        return providers
+    }
+
+    /// Writes a new `[ask.providers.<id>]` entry (`ask_provider_add`) and
+    /// returns the refreshed list. `id` is the config key, the Ask agent
+    /// name and the Keychain account, so several instances of one engine
+    /// stay independent. Optional fields are sent only when non-empty; the
+    /// daemon refuses an id that is not a TOML bare key, an unknown engine,
+    /// and an id that is already configured.
+    func addAskProvider(
+        id providerID: String,
+        engine: String,
+        title: String? = nil,
+        model: String? = nil,
+        apiKeyEnv: String? = nil,
+        executable: String? = nil
+    ) async throws -> [MuxaAskProvider] {
+        guard capabilities.contains(Self.askProvidersCapability) else {
+            throw MuxaIPCError.server(
+                "The running muxad cannot add Ask providers; update muxa or choose Use Bundled muxad"
+            )
+        }
+        var request: [String: Any] = [
+            "protocol": Self.protocolVersion,
+            "kind": "ask_provider_add",
+            "id": providerID,
+            "engine": engine,
+        ]
+        for (key, value) in [
+            ("title", title), ("model", model),
+            ("api_key_env", apiKeyEnv), ("executable", executable),
+        ] {
+            if case .set(let text) = MuxaAskProviderFieldUpdate(value) {
+                request[key] = text
+            }
+        }
+        let response = try await call(request, timeout: 10)
+        guard let providers = response.askProviders else {
+            throw MuxaIPCError.missingField("ask_providers")
+        }
+        return providers
+    }
+
+    /// Deletes `[ask.providers.<id>]` (`ask_provider_remove`) and returns the
+    /// refreshed list. The daemon refuses a built-in that has no config entry
+    /// and re-points `[ask] agent` when it named the removed instance.
+    func removeAskProvider(_ providerID: String) async throws -> [MuxaAskProvider] {
+        guard capabilities.contains(Self.askProvidersCapability) else {
+            throw MuxaIPCError.server(
+                "The running muxad cannot remove Ask providers; update muxa or choose Use Bundled muxad"
+            )
+        }
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "ask_provider_remove",
+            "id": providerID,
+        ], timeout: 10)
         guard let providers = response.askProviders else {
             throw MuxaIPCError.missingField("ask_providers")
         }

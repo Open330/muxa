@@ -36,10 +36,12 @@
 pub mod activity;
 pub mod adapters;
 pub mod ask;
+pub mod automation;
 pub mod backend;
 pub mod collaboration;
 pub mod collaboration_audit;
 pub mod config;
+pub mod config_file;
 pub mod dashboard;
 pub mod discovery;
 pub mod error;

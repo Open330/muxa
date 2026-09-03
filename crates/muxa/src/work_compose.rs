@@ -176,7 +176,8 @@ pub struct WorkComposeRequest {
     /// What the operator wants, in their own words. With `current` set it
     /// is the change request against that draft.
     pub description: String,
-    /// Provider to draft with; `None` means the ask store's selected one.
+    /// Provider instance id to draft with — a built-in or one the
+    /// operator added; `None` means the ask store's selected one.
     #[serde(default)]
     pub agent: Option<String>,
     /// A previous draft to refine.

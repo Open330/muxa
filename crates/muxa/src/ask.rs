@@ -23,6 +23,18 @@
 //! environment variable named in `[ask.providers.<id>]` — never from the
 //! config file itself.
 //!
+//! **Engines are closed, instances are open.** [`AskEngine`] is the code
+//! that drives a provider: the argv a CLI takes, the JSON an API answers
+//! with, the environment variable its key lives in. Adding one means
+//! writing that code, so the set is fixed. What the operator composes is
+//! [`AskProviderInstance`]: an `[ask.providers.<id>]` table naming an
+//! engine, with its own title, model, key variable, and binary. Two
+//! instances can share an engine — a work and a personal `OpenAI` account,
+//! two Anthropic keys, a second `claude` binary — and each keeps its own
+//! conversation. The five engine ids are also instances of themselves, so
+//! a fresh install works with no `[ask.providers]` at all and an existing
+//! `[ask.providers.anthropic] model = "…"` keeps overriding the built-in.
+//!
 //! The daemon owns execution so a query survives the watch popup closing:
 //! the answer lands in the store either way, and the next `muxa watch`
 //! shows it.
@@ -64,8 +76,18 @@ pub enum AskError {
     ConversationBusy,
     #[error("ask conversation {0:?} was not found")]
     ConversationNotFound(String),
-    #[error("ask agent {0:?} is not supported (use claude, codex, gemini, anthropic, or openai)")]
+    #[error("ask provider {0:?} is not configured; `muxa ask providers` lists the ones that are")]
     UnsupportedAgent(String),
+    #[error("ask engine {0:?} is not supported (use claude, codex, gemini, anthropic, or openai)")]
+    UnknownEngine(String),
+    #[error("ask provider id {0:?} must be a TOML bare key: letters, digits, `-`, or `_`")]
+    InvalidProviderId(String),
+    #[error("ask provider {0:?} already exists; edit it with `muxa ask provider set` or pick another id")]
+    ProviderExists(String),
+    #[error("{id:?} is a built-in provider and always uses the {id} engine; name a different id to run engine {engine:?}")]
+    BuiltinProviderEngine { id: String, engine: String },
+    #[error("{0:?} is a built-in provider with no config entry, so there is nothing to remove")]
+    BuiltinProviderRemoval(String),
     #[error("the supplied API key is for {supplied}, but the selected ask agent is {selected}")]
     CredentialAgentMismatch { supplied: String, selected: String },
     #[error("no config file is known for [ask.providers.{0}]; start muxad with --config or a default config path")]
@@ -78,6 +100,7 @@ pub enum AskError {
 #[derive(Debug, Clone)]
 pub struct AskOptions {
     pub enabled: bool,
+    /// Provider instance id the next question goes to.
     pub agent: String,
     /// Working directory the headless process runs in. Default-mode asks are
     /// intended as queries; edit/bypass automation still resolves its files
@@ -88,8 +111,8 @@ pub struct AskOptions {
     pub timeout_secs: u64,
     pub path: Option<PathBuf>,
     pub keep: usize,
-    /// `[ask.providers.<id>]` as loaded; [`AskStore::configure_provider`]
-    /// keeps the live copy in step with the file afterwards.
+    /// `[ask.providers.<id>]` as loaded; the store's configure/add/remove
+    /// operations keep the live copy in step with the file afterwards.
     pub providers: BTreeMap<String, AskProviderConfig>,
     /// The `config.toml` the daemon read `[ask]` from, so provider settings
     /// can be written back where they came from.
@@ -283,18 +306,26 @@ impl AskSnapshot {
             self.active_conversations.entry(agent).or_insert(id);
         }
 
-        for agent in supported_agents() {
-            if self.active_conversations.contains_key(*agent) {
+        // Every provider that has history gets its latest thread back,
+        // whichever id it is: the built-ins plus whatever instances the
+        // operator composed and has since asked something.
+        let agents: std::collections::BTreeSet<String> = self
+            .conversations
+            .iter()
+            .map(|conversation| conversation.agent.clone())
+            .collect();
+        for agent in agents {
+            if self.active_conversations.contains_key(&agent) {
                 continue;
             }
             if let Some(id) = self
                 .conversations
                 .iter()
-                .filter(|conversation| conversation.agent == *agent)
+                .filter(|conversation| conversation.agent == agent)
                 .max_by_key(|conversation| conversation.updated_at)
                 .map(|conversation| conversation.id.clone())
             {
-                self.active_conversations.insert((*agent).into(), id);
+                self.active_conversations.insert(agent, id);
             }
         }
     }
@@ -429,13 +460,17 @@ impl AskStore {
         self.agent.read().await.clone()
     }
 
-    /// Point the next question at a different agent. Each agent keeps its
-    /// own thread, so switching back resumes where that one left off
-    /// rather than starting over.
+    /// Point the next question at a different provider instance — a
+    /// built-in id or one the operator added. Each instance keeps its own
+    /// thread, so switching back resumes where that one left off rather
+    /// than starting over, and two instances of one engine stay two
+    /// separate conversations.
     pub async fn set_agent(&self, agent: &str) -> Result<String, AskError> {
-        let parsed = AskProvider::parse(agent)
-            .ok_or_else(|| AskError::UnsupportedAgent(agent.to_string()))?;
-        let label = parsed.id().to_string();
+        let label = self
+            .instance(agent)
+            .await
+            .ok_or_else(|| AskError::UnsupportedAgent(agent.to_string()))?
+            .id;
         let mut selected = self.agent.write().await;
         let changed = *selected != label;
         selected.clone_from(&label);
@@ -446,37 +481,140 @@ impl AskStore {
         Ok(label)
     }
 
-    /// Every provider this daemon can drive, with its effective model,
-    /// whether a key is already resolvable from the daemon's environment,
-    /// and which one the next question goes to.
+    /// Every provider instance this daemon can drive, with its effective
+    /// model, whether a key is already resolvable from the daemon's
+    /// environment, and which one the next question goes to.
     pub async fn providers(&self) -> Vec<AskProviderInfo> {
         let selected = self.agent.read().await.clone();
         let providers = self.providers.read().await;
         provider_infos(&providers, &selected, |name| std::env::var(name).ok())
     }
 
+    /// Every configured and built-in instance, in list order.
+    pub async fn instances(&self) -> Vec<AskProviderInstance> {
+        let providers = self.providers.read().await;
+        provider_instances(&providers)
+    }
+
+    /// The instance `id` names, or `None` when nothing answers to it.
+    pub async fn instance(&self, id: &str) -> Option<AskProviderInstance> {
+        let instances = self.instances().await;
+        find_instance(&instances, id).cloned()
+    }
+
     /// Apply `edit` under `[ask.providers.<id>]` and refresh the live
-    /// settings from what was written. Each key is tri-state: absent leaves
-    /// it alone, `Some(None)` removes it, `Some(Some(value))` sets it. The
-    /// file is edited in place through `toml_edit`, validated as a full
-    /// [`Config`] before anything touches disk, and swapped in atomically,
-    /// so a bad value cannot leave the daemon unable to start.
+    /// settings from what was written. Works on any known instance, built
+    /// in or composed. Each key is tri-state: absent leaves it alone,
+    /// `Some(None)` removes it, `Some(Some(value))` sets it. The file is
+    /// edited in place through `toml_edit`, validated as a full [`Config`]
+    /// before anything touches disk, and swapped in atomically, so a bad
+    /// value cannot leave the daemon unable to start.
+    ///
+    /// `engine` is not editable: it is what the instance *is*, and changing
+    /// it under a live conversation would resume a claude session id
+    /// against codex. Remove the instance and add it again instead.
     pub async fn configure_provider(
         &self,
         provider: &str,
         edit: AskProviderEdit,
     ) -> Result<Vec<AskProviderInfo>, AskError> {
-        let parsed = AskProvider::parse(provider)
+        let instance = self
+            .instance(provider)
+            .await
             .ok_or_else(|| AskError::UnsupportedAgent(provider.to_string()))?;
         let path = self
             .opts
             .config_path
             .clone()
-            .ok_or_else(|| AskError::NoConfigPath(parsed.id().to_string()))?;
+            .ok_or_else(|| AskError::NoConfigPath(instance.id.clone()))?;
         let _guard = self.write_lock.lock().await;
         let config =
-            write_provider_config(&path, parsed.id(), &edit.normalized()).map_err(AskError::Io)?;
+            write_provider_config(&path, &instance.id, &edit.normalized()).map_err(AskError::Io)?;
         *self.providers.write().await = config.ask.providers;
+        self.publish_change();
+        Ok(self.providers().await)
+    }
+
+    /// Add an `[ask.providers.<id>]` instance and answer with the refreshed
+    /// list. The id has to be a TOML bare key, the engine one muxa ships,
+    /// and the id free — except a built-in id with no table yet, which this
+    /// materialises into config so it can carry its own settings.
+    pub async fn add_provider(
+        &self,
+        request: AskProviderAdd,
+    ) -> Result<Vec<AskProviderInfo>, AskError> {
+        let request = request.normalized();
+        let id = request.id.clone();
+        if !crate::config::is_bare_key(&id) {
+            return Err(AskError::InvalidProviderId(id));
+        }
+        let Some(engine) = AskEngine::parse(&request.engine) else {
+            return Err(AskError::UnknownEngine(request.engine));
+        };
+        if let Some(builtin) = builtin_engine(&id) {
+            if builtin != engine {
+                return Err(AskError::BuiltinProviderEngine {
+                    id,
+                    engine: engine.id().to_string(),
+                });
+            }
+        }
+        if self.providers.read().await.contains_key(&id) {
+            return Err(AskError::ProviderExists(id));
+        }
+        let path = self
+            .opts
+            .config_path
+            .clone()
+            .ok_or_else(|| AskError::NoConfigPath(id.clone()))?;
+        let _guard = self.write_lock.lock().await;
+        let config = write_new_provider(&path, &id, engine, &request).map_err(AskError::Io)?;
+        *self.providers.write().await = config.ask.providers;
+        self.publish_change();
+        Ok(self.providers().await)
+    }
+
+    /// Drop an `[ask.providers.<id>]` table and answer with the refreshed
+    /// list. A built-in id keeps its row — removing it clears the overrides
+    /// and the shipped provider stands again — so a built-in with no table
+    /// has nothing to remove and is refused.
+    ///
+    /// If the selection pointed at what just went away, it falls back to the
+    /// first usable provider, in config too when `[ask] agent` named it: a
+    /// daemon left selecting a provider that no longer exists would refuse
+    /// every question with nothing on screen saying why.
+    pub async fn remove_provider(&self, provider: &str) -> Result<Vec<AskProviderInfo>, AskError> {
+        let instance = self
+            .instance(provider)
+            .await
+            .ok_or_else(|| AskError::UnsupportedAgent(provider.to_string()))?;
+        let id = instance.id.clone();
+        if !self.providers.read().await.contains_key(&id) {
+            return Err(AskError::BuiltinProviderRemoval(id));
+        }
+        let path = self
+            .opts
+            .config_path
+            .clone()
+            .ok_or_else(|| AskError::NoConfigPath(id.clone()))?;
+        let _guard = self.write_lock.lock().await;
+        let selected = self.agent.read().await.clone();
+        let fallback = if selected == id {
+            let mut remaining = self.providers.read().await.clone();
+            remaining.remove(&id);
+            Some(provider_instances(&remaining).first().map_or_else(
+                || AskEngine::Claude.id().to_string(),
+                |first| first.id.clone(),
+            ))
+        } else {
+            None
+        };
+        let config =
+            remove_provider_config(&path, &id, fallback.as_deref()).map_err(AskError::Io)?;
+        *self.providers.write().await = config.ask.providers;
+        if let Some(fallback) = fallback {
+            self.agent.write().await.clone_from(&fallback);
+        }
         self.publish_change();
         Ok(self.providers().await)
     }
@@ -597,20 +735,14 @@ impl AskStore {
             return Err(AskError::EmptyPrompt);
         }
         let selected = self.agent.read().await.clone();
-        let Some(provider) = AskProvider::parse(&selected) else {
+        let instances = self.instances().await;
+        let Some(provider) = find_instance(&instances, &selected).cloned() else {
             return Err(AskError::UnsupportedAgent(selected));
         };
-        let credential_key = take_credential(provider, credential)?;
-        let provider_config = self
-            .providers
-            .read()
-            .await
-            .get(provider.id())
-            .cloned()
-            .unwrap_or_default();
+        let credential_key = take_credential(&instances, &provider, credential)?;
 
         let write_guard = self.write_lock.lock().await;
-        let conversation = self.ensure_active_conversation(provider.id()).await;
+        let conversation = self.ensure_active_conversation(&provider.id).await;
         let conversation_id = conversation.id.clone();
         if self.entries.read().await.iter().any(|entry| {
             entry.conversation_id.as_deref() == Some(conversation_id.as_str())
@@ -626,6 +758,7 @@ impl AskStore {
             AskProviderKind::Api => replay_history(&self.entries.read().await, &conversation_id),
             AskProviderKind::Cli => Vec::new(),
         };
+        let engine = provider.engine;
         let now = OffsetDateTime::now_utc();
         let entry = AskEntry {
             id: format!("ask_{:x}", next_id()),
@@ -633,7 +766,7 @@ impl AskStore {
             prompt: prompt.to_string(),
             answer: String::new(),
             status: AskStatus::Running,
-            agent: provider.id().to_string(),
+            agent: provider.id.clone(),
             agent_session_id: resume.clone(),
             cwd: self.opts.cwd.display().to_string(),
             asked_at: now,
@@ -670,10 +803,9 @@ impl AskStore {
         let id = entry.id.clone();
         let prompt = prompt.to_string();
         tokio::spawn(async move {
-            let api_key = resolve_api_key(provider, credential_key, &provider_config, |name| {
-                std::env::var(name).ok()
-            });
-            let outcome = provider
+            let api_key =
+                resolve_api_key(&provider, credential_key, |name| std::env::var(name).ok());
+            let outcome = engine
                 .run(Turn {
                     prompt: &prompt,
                     resume: resume.as_deref(),
@@ -682,7 +814,8 @@ impl AskStore {
                     permission_mode: store.opts.permission_mode,
                     additional_dirs: &store.opts.additional_dirs,
                     timeout: Duration::from_secs(store.opts.timeout_secs.max(5)),
-                    model: provider_config.model.as_deref(),
+                    model: provider.model(),
+                    executable: provider.executable(),
                     api_key: api_key.as_deref(),
                 })
                 .await;
@@ -713,20 +846,14 @@ impl AskStore {
             Some(name) => name.to_string(),
             None => self.agent.read().await.clone(),
         };
-        let provider = AskProvider::parse(&selected)
-            .ok_or_else(|| AskError::UnsupportedAgent(selected.clone()))?;
-        let credential_key = take_credential(provider, credential)?;
-        let provider_config = self
-            .providers
-            .read()
-            .await
-            .get(provider.id())
+        let instances = self.instances().await;
+        let provider = find_instance(&instances, &selected)
             .cloned()
-            .unwrap_or_default();
-        let api_key = resolve_api_key(provider, credential_key, &provider_config, |name| {
-            std::env::var(name).ok()
-        });
+            .ok_or_else(|| AskError::UnsupportedAgent(selected.clone()))?;
+        let credential_key = take_credential(&instances, &provider, credential)?;
+        let api_key = resolve_api_key(&provider, credential_key, |name| std::env::var(name).ok());
         provider
+            .engine
             .run(Turn {
                 prompt,
                 resume: None,
@@ -735,7 +862,8 @@ impl AskStore {
                 permission_mode,
                 additional_dirs: &self.opts.additional_dirs,
                 timeout: Duration::from_secs(self.opts.timeout_secs.max(5)),
-                model: provider_config.model.as_deref(),
+                model: provider.model(),
+                executable: provider.executable(),
                 api_key: api_key.as_deref(),
             })
             .await
@@ -866,19 +994,25 @@ impl AskStore {
     }
 }
 
-/// A one-turn credential is only honoured for the provider it names; a key
-/// for the wrong provider is refused before anything is spawned.
+/// A one-turn credential is only honoured for the instance it names; a key
+/// for another provider is refused before anything is spawned. It is
+/// matched by instance id, not by engine, so a key meant for the personal
+/// account cannot be spent on the work one.
 fn take_credential(
-    provider: AskProvider,
+    instances: &[AskProviderInstance],
+    provider: &AskProviderInstance,
     credential: Option<AskCredential>,
 ) -> Result<Option<String>, AskError> {
     match credential {
-        Some(credential) if AskProvider::parse(&credential.agent) == Some(provider) => {
+        Some(credential)
+            if find_instance(instances, &credential.agent)
+                .is_some_and(|named| named.id == provider.id) =>
+        {
             Ok(Some(credential.api_key))
         }
         Some(credential) => Err(AskError::CredentialAgentMismatch {
             supplied: credential.agent,
-            selected: provider.id().to_string(),
+            selected: provider.id.clone(),
         }),
         None => Ok(None),
     }
@@ -887,26 +1021,77 @@ fn take_credential(
 /// One `ask_provider_configure` edit. Each key is tri-state so a client
 /// can send only what it changed: `None` leaves the key as it is,
 /// `Some(None)` removes it, `Some(Some(value))` sets it.
+///
+/// `engine` is absent on purpose — see [`AskStore::configure_provider`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AskProviderEdit {
+    pub title: Option<Option<String>>,
     pub model: Option<Option<String>>,
     pub api_key_env: Option<Option<String>>,
+    pub executable: Option<Option<String>>,
 }
 
 impl AskProviderEdit {
     /// A blank value from a form field means "clear it", the same as
-    /// `null`: an empty model or variable name could never be used.
+    /// `null`: an empty model, title, path, or variable name could never
+    /// be used.
     fn normalized(self) -> Self {
-        let trim = |value: Option<Option<String>>| {
-            value.map(|inner| {
-                inner
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-            })
+        Self {
+            title: trim_edit(self.title),
+            model: trim_edit(self.model),
+            api_key_env: trim_edit(self.api_key_env),
+            executable: trim_edit(self.executable),
+        }
+    }
+
+    /// The keys this edit touches, paired with what to do to each.
+    fn entries(&self) -> [(&'static str, Option<&Option<String>>); 4] {
+        [
+            ("title", self.title.as_ref()),
+            ("model", self.model.as_ref()),
+            ("api_key_env", self.api_key_env.as_ref()),
+            ("executable", self.executable.as_ref()),
+        ]
+    }
+}
+
+#[allow(clippy::option_option)] // the tri-state is the contract; see above
+fn trim_edit(value: Option<Option<String>>) -> Option<Option<String>> {
+    value.map(|inner| {
+        inner
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+/// One `ask_provider_add`: a new `[ask.providers.<id>]` table. `engine` is
+/// required because it is the only thing muxa cannot infer — everything
+/// else has a default the engine supplies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AskProviderAdd {
+    pub id: String,
+    pub engine: String,
+    pub title: Option<String>,
+    pub model: Option<String>,
+    pub api_key_env: Option<String>,
+    pub executable: Option<String>,
+}
+
+impl AskProviderAdd {
+    /// Blank optional fields mean "not given", as they do in an edit.
+    fn normalized(self) -> Self {
+        let trim = |value: Option<String>| {
+            value
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
         };
         Self {
+            id: self.id.trim().to_string(),
+            engine: self.engine.trim().to_ascii_lowercase(),
+            title: trim(self.title),
             model: trim(self.model),
             api_key_env: trim(self.api_key_env),
+            executable: trim(self.executable),
         }
     }
 }
@@ -960,7 +1145,8 @@ pub struct AskAnswer {
 /// typed `muxa work up`, which is its own consent.
 #[derive(Debug, Clone)]
 pub struct OneShot<'a> {
-    /// A provider id from [`supported_agents`].
+    /// A provider instance id: one of [`supported_agents`], or an
+    /// `[ask.providers.<id>]` the operator added.
     pub agent: &'a str,
     pub prompt: &'a str,
     pub cwd: &'a std::path::Path,
@@ -969,16 +1155,213 @@ pub struct OneShot<'a> {
     pub timeout: Duration,
 }
 
-/// Providers this bridge can drive headlessly, in preference order.
+/// Engines this bridge can drive headlessly, in preference order. Each is
+/// also a built-in provider instance of the same id, so these are the ids
+/// `[ask] agent` accepts before the operator adds any of their own.
 ///
 /// Membership is not "muxa knows this agent" — the launcher knows more
 /// (agy, opencode) — but "it has a print mode that reports completion as
 /// a fact": an exit code plus a parseable envelope, or an HTTPS API with a
 /// status code. Without that, reading an answer back means screen-scraping
-/// a moving target.
+/// a moving target. Which is why *engines* are closed while the instances
+/// built on them are not: a new instance is config, a new engine is code.
 #[must_use]
 pub fn supported_agents() -> &'static [&'static str] {
     &["claude", "codex", "gemini", "anthropic", "openai"]
+}
+
+/// The engine a built-in provider id drives, or `None` for an id the
+/// operator composed. Exact match: an id is a config table key, and
+/// `[ask.providers.Claude]` is a different table from
+/// `[ask.providers.claude]`.
+#[must_use]
+pub fn builtin_engine(id: &str) -> Option<AskEngine> {
+    AskEngine::ALL
+        .iter()
+        .copied()
+        .find(|engine| engine.id() == id)
+}
+
+/// A provider instance: one `[ask.providers.<id>]` entry resolved against
+/// its engine, or a built-in standing in for the entry nobody wrote.
+///
+/// This is what a turn runs on. The engine supplies behaviour the operator
+/// cannot change (argv, response shape, which environment variable holds
+/// the key); the instance supplies the identity and the settings they can.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskProviderInstance {
+    /// Config table key, wire id, and `muxa ask --agent` argument.
+    pub id: String,
+    pub title: String,
+    pub engine: AskEngine,
+    /// Configured model, or `None` to let the engine decide.
+    pub model: Option<String>,
+    /// Variable this instance's key is read from when the engine's own is
+    /// unset. Two instances of one engine that each want their own key
+    /// need this, because they share `credential_env`.
+    pub api_key_env: Option<String>,
+    /// Binary override for a CLI engine.
+    pub executable: Option<String>,
+    /// `true` when the id is one of [`supported_agents`] — present with or
+    /// without a config entry, and never removable from the list.
+    pub builtin: bool,
+    /// `true` when an `[ask.providers.<id>]` table backs this instance.
+    /// Orthogonal to `builtin`: a tuned built-in is both, and an empty
+    /// table is what makes it different from the shipped default.
+    pub configured: bool,
+}
+
+impl AskProviderInstance {
+    #[must_use]
+    pub fn kind(&self) -> AskProviderKind {
+        self.engine.kind()
+    }
+
+    /// Where a key for this instance is looked up in muxad's environment.
+    /// It comes from the engine, so two instances of one engine share it.
+    #[must_use]
+    pub fn credential_env(&self) -> &'static str {
+        self.engine.credential_env()
+    }
+
+    /// The binary a CLI turn spawns: the instance's override, else the
+    /// engine's. `None` for an API engine.
+    #[must_use]
+    pub fn executable(&self) -> Option<&str> {
+        match self.engine.kind() {
+            AskProviderKind::Cli => self
+                .executable
+                .as_deref()
+                .or_else(|| self.engine.executable()),
+            AskProviderKind::Api => None,
+        }
+    }
+
+    /// The model a turn will use: configured, else the engine's default.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .or_else(|| self.engine.default_model())
+    }
+}
+
+/// One instance resolved from its id and the `[ask.providers.<id>]` table
+/// (default when there is none). `None` when the pair does not describe a
+/// provider muxa can drive: an unknown engine, a composed id with no
+/// engine, or a built-in id claiming a different engine.
+#[must_use]
+pub fn resolve_instance(id: &str, config: &AskProviderConfig) -> Option<AskProviderInstance> {
+    let builtin = builtin_engine(id);
+    let engine = match config.engine.as_deref() {
+        Some(name) => {
+            let named = AskEngine::parse(name)?;
+            if builtin.is_some_and(|builtin| builtin != named) {
+                return None;
+            }
+            named
+        }
+        None => builtin?,
+    };
+    Some(AskProviderInstance {
+        id: id.to_string(),
+        title: config
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| {
+                if builtin.is_some() {
+                    engine.title().to_string()
+                } else {
+                    humanize_id(id)
+                }
+            }),
+        engine,
+        model: config.model.clone(),
+        api_key_env: config.api_key_env.clone(),
+        executable: config.executable.clone(),
+        builtin: builtin.is_some(),
+        configured: true,
+    })
+}
+
+/// Every instance this daemon can drive: the configured ones in id order,
+/// then the built-ins no configured id already covers. Configured first so
+/// what the operator wrote leads the picker, and the built-ins stay at the
+/// end as the floor a fresh install runs on. An entry that resolves to
+/// nothing is skipped rather than dropped silently — `Config::validate`
+/// refuses to load one, so reaching here means the file was edited under
+/// a running daemon.
+#[must_use]
+pub fn provider_instances(
+    providers: &BTreeMap<String, AskProviderConfig>,
+) -> Vec<AskProviderInstance> {
+    let mut instances: Vec<AskProviderInstance> = Vec::new();
+    for (id, config) in providers {
+        if let Some(instance) = resolve_instance(id, config) {
+            instances.push(instance);
+        } else {
+            tracing::warn!(
+                provider = %id,
+                "[ask.providers] entry names no usable engine — skipping it",
+            );
+        }
+    }
+    for engine in AskEngine::ALL {
+        if instances.iter().any(|instance| instance.id == engine.id()) {
+            continue;
+        }
+        instances.push(AskProviderInstance {
+            id: engine.id().to_string(),
+            title: engine.title().to_string(),
+            engine,
+            model: None,
+            api_key_env: None,
+            executable: None,
+            builtin: true,
+            configured: false,
+        });
+    }
+    instances
+}
+
+/// The instance `id` names, matched exactly first so a config table always
+/// wins, then case-insensitively so `muxa ask --agent OpenAI` still works.
+#[must_use]
+pub fn find_instance<'a>(
+    instances: &'a [AskProviderInstance],
+    id: &str,
+) -> Option<&'a AskProviderInstance> {
+    let wanted = id.trim();
+    instances
+        .iter()
+        .find(|instance| instance.id == wanted)
+        .or_else(|| {
+            instances
+                .iter()
+                .find(|instance| instance.id.eq_ignore_ascii_case(wanted))
+        })
+}
+
+/// `anthropic-work` -> `Anthropic Work`. What a composed instance is called
+/// when the operator did not say.
+fn humanize_id(id: &str) -> String {
+    let words: Vec<String> = id
+        .split(['-', '_'])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        id.to_string()
+    } else {
+        words.join(" ")
+    }
 }
 
 /// Run one headless turn and return its answer. The key for an API provider
@@ -1004,11 +1387,12 @@ pub async fn one_shot_configured(
     if prompt.is_empty() {
         return Err(AskError::EmptyPrompt);
     }
-    let provider = AskProvider::parse(request.agent)
-        .ok_or_else(|| AskError::UnsupportedAgent(request.agent.to_string()))?;
     let settings = provider_config.cloned().unwrap_or_default();
-    let api_key = resolve_api_key(provider, None, &settings, |name| std::env::var(name).ok());
-    provider
+    let instance = resolve_instance(request.agent.trim(), &settings)
+        .ok_or_else(|| AskError::UnsupportedAgent(request.agent.to_string()))?;
+    let api_key = resolve_api_key(&instance, None, |name| std::env::var(name).ok());
+    instance
+        .engine
         .run(Turn {
             prompt,
             resume: None,
@@ -1017,7 +1401,8 @@ pub async fn one_shot_configured(
             permission_mode: request.permission_mode,
             additional_dirs: request.additional_dirs,
             timeout: request.timeout.max(Duration::from_secs(5)),
-            model: settings.model.as_deref(),
+            model: instance.model(),
+            executable: instance.executable(),
             api_key: api_key.as_deref(),
         })
         .await
@@ -1036,12 +1421,20 @@ pub enum AskProviderKind {
 
 /// What a client needs to offer a provider: how to reach it, which
 /// credential it takes, and the model it will use.
+// The flags are independent facts about one row, each read on its own by a
+// client deciding what to show; folding them into an enum would mean
+// enumerating combinations that carry no meaning together.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskProviderInfo {
     pub id: String,
     pub title: String,
+    /// The engine driving this instance — one of [`supported_agents`].
+    /// Several instances may name the same one.
+    pub engine: String,
     pub kind: AskProviderKind,
-    /// The CLI binary for `cli` providers; `null` for APIs.
+    /// The CLI binary for `cli` providers, including an instance's
+    /// `executable` override; `null` for APIs.
     pub executable: Option<String>,
     /// Environment variable the provider's key is read from.
     pub credential_env: String,
@@ -1058,9 +1451,21 @@ pub struct AskProviderInfo {
     pub model: Option<String>,
     /// Mirrors the store's current agent.
     pub selected: bool,
+    /// One of the five ids muxa ships. A built-in is always listed, with
+    /// or without an `[ask.providers.<id>]` table, and `ask_provider_remove`
+    /// only ever clears that table rather than taking the row away.
+    #[serde(default)]
+    pub builtin: bool,
+    /// Whether an `[ask.providers.<id>]` table backs this row — what
+    /// `ask_provider_remove` has to remove, and what a client offers Add
+    /// versus Remove on. Independent of `builtin`: a tuned built-in is
+    /// both, and an empty table is `configured` even though every value it
+    /// reports is the shipped default.
+    #[serde(default)]
+    pub configured: bool,
 }
 
-/// The provider list for `ask_providers`, in [`supported_agents`] order.
+/// The provider list for `ask_providers`, in [`provider_instances`] order.
 /// `env` reads the daemon's environment (injected so the list is testable
 /// without touching the process environment).
 #[must_use]
@@ -1069,31 +1474,43 @@ pub fn provider_infos(
     selected: &str,
     env: impl Fn(&str) -> Option<String>,
 ) -> Vec<AskProviderInfo> {
-    AskProvider::ALL
+    provider_instances(providers)
         .iter()
-        .map(|provider| {
-            let configured = providers.get(provider.id());
-            let settings = configured.cloned().unwrap_or_default();
-            AskProviderInfo {
-                id: provider.id().to_string(),
-                title: provider.title().to_string(),
-                kind: provider.kind(),
-                executable: provider.executable().map(str::to_string),
-                credential_env: provider.credential_env().to_string(),
-                credential_required: provider.credential_required(),
-                credential_present: resolve_api_key(*provider, None, &settings, &env).is_some(),
-                model: configured
-                    .and_then(|config| config.model.clone())
-                    .or_else(|| provider.default_model().map(str::to_string)),
-                selected: provider.id() == selected,
-            }
-        })
+        .map(|instance| instance_info(instance, selected, &env))
         .collect()
 }
 
-/// A provider muxa can ask headlessly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AskProvider {
+/// One row of [`provider_infos`].
+fn instance_info(
+    instance: &AskProviderInstance,
+    selected: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> AskProviderInfo {
+    AskProviderInfo {
+        id: instance.id.clone(),
+        title: instance.title.clone(),
+        engine: instance.engine.id().to_string(),
+        kind: instance.kind(),
+        executable: instance.executable().map(str::to_string),
+        credential_env: instance.credential_env().to_string(),
+        credential_required: instance.engine.credential_required(),
+        credential_present: resolve_api_key(instance, None, &env).is_some(),
+        model: instance.model().map(str::to_string),
+        selected: instance.id == selected,
+        builtin: instance.builtin,
+        configured: instance.configured,
+    }
+}
+
+/// The code that drives one provider: its argv or HTTP shape, the envelope
+/// it answers with, and the environment variable its key lives in.
+///
+/// Closed by construction — a new member is a new parser and a new argv,
+/// not a config entry. [`AskProviderInstance`] is the open half: several
+/// instances may share one engine, each with its own id, model, and key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AskEngine {
     Claude,
     Codex,
     Gemini,
@@ -1101,7 +1518,7 @@ pub enum AskProvider {
     OpenAi,
 }
 
-impl AskProvider {
+impl AskEngine {
     /// Every provider, in the order clients list them.
     pub const ALL: [Self; 5] = [
         Self::Claude,
@@ -1154,7 +1571,7 @@ impl AskProvider {
         }
     }
 
-    /// The binary a CLI provider spawns.
+    /// The binary a CLI engine spawns unless an instance overrides it.
     #[must_use]
     pub fn executable(self) -> Option<&'static str> {
         match self {
@@ -1322,13 +1739,17 @@ impl AskProvider {
     }
 
     async fn run_cli(self, turn: &Turn<'_>) -> Result<AskAnswer, String> {
-        let (bin, args) = self.argv(
+        let (default_bin, args) = self.argv(
             turn.prompt,
             turn.resume,
             turn.permission_mode,
             turn.additional_dirs,
             turn.model,
         );
+        // An instance may point at its own copy of the CLI — a second
+        // `claude` under a different login, say. Only the program changes;
+        // the argv and the parser stay the engine's.
+        let bin = turn.executable.unwrap_or(default_bin);
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(&args)
             .current_dir(turn.cwd)
@@ -1364,9 +1785,8 @@ impl AskProvider {
         let Some(api_key) = turn.api_key else {
             return Err(format!(
                 "no API key for {title}: pass one for this turn, set {env} in muxad's environment, \
-                 or point [ask.providers.{id}] api_key_env at a variable that holds it",
+                 or point this provider's api_key_env at a variable that holds it",
                 env = self.credential_env(),
-                id = self.id(),
             ));
         };
         let model = turn
@@ -1426,6 +1846,8 @@ struct Turn<'a> {
     additional_dirs: &'a [PathBuf],
     timeout: Duration,
     model: Option<&'a str>,
+    /// Binary a CLI engine spawns, when the instance overrides it.
+    executable: Option<&'a str>,
     api_key: Option<&'a str>,
 }
 
@@ -1437,20 +1859,24 @@ fn timeout_message(what: &str, timeout: Duration) -> String {
 }
 
 /// Where an API key comes from, in order: the request's one-turn
-/// credential, the provider's own environment variable in the daemon's
-/// environment, then whatever variable `[ask.providers.<id>] api_key_env`
-/// names. `env` is injected so the order is testable without touching the
-/// process environment.
+/// credential, the engine's own environment variable in the daemon's
+/// environment, then whatever variable the instance's `api_key_env` names.
+/// `env` is injected so the order is testable without touching the process
+/// environment.
+///
+/// The engine's variable comes first because that is the one a shell
+/// already exports. Two instances of one engine therefore see the same
+/// ambient key unless each names its own `api_key_env` — or the client
+/// sends a one-turn credential, which always wins.
 fn resolve_api_key(
-    provider: AskProvider,
+    instance: &AskProviderInstance,
     credential: Option<String>,
-    config: &AskProviderConfig,
     env: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
     credential
         .filter(|key| !key.trim().is_empty())
-        .or_else(|| env(provider.credential_env()))
-        .or_else(|| config.api_key_env.as_deref().and_then(&env))
+        .or_else(|| env(instance.credential_env()))
+        .or_else(|| instance.api_key_env.as_deref().and_then(&env))
         .filter(|key| !key.trim().is_empty())
 }
 
@@ -1755,15 +2181,127 @@ fn find_str(value: &serde_json::Value, key: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Apply `edit` to `[ask.providers.<id>]` in `path` — set, remove, or
-/// leave each key — keeping every other byte of the file. Tables that end
-/// up empty are dropped so a cleared provider leaves no stray header
-/// behind. The merged text has to read back as a full [`Config`] before it
-/// is written, and the write is tmp-then-rename with the file's existing
-/// mode preserved. Returns the config as written.
+/// leave each key — keeping every other byte of the file. A table that
+/// ends up empty is dropped so a cleared built-in leaves no stray header
+/// behind; a composed instance always keeps its `engine`, so its table
+/// survives every edit. Returns the config as written.
 pub fn write_provider_config(
     path: &Path,
     provider: &str,
     edit: &AskProviderEdit,
+) -> Result<Config, String> {
+    edit_config_document(path, |document| {
+        let ask = implicit_table(document.as_table_mut(), "ask")?;
+        let providers = implicit_table(ask, "providers")?;
+        let entry = implicit_table(providers, provider)?;
+        // A real header for the provider itself: `[ask.providers.<id>]`
+        // is what the operator expects to find and edit.
+        entry.set_implicit(false);
+        for (key, change) in edit.entries() {
+            match change.map(Option::as_deref) {
+                // Absent from the edit: leave the key exactly as it is.
+                None => {}
+                Some(Some(value)) => set_value(entry, key, value),
+                Some(None) => {
+                    entry.remove(key);
+                }
+            }
+        }
+        if entry.is_empty() {
+            providers.remove(provider);
+        }
+        prune_ask(document)
+    })
+}
+
+/// Write a fresh `[ask.providers.<id>]` table for `request`. The caller has
+/// already checked the id and engine; this only renders them.
+fn write_new_provider(
+    path: &Path,
+    id: &str,
+    engine: AskEngine,
+    request: &AskProviderAdd,
+) -> Result<Config, String> {
+    edit_config_document(path, |document| {
+        let ask = implicit_table(document.as_table_mut(), "ask")?;
+        let providers = implicit_table(ask, "providers")?;
+        let entry = implicit_table(providers, id)?;
+        entry.set_implicit(false);
+        // `engine` first: it is what the instance is, and an operator
+        // reading the file should see it before the tuning.
+        set_value(entry, "engine", engine.id());
+        for (key, value) in [
+            ("title", request.title.as_deref()),
+            ("model", request.model.as_deref()),
+            ("api_key_env", request.api_key_env.as_deref()),
+            ("executable", request.executable.as_deref()),
+        ] {
+            if let Some(value) = value {
+                set_value(entry, key, value);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Drop `[ask.providers.<id>]` entirely, and point `[ask] agent` at
+/// `select` when the file named the provider being removed. Only rewrites
+/// `agent` if the key is already there: materialising one the operator
+/// never wrote would be muxa editing a choice it was not asked about.
+fn remove_provider_config(path: &Path, id: &str, select: Option<&str>) -> Result<Config, String> {
+    edit_config_document(path, |document| {
+        let ask = implicit_table(document.as_table_mut(), "ask")?;
+        let providers = implicit_table(ask, "providers")?;
+        providers.remove(id);
+        if let Some(select) = select {
+            if ask.get("agent").and_then(toml_edit::Item::as_str) == Some(id) {
+                set_value(ask, "agent", select);
+            }
+        }
+        prune_ask(document)
+    })
+}
+
+/// `table[key] = value`, replacing in place so a comment on the line
+/// survives.
+fn set_value(table: &mut toml_edit::Table, key: &str, value: &str) {
+    match table.get_mut(key).and_then(toml_edit::Item::as_value_mut) {
+        Some(existing) => {
+            let decor = existing.decor().clone();
+            *existing = toml_edit::Value::from(value);
+            *existing.decor_mut() = decor;
+        }
+        None => {
+            table.insert(key, toml_edit::value(value));
+        }
+    }
+}
+
+/// Drop the `[ask.providers]` and `[ask]` scaffolding once nothing is left
+/// under it, so clearing the last override leaves the file as it was.
+fn prune_ask(document: &mut toml_edit::DocumentMut) -> Result<(), String> {
+    let ask = implicit_table(document.as_table_mut(), "ask")?;
+    if ask
+        .get("providers")
+        .and_then(toml_edit::Item::as_table)
+        .is_some_and(toml_edit::Table::is_empty)
+    {
+        ask.remove("providers");
+    }
+    if ask.is_empty() && ask.is_implicit() {
+        document.remove("ask");
+    }
+    Ok(())
+}
+
+/// Parse `path`, hand the document to `mutate`, and write it back — but
+/// only after the merged text reads as a full [`Config`] and passes
+/// validation, so a bad value cannot leave the daemon unable to start. The
+/// write is tmp-then-rename with the file's existing mode preserved.
+/// Returns the config as written.
+fn edit_config_document(
+    path: &Path,
+    mutate: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
 ) -> Result<Config, String> {
     let mut document = match std::fs::read_to_string(path) {
         Ok(text) if !text.trim().is_empty() => text
@@ -1773,50 +2311,7 @@ pub fn write_provider_config(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
         Err(error) => return Err(format!("reading {}: {error}", path.display())),
     };
-
-    {
-        let ask = implicit_table(document.as_table_mut(), "ask")?;
-        let providers = implicit_table(ask, "providers")?;
-        let entry = implicit_table(providers, provider)?;
-        // A real header for the provider itself: `[ask.providers.<id>]`
-        // is what the operator expects to find and edit.
-        entry.set_implicit(false);
-        for (key, change) in [
-            ("model", edit.model.as_ref()),
-            ("api_key_env", edit.api_key_env.as_ref()),
-        ] {
-            match change.map(Option::as_deref) {
-                // Absent from the edit: leave the key exactly as it is.
-                None => {}
-                Some(Some(value)) => {
-                    match entry.get_mut(key).and_then(toml_edit::Item::as_value_mut) {
-                        // Replace in place so a comment on the line survives.
-                        Some(existing) => {
-                            let decor = existing.decor().clone();
-                            *existing = toml_edit::Value::from(value);
-                            *existing.decor_mut() = decor;
-                        }
-                        None => {
-                            entry.insert(key, toml_edit::value(value));
-                        }
-                    }
-                }
-                Some(None) => {
-                    entry.remove(key);
-                }
-            }
-        }
-        if entry.is_empty() {
-            providers.remove(provider);
-        }
-        if providers.is_empty() {
-            ask.remove("providers");
-        }
-        if ask.is_empty() && ask.is_implicit() {
-            document.remove("ask");
-        }
-    }
-
+    mutate(&mut document)?;
     let text = document.to_string();
     let config: Config = toml::from_str(&text)
         .map_err(|e| format!("the updated config would not parse, so it was not written: {e}"))?;
@@ -1889,6 +2384,21 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// The built-in instance for one engine, as `provider_instances` would
+    /// mint it with no `[ask.providers]` at all.
+    fn builtin(engine: AskEngine) -> AskProviderInstance {
+        AskProviderInstance {
+            id: engine.id().to_string(),
+            title: engine.title().to_string(),
+            engine,
+            model: None,
+            api_key_env: None,
+            executable: None,
+            builtin: true,
+            configured: false,
+        }
+    }
+
     #[test]
     fn claude_json_yields_text_session_and_cost() {
         let raw =
@@ -1946,13 +2456,13 @@ mod tests {
     #[test]
     fn claude_argv_only_resumes_when_there_is_a_thread() {
         let (bin, fresh) =
-            AskProvider::Claude.argv("hi", None, AskPermissionMode::Default, &[], None);
+            AskEngine::Claude.argv("hi", None, AskPermissionMode::Default, &[], None);
         assert_eq!(bin, "claude");
         assert!(!fresh.contains(&"--resume".to_string()));
         assert_eq!(fresh.last().unwrap(), "hi");
 
         let (_, resumed) =
-            AskProvider::Claude.argv("hi", Some("s-9"), AskPermissionMode::Default, &[], None);
+            AskEngine::Claude.argv("hi", Some("s-9"), AskPermissionMode::Default, &[], None);
         let at = resumed.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(resumed[at + 1], "s-9");
     }
@@ -1961,33 +2471,31 @@ mod tests {
     fn execution_controls_are_explicit_in_agent_argv() {
         let dirs = [PathBuf::from("/nfs/home/june")];
         let (_, claude) =
-            AskProvider::Claude.argv("resolve", None, AskPermissionMode::Bypass, &dirs, None);
+            AskEngine::Claude.argv("resolve", None, AskPermissionMode::Bypass, &dirs, None);
         assert!(claude.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(claude.contains(&"--add-dir=/nfs/home/june".to_string()));
 
         let (_, codex) =
-            AskProvider::Codex.argv("resolve", None, AskPermissionMode::Bypass, &dirs, None);
+            AskEngine::Codex.argv("resolve", None, AskPermissionMode::Bypass, &dirs, None);
         assert!(codex.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(codex.contains(&"--add-dir=/nfs/home/june".to_string()));
 
         let (_, safe) =
-            AskProvider::Claude.argv("question", None, AskPermissionMode::Default, &dirs, None);
+            AskEngine::Claude.argv("question", None, AskPermissionMode::Default, &dirs, None);
         assert!(!safe.contains(&"--dangerously-skip-permissions".to_string()));
     }
 
     #[test]
     fn plan_mode_is_read_only_in_every_cli_argv() {
-        let (_, claude) =
-            AskProvider::Claude.argv("draft", None, AskPermissionMode::Plan, &[], None);
+        let (_, claude) = AskEngine::Claude.argv("draft", None, AskPermissionMode::Plan, &[], None);
         assert!(claude.contains(&"--permission-mode=plan".to_string()));
         assert!(!claude.contains(&"--dangerously-skip-permissions".to_string()));
 
-        let (_, codex) = AskProvider::Codex.argv("draft", None, AskPermissionMode::Plan, &[], None);
+        let (_, codex) = AskEngine::Codex.argv("draft", None, AskPermissionMode::Plan, &[], None);
         assert!(codex.contains(&"--sandbox=read-only".to_string()));
         assert!(!codex.iter().any(|arg| arg.contains("bypass")));
 
-        let (_, gemini) =
-            AskProvider::Gemini.argv("draft", None, AskPermissionMode::Plan, &[], None);
+        let (_, gemini) = AskEngine::Gemini.argv("draft", None, AskPermissionMode::Plan, &[], None);
         let at = gemini.iter().position(|a| a == "--approval-mode").unwrap();
         assert_eq!(gemini[at + 1], "plan");
         assert!(!gemini.contains(&"--yolo".to_string()));
@@ -1996,7 +2504,7 @@ mod tests {
     #[test]
     fn gemini_argv_is_headless_json_with_directories_model_and_resume() {
         let dirs = [PathBuf::from("/srv/shared")];
-        let (bin, args) = AskProvider::Gemini.argv(
+        let (bin, args) = AskEngine::Gemini.argv(
             "hi",
             Some("sess-1"),
             AskPermissionMode::Bypass,
@@ -2020,7 +2528,7 @@ mod tests {
 
     #[test]
     fn a_configured_model_reaches_claude_and_codex_argv() {
-        let (_, claude) = AskProvider::Claude.argv(
+        let (_, claude) = AskEngine::Claude.argv(
             "hi",
             None,
             AskPermissionMode::Default,
@@ -2030,7 +2538,7 @@ mod tests {
         let at = claude.iter().position(|a| a == "--model").unwrap();
         assert_eq!(claude[at + 1], "claude-opus-5");
         let (_, codex) =
-            AskProvider::Codex.argv("hi", None, AskPermissionMode::Default, &[], Some("gpt-5"));
+            AskEngine::Codex.argv("hi", None, AskPermissionMode::Default, &[], Some("gpt-5"));
         let at = codex.iter().position(|a| a == "--model").unwrap();
         assert_eq!(codex[at + 1], "gpt-5");
         // And the prompt is still the trailing argument for both.
@@ -2053,17 +2561,21 @@ mod tests {
             supported_agents(),
             &["claude", "codex", "gemini", "anthropic", "openai"]
         );
-        for (provider, id) in AskProvider::ALL.iter().zip(supported_agents()) {
+        for (provider, id) in AskEngine::ALL.iter().zip(supported_agents()) {
             assert_eq!(provider.id(), *id);
-            assert_eq!(AskProvider::parse(id), Some(*provider));
-            assert_eq!(AskProvider::parse(&id.to_uppercase()), Some(*provider));
+            assert_eq!(AskEngine::parse(id), Some(*provider));
+            assert_eq!(AskEngine::parse(&id.to_uppercase()), Some(*provider));
         }
-        assert_eq!(AskProvider::parse("bard"), None);
-        assert_eq!(AskProvider::Claude.kind(), AskProviderKind::Cli);
-        assert_eq!(AskProvider::OpenAi.kind(), AskProviderKind::Api);
-        assert_eq!(AskProvider::Gemini.credential_env(), "GEMINI_API_KEY");
-        assert_eq!(AskProvider::Anthropic.credential_env(), "ANTHROPIC_API_KEY");
-        assert_eq!(AskProvider::OpenAi.credential_env(), "OPENAI_API_KEY");
+        assert_eq!(AskEngine::parse("bard"), None);
+        assert_eq!(builtin_engine("anthropic"), Some(AskEngine::Anthropic));
+        // Exact match only: a config table key is not case-folded.
+        assert_eq!(builtin_engine("Anthropic"), None);
+        assert_eq!(builtin_engine("anthropic-work"), None);
+        assert_eq!(AskEngine::Claude.kind(), AskProviderKind::Cli);
+        assert_eq!(AskEngine::OpenAi.kind(), AskProviderKind::Api);
+        assert_eq!(AskEngine::Gemini.credential_env(), "GEMINI_API_KEY");
+        assert_eq!(AskEngine::Anthropic.credential_env(), "ANTHROPIC_API_KEY");
+        assert_eq!(AskEngine::OpenAi.credential_env(), "OPENAI_API_KEY");
     }
 
     #[test]
@@ -2074,13 +2586,14 @@ mod tests {
             AskProviderConfig {
                 model: Some("gpt-5-mini".into()),
                 api_key_env: Some("WORK_OPENAI".into()),
+                ..AskProviderConfig::default()
             },
         );
         providers.insert(
             "codex".to_string(),
             AskProviderConfig {
                 model: Some("gpt-5-codex".into()),
-                api_key_env: None,
+                ..AskProviderConfig::default()
             },
         );
         // The daemon's environment holds a Gemini key and the variable the
@@ -2091,31 +2604,51 @@ mod tests {
             _ => None,
         };
         let infos = provider_infos(&providers, "anthropic", env);
+        // Configured ids lead, in id order; the untouched built-ins follow
+        // in their own.
         let ids: Vec<&str> = infos.iter().map(|info| info.id.as_str()).collect();
-        assert_eq!(ids, supported_agents());
+        assert_eq!(ids, ["codex", "openai", "claude", "gemini", "anthropic"]);
+        assert!(
+            infos.iter().all(|info| info.builtin),
+            "all five are built in"
+        );
+        // `configured` is the other question: which rows have a table.
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|info| info.configured)
+                .map(|info| info.id.as_str())
+                .collect::<Vec<_>>(),
+            ["codex", "openai"]
+        );
 
-        let anthropic = &infos[3];
+        let anthropic = infos.iter().find(|info| info.id == "anthropic").unwrap();
         assert_eq!(
             serde_json::to_value(anthropic).unwrap(),
             serde_json::json!({
-                "id": "anthropic", "title": "Anthropic API", "kind": "api",
-                "executable": null, "credential_env": "ANTHROPIC_API_KEY",
+                "id": "anthropic", "title": "Anthropic API", "engine": "anthropic",
+                "kind": "api", "executable": null,
+                "credential_env": "ANTHROPIC_API_KEY",
                 "credential_required": true, "credential_present": false,
                 "model": "claude-sonnet-5", "selected": true,
+                "builtin": true, "configured": false,
             })
         );
-        let openai = &infos[4];
+        let openai = infos.iter().find(|info| info.id == "openai").unwrap();
         assert_eq!(openai.model.as_deref(), Some("gpt-5-mini"));
         assert!(openai.credential_present, "resolved through api_key_env");
         assert!(!openai.selected);
-        let claude = &infos[0];
+        let claude = infos.iter().find(|info| info.id == "claude").unwrap();
         assert_eq!(claude.kind, AskProviderKind::Cli);
+        assert_eq!(claude.engine, "claude");
         assert_eq!(claude.executable.as_deref(), Some("claude"));
         assert!(!claude.credential_required);
         assert!(!claude.credential_present);
         assert_eq!(claude.model, None);
-        assert!(infos[2].credential_present, "GEMINI_API_KEY is set");
-        assert_eq!(infos[1].model.as_deref(), Some("gpt-5-codex"));
+        let gemini = infos.iter().find(|info| info.id == "gemini").unwrap();
+        assert!(gemini.credential_present, "GEMINI_API_KEY is set");
+        let codex = infos.iter().find(|info| info.id == "codex").unwrap();
+        assert_eq!(codex.model.as_deref(), Some("gpt-5-codex"));
         // The list survives a JSON round trip for native clients.
         let text = serde_json::to_string(&infos).unwrap();
         let back: Vec<AskProviderInfo> = serde_json::from_str(&text).unwrap();
@@ -2124,9 +2657,9 @@ mod tests {
 
     #[test]
     fn api_key_resolution_prefers_the_request_then_env_then_configured_variable() {
-        let config = AskProviderConfig {
-            model: None,
+        let instance = AskProviderInstance {
             api_key_env: Some("WORK_KEY".into()),
+            ..builtin(AskEngine::OpenAi)
         };
         let env = |name: &str| match name {
             "OPENAI_API_KEY" => Some("from-env".to_string()),
@@ -2134,26 +2667,20 @@ mod tests {
             _ => None,
         };
         assert_eq!(
-            resolve_api_key(
-                AskProvider::OpenAi,
-                Some("from-request".into()),
-                &config,
-                env
-            )
-            .as_deref(),
+            resolve_api_key(&instance, Some("from-request".into()), env).as_deref(),
             Some("from-request")
         );
         assert_eq!(
-            resolve_api_key(AskProvider::OpenAi, None, &config, env).as_deref(),
+            resolve_api_key(&instance, None, env).as_deref(),
             Some("from-env")
         );
         let only_work = |name: &str| (name == "WORK_KEY").then(|| "from-work".to_string());
         assert_eq!(
-            resolve_api_key(AskProvider::OpenAi, None, &config, only_work).as_deref(),
+            resolve_api_key(&instance, None, only_work).as_deref(),
             Some("from-work")
         );
         assert_eq!(
-            resolve_api_key(AskProvider::OpenAi, Some("  ".into()), &config, |_| None),
+            resolve_api_key(&instance, Some("  ".into()), |_| None),
             None
         );
     }
@@ -2358,9 +2885,10 @@ mod tests {
             additional_dirs: &[],
             timeout: Duration::from_secs(5),
             model,
+            executable: None,
             api_key: Some(api_key),
         };
-        let answer = AskProvider::Anthropic
+        let answer = AskEngine::Anthropic
             .call_api(
                 &format!("{}/v1/messages", server.uri()),
                 &turn("sk-test", Some("claude-opus-5")),
@@ -2370,7 +2898,7 @@ mod tests {
         assert_eq!(answer.text, "two");
         assert_eq!(answer.session_id, None);
 
-        let error = AskProvider::OpenAi
+        let error = AskEngine::OpenAi
             .call_api(
                 &format!("{}/v1/chat/completions", server.uri()),
                 &turn("sk-open", None),
@@ -2380,7 +2908,7 @@ mod tests {
         assert_eq!(error, "OpenAI API returned HTTP 429: slow down");
 
         // No key at all fails before any request leaves the process.
-        let missing = AskProvider::OpenAi
+        let missing = AskEngine::OpenAi
             .call_api(
                 &format!("{}/v1/chat/completions", server.uri()),
                 &Turn {
@@ -2628,7 +3156,7 @@ mod tests {
     async fn an_unknown_agent_is_refused() {
         let store = AskStore::in_memory(AskOptions::default());
         let error = store.set_agent("bard").await.unwrap_err().to_string();
-        assert!(error.contains("is not supported"), "{error}");
+        assert!(error.contains("is not configured"), "{error}");
         assert_eq!(store.agent().await, "claude");
     }
 
@@ -2719,6 +3247,7 @@ mod tests {
             &AskProviderEdit {
                 model: Some(Some("claude-opus-5".into())),
                 api_key_env: Some(Some("WORK_KEY".into())),
+                ..AskProviderEdit::default()
             },
         )
         .unwrap();
@@ -2744,7 +3273,7 @@ mod tests {
             "anthropic",
             &AskProviderEdit {
                 model: Some(Some("claude-sonnet-5".into())),
-                api_key_env: None,
+                ..AskProviderEdit::default()
             },
         )
         .unwrap();
@@ -2762,7 +3291,7 @@ mod tests {
             "anthropic",
             &AskProviderEdit {
                 model: Some(None),
-                api_key_env: None,
+                ..AskProviderEdit::default()
             },
         )
         .unwrap();
@@ -2777,6 +3306,7 @@ mod tests {
             &AskProviderEdit {
                 model: Some(None),
                 api_key_env: Some(None),
+                ..AskProviderEdit::default()
             },
         )
         .unwrap();
@@ -2796,7 +3326,7 @@ mod tests {
             "openai",
             &AskProviderEdit {
                 model: Some(Some("gpt-5-mini".into())),
-                api_key_env: None,
+                ..AskProviderEdit::default()
             },
         )
         .unwrap();
@@ -2821,7 +3351,7 @@ mod tests {
             "openai",
             &AskProviderEdit {
                 model: Some(Some("gpt-5".into())),
-                api_key_env: None,
+                ..AskProviderEdit::default()
             },
         )
         .unwrap_err();
@@ -2844,6 +3374,7 @@ mod tests {
                 AskProviderEdit {
                     model: Some(Some("gpt-5-mini".into())),
                     api_key_env: Some(Some(" WORK_OPENAI ".into())),
+                    ..AskProviderEdit::default()
                 },
             )
             .await
@@ -2860,7 +3391,7 @@ mod tests {
                 "openai",
                 AskProviderEdit {
                     model: Some(Some(String::new())),
-                    api_key_env: None,
+                    ..AskProviderEdit::default()
                 },
             )
             .await
@@ -2873,8 +3404,8 @@ mod tests {
             .configure_provider(
                 "openai",
                 AskProviderEdit {
-                    model: None,
                     api_key_env: Some(None),
+                    ..AskProviderEdit::default()
                 },
             )
             .await
@@ -2896,5 +3427,475 @@ mod tests {
                 .await,
             Err(AskError::NoConfigPath(_))
         ));
+    }
+
+    #[test]
+    fn a_bare_model_override_still_means_the_built_in_provider() {
+        // The shape every config written before instances existed has: a
+        // table named after a built-in, with no `engine`. It has to keep
+        // meaning "the built-in, tuned", not "an instance of nothing".
+        let config: Config = toml::from_str(
+            "[ask.providers.anthropic]\nmodel = \"claude-opus-5\"\n\n\
+             [ask.providers.claude]\napi_key_env = \"WORK_ANTHROPIC_KEY\"\n",
+        )
+        .unwrap();
+        config.validate().expect("a bare override still validates");
+
+        let instances = provider_instances(&config.ask.providers);
+        let ids: Vec<&str> = instances.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["anthropic", "claude", "codex", "gemini", "openai"]);
+        assert!(instances.iter().all(|i| i.builtin));
+        // A tuned built-in is both built in and configured; the three with
+        // no table are built in only.
+        assert_eq!(
+            instances
+                .iter()
+                .filter(|i| i.configured)
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>(),
+            ["anthropic", "claude"]
+        );
+
+        let anthropic = find_instance(&instances, "anthropic").unwrap();
+        assert_eq!(anthropic.engine, AskEngine::Anthropic);
+        assert_eq!(anthropic.title, "Anthropic API");
+        assert_eq!(anthropic.model(), Some("claude-opus-5"));
+        assert_eq!(anthropic.credential_env(), "ANTHROPIC_API_KEY");
+        let claude = find_instance(&instances, "claude").unwrap();
+        assert_eq!(claude.engine, AskEngine::Claude);
+        assert_eq!(claude.executable(), Some("claude"));
+        assert_eq!(claude.model(), None);
+
+        // A composed id with no engine, and a built-in id claiming someone
+        // else's engine, are both refused at load rather than silently
+        // dropped from the list.
+        for broken in [
+            "[ask.providers.anthropic-work]\nmodel = \"claude-opus-5\"\n",
+            "[ask.providers.claude]\nengine = \"codex\"\n",
+            "[ask.providers.mine]\nengine = \"bard\"\n",
+        ] {
+            let config: Config = toml::from_str(broken).unwrap();
+            assert!(config.validate().is_err(), "{broken}");
+        }
+    }
+
+    #[test]
+    fn an_empty_table_is_configured_even_though_it_changes_nothing() {
+        // `builtin` and `configured` answer different questions, and this
+        // is the row where they diverge with every visible value equal to
+        // the shipped default: a client can still offer Remove for it.
+        let providers = BTreeMap::from([("anthropic".to_string(), AskProviderConfig::default())]);
+        let infos = provider_infos(&providers, "claude", |_| None);
+        let anthropic = infos.iter().find(|info| info.id == "anthropic").unwrap();
+        let bare = provider_infos(&BTreeMap::new(), "claude", |_| None);
+        let shipped = bare.iter().find(|info| info.id == "anthropic").unwrap();
+        assert!(anthropic.builtin && shipped.builtin);
+        assert!(anthropic.configured && !shipped.configured);
+        assert_eq!(anthropic.model, shipped.model);
+        assert_eq!(anthropic.title, shipped.title);
+    }
+
+    #[test]
+    fn two_instances_of_one_engine_each_resolve_their_own_key() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "anthropic-work".to_string(),
+            AskProviderConfig {
+                engine: Some("anthropic".into()),
+                title: Some("Anthropic (work)".into()),
+                api_key_env: Some("WORK_ANTHROPIC_KEY".into()),
+                model: Some("claude-opus-5".into()),
+                executable: None,
+            },
+        );
+        providers.insert(
+            "anthropic_personal".to_string(),
+            AskProviderConfig {
+                engine: Some("anthropic".into()),
+                api_key_env: Some("HOME_ANTHROPIC_KEY".into()),
+                ..AskProviderConfig::default()
+            },
+        );
+        // muxad's own environment carries neither engine variable, which is
+        // what leaves each instance's `api_key_env` free to differ.
+        let env = |name: &str| match name {
+            "WORK_ANTHROPIC_KEY" => Some("sk-work".to_string()),
+            "HOME_ANTHROPIC_KEY" => Some("sk-home".to_string()),
+            _ => None,
+        };
+
+        let instances = provider_instances(&providers);
+        let work = find_instance(&instances, "anthropic-work").unwrap();
+        let personal = find_instance(&instances, "anthropic_personal").unwrap();
+        assert_eq!(work.engine, personal.engine);
+        assert_eq!(work.credential_env(), personal.credential_env());
+        assert_eq!(resolve_api_key(work, None, env).as_deref(), Some("sk-work"));
+        assert_eq!(
+            resolve_api_key(personal, None, env).as_deref(),
+            Some("sk-home")
+        );
+        // Neither is built in, and the one without a title gets a humanized
+        // id rather than the engine's name.
+        assert!(!work.builtin && !personal.builtin);
+        assert!(work.configured && personal.configured);
+        assert_eq!(work.title, "Anthropic (work)");
+        assert_eq!(personal.title, "Anthropic Personal");
+
+        // Both are offered, ahead of the five that ship with muxa.
+        let infos = provider_infos(&providers, "anthropic-work", env);
+        let ids: Vec<&str> = infos.iter().map(|info| info.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "anthropic-work",
+                "anthropic_personal",
+                "claude",
+                "codex",
+                "gemini",
+                "anthropic",
+                "openai",
+            ]
+        );
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|info| info.builtin)
+                .map(|info| info.id.as_str())
+                .collect::<Vec<_>>(),
+            supported_agents()
+        );
+        let work = &infos[0];
+        assert!(work.selected && work.credential_present);
+        assert_eq!(work.engine, "anthropic");
+        assert_eq!(work.model.as_deref(), Some("claude-opus-5"));
+        // The built-in `anthropic` row is still there, still unconfigured.
+        let builtin = infos.iter().find(|info| info.id == "anthropic").unwrap();
+        assert!(builtin.builtin && !builtin.configured);
+        assert!(!builtin.credential_present);
+        assert_eq!(builtin.model.as_deref(), Some("claude-sonnet-5"));
+    }
+
+    #[tokio::test]
+    async fn two_instances_of_one_engine_keep_separate_conversations() {
+        let mut providers = BTreeMap::new();
+        for id in ["anthropic-work", "anthropic-personal"] {
+            providers.insert(
+                id.to_string(),
+                AskProviderConfig {
+                    engine: Some("anthropic".into()),
+                    ..AskProviderConfig::default()
+                },
+            );
+        }
+        let store = AskStore::in_memory(AskOptions {
+            agent: "anthropic-work".into(),
+            providers,
+            ..AskOptions::default()
+        });
+        let work = store.reset_thread().await;
+        assert_eq!(work.agent, "anthropic-work");
+        assert_eq!(
+            store.set_agent("anthropic-personal").await.unwrap(),
+            "anthropic-personal"
+        );
+        let personal = store.reset_thread().await;
+        assert_ne!(work.id, personal.id);
+        assert_eq!(store.active_conversation().await.unwrap().id, personal.id);
+        store.set_agent("anthropic-work").await.unwrap();
+        assert_eq!(store.active_conversation().await.unwrap().id, work.id);
+        // The built-in engine id is still selectable next to them.
+        assert_eq!(store.set_agent("anthropic").await.unwrap(), "anthropic");
+        assert!(store.set_agent("anthropic-nope").await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cli_instance_spawns_the_binary_it_names() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let fake = directory.path().join("claude-work");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s' \"{\\\"is_error\\\":false,\\\"result\\\":\\\"PONG $*\\\",\\\"session_id\\\":\\\"s-1\\\"}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = AskProviderConfig {
+            engine: Some("claude".into()),
+            executable: Some(fake.display().to_string()),
+            model: Some("claude-opus-5".into()),
+            ..AskProviderConfig::default()
+        };
+        let instance = resolve_instance("claude-work", &config).unwrap();
+        assert_eq!(instance.engine, AskEngine::Claude);
+        assert_eq!(
+            instance.executable(),
+            Some(fake.display().to_string().as_str())
+        );
+        assert!(!instance.builtin);
+
+        let answer = one_shot_configured(
+            OneShot {
+                agent: "claude-work",
+                prompt: "hi",
+                cwd: directory.path(),
+                permission_mode: AskPermissionMode::Plan,
+                additional_dirs: &[],
+                timeout: Duration::from_secs(30),
+            },
+            Some(&config),
+        )
+        .await
+        .unwrap();
+        // The engine's argv reached the instance's own binary.
+        assert!(answer.text.starts_with("PONG -p"), "{}", answer.text);
+        assert!(
+            answer.text.contains("--permission-mode=plan"),
+            "{}",
+            answer.text
+        );
+        assert!(answer.text.contains("claude-opus-5"), "{}", answer.text);
+        assert_eq!(answer.session_id.as_deref(), Some("s-1"));
+
+        // An API engine has no binary to override.
+        let api = resolve_instance(
+            "openai-work",
+            &AskProviderConfig {
+                engine: Some("openai".into()),
+                executable: Some("/bin/echo".into()),
+                ..AskProviderConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(api.executable(), None);
+    }
+
+    #[allow(clippy::too_many_lines)] // one add/refuse/remove lifecycle, in order
+    #[tokio::test]
+    async fn instances_are_added_and_removed_through_config() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# operator notes\n[ask]\nenabled = true\nagent = \"anthropic-work\"\n",
+        )
+        .unwrap();
+        let store = AskStore::in_memory(AskOptions {
+            enabled: true,
+            agent: "anthropic-work".into(),
+            config_path: Some(path.clone()),
+            ..AskOptions::default()
+        });
+
+        let infos = store
+            .add_provider(AskProviderAdd {
+                id: "anthropic-work".into(),
+                engine: " Anthropic ".into(),
+                title: Some("Anthropic (work)".into()),
+                api_key_env: Some("WORK_ANTHROPIC_KEY".into()),
+                ..AskProviderAdd::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(infos[0].id, "anthropic-work");
+        assert_eq!(infos[0].engine, "anthropic");
+        assert_eq!(infos[0].title, "Anthropic (work)");
+        assert!(!infos[0].builtin);
+        assert!(infos[0].selected, "[ask] agent already named it");
+        assert_eq!(infos.len(), supported_agents().len() + 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# operator notes\n[ask]\n"), "{text}");
+        assert!(text.contains("[ask.providers.anthropic-work]"), "{text}");
+        assert!(text.contains("engine = \"anthropic\""), "{text}");
+        assert!(
+            text.contains("api_key_env = \"WORK_ANTHROPIC_KEY\""),
+            "{text}"
+        );
+        assert!(!text.contains("model ="), "{text}");
+
+        // Refusals, none of which touch the file.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let refuse = |request: AskProviderAdd| {
+            let store = std::sync::Arc::clone(&store);
+            async move { store.add_provider(request).await.unwrap_err() }
+        };
+        assert!(matches!(
+            refuse(AskProviderAdd {
+                id: "anthropic-work".into(),
+                engine: "anthropic".into(),
+                ..AskProviderAdd::default()
+            })
+            .await,
+            AskError::ProviderExists(_)
+        ));
+        assert!(matches!(
+            refuse(AskProviderAdd {
+                id: "anthropic work".into(),
+                engine: "anthropic".into(),
+                ..AskProviderAdd::default()
+            })
+            .await,
+            AskError::InvalidProviderId(_)
+        ));
+        assert!(matches!(
+            refuse(AskProviderAdd {
+                id: "mine".into(),
+                engine: "bard".into(),
+                ..AskProviderAdd::default()
+            })
+            .await,
+            AskError::UnknownEngine(_)
+        ));
+        assert!(matches!(
+            refuse(AskProviderAdd {
+                id: "claude".into(),
+                engine: "codex".into(),
+                ..AskProviderAdd::default()
+            })
+            .await,
+            AskError::BuiltinProviderEngine { .. }
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // A built-in id may be materialised into config under its own engine.
+        let infos = store
+            .add_provider(AskProviderAdd {
+                id: "claude".into(),
+                engine: "claude".into(),
+                executable: Some("/opt/homebrew/bin/claude".into()),
+                ..AskProviderAdd::default()
+            })
+            .await
+            .unwrap();
+        let claude = infos.iter().find(|info| info.id == "claude").unwrap();
+        assert!(
+            claude.builtin,
+            "a built-in id stays built in once configured"
+        );
+        assert!(claude.configured, "and now it has a table to remove");
+        assert_eq!(
+            claude.executable.as_deref(),
+            Some("/opt/homebrew/bin/claude")
+        );
+        assert_eq!(claude.title, "Claude Code");
+        assert_eq!(infos.len(), supported_agents().len() + 1);
+
+        // Removing a built-in's table leaves the shipped provider standing.
+        let infos = store.remove_provider("claude").await.unwrap();
+        let claude = infos.iter().find(|info| info.id == "claude").unwrap();
+        assert_eq!(claude.executable.as_deref(), Some("claude"));
+        assert!(claude.builtin && !claude.configured);
+        assert!(matches!(
+            store.remove_provider("claude").await,
+            Err(AskError::BuiltinProviderRemoval(_))
+        ));
+        assert!(matches!(
+            store.remove_provider("nope").await,
+            Err(AskError::UnsupportedAgent(_))
+        ));
+
+        // Removing the selected instance falls back to the first usable
+        // provider, in the file as well as in the running daemon.
+        assert_eq!(store.agent().await, "anthropic-work");
+        let infos = store.remove_provider("anthropic-work").await.unwrap();
+        let ids: Vec<&str> = infos.iter().map(|info| info.id.as_str()).collect();
+        assert_eq!(ids, supported_agents());
+        assert_eq!(store.agent().await, "claude");
+        assert!(infos[0].selected);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("agent = \"claude\""), "{text}");
+        assert!(!text.contains("providers"), "{text}");
+        assert!(Config::load(&path).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_instance_is_configured_and_keeps_its_engine() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let store = AskStore::in_memory(AskOptions {
+            config_path: Some(path.clone()),
+            ..AskOptions::default()
+        });
+        store
+            .add_provider(AskProviderAdd {
+                id: "openai-work".into(),
+                engine: "openai".into(),
+                ..AskProviderAdd::default()
+            })
+            .await
+            .unwrap();
+        let infos = store
+            .configure_provider(
+                "openai-work",
+                AskProviderEdit {
+                    title: Some(Some("OpenAI (work)".into())),
+                    model: Some(Some("gpt-5-mini".into())),
+                    api_key_env: Some(Some("WORK_OPENAI".into())),
+                    executable: Some(Some("  ".into())),
+                },
+            )
+            .await
+            .unwrap();
+        let work = infos.iter().find(|info| info.id == "openai-work").unwrap();
+        assert_eq!(work.title, "OpenAI (work)");
+        assert_eq!(work.model.as_deref(), Some("gpt-5-mini"));
+        assert_eq!(work.engine, "openai");
+
+        // Clearing every editable key keeps the instance: `engine` is what
+        // it is, not a setting, so the table never empties out from under it.
+        let infos = store
+            .configure_provider(
+                "openai-work",
+                AskProviderEdit {
+                    title: Some(None),
+                    model: Some(None),
+                    api_key_env: Some(None),
+                    executable: Some(None),
+                },
+            )
+            .await
+            .unwrap();
+        let work = infos.iter().find(|info| info.id == "openai-work").unwrap();
+        assert_eq!(work.title, "Openai Work");
+        assert_eq!(work.model.as_deref(), Some("gpt-5"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "[ask.providers.openai-work]\nengine = \"openai\"\n");
+    }
+
+    #[tokio::test]
+    async fn a_one_turn_key_is_matched_against_the_instance_not_the_engine() {
+        let mut providers = BTreeMap::new();
+        for id in ["anthropic-work", "anthropic-personal"] {
+            providers.insert(
+                id.to_string(),
+                AskProviderConfig {
+                    engine: Some("anthropic".into()),
+                    ..AskProviderConfig::default()
+                },
+            );
+        }
+        let store = AskStore::in_memory(AskOptions {
+            enabled: true,
+            agent: "anthropic-work".into(),
+            providers,
+            ..AskOptions::default()
+        });
+        // Same engine, different account: the key must not be spent on it.
+        let result = store
+            .ask_with_credential(
+                "hello",
+                Some(AskCredential {
+                    agent: "anthropic-personal".into(),
+                    api_key: "sk-personal".into(),
+                }),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(AskError::CredentialAgentMismatch { .. })
+        ));
+        assert!(store.list().await.is_empty());
     }
 }

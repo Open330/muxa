@@ -59,9 +59,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Ask providers are an open set, including API keys.** `muxa ask` and
-  Muxa.app's Global Ask accept `claude`, `codex`, `gemini` (CLIs) and
-  `anthropic`, `openai` (direct API calls with a key). API providers replay
+- **Automations: muxa can act on what it observes.** A rule engine in muxad
+  watches the agent events it already collects and, when a rule matches,
+  waits and then acts. The first rule that matters: an agent that hits its
+  session limit is sent `continue` a couple of minutes after the limit
+  resets (or after a fallback delay when the cap carries no reset time).
+  Rules live in `[[automation.rule]]`, guards are not optional (master
+  switch, per-rule enable, pause, per-hour cap, cooldown, a re-check at fire
+  time, one firing per limit episode), and every firing is recorded.
+  `muxa automation list|log|enable|disable|pause|resume|test|add|remove`
+  drives it from the terminal; `automation_*` requests (`automation_v1`) do
+  the same from Muxa.app. Nothing fires until a rule exists.
+
+- **The whole configuration is editable from Muxa.app.** `config_read` and
+  `config_write` (`config_edit_v1`) hand the daemon's `config.toml` to a
+  client and take a replacement back, parsed and validated before it lands,
+  refusing a write whose base text changed underneath. `muxa config
+  path|show|set|check` is the same thing from the terminal. Muxa.app's
+  Settings grew Automations, Behaviour, and Advanced tabs on top of it.
+
+- **Ask providers are the operator's list, not a fixed five.** A provider
+  is now an instance in `[ask.providers.<id>]` with an `engine`
+  (`claude`, `codex`, `gemini` CLIs; `anthropic`, `openai` APIs), so two
+  Anthropic keys, a work and a personal OpenAI account, or a second Claude
+  Code binary can sit side by side. `muxa ask provider add|remove` and
+  Muxa.app's Providers pane compose the list; the five muxa ships stay
+  available with no config at all. `muxa ask` and Global Ask accept any
+  instance id. API providers replay
   the conversation from muxa's own store, take the key from a one-turn
   credential, muxad's environment, or a variable named in
   `[ask.providers.<id>] api_key_env`, and honour `[ask.providers.<id>]

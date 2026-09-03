@@ -102,6 +102,12 @@ pub enum ConfigError {
 
     #[error("{path}: {message}")]
     InvalidMcp { path: String, message: String },
+
+    #[error("{path}: {message}")]
+    InvalidAsk { path: String, message: String },
+
+    #[error("automation: {0}")]
+    InvalidAutomation(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -129,6 +135,12 @@ pub struct Config {
     pub message: MessageConfig,
     #[serde(default)]
     pub ask: AskConfig,
+    /// Rules that watch agent state and act on it — the
+    /// session-limit resume being the first of them. Enabled by
+    /// default with no rules, so a fresh install does nothing until
+    /// one is written.
+    #[serde(default)]
+    pub automation: crate::automation::AutomationConfig,
     pub history: HistoryConfig,
     pub activity: ActivityConfig,
     pub state: StateConfig,
@@ -340,9 +352,11 @@ pub const DEFAULT_ASK_TIMEOUT_SECS: u64 = 30 * 60;
 #[serde(default, deny_unknown_fields)]
 pub struct AskConfig {
     pub enabled: bool,
-    /// Provider the next question goes to: `claude`, `codex`, `gemini`
-    /// (agent CLIs), or `anthropic`, `openai` (HTTPS APIs). See
-    /// [`crate::ask::supported_agents`].
+    /// Provider instance the next question goes to. Either one of the
+    /// built-in ids — `claude`, `codex`, `gemini` (agent CLIs), or
+    /// `anthropic`, `openai` (HTTPS APIs) — or the id of an
+    /// `[ask.providers.<id>]` instance the operator added. See
+    /// [`crate::ask::supported_agents`] for the built-ins.
     pub agent: String,
     /// Directory the headless process runs in. Defaults to `$HOME`; a neutral
     /// cwd keeps default-mode questions away from a working tree. Explicit
@@ -363,9 +377,10 @@ pub struct AskConfig {
     pub path: Option<PathBuf>,
     /// Answers retained before the oldest are dropped.
     pub keep: usize,
-    /// Per-provider overrides, `[ask.providers.<id>]`. Only a model name
-    /// and the *name* of an environment variable holding the API key live
-    /// here; the key itself never does.
+    /// Provider instances, `[ask.providers.<id>]` — one table per id the
+    /// operator composed, plus any override of a built-in. Only a model
+    /// name, a binary path, and the *name* of an environment variable
+    /// holding the API key live here; the key itself never does.
     pub providers: BTreeMap<String, AskProviderConfig>,
 }
 
@@ -385,19 +400,33 @@ impl Default for AskConfig {
     }
 }
 
-/// `[ask.providers.<id>]` — what one ask provider may be tuned with.
+/// `[ask.providers.<id>]` — one provider *instance*.
 ///
-/// Both keys are optional. `model` overrides the provider's default
+/// The table id is the instance's name on the wire, in `[ask] agent`, and
+/// in `muxa ask --agent`. `engine` names the closed set of code that
+/// drives it (`claude`, `codex`, `gemini`, `anthropic`, `openai`), so the
+/// operator can keep several instances of one engine side by side — a
+/// work and a personal `OpenAI` account, two Anthropic keys, a second
+/// `claude` binary — each with its own key.
+///
+/// Every key is optional. `engine` may be omitted only when the id *is* a
+/// built-in engine id, which is what makes an existing
+/// `[ask.providers.anthropic] model = "…"` keep meaning "the built-in
+/// anthropic provider, with this model". `title` is what clients show and
+/// defaults to a humanized id. `model` overrides the engine's default
 /// (`claude-sonnet-5` for `anthropic`, `gpt-5` for `openai`; the agent
-/// CLIs use their own default unless one is named here). `api_key_env`
-/// names an environment variable the daemon reads the key from when the
-/// request carried none and the provider's usual variable is unset — a
-/// pointer, so a raw secret is never written into this file.
+/// CLIs use their own unless one is named here). `api_key_env` names an
+/// environment variable the daemon reads the key from — a pointer, so a
+/// raw secret is never written into this file. `executable` overrides the
+/// binary a CLI engine spawns and is ignored by the API engines.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AskProviderConfig {
+    pub engine: Option<String>,
+    pub title: Option<String>,
     pub model: Option<String>,
     pub api_key_env: Option<String>,
+    pub executable: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1338,7 +1367,14 @@ impl Config {
     /// callers.
     pub fn validate(&self) -> std::result::Result<(), ConfigError> {
         validate_fleet(&self.fleet)?;
-        validate_mcp(&self.mcp)
+        validate_mcp(&self.mcp)?;
+        validate_ask(&self.ask)?;
+        // An automation types into a live agent, so a rule that does
+        // not hold together fails the load rather than sitting in the
+        // file waiting to surprise someone.
+        self.automation
+            .validate()
+            .map_err(ConfigError::InvalidAutomation)
     }
 
     /// Run hard semantic checks that only matter when the daemon is
@@ -1427,6 +1463,64 @@ fn validate_mcp(cfg: &McpConfig) -> std::result::Result<(), ConfigError> {
         ));
     }
     Ok(())
+}
+
+/// `[ask.providers.<id>]` has to name an engine muxa can actually drive.
+/// An entry that names none, or names one that does not exist, would be
+/// silently inert — the operator would see their new provider missing from
+/// `muxa ask providers` with nothing saying why — so it fails the load
+/// instead.
+fn validate_ask(cfg: &AskConfig) -> std::result::Result<(), ConfigError> {
+    for (id, provider) in &cfg.providers {
+        let path = format!("ask.providers.{id}");
+        let invalid = |message: String| ConfigError::InvalidAsk {
+            path: path.clone(),
+            message,
+        };
+        if !is_bare_key(id) {
+            return Err(invalid(
+                "a provider id must be a TOML bare key: letters, digits, `-`, or `_`".into(),
+            ));
+        }
+        let builtin = crate::ask::builtin_engine(id);
+        match provider.engine.as_deref() {
+            Some(engine) => {
+                let parsed = crate::ask::AskEngine::parse(engine).ok_or_else(|| {
+                    invalid(format!(
+                        "engine = {engine:?} is not one of {}",
+                        crate::ask::supported_agents().join(", ")
+                    ))
+                })?;
+                if let Some(builtin) = builtin {
+                    if builtin != parsed {
+                        return Err(invalid(format!(
+                            "`{id}` is a built-in provider and always uses the `{id}` engine; \
+                             name a different id to run engine = {engine:?}"
+                        )));
+                    }
+                }
+            }
+            None if builtin.is_some() => {}
+            None => {
+                return Err(invalid(format!(
+                    "a provider id that is not built in needs `engine`, one of {}",
+                    crate::ask::supported_agents().join(", ")
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `key` can be written as a TOML bare key. Provider ids travel on
+/// the wire, through argv, and back into `[ask.providers.<id>]`, so they
+/// stay in the one spelling every surface renders the same.
+#[must_use]
+pub fn is_bare_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn validate_fleet(cfg: &FleetConfig) -> std::result::Result<(), ConfigError> {
@@ -2225,6 +2319,62 @@ api_key = "sk-live-never"
 "#,
         );
         assert!(refused.is_err());
+    }
+
+    #[test]
+    fn parses_composed_ask_providers_and_refuses_the_ones_that_drive_nothing() {
+        let cfg: Config = toml::from_str(
+            r#"
+[ask]
+agent = "anthropic-work"
+
+[ask.providers.anthropic-work]
+engine = "anthropic"
+title = "Anthropic (work)"
+api_key_env = "WORK_ANTHROPIC_KEY"
+
+[ask.providers.claude_alt]
+engine = "claude"
+executable = "/opt/homebrew/bin/claude"
+
+[ask.providers.anthropic]
+model = "claude-opus-5"
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.ask.agent, "anthropic-work");
+        let work = &cfg.ask.providers["anthropic-work"];
+        assert_eq!(work.engine.as_deref(), Some("anthropic"));
+        assert_eq!(work.title.as_deref(), Some("Anthropic (work)"));
+        assert_eq!(
+            cfg.ask.providers["claude_alt"].executable.as_deref(),
+            Some("/opt/homebrew/bin/claude")
+        );
+        // A built-in id with no engine still means that built-in.
+        assert_eq!(cfg.ask.providers["anthropic"].engine, None);
+
+        // An entry that names no usable engine would be inert, so it fails
+        // the load rather than going missing from `muxa ask providers`.
+        for (broken, expected) in [
+            (
+                "[ask.providers.anthropic-work]\nmodel = \"claude-opus-5\"\n",
+                "needs `engine`",
+            ),
+            ("[ask.providers.mine]\nengine = \"bard\"\n", "is not one of"),
+            (
+                "[ask.providers.claude]\nengine = \"codex\"\n",
+                "always uses the `claude` engine",
+            ),
+            (
+                "[ask.providers.\"has a space\"]\nengine = \"claude\"\n",
+                "TOML bare key",
+            ),
+        ] {
+            let cfg: Config = toml::from_str(broken).unwrap();
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains(expected), "{broken}: {error}");
+        }
     }
 
     #[test]

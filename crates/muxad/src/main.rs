@@ -12,6 +12,11 @@ use muxa::activity::{
     ActivityEntry, ActivityLog, ActivityOptions, StateTransitionEntry, StateTransitionInput,
 };
 use muxa::ask::{AskOptions, AskStore};
+use muxa::automation::{
+    subjects_from, AutomationAction, AutomationLedger, AutomationLedgerEntry, AutomationOutcome,
+    AutomationRule, AutomationStore, AutomationSubject, Decision, PlannedFiring, Scheduler,
+    SkipReason,
+};
 use muxa::collaboration::{
     CollaborationClientKind, CollaborationOptions, CollaborationOriginMatch, CollaborationRequest,
     CollaborationStore, WakeDeliveryState,
@@ -29,7 +34,7 @@ use muxa::sinks::{webhook as webhook_sink, OhMyPromptSink, WebhookSink};
 use muxa::snapshot::{self, Snapshotter, SnapshotterOptions};
 use muxa::tmux::scanner::PaneCache;
 use muxa::{discovery, paths, Config, Store};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -54,6 +59,18 @@ const SHUTDOWN_TASK_TIMEOUT_SECONDS: u64 = 2;
 const COLLABORATION_WAKE_RECONCILE_SECONDS: u64 = 30;
 /// Carries the daemon image identity across an in-place re-exec.
 const RESTART_GENERATION_ENV: &str = "MUXA_RESTART_GENERATION";
+/// Safety-net rescan for the automation engine. Arming is normally driven by
+/// state transitions; this catches a row that was already capped when the
+/// daemon started, and a cap that landed on a row already in `Error` (which
+/// produces no transition at all).
+const AUTOMATION_RECONCILE_SECONDS: u64 = 30;
+/// Longest the automation task parks between rescans when nothing is due.
+/// Bounds the wait so a rule added at runtime is picked up promptly even
+/// with an empty firing queue.
+const AUTOMATION_MAX_IDLE_SECONDS: u64 = 60;
+/// How long a pane scan is reused for workspace/work rule filters. Only
+/// paid for when at least one enabled rule actually reads that metadata.
+const AUTOMATION_PANE_CACHE_SECONDS: u64 = 10;
 
 #[derive(Debug, Parser)]
 #[command(name = "muxad", version, about = "muxa daemon")]
@@ -168,6 +185,7 @@ async fn main() -> Result<()> {
     let collaboration = build_collaboration(&cfg).await;
     let collaboration_audit = build_collaboration_audit(&cfg);
     let ask = build_ask(&cfg, config_path.clone()).await;
+    let automation = build_automation(&cfg, config_path.clone());
     let pipeline_runs = PipelineRunStore::load(paths::default_pipeline_run_file())
         .context("loading durable pipeline Runs")?;
 
@@ -274,6 +292,15 @@ async fn main() -> Result<()> {
     );
     let pipeline_state_handle =
         spawn_pipeline_state_task(pipeline_runs.clone(), store.clone(), &shutdown_tx);
+    // Automation engine. Subscribes to the same transition broadcast the
+    // waker uses, so it must be spawned before the IPC server takes
+    // ownership of `store`.
+    let automation_handle = spawn_automation_task(
+        automation.clone(),
+        store.clone(),
+        backends.clone(),
+        &shutdown_tx,
+    );
 
     // The snapshotter listens on its own dedicated channel rather than
     // the main shutdown broadcast: it has to be the last thing to die
@@ -382,6 +409,8 @@ async fn main() -> Result<()> {
         .with_collaboration(collaboration)
         .with_collaboration_audit(collaboration_audit)
         .with_ask(ask)
+        .with_automation(automation)
+        .with_config_path(config_path.clone())
         .with_fleet(fleet_runtime)
         .with_pipeline_runs(pipeline_runs.clone())
         .with_restart_controller(Arc::clone(&restart));
@@ -443,6 +472,7 @@ async fn main() -> Result<()> {
     await_shutdown_task("history compaction", history_compaction_handle).await;
     await_shutdown_task("activity compaction", activity_compaction_handle).await;
     await_shutdown_task("collaboration waker", collaboration_waker_handle).await;
+    await_shutdown_task("automation", Some(automation_handle)).await;
     await_shutdown_task("pipeline reconciler", Some(pipeline_reconciler_handle)).await;
     await_shutdown_task("pipeline state projection", Some(pipeline_state_handle)).await;
     await_shutdown_task("fleet manager", Some(fleet_handle)).await;
@@ -728,6 +758,451 @@ async fn run_pipeline_reconciler(socket: &Path) {
             tracing::warn!(program = %program.display(), %error, "could not start pipeline reconciler");
         }
     }
+}
+
+/// Resolve `[automation]` into a live store. The ledger is materialized
+/// unconditionally — the guards read from it, and an operator who adds a
+/// rule at runtime should not have to restart the daemon to get one.
+fn build_automation(cfg: &Config, config_path: Option<PathBuf>) -> Arc<AutomationStore> {
+    let ledger = AutomationLedger::load(muxa::automation::default_automation_file());
+    let store = AutomationStore::new(cfg.automation.clone(), config_path, ledger);
+    let enabled_rules = cfg
+        .automation
+        .rule
+        .iter()
+        .filter(|rule| rule.enabled)
+        .count();
+    if enabled_rules > 0 {
+        tracing::info!(
+            rules = cfg.automation.rule.len(),
+            enabled = enabled_rules,
+            engine_enabled = cfg.automation.enabled,
+            paused_until = ?cfg.automation.paused_until,
+            "automation rules loaded",
+        );
+    }
+    store
+}
+
+/// The engine: watch state transitions, arm matching rules, hold their
+/// firings until due, re-check them against the live store, and act.
+///
+/// Modelled on the collaboration waker directly above — same transition
+/// subscription, same debounce-by-key discipline, same slow reconcile tick
+/// as the recovery path. The differences are that firings are *scheduled*
+/// rather than immediate (hence the heap) and that every decision is
+/// recorded in the ledger.
+///
+/// Always spawned, even with no rules: a rule written through
+/// `automation_set_rule` must take effect without a daemon restart, and an
+/// engine with nothing to do costs one refcount bump per transition.
+fn spawn_automation_task(
+    automation: Arc<AutomationStore>,
+    store: muxa::SharedStore,
+    backends: Vec<muxa::SharedBackend>,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> tokio::task::JoinHandle<()> {
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    // Subscribe before the first authoritative scan so a transition racing
+    // task startup is represented either by that scan or by a pending signal.
+    let mut transitions = store.subscribe();
+    let mut config_changes = automation.subscribe();
+    tokio::spawn(async move {
+        let mut engine = AutomationEngine::new(automation, store, backends);
+        engine.rescan().await;
+        let mut reconcile =
+            tokio::time::interval(std::time::Duration::from_secs(AUTOMATION_RECONCILE_SECONDS));
+        reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        reconcile.tick().await;
+        loop {
+            let idle = engine.time_until_next_firing();
+            tokio::select! {
+                transition = transitions.recv() => match transition {
+                    Ok(transition) => engine.observe(&transition.agent).await,
+                    // A lag means an arming transition may have been dropped.
+                    // Re-read the authoritative state immediately.
+                    Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                        tracing::debug!(dropped, "automation transition stream lagged");
+                        engine.rescan().await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                changed = config_changes.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    // A rule was added, edited, enabled, or paused. Drop
+                    // pending firings whose rule no longer exists and
+                    // re-evaluate everything against the new set.
+                    engine.rescan().await;
+                }
+                () = tokio::time::sleep(idle) => engine.fire_due().await,
+                _ = reconcile.tick() => engine.rescan().await,
+                _ = shutdown_rx.recv() => break,
+            }
+        }
+    })
+}
+
+/// Live state of the automation engine: the pending firing queue, the
+/// in-flight key set, and a short-lived pane scan for the workspace/work
+/// filters.
+struct AutomationEngine {
+    automation: Arc<AutomationStore>,
+    store: muxa::SharedStore,
+    backends: Vec<muxa::SharedBackend>,
+    /// Firings waiting on their fire time, earliest first.
+    pending: BinaryHeap<std::cmp::Reverse<PlannedFiring>>,
+    /// `(rule, pane, episode)` already queued. Together with the ledger's
+    /// own episode check this is what makes "never twice for one cap
+    /// episode" hold both within a daemon run and across a restart.
+    armed: HashSet<(String, String, String)>,
+    panes: Vec<muxa::tmux::PaneInfo>,
+    panes_read_at: Option<std::time::Instant>,
+}
+
+impl AutomationEngine {
+    fn new(
+        automation: Arc<AutomationStore>,
+        store: muxa::SharedStore,
+        backends: Vec<muxa::SharedBackend>,
+    ) -> Self {
+        Self {
+            automation,
+            store,
+            backends,
+            pending: BinaryHeap::new(),
+            armed: HashSet::new(),
+            panes: Vec::new(),
+            panes_read_at: None,
+        }
+    }
+
+    /// How long to park before the next firing is due, bounded so a rule
+    /// added at runtime is still picked up promptly.
+    fn time_until_next_firing(&self) -> std::time::Duration {
+        let cap = std::time::Duration::from_secs(AUTOMATION_MAX_IDLE_SECONDS);
+        let Some(next) = self.pending.peek() else {
+            return cap;
+        };
+        let remaining = next.0.fire_at - time::OffsetDateTime::now_utc();
+        if remaining.is_negative() {
+            return std::time::Duration::ZERO;
+        }
+        remaining.unsigned_abs().min(cap)
+    }
+
+    /// Evaluate every enabled rule against one agent that just changed state.
+    async fn observe(&mut self, agent: &muxa::Agent) {
+        let now = time::OffsetDateTime::now_utc();
+        let (active, rules) = self.automation.active_rules(now).await;
+        if !active || rules.is_empty() {
+            return;
+        }
+        let subject = self.subject_for(&rules, agent).await;
+        self.arm_all(&rules, std::slice::from_ref(&subject), now)
+            .await;
+    }
+
+    /// Authoritative pass over the whole registry. Recovers the two cases a
+    /// transition cannot cover: a row already capped when the daemon
+    /// started, and a `RateLimited` landing on a row that was already in
+    /// `Error` (no state change, so no transition is broadcast).
+    async fn rescan(&mut self) {
+        let now = time::OffsetDateTime::now_utc();
+        let (active, rules) = self.automation.active_rules(now).await;
+        // A firing whose rule was disabled or deleted must not survive.
+        let live: HashSet<&str> = rules.iter().map(|rule| rule.name.as_str()).collect();
+        self.pending
+            .retain(|firing| live.contains(firing.0.rule.as_str()));
+        self.armed
+            .retain(|(rule, _, _)| live.contains(rule.as_str()));
+        if !active || rules.is_empty() {
+            return;
+        }
+        let agents = self.store.snapshot().await;
+        let subjects = if rules.iter().any(AutomationRule::needs_pane_metadata) {
+            self.refresh_panes().await;
+            subjects_from(&agents, &self.panes)
+        } else {
+            subjects_from(&agents, &[])
+        };
+        self.arm_all(&rules, &subjects, now).await;
+    }
+
+    async fn arm_all(
+        &mut self,
+        rules: &[AutomationRule],
+        subjects: &[AutomationSubject],
+        now: time::OffsetDateTime,
+    ) {
+        let config = self.automation.config().await;
+        let ledger = self.automation.ledger();
+        for rule in rules {
+            for subject in subjects {
+                let Some(pane) = subject.pane.clone() else {
+                    continue;
+                };
+                // Cheap pre-filter before touching the ledger. Most
+                // evaluations are "this agent is not in the state this rule
+                // watches", and a guard read scans up to 500 entries.
+                if subject.current_event() != Some(rule.on) {
+                    continue;
+                }
+                let episode = subject.episode();
+                let key = (rule.name.clone(), pane.clone(), episode.clone());
+                if self.armed.contains(&key) {
+                    continue;
+                }
+                let guards = ledger.guard_state(&rule.name, &pane, &episode, now).await;
+                match Scheduler::arm(&config, rule, subject, guards, now, jitter_ratio()) {
+                    Decision::Fire(firing) => {
+                        tracing::info!(
+                            rule = %rule.name,
+                            pane = %pane,
+                            action = %firing.action,
+                            fire_at = %firing.fire_at,
+                            "automation armed",
+                        );
+                        self.armed.insert(key);
+                        self.pending.push(std::cmp::Reverse(*firing));
+                    }
+                    // Arm-time skips are the common case (every rule sees
+                    // every agent), so they stay in the trace rather than
+                    // flooding the ledger. Fire-time skips are recorded.
+                    Decision::Skip(reason) => tracing::trace!(
+                        rule = %rule.name,
+                        pane = %pane,
+                        %reason,
+                        "automation did not arm",
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Act on every firing whose time has come, re-checking each against
+    /// the live store first.
+    async fn fire_due(&mut self) {
+        let now = time::OffsetDateTime::now_utc();
+        let mut due = Vec::new();
+        while self
+            .pending
+            .peek()
+            .is_some_and(|firing| firing.0.fire_at <= now)
+        {
+            if let Some(std::cmp::Reverse(firing)) = self.pending.pop() {
+                due.push(firing);
+            }
+        }
+        for firing in due {
+            self.armed.remove(&(
+                firing.rule.clone(),
+                firing.pane.clone(),
+                firing.episode.clone(),
+            ));
+            self.fire(&firing, now).await;
+        }
+    }
+
+    async fn fire(&mut self, firing: &PlannedFiring, now: time::OffsetDateTime) {
+        let config = self.automation.config().await;
+        let Some(rule) = config.rule_named(&firing.rule).cloned() else {
+            // The rule was removed while this firing waited.
+            return;
+        };
+        let subject = self.live_subject(&rule, &firing.agent_session_id).await;
+        let ledger = self.automation.ledger();
+        let guards = ledger
+            .guard_state(&firing.rule, &firing.pane, &firing.episode, now)
+            .await;
+        match Scheduler::confirm(&config, &rule, firing, subject.as_ref(), guards, now) {
+            Decision::Skip(reason) => {
+                tracing::info!(
+                    rule = %firing.rule,
+                    pane = %firing.pane,
+                    %reason,
+                    "automation skipped at fire time",
+                );
+                ledger
+                    .append(ledger_entry(
+                        firing,
+                        now,
+                        AutomationOutcome::Skipped,
+                        Some(reason.to_string()),
+                    ))
+                    .await;
+            }
+            Decision::Fire(confirmed) => {
+                let delivered = self.perform(&confirmed).await;
+                let outcome = if delivered {
+                    AutomationOutcome::Fired
+                } else {
+                    AutomationOutcome::Failed
+                };
+                let detail = if delivered {
+                    confirmed.text.clone()
+                } else {
+                    Some(SkipReason::ActionFailed.to_string())
+                };
+                tracing::info!(
+                    rule = %confirmed.rule,
+                    pane = %confirmed.pane,
+                    action = %confirmed.action,
+                    %outcome,
+                    "automation acted",
+                );
+                ledger
+                    .append(ledger_entry(&confirmed, now, outcome, detail))
+                    .await;
+            }
+        }
+    }
+
+    /// Carry out one action. Every arm keeps the injection inside this
+    /// function, so "what an automation can do to a pane" has exactly one
+    /// place to read.
+    async fn perform(&self, firing: &PlannedFiring) -> bool {
+        match firing.action {
+            AutomationAction::SendPrompt => {
+                let Some(text) = firing.text.as_deref() else {
+                    return false;
+                };
+                if !send_automation_text(&self.backends, firing, text).await {
+                    return false;
+                }
+                if !firing.submit {
+                    return true;
+                }
+                // Same grace the collaboration waker uses: codex's TUI reads
+                // an immediate trailing Enter as part of the pasted burst and
+                // leaves the prompt composed but unsubmitted.
+                tokio::time::sleep(muxa::backend::PROMPT_SUBMIT_GRACE).await;
+                send_automation_text(&self.backends, firing, "\r").await
+            }
+            // A notice, not a keystroke: nothing is typed into the pane. The
+            // ledger entry is the durable half, and `muxa automation log`
+            // is where an operator reads it back.
+            AutomationAction::Notify => {
+                tracing::warn!(
+                    rule = %firing.rule,
+                    pane = %firing.pane,
+                    agent = %firing.agent,
+                    message = firing.text.as_deref().unwrap_or_default(),
+                    "automation notice",
+                );
+                true
+            }
+            // ETX — the same byte `muxa agent control --action interrupt`
+            // writes into a native PTY session.
+            AutomationAction::Interrupt => {
+                send_automation_text(&self.backends, firing, "\u{3}").await
+            }
+        }
+    }
+
+    /// The registry row behind a firing, as the live store has it now.
+    async fn live_subject(
+        &mut self,
+        rule: &AutomationRule,
+        agent_session_id: &str,
+    ) -> Option<AutomationSubject> {
+        let agent = self.store.by_session(agent_session_id).await?;
+        Some(self.subject_for(std::slice::from_ref(rule), &agent).await)
+    }
+
+    async fn subject_for(
+        &mut self,
+        rules: &[AutomationRule],
+        agent: &muxa::Agent,
+    ) -> AutomationSubject {
+        if rules.iter().any(AutomationRule::needs_pane_metadata) {
+            self.refresh_panes().await;
+            let agents = [agent.clone()];
+            let mut subjects = subjects_from(&agents, &self.panes);
+            if let Some(subject) = subjects.pop() {
+                return subject;
+            }
+        }
+        AutomationSubject::from_agent(agent)
+    }
+
+    /// Refresh the pane scan when it has gone stale. Only reached when a
+    /// rule actually reads workspace/work metadata.
+    async fn refresh_panes(&mut self) {
+        let fresh = self.panes_read_at.is_some_and(|at| {
+            at.elapsed() < std::time::Duration::from_secs(AUTOMATION_PANE_CACHE_SECONDS)
+        });
+        if fresh {
+            return;
+        }
+        let backends = self.backends.clone();
+        self.panes = tokio::task::spawn_blocking(move || {
+            backends
+                .iter()
+                .flat_map(|backend| backend.list_panes())
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        self.panes_read_at = Some(std::time::Instant::now());
+    }
+}
+
+fn ledger_entry(
+    firing: &PlannedFiring,
+    at: time::OffsetDateTime,
+    outcome: AutomationOutcome,
+    detail: Option<String>,
+) -> AutomationLedgerEntry {
+    AutomationLedgerEntry {
+        rule: firing.rule.clone(),
+        pane: firing.pane.clone(),
+        agent: firing.agent,
+        fired_at: at,
+        action: firing.action,
+        outcome,
+        detail,
+        episode: Some(firing.episode.clone()),
+    }
+}
+
+/// A random ratio in `[0, 1)` for the per-firing jitter. Derived from a v4
+/// UUID so the engine needs no RNG dependency of its own; the scheduler
+/// takes the ratio as an argument precisely so tests can pin it.
+fn jitter_ratio() -> f64 {
+    let bits = u64::from(uuid::Uuid::new_v4().as_fields().0);
+    #[allow(clippy::cast_precision_loss)]
+    {
+        bits as f64 / f64::from(u32::MAX)
+    }
+}
+
+/// Inject literal text into the firing's pane through the backend that owns
+/// its id namespace. Mirrors `send_collaboration_text`; a backend without
+/// `send_text` (zellij) simply refuses, which the caller records as a
+/// failure rather than a silent success.
+async fn send_automation_text(
+    backends: &[muxa::SharedBackend],
+    firing: &PlannedFiring,
+    text: &str,
+) -> bool {
+    let Some(kind) = muxa::backend::pane_id_host_kind(&firing.pane) else {
+        return false;
+    };
+    let Some(backend) = backends
+        .iter()
+        .find(|backend| backend.kind() == kind && backend.caps().send_text)
+        .cloned()
+    else {
+        return false;
+    };
+    let pane = firing.pane.clone();
+    let socket = firing.socket.clone();
+    let text = text.to_string();
+    tokio::task::spawn_blocking(move || backend.send_text_on(socket.as_deref(), &pane, &text))
+        .await
+        .unwrap_or(false)
 }
 
 fn spawn_collaboration_waker_task(
@@ -3441,5 +3916,195 @@ mod tests {
             &shutdown_tx,
         );
         assert!(!spawned, "discovery must not spawn when disabled");
+    }
+
+    // -----------------------------------------------------------------
+    // automation engine
+    // -----------------------------------------------------------------
+
+    /// A capped agent: `Started`, then a `RateLimited` whose reset time has
+    /// already passed, so a `wait = "reset"` rule is due immediately.
+    async fn add_capped_agent(store: &muxa::SharedStore, pane: &str, session_id: &str) {
+        add_agent(store, pane, session_id, AgentKind::ClaudeCode).await;
+        store
+            .apply(&AgentEvent::RateLimited {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: session_id.into(),
+                    surface: None,
+                    pane: Some(pane.into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: Some("/repo".into()),
+                },
+                scope: muxa::event::RateLimitScope::FiveHour,
+                source: muxa::event::RateLimitSource::Statusline,
+                resets_at: Some(OffsetDateTime::now_utc() - time::Duration::minutes(1)),
+                message: Some("You've hit your limit".into()),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+    }
+
+    fn resume_rule_config() -> muxa::automation::AutomationConfig {
+        let mut rule = AutomationRule::new(
+            "resume-after-limit",
+            muxa::automation::AutomationEvent::RateLimited,
+            AutomationAction::SendPrompt,
+        );
+        rule.text = Some("continue".into());
+        rule.wait = Some(muxa::automation::parse_wait("reset").unwrap());
+        rule.jitter = Some(muxa::automation::DurationSpec::seconds(0));
+        muxa::automation::AutomationConfig {
+            rule: vec![rule],
+            ..muxa::automation::AutomationConfig::default()
+        }
+    }
+
+    /// Every `(pane, text)` an automation typed, in order.
+    type RecordedSends = Arc<Mutex<Vec<(String, String)>>>;
+
+    fn automation_backend(panes: Vec<PaneInfo>) -> (Vec<muxa::SharedBackend>, RecordedSends) {
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+            panes,
+            sends: sends.clone(),
+        });
+        (vec![backend], sends)
+    }
+
+    #[tokio::test]
+    async fn automation_resumes_a_capped_agent_by_typing_into_its_pane() {
+        let store = muxa::Store::shared();
+        add_capped_agent(&store, "%1", "capped").await;
+        let (backends, sends) = automation_backend(vec![collaboration_pane("%1", "0")]);
+        let automation = AutomationStore::in_memory(resume_rule_config());
+        let mut engine = AutomationEngine::new(automation.clone(), store, backends);
+
+        engine.rescan().await;
+        engine.fire_due().await;
+
+        // The prompt, then the submit CR — the same two-step the
+        // collaboration waker uses.
+        assert_eq!(
+            *sends.lock().unwrap(),
+            vec![
+                ("%1".to_string(), "continue".to_string()),
+                ("%1".to_string(), "\r".to_string()),
+            ],
+        );
+        let log = automation.ledger().all().await;
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].outcome, AutomationOutcome::Fired);
+        assert_eq!(log[0].rule, "resume-after-limit");
+        assert_eq!(log[0].pane, "%1");
+    }
+
+    #[tokio::test]
+    async fn automation_fires_once_per_cap_episode() {
+        let store = muxa::Store::shared();
+        add_capped_agent(&store, "%1", "capped").await;
+        let (backends, sends) = automation_backend(vec![collaboration_pane("%1", "0")]);
+        let automation = AutomationStore::in_memory(resume_rule_config());
+        let mut engine = AutomationEngine::new(automation.clone(), store, backends);
+
+        for _ in 0..3 {
+            engine.rescan().await;
+            engine.fire_due().await;
+        }
+
+        // The row is still capped and still in the same episode, so the
+        // ledger's episode key stops every re-arm after the first.
+        assert_eq!(sends.lock().unwrap().len(), 2, "one prompt, one submit");
+        let log = automation.ledger().all().await;
+        assert_eq!(log.len(), 1, "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn automation_skips_an_agent_that_recovered_before_the_firing_was_due() {
+        let store = muxa::Store::shared();
+        add_capped_agent(&store, "%1", "capped").await;
+        let (backends, sends) = automation_backend(vec![collaboration_pane("%1", "0")]);
+        let automation = AutomationStore::in_memory(resume_rule_config());
+        let mut engine = AutomationEngine::new(automation.clone(), store.clone(), backends);
+        engine.rescan().await;
+
+        // The operator got there first: a fresh `Started` clears the cap.
+        add_agent(&store, "%1", "capped", AgentKind::ClaudeCode).await;
+        engine.fire_due().await;
+
+        assert!(
+            sends.lock().unwrap().is_empty(),
+            "a recovered agent must not be typed into",
+        );
+        let log = automation.ledger().all().await;
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].outcome, AutomationOutcome::Skipped);
+        assert_eq!(
+            log[0].detail.as_deref(),
+            Some(SkipReason::ConditionCleared.to_string()).as_deref(),
+        );
+    }
+
+    #[tokio::test]
+    async fn automation_with_the_engine_paused_does_nothing() {
+        let store = muxa::Store::shared();
+        add_capped_agent(&store, "%1", "capped").await;
+        let (backends, sends) = automation_backend(vec![collaboration_pane("%1", "0")]);
+        let mut config = resume_rule_config();
+        config.paused_until = Some(OffsetDateTime::now_utc() + time::Duration::hours(1));
+        let automation = AutomationStore::in_memory(config);
+        let mut engine = AutomationEngine::new(automation.clone(), store, backends);
+
+        engine.rescan().await;
+        engine.fire_due().await;
+
+        assert!(sends.lock().unwrap().is_empty());
+        assert!(automation.ledger().all().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn automation_with_no_rules_is_inert() {
+        let store = muxa::Store::shared();
+        add_capped_agent(&store, "%1", "capped").await;
+        let (backends, sends) = automation_backend(vec![collaboration_pane("%1", "0")]);
+        // The shipped default: enabled, with no rules at all.
+        let automation = AutomationStore::in_memory(muxa::automation::AutomationConfig::default());
+        let mut engine = AutomationEngine::new(automation.clone(), store, backends);
+
+        engine.rescan().await;
+        engine.fire_due().await;
+
+        assert!(sends.lock().unwrap().is_empty());
+        assert!(automation.ledger().all().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn automation_honours_the_workspace_and_work_filters() {
+        let store = muxa::Store::shared();
+        add_capped_agent(&store, "%1", "match").await;
+        add_capped_agent(&store, "%2", "miss").await;
+        let mut matching = collaboration_pane("%1", "0");
+        matching.workspace_id = Some("callabo".into());
+        matching.work_id = Some("CAL-1234".into());
+        let mut other = collaboration_pane("%2", "1");
+        other.workspace_id = Some("callabo".into());
+        other.work_id = Some("JIRA-9".into());
+        let (backends, sends) = automation_backend(vec![matching, other]);
+
+        let mut config = resume_rule_config();
+        config.rule[0].workspace = Some("callabo".into());
+        config.rule[0].work = Some("^CAL-".into());
+        let automation = AutomationStore::in_memory(config);
+        let mut engine = AutomationEngine::new(automation, store, backends);
+
+        engine.rescan().await;
+        engine.fire_due().await;
+
+        let sends = sends.lock().unwrap();
+        assert!(
+            sends.iter().all(|(pane, _)| pane == "%1"),
+            "only the pane whose work id matches may be typed into: {sends:?}",
+        );
+        assert_eq!(sends.len(), 2);
     }
 }

@@ -448,14 +448,15 @@ program = 'claude'
         configured.insert(
             "anthropic".to_string(),
             AskProviderConfig {
-                model: None,
                 api_key_env: Some("WORK_KEY".into()),
+                ..AskProviderConfig::default()
             },
         );
         let work_key = |name: &str| (name == "WORK_KEY").then(|| "k".to_string());
+        // A configured provider leads the list; the built-ins follow.
         assert_eq!(
             available_agents(&configured, &|name| name == "claude", &work_key),
-            ["claude", "anthropic"]
+            ["anthropic", "claude"]
         );
     }
 
