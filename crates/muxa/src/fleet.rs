@@ -27,6 +27,7 @@ use crate::state::{Agent, Transition};
 use crate::tmux::layout::PaneGeometry;
 use crate::tmux::{PaneInfo, SessionInfo};
 use crate::topology::{PaneKey, WindowKey};
+use crate::work_control::WorkCommandOutput;
 
 pub const FLEET_PROTOCOL_VERSION: u32 = 1;
 pub const FLEET_MIN_PROTOCOL_VERSION: u32 = 1;
@@ -47,6 +48,10 @@ pub const FLEET_MAX_DIAGNOSTIC_BYTES: usize = 1024;
 /// when every request carries maximum-sized text and AIR references.
 pub const FLEET_MAILBOX_REQUEST_LIMIT: usize = 32;
 pub const FLEET_MAX_CAPTURE_BYTES: usize = 256 * 1024;
+/// Relay capability: the remote node runs an allowlisted `muxa work …` argv
+/// with its own binary. A controller falls back to a one-shot OpenSSH
+/// command for a relay that does not advertise it.
+pub const FLEET_WORK_COMMAND_CAPABILITY: &str = "work_command";
 pub const FLEET_CAPABILITIES: &[&str] = &[
     "snapshot_watch",
     "capture",
@@ -57,6 +62,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     "exact_pane_ref",
     "labels_v1",
     "raw_capture_base64",
+    FLEET_WORK_COMMAND_CAPABILITY,
 ];
 
 /// Read one UTF-8 line without allowing a peer that withholds `\n` to grow
@@ -514,6 +520,14 @@ pub enum RelayRequest {
         status: RequestStatus,
         body: String,
     },
+    /// Run an allowlisted `muxa work …` argv on the remote node with its own
+    /// binary. Advertised by [`FLEET_WORK_COMMAND_CAPABILITY`].
+    WorkCommand {
+        request_id: String,
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdin: Option<String>,
+    },
 }
 
 impl RelayRequest {
@@ -529,7 +543,8 @@ impl RelayRequest {
             | Self::CollaborationMailbox { request_id, .. }
             | Self::CollaborationGet { request_id, .. }
             | Self::CollaborationClaim { request_id, .. }
-            | Self::CollaborationReply { request_id, .. } => request_id,
+            | Self::CollaborationReply { request_id, .. }
+            | Self::WorkCommand { request_id, .. } => request_id,
         }
     }
 }
@@ -609,6 +624,14 @@ pub enum FleetOperation {
         status: RequestStatus,
         body: String,
     },
+    /// Run an allowlisted `muxa work …` argv on the host and return its exit
+    /// code and streams in the `command_*` result fields. See
+    /// [`crate::work_control::validate_work_command`] for the allowlist.
+    WorkCommand {
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdin: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -630,6 +653,14 @@ pub struct FleetCommandResult {
     pub collaboration_incoming: Vec<CollaborationRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collaboration_sent: Vec<CollaborationRequest>,
+    /// Exit code of a `work_command` child; absent for every other operation
+    /// and in replies from a relay that predates the operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_stderr: Option<String>,
 }
 
 impl FleetCommandResult {
@@ -645,6 +676,9 @@ impl FleetCommandResult {
             collaboration_request: None,
             collaboration_incoming: Vec::new(),
             collaboration_sent: Vec::new(),
+            command_exit_code: None,
+            command_stdout: None,
+            command_stderr: None,
         }
     }
 
@@ -660,6 +694,9 @@ impl FleetCommandResult {
             collaboration_request: None,
             collaboration_incoming: Vec::new(),
             collaboration_sent: Vec::new(),
+            command_exit_code: None,
+            command_stdout: None,
+            command_stderr: None,
         }
     }
 
@@ -677,6 +714,9 @@ impl FleetCommandResult {
             collaboration_request: None,
             collaboration_incoming: Vec::new(),
             collaboration_sent: Vec::new(),
+            command_exit_code: None,
+            command_stdout: None,
+            command_stderr: None,
         }
     }
 
@@ -692,6 +732,9 @@ impl FleetCommandResult {
             collaboration_request: None,
             collaboration_incoming: Vec::new(),
             collaboration_sent: Vec::new(),
+            command_exit_code: None,
+            command_stdout: None,
+            command_stderr: None,
         }
     }
 
@@ -707,6 +750,9 @@ impl FleetCommandResult {
             collaboration_request: None,
             collaboration_incoming: Vec::new(),
             collaboration_sent: Vec::new(),
+            command_exit_code: None,
+            command_stdout: None,
+            command_stderr: None,
         }
     }
 
@@ -722,6 +768,9 @@ impl FleetCommandResult {
             collaboration_request: Some(Box::new(request)),
             collaboration_incoming: Vec::new(),
             collaboration_sent: Vec::new(),
+            command_exit_code: None,
+            command_stdout: None,
+            command_stderr: None,
         }
     }
 
@@ -742,7 +791,39 @@ impl FleetCommandResult {
             collaboration_request: None,
             collaboration_incoming: incoming,
             collaboration_sent: sent,
+            command_exit_code: None,
+            command_stdout: None,
+            command_stderr: None,
         }
+    }
+
+    /// Reply for a finished `work_command` child.
+    #[must_use]
+    pub fn command(output: WorkCommandOutput) -> Self {
+        Self {
+            accepted: true,
+            message: None,
+            capture: None,
+            capture_raw_base64: None,
+            send: None,
+            window_capture: None,
+            collaboration_request: None,
+            collaboration_incoming: Vec::new(),
+            collaboration_sent: Vec::new(),
+            command_exit_code: Some(output.exit_code),
+            command_stdout: Some(output.stdout),
+            command_stderr: Some(output.stderr),
+        }
+    }
+
+    /// The `work_command` child result this reply carries, if any.
+    #[must_use]
+    pub fn command_output(&self) -> Option<WorkCommandOutput> {
+        Some(WorkCommandOutput {
+            exit_code: self.command_exit_code?,
+            stdout: self.command_stdout.clone().unwrap_or_default(),
+            stderr: self.command_stderr.clone().unwrap_or_default(),
+        })
     }
 }
 
@@ -1422,5 +1503,65 @@ mod tests {
         let selected = store.snapshot_selected(Some(&selector)).await;
         assert_eq!(selected.hosts.len(), 1);
         assert!(selected.hosts[0].local);
+    }
+
+    #[test]
+    fn work_command_relay_frames_round_trip_and_stay_additive() {
+        let request = RelayRequest::WorkCommand {
+            request_id: "relay-3".into(),
+            args: ["work", "pipeline", "set", "--from-json", "-"]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            stdin: Some("{\"name\":\"solo\"}".into()),
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("\"kind\":\"work_command\""));
+        let decoded: RelayRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.request_id(), "relay-3");
+        match decoded {
+            RelayRequest::WorkCommand { args, stdin, .. } => {
+                assert_eq!(args[1], "pipeline");
+                assert_eq!(stdin.as_deref(), Some("{\"name\":\"solo\"}"));
+            }
+            _ => panic!("wrong relay request variant"),
+        }
+
+        let operation: FleetOperation =
+            serde_json::from_str(r#"{"kind":"work_command","args":["work","options","--json"]}"#)
+                .unwrap();
+        match operation {
+            FleetOperation::WorkCommand { args, stdin } => {
+                assert_eq!(args, ["work", "options", "--json"]);
+                assert_eq!(stdin, None);
+            }
+            _ => panic!("wrong fleet operation variant"),
+        }
+
+        let output = WorkCommandOutput {
+            exit_code: 2,
+            stdout: "{}".into(),
+            stderr: "warn\n".into(),
+        };
+        let result = FleetCommandResult::command(output.clone());
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["accepted"], true);
+        assert_eq!(encoded["command_exit_code"], 2);
+        assert_eq!(encoded["command_stdout"], "{}");
+        assert_eq!(encoded["command_stderr"], "warn\n");
+        let decoded: FleetCommandResult = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.command_output(), Some(output));
+
+        // A relay that predates the operation answers without the fields, and
+        // replies for other operations never carry them.
+        let legacy: FleetCommandResult =
+            serde_json::from_str(r#"{"accepted":true,"message":"pong"}"#).unwrap();
+        assert_eq!(legacy.command_output(), None);
+        assert!(
+            !serde_json::to_string(&FleetCommandResult::accepted("pong"))
+                .unwrap()
+                .contains("command_")
+        );
+        assert!(FLEET_CAPABILITIES.contains(&FLEET_WORK_COMMAND_CAPABILITY));
     }
 }

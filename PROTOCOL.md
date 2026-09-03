@@ -39,7 +39,10 @@ prompt, or collaboration/mailbox requests, results, errors, and explicit
 resync markers. Collaboration operations are advertised by the optional
 `collaboration` capability; exact durable reply lookup additionally requires
 `collaboration_get`, so mixed-version controllers reject it before sending an
-unsupported frame. See
+unsupported frame. Running `muxa work …` on the remote node is advertised by
+the relay capability `work_command`; a controller talking to an older relay
+runs the same argv over a one-shot OpenSSH command instead (see
+[`work_command`](#work_command)). See
 [`docs/FLEET.md`](docs/FLEET.md); `FLEET_PROTOCOL_VERSION` is negotiated
 separately from this local IPC protocol.
 
@@ -155,6 +158,95 @@ than being copied into the controller.
   "operation": { "kind": "refresh" }
 }
 ```
+
+The `work_command` operation (`{ "kind": "work_command", "args": [...],
+"stdin": "..." | null }`) runs an allowlisted `muxa work …` argv on the host
+and answers through three additive `FleetCommandResult` fields:
+`command_exit_code`, `command_stdout`, `command_stderr`. They are absent on
+every other operation and in replies from a relay that predates the
+operation. Clients normally reach it through [`work_command`](#work_command)
+and `work_up` with a `host` rather than dispatching it themselves.
+
+#### Work control: `work_up`, `work_up_status`, `work_command`
+
+Advertised by `work_control_v1` (`work_up`/`work_up_status`) and
+`work_command_v1` (`work_command`, and the `host` field on `work_up`). The
+daemon never reimplements Work: it launches the exact `muxa` binary that
+ships with it (`$MUXA_CLI`, else the sibling of `muxad`, else `muxa` on
+`PATH`) with `MUXA_SOCKET` pinned to its own socket, or, for a Fleet host,
+that host's `muxa`.
+
+`work_up` starts `muxa work up <work> --json --yes …` as a bounded (600 s,
+2 MiB) asynchronous operation and returns immediately; clients poll
+`work_up_status` with the `operation_id`. The request object carries `work`
+plus optional `external`, `pipeline`, `workspace`, `cwd`, `skill`, `body`,
+`context`, `no_ticket`, `dry_run`, and `host`. `host` names a `[fleet.hosts]`
+alias; absent or `"local"` runs on the daemon's own host. A remote host must
+be `mode = "control"`; an observe-only host is refused synchronously with an
+`error`. `cwd` is a path on the host that runs the command and passes
+through untouched.
+
+```json
+{
+  "protocol": 6,
+  "kind": "work_up",
+  "request": { "work": "W-7", "pipeline": "solo", "cwd": "/srv/checkout",
+               "body": "ship it", "no_ticket": true, "host": "dev" }
+}
+```
+
+```json
+{ "ok": true, "protocol": 6,
+  "work_operation": { "operation_id": "native-work-1", "state": "running",
+                      "work": "W-7", "message": "Starting configured Work pipeline…" } }
+```
+
+`work_up_status` answers with the same `work_operation` object; once `state`
+is `succeeded` its `result` holds the CLI's `--json` document, and on
+`failed` its `message` holds the last stderr line.
+
+`work_command` runs one read/edit subcommand synchronously and returns the
+child's exit code and streams. `args` is an argv, never a shell string. The
+allowlist is applied before any process exists: `args[0]` must be `work` and
+`args[1]` one of `options`, `preset`, `pipeline`, `route`; anything else,
+including `up`, `start`, a flag before `work`, or the daemon-owned
+`--socket`/`--config`, is rejected. `stdin` (optional) is written to the
+child's stdin, which `work pipeline set --from-json -` reads. Each command is
+bounded to 30 s and 1 MiB of combined output, and argv plus stdin may not
+exceed 1 MiB. On a remote host, `mode = "observe"` permits only the read-only
+`work options`; `mode = "control"` permits all four.
+
+```json
+{ "protocol": 6, "kind": "work_command", "host": "dev",
+  "args": ["work", "options", "--json"], "stdin": null }
+```
+
+```json
+{ "ok": true, "protocol": 6,
+  "work_command": { "exit_code": 0, "stdout": "{ … }\n", "stderr": "" } }
+```
+
+Remote execution has two transports, chosen by muxad per host:
+
+1. **Relay** — when the connected `muxa relay --stdio` advertises the
+   `work_command` capability, the argv travels as a `work_command` relay
+   request and the remote node spawns its own binary
+   (`std::env::current_exe()`, `MUXA_SOCKET` pinned to its daemon) under the
+   same allowlist and bounds. The relay transport additionally accepts `work
+   up`, which is how a remote `work_up` operation travels.
+2. **OpenSSH fallback** — when the relay predates the capability, or no relay
+   is connected (on-demand or offline host), muxad runs
+   `ssh -T -o BatchMode=yes -o ClearAllForwardings=yes -o ConnectTimeout=<fleet.connect_timeout_secs>
+   -- <host.ssh> <host.muxa_path> [--socket <host.remote_socket>] 'work' 'options' '--json'`
+   with every `work …` argument single-quoted for the remote login shell and
+   `stdin` forwarded. OpenSSH's own failure (exit 255) is reported as an
+   `error`; any other exit code is the remote `muxa` speaking. The remote host
+   therefore needs a `muxa` that already has the requested subcommand, but
+   no particular relay version.
+
+Either way the controller re-checks the allowlist and the host's access mode
+before choosing a transport, and the remote node re-checks the allowlist
+before spawning.
 
 #### `by_pane`
 
@@ -284,6 +376,8 @@ Capability tags currently advertised:
 | `needs_choice`   | server emits `NotificationLevel::needs_choice` (otherwise: `needs_input`). |
 | `rate_limited`   | server emits the `rate_limited` event type and the `rate_limit_*` fields on `Agent`. |
 | `collaboration_wait` | server accepts event-driven bounded waits for durable request completion. |
+| `work_control_v1` | server accepts `work_up` / `work_up_status`. |
+| `work_command_v1` | server accepts `work_command` and the `host` field on `work_up`. |
 | `restart`        | server accepts `restart` and can re-exec itself in place. |
 
 #### v1-compat downgrade

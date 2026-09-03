@@ -18,6 +18,7 @@ use muxa::fleet::{
     FLEET_PROTOCOL_VERSION, LOCAL_HOST_ALIAS, LOCAL_MANAGED_LABELS,
 };
 use muxa::ipc::Client;
+use muxa::work_control::shell_quote;
 use muxa::{Config, PaneKey};
 use tokio::io::BufReader;
 use tokio::process::Command;
@@ -878,10 +879,6 @@ fn remote_tmux_command(
         &remote,
     ]);
     command
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 async fn doctor(client: &Client, cfg: &Config, alias: &str, timeout: Duration) -> Result<()> {

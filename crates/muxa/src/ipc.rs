@@ -44,7 +44,9 @@ use crate::session::{
 use crate::state::{Agent, SharedStore};
 use crate::tmux::PaneInfo;
 use crate::work::WorkIdentity;
-use crate::work_control::{self, WorkUpRequest};
+use crate::work_control::{
+    self, RemoteWorkRunner, WorkCommandLimits, WorkCommandOutput, WorkCommandSurface, WorkUpRequest,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -97,6 +99,8 @@ const fn default_session_wait_ms() -> u64 {
 /// hello + write + read). No caller should ever block forever against a
 /// wedged or half-dead daemon.
 const CLIENT_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// A `work_command` waits for a 30 s child plus Fleet transport slack.
+const WORK_COMMAND_CLIENT_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// A collaboration wait occupies one bounded IPC handler and client
 /// connection. Keep the ceiling aligned with the MCP surface so a caller
@@ -177,6 +181,16 @@ enum RequestBody {
     },
     WorkUpStatus {
         operation_id: String,
+    },
+    /// Run one allowlisted `muxa work options|preset|pipeline|route …` argv
+    /// on the local host or a Fleet host and return its exit code and
+    /// streams. Bounded to 30 s and 1 MiB of output.
+    WorkCommand {
+        #[serde(default)]
+        host: Option<String>,
+        args: Vec<String>,
+        #[serde(default)]
+        stdin: Option<String>,
     },
     /// Create or update one desired Run and reconcile live pane evidence.
     PipelineRegister {
@@ -532,6 +546,7 @@ const CAPABILITIES: &[&str] = &[
     "pipeline_runs_v1",
     "pipeline_subscribe",
     "work_control_v1",
+    "work_command_v1",
     "handle_namespace_v1",
     "session_bytes_v1",
     "session_attachment_identity_v1",
@@ -648,6 +663,8 @@ pub struct Response {
     pub pipeline_claims: Option<Vec<PipelineClaim>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_operation: Option<WorkUpOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_command: Option<WorkCommandOutput>,
 }
 
 #[derive(Debug, Serialize)]
@@ -695,6 +712,7 @@ impl Response {
             pipeline_run: None,
             pipeline_claims: None,
             work_operation: None,
+            work_command: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -736,6 +754,11 @@ impl Response {
     fn with_work_operation(operation: WorkUpOperation) -> Self {
         let mut response = Self::ok();
         response.work_operation = Some(operation);
+        response
+    }
+    fn with_work_command(output: WorkCommandOutput) -> Self {
+        let mut response = Self::ok();
+        response.work_command = Some(output);
         response
     }
     fn with_prompts(prompts: Vec<crate::history::HistoryEntry>) -> Self {
@@ -944,6 +967,10 @@ impl RestartController {
 
 const MAX_RETAINED_WORK_OPERATIONS: usize = 32;
 const MAX_CONCURRENT_WORK_OPERATIONS: usize = 4;
+const MAX_CONCURRENT_WORK_COMMANDS: usize = 4;
+/// Transport slack added to a child's own budget when a `work` argv travels
+/// through the Fleet manager (relay round trip or OpenSSH session setup).
+const FLEET_WORK_COMMAND_SLACK: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -977,24 +1004,153 @@ struct WorkUpOperations {
     order: VecDeque<String>,
 }
 
-#[derive(Debug)]
 struct WorkUpManager {
     socket_path: PathBuf,
+    /// Runs `work` argv on remote Fleet hosts. `None` while Fleet is not
+    /// installed, in which case every non-local `host` is refused.
+    remote: Option<Arc<dyn RemoteWorkRunner>>,
     next_id: AtomicU64,
     operations: tokio::sync::Mutex<WorkUpOperations>,
+    commands: tokio::sync::Semaphore,
+}
+
+impl std::fmt::Debug for WorkUpManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkUpManager")
+            .field("socket_path", &self.socket_path)
+            .field("remote", &self.remote.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Routes remote `work` argv through the Fleet manager, which owns per-host
+/// authorization, the SSH relay, and the OpenSSH fallback for older relays.
+struct FleetWorkRunner {
+    fleet: FleetRuntime,
+}
+
+impl RemoteWorkRunner for FleetWorkRunner {
+    fn host_mode<'a>(&'a self, host: &'a str) -> work_control::HostModeFuture<'a> {
+        Box::pin(async move {
+            self.fleet
+                .store
+                .snapshot()
+                .await
+                .hosts
+                .into_iter()
+                .find(|candidate| candidate.alias == host)
+                .map(|candidate| candidate.mode)
+                .ok_or_else(|| {
+                    work_control::WorkCommandError::Invalid(format!(
+                        "fleet host '{host}' is not configured"
+                    ))
+                })
+        })
+    }
+
+    fn run<'a>(
+        &'a self,
+        host: &'a str,
+        args: Vec<String>,
+        stdin: Option<String>,
+        limits: WorkCommandLimits,
+    ) -> work_control::RemoteWorkFuture<'a> {
+        Box::pin(async move {
+            let result = self
+                .fleet
+                .execute(
+                    host,
+                    FleetOperation::WorkCommand { args, stdin },
+                    limits.timeout + FLEET_WORK_COMMAND_SLACK,
+                )
+                .await
+                .map_err(work_control::WorkCommandError::Failed)?;
+            result.command_output().ok_or_else(|| {
+                work_control::WorkCommandError::Failed(format!(
+                    "fleet host '{host}' answered without a command result"
+                ))
+            })
+        })
+    }
 }
 
 impl WorkUpManager {
     fn new(socket_path: PathBuf) -> Arc<Self> {
+        Self::with_remote(socket_path, None)
+    }
+
+    fn with_remote(socket_path: PathBuf, remote: Option<Arc<dyn RemoteWorkRunner>>) -> Arc<Self> {
         Arc::new(Self {
             socket_path,
+            remote,
             next_id: AtomicU64::new(1),
             operations: tokio::sync::Mutex::new(WorkUpOperations::default()),
+            commands: tokio::sync::Semaphore::new(MAX_CONCURRENT_WORK_COMMANDS),
         })
+    }
+
+    /// Resolve and authorize the runner for `host`; `None` means the daemon's
+    /// own host. Observe-only hosts are refused here, before any operation is
+    /// recorded, so the caller gets a synchronous error rather than a failed
+    /// operation.
+    async fn remote_for(
+        &self,
+        host: Option<&str>,
+        args: &[String],
+    ) -> Result<Option<(String, Arc<dyn RemoteWorkRunner>)>, String> {
+        let Some(host) = work_control::remote_host_alias(host) else {
+            return Ok(None);
+        };
+        let runner = self
+            .remote
+            .as_ref()
+            .ok_or_else(|| format!("fleet is not enabled in muxad; cannot reach host '{host}'"))?;
+        let mode = runner
+            .host_mode(host)
+            .await
+            .map_err(|error| error.to_string())?;
+        work_control::authorize_work_command(host, mode, args)
+            .map_err(|error| error.to_string())?;
+        Ok(Some((host.to_string(), Arc::clone(runner))))
+    }
+
+    /// Run one allowlisted `work` subcommand to completion.
+    async fn command(
+        &self,
+        host: Option<String>,
+        args: Vec<String>,
+        stdin: Option<String>,
+    ) -> Result<WorkCommandOutput, String> {
+        work_control::validate_work_command(&args, stdin.as_deref(), WorkCommandSurface::Ipc)
+            .map_err(|error| error.to_string())?;
+        if host.as_deref().is_some_and(|host| host.trim().is_empty()) {
+            return Err("host alias is empty".into());
+        }
+        let remote = self.remote_for(host.as_deref(), &args).await?;
+        let _permit = self.commands.try_acquire().map_err(|_| {
+            format!("at most {MAX_CONCURRENT_WORK_COMMANDS} work commands may run at once")
+        })?;
+        match remote {
+            Some((host, runner)) => runner
+                .run(&host, args, stdin, WorkCommandLimits::COMMAND)
+                .await
+                .map_err(|error| error.to_string()),
+            None => work_control::execute_work_command(
+                &work_control::resolve_muxa_binary(),
+                &args,
+                stdin.as_deref(),
+                Some(&self.socket_path),
+                WorkCommandLimits::COMMAND,
+            )
+            .await
+            .map_err(|error| error.to_string()),
+        }
     }
 
     async fn start(self: &Arc<Self>, request: WorkUpRequest) -> Result<WorkUpOperation, String> {
         request.validate().map_err(|error| error.to_string())?;
+        let arguments = request.arguments();
+        let remote = self.remote_for(request.host.as_deref(), &arguments).await?;
         let mut operations = self.operations.lock().await;
         if let Some(existing) = operations.values.values().find(|tracked| {
             tracked.operation.state == WorkUpOperationState::Running && tracked.request == request
@@ -1055,7 +1211,14 @@ impl WorkUpManager {
 
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            let outcome = work_control::execute_work_up(&request, Some(&manager.socket_path)).await;
+            let outcome = match remote {
+                Some((host, runner)) => runner
+                    .run(&host, arguments, None, WorkCommandLimits::WORK_UP)
+                    .await
+                    .map_err(work_control::WorkUpError::from)
+                    .and_then(|output| work_control::work_up_result(&output)),
+                None => work_control::execute_work_up(&request, Some(&manager.socket_path)).await,
+            };
             let mut operations = manager.operations.lock().await;
             let Some(tracked) = operations.values.get_mut(&operation_id) else {
                 return;
@@ -1196,6 +1359,12 @@ impl Server {
     /// no SSH processes or background resources.
     #[must_use]
     pub fn with_fleet(mut self, fleet: FleetRuntime) -> Self {
+        self.work_up = WorkUpManager::with_remote(
+            self.socket_path.clone(),
+            Some(Arc::new(FleetWorkRunner {
+                fleet: fleet.clone(),
+            })),
+        );
         self.fleet = Some(fleet);
         self
     }
@@ -2325,6 +2494,13 @@ async fn handle(
                         None => {
                             Response::err(format!("Work operation {operation_id:?} was not found"))
                         }
+                    }
+                }
+                RequestBody::WorkCommand { host, args, stdin } => {
+                    kind = "work_command";
+                    match work_up.command(host, args, stdin).await {
+                        Ok(output) => Response::with_work_command(output),
+                        Err(error) => Response::err(error),
                     }
                 }
                 RequestBody::PipelineRegister { registration } => {
@@ -3851,6 +4027,36 @@ impl Client {
             )));
         }
         serde_json::from_value(response["fleet_result"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Run one allowlisted `muxa work …` argv through the daemon, on its own
+    /// host or on the Fleet host `host`, and return the child's exit code and
+    /// streams. Requires the `work_command_v1` capability.
+    pub async fn work_command(
+        &self,
+        host: Option<&str>,
+        args: &[String],
+        stdin: Option<&str>,
+    ) -> Result<WorkCommandOutput, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "work_command",
+            "host": host,
+            "args": args,
+            "stdin": stdin,
+        });
+        let response = self
+            .call_with_timeout(&req, WORK_COMMAND_CLIENT_TIMEOUT)
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("work command failed")
+                    .to_string(),
+            )));
+        }
+        serde_json::from_value(response["work_command"].clone()).map_err(RuntimeError::Json)
     }
 
     /// Ask the daemon which additive features it supports and, when it can
@@ -7436,5 +7642,344 @@ mod tests {
         tokio::task::yield_now().await;
         let _ = shutdown_tx.send(());
         server_task.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod work_command_tests {
+    use super::*;
+    use crate::fleet::HostAccessMode;
+    use crate::work_control::{WorkCommandError, WorkCommandOutput};
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedRun {
+        host: String,
+        args: Vec<String>,
+        stdin: Option<String>,
+        limits: WorkCommandLimits,
+    }
+
+    /// Fake Fleet transport: one configured host with a fixed mode, recording
+    /// every argv it is asked to run.
+    struct FakeRunner {
+        host: &'static str,
+        mode: HostAccessMode,
+        output: WorkCommandOutput,
+        runs: Mutex<Vec<RecordedRun>>,
+    }
+
+    impl FakeRunner {
+        fn new(mode: HostAccessMode, stdout: &str) -> Arc<Self> {
+            Arc::new(Self {
+                host: "dev",
+                mode,
+                output: WorkCommandOutput {
+                    exit_code: 0,
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                },
+                runs: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn runs(&self) -> Vec<RecordedRun> {
+            self.runs.lock().unwrap().clone()
+        }
+    }
+
+    impl RemoteWorkRunner for FakeRunner {
+        fn host_mode<'a>(&'a self, host: &'a str) -> work_control::HostModeFuture<'a> {
+            Box::pin(async move {
+                if host == self.host {
+                    Ok(self.mode)
+                } else {
+                    Err(WorkCommandError::Invalid(format!(
+                        "fleet host '{host}' is not configured"
+                    )))
+                }
+            })
+        }
+
+        fn run<'a>(
+            &'a self,
+            host: &'a str,
+            args: Vec<String>,
+            stdin: Option<String>,
+            limits: WorkCommandLimits,
+        ) -> work_control::RemoteWorkFuture<'a> {
+            Box::pin(async move {
+                self.runs.lock().unwrap().push(RecordedRun {
+                    host: host.to_string(),
+                    args,
+                    stdin,
+                    limits,
+                });
+                Ok(self.output.clone())
+            })
+        }
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    fn request(host: Option<&str>) -> WorkUpRequest {
+        WorkUpRequest {
+            work: "W-7".into(),
+            external: None,
+            pipeline: Some("solo".into()),
+            workspace: None,
+            cwd: Some(PathBuf::from("/srv/remote/checkout")),
+            skill: None,
+            body: Some("ship it".into()),
+            context: None,
+            no_ticket: true,
+            dry_run: false,
+            host: host.map(str::to_string),
+        }
+    }
+
+    async fn wait_settled(manager: &WorkUpManager, operation_id: &str) -> WorkUpOperation {
+        for _ in 0..200 {
+            let operation = manager.status(operation_id).await.unwrap();
+            if operation.state != WorkUpOperationState::Running {
+                return operation;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("operation {operation_id} never settled");
+    }
+
+    #[test]
+    fn work_command_request_decodes_the_documented_shape() {
+        let request: Request = serde_json::from_str(
+            r#"{"protocol":6,"kind":"work_command","host":"dev","args":["work","options","--json"],"stdin":null}"#,
+        )
+        .unwrap();
+        match request.body {
+            RequestBody::WorkCommand { host, args, stdin } => {
+                assert_eq!(host.as_deref(), Some("dev"));
+                assert_eq!(args, ["work", "options", "--json"]);
+                assert_eq!(stdin, None);
+            }
+            _ => panic!("wrong request kind"),
+        }
+        let request: Request = serde_json::from_str(
+            r#"{"protocol":6,"kind":"work_command","args":["work","pipeline","set","--from-json","-"],"stdin":"{}"}"#,
+        )
+        .unwrap();
+        match request.body {
+            RequestBody::WorkCommand { host, args, stdin } => {
+                assert_eq!(host, None);
+                assert_eq!(args[1], "pipeline");
+                assert_eq!(stdin.as_deref(), Some("{}"));
+            }
+            _ => panic!("wrong request kind"),
+        }
+        let request: Request = serde_json::from_str(
+            r#"{"protocol":6,"kind":"work_up","request":{"work":"W-7","host":"dev","cwd":"/srv/x"}}"#,
+        )
+        .unwrap();
+        match request.body {
+            RequestBody::WorkUp { request } => assert_eq!(request.remote_host(), Some("dev")),
+            _ => panic!("wrong request kind"),
+        }
+        assert!(CAPABILITIES.contains(&"work_command_v1"));
+    }
+
+    #[test]
+    fn work_command_response_encodes_the_documented_shape() {
+        let response = Response::with_work_command(WorkCommandOutput {
+            exit_code: 0,
+            stdout: "{\"routes\":[]}\n".into(),
+            stderr: String::new(),
+        });
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["ok"], true);
+        assert_eq!(
+            encoded["work_command"],
+            serde_json::json!({"exit_code": 0, "stdout": "{\"routes\":[]}\n", "stderr": ""})
+        );
+        let plain = serde_json::to_value(Response::ok()).unwrap();
+        assert!(plain.get("work_command").is_none());
+    }
+
+    #[tokio::test]
+    async fn work_up_with_a_control_host_runs_the_same_argv_on_the_runner() {
+        let runner = FakeRunner::new(HostAccessMode::Control, "{\"work\":\"W-7\",\"agents\":2}\n");
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        let started = manager.start(request(Some("dev"))).await.unwrap();
+        assert_eq!(started.state, WorkUpOperationState::Running);
+        let settled = wait_settled(&manager, &started.operation_id).await;
+        assert_eq!(settled.state, WorkUpOperationState::Succeeded);
+        assert_eq!(settled.message, "Work pipeline started");
+        assert_eq!(settled.result.unwrap()["agents"], 2);
+        assert_eq!(
+            runner.runs(),
+            vec![RecordedRun {
+                host: "dev".into(),
+                args: request(None).arguments(),
+                stdin: None,
+                limits: WorkCommandLimits::WORK_UP,
+            }]
+        );
+        // The remote cwd travelled untouched.
+        assert!(runner.runs()[0]
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--cwd", "/srv/remote/checkout"]));
+    }
+
+    #[tokio::test]
+    async fn work_up_remote_failure_is_reported_from_the_last_stderr_line() {
+        let runner = Arc::new(FakeRunner {
+            host: "dev",
+            mode: HostAccessMode::Control,
+            output: WorkCommandOutput {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "note\nerror: no route matched W-7\n".into(),
+            },
+            runs: Mutex::new(Vec::new()),
+        });
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner),
+        );
+        let started = manager.start(request(Some("dev"))).await.unwrap();
+        let settled = wait_settled(&manager, &started.operation_id).await;
+        assert_eq!(settled.state, WorkUpOperationState::Failed);
+        assert_eq!(
+            settled.message,
+            "muxa work up failed: error: no route matched W-7"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_up_on_an_observe_host_is_refused_before_anything_runs() {
+        let runner = FakeRunner::new(HostAccessMode::Observe, "{}");
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        let error = manager.start(request(Some("dev"))).await.unwrap_err();
+        assert!(error.contains("observe-only"), "{error}");
+        assert!(error.contains("mode = \"control\""), "{error}");
+        assert!(runner.runs().is_empty());
+        let error = manager.start(request(Some("nope"))).await.unwrap_err();
+        assert!(error.contains("not configured"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn remote_hosts_are_refused_when_fleet_is_not_installed() {
+        let manager = WorkUpManager::new(PathBuf::from("/tmp/muxa-work-remote-test.sock"));
+        let error = manager.start(request(Some("dev"))).await.unwrap_err();
+        assert!(error.contains("fleet is not enabled"), "{error}");
+        let error = manager
+            .command(
+                Some("dev".into()),
+                argv(&["work", "options", "--json"]),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("fleet is not enabled"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn work_command_on_a_remote_host_forwards_argv_and_stdin() {
+        let runner = FakeRunner::new(HostAccessMode::Control, "{\"pipeline\":\"solo\"}\n");
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        let output = manager
+            .command(
+                Some("dev".into()),
+                argv(&["work", "pipeline", "set", "--from-json", "-"]),
+                Some("{\"name\":\"solo\"}".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "{\"pipeline\":\"solo\"}\n");
+        assert_eq!(
+            runner.runs(),
+            vec![RecordedRun {
+                host: "dev".into(),
+                args: argv(&["work", "pipeline", "set", "--from-json", "-"]),
+                stdin: Some("{\"name\":\"solo\"}".into()),
+                limits: WorkCommandLimits::COMMAND,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn work_command_on_an_observe_host_may_only_read_options() {
+        let runner = FakeRunner::new(HostAccessMode::Observe, "{}");
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        manager
+            .command(
+                Some("dev".into()),
+                argv(&["work", "options", "--json"]),
+                None,
+            )
+            .await
+            .unwrap();
+        for args in [
+            argv(&["work", "preset", "apply", "solo"]),
+            argv(&["work", "pipeline", "set", "--from-json", "-"]),
+            argv(&["work", "route", "remove", "CAL-.*"]),
+        ] {
+            let error = manager
+                .command(Some("dev".into()), args.clone(), None)
+                .await
+                .unwrap_err();
+            assert!(error.contains("observe-only"), "{args:?}: {error}");
+        }
+        assert_eq!(runner.runs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn work_command_rejects_non_allowlisted_argv_before_dispatch() {
+        let runner = FakeRunner::new(HostAccessMode::Control, "{}");
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        for args in [
+            argv(&["work", "up", "W-7", "--json", "--yes"]),
+            argv(&["fleet", "status"]),
+            argv(&["--socket", "/tmp/x.sock", "work", "options"]),
+            argv(&["work", "options", "--config", "/tmp/other.toml"]),
+            argv(&[]),
+        ] {
+            let error = manager
+                .command(Some("dev".into()), args.clone(), None)
+                .await
+                .unwrap_err();
+            assert!(
+                error.starts_with("invalid work command"),
+                "{args:?}: {error}"
+            );
+            let error = manager.command(None, args.clone(), None).await.unwrap_err();
+            assert!(
+                error.starts_with("invalid work command"),
+                "{args:?}: {error}"
+            );
+        }
+        let error = manager
+            .command(Some("   ".into()), argv(&["work", "options"]), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "host alias is empty");
+        assert!(runner.runs().is_empty());
     }
 }

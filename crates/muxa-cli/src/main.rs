@@ -26,6 +26,7 @@ mod upgrade;
 mod watch;
 mod work_init;
 mod work_options;
+mod work_pipeline;
 mod work_up;
 
 use anyhow::{Context, Result};
@@ -551,6 +552,11 @@ enum WorkCmd {
     /// Built-in pipeline presets: list them, or write one into config.toml
     /// as `[pipeline.<name>]` without spending an agent turn.
     Preset(work_options::PresetArgs),
+    /// Write, replace, or remove a `[pipeline.<name>]` from the JSON shape
+    /// `work options` prints, so an editor never parses config.toml.
+    Pipeline(work_pipeline::PipelineArgs),
+    /// Add, update, or remove one `[[route]]` by its `match` regex.
+    Route(work_pipeline::RouteArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -743,6 +749,8 @@ async fn run_work_cmd(
         WorkCmd::Close(args) | WorkCmd::Down(args) => tmux_work::run_work_close(args),
         WorkCmd::Options(args) => work_options::run_options(args, cfg, config_path),
         WorkCmd::Preset(args) => work_options::run_preset(args, config_path),
+        WorkCmd::Pipeline(args) => work_pipeline::run_pipeline(args, config_path),
+        WorkCmd::Route(args) => work_pipeline::run_route(args, config_path),
     }
 }
 

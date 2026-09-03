@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -16,9 +17,10 @@ use muxa::fleet::{
     FleetHostSnapshot, FleetHostState, FleetOperation, FleetRuntime, FleetStore,
     FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
     RemoteSnapshot, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES, FLEET_MAX_FRAME_BYTES,
-    FLEET_PROTOCOL_VERSION, LOCAL_HOST_ALIAS,
+    FLEET_PROTOCOL_VERSION, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
 };
 use muxa::tmux::SessionInfo;
+use muxa::work_control::{self, SshWorkTarget, WorkCommandLimits, WorkCommandSurface};
 use muxa::{HostKind, PaneKey, SharedBackend, SharedStore, WindowKey};
 use time::OffsetDateTime;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -332,11 +334,28 @@ impl LocalTask {
                 }
                 command = self.commands.recv() => {
                     let Some(command) = command else { break; };
+                    // A `work` child may run for its whole budget; never let
+                    // it stall local refreshes and transition handling.
+                    let Some(command) = self.spawn_work_command(command) else { continue; };
                     let result = self.execute(command.operation).await;
                     let _ = command.reply.send(result);
                 }
             }
         }
+    }
+
+    /// Run a `work_command` on this host in its own task, or hand any other
+    /// command back to the caller.
+    fn spawn_work_command(&self, command: HostCommand) -> Option<HostCommand> {
+        let FleetOperation::WorkCommand { args, stdin } = command.operation else {
+            return Some(command);
+        };
+        let socket = self.client.socket().to_path_buf();
+        let reply = command.reply;
+        tokio::spawn(async move {
+            let _ = reply.send(run_local_work_command(args, stdin, &socket).await);
+        });
+        None
     }
 
     async fn refresh(&self) {
@@ -477,8 +496,44 @@ impl LocalTask {
                     .map(FleetCommandResult::collaboration_request)
                     .map_err(|error| error.to_string())
             }
+            FleetOperation::WorkCommand { .. } => {
+                Err("work commands run in their own task; see spawn_work_command".into())
+            }
         }
     }
+}
+
+/// Run an allowlisted `muxa work …` argv next to this daemon with the sibling
+/// `muxa` binary, pinned to the daemon's own socket.
+async fn run_local_work_command(
+    args: Vec<String>,
+    stdin: Option<String>,
+    socket: &Path,
+) -> Result<FleetCommandResult, String> {
+    work_control::validate_work_command(&args, stdin.as_deref(), WorkCommandSurface::Relay)
+        .map_err(|error| error.to_string())?;
+    audit_operation(
+        LOCAL_HOST_ALIAS,
+        "work_command",
+        stdin.as_ref().map_or(0, String::len),
+    );
+    let limits = WorkCommandLimits::for_args(&args);
+    work_control::execute_work_command(
+        &work_control::resolve_muxa_binary(),
+        &args,
+        stdin.as_deref(),
+        Some(socket),
+        limits,
+    )
+    .await
+    .map(FleetCommandResult::command)
+    .map_err(|error| error.to_string())
+}
+
+fn relay_supports_work_command(capabilities: &[String]) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability == FLEET_WORK_COMMAND_CAPABILITY)
 }
 
 async fn next_mailbox_update(
@@ -824,6 +879,9 @@ impl HostTask {
                     _ = self.shutdown.recv() => break,
                     command = self.commands.recv() => {
                         let Some(command) = command else { break; };
+                        // No relay is up; a `work` argv still reaches the host
+                        // over a one-shot OpenSSH command.
+                        let Some(command) = self.intercept_work_command(command, None) else { continue; };
                         match command.operation {
                             FleetOperation::Connect => {
                                 desired = true;
@@ -878,6 +936,7 @@ impl HostTask {
                 () = tokio::time::sleep(delay) => {},
                 command = self.commands.recv() => {
                     let Some(command) = command else { break; };
+                    let Some(command) = self.intercept_work_command(command, None) else { continue; };
                     match command.operation {
                         FleetOperation::Disconnect => {
                             desired = false;
@@ -989,6 +1048,71 @@ impl HostTask {
         })
     }
 
+    /// Handle a `work_command` before the relay sees it: refuse it for an
+    /// observe-only host, let a relay that advertises the operation carry it,
+    /// or run it over a one-shot OpenSSH command when the relay predates the
+    /// operation or is not connected. Returns the command to the caller when
+    /// it is any other operation, or when the relay should carry it.
+    fn intercept_work_command(
+        &self,
+        command: HostCommand,
+        relay_capabilities: Option<&[String]>,
+    ) -> Option<HostCommand> {
+        let FleetOperation::WorkCommand { args, stdin } = command.operation else {
+            return Some(command);
+        };
+        let reply = command.reply;
+        if let Err(error) = self.authorize_work_command(&args, stdin.as_deref()) {
+            let _ = reply.send(Err(error));
+            return None;
+        }
+        if relay_capabilities.is_some_and(relay_supports_work_command) {
+            return Some(HostCommand {
+                operation: FleetOperation::WorkCommand { args, stdin },
+                reply,
+            });
+        }
+        self.spawn_ssh_work_command(args, stdin, reply);
+        None
+    }
+
+    fn authorize_work_command(&self, args: &[String], stdin: Option<&str>) -> Result<(), String> {
+        work_control::validate_work_command(args, stdin, WorkCommandSurface::Relay)
+            .map_err(|error| error.to_string())?;
+        work_control::authorize_work_command(&self.alias, self.config.mode, args)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Fallback transport: `ssh … <muxa_path> [--socket …] 'work' …` with
+    /// stdin forwarded, for a host whose `muxa` predates the relay operation.
+    fn spawn_ssh_work_command(
+        &self,
+        args: Vec<String>,
+        stdin: Option<String>,
+        reply: oneshot::Sender<Result<FleetCommandResult, String>>,
+    ) {
+        audit_operation(
+            &self.alias,
+            "work_command_ssh",
+            stdin.as_ref().map_or(0, String::len),
+        );
+        let target = SshWorkTarget {
+            ssh: self.config.ssh.clone(),
+            muxa_path: self.config.muxa_path.clone(),
+            remote_socket: self.config.remote_socket.clone(),
+            connect_timeout: Some(Duration::from_secs(self.fleet.connect_timeout_secs)),
+        };
+        let limits = WorkCommandLimits::for_args(&args);
+        tokio::spawn(async move {
+            let result =
+                work_control::execute_ssh_work_command(&target, &args, stdin.as_deref(), limits)
+                    .await
+                    .map(|output| sanitize_command_result(FleetCommandResult::command(output)))
+                    .map_err(|error| sanitize_remote_error(&error.to_string()));
+            let _ = reply.send(result);
+        });
+    }
+
     async fn apply_hello(&self, hello: &RelayHello, latency_ms: u64) {
         self.store
             .mutate_host(&self.alias, |host| {
@@ -1072,6 +1196,12 @@ impl HostTask {
                     let Some(command) = command else {
                         *desired = false;
                         break Ok(());
+                    };
+                    let Some(command) = self.intercept_work_command(
+                        command,
+                        Some(&connected.hello.capabilities),
+                    ) else {
+                        continue;
                     };
                     if let FleetOperation::Disconnect = command.operation {
                         *desired = false;
@@ -1225,6 +1355,17 @@ impl HostTask {
                                 status,
                                 body,
                             }
+                        }
+                        FleetOperation::WorkCommand { args, stdin } => {
+                            audit_operation(&self.alias, "work_command", stdin.as_ref().map_or(0, String::len));
+                            // The remote child owns its own budget; the relay
+                            // round trip only adds the usual command slack.
+                            let deadline = WorkCommandLimits::for_args(&args).timeout + command_timeout;
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), deadline),
+                            );
+                            RelayRequest::WorkCommand { request_id: id, args, stdin }
                         }
                         FleetOperation::Connect | FleetOperation::Disconnect => unreachable!(),
                     };
@@ -1571,6 +1712,14 @@ fn sanitize_command_result(mut result: FleetCommandResult) -> FleetCommandResult
             pane.text = pane.text.take().map(sanitize_capture_text);
         }
     }
+    // Command streams keep their full (already bounded) length: `--json`
+    // output must stay parseable, so only terminal controls are removed.
+    result.command_stdout = result
+        .command_stdout
+        .map(|text| sanitize_terminal_text(&text));
+    result.command_stderr = result
+        .command_stderr
+        .map(|text| sanitize_terminal_text(&text));
     result
 }
 
@@ -1647,6 +1796,99 @@ mod tests {
         assert_eq!(host.annotations["example.com/owner"], "June");
         assert_eq!(host.daemon_generation, Some(9));
         assert_eq!(host.remote.unwrap().revision, 4);
+    }
+
+    fn host_task(mode: HostAccessMode) -> HostTask {
+        let (_commands_tx, commands) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown) = broadcast::channel(1);
+        HostTask {
+            alias: "dev".into(),
+            config: FleetHostConfig {
+                ssh: "dev.example".into(),
+                mode,
+                ..FleetHostConfig::default()
+            },
+            fleet: FleetConfig::default(),
+            store: Arc::new(FleetStore::new()),
+            permits: Arc::new(Semaphore::new(1)),
+            node_registry: Arc::new(RwLock::new(BTreeMap::new())),
+            commands,
+            shutdown,
+        }
+    }
+
+    fn work_command(
+        args: &[&str],
+    ) -> (
+        HostCommand,
+        oneshot::Receiver<Result<FleetCommandResult, String>>,
+    ) {
+        let (reply, receiver) = oneshot::channel();
+        (
+            HostCommand {
+                operation: FleetOperation::WorkCommand {
+                    args: args.iter().map(ToString::to_string).collect(),
+                    stdin: None,
+                },
+                reply,
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn work_commands_are_authorized_before_any_transport_is_chosen() {
+        let observe = host_task(HostAccessMode::Observe);
+        let (command, reply) = work_command(&["work", "pipeline", "set", "--from-json", "-"]);
+        assert!(observe.intercept_work_command(command, None).is_none());
+        let error = reply.await.unwrap().unwrap_err();
+        assert!(error.contains("observe-only"), "{error}");
+
+        let control = host_task(HostAccessMode::Control);
+        let (command, reply) = work_command(&["work", "start", "W-1"]);
+        assert!(control.intercept_work_command(command, None).is_none());
+        let error = reply.await.unwrap().unwrap_err();
+        assert!(error.contains("not allowed"), "{error}");
+
+        // A relay that advertises the operation carries it unchanged.
+        let capabilities = vec![FLEET_WORK_COMMAND_CAPABILITY.to_string()];
+        let (command, _reply) = work_command(&["work", "options", "--json"]);
+        let forwarded = control
+            .intercept_work_command(command, Some(&capabilities))
+            .expect("relay path keeps the command");
+        assert!(matches!(
+            forwarded.operation,
+            FleetOperation::WorkCommand { ref args, stdin: None } if args[1] == "options"
+        ));
+
+        // Other operations pass straight through on every host.
+        let (reply, _receiver) = oneshot::channel();
+        let passthrough = observe.intercept_work_command(
+            HostCommand {
+                operation: FleetOperation::Refresh,
+                reply,
+            },
+            None,
+        );
+        assert!(matches!(
+            passthrough.map(|command| command.operation),
+            Some(FleetOperation::Refresh)
+        ));
+        assert!(!relay_supports_work_command(&["capture".to_string()]));
+        assert!(relay_supports_work_command(&capabilities));
+    }
+
+    #[test]
+    fn command_streams_are_sanitized_but_not_truncated_or_reflowed() {
+        let output = muxa::work_control::WorkCommandOutput {
+            exit_code: 0,
+            stdout: "{\"ok\":true}\n".into(),
+            stderr: "warn \u{1b}[31mred\u{1b}[0m\n".into(),
+        };
+        let result = sanitize_command_result(FleetCommandResult::command(output));
+        assert_eq!(result.command_stdout.as_deref(), Some("{\"ok\":true}\n"));
+        assert_eq!(result.command_stderr.as_deref(), Some("warn red\n"));
+        assert_eq!(result.command_exit_code, Some(0));
     }
 
     #[test]

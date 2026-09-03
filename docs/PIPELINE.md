@@ -88,7 +88,34 @@ Launchers ask what is configured with `muxa work options`: routes in config
 order, pipelines by name, `[message.skills]` with a one-line summary, the
 presets above, and `[ticket].agent`. `--json` is the contract Muxa.app's
 Start Work sheet is built on; `configured` is `false` until at least one
-`[pipeline.*]` exists.
+`[pipeline.*]` exists. Each pipeline and agent carries its raw `prompt`
+template, so an editor can hand the entry straight back.
+
+Editors write back through the same shape. `muxa work pipeline set <name>
+--from-json <path|->` takes one `pipelines[]` entry as `options --json`
+prints it (with or without its `name`), runs the checks a launch would fail
+— allowlisted programs, unique aliases, `after` edges that resolve and do
+not cycle, `direction` right or down — and writes `[pipeline.<name>]`
+through `toml_edit`, replacing an existing pipeline where it stands and
+leaving every other section, comment, and value alone. `muxa work pipeline
+remove <name>` refuses while a `[[route]]` still names the pipeline unless
+`--force`, which also clears `pipeline` on those routes. `muxa work route
+set --match <regex>` adds or updates the one `[[route]]` with exactly that
+`match` (`--pipeline`, `--workspace`, `--cwd`, `--position <n>`; `--clear-*`
+removes a field; `worktree` and `prepare` are never touched), and `muxa work
+route remove --match <regex>` deletes it. Every command validates the merged
+file as a whole `Config` before an atomic write, refuses without touching
+the file otherwise, and prints only JSON with `--json`.
+
+```console
+muxa work pipeline set pair --from-json pair.json     # {"pipeline","replaced","config_path"}
+muxa work options --json | jq '.pipelines[] | select(.name == "triad")' \
+  | muxa work pipeline set triad --from-json -        # round trip, unchanged
+muxa work pipeline remove pair --force                # {"pipeline","removed","routes_cleared","config_path"}
+muxa work route set --match '^cal-' --pipeline triad --position 0   # {"match","position","created","config_path"}
+muxa work route set --match '.*' --clear-workspace    # unset flags change nothing
+muxa work route remove --match '^cal-'                # {"match","removed","config_path"}
+```
 
 Prefer to write it by hand? The annotated reference is in
 [`config.example.toml`](../config.example.toml), and everything below
@@ -347,6 +374,10 @@ muxa work init                       # write the config by describing it
 muxa work preset list                # built-in line-ups: solo, pair, triad
 muxa work preset apply <name> --route '<regex>'   # write one, no agent turn
 muxa work options [--json]           # routes, pipelines, skills, presets for a launcher
+muxa work pipeline set <name> --from-json <path|->   # write/replace [pipeline.<name>] from that JSON shape
+muxa work pipeline remove <name> [--force]           # drop it; --force also clears routes naming it
+muxa work route set --match '<regex>' [--pipeline <name>] [--position <n>]   # add/update one [[route]]
+muxa work route remove --match '<regex>'             # drop that route
 muxa work up <work> --external <id>  # link issue, route, create what is missing
 muxa work up <id>                    # compatibility: also look up <id> as an issue
 muxa work up <id> --dry-run          # print the plan, touch nothing

@@ -92,6 +92,8 @@ pub struct PipelineOption {
     pub name: String,
     pub description: Option<String>,
     pub layout: Option<String>,
+    /// The raw `[pipeline.<name>].prompt` template, not rendered.
+    pub prompt: Option<String>,
     pub agents: Vec<AgentOption>,
 }
 
@@ -101,6 +103,8 @@ pub struct AgentOption {
     pub program: String,
     pub role: Option<String>,
     pub task: Option<String>,
+    /// The raw agent `prompt` template, not rendered.
+    pub prompt: Option<String>,
     pub direction: Option<String>,
     pub after: Vec<String>,
 }
@@ -166,7 +170,7 @@ pub fn run_preset(args: PresetArgs, config_path: Option<PathBuf>) -> Result<()> 
     }
 }
 
-fn resolve_path(config_path: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn resolve_path(config_path: Option<PathBuf>) -> Result<PathBuf> {
     config_path
         .or_else(muxa::paths::default_config_file)
         .context("no config directory is available on this system")
@@ -226,6 +230,7 @@ fn pipeline_option(name: &str, pipeline: &PipelineConfig) -> PipelineOption {
         name: name.to_string(),
         description: pipeline.description.clone(),
         layout: pipeline.layout.clone(),
+        prompt: pipeline.prompt.clone(),
         agents: pipeline.agent.iter().map(agent_option).collect(),
     }
 }
@@ -236,6 +241,7 @@ fn agent_option(agent: &PipelineAgentConfig) -> AgentOption {
         program: agent.program.clone(),
         role: agent.role.clone(),
         task: agent.task.clone(),
+        prompt: agent.prompt.clone(),
         direction: agent.direction.clone(),
         after: agent.after.clone(),
     }
@@ -332,26 +338,13 @@ pub fn apply_preset(
         }
     }
 
-    let text = document.to_string();
-    let updated: Config = toml::from_str(&text).context("validating updated muxa config")?;
-    updated
-        .validate()
-        .context("validating updated muxa config")?;
+    let (text, updated) = validated(&document)?;
     let written = updated
         .pipeline
         .get(preset.name)
         .context("the written pipeline did not read back")?;
     pipeline::desired_agents(preset.name, written, &Vars::new())?;
-
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    crate::init::apply::atomic_write(path, &text)
-        .with_context(|| format!("writing {}", path.display()))?;
+    write_config(path, &text)?;
     Ok(PresetApplied {
         pipeline: preset.name.to_string(),
         route: route.map(str::to_string),
@@ -361,7 +354,33 @@ pub fn apply_preset(
     })
 }
 
-fn load_document(path: &Path) -> Result<toml_edit::DocumentMut> {
+/// Render an edited document and read it back as a full [`Config`], so a
+/// file this module writes is one muxad will load. Returns the text that
+/// was checked, which is the text to write.
+pub(crate) fn validated(document: &toml_edit::DocumentMut) -> Result<(String, Config)> {
+    let text = document.to_string();
+    let config: Config = toml::from_str(&text).context("validating updated muxa config")?;
+    config
+        .validate()
+        .context("validating updated muxa config")?;
+    Ok((text, config))
+}
+
+/// Write config text atomically, creating the directory if this is the
+/// first thing ever written there.
+pub(crate) fn write_config(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    crate::init::apply::atomic_write(path, text)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+pub(crate) fn load_document(path: &Path) -> Result<toml_edit::DocumentMut> {
     match std::fs::read_to_string(path) {
         Ok(text) if !text.trim().is_empty() => text
             .parse::<toml_edit::DocumentMut>()
@@ -376,7 +395,9 @@ fn load_document(path: &Path) -> Result<toml_edit::DocumentMut> {
 
 /// The `[pipeline]` parent, created implicit so only `[pipeline.<name>]`
 /// headers are ever rendered.
-fn pipelines_table_mut(document: &mut toml_edit::DocumentMut) -> Result<&mut toml_edit::Table> {
+pub(crate) fn pipelines_table_mut(
+    document: &mut toml_edit::DocumentMut,
+) -> Result<&mut toml_edit::Table> {
     if document.get("pipeline").is_none() {
         let mut table = toml_edit::Table::new();
         table.set_implicit(true);
@@ -387,7 +408,9 @@ fn pipelines_table_mut(document: &mut toml_edit::DocumentMut) -> Result<&mut tom
         .context("[pipeline] is not a table")
 }
 
-fn routes_mut(document: &mut toml_edit::DocumentMut) -> Result<&mut toml_edit::ArrayOfTables> {
+pub(crate) fn routes_mut(
+    document: &mut toml_edit::DocumentMut,
+) -> Result<&mut toml_edit::ArrayOfTables> {
     if document.get("route").is_none() {
         document["route"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
     }
@@ -398,7 +421,7 @@ fn routes_mut(document: &mut toml_edit::DocumentMut) -> Result<&mut toml_edit::A
 
 /// Render a pipeline as the `[pipeline.<name>]` table the config parser
 /// reads back, key for key.
-fn pipeline_table(pipeline: &PipelineConfig) -> toml_edit::Table {
+pub(crate) fn pipeline_table(pipeline: &PipelineConfig) -> toml_edit::Table {
     let mut table = toml_edit::Table::new();
     insert_opt(&mut table, "description", pipeline.description.as_deref());
     insert_opt(&mut table, "layout", pipeline.layout.as_deref());
@@ -429,40 +452,45 @@ fn insert_opt(table: &mut toml_edit::Table, key: &str, value: Option<&str>) {
 }
 
 /// Highest render position any table in the document currently occupies.
-fn last_position(document: &toml_edit::DocumentMut) -> usize {
-    fn walk(table: &toml_edit::Table) -> usize {
-        table
-            .iter()
-            .map(|(_, item)| match item {
-                toml_edit::Item::Table(table) => table.position().unwrap_or(0).max(walk(table)),
-                toml_edit::Item::ArrayOfTables(array) => array
-                    .iter()
-                    .map(|table| table.position().unwrap_or(0).max(walk(table)))
-                    .max()
-                    .unwrap_or(0),
-                _ => 0,
-            })
-            .max()
-            .unwrap_or(0)
-    }
-    walk(document.as_table())
+pub(crate) fn last_position(document: &toml_edit::DocumentMut) -> usize {
+    max_position(document.as_item()).unwrap_or(0)
 }
 
-/// Pin an item's tables to render after everything already in the file,
-/// returning the next free position.
-fn place_after(item: &mut toml_edit::Item, mut next: usize) -> usize {
+/// Highest render position of an item's own table or any table under it.
+/// `None` for a value, or for tables that were never placed.
+pub(crate) fn max_position(item: &toml_edit::Item) -> Option<usize> {
+    fn table(table: &toml_edit::Table) -> Option<usize> {
+        table
+            .position()
+            .into_iter()
+            .chain(table.iter().filter_map(|(_, child)| max_position(child)))
+            .max()
+    }
     match item {
-        toml_edit::Item::Table(table) => {
-            table.set_position(next);
-            next += 1;
-            for (_, child) in table.iter_mut() {
-                next = place_after(child, next);
-            }
+        toml_edit::Item::Table(inner) => table(inner),
+        toml_edit::Item::ArrayOfTables(array) => array.iter().filter_map(table).max(),
+        _ => None,
+    }
+}
+
+/// Pin an item's tables to render from `next` on, in declaration order,
+/// returning the next free position. Positions are what `toml_edit` sorts
+/// headers by, so a table built through the API has to be placed or it
+/// inherits whatever position the parser last saw.
+pub(crate) fn place_after(item: &mut toml_edit::Item, mut next: usize) -> usize {
+    fn table(table: &mut toml_edit::Table, mut next: usize) -> usize {
+        table.set_position(next);
+        next += 1;
+        for (_, child) in table.iter_mut() {
+            next = place_after(child, next);
         }
+        next
+    }
+    match item {
+        toml_edit::Item::Table(inner) => next = table(inner, next),
         toml_edit::Item::ArrayOfTables(array) => {
-            for table in array.iter_mut() {
-                table.set_position(next);
-                next += 1;
+            for inner in array.iter_mut() {
+                next = table(inner, next);
             }
         }
         _ => {}
@@ -719,12 +747,27 @@ after = ['plan']
         assert_eq!(names, PRESET_NAMES);
         assert_eq!(
             keys(&presets[0]),
-            BTreeSet::from(["name", "description", "layout", "agents"])
+            BTreeSet::from(["name", "description", "layout", "prompt", "agents"])
         );
+        assert_eq!(presets[0]["prompt"], "You are working on {{work}}.");
         let solo_agent = &presets[0]["agents"][0];
         assert_eq!(
             keys(solo_agent),
-            BTreeSet::from(["alias", "program", "role", "task", "direction", "after"])
+            BTreeSet::from([
+                "alias",
+                "program",
+                "role",
+                "task",
+                "prompt",
+                "direction",
+                "after"
+            ])
+        );
+        assert!(
+            solo_agent["prompt"]
+                .as_str()
+                .is_some_and(|prompt| prompt.starts_with("You own the implementation")),
+            "{solo_agent}"
         );
         assert_eq!(solo_agent["alias"], "claude");
         assert_eq!(solo_agent["direction"], Value::Null);
@@ -787,6 +830,8 @@ after = ['plan']
         assert_eq!(agents.len(), 2);
         assert_eq!(agents[0]["alias"], "plan");
         assert_eq!(agents[0]["task"], Value::Null);
+        assert_eq!(agents[0]["prompt"], Value::Null);
+        assert_eq!(pipelines[0]["prompt"], Value::Null);
         assert_eq!(agents[0]["after"], Value::Array(vec![]));
         assert_eq!(agents[1]["direction"], "down");
         assert_eq!(agents[1]["after"], serde_json::json!(["plan"]));
