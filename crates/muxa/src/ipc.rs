@@ -19,7 +19,9 @@
 //! can call `Store::apply` afterwards, so the daemon's final flush
 //! captures every state change the user actually triggered.
 
-use crate::ask::{AskConversation, AskCredential, AskEntry, AskStore};
+use crate::ask::{
+    AskConversation, AskCredential, AskEntry, AskProviderEdit, AskProviderInfo, AskStore,
+};
 use crate::backend::{default_backend, HostKind, SharedBackend};
 use crate::collaboration::{
     self, AirArtifactReference, CollaborationClientKind, CollaborationOptions, CollaborationOrigin,
@@ -44,6 +46,7 @@ use crate::session::{
 use crate::state::{Agent, SharedStore};
 use crate::tmux::PaneInfo;
 use crate::work::WorkIdentity;
+use crate::work_compose::{self, WorkComposeOutput, WorkComposeRequest};
 use crate::work_control::{
     self, RemoteWorkRunner, WorkCommandLimits, WorkCommandOutput, WorkCommandSurface, WorkUpRequest,
 };
@@ -191,6 +194,21 @@ enum RequestBody {
         args: Vec<String>,
         #[serde(default)]
         stdin: Option<String>,
+    },
+    /// Draft one pipeline from a description with a read-only headless
+    /// turn, validated with the `pipeline set` rules and retried once on a
+    /// draft that would not launch. Writes nothing.
+    WorkCompose {
+        description: String,
+        /// Provider to draft with; absent means the ask store's selection.
+        #[serde(default)]
+        agent: Option<String>,
+        /// A previous draft to refine; `description` is then the change.
+        #[serde(default)]
+        current: Option<crate::work_pipeline_spec::PipelineSpec>,
+        /// Same shape and handling as `ask_send`'s.
+        #[serde(default)]
+        credential: Option<AskCredential>,
     },
     /// Create or update one desired Run and reconcile live pane evidence.
     PipelineRegister {
@@ -376,6 +394,24 @@ enum RequestBody {
     AskDelete {
         id: String,
     },
+    /// Every provider the daemon can ask — CLIs and APIs — with the
+    /// effective model and which one is selected.
+    AskProviders {},
+    /// Edit `[ask.providers.<provider>]`. Each key is tri-state: absent
+    /// from the request leaves it unchanged, `null` clears it, a string
+    /// sets it — so a client sends only what it changed. Answers with the
+    /// updated provider list.
+    AskProviderConfigure {
+        provider: String,
+        // `Option<Option<_>>` is the point: the outer level is "was the key
+        // sent", the inner is "null or a value", and clients rely on both.
+        #[allow(clippy::option_option)]
+        #[serde(default, deserialize_with = "double_option")]
+        model: Option<Option<String>>,
+        #[allow(clippy::option_option)]
+        #[serde(default, deserialize_with = "double_option")]
+        api_key_env: Option<Option<String>>,
+    },
     CollaborationInbox {
         origin: CollaborationOrigin,
     },
@@ -520,6 +556,17 @@ struct Request {
     body: RequestBody,
 }
 
+/// `Option<Option<T>>` from JSON: a present key — `null` included — is
+/// `Some(...)`, so `#[serde(default)]` alone marks the absent case.
+#[allow(clippy::option_option)]
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// Oldest protocol the server can still serve via the negotiated regime
 /// (i.e. with v1-compat enum downgrade). Bumped when we drop the
 /// downgrade path for an older variant.
@@ -555,6 +602,8 @@ const CAPABILITIES: &[&str] = &[
     "ask_status_v1",
     "ask_conversations_v1",
     "ask_subscribe",
+    "ask_providers_v1",
+    "work_compose_v1",
 ];
 
 /// Advertised only when the server has the controller required to come back
@@ -652,6 +701,8 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ask_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_providers: Option<Vec<AskProviderInfo>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fleet: Option<FleetSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fleet_result: Option<FleetCommandResult>,
@@ -665,6 +716,8 @@ pub struct Response {
     pub work_operation: Option<WorkUpOperation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_command: Option<WorkCommandOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_compose: Option<WorkComposeOutput>,
 }
 
 #[derive(Debug, Serialize)]
@@ -706,6 +759,7 @@ impl Response {
             ask_conversation: None,
             ask_agent: None,
             ask_enabled: None,
+            ask_providers: None,
             fleet: None,
             fleet_result: None,
             pipeline_runs: None,
@@ -713,6 +767,7 @@ impl Response {
             pipeline_claims: None,
             work_operation: None,
             work_command: None,
+            work_compose: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -759,6 +814,11 @@ impl Response {
     fn with_work_command(output: WorkCommandOutput) -> Self {
         let mut response = Self::ok();
         response.work_command = Some(output);
+        response
+    }
+    fn with_work_compose(output: WorkComposeOutput) -> Self {
+        let mut response = Self::ok();
+        response.work_compose = Some(output);
         response
     }
     fn with_prompts(prompts: Vec<crate::history::HistoryEntry>) -> Self {
@@ -874,6 +934,11 @@ impl Response {
     fn with_ask_conversation(conversation: AskConversation) -> Self {
         let mut response = Self::ok();
         response.ask_conversation = Some(conversation);
+        response
+    }
+    fn with_ask_providers(providers: Vec<AskProviderInfo>) -> Self {
+        let mut response = Self::ok();
+        response.ask_providers = Some(providers);
         response
     }
     fn hello(restart: Option<&RestartController>) -> Self {
@@ -2503,6 +2568,45 @@ async fn handle(
                         Err(error) => Response::err(error),
                     }
                 }
+                RequestBody::WorkCompose {
+                    description,
+                    agent,
+                    current,
+                    credential,
+                } => {
+                    kind = "work_compose";
+                    let request = WorkComposeRequest {
+                        description,
+                        agent,
+                        current,
+                    };
+                    let installed = work_compose::installed_programs();
+                    // The drafting turn is read-only whatever `[ask]` says:
+                    // a model describing a pipeline must not edit files.
+                    let drafter = Arc::clone(&ask);
+                    let agent = request.agent.clone();
+                    let result = work_compose::compose(&request, &installed, move |prompt| {
+                        let drafter = Arc::clone(&drafter);
+                        let agent = agent.clone();
+                        let credential = credential.clone();
+                        async move {
+                            drafter
+                                .one_shot_for(
+                                    agent.as_deref(),
+                                    &prompt,
+                                    crate::config::AskPermissionMode::Plan,
+                                    credential,
+                                )
+                                .await
+                                .map_err(|error| error.to_string())
+                        }
+                    })
+                    .await;
+                    match result {
+                        Ok(output) => Response::with_work_compose(output),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
                 RequestBody::PipelineRegister { registration } => {
                     kind = "pipeline_register";
                     match pipeline_runs.register(registration).await {
@@ -2965,6 +3069,22 @@ async fn handle(
                 RequestBody::AskDelete { id } => {
                     kind = "ask_delete";
                     Response::with_pruned(usize::from(ask.delete_history_entry(&id).await))
+                }
+                RequestBody::AskProviders {} => {
+                    kind = "ask_providers";
+                    Response::with_ask_providers(ask.providers().await)
+                }
+                RequestBody::AskProviderConfigure {
+                    provider,
+                    model,
+                    api_key_env,
+                } => {
+                    kind = "ask_provider_configure";
+                    let edit = AskProviderEdit { model, api_key_env };
+                    match ask.configure_provider(&provider, edit).await {
+                        Ok(providers) => Response::with_ask_providers(providers),
+                        Err(error) => Response::err(error.to_string()),
+                    }
                 }
                 RequestBody::CollaborationSend {
                     origin,
@@ -4383,6 +4503,63 @@ impl Client {
         let removed: usize =
             serde_json::from_value(resp["pruned"].clone()).map_err(RuntimeError::Json)?;
         Ok(removed == 1)
+    }
+
+    /// Every provider the daemon can ask, with its effective model and
+    /// which one is selected. Requires the `ask_providers_v1` capability.
+    pub async fn ask_providers(&self) -> Result<Vec<AskProviderInfo>, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_providers" });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_providers"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Edit `[ask.providers.<provider>]` and read back the updated provider
+    /// list. Each key is tri-state: `None` is not sent and leaves the key
+    /// unchanged, `Some(None)` sends `null` to clear it, `Some(Some(v))`
+    /// sets it. Requires the `ask_providers_v1` capability.
+    #[allow(clippy::option_option)]
+    pub async fn ask_provider_configure(
+        &self,
+        provider: &str,
+        model: Option<Option<&str>>,
+        api_key_env: Option<Option<&str>>,
+    ) -> Result<Vec<AskProviderInfo>, RuntimeError> {
+        let mut req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_provider_configure",
+            "provider": provider,
+        });
+        if let Some(model) = model {
+            req["model"] = serde_json::json!(model);
+        }
+        if let Some(api_key_env) = api_key_env {
+            req["api_key_env"] = serde_json::json!(api_key_env);
+        }
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_providers"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Draft one pipeline from a description with a read-only headless
+    /// turn. `credential` is a one-turn `(agent, api_key)` pair handled
+    /// like `ask_send`'s. Requires the `work_compose_v1` capability.
+    pub async fn work_compose(
+        &self,
+        request: &WorkComposeRequest,
+        credential: Option<(&str, &str)>,
+    ) -> Result<WorkComposeOutput, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "work_compose",
+            "description": request.description,
+            "agent": request.agent,
+            "current": request.current,
+            "credential": credential.map(|(agent, api_key)| serde_json::json!({
+                "agent": agent,
+                "api_key": api_key,
+            })),
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["work_compose"].clone()).map_err(RuntimeError::Json)
     }
 
     pub async fn collaboration_send(
@@ -6353,6 +6530,8 @@ mod tests {
         assert!(caps.contains(&"ask_one_turn_credential_v1"));
         assert!(caps.contains(&"ask_status_v1"));
         assert!(caps.contains(&"ask_conversations_v1"));
+        assert!(caps.contains(&"ask_providers_v1"));
+        assert!(caps.contains(&"work_compose_v1"));
         assert!(!caps.contains(&RESTART_CAPABILITY));
         assert!(!caps.contains(&STOP_CAPABILITY));
         assert!(resp["generation"].is_null());
@@ -6429,6 +6608,293 @@ mod tests {
         assert_eq!(selected.id, first.id);
         let (_, active) = client.ask_conversation_list().await.unwrap();
         assert_eq!(active.unwrap().id, first.id);
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn provider_and_compose_requests_deserialize_from_their_documented_shapes() {
+        let providers: RequestBody =
+            serde_json::from_value(serde_json::json!({"kind": "ask_providers"})).unwrap();
+        assert!(matches!(providers, RequestBody::AskProviders {}));
+
+        let configure: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "ask_provider_configure",
+            "provider": "anthropic",
+            "model": "claude-opus-5",
+            "api_key_env": null,
+        }))
+        .unwrap();
+        match configure {
+            RequestBody::AskProviderConfigure {
+                provider,
+                model,
+                api_key_env,
+            } => {
+                assert_eq!(provider, "anthropic");
+                // A string sets, `null` clears…
+                assert_eq!(model, Some(Some("claude-opus-5".to_string())));
+                assert_eq!(api_key_env, Some(None));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // …and an absent key means "leave it unchanged".
+        let partial: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "ask_provider_configure",
+            "provider": "openai",
+            "model": "gpt-5-mini",
+        }))
+        .unwrap();
+        assert!(matches!(
+            partial,
+            RequestBody::AskProviderConfigure {
+                model: Some(Some(_)),
+                api_key_env: None,
+                ..
+            }
+        ));
+
+        let compose: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "work_compose",
+            "description": "implementer in claude, reviewer in codex after it",
+            "agent": "claude",
+            "current": {
+                "name": "pair", "description": null, "layout": null, "prompt": null,
+                "agents": [{"alias": "impl", "program": "claude", "role": null, "task": null,
+                            "prompt": null, "direction": null, "after": []}],
+            },
+            "credential": {"agent": "claude", "api_key": "sk-one-turn"},
+        }))
+        .unwrap();
+        match compose {
+            RequestBody::WorkCompose {
+                description,
+                agent,
+                current,
+                credential,
+            } => {
+                assert_eq!(
+                    description,
+                    "implementer in claude, reviewer in codex after it"
+                );
+                assert_eq!(agent.as_deref(), Some("claude"));
+                let current = current.unwrap();
+                assert_eq!(current.name.as_deref(), Some("pair"));
+                assert_eq!(current.agents[0].alias, "impl");
+                let credential = credential.unwrap();
+                assert_eq!(credential.agent, "claude");
+                assert_eq!(credential.api_key, "sk-one-turn");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Every optional field really is optional.
+        let minimal: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "work_compose",
+            "description": "solo claude",
+        }))
+        .unwrap();
+        assert!(matches!(
+            minimal,
+            RequestBody::WorkCompose {
+                agent: None,
+                current: None,
+                credential: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_and_compose_responses_serialize_with_their_documented_fields() {
+        let response = Response::with_work_compose(WorkComposeOutput {
+            pipeline: crate::work_pipeline_spec::PipelineSpec {
+                name: Some("pair".into()),
+                ..Default::default()
+            },
+            notes: "two agents".into(),
+            raw: "raw".into(),
+        });
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["work_compose"]["pipeline"]["name"], "pair");
+        assert_eq!(value["work_compose"]["notes"], "two agents");
+        assert_eq!(value["work_compose"]["raw"], "raw");
+        let response = Response::with_ask_providers(crate::ask::provider_infos(
+            &std::collections::BTreeMap::new(),
+            "claude",
+            |_| None,
+        ));
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["ask_providers"][0]["id"], "claude");
+        assert_eq!(value["ask_providers"][0]["kind"], "cli");
+        assert_eq!(value["ask_providers"][3]["kind"], "api");
+        assert!(value["ask_providers"][3]["credential_present"].is_boolean());
+    }
+
+    #[tokio::test]
+    async fn ask_providers_lists_every_provider_and_follows_the_selection() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-providers.sock");
+        let server = Server::new(sock.clone(), Store::shared());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let client = Client::new(sock);
+        let providers = client.ask_providers().await.unwrap();
+        let ids: Vec<&str> = providers.iter().map(|info| info.id.as_str()).collect();
+        assert_eq!(ids, crate::ask::supported_agents());
+        assert!(providers[0].selected);
+        assert_eq!(providers[3].model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(providers[4].model.as_deref(), Some("gpt-5"));
+
+        assert_eq!(client.ask_agent(Some("openai")).await.unwrap(), "openai");
+        let providers = client.ask_providers().await.unwrap();
+        let selected: Vec<&str> = providers
+            .iter()
+            .filter(|info| info.selected)
+            .map(|info| info.id.as_str())
+            .collect();
+        assert_eq!(selected, ["openai"]);
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_provider_configure_writes_config_and_answers_with_the_list() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-configure.sock");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[watch]\nspinner = false\n").unwrap();
+        let ask = crate::ask::AskStore::in_memory(crate::ask::AskOptions {
+            config_path: Some(config_path.clone()),
+            ..crate::ask::AskOptions::default()
+        });
+        let server = Server::new(sock.clone(), Store::shared()).with_ask(ask);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let resp = raw_call(
+            &sock,
+            &serde_json::json!({
+                "protocol": PROTOCOL_VERSION,
+                "kind": "ask_provider_configure",
+                "provider": "anthropic",
+                "model": "claude-opus-5",
+                "api_key_env": "WORK_ANTHROPIC_KEY",
+            }),
+        )
+        .await;
+        assert_eq!(resp["ok"], true, "{resp}");
+        let anthropic = &resp["ask_providers"][3];
+        assert_eq!(anthropic["id"], "anthropic");
+        assert_eq!(anthropic["model"], "claude-opus-5");
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(text.starts_with("[watch]\nspinner = false\n"), "{text}");
+        assert!(text.contains("[ask.providers.anthropic]"), "{text}");
+        assert!(
+            text.contains("api_key_env = \"WORK_ANTHROPIC_KEY\""),
+            "{text}"
+        );
+
+        // Sending only `model` leaves `api_key_env` as it was.
+        let client = Client::new(sock.clone());
+        let providers = client
+            .ask_provider_configure("anthropic", Some(None), None)
+            .await
+            .unwrap();
+        assert_eq!(providers[3].model.as_deref(), Some("claude-sonnet-5"));
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!text.contains("model ="), "{text}");
+        assert!(
+            text.contains("api_key_env = \"WORK_ANTHROPIC_KEY\""),
+            "{text}"
+        );
+        // An empty edit is a no-op that still answers with the list.
+        let providers = client
+            .ask_provider_configure("anthropic", None, None)
+            .await
+            .unwrap();
+        assert_eq!(providers.len(), crate::ask::supported_agents().len());
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), text);
+        // `null` clears the last key and the table goes with it.
+        client
+            .ask_provider_configure("anthropic", None, Some(None))
+            .await
+            .unwrap();
+        assert!(!std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("providers"));
+
+        let refused = client
+            .ask_provider_configure("bard", Some(Some("x")), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("is not supported"), "{refused}");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn work_compose_refuses_before_spending_a_turn_on_bad_input() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-work-compose.sock");
+        let server = Server::new(sock.clone(), Store::shared());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let blank = raw_call(
+            &sock,
+            &serde_json::json!({
+                "protocol": PROTOCOL_VERSION,
+                "kind": "work_compose",
+                "description": "   ",
+            }),
+        )
+        .await;
+        assert_eq!(blank["ok"], false);
+        assert!(blank["error"]
+            .as_str()
+            .unwrap()
+            .contains("description is empty"));
+
+        // An unknown provider fails inside the turn, so nothing is spawned
+        // and nothing is retried.
+        let client = Client::new(sock.clone());
+        let error = client
+            .work_compose(
+                &WorkComposeRequest {
+                    description: "solo claude".into(),
+                    agent: Some("bard".into()),
+                    current: None,
+                },
+                None,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not supported"), "{error}");
+
+        // A key for the wrong provider is refused the same way `ask_send`
+        // refuses it.
+        let error = client
+            .work_compose(
+                &WorkComposeRequest {
+                    description: "solo claude".into(),
+                    agent: Some("anthropic".into()),
+                    current: None,
+                },
+                Some(("openai", "sk-wrong")),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("selected ask agent is anthropic"), "{error}");
 
         tx.send(()).unwrap();
         handle.await.unwrap();

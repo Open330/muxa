@@ -23,8 +23,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::work_up::expand_tilde;
-use muxa::config::Config;
+use muxa::ask::AskProviderKind;
+use muxa::config::{AskProviderConfig, Config};
 use muxa::pipeline::{self, ProposalSummary};
+use muxa::work_compose::{config_prompt, installed_programs};
+use std::collections::BTreeMap;
 
 /// The three keys this command owns. Anything else in the file is left
 /// exactly as it was.
@@ -35,7 +38,8 @@ pub struct InitArgs {
     /// Describe the setup in your own words. Omit to be asked.
     #[arg(long)]
     pub describe: Option<String>,
-    /// Resolver agent: claude or codex. Defaults to `[ticket].agent`.
+    /// Resolver: claude, codex, gemini, anthropic, or openai. Defaults to
+    /// `[ticket].agent`.
     #[arg(long)]
     pub agent: Option<String>,
     /// Print the proposed config and write nothing. The agent turn still
@@ -46,70 +50,6 @@ pub struct InitArgs {
     #[arg(long, short = 'y')]
     pub yes: bool,
 }
-
-/// What the model is told about the shape it must produce. Kept next to the
-/// command rather than in the docs directory so the two cannot drift: if
-/// the schema changes, this is in the same diff.
-const SCHEMA: &str = r#"
-muxa work pipeline configuration. Three top-level keys, all optional except
-as noted:
-
-[ticket]                      # how a work id becomes ticket context
-agent = "claude"              # or "codex" — the resolver CLI
-cwd = "~"                     # where the resolver runs
-timeout_secs = 300
-cache_secs = 900              # 0 disables the cache
-additional_dirs = ["/path"]   # extra roots the resolver may read
-
-[ticket.source.<name>]        # tried in sorted-key order, first match wins
-match = '^cal-\d+$'           # regex against the work id, case-insensitive
-prompt = '''...'''            # asks an agent to answer with ticket JSON.
-                              # {{id}} is the lowercased work id. muxa reads
-                              # id/identifier/key, title/name/summary,
-                              # body/description, url, state, branch.
-
-[[route]]                     # REQUIRED: ordered, first match wins
-match     = '^cal-'           # regex against the work id
-workspace = 'callabo'         # the tmux session; defaults to the cwd name
-pipeline  = 'triad'           # must name a [pipeline.*] below
-cwd       = '~/src/{{id}}'    # optional; omit to use the current directory
-prepare   = 'mk-ws {{id}} {{ticket.branch}}'
-                              # optional: command that provisions this work's
-                              # environment, run once when the work window does
-                              # not exist yet. Pair it with `cwd`, since the
-                              # directory usually does not exist until it has
-                              # run. Cannot be combined with [route.worktree].
-[route.worktree]              # optional: a git worktree per work item.
-repo   = '~/src/repo'         # Use this OR prepare, never both.
-branch = '{{id}}'
-
-[pipeline.<name>]             # REQUIRED: at least one
-layout = 'main-vertical'      # tmux layout, applied once every pane exists
-prompt = '''...'''            # context every agent in this pipeline gets
-
-[[pipeline.<name>.agent]]     # one per pane, at least one
-alias   = 'impl'              # unique within the pipeline; keys the pane diff
-program = 'codex'             # ONLY claude, codex, gemini, or opencode
-role    = 'implementer'       # optional; peers address it as role:<role>
-task    = 'fix the reaper'    # optional; short label in `muxa work show`/`watch`
-prompt  = '...'               # optional; this agent's own instructions
-direction = 'right'           # optional: right (default) or down
-after   = ['impl']            # optional: aliases that must report finishing
-                              # before this one starts. Omit for work that is
-                              # genuinely parallel; use it when one agent must
-                              # not see a tree the other is still changing —
-                              # a reviewer after its implementer, say. The
-                              # upstream agent opens the edge by running
-                              # `muxa work done` from its own pane, so tell it
-                              # to in that agent's prompt.
-
-Placeholders, usable in any prompt/path/workspace string:
-{{id}} lowercased work id, {{work}} as muxa stores it, {{workspace}},
-{{cwd}}, {{alias}}, {{role}}, {{program}}, {{request}} (the caller's
---body/--skill/--context), and {{ticket.title|body|url|state|id|branch}}.
-
-Unknown keys are a hard error, so do not invent any.
-"#;
 
 pub async fn run(args: InitArgs, config: &Config, config_path: Option<PathBuf>) -> Result<()> {
     let path = config_path
@@ -126,7 +66,9 @@ pub async fn run(args: InitArgs, config: &Config, config_path: Option<PathBuf>) 
         .unwrap_or(config.ticket.agent.as_str())
         .to_string();
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let prompt = compose_prompt(&describe, &existing);
+    // The schema, the prompt shape, and the "which programs are installed"
+    // hint are shared with `work compose` so the two cannot drift.
+    let prompt = config_prompt(&describe, &existing, &installed_programs());
 
     let resolver_cwd = config
         .ticket
@@ -139,20 +81,23 @@ pub async fn run(args: InitArgs, config: &Config, config_path: Option<PathBuf>) 
     let agent = if args.yes {
         agent
     } else {
-        let Some(chosen) = choose_agent(&agent)? else {
+        let Some(chosen) = choose_agent(&agent, &config.ask.providers)? else {
             println!("nothing was called.");
             return Ok(());
         };
         chosen
     };
-    let answer = muxa::ask::one_shot(muxa::ask::OneShot {
-        agent: &agent,
-        prompt: &prompt,
-        cwd: &resolver_cwd,
-        permission_mode: config.ticket.permission_mode,
-        additional_dirs: &config.ticket.additional_dirs,
-        timeout: Duration::from_secs(config.ticket.timeout_secs.max(60)),
-    })
+    let answer = muxa::ask::one_shot_configured(
+        muxa::ask::OneShot {
+            agent: &agent,
+            prompt: &prompt,
+            cwd: &resolver_cwd,
+            permission_mode: config.ticket.permission_mode,
+            additional_dirs: &config.ticket.additional_dirs,
+            timeout: Duration::from_secs(config.ticket.timeout_secs.max(60)),
+        },
+        config.ask.providers.get(&agent),
+    )
     .await
     .context("asking an agent to write the pipeline config")?;
     if let Some(cost) = answer.cost_usd {
@@ -224,16 +169,21 @@ fn notice_lines(cwd: &std::path::Path, config: &Config, dry_run: bool) -> Vec<St
 /// it at all. One prompt rather than "confirm?" then "which?": picking the
 /// agent is already the decision.
 ///
-/// Only agents that can actually do the job are listed: the bridge needs a
-/// print mode ([`muxa::ask::supported_agents`]) and the binary has to be on
-/// PATH. Offering one that would fail after the operator picked it is worse
-/// than not offering it at all.
-fn choose_agent(default: &str) -> Result<Option<String>> {
+/// Only providers that can actually do the job are listed: a CLI has to
+/// be on PATH, and an API provider needs a key the process can already
+/// resolve. Offering one that would fail after the operator picked it is
+/// worse than not offering it at all.
+fn choose_agent(
+    default: &str,
+    providers: &BTreeMap<String, AskProviderConfig>,
+) -> Result<Option<String>> {
     use std::io::IsTerminal;
-    let available = available_agents(&|name| which::which(name).is_ok());
+    let available = available_agents(providers, &|name| which::which(name).is_ok(), &|name| {
+        std::env::var(name).ok()
+    });
     if available.is_empty() {
         bail!(
-            "no headless-capable agent is installed; muxa needs one of: {}",
+            "no headless-capable provider is usable; install one of the agent CLIs or set an              API key for one of: {}",
             muxa::ask::supported_agents().join(", ")
         );
     }
@@ -243,25 +193,32 @@ fn choose_agent(default: &str) -> Result<Option<String>> {
     let mut select = cliclack::select("Spend one agent turn on…");
     for name in &available {
         select = select.item(
-            Some((*name).to_string()),
-            *name,
-            if *name == default { "configured" } else { "" },
+            Some(name.clone()),
+            name.as_str(),
+            if name == default { "configured" } else { "" },
         );
     }
     select = select.item(None, "Cancel", "call nothing");
-    if available.contains(&default) {
+    if available.iter().any(|name| name == default) {
         select = select.initial_value(Some(default.to_string()));
     }
     Ok(select.interact()?)
 }
 
-/// Supported by the bridge *and* present on this machine, in the bridge's
-/// preference order.
-fn available_agents(installed: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
-    muxa::ask::supported_agents()
-        .iter()
-        .copied()
-        .filter(|name| installed(name))
+/// Supported by the bridge *and* usable on this machine, in the bridge's
+/// preference order: CLIs that are installed, APIs whose key resolves.
+fn available_agents(
+    providers: &BTreeMap<String, AskProviderConfig>,
+    installed: &dyn Fn(&str) -> bool,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    muxa::ask::provider_infos(providers, "", env)
+        .into_iter()
+        .filter(|info| match info.kind {
+            AskProviderKind::Cli => installed(info.executable.as_deref().unwrap_or(&info.id)),
+            AskProviderKind::Api => info.credential_present,
+        })
+        .map(|info| info.id)
         .collect()
 }
 
@@ -278,29 +235,6 @@ fn ask_operator() -> Result<String> {
         bail!("description cannot be empty");
     }
     Ok(text)
-}
-
-fn compose_prompt(describe: &str, existing: &str) -> String {
-    // The current file goes in so the model extends what is there rather
-    // than proposing a config that contradicts it — and so it can see which
-    // of the three keys already exist.
-    let current = if existing.trim().is_empty() {
-        "(the config file is empty or absent)".to_string()
-    } else {
-        format!("Current config.toml:\n```toml\n{}\n```", existing.trim())
-    };
-    format!(
-        "You are writing muxa work pipeline configuration.\n\n\
-         SCHEMA\n{SCHEMA}\n\n\
-         {current}\n\n\
-         WHAT THE OPERATOR WANTS\n{describe}\n\n\
-         Answer with ONE ```toml block containing only the [ticket], [[route]], and\n\
-         [pipeline.*] sections. Do not repeat other sections of the current config.\n\
-         Include at least one [[route]] and one [pipeline.*]. End routes with a\n\
-         catch-all `match = '.*'` unless the operator said otherwise. Prefer omitting\n\
-         `cwd` so the work runs where the operator invoked it. No prose outside the\n\
-         block."
-    )
 }
 
 /// Copy the three owned keys from the proposal into the existing document,
@@ -433,7 +367,7 @@ program = 'claude'
             .expect("RouteConfig serializes");
         for key in route.as_object().expect("an object").keys() {
             assert!(
-                SCHEMA.contains(key.as_str()),
+                muxa::work_compose::CONFIG_SCHEMA.contains(key.as_str()),
                 "route key `{key}` is not in the schema the model is shown"
             );
         }
@@ -445,7 +379,7 @@ program = 'claude'
             .expect("PipelineAgentConfig serializes");
         for key in agent.as_object().expect("an object").keys() {
             assert!(
-                SCHEMA.contains(key.as_str()),
+                muxa::work_compose::CONFIG_SCHEMA.contains(key.as_str()),
                 "pipeline agent key `{key}` is not in the schema the model is shown"
             );
         }
@@ -478,26 +412,51 @@ program = 'claude'
         // silently spend a turn. Whether it lands on the "no agent
         // installed" or the "not a terminal" refusal depends on the
         // machine; both stop before anything is spawned.
-        let error = choose_agent("claude").unwrap_err().to_string();
+        let error = choose_agent("claude", &BTreeMap::new())
+            .unwrap_err()
+            .to_string();
         assert!(
-            error.contains("--yes") || error.contains("no headless-capable agent"),
+            error.contains("--yes") || error.contains("no headless-capable provider"),
             "{error}"
         );
     }
 
     #[test]
-    fn only_agents_that_could_actually_run_are_offered() {
-        // The launcher knows gemini/agy/opencode; the headless bridge does
-        // not, so they must never appear here however installed.
-        let all = available_agents(&|_| true);
-        assert_eq!(all, muxa::ask::supported_agents().to_vec());
-        assert!(!all.contains(&"gemini"), "{all:?}");
-        assert!(!all.contains(&"agy"), "{all:?}");
+    fn only_providers_that_could_actually_run_are_offered() {
+        let none = BTreeMap::new();
+        // Every CLI installed, no key anywhere: the three CLIs, in order.
+        let all = available_agents(&none, &|_| true, &|_| None);
+        assert_eq!(all, ["claude", "codex", "gemini"]);
+        // The launcher knows agy/opencode; the headless bridge does not, so
+        // they must never appear here however installed.
+        assert!(!all.iter().any(|name| name == "agy"), "{all:?}");
+        assert!(!all.iter().any(|name| name == "opencode"), "{all:?}");
 
         // Supported but absent from PATH is still not offered: picking it
         // would fail after the operator chose it.
-        assert_eq!(available_agents(&|name| name == "codex"), vec!["codex"]);
-        assert!(available_agents(&|_| false).is_empty());
+        assert_eq!(
+            available_agents(&none, &|name| name == "codex", &|_| None),
+            ["codex"]
+        );
+        assert!(available_agents(&none, &|_| false, &|_| None).is_empty());
+
+        // An API provider joins once its key resolves — from its own
+        // variable or the one `[ask.providers.<id>]` names.
+        let openai_key = |name: &str| (name == "OPENAI_API_KEY").then(|| "k".to_string());
+        assert_eq!(available_agents(&none, &|_| false, &openai_key), ["openai"]);
+        let mut configured = BTreeMap::new();
+        configured.insert(
+            "anthropic".to_string(),
+            AskProviderConfig {
+                model: None,
+                api_key_env: Some("WORK_KEY".into()),
+            },
+        );
+        let work_key = |name: &str| (name == "WORK_KEY").then(|| "k".to_string());
+        assert_eq!(
+            available_agents(&configured, &|name| name == "claude", &work_key),
+            ["claude", "anthropic"]
+        );
     }
 
     #[test]
@@ -559,18 +518,5 @@ program = 'claude'
     fn a_broken_existing_config_is_reported_not_overwritten() {
         let error = merge("[watch\n", PROPOSAL).unwrap_err().to_string();
         assert!(error.contains("existing config.toml"), "{error}");
-    }
-
-    #[test]
-    fn the_prompt_carries_the_schema_and_the_current_file() {
-        let prompt = compose_prompt("cal tickets get three agents", "[watch]\ntheme = \"ops\"\n");
-        assert!(
-            prompt.contains("[[pipeline.<name>.agent]]"),
-            "schema missing"
-        );
-        assert!(prompt.contains("theme = \"ops\""), "current config missing");
-        assert!(prompt.contains("cal tickets get three agents"));
-        // An empty file says so rather than sending an empty fence.
-        assert!(compose_prompt("x", "  ").contains("empty or absent"));
     }
 }

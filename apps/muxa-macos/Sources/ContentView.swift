@@ -18,7 +18,8 @@ struct ContentView: View {
                     openPinnedPane: { id in
                         model.selectWatchPane(id)
                         tabs.openPinned(.pane(id))
-                    }
+                    },
+                    closeShell: dismissExitedShell
                 )
                     .frame(minWidth: 260, idealWidth: 300, maxWidth: 380)
                 editorRegion
@@ -161,7 +162,7 @@ struct ContentView: View {
             }
         case .agent(let id):
             if let participant = model.hostedAgents.first(where: { $0.id == id }) {
-                FleetAgentDetailView(participant: participant, client: model.client)
+                FleetAgentDetailView(participant: participant, model: model)
                     .id(participant.id)
             } else {
                 MuxaEmptyDetail(model: model)
@@ -215,6 +216,21 @@ struct ContentView: View {
         let selection = MuxaSidebarSelection.shell(id)
         if tabs.focusedGroupID == groupID {
             model.activateEditor(tabs.close(selection, groupID: groupID))
+        }
+        Task { await model.refresh() }
+    }
+
+    /// The Shells sidebar's close button on an exited row: drop every editor
+    /// tab that still shows the dead session, then refresh like the terminal's
+    /// own exit handling does. muxad keeps the record for a while, so the
+    /// sidebar hides the row itself.
+    private func dismissExitedShell(id: String) {
+        let selection = MuxaSidebarSelection.shell(id)
+        for group in tabs.groups where group.tabs.contains(selection) {
+            let focused = tabs.close(selection, groupID: group.id)
+            if tabs.focusedGroupID == group.id {
+                model.activateEditor(focused)
+            }
         }
         Task { await model.refresh() }
     }
@@ -745,9 +761,16 @@ private struct MuxaSidebar: View {
     @ObservedObject var model: AppModel
     let openPinnedSession: (MuxaWatchSessionIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
+    let closeShell: (String) -> Void
     @Environment(\.colorScheme) private var colorScheme
     @State private var filterText = ""
     @State private var statusScope: StatusScope = .all
+    /// Exited shells the user closed from the Shells list. muxad keeps an
+    /// exited session listed for a while, so the sidebar hides these until
+    /// the daemon drops them.
+    @State private var dismissedShellIDs: Set<String> = []
+    @State private var remoteShellError: String?
+    @State private var isOpeningRemoteShell = false
     @AppStorage("muxa.explore.sort") private var exploreSort: ExploreSort = .topology
     @AppStorage("muxa.explore.grouping") private var exploreGrouping: ExploreGrouping = .host
 
@@ -784,6 +807,35 @@ private struct MuxaSidebar: View {
                             }
                             .buttonStyle(.borderless)
                             .help("Register SSH Host")
+                        }
+                        if model.sidebarMode == .shells {
+                            Button {
+                                model.createShell()
+                            } label: {
+                                Image(systemName: "plus")
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(!model.isConnected || model.isCreatingSession)
+                            .help("New native shell")
+                            Menu {
+                                if model.remoteShellHosts.isEmpty {
+                                    Text("No online fleet hosts")
+                                } else {
+                                    ForEach(model.remoteShellHosts) { host in
+                                        Button {
+                                            openRemoteShell(on: host)
+                                        } label: {
+                                            Label(host.alias, systemImage: "server.rack")
+                                        }
+                                    }
+                                }
+                            } label: {
+                                Image(systemName: "network")
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .disabled(!model.isConnected || isOpeningRemoteShell)
+                            .help("New shell on a fleet host")
                         }
                         Text(sidebarCountLabel)
                             .font(.caption.monospacedDigit())
@@ -869,7 +921,36 @@ private struct MuxaSidebar: View {
         .onChange(of: model.sidebarMode) { _ in
             filterText = ""
             statusScope = .all
+            remoteShellError = nil
         }
+        .onChange(of: model.sessions) { sessions in
+            dismissedShellIDs = dismissedShellIDs.filter { id in
+                sessions.contains { $0.id == id }
+            }
+        }
+    }
+
+    private func openInLiveWatch(_ participant: MuxaHostedAgent) {
+        model.openInLiveWatch(participant)
+    }
+
+    private func openRemoteShell(on host: MuxaFleetHost) {
+        guard !isOpeningRemoteShell else { return }
+        isOpeningRemoteShell = true
+        remoteShellError = nil
+        Task {
+            defer { isOpeningRemoteShell = false }
+            do {
+                try await model.createShell(sshHost: host)
+            } catch {
+                remoteShellError = error.localizedDescription
+            }
+        }
+    }
+
+    private func dismissShell(_ session: MuxaSession) {
+        dismissedShellIDs.insert(session.id)
+        closeShell(session.id)
     }
 
     private var sidebarCount: Int {
@@ -911,6 +992,18 @@ private struct MuxaSidebar: View {
                     attention: false,
                     active: true
                 )
+        }
+    }
+
+    /// Exited shells still listed by muxad and not yet closed from the
+    /// sidebar. They are neither "active" nor "attention", so a status
+    /// scope hides them.
+    private var visibleExitedSessions: [MuxaSession] {
+        guard statusScope == .all else { return [] }
+        return model.sessions.filter {
+            $0.exited
+                && !dismissedShellIDs.contains($0.id)
+                && matchesFilter([$0.displayName, $0.id])
         }
     }
 
@@ -1202,30 +1295,57 @@ private struct MuxaSidebar: View {
                     SidebarEmptyRow(title: "No matching requests", systemImage: "line.3.horizontal.decrease.circle")
                 } else {
                     ForEach(filteredAttentionAgents) { participant in
-                        Button {
-                            if let pane = participant.pane {
-                                model.selectWatchPane(
-                                    MuxaWatchPaneIdentity(
-                                        hostAlias: participant.host.alias,
-                                        socket: pane.endpointSocket,
-                                        paneID: pane.paneID
-                                    )
-                                )
-                            } else {
+                        // The row is the selection; the sidebar stays on
+                        // Inbox and the detail explains the request. The
+                        // trailing button keeps one-click access to the
+                        // pane in Live Watch.
+                        HStack(spacing: 2) {
+                            Button {
                                 model.select(.agent(participant.id))
+                            } label: {
+                                InboxAgentRow(participant: participant)
                             }
-                        } label: {
-                            InboxAgentRow(participant: participant)
+                            .buttonStyle(.plain)
+                            if participant.pane != nil {
+                                Button {
+                                    openInLiveWatch(participant)
+                                } label: {
+                                    Image(systemName: "rectangle.on.rectangle")
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.borderless)
+                                .controlSize(.small)
+                                .help("Open in Live Watch")
+                            }
                         }
-                        .buttonStyle(.plain)
+                        .listRowBackground(
+                            model.sidebarSelection == .agent(participant.id)
+                                ? Color.accentColor.opacity(0.14) : Color.clear
+                        )
+                        .contextMenu {
+                            Button("Open in Live Watch") {
+                                openInLiveWatch(participant)
+                            }
+                            .disabled(participant.pane == nil)
+                        }
                     }
                 }
             }
         case .shells:
             Section("Native shells") {
-                if model.sessions.isEmpty {
-                    SidebarEmptyRow(title: "No native shells", systemImage: "terminal")
-                } else if filteredSessions.isEmpty {
+                if let remoteShellError {
+                    Label(remoteShellError, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .lineLimit(3)
+                        .listRowBackground(Color.clear)
+                }
+                if model.sessions.allSatisfy(\.exited), visibleExitedSessions.isEmpty {
+                    ShellsEmptyRow(
+                        canCreate: model.isConnected && !model.isCreatingSession,
+                        create: model.createShell
+                    )
+                } else if filteredSessions.isEmpty, visibleExitedSessions.isEmpty {
                     SidebarEmptyRow(title: "No matching shells", systemImage: "line.3.horizontal.decrease.circle")
                 } else {
                     ForEach(filteredSessions) { session in
@@ -1239,6 +1359,24 @@ private struct MuxaSidebar: View {
                             model.sidebarSelection == .shell(session.id)
                                 ? Color.accentColor.opacity(0.14) : Color.clear
                         )
+                    }
+                    ForEach(visibleExitedSessions) { session in
+                        // Not selectable: the model drops an exited shell
+                        // from the available selections, so a click would
+                        // only bounce back to the Work board.
+                        HStack(spacing: 2) {
+                            SessionRow(session: session)
+                            Button {
+                                dismissShell(session)
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                            .help("Remove exited shell")
+                        }
+                        .listRowBackground(Color.clear)
                     }
                 }
             }
@@ -1415,6 +1553,31 @@ private struct SidebarEmptyRow: View {
         Label(title, systemImage: systemImage)
             .foregroundStyle(.secondary)
             .listRowBackground(Color.clear)
+    }
+}
+
+/// The Shells tab with nothing to list: a hint plus the same action as the
+/// toolbar's "New shell", so the tab can create what it shows.
+private struct ShellsEmptyRow: View {
+    let canCreate: Bool
+    let create: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("No native shells", systemImage: "terminal")
+                .foregroundStyle(.secondary)
+            Text("Open a terminal on this Mac, or on an online fleet host from the network menu above.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button(action: create) {
+                Label("New Shell", systemImage: "plus")
+            }
+            .controlSize(.small)
+            .disabled(!canCreate)
+        }
+        .padding(.vertical, 4)
+        .listRowBackground(Color.clear)
     }
 }
 
@@ -1697,11 +1860,15 @@ private struct SessionRow: View {
                 .frame(width: 16)
             VStack(alignment: .leading, spacing: 2) {
                 Text(session.displayName ?? session.id)
+                    .foregroundStyle(session.exited ? .secondary : .primary)
                     .lineLimit(1)
                 HStack(spacing: 6) {
-                    if let pid = session.pid { Text("pid \(pid)") }
-                    if session.attachedClients > 0 { Text("\(session.attachedClients) attached") }
-                    if session.exited { Text("exited \(session.exitStatus ?? 0)") }
+                    if session.exited {
+                        Text(session.shellStateText)
+                    } else {
+                        if let pid = session.pid { Text("pid \(pid)") }
+                        if session.attachedClients > 0 { Text("\(session.attachedClients) attached") }
+                    }
                 }
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -2148,15 +2315,25 @@ private struct FleetAgentDetailView: View {
     }
 
     let participant: MuxaHostedAgent
-    let client: MuxaIPCClient
+    @ObservedObject var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
     @State private var selectedTab: DetailTab = .summary
+
+    private var client: MuxaIPCClient { model.client }
 
     private var summary: String? {
         participant.agent.recap
             ?? participant.agent.lastNotification
             ?? participant.agent.aiTitle
             ?? participant.agent.lastPrompt
+    }
+
+    /// Agents the Inbox lists under "Needs attention" get the request card
+    /// on top; a working or idle agent opened from elsewhere keeps the
+    /// plain summary.
+    private var needsAttention: Bool {
+        ["waiting_input", "waiting_choice", "blocked", "error", "failed"]
+            .contains(participant.agent.state)
     }
 
     private var title: String {
@@ -2183,6 +2360,27 @@ private struct FleetAgentDetailView: View {
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
                     }
+                    Spacer(minLength: 12)
+                    if !needsAttention {
+                        Button {
+                            model.openInLiveWatch(participant)
+                        } label: {
+                            Label("Open in Live Watch", systemImage: "rectangle.on.rectangle")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(participant.pane == nil)
+                        .help("Follow this agent's pane in Live Watch")
+                        .padding(.top, 6)
+                    }
+                }
+
+                if needsAttention {
+                    InboxAgentRequestCard(
+                        participant: participant,
+                        requests: participant.openRequests(in: model.operatorMessages),
+                        work: model.workGroup(for: participant),
+                        openInLiveWatch: { model.openInLiveWatch(participant) }
+                    )
                 }
 
                 Picker("Agent detail", selection: $selectedTab) {

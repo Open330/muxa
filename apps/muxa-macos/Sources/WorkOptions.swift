@@ -500,8 +500,12 @@ struct MuxaPipelineEditorTarget: Identifiable, Equatable, Sendable {
     let host: String?
     /// nil creates a new pipeline.
     let pipeline: MuxaWorkOptions.Pipeline?
+    /// An unsaved draft (from the composer): edited like a new pipeline
+    /// whose fields are prefilled, so the name stays editable and saving
+    /// creates it.
+    var isDraft = false
 
-    var id: String { "\(host ?? "local"):\(pipeline?.name ?? "+new")" }
+    var id: String { "\(host ?? "local"):\(pipeline?.name ?? "+new")\(isDraft ? ":draft" : "")" }
 }
 
 /// One route row as edited in the Command Center.

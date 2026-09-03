@@ -67,6 +67,17 @@ struct MuxaApp: App {
                 .preferredColorScheme(preferredColorScheme)
         }
 
+        // First-launch Welcome guide; reopened from Help › Welcome Guide…
+        // (see OnboardingView.swift for the launch decision).
+        Window("Welcome to Muxa", id: OnboardingPreferences.windowID) {
+            OnboardingView(model: model)
+                .environmentObject(model)
+                .preferredColorScheme(preferredColorScheme)
+        }
+        .defaultSize(width: 720, height: 560)
+        .defaultPosition(.center)
+        .windowResizability(.contentSize)
+
         MenuBarExtra("Muxa", systemImage: menuBarIcon) {
             MenuBarContent(model: model)
                 .preferredColorScheme(preferredColorScheme)
@@ -86,10 +97,12 @@ struct MuxaApp: App {
             ContentView()
                 .environmentObject(model)
                 .preferredColorScheme(preferredColorScheme)
+                .presentsOnboardingOnLaunch()
         }
         .defaultSize(width: 1120, height: 760)
         .commands {
             MuxaEditorMenuCommands()
+            OnboardingMenuCommands()
             CommandGroup(after: .newItem) {
                 Button("Start Muxa Work…") { model.presentWorkStart() }
                     .keyboardShortcut("n", modifiers: [.command, .option])

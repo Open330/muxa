@@ -13,13 +13,14 @@
 //! back as a full [`Config`](muxa::config::Config).
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-use muxa::config::{PipelineAgentConfig, PipelineConfig, RouteConfig};
-use muxa::pipeline::{self, PipelineError, Vars, ALLOWLISTED_PROGRAMS};
+use muxa::config::RouteConfig;
+use muxa::pipeline::{self, Vars};
+use muxa::work_pipeline_spec::validate_spec;
+pub use muxa::work_pipeline_spec::PipelineSpec;
 
-use crate::agent_launch::SplitDirection;
 use crate::work_options::{
     last_position, load_document, max_position, pipeline_table, pipelines_table_mut, place_after,
     resolve_path, routes_mut, validated, write_config,
@@ -112,59 +113,6 @@ pub struct RouteEdit {
     /// Remove `cwd` from the route.
     #[arg(long)]
     pub clear_cwd: bool,
-}
-
-/// A pipeline as the editor sends it: one `pipelines[]` entry of
-/// `muxa work options --json`. `name` is tolerated so an entry can be
-/// handed back verbatim, but it has to agree with the command line.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PipelineSpec {
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub layout: Option<String>,
-    pub prompt: Option<String>,
-    pub agents: Vec<AgentSpec>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentSpec {
-    pub alias: String,
-    pub program: String,
-    #[serde(default)]
-    pub role: Option<String>,
-    #[serde(default)]
-    pub task: Option<String>,
-    #[serde(default)]
-    pub prompt: Option<String>,
-    #[serde(default)]
-    pub direction: Option<String>,
-    #[serde(default)]
-    pub after: Vec<String>,
-}
-
-impl From<PipelineSpec> for PipelineConfig {
-    fn from(spec: PipelineSpec) -> Self {
-        PipelineConfig {
-            description: spec.description,
-            layout: spec.layout,
-            prompt: spec.prompt,
-            agent: spec
-                .agents
-                .into_iter()
-                .map(|agent| PipelineAgentConfig {
-                    alias: agent.alias,
-                    program: agent.program,
-                    role: agent.role,
-                    task: agent.task,
-                    prompt: agent.prompt,
-                    direction: agent.direction,
-                    after: agent.after,
-                })
-                .collect(),
-        }
-    }
 }
 
 /// What `pipeline set` did.
@@ -281,19 +229,10 @@ fn read_spec(source: &Path) -> Result<PipelineSpec> {
 ///
 /// Refuses, without touching the file, a name TOML cannot use as a bare
 /// key, a JSON `name` that disagrees with the command line, and any
-/// line-up `muxa work up` would refuse to launch.
+/// line-up `muxa work up` would refuse to launch — the same checks the
+/// daemon's `work_compose` runs, from [`muxa::work_pipeline_spec`].
 pub fn set_pipeline(path: &Path, name: &str, spec: PipelineSpec) -> Result<PipelineSet> {
-    check_name(name)?;
-    if let Some(given) = spec.name.as_deref() {
-        if given != name {
-            bail!(
-                "the JSON names pipeline {given:?} but the command line says {name:?}; \
-                 drop `name` from the JSON or make them agree"
-            );
-        }
-    }
-    let pipeline = PipelineConfig::from(spec);
-    check_pipeline(name, &pipeline)?;
+    let pipeline = validate_spec(name, &spec)?;
 
     let mut document = load_document(path)?;
     let previous = document
@@ -402,49 +341,6 @@ pub fn remove_pipeline(path: &Path, name: &str, force: bool) -> Result<PipelineR
         routes_cleared: naming.into_iter().map(|(_, pattern)| pattern).collect(),
         config_path: path.to_path_buf(),
     })
-}
-
-fn check_name(name: &str) -> Result<()> {
-    let bare = !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if !bare {
-        bail!(
-            "pipeline name {name:?} cannot be a [pipeline.<name>] key; \
-             use letters, digits, `-`, and `_`"
-        );
-    }
-    Ok(())
-}
-
-/// The checks `muxa work up` would fail at launch, run while the pipeline
-/// is still just JSON: an agent with no alias, a program that is not an
-/// agent CLI, a split direction tmux has no name for, and — through the
-/// launcher's own renderer — an empty line-up, a duplicate alias, an edge
-/// to nobody, or a cycle.
-fn check_pipeline(name: &str, pipeline: &PipelineConfig) -> Result<()> {
-    for (index, agent) in pipeline.agent.iter().enumerate() {
-        if agent.alias.trim().is_empty() {
-            bail!("pipeline {name:?} agent #{} has no alias", index + 1);
-        }
-        let program = agent.program.trim().to_ascii_lowercase();
-        if !ALLOWLISTED_PROGRAMS.contains(&program.as_str()) {
-            return Err(PipelineError::UnknownProgram {
-                pipeline: name.to_string(),
-                alias: agent.alias.clone(),
-                program: agent.program.clone(),
-            }
-            .into());
-        }
-        if let Some(direction) = agent.direction.as_deref() {
-            SplitDirection::parse(Some(direction)).map_err(|error| {
-                anyhow::anyhow!("pipeline {name:?} agent {:?}: {error}", agent.alias)
-            })?;
-        }
-    }
-    pipeline::desired_agents(name, pipeline, &Vars::new())?;
-    Ok(())
 }
 
 fn pipeline_defined(document: &toml_edit::DocumentMut, name: &str) -> bool {

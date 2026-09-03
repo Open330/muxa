@@ -256,7 +256,9 @@ pub const DEFAULT_ASK_TIMEOUT_SECS: u64 = 30 * 60;
 #[serde(default, deny_unknown_fields)]
 pub struct AskConfig {
     pub enabled: bool,
-    /// `claude` or `codex`.
+    /// Provider the next question goes to: `claude`, `codex`, `gemini`
+    /// (agent CLIs), or `anthropic`, `openai` (HTTPS APIs). See
+    /// [`crate::ask::supported_agents`].
     pub agent: String,
     /// Directory the headless process runs in. Defaults to `$HOME`; a neutral
     /// cwd keeps default-mode questions away from a working tree. Explicit
@@ -277,6 +279,10 @@ pub struct AskConfig {
     pub path: Option<PathBuf>,
     /// Answers retained before the oldest are dropped.
     pub keep: usize,
+    /// Per-provider overrides, `[ask.providers.<id>]`. Only a model name
+    /// and the *name* of an environment variable holding the API key live
+    /// here; the key itself never does.
+    pub providers: BTreeMap<String, AskProviderConfig>,
 }
 
 impl Default for AskConfig {
@@ -290,8 +296,24 @@ impl Default for AskConfig {
             timeout_secs: DEFAULT_ASK_TIMEOUT_SECS,
             path: None,
             keep: 200,
+            providers: BTreeMap::new(),
         }
     }
+}
+
+/// `[ask.providers.<id>]` — what one ask provider may be tuned with.
+///
+/// Both keys are optional. `model` overrides the provider's default
+/// (`claude-sonnet-5` for `anthropic`, `gpt-5` for `openai`; the agent
+/// CLIs use their own default unless one is named here). `api_key_env`
+/// names an environment variable the daemon reads the key from when the
+/// request carried none and the provider's usual variable is unset — a
+/// pointer, so a raw secret is never written into this file.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AskProviderConfig {
+    pub model: Option<String>,
+    pub api_key_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +321,10 @@ impl Default for AskConfig {
 pub enum AskPermissionMode {
     /// Preserve the selected agent CLI's normal permission behavior.
     Default,
+    /// Read-only: the agent may inspect the tree but never write to it.
+    /// `muxa work compose` runs under this so a drafting turn cannot edit
+    /// files however the operator configured `[ask]`.
+    Plan,
     /// Permit workspace edits while retaining sandbox/review protection.
     Edit,
     /// Disable approval and sandbox checks for unattended automation.
@@ -2043,6 +2069,42 @@ additional_dirs = ["/nfs/home/june", "/srv/shared"]
                 PathBuf::from("/srv/shared")
             ]
         );
+    }
+
+    #[test]
+    fn parses_ask_provider_overrides_and_plan_mode() {
+        let cfg: Config = toml::from_str(
+            r#"
+[ask]
+agent = "anthropic"
+permission_mode = "plan"
+
+[ask.providers.anthropic]
+model = "claude-opus-5"
+api_key_env = "WORK_ANTHROPIC_KEY"
+
+[ask.providers.codex]
+model = "gpt-5-codex"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.ask.agent, "anthropic");
+        assert_eq!(cfg.ask.permission_mode, AskPermissionMode::Plan);
+        let anthropic = &cfg.ask.providers["anthropic"];
+        assert_eq!(anthropic.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(anthropic.api_key_env.as_deref(), Some("WORK_ANTHROPIC_KEY"));
+        let codex = &cfg.ask.providers["codex"];
+        assert_eq!(codex.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(codex.api_key_env, None);
+        // A raw key has no home here: the table only takes a model and an
+        // environment variable *name*.
+        let refused: Result<Config, _> = toml::from_str(
+            r#"
+[ask.providers.openai]
+api_key = "sk-live-never"
+"#,
+        );
+        assert!(refused.is_err());
     }
 
     #[test]

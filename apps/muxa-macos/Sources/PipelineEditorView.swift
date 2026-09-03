@@ -22,7 +22,9 @@ struct PipelineEditorView: View {
             ?? MuxaPipelineDefinition(agents: [MuxaPipelineDefinition.Agent(alias: "impl", role: "implementer")]))
     }
 
-    private var isNew: Bool { target.pipeline == nil }
+    /// A draft from the composer is prefilled but not saved yet, so it is
+    /// created like a new pipeline.
+    private var isNew: Bool { target.pipeline == nil || target.isDraft }
 
     private var problems: [String] {
         var problems = definition.problems()

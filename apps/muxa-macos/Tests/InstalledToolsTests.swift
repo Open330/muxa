@@ -1,0 +1,36 @@
+import Foundation
+import Testing
+@testable import Muxa
+
+@Test func installedToolsMergesPathEntriesWithoutDuplicates() {
+    let merged = InstalledTools.mergedDirectories(
+        pathStrings: ["/opt/homebrew/bin:/usr/bin::/Users/me/.cargo/bin", "/usr/bin:/bin"],
+        fallback: ["/usr/local/bin", "/opt/homebrew/bin", " ", "/bin"]
+    )
+    #expect(merged == ["/opt/homebrew/bin", "/usr/bin", "/Users/me/.cargo/bin", "/bin", "/usr/local/bin"])
+}
+
+@Test func installedToolsTakesTheFirstNonEmptyVersionLine() {
+    #expect(InstalledTools.versionLine(from: "\n  2.1.3 (Claude Code)\nextra\n") == "2.1.3 (Claude Code)")
+    #expect(InstalledTools.versionLine(from: "   \n\n") == nil)
+    #expect(InstalledTools.versionLine(from: "tmux 3.5a") == "tmux 3.5a")
+}
+
+@Test func installedToolsResolvesExecutablesInSearchOrder() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("muxa-installed-tools-\(UUID().uuidString)")
+    let first = root.appendingPathComponent("first")
+    let second = root.appendingPathComponent("second")
+    try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let plain = first.appendingPathComponent("codex")
+    try Data("not executable".utf8).write(to: plain)
+    let executable = second.appendingPathComponent("codex")
+    try Data("#!/bin/sh\n".utf8).write(to: executable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+    #expect(InstalledTools.resolve("codex", in: [first.path, second.path]) == executable.path)
+    #expect(InstalledTools.resolve("claude", in: [first.path, second.path]) == nil)
+}

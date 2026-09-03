@@ -2339,6 +2339,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "toml_edit 0.22.27",
  "tower",
  "tower-http",
  "tracing",

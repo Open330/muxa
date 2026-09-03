@@ -259,14 +259,22 @@ struct PipelineFlowLayout: Layout {
 }
 
 /// Shown when the config has no pipeline yet: muxa's built-in presets with
-/// their stage diagrams and one-click install, plus the agent-driven
-/// `muxa work init` conversation for a custom setup.
+/// their stage diagrams and one-click install, plus the in-app composer that
+/// drafts a custom line-up from a plain-language description.
+///
+/// The composer sheet is attached here rather than to the main window: the
+/// gallery also lives inside the Start Work sheet, where a window-level
+/// sheet would stay hidden behind it.
 struct WorkPresetGallery: View {
     let options: MuxaWorkOptions
     var host: String?
     @ObservedObject var model: AppModel
     var onInstalled: ((String) -> Void)?
+    /// The pre-composer path (`muxa work init` in a Shell tab), kept as the
+    /// composer's escape hatch when neither muxad nor the bundled CLI can
+    /// draft. Callers that own a sheet close it inside this closure.
     var onDescribe: (() -> Void)?
+    @State private var composerTarget: MuxaPipelineComposerTarget?
 
     private let columns = [
         GridItem(.adaptive(minimum: 250, maximum: 400), spacing: 12, alignment: .top),
@@ -346,10 +354,12 @@ struct WorkPresetGallery: View {
                     Label("Design your own…", systemImage: "slider.horizontal.3")
                 }
                 .help("Compose agents, prompts, and after edges visually")
-                if let onDescribe {
-                    Button("Describe with an agent…", action: onDescribe)
-                        .help("Runs the interactive `muxa work init` wizard in a Shell tab")
+                Button {
+                    composerTarget = MuxaPipelineComposerTarget(host: host)
+                } label: {
+                    Label("Describe with an agent…", systemImage: "sparkles")
                 }
+                .help("Describe the line-up in plain language; the Ask provider drafts a pipeline you can refine, edit, or save")
             }
             if let error = model.workOptionsError(for: host) {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
@@ -357,6 +367,14 @@ struct WorkPresetGallery: View {
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
             }
+        }
+        .sheet(item: $composerTarget) { target in
+            PipelineComposerView(
+                target: target,
+                model: model,
+                shellFallback: onDescribe,
+                onSaved: onInstalled
+            )
         }
     }
 }

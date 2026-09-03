@@ -54,6 +54,20 @@ muxa work init --dry-run                      # 제안만 보고 안 씀
 muxa work init --agent codex                  # 다른 resolver 사용
 ```
 
+설정 전체가 아니라 pipeline 하나만 원한다면 `muxa work compose "<설명>"`이
+**읽기 전용** agent 턴 하나를 써서 `pipeline set`이 읽는 JSON으로 pipeline을
+출력합니다 — 아무것도 쓰지 않습니다. 초안은 `pipeline set`과 같은 규칙으로
+검증하고, 실행될 수 없는 초안은 이유를 붙여 한 번 더 요청한 뒤 포기합니다.
+`--current <path|->`는 이전 초안을 다듬고(그때 설명은 바꿀 내용), `--agent <id>`는
+`[ask]` provider 아무거나 고르며, `--json`은 응답 전체(`pipeline`, `notes`,
+`raw`)를 출력합니다 — Muxa.app의 pipeline 편집기가 daemon의 `work_compose`
+요청에서 받는 것과 같은 모양입니다.
+
+```console
+muxa work compose "implementer는 claude, 그 뒤에 codex reviewer"
+muxa work compose "review 뒤에 gemini tester 추가" --current pair.json --json
+```
+
 턴을 쓰고 싶지 않다면 내장 preset 셋이 흔한 구성을 덮습니다. `muxa work preset
 apply`는 같은 방식으로 — `toml_edit`으로, 파일을 건드리기 전에 전체 `Config`로
 검증하고, `--overwrite` 없이는 이미 있는 `[pipeline.<name>]`을 덮어쓰지 않으며 —
@@ -327,6 +341,7 @@ prompt는 일의 모양과 URL을 나르고, 나머지는 agent가 직접 읽으
 
 ```console
 muxa work init                       # 말로 설명해 설정 쓰기
+muxa work compose "<설명>" [--agent <id>] [--current <path|->] [--json]   # pipeline 하나를 JSON으로 초안; 쓰지 않음
 muxa work preset list                # 내장 구성: solo, pair, triad
 muxa work preset apply <name> --route '<regex>'   # 턴 없이 하나 쓰기
 muxa work options [--json]           # 런처용 route·pipeline·skill·preset

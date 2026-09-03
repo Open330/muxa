@@ -561,6 +561,13 @@ struct WorkCommandCenterView: View {
             // after this view appeared; read the newly known hosts then.
             Task { await model.loadAllWorkOptions() }
         }
+        .sheet(item: $pipelineComposer.target) { target in
+            PipelineComposerView(
+                target: target,
+                model: model,
+                shellFallback: pipelineComposer.shellFallback
+            )
+        }
     }
 
     private let pipelineColumns = [
@@ -573,6 +580,7 @@ struct WorkCommandCenterView: View {
     @State private var routesHost = ""
     @State private var syncingPipelines = Set<String>()
     @State private var syncFailures: [String: String] = [:]
+    @ObservedObject private var pipelineComposer = PipelineComposerPresenter.shared
 
     private var routesHostAlias: String? { routesHost.isEmpty ? nil : routesHost }
     private var pipelinesHostAlias: String? { nil }
@@ -616,6 +624,14 @@ struct WorkCommandCenterView: View {
                     .disabled(!syncingPipelines.isEmpty)
                     .help("Write every library pipeline to the hosts where it is missing or differs")
                 }
+                Button {
+                    model.presentPipelineComposer(host: pipelinesHostAlias)
+                } label: {
+                    Label("Describe…", systemImage: "sparkles")
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.workOptions == nil || !model.isConnected)
+                .help("Describe a pipeline in plain language and let the Ask provider draft it")
                 Button {
                     model.presentPipelineEditor(host: nil, pipeline: nil)
                 } label: {
@@ -1078,6 +1094,7 @@ private struct FleetPaneWorkspace: View {
 
 struct MuxaAskView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject private var providers = AskProviderStore.shared
     @State private var prompt = ""
     @State private var agent = "claude"
 
@@ -1116,7 +1133,7 @@ struct MuxaAskView: View {
                         .lineLimit(1)
                 }
                 Spacer()
-                Text("Conversations resume their Claude Code or Codex context")
+                Text("Conversations resume where the provider left off")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
@@ -1229,21 +1246,34 @@ struct MuxaAskView: View {
         .onChange(of: agent) { selected in
             Task { await model.selectAskAgent(selected) }
         }
-        .sheet(isPresented: $model.isPresentingAskSettings) {
-            AskProviderSettingsView(model: model)
+        .task(id: model.isConnected) {
+            await providers.reload(model: model)
         }
     }
 
     private var askContextControls: some View {
         HStack(spacing: 7) {
             Picker("Provider", selection: $agent) {
-                Text("Claude Code").tag("claude")
-                Text("Codex").tag("codex")
+                ForEach(providers.providers) { provider in
+                    Text(provider.title)
+                        .tag(provider.id)
+                        .disabled(!providers.isUsable(provider))
+                }
+                if !providers.providers.contains(where: { $0.id == agent }) {
+                    Text(providers.title(for: agent)).tag(agent)
+                }
             }
             .labelsHidden()
-            .frame(width: 132)
+            .frame(width: 150)
+            .help("Provider for new conversations; disabled entries need a CLI install or an API key in Settings")
 
             Menu {
+                Button {
+                    Task { await model.resetAskConversation() }
+                } label: {
+                    Label("New Conversation", systemImage: "plus.bubble")
+                }
+                Divider()
                 if providerConversations.isEmpty {
                     Text("No previous conversations")
                 } else {
@@ -1266,19 +1296,9 @@ struct MuxaAskView: View {
             }
             .menuStyle(.borderlessButton)
 
-            Button {
-                Task { await model.resetAskConversation() }
-            } label: {
-                Label("New", systemImage: "plus.bubble")
-            }
-            .help("Start a new conversation without deleting prior conversations")
-
-            Button {
-                model.presentAskSettings()
-            } label: {
-                Label("Providers", systemImage: "gearshape")
-            }
-            .help("Configure Claude Code and Codex authentication")
+            AskProvidersSettingsButton()
+                .labelStyle(.iconOnly)
+                .help("Open Settings › Providers")
         }
     }
 
@@ -1359,132 +1379,15 @@ private struct AskComposerEditor: View {
     }
 }
 
-private struct AskProviderSettingsView: View {
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Ask Providers")
-                    .font(.title2.weight(.semibold))
-                Text("Muxa runs the installed CLIs headlessly. Existing CLI sign-in works unchanged; optional API keys are stored only in the macOS login Keychain.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-
-            ForEach(MuxaAskProvider.allCases) { provider in
-                AskProviderCredentialRow(provider: provider, model: model)
-            }
-
-            if let status = model.askSettingsStatus {
-                Label(status, systemImage: "checkmark.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.green)
-            }
-            if let error = model.askSettingsError {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .textSelection(.enabled)
-            }
-
-            HStack {
-                Text("API keys apply per Ask without restart. Reload muxad only after installing a CLI in a new PATH; native PTY sessions owned by it will end, while tmux sessions remain.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Reload muxad PATH…") {
-                    model.requestDaemonRestartForProviderSettings()
-                }
-                Button("Done") { model.isPresentingAskSettings = false }
-                    .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(20)
-        .frame(width: 660)
-    }
-}
-
-struct AskProviderCredentialRow: View {
-    let provider: MuxaAskProvider
-    @ObservedObject var model: AppModel
-    @State private var key = ""
-    @State private var hasKey = false
-
-    private var executablePath: String? {
-        MuxaExecutableResolver.executablePath(provider.executable)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: provider == .claude ? "brain.head.profile" : "chevron.left.forwardslash.chevron.right")
-                    .foregroundStyle(.tint)
-                    .frame(width: 20)
-                Text(provider.title)
-                    .font(.headline)
-                Text(executablePath == nil ? "CLI not found" : "CLI installed")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(executablePath == nil ? Color.red : Color.green)
-                if hasKey {
-                    Text("Keychain API key")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.blue)
-                } else {
-                    Text("CLI sign-in / environment")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button(provider == .codex ? "Open Login" : "Open Claude Code") {
-                    Task { await model.openProviderCLI(provider) }
-                }
-                .disabled(executablePath == nil)
-            }
-
-            if let executablePath {
-                Text(executablePath)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
-                    .textSelection(.enabled)
-            }
-
-            HStack(spacing: 8) {
-                SecureField(provider == .claude ? "Anthropic API key" : "OpenAI API key", text: $key)
-                    .textFieldStyle(.roundedBorder)
-                Button("Save to Keychain") {
-                    if model.saveProviderKey(key, provider: provider) {
-                        key = ""
-                        hasKey = true
-                    }
-                }
-                .disabled(key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                if hasKey {
-                    Button("Remove", role: .destructive) {
-                        model.removeProviderKey(provider)
-                        hasKey = false
-                    }
-                }
-            }
-            Text("Environment: \(provider.environmentKey). The key is never written to muxa config, Ask history, logs, or command arguments.")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
-        .padding(14)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
-        .onAppear { hasKey = MuxaProviderCredentialStore.hasKey(for: provider) }
-    }
-}
-
 private struct AskConversationTurn: View {
     let entry: MuxaAskEntry
 
     private var providerTitle: String {
-        entry.agent == "claude" ? "Claude Code" : entry.agent == "codex" ? "Codex" : entry.agent.capitalized
+        AskProviderStore.shared.title(for: entry.agent)
     }
 
     private var providerIcon: String {
-        entry.agent == "claude" ? "brain.head.profile" : "chevron.left.forwardslash.chevron.right"
+        AskProviderStore.shared.symbolName(for: entry.agent)
     }
 
     private var statusColor: Color {
@@ -1564,11 +1467,11 @@ private struct AskHistoryCard: View {
     let entry: MuxaAskEntry
 
     private var providerTitle: String {
-        entry.agent == "claude" ? "Claude Code" : entry.agent == "codex" ? "Codex" : entry.agent.capitalized
+        AskProviderStore.shared.title(for: entry.agent)
     }
 
     private var providerIcon: String {
-        entry.agent == "claude" ? "brain.head.profile" : "chevron.left.forwardslash.chevron.right"
+        AskProviderStore.shared.symbolName(for: entry.agent)
     }
 
     private var statusColor: Color {

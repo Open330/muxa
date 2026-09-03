@@ -117,7 +117,6 @@ final class AppModel: ObservableObject {
     @Published private(set) var isSendingAsk = false
     @Published private(set) var isEnablingAsk = false
     @Published private(set) var askError: String?
-    @Published var isPresentingAskSettings = false
     @Published private(set) var askSettingsStatus: String?
     @Published private(set) var askSettingsError: String?
     @Published private(set) var operatorMessages: [MuxaOperatorMessage] = []
@@ -663,8 +662,8 @@ final class AppModel: ObservableObject {
                     environment: terminalEnvironment
                 )
                 shellNumber += 1
+                registerSpawnedSession(session)
                 await refresh()
-                select(.shell(session.id))
             } catch {
                 MuxaLog.app.error(
                     "session creation failed: \(error.localizedDescription, privacy: .public)"
@@ -1209,12 +1208,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func presentAskSettings() {
-        askSettingsError = nil
-        askSettingsStatus = nil
-        isPresentingAskSettings = true
-    }
-
     func saveProviderKey(_ key: String, provider: MuxaAskProvider) -> Bool {
         askSettingsError = nil
         do {
@@ -1237,15 +1230,20 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func requestDaemonRestartForProviderSettings() {
-        isPresentingAskSettings = false
-        isConfirmingDaemonReplacement = true
-    }
-
+    /// Opens the provider's CLI sign-in in a native shell. The executable
+    /// is looked up the same way the Providers pane detects it (login-shell
+    /// PATH plus the usual per-user install folders), so a CLI the pane
+    /// shows as installed can always be launched from here.
     func openProviderCLI(_ provider: MuxaAskProvider) async {
         askSettingsError = nil
-        guard let executable = MuxaExecutableResolver.executablePath(provider.executable) else {
-            askSettingsError = "\(provider.title) CLI was not found in ~/.local/bin, Homebrew, or PATH."
+        let name = provider.executable
+        let executable: String
+        if let resolved = MuxaExecutableResolver.executablePath(name) {
+            executable = resolved
+        } else if let resolved = InstalledTools.resolve(name, in: await InstalledTools.searchDirectories()) {
+            executable = resolved
+        } else {
+            askSettingsError = String(localized: "\(provider.title) CLI was not found on your PATH or in the usual install folders.")
             return
         }
         do {
@@ -1254,14 +1252,13 @@ final class AppModel: ObservableObject {
                 command: executable,
                 arguments: arguments,
                 cwd: FileManager.default.homeDirectoryForCurrentUser.path,
-                name: provider == .codex ? "Codex Login" : "Claude Code Login",
+                name: String(localized: "\(provider.title) Login"),
                 environment: MuxaProviderCredentialStore.environment(
                     ProcessInfo.processInfo.environment,
                     for: provider
                 )
             )
             await refresh()
-            isPresentingAskSettings = false
             select(.shell(session.id))
         } catch {
             askSettingsError = error.localizedDescription
@@ -1720,10 +1717,38 @@ final class AppModel: ObservableObject {
     }
 
     private func reconcileSelection() {
-        if let sidebarSelection, isSelectionAvailable(sidebarSelection) { return }
+        guard let sidebarSelection else {
+            // Nothing selected: the Shells tab may legitimately be empty (or
+            // show only exited shells); every other mode falls back to the
+            // Work board.
+            if sidebarMode != .shells {
+                sidebarMode = .work
+                self.sidebarSelection = .workBoard
+            }
+            return
+        }
+        if isSelectionAvailable(sidebarSelection) { return }
+        if sidebarMode == .shells {
+            // A shell that exited stays listed in the tab until the user
+            // removes it; losing the selection must not throw the user out
+            // of the Shells tab.
+            self.sidebarSelection = nil
+            return
+        }
 
         sidebarMode = .work
-        sidebarSelection = .workBoard
+        self.sidebarSelection = .workBoard
+    }
+
+    /// Lists a session muxad just spawned and selects it right away. A
+    /// `refresh()` that is already in flight would otherwise return before
+    /// the new session is known, and the editor showed an empty placeholder
+    /// until the next 15 s refresh.
+    func registerSpawnedSession(_ session: MuxaSession) {
+        if !sessions.contains(where: { $0.id == session.id }) {
+            sessions.append(session)
+        }
+        select(.shell(session.id))
     }
 
     private func reconcileWatchSelection() {

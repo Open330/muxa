@@ -87,7 +87,7 @@ pub enum PipelineError {
     BadToml(String),
     #[error("the generated config configures nothing: expected at least one [[route]] and one [pipeline.*]")]
     EmptyProposal,
-    #[error("pipeline {pipeline:?} agent {alias:?} names program {program:?}, which is not an allowlisted agent CLI (claude, codex, gemini, opencode)")]
+    #[error("pipeline {pipeline:?} agent {alias:?} names program {program:?}, which is not an allowlisted agent CLI (claude, codex, gemini, agy, opencode)")]
     UnknownProgram {
         pipeline: String,
         alias: String,
@@ -234,7 +234,7 @@ pub fn extract_json_object(text: &str) -> Option<&str> {
 
 /// Agent CLIs a pipeline may name. Kept here so a generated config can be
 /// rejected before it reaches tmux, rather than failing one pane at a time.
-pub const ALLOWLISTED_PROGRAMS: [&str; 4] = ["claude", "codex", "gemini", "opencode"];
+pub const ALLOWLISTED_PROGRAMS: [&str; 5] = ["claude", "codex", "gemini", "agy", "opencode"];
 
 /// Pull a TOML document out of an agent's reply.
 ///

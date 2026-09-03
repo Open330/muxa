@@ -59,7 +59,7 @@ struct MuxaSettingsView: View {
                 .tabItem { Label("General", systemImage: "gearshape") }
                 .tag(MuxaSettingsTab.general.rawValue)
 
-            MuxaProviderSettingsPane(model: model)
+            AskProvidersSettingsPane(model: model, store: AskProviderStore.shared)
                 .tabItem { Label("Providers", systemImage: "brain.head.profile") }
                 .tag(MuxaSettingsTab.providers.rawValue)
 
@@ -79,6 +79,7 @@ private struct MuxaGeneralSettingsView: View {
     @AppStorage(MuxaPreferences.appearanceKey) private var appearance = MuxaAppearance.system.rawValue
     @AppStorage(MuxaPreferences.showWorkbenchOnLaunchKey) private var showWorkbenchOnLaunch = true
     @AppStorage(MuxaPreferences.workDirectoryKey) private var workDirectory = ""
+    @Environment(\.openWindow) private var openWindow
 
     private var directoryExists: Bool {
         workDirectory.isEmpty || FileManager.default.fileExists(atPath: workDirectory)
@@ -103,6 +104,15 @@ private struct MuxaGeneralSettingsView: View {
                 Text("When disabled, Muxa starts in the menu bar and keeps host monitoring available.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                HStack {
+                    Button("Show Welcome Guide…") {
+                        openWindow(id: OnboardingPreferences.windowID)
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
+                    Text("The first-launch tour of Work, Explore, Inbox, and Shells, with the setup checklist.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Work") {
@@ -141,68 +151,6 @@ private struct MuxaGeneralSettingsView: View {
         }
         if panel.runModal() == .OK, let url = panel.url {
             workDirectory = url.path
-        }
-    }
-}
-
-private struct MuxaProviderSettingsPane: View {
-    @ObservedObject var model: AppModel
-    @State private var confirmsReload = false
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                settingsHeading(
-                    "Ask Providers",
-                    detail: "Use Claude Code or Codex sign-in, or store an optional API key in the macOS login Keychain."
-                )
-
-                if model.askEnabled == false {
-                    HStack {
-                        Label("Global Ask is disabled in muxa configuration.", systemImage: "exclamationmark.circle")
-                            .foregroundStyle(.orange)
-                        Spacer()
-                        Button("Enable Global Ask") {
-                            Task { await model.enableAsk() }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(model.isEnablingAsk)
-                    }
-                    .padding(12)
-                    .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-                }
-
-                ForEach(MuxaAskProvider.allCases) { provider in
-                    AskProviderCredentialRow(provider: provider, model: model)
-                }
-
-                if let status = model.askSettingsStatus {
-                    Label(status, systemImage: "checkmark.circle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.green)
-                }
-                if let error = model.askSettingsError {
-                    Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .textSelection(.enabled)
-                }
-
-                HStack {
-                    Text("Reload only after installing a provider CLI in a new PATH.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Reload muxad PATH…") { confirmsReload = true }
-                }
-            }
-            .padding(20)
-        }
-        .alert("Reload the bundled muxad?", isPresented: $confirmsReload) {
-            Button("Cancel", role: .cancel) {}
-            Button("Reload", role: .destructive) { model.replaceRunningDaemon() }
-        } message: {
-            Text("Native PTY sessions owned by muxad will end. tmux sessions are not terminated.")
         }
     }
 }
@@ -403,8 +351,9 @@ private struct MuxaRuntimeSettingsPane: View {
     }
 }
 
+/// Shared by the settings panes, including `AskProvidersSettingsPane`.
 @ViewBuilder
-private func settingsHeading(_ title: String, detail: String) -> some View {
+func settingsHeading(_ title: String, detail: String) -> some View {
     VStack(alignment: .leading, spacing: 3) {
         Text(title).font(.title2.weight(.semibold))
         Text(detail).font(.subheadline).foregroundStyle(.secondary)

@@ -67,8 +67,10 @@ pub mod timeline;
 pub mod tmux;
 pub mod topology;
 pub mod work;
+pub mod work_compose;
 #[doc(hidden)]
 pub mod work_control;
+pub mod work_pipeline_spec;
 pub mod work_presets;
 
 // ---------------------------------------------------------------------------

@@ -54,12 +54,16 @@ compatibility source이자 stats fallback으로 사용됩니다.
 ```toml
 [ask]
 enabled = true
-agent = "claude"     # claude | codex
+agent = "claude"     # claude | codex | gemini | anthropic | openai
 cwd = "~"            # headless 프로세스가 실행될 위치. 기본값 $HOME
-permission_mode = "bypass" # bypass(기본값) | edit | default
+permission_mode = "bypass" # bypass(기본값) | edit | plan | default
 additional_dirs = [] # 추가 real path. 예: ["/nfs/home/june"]
 timeout_secs = 1800    # wall-clock 제한 30분
 keep = 200           # 보관할 답변 수. 넘으면 오래된 것부터 버립니다
+
+[ask.providers.anthropic]           # 선택. provider id마다 테이블 하나
+model = "claude-opus-5"             # 기본값: claude-sonnet-5(anthropic), gpt-5(openai). CLI는 자체 기본값
+api_key_env = "WORK_ANTHROPIC_KEY"  # 키를 담은 환경 변수의 *이름*. 키 자체는 절대 아님
 ```
 
 `muxa watch`에서 보내는 headless 질의입니다. `a`로 묻고 `A`로 이력을 봅니다.
@@ -80,15 +84,33 @@ sandbox/자동 검토를 유지한 채 workspace 편집을 허용하고, `defaul
 `/home/june/workspace`가 NFS를 가리키면 `["/nfs/home/june"]`를 사용합니다.
 `timeout_secs` 기본값은 persistent worker를 준비하는 skill을 고려해 30분입니다.
 이 제한에 도달하면 headless agent 프로세스가 종료됩니다. inactivity timeout이 아닌
-전체 wall-clock 안전 제한입니다.
+전체 wall-clock 안전 제한입니다. `plan`은 읽기 전용 모드입니다(claude
+`--permission-mode plan`, codex `--sandbox read-only`, gemini `--approval-mode
+plan`). `muxa work compose`는 항상 이 모드로 초안을 만듭니다.
+
+`agent`는 provider를 고릅니다. `claude`, `codex`, `gemini`는 agent CLI를 print
+모드(`claude -p`, `codex exec --json`, `gemini -p --output-format json`)로
+실행하고 질문 사이에 자체 세션을 resume합니다. `anthropic`과 `openai`는 Messages
+API와 Chat Completions API를 HTTPS로 직접 호출합니다. resume할 세션이 없으므로
+muxad가 자기 이력에서 그 대화의 이전 턴(최근 40턴 또는 60k자)을 질문 앞에
+다시 넣어 보내며, `cwd`·`additional_dirs`·`permission_mode`는 적용되지 않습니다.
+API 키는 순서대로 client가 보낸 1회용 키, muxad 환경의 provider 고유 변수
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`; CLI는 `CODEX_API_KEY`, `GEMINI_API_KEY`),
+그다음 `[ask.providers.<id>] api_key_env`가 가리키는 변수에서 읽습니다. 키 자체는
+config.toml에 절대 쓰지 않습니다. `[ask.providers.<id>] model`은 CLI를 포함한
+모든 provider의 모델을 바꿉니다.
 
 TUI를 열지 않아도 동일한 daemon 소유 이력을 사용할 수 있습니다.
 
 ```bash
 muxa ask --agent codex "현재 구현을 요약해줘"
 muxa ask --agent claude --detach --json "배포 계획을 검토해줘"
+muxa ask --agent anthropic "reaper가 건드리는 파일은?"
 security find-generic-password -w -s my-codex-key \
   | muxa ask --agent codex --api-key-stdin "이 저장소를 검토해줘"
+muxa ask providers [--json]           # 모든 provider: 종류, 모델, 키 확보 여부, 선택 상태
+muxa ask provider set anthropic --model claude-opus-5 --api-key-env WORK_ANTHROPIC_KEY
+muxa ask provider set anthropic --clear-model         # 생략한 플래그의 키는 그대로 둡니다
 ```
 
 `--api-key-stdin`은 interactive terminal 입력을 거부합니다. 키는 owner-only Unix

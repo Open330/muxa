@@ -59,6 +59,21 @@ muxa work init --dry-run                      # show the proposal, write nothing
 muxa work init --agent codex                  # use a different resolver
 ```
 
+Want one pipeline rather than the whole config? `muxa work compose
+"<description>"` spends one **read-only** agent turn and prints the
+pipeline as the JSON `pipeline set` reads — nothing is written. The draft
+is validated with the same rules as `pipeline set`, and a draft that would
+not launch is sent back once with the reason before muxa gives up.
+`--current <path|->` refines an earlier draft (the description is then the
+change to make), `--agent <id>` picks any `[ask]` provider, and `--json`
+prints the whole response (`pipeline`, `notes`, `raw`) — the same shape
+Muxa.app's pipeline editor gets from the daemon's `work_compose` request.
+
+```console
+muxa work compose "implementer in claude, reviewer in codex after it"
+muxa work compose "add a gemini tester after review" --current pair.json --json
+```
+
 Do not want to spend a turn? Three built-in presets cover the common
 line-ups, and `muxa work preset apply` writes one into `config.toml` the
 same way — through `toml_edit`, validated as a whole `Config` before the
@@ -371,6 +386,7 @@ So an agent's launch prompt is three layers, outermost first:
 
 ```console
 muxa work init                       # write the config by describing it
+muxa work compose "<description>" [--agent <id>] [--current <path|->] [--json]   # draft one pipeline as JSON; writes nothing
 muxa work preset list                # built-in line-ups: solo, pair, triad
 muxa work preset apply <name> --route '<regex>'   # write one, no agent turn
 muxa work options [--json]           # routes, pipelines, skills, presets for a launcher

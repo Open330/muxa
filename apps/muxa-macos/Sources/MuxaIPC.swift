@@ -700,6 +700,32 @@ struct MuxaAskConversationSnapshot: Sendable {
     let active: MuxaAskConversation?
 }
 
+/// One optional `[ask.providers.<id>]` key in an `ask_provider_configure`
+/// request: omitted from the request (`keep`), sent as JSON `null` so the
+/// daemon clears it, or set to a value.
+enum MuxaAskProviderFieldUpdate: Equatable, Sendable {
+    case keep
+    case clear
+    case set(String)
+
+    /// `nil` or blank clears; anything else sets the trimmed value.
+    init(_ value: String?) {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        self = trimmed.isEmpty ? .clear : .set(trimmed)
+    }
+
+    fileprivate func apply(to request: inout [String: Any], key: String) {
+        switch self {
+        case .keep:
+            break
+        case .clear:
+            request[key] = NSNull()
+        case .set(let value):
+            request[key] = value
+        }
+    }
+}
+
 struct MuxaCollaborationRoom: Decodable, Hashable, Sendable {
     let host: String
     let socket: String?
@@ -824,6 +850,7 @@ private struct MuxaIPCResponse: Decodable, Sendable {
     let askConversation: MuxaAskConversation?
     let askAgent: String?
     let askEnabled: Bool?
+    let askProviders: [MuxaAskProvider]?
     let workCommand: MuxaWorkCommandOutput?
 
     enum CodingKeys: String, CodingKey {
@@ -840,6 +867,7 @@ private struct MuxaIPCResponse: Decodable, Sendable {
         case askConversation = "ask_conversation"
         case askAgent = "ask_agent"
         case askEnabled = "ask_enabled"
+        case askProviders = "ask_providers"
     }
 }
 
@@ -905,6 +933,7 @@ actor MuxaIPCClient {
     static let workCommandCapability = "work_command_v1"
     static let askCredentialCapability = "ask_one_turn_credential_v1"
     static let askConversationCapability = "ask_conversations_v1"
+    static let askProvidersCapability = "ask_providers_v1"
     static let fleetSubscribeCapability = "fleet_subscribe"
     static let sessionWaitCapability = "session_wait_v1"
     static let askSubscribeCapability = "ask_subscribe"
@@ -1231,6 +1260,52 @@ actor MuxaIPCClient {
             "agent": agent,
         ])
         return response.askAgent ?? agent
+    }
+
+    /// The daemon's Ask providers (`ask_providers`, capability
+    /// `ask_providers_v1`). Callers fall back to `MuxaAskProvider.builtIn`
+    /// when the capability is absent; see `AskProviderStore.reload`.
+    func listAskProviders() async throws -> [MuxaAskProvider] {
+        guard capabilities.contains(Self.askProvidersCapability) else {
+            throw MuxaIPCError.server(
+                "The running muxad does not list Ask providers; update muxa or choose Use Bundled muxad"
+            )
+        }
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "ask_providers",
+        ])
+        guard let providers = response.askProviders else {
+            throw MuxaIPCError.missingField("ask_providers")
+        }
+        return providers
+    }
+
+    /// Writes `model` / `api_key_env` under `[ask.providers.<id>]` in the
+    /// daemon's config and returns the refreshed provider list. `.keep`
+    /// leaves the key out of the request so the daemon does not touch it.
+    func configureAskProvider(
+        _ providerID: String,
+        model: MuxaAskProviderFieldUpdate = .keep,
+        apiKeyEnv: MuxaAskProviderFieldUpdate = .keep
+    ) async throws -> [MuxaAskProvider] {
+        guard capabilities.contains(Self.askProvidersCapability) else {
+            throw MuxaIPCError.server(
+                "The running muxad cannot configure Ask providers; update muxa or choose Use Bundled muxad"
+            )
+        }
+        var request: [String: Any] = [
+            "protocol": Self.protocolVersion,
+            "kind": "ask_provider_configure",
+            "provider": providerID,
+        ]
+        model.apply(to: &request, key: "model")
+        apiKeyEnv.apply(to: &request, key: "api_key_env")
+        let response = try await call(request, timeout: 10)
+        guard let providers = response.askProviders else {
+            throw MuxaIPCError.missingField("ask_providers")
+        }
+        return providers
     }
 
     func sendAsk(

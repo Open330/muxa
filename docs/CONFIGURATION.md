@@ -55,12 +55,16 @@ stats while newer activity ledger intervals are accumulating.
 ```toml
 [ask]
 enabled = true
-agent = "claude"     # claude | codex
+agent = "claude"     # claude | codex | gemini | anthropic | openai
 cwd = "~"            # where the headless process runs; defaults to $HOME
-permission_mode = "bypass" # bypass (default) | edit | default
+permission_mode = "bypass" # bypass (default) | edit | plan | default
 additional_dirs = [] # extra real paths, e.g. ["/nfs/home/june"]
 timeout_secs = 1800    # 30-minute wall-clock limit
 keep = 200           # answers retained before the oldest are dropped
+
+[ask.providers.anthropic]           # optional, one table per provider id
+model = "claude-opus-5"             # defaults: claude-sonnet-5 (anthropic), gpt-5 (openai); CLIs use their own
+api_key_env = "WORK_ANTHROPIC_KEY"  # the NAME of a variable holding the key — never the key itself
 ```
 
 Opt-in headless questions from `muxa watch`: `a` composes one, `A` browses
@@ -83,15 +87,36 @@ Add the resolved target when files under `cwd` are symlinks outside it—for
 example `["/nfs/home/june"]` when `/home/june/workspace` points there.
 `timeout_secs` defaults to 30 minutes so skills have time to prepare a
 persistent worker. Reaching it terminates the headless agent process; it is a
-wall-clock safety limit, not an inactivity detector.
+wall-clock safety limit, not an inactivity detector. `plan` is a read-only
+mode (claude `--permission-mode plan`, codex `--sandbox read-only`, gemini
+`--approval-mode plan`); `muxa work compose` always drafts under it.
+
+`agent` names a provider. `claude`, `codex`, and `gemini` drive the agent
+CLIs in print mode (`claude -p`, `codex exec --json`, `gemini -p
+--output-format json`) and resume their own sessions between questions.
+`anthropic` and `openai` call the Messages and Chat Completions APIs
+directly over HTTPS. They have no session to resume, so muxad replays the
+conversation's earlier turns from its own history — the most recent 40
+turns or 60k characters — ahead of each question; `cwd`, `additional_dirs`,
+and `permission_mode` do not apply to them. An API key comes from, in
+order: the one-turn key a client sends, the provider's own variable in
+muxad's environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`; `CODEX_API_KEY`
+and `GEMINI_API_KEY` for the CLIs), then the variable `[ask.providers.<id>]
+api_key_env` names. The key itself is never written to config.toml.
+`[ask.providers.<id>] model` overrides the model for any provider, CLIs
+included.
 
 The same daemon-owned history is available without opening the TUI:
 
 ```bash
 muxa ask --agent codex "summarize the current implementation"
 muxa ask --agent claude --detach --json "review the deployment plan"
+muxa ask --agent anthropic "which files does the reaper touch?"
 security find-generic-password -w -s my-codex-key \
   | muxa ask --agent codex --api-key-stdin "review this repository"
+muxa ask providers [--json]           # every provider: kind, model, whether a key resolves, selected
+muxa ask provider set anthropic --model claude-opus-5 --api-key-env WORK_ANTHROPIC_KEY
+muxa ask provider set anthropic --clear-model         # flags you omit leave that key unchanged
 ```
 
 `--api-key-stdin` refuses an interactive terminal, crosses only the owner-only

@@ -49,6 +49,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Ask providers are an open set, including API keys.** `muxa ask` and
+  Muxa.app's Global Ask accept `claude`, `codex`, `gemini` (CLIs) and
+  `anthropic`, `openai` (direct API calls with a key). API providers replay
+  the conversation from muxa's own store, take the key from a one-turn
+  credential, muxad's environment, or a variable named in
+  `[ask.providers.<id>] api_key_env`, and honour `[ask.providers.<id>]
+  model`. New `ask_providers` / `ask_provider_configure` requests
+  (`ask_providers_v1`) and `muxa ask providers` / `muxa ask provider set`
+  expose the list with what each provider still needs. `[ask]
+  permission_mode = "plan"` runs CLI turns read-only.
+
+- **Muxa.app Settings › Providers is the one place to set up Ask.** Each
+  provider shows whether its CLI is installed (found on the login-shell
+  PATH, with version) or its API key is saved in the Keychain, offers Log
+  In / Save Key / Model, and the default-provider picker only lists
+  providers that can answer. The Global Ask bar lists the same providers,
+  folds "New Conversation" into the conversations menu, and opens that
+  settings tab from a gear instead of its own sheet.
+
+- **Pipelines drafted from a description.** `muxa work compose "<what you
+  want>"` and muxad's `work_compose` request (`work_compose_v1`) ask the
+  selected provider for one pipeline in the exact JSON `muxa work pipeline
+  set` accepts, validated with the same rules, without writing anything.
+  Muxa.app's "Describe with an agent…" (Start Work presets, Command Center
+  "Describe…") opens a composer: describe the line-up, see the draft as
+  launch stages with the model's notes, refine it with follow-ups, then
+  open it in the visual editor or save it to the library (optionally with a
+  catch-all route). `agy` joins the pipeline program allowlist.
+
+- **Muxa.app welcomes a first launch.** A Welcome window opens the first
+  time a version runs (and from Help › Welcome Guide… or Settings ›
+  General): what the four surfaces are for, a live setup checklist (muxad
+  connected, tmux and agent CLIs found on the login-shell PATH with
+  versions, Global Ask enabled, Work folder set, SSH hosts registered) with
+  the matching actions, and how a Work item flows from Start Work through
+  the pipeline to the Inbox and Live Watch.
+
+- **Muxa.app Inbox selects an agent instead of leaving.** Clicking a
+  "Needs attention" row keeps you in the Inbox and shows that agent's
+  request card (what it waits on, its open operator requests, latest
+  prompt, host and pane) with an explicit **Open in Live Watch** button; the
+  row and its context menu offer the same jump.
+
+- **Muxa.app Shells tab is a place to open shells.** The sidebar header
+  gains "+" for a local shell and a host menu that opens an `ssh` shell to
+  any online fleet host; an empty tab explains itself with a New Shell
+  button; exited shells stay listed with their exit status until you remove
+  them instead of vanishing, and a shell that exits no longer throws the
+  sidebar back to the Work board.
+
 - **Muxa.app Start Work shows real choices and the pipeline picture.** The
   Command Center lists configured pipelines as launchable cards drawn in
   launch stages, the Start Work sheet previews the matching route, suggests

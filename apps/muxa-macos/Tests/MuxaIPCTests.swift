@@ -2244,3 +2244,1070 @@ func workbenchLaunchReactivationKeepsRestoredPreview() throws {
     #expect(group.tabs == [.workBoard, .pane(pane)])
     #expect(group.preview == .pane(pane))
 }
+
+// MARK: - Onboarding (peer: onboarding)
+
+@Test func onboardingShowsForFirstLaunchAndOlderRecordedVersions() {
+    #expect(OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: nil))
+    #expect(OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: ""))
+    #expect(OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: "0.1.0"))
+    #expect(OnboardingPreferences.shouldPresent(currentVersion: "0.1.10", completedVersion: "0.1.9"))
+    #expect(OnboardingPreferences.shouldPresent(currentVersion: "1.0", completedVersion: "0.9.9"))
+}
+
+@Test func onboardingStaysQuietForEqualOrNewerRecordedVersions() {
+    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: "0.2.0"))
+    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: "0.2"))
+    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.2", completedVersion: "0.2.0"))
+    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.1.9", completedVersion: "0.1.10"))
+    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: "0.3.0-beta"))
+    #expect(OnboardingPreferences.compareVersions("0.1.0-beta", "0.1.0") == .orderedSame)
+}
+
+@Test func onboardingNeverPresentsInsideTestHosts() {
+    #expect(OnboardingPreferences.isRunningTests(
+        environment: ["XCTestConfigurationFilePath": "/tmp/Muxa.xctestconfiguration"]
+    ))
+    #expect(OnboardingPreferences.isRunningTests(environment: ["SWIFT_TESTING_ENABLED": "1"]))
+    #expect(!OnboardingPreferences.isRunningTests(environment: ["PATH": "/usr/bin"]))
+    #expect(OnboardingPreferences.isRunningTests())
+    #expect(!OnboardingPreferences.shouldPresentOnLaunch(currentVersion: "9.9.9"))
+}
+
+@Test func onboardingRecordsTheCompletedVersionInDefaults() throws {
+    let suite = "dev.muxa.tests.onboarding.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let environment = ["PATH": "/usr/bin"]
+
+    #expect(OnboardingPreferences.shouldPresentOnLaunch(
+        defaults: defaults, currentVersion: "0.2.0", environment: environment
+    ))
+    OnboardingPreferences.markCompleted(version: "0.2.0", defaults: defaults)
+    #expect(defaults.string(forKey: OnboardingPreferences.completedVersionKey) == "0.2.0")
+    #expect(!OnboardingPreferences.shouldPresentOnLaunch(
+        defaults: defaults, currentVersion: "0.2.0", environment: environment
+    ))
+    #expect(OnboardingPreferences.shouldPresentOnLaunch(
+        defaults: defaults, currentVersion: "0.3.0", environment: environment
+    ))
+}
+
+@Test func onboardingChecklistMapsDetectedTools() {
+    let detected = [
+        InstalledTool(name: "tmux", path: "/opt/homebrew/bin/tmux", version: "tmux 3.5a"),
+        InstalledTool(name: "claude", path: "/Users/me/.local/bin/claude", version: "2.1.3 (Claude Code)"),
+        InstalledTool(name: "codex", path: "/opt/homebrew/bin/codex", version: nil),
+    ]
+
+    #expect(OnboardingChecklist.toolStatus(named: "tmux", in: nil) == .unknown)
+    #expect(OnboardingChecklist.agentsStatus(in: nil) == .unknown)
+    #expect(OnboardingChecklist.toolStatus(named: "tmux", in: detected) == .ready)
+    #expect(OnboardingChecklist.toolStatus(named: "tmux", in: []) == .attention)
+    #expect(OnboardingChecklist.agentTools(in: detected).map(\.name) == ["claude", "codex"])
+    #expect(OnboardingChecklist.agentsStatus(in: detected) == .ready)
+    #expect(OnboardingChecklist.agentsStatus(in: [detected[0]]) == .attention)
+    #expect(OnboardingChecklist.probedPrograms == ["tmux", "claude", "codex", "gemini", "agy", "opencode"])
+}
+
+@Test @MainActor
+func onboardingChecklistMapsModelState() {
+    #expect(OnboardingChecklist.connectionStatus(.connected) == .ready)
+    #expect(OnboardingChecklist.connectionStatus(.connecting) == .unknown)
+    #expect(OnboardingChecklist.connectionStatus(.failed("socket missing")) == .attention)
+    #expect(OnboardingChecklist.connectionStatus(.upgradeRequired("0.2 needed")) == .attention)
+
+    #expect(OnboardingChecklist.askStatus(true) == .ready)
+    #expect(OnboardingChecklist.askStatus(false) == .attention)
+    #expect(OnboardingChecklist.askStatus(nil) == .unknown)
+
+    #expect(OnboardingChecklist.workFolderStatus(path: "") { _ in true } == .attention)
+    #expect(OnboardingChecklist.workFolderStatus(path: "  ") { _ in true } == .attention)
+    #expect(OnboardingChecklist.workFolderStatus(path: "/tmp/project") { $0 == "/tmp/project" } == .ready)
+    #expect(OnboardingChecklist.workFolderStatus(path: "/gone") { _ in false } == .attention)
+
+    #expect(OnboardingChecklist.fleetHostsStatus(remoteHostCount: 0) == .attention)
+    #expect(OnboardingChecklist.fleetHostsStatus(remoteHostCount: 2) == .ready)
+}
+
+@Test func installedToolsVersionLineSkipsBlankAndIndentedLines() {
+    #expect(InstalledTools.versionLine(from: "\r\n\t codex-cli 0.42.0\r\nnode 22.1.0\n") == "codex-cli 0.42.0")
+    #expect(InstalledTools.versionLine(from: "gemini 0.9.1") == "gemini 0.9.1")
+    #expect(InstalledTools.versionLine(from: "") == nil)
+}
+
+@Test func installedToolsMergedDirectoriesKeepsFallbackOrderWhenPathIsEmpty() {
+    let merged = InstalledTools.mergedDirectories(
+        pathStrings: ["", "  "],
+        fallback: ["/opt/homebrew/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+    )
+    #expect(merged == ["/opt/homebrew/bin", "/usr/local/bin"])
+    #expect(InstalledTools.mergedDirectories(pathStrings: [], fallback: []).isEmpty)
+}
+
+// MARK: - Ask providers (ask-settings peer)
+
+/// The `ask_providers` wire shape from the ask-rust contract, in daemon order.
+private func askProviderFixture(anthropicModel: String = "claude-sonnet-5") -> [[String: Any]] {
+    [
+        [
+            "id": "claude", "title": "Claude Code", "kind": "cli", "executable": "claude",
+            "credential_env": "ANTHROPIC_API_KEY", "credential_required": false,
+            "model": NSNull(), "selected": true,
+        ],
+        [
+            "id": "codex", "title": "Codex", "kind": "cli", "executable": "codex",
+            "credential_env": "CODEX_API_KEY", "credential_required": false,
+            "model": NSNull(), "selected": false,
+        ],
+        [
+            "id": "anthropic", "title": "Anthropic API", "kind": "api", "executable": NSNull(),
+            "credential_env": "ANTHROPIC_API_KEY", "credential_required": true,
+            "model": anthropicModel, "selected": false,
+        ],
+        [
+            "id": "openai", "title": "OpenAI API", "kind": "api", "executable": NSNull(),
+            "credential_env": "OPENAI_API_KEY", "credential_required": true,
+            "model": "gpt-5", "selected": false,
+        ],
+    ]
+}
+
+/// `hello` with the baseline the client requires plus the given extras.
+private func askProviderHello(capabilities: [String]) throws -> Data {
+    try JSONSerialization.data(withJSONObject: [
+        "ok": true,
+        "min_protocol": 1,
+        "max_protocol": 6,
+        "capabilities": ["session_bytes_v1", "session_attachment_identity_v1", "work_control_v1"] + capabilities,
+    ])
+}
+
+@Test
+func askProvidersDecodeTheDaemonListAndConfigureRoundTrips() async throws {
+    let handler: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        switch object["kind"] as? String {
+        case "hello":
+            return try askProviderHello(capabilities: ["ask_providers_v1", "ask_conversations_v1"])
+        case "ask_providers":
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true,
+                "ask_providers": askProviderFixture(),
+            ])
+        case "ask_provider_configure":
+            #expect(object["provider"] as? String == "anthropic")
+            #expect(object["model"] as? String == "claude-opus-5")
+            // `.keep` leaves the key out so the daemon does not touch it.
+            #expect(object["api_key_env"] == nil)
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true,
+                "ask_providers": askProviderFixture(anthropicModel: "claude-opus-5"),
+            ])
+        default:
+            return try JSONSerialization.data(withJSONObject: ["ok": true])
+        }
+    }
+    let client = MuxaIPCClient(socketPath: "/tmp/muxa-ask-providers-test.sock", request: handler)
+    try await client.hello()
+    #expect(await client.supports(MuxaIPCClient.askProvidersCapability))
+
+    let providers = try await client.listAskProviders()
+    #expect(providers.map(\.id) == ["claude", "codex", "anthropic", "openai"])
+
+    let claude = try #require(providers.first { $0.id == "claude" })
+    #expect(claude.kind == .cli)
+    #expect(claude.cliExecutable == "claude")
+    #expect(claude.executable == "claude")
+    #expect(!claude.credentialRequired)
+    #expect(claude.model == nil)
+    #expect(claude.selected)
+    // Equality is by id, so the daemon's row matches the static provider
+    // AppModel compares against (`provider == .codex`) whatever its state.
+    #expect(claude == .claude)
+    #expect(claude != .codex)
+
+    let anthropic = try #require(providers.first { $0.id == "anthropic" })
+    #expect(anthropic.kind == .api)
+    #expect(!anthropic.isCLI)
+    #expect(anthropic.cliExecutable == nil)
+    #expect(anthropic.credentialEnv == "ANTHROPIC_API_KEY")
+    #expect(anthropic.environmentKey == "ANTHROPIC_API_KEY")
+    #expect(anthropic.credentialRequired)
+    #expect(anthropic.model == "claude-sonnet-5")
+    #expect(!anthropic.selected)
+
+    let configured = try await client.configureAskProvider("anthropic", model: .set("claude-opus-5"))
+    #expect(configured.first { $0.id == "anthropic" }?.model == "claude-opus-5")
+}
+
+@Test
+func askProviderConfigureSendsNullToClearAndRequiresTheCapability() async throws {
+    let clearing: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        switch object["kind"] as? String {
+        case "hello":
+            return try askProviderHello(capabilities: ["ask_providers_v1"])
+        case "ask_provider_configure":
+            #expect(object["provider"] as? String == "openai")
+            #expect(object["model"] is NSNull)
+            #expect(object["api_key_env"] as? String == "OPENAI_KEY_ALT")
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true,
+                "ask_providers": askProviderFixture(),
+            ])
+        default:
+            return try JSONSerialization.data(withJSONObject: ["ok": true])
+        }
+    }
+    let client = MuxaIPCClient(socketPath: "/tmp/muxa-ask-providers-clear.sock", request: clearing)
+    try await client.hello()
+    let updated = try await client.configureAskProvider(
+        "openai",
+        model: .clear,
+        apiKeyEnv: .set("OPENAI_KEY_ALT")
+    )
+    #expect(updated.count == 4)
+
+    // Blank input clears; surrounding whitespace is trimmed.
+    #expect(MuxaAskProviderFieldUpdate(nil) == .clear)
+    #expect(MuxaAskProviderFieldUpdate("   ") == .clear)
+    #expect(MuxaAskProviderFieldUpdate(" gpt-5 ") == .set("gpt-5"))
+
+    let legacy: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        if object["kind"] as? String == "hello" {
+            return try askProviderHello(capabilities: ["ask_conversations_v1"])
+        }
+        Issue.record("an old daemon must not receive provider requests")
+        return try JSONSerialization.data(withJSONObject: ["ok": false, "error": "unknown kind"])
+    }
+    let old = MuxaIPCClient(socketPath: "/tmp/muxa-ask-providers-legacy.sock", request: legacy)
+    try await old.hello()
+    await #expect(throws: (any Error).self) {
+        _ = try await old.listAskProviders()
+    }
+    await #expect(throws: (any Error).self) {
+        _ = try await old.configureAskProvider("anthropic", model: .set("x"))
+    }
+}
+
+@Test
+func askProviderUsabilityRuleTable() {
+    let tool = InstalledTool(name: "claude", path: "/opt/homebrew/bin/claude", version: "2.1.0")
+    // CLI providers: the executable decides; a key alone is not enough.
+    #expect(AskProviderStore.usability(kind: .cli, detection: .installed(tool), hasKey: false) == .usable)
+    #expect(AskProviderStore.usability(kind: .cli, detection: .installed(tool), hasKey: true) == .usable)
+    #expect(AskProviderStore.usability(kind: .cli, detection: .notInstalled, hasKey: true) == .notInstalled)
+    #expect(AskProviderStore.usability(kind: .cli, detection: .notInstalled, hasKey: false) == .notInstalled)
+    #expect(AskProviderStore.usability(kind: .cli, detection: .probing, hasKey: false) == .probing)
+    // API providers: the key decides; detection is irrelevant.
+    #expect(AskProviderStore.usability(kind: .api, detection: .notInstalled, hasKey: true) == .usable)
+    #expect(AskProviderStore.usability(kind: .api, detection: .probing, hasKey: true) == .usable)
+    #expect(AskProviderStore.usability(kind: .api, detection: .installed(tool), hasKey: false) == .missingKey)
+    // Probing counts as usable so the picker never blocks on a slow probe.
+    #expect(AskProviderUsability.usable.isUsable)
+    #expect(AskProviderUsability.probing.isUsable)
+    #expect(!AskProviderUsability.notInstalled.isUsable)
+    #expect(!AskProviderUsability.missingKey.isUsable)
+    #expect(AskProviderUsability.usable.reason == nil)
+    #expect(AskProviderUsability.probing.reason == nil)
+    #expect(AskProviderUsability.notInstalled.reason?.isEmpty == false)
+    #expect(AskProviderUsability.missingKey.reason?.isEmpty == false)
+    #expect(AskProviderDetection.installed(tool).tool == tool)
+    #expect(AskProviderDetection.notInstalled.tool == nil)
+}
+
+@Test
+func askProviderKeychainAccountsMatchEarlierBuilds() throws {
+    // The enum this struct replaced used "<rawValue>-api-key" under this
+    // service; keys saved by earlier builds must keep resolving.
+    #expect(MuxaProviderCredentialStore.service == "dev.muxa.mac.ask-provider")
+    #expect(MuxaAskProvider.claude.keychainAccount == "claude-api-key")
+    #expect(MuxaAskProvider.codex.keychainAccount == "codex-api-key")
+    #expect(MuxaAskProvider.claude.environmentKey == "ANTHROPIC_API_KEY")
+    #expect(MuxaAskProvider.codex.environmentKey == "CODEX_API_KEY")
+    #expect(MuxaAskProvider.claude.rawValue == "claude")
+    #expect(MuxaAskProvider(rawValue: "claude")?.keychainAccount == "claude-api-key")
+    #expect(MuxaAskProvider(rawValue: "codex")?.keychainAccount == "codex-api-key")
+    #expect(MuxaAskProvider(rawValue: "codex") == .codex)
+    #expect(MuxaAskProvider(rawValue: "codex")?.title == "Codex")
+    #expect(MuxaAskProvider(rawValue: "") == nil)
+    #expect(MuxaAskProvider(rawValue: "anthropic")?.kind == .api)
+    #expect(MuxaAskProvider(rawValue: "openai")?.keychainAccount == "openai-api-key")
+
+    // An id this build never saw still maps to a stable account and env var.
+    let gemini = try #require(MuxaAskProvider(rawValue: "gemini"))
+    #expect(gemini.keychainAccount == "gemini-api-key")
+    #expect(gemini.environmentKey == "GEMINI_API_KEY")
+    #expect(gemini.title == "Gemini")
+    #expect(gemini.kind == .cli)
+    #expect(gemini.executable == "gemini")
+    #expect(MuxaAskProvider.defaultEnvironmentKey(for: "my-provider") == "MY_PROVIDER_API_KEY")
+
+    // Only `id` is required on the wire; the rest has safe defaults.
+    let minimal = try JSONDecoder().decode(
+        MuxaAskProvider.self,
+        from: Data(#"{"id":"gemini","kind":"cli","executable":"gemini"}"#.utf8)
+    )
+    #expect(minimal.title == "Gemini")
+    #expect(minimal.keychainAccount == "gemini-api-key")
+    #expect(!minimal.credentialRequired)
+    #expect(!minimal.selected)
+    let apiOnly = try JSONDecoder().decode(MuxaAskProvider.self, from: Data(#"{"id":"mistral"}"#.utf8))
+    #expect(apiOnly.kind == .api)
+    #expect(apiOnly.credentialRequired)
+    #expect(apiOnly.environmentKey == "MISTRAL_API_KEY")
+
+    // Environment injection still keys off the provider's env var and never
+    // overrides a value the daemon already has.
+    let env = MuxaProviderCredentialStore.environment(["ANTHROPIC_API_KEY": "from-env"], for: .claude)
+    #expect(env["ANTHROPIC_API_KEY"] == "from-env")
+    #expect(env["PATH"]?.isEmpty == false)
+}
+
+@Test
+func askProviderFallbackListMirrorsTheSelectedAgent() {
+    let fallback = AskProviderStore.fallbackProviders(selected: "codex")
+    #expect(fallback.map(\.id) == ["claude", "codex"])
+    #expect(fallback.map(\.selected) == [false, true])
+    let allCLI = fallback.allSatisfy { $0.isCLI }
+    #expect(allCLI)
+    #expect(fallback == MuxaAskProvider.builtIn)
+    let unknownSelectsNothing = AskProviderStore.fallbackProviders(selected: "gemini").allSatisfy { !$0.selected }
+    #expect(unknownSelectsNothing)
+}
+
+@Test
+func askSettingsTabKeySelectsTheProvidersTab() throws {
+    let suite = "dev.muxa.tests.ask-settings.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    #expect(MuxaPreferences.settingsTabKey == "muxa.settings.selectedTab")
+    #expect(MuxaSettingsTab.providers.rawValue == "providers")
+
+    MuxaSettingsOpener.select(.providers, in: defaults)
+    #expect(defaults.string(forKey: MuxaPreferences.settingsTabKey) == "providers")
+    #expect(MuxaSettingsTab(rawValue: defaults.string(forKey: MuxaPreferences.settingsTabKey) ?? "") == .providers)
+
+    MuxaSettingsOpener.select(.general, in: defaults)
+    #expect(defaults.string(forKey: MuxaPreferences.settingsTabKey) == "general")
+}
+
+// MARK: - Pipeline composer (ask-pipeline peer)
+
+private func composeFixturePipelineJSON() -> String {
+    """
+    {"name":"implement-review","description":"Implementer then reviewer","layout":"main-vertical","prompt":null,"agents":[{"alias":"impl","program":"claude","role":"implementer","task":null,"prompt":"Implement the request.","direction":null,"after":[]},{"alias":"review","program":"codex","role":"reviewer","task":"review","prompt":"Read only; report findings.","direction":"down","after":["impl"]}]}
+    """
+}
+
+/// What `muxa work compose --json` prints: the bare result object.
+private func composeFixtureBare() -> Data {
+    Data("""
+    {"pipeline":\(composeFixturePipelineJSON()),"notes":"Reviewer is read-only.","raw":"```json\\n{}\\n```\\nReviewer is read-only."}
+    """.utf8)
+}
+
+/// What muxad replies to `work_compose`: the same object under `work_compose`.
+private func composeFixtureReply() -> Data {
+    Data("""
+    {"ok":true,"work_compose":\(String(decoding: composeFixtureBare(), as: UTF8.self))}
+    """.utf8)
+}
+
+private final class ComposeRequestLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [PipelineComposerSession.Request] = []
+    private var payloads: [[String: Any]] = []
+
+    func append(_ request: PipelineComposerSession.Request) {
+        lock.lock()
+        requests.append(request)
+        lock.unlock()
+    }
+
+    func append(payload: [String: Any]) {
+        lock.lock()
+        payloads.append(payload)
+        lock.unlock()
+    }
+
+    var all: [PipelineComposerSession.Request] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+
+    var lastPayload: [String: Any]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return payloads.last
+    }
+}
+
+private final class ComposeMode: @unchecked Sendable {
+    private let lock = NSLock()
+    private var failure: String?
+    private var hangs = false
+
+    func fail(with message: String?) {
+        lock.lock()
+        failure = message
+        lock.unlock()
+    }
+
+    func hang(_ value: Bool) {
+        lock.lock()
+        hangs = value
+        lock.unlock()
+    }
+
+    var currentFailure: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return failure
+    }
+
+    var shouldHang: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return hangs
+    }
+}
+
+@Test
+func workComposeDecodesDaemonReplyIntoPipelineDefinition() async throws {
+    let handler: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        #expect(object["kind"] as? String == "work_compose")
+        return composeFixtureReply()
+    }
+    let client = MuxaWorkComposeClient(socketPath: "/tmp/muxa-compose-test.sock", request: handler)
+
+    let result = try await client.composeWork(
+        description: "implementer in claude, reviewer in codex after it",
+        agent: nil,
+        current: nil,
+        name: nil,
+        credential: nil
+    )
+
+    #expect(result.pipeline.name == "implement-review")
+    #expect(result.notes == "Reviewer is read-only.")
+    #expect(result.raw.contains("```json"))
+    let definition = result.definition
+    #expect(definition.description == "Implementer then reviewer")
+    #expect(definition.layout == "main-vertical")
+    #expect(definition.agents.map(\.alias) == ["impl", "review"])
+    #expect(definition.agents.map(\.program) == ["claude", "codex"])
+    #expect(definition.agents[1].after == ["impl"])
+    #expect(definition.agents[1].direction == "down")
+    #expect(definition.agents[0].prompt == "Implement the request.")
+    #expect(definition.problems().isEmpty)
+    #expect(MuxaPipelineStages.stages(for: definition.optionsAgents).map { $0.map(\.alias) } == [["impl"], ["review"]])
+}
+
+@Test
+func workComposeDecodesBareCLIOutputAndDaemonEnvelopeAlike() throws {
+    let fromCLI = try MuxaWorkComposeResult.decode(composeFixtureBare())
+    let fromDaemon = try MuxaWorkComposeResult.decode(composeFixtureReply())
+    #expect(fromCLI == fromDaemon)
+    #expect(fromCLI.pipeline.agents.count == 2)
+
+    // notes/raw are optional on the wire; the pipeline is not.
+    let minimal = try MuxaWorkComposeResult.decode(Data("{\"pipeline\":\(composeFixturePipelineJSON())}".utf8))
+    #expect(minimal.notes.isEmpty)
+    #expect(minimal.raw.isEmpty)
+    #expect(throws: (any Error).self) {
+        try MuxaWorkComposeResult.decode(Data("{\"notes\":\"no pipeline here\"}".utf8))
+    }
+    #expect(throws: (any Error).self) {
+        try MuxaWorkComposeResult.decode(Data("{\"ok\":false,\"error\":\"ask is disabled\"}".utf8))
+    }
+}
+
+@Test
+func workComposeRefineRequestCarriesCurrentDraftNameAndCredential() async throws {
+    let log = ComposeRequestLog()
+    let handler: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        log.append(payload: object)
+        return composeFixtureReply()
+    }
+    let client = MuxaWorkComposeClient(socketPath: "/tmp/muxa-compose-test.sock", request: handler)
+    let current = MuxaPipelineDefinition(
+        description: "Implementer then reviewer",
+        agents: [
+            MuxaPipelineDefinition.Agent(alias: "impl", program: "claude", role: "implementer"),
+            MuxaPipelineDefinition.Agent(alias: "review", program: "codex", role: "reviewer", after: ["impl"]),
+        ]
+    )
+
+    _ = try await client.composeWork(
+        description: "make the reviewer use gemini",
+        agent: "codex",
+        current: current,
+        name: "review-loop",
+        credential: MuxaWorkComposeCredential(agent: "codex", apiKey: "test-only-secret")
+    )
+
+    let object = try #require(log.lastPayload)
+    #expect(object["protocol"] as? UInt32 == MuxaIPCClient.protocolVersion)
+    #expect(object["kind"] as? String == "work_compose")
+    #expect(object["description"] as? String == "make the reviewer use gemini")
+    #expect(object["agent"] as? String == "codex")
+    let sent = try #require(object["current"] as? [String: Any])
+    #expect(sent["name"] as? String == "review-loop")
+    #expect(sent["description"] as? String == "Implementer then reviewer")
+    let agents = try #require(sent["agents"] as? [[String: Any]])
+    #expect(agents.map { $0["alias"] as? String } == ["impl", "review"])
+    #expect(agents.map { $0["program"] as? String } == ["claude", "codex"])
+    #expect(agents[1]["after"] as? [String] == ["impl"])
+    #expect(agents[0]["after"] as? [String] == [])
+    let credential = try #require(object["credential"] as? [String: String])
+    #expect(credential == ["agent": "codex", "api_key": "test-only-secret"])
+}
+
+@Test
+func workComposeFirstDraftSendsNullForAbsentFields() throws {
+    let object = try MuxaWorkComposeClient.requestObject(
+        description: "  solo claude that runs the tests  ",
+        agent: nil,
+        current: nil,
+        name: nil,
+        credential: MuxaWorkComposeCredential(agent: "claude", apiKey: "")
+    )
+    #expect(object["description"] as? String == "solo claude that runs the tests")
+    #expect(object["agent"] is NSNull)
+    #expect(object["current"] is NSNull)
+    // An empty Keychain entry is not a credential.
+    #expect(object["credential"] is NSNull)
+
+    let payload = try MuxaWorkComposeClient.currentPayload(
+        MuxaPipelineDefinition(agents: [MuxaPipelineDefinition.Agent(alias: "impl")]),
+        name: "   "
+    )
+    #expect(payload["name"] as? String == "draft")
+    #expect((payload["agents"] as? [[String: Any]])?.count == 1)
+}
+
+@Test
+func workComposeThroughTheClientRequiresTheDaemonCapability() async throws {
+    let handler: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        switch object["kind"] as? String {
+        case "hello":
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true,
+                "min_protocol": 1,
+                "max_protocol": 6,
+                "capabilities": [
+                    "session_bytes_v1",
+                    "session_attachment_identity_v1",
+                    "work_control_v1",
+                ],
+            ])
+        default:
+            return composeFixtureReply()
+        }
+    }
+    let client = MuxaIPCClient(socketPath: "/tmp/muxa-compose-test.sock", request: handler)
+    try await client.hello()
+    #expect(await !client.supports(MuxaIPCClient.workComposeCapability))
+    #expect(MuxaIPCClient.workComposeCapability == "work_compose_v1")
+
+    await #expect(throws: MuxaIPCError.self) {
+        _ = try await client.composeWork(
+            description: "anything",
+            agent: nil,
+            current: nil,
+            name: nil,
+            credential: nil
+        )
+    }
+    // No provider list on an older daemon: callers keep the built-in pair.
+    let providers = try await client.workComposeProviders()
+    #expect(providers == nil)
+}
+
+@Test
+func workComposeProviderListDecodesJustWhatThePickerNeeds() async throws {
+    let handler: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        #expect(object["kind"] as? String == "ask_providers")
+        return Data("""
+        {"ok":true,"ask_providers":[
+          {"id":"claude","title":"Claude Code","kind":"cli","executable":"claude","credential_env":"ANTHROPIC_API_KEY","credential_required":false,"model":null,"selected":true},
+          {"id":"anthropic","title":"Anthropic API","kind":"api","executable":null,"credential_env":"ANTHROPIC_API_KEY","credential_required":true,"model":"claude-sonnet-5","selected":false},
+          {"id":"future"}
+        ]}
+        """.utf8)
+    }
+    let client = MuxaWorkComposeClient(socketPath: "/tmp/muxa-compose-test.sock", request: handler)
+    let providers = try await client.providers()
+    #expect(providers.map(\.id) == ["claude", "anthropic", "future"])
+    #expect(providers.map(\.title) == ["Claude Code", "Anthropic API", "future"])
+    #expect(providers.map(\.selected) == [true, false, false])
+}
+
+@Test @MainActor
+func pipelineComposerSessionMovesThroughPhases() async throws {
+    let log = ComposeRequestLog()
+    let fixture = try MuxaWorkComposeResult.decode(composeFixtureReply())
+    let session = PipelineComposerSession(
+        host: nil,
+        defaultProvider: "codex",
+        backend: .daemon,
+        composer: { request in
+            log.append(request)
+            return fixture
+        }
+    )
+    #expect(session.phase == .idle)
+    #expect(!session.hasDraft)
+    #expect(!session.canDraft)
+
+    session.description = "implementer in claude, reviewer in codex after it"
+    #expect(session.canDraft)
+    session.draftPipeline()
+    #expect(session.phase == .drafting)
+    #expect(session.isDrafting)
+    #expect(!session.canDraft)
+    await session.awaitPendingRequest()
+
+    #expect(session.phase == .ready)
+    #expect(session.name == "implement-review")
+    #expect(session.draft?.agents.map(\.alias) == ["impl", "review"])
+    #expect(session.notes == "Reviewer is read-only.")
+    #expect(session.history.isEmpty)
+    #expect(session.canSave)
+    #expect(session.draftAsPipeline?.name == "implement-review")
+    #expect(session.draftAsPipeline?.agents.count == 2)
+    let first = try #require(log.all.first)
+    #expect(first.agent == "codex")
+    #expect(first.current == nil)
+    #expect(first.name == nil)
+
+    // A refinement sends the draft along under the operator's chosen name.
+    session.name = "review-loop"
+    session.refinement = "make the reviewer use gemini"
+    #expect(session.canRefine)
+    session.refine()
+    #expect(session.phase == .drafting)
+    await session.awaitPendingRequest()
+
+    #expect(session.phase == .ready)
+    let refine = try #require(log.all.last)
+    #expect(log.all.count == 2)
+    #expect(refine.description == "make the reviewer use gemini")
+    #expect(refine.current?.agents.map(\.alias) == ["impl", "review"])
+    #expect(refine.name == "review-loop")
+    #expect(session.name == "review-loop")
+    #expect(session.history.map(\.request) == ["make the reviewer use gemini"])
+    #expect(session.history.first?.notes == "Reviewer is read-only.")
+    #expect(session.refinement.isEmpty)
+    #expect(!session.canRefine)
+}
+
+@Test @MainActor
+func pipelineComposerSessionKeepsTheDraftOnErrorAndCancel() async throws {
+    let mode = ComposeMode()
+    let fixture = try MuxaWorkComposeResult.decode(composeFixtureReply())
+    let session = PipelineComposerSession(
+        host: nil,
+        defaultProvider: "claude",
+        backend: .daemon,
+        composer: { _ in
+            if mode.shouldHang { try await Task.sleep(for: .seconds(30)) }
+            if let failure = mode.currentFailure { throw MuxaIPCError.server(failure) }
+            return fixture
+        }
+    )
+    session.description = "solo claude"
+    session.draftPipeline()
+    await session.awaitPendingRequest()
+    #expect(session.phase == .ready)
+
+    mode.fail(with: "ask is disabled")
+    session.refinement = "add a tester"
+    session.refine()
+    await session.awaitPendingRequest()
+    #expect(session.phase == .error("ask is disabled"))
+    #expect(session.errorMessage == "ask is disabled")
+    #expect(session.draft?.agents.count == 2)
+    #expect(session.history.isEmpty)
+    #expect(session.refinement == "add a tester")
+    #expect(session.canRefine)
+
+    mode.fail(with: nil)
+    mode.hang(true)
+    session.refine()
+    #expect(session.phase == .drafting)
+    session.cancel()
+    #expect(session.phase == .ready)
+    #expect(session.draft?.agents.count == 2)
+    #expect(session.errorMessage == nil)
+
+    // Cancelling before any draft exists goes back to idle.
+    let fresh = PipelineComposerSession(
+        host: nil,
+        defaultProvider: "claude",
+        backend: .daemon,
+        composer: { _ in
+            try await Task.sleep(for: .seconds(30))
+            return fixture
+        }
+    )
+    fresh.description = "anything"
+    fresh.draftPipeline()
+    fresh.cancel()
+    #expect(fresh.phase == .idle)
+}
+
+@Test @MainActor
+func pipelineComposerSessionValidatesNameAndOffersTheDefaultProvider() async throws {
+    let fixture = try MuxaWorkComposeResult.decode(composeFixtureReply())
+    let session = PipelineComposerSession(
+        host: "build-box",
+        defaultProvider: "gemini",
+        backend: .daemon,
+        composer: { _ in fixture }
+    )
+    #expect(session.host == "build-box")
+    // The configured Ask agent is offered even when the built-in list lacks it.
+    #expect(session.providers.map(\.id) == ["claude", "codex", "gemini"])
+    #expect(session.providerID == "gemini")
+    #expect(session.providerTitle == "gemini")
+    session.setProviders([
+        PipelineComposerSession.Provider(id: "claude", title: "Claude Code"),
+        PipelineComposerSession.Provider(id: "anthropic", title: "Anthropic API"),
+    ])
+    #expect(session.providers.map(\.id) == ["claude", "anthropic", "gemini"])
+
+    session.description = "implementer and reviewer"
+    session.draftPipeline()
+    await session.awaitPendingRequest()
+    #expect(session.problems.isEmpty)
+
+    session.name = "bad name!"
+    #expect(session.problems.first == "Name may only use letters, digits, - and _.")
+    #expect(!session.canSave)
+    #expect(!MuxaPipelineDefinition.isValidName("bad name!"))
+    #expect(MuxaPipelineDefinition.isValidName("implement-review_2"))
+    session.name = "ok"
+    #expect(session.canSave)
+    #expect(session.draftAsPipeline?.name == "ok")
+
+    // A draft that the CLI would refuse is reported, not hidden.
+    session.draft?.agents[1].after = ["ghost"]
+    #expect(session.problems == ["@review waits for unknown alias \"ghost\"."])
+    #expect(!session.canSave)
+
+    // Without any backend the description alone cannot start a draft.
+    let blocked = PipelineComposerSession(
+        host: nil,
+        defaultProvider: "claude",
+        backend: .unavailable,
+        composer: { _ in fixture }
+    )
+    blocked.description = "anything"
+    #expect(!blocked.canDraft)
+}
+
+@Test @MainActor
+func pipelineComposerSessionPrepareProbesTheBackendAndLoadsProviders() async throws {
+    let fixture = try MuxaWorkComposeResult.decode(composeFixtureReply())
+    let session = PipelineComposerSession(
+        host: nil,
+        defaultProvider: "claude",
+        composer: { _ in fixture },
+        backendProbe: { .bundledCLI },
+        providerLoader: {
+            [
+                PipelineComposerSession.Provider(id: "claude", title: "Claude Code"),
+                PipelineComposerSession.Provider(id: "openai", title: "OpenAI API"),
+            ]
+        }
+    )
+    #expect(session.backend == .checking)
+    session.description = "anything"
+    #expect(!session.canDraft)
+
+    await session.prepare()
+
+    #expect(session.backend == .bundledCLI)
+    #expect(session.providers.map(\.id) == ["claude", "openai"])
+    #expect(session.canDraft)
+
+    // A daemon without a provider list leaves the built-in pair in place.
+    let plain = PipelineComposerSession(
+        host: nil,
+        defaultProvider: "codex",
+        composer: { _ in fixture },
+        backendProbe: { .daemon },
+        providerLoader: { nil }
+    )
+    await plain.prepare()
+    #expect(plain.backend == .daemon)
+    #expect(plain.providers.map(\.id) == ["claude", "codex"])
+}
+
+@Test
+func composeBundledCLIArgumentsMirrorTheDaemonRequest() throws {
+    let current = MuxaPipelineDefinition(agents: [MuxaPipelineDefinition.Agent(alias: "impl")])
+    let refine = PipelineComposerSession.Request(
+        description: "make the reviewer use gemini",
+        agent: "codex",
+        current: current,
+        name: "solo",
+        credential: nil
+    )
+    #expect(AppModel.composeCLIArguments(for: refine) == [
+        "work", "compose", "make the reviewer use gemini", "--json", "--agent", "codex", "--current", "-",
+    ])
+    let first = PipelineComposerSession.Request(
+        description: "solo claude",
+        agent: nil,
+        current: nil,
+        name: nil,
+        credential: nil
+    )
+    #expect(AppModel.composeCLIArguments(for: first) == ["work", "compose", "solo claude", "--json"])
+
+    #expect(AppModel.composeCredentialEnvironmentKey(for: "claude") == "ANTHROPIC_API_KEY")
+    #expect(AppModel.composeCredentialEnvironmentKey(for: "anthropic") == "ANTHROPIC_API_KEY")
+    #expect(AppModel.composeCredentialEnvironmentKey(for: "codex") == "CODEX_API_KEY")
+    #expect(AppModel.composeCredentialEnvironmentKey(for: "openai") == "OPENAI_API_KEY")
+    #expect(AppModel.composeCredentialEnvironmentKey(for: "gemini") == "GEMINI_API_KEY")
+    #expect(AppModel.composeCredentialEnvironmentKey(for: "unknown") == nil)
+}
+
+@Test
+func pipelineEditorTargetTellsDraftsFromSavedPipelines() {
+    let pipeline = MuxaWorkOptions.Pipeline(name: "implement-review", agents: [])
+    let saved = MuxaPipelineEditorTarget(host: nil, pipeline: pipeline)
+    let draft = MuxaPipelineEditorTarget(host: nil, pipeline: pipeline, isDraft: true)
+    #expect(!saved.isDraft)
+    #expect(draft.isDraft)
+    #expect(saved.id != draft.id)
+    #expect(MuxaPipelineEditorTarget(host: "build-box", pipeline: nil).id == "build-box:+new")
+}
+
+// MARK: - Inbox selection and Shells tab (inbox-shells peer)
+
+private func inboxShellsTestHost(
+    alias: String,
+    local: Bool = false,
+    state: String = "online",
+    sshTarget: String? = nil
+) -> MuxaFleetHost {
+    MuxaFleetHost(
+        alias: alias,
+        local: local,
+        sshTarget: sshTarget,
+        mode: "control",
+        state: state,
+        latencyMS: nil,
+        error: nil,
+        muxaVersion: nil,
+        daemonGeneration: nil,
+        labels: nil,
+        annotations: nil,
+        remote: nil
+    )
+}
+
+private func inboxShellsTestAgent(
+    id: String,
+    state: String = "waiting_input"
+) throws -> MuxaAgent {
+    try JSONDecoder().decode(
+        MuxaAgent.self,
+        from: Data(#"{"kind":"claude_code","agent_session_id":"\#(id)","state":"\#(state)"}"#.utf8)
+    )
+}
+
+private func inboxShellsTestPane(id: String, socket: String? = nil) throws -> MuxaPaneInfo {
+    let socketField = socket.map { #","socket":"\#($0)""# } ?? ""
+    return try JSONDecoder().decode(
+        MuxaPaneInfo.self,
+        from: Data(#"""
+        {"pane_id":"\#(id)","session_id":"$1","session":"muxa","window_id":"@2","window_name":"impl",
+         "window_index":"1","pane_index":"0","current_command":"claude","title":"","current_path":"/tmp"\#(socketField)}
+        """#.utf8)
+    )
+}
+
+@Test func remoteShellLaunchDialsTheHostsSSHTarget() {
+    let host = inboxShellsTestHost(alias: "devbox", sshTarget: "june@devbox.local")
+    let launch = MuxaNativeShellLaunch.remoteShell(
+        host: host,
+        base: ["PATH": "/usr/bin", "TMUX": "/tmp/tmux-1/default,1,0", "TMUX_PANE": "%3", "LANG": "ko_KR.UTF-8"],
+        shell: "/bin/zsh",
+        appVersion: "1.2.3",
+        home: "/Users/june",
+        sshExecutable: "/usr/bin/ssh"
+    )
+
+    #expect(launch.command == "/usr/bin/ssh")
+    #expect(launch.arguments == ["--", "june@devbox.local"])
+    #expect(launch.cwd == "/Users/june")
+    #expect(launch.name == "devbox shell")
+    #expect(launch.environment["TERM"] == "xterm-256color")
+    #expect(launch.environment["TERM_PROGRAM"] == "Muxa")
+    #expect(launch.environment["TERM_PROGRAM_VERSION"] == "1.2.3")
+    #expect(launch.environment["SHELL"] == "/bin/zsh")
+    #expect(launch.environment["PATH"] == "/usr/bin")
+    #expect(launch.environment["LANG"] == "ko_KR.UTF-8")
+    #expect(launch.environment["TMUX"] == nil)
+    #expect(launch.environment["TMUX_PANE"] == nil)
+}
+
+@Test func remoteShellLaunchFallsBackToAliasAndPathLookup() {
+    let bareAlias = inboxShellsTestHost(alias: "rack-7", sshTarget: nil)
+    let launch = MuxaNativeShellLaunch.remoteShell(
+        host: bareAlias,
+        base: [:],
+        shell: "/bin/zsh",
+        appVersion: "development",
+        home: "/Users/june",
+        sshExecutable: nil
+    )
+
+    #expect(launch.command == "/usr/bin/env")
+    #expect(launch.arguments == ["ssh", "--", "rack-7"])
+    #expect(launch.name == "rack-7 shell")
+    // A missing locale is filled in the same way `createShell()` does it.
+    #expect(launch.environment["LANG"] == "en_US.UTF-8")
+    #expect(launch.environment["LC_CTYPE"] == "en_US.UTF-8")
+
+    let localTarget = inboxShellsTestHost(alias: "local", local: true, sshTarget: "local://")
+    #expect(MuxaNativeShellLaunch.sshDestination(for: localTarget) == "local")
+    #expect(MuxaNativeShellLaunch.sshDestination(for: inboxShellsTestHost(alias: "x", sshTarget: "  ")) == "x")
+}
+
+@Test func terminalEnvironmentKeepsAnExplicitLocale() {
+    let environment = MuxaNativeShellLaunch.terminalEnvironment(
+        base: ["LC_ALL": "C.UTF-8"],
+        shell: "/bin/bash",
+        appVersion: "1.0"
+    )
+
+    #expect(environment["LC_ALL"] == "C.UTF-8")
+    #expect(environment["LC_CTYPE"] == nil)
+    #expect(environment["LANG"] == "en_US.UTF-8")
+    #expect(environment["COLORTERM"] == "truecolor")
+}
+
+@Test @MainActor
+func remoteShellHostsListOnlyReachableFleetHosts() {
+    let model = AppModel()
+    model.ingestExecutionSnapshotForTesting(MuxaExecutionSnapshot(hosts: [
+        inboxShellsTestHost(alias: "local", local: true, state: "online"),
+        inboxShellsTestHost(alias: "zeta", state: "online"),
+        inboxShellsTestHost(alias: "alpha", state: "version_skew"),
+        inboxShellsTestHost(alias: "down", state: "offline"),
+        inboxShellsTestHost(alias: "flaky", state: "auth_failed"),
+        inboxShellsTestHost(alias: "dialing", state: "connecting"),
+    ]))
+
+    #expect(model.remoteShellHosts.map(\.alias) == ["alpha", "zeta"])
+}
+
+@Test func shellRowStateTextDescribesExitOutcome() {
+    func session(exited: Bool, status: Int32?, attached: Int = 0) -> MuxaSession {
+        MuxaSession(
+            id: "s",
+            backend: .pty,
+            displayName: "Muxa Shell 1",
+            cwd: nil,
+            attachedClients: attached,
+            hasBeenAttached: nil,
+            exited: exited,
+            exitStatus: status,
+            pid: nil
+        )
+    }
+
+    #expect(session(exited: true, status: 0).shellStateText == "Exited")
+    #expect(session(exited: true, status: nil).shellStateText == "Exited")
+    #expect(session(exited: true, status: 130).shellStateText == "Exited with status 130")
+    #expect(session(exited: false, status: nil).shellStateText == "Running")
+    #expect(session(exited: false, status: nil, attached: 2).shellStateText == "2 attached")
+}
+
+@Test @MainActor
+func inboxAttentionRowSelectsWithoutLeavingInbox() throws {
+    let model = AppModel()
+    let host = MuxaFleetHostIdentity(alias: "devbox", local: false, state: "online", mode: "control")
+    let withPane = MuxaHostedAgent(
+        host: host,
+        agent: try inboxShellsTestAgent(id: "agent-1"),
+        pane: try inboxShellsTestPane(id: "%7", socket: "work")
+    )
+    let withoutPane = MuxaHostedAgent(
+        host: host,
+        agent: try inboxShellsTestAgent(id: "agent-2"),
+        pane: nil
+    )
+
+    model.show(.inbox)
+    model.select(.agent(withPane.id))
+    #expect(model.sidebarMode == .inbox)
+    #expect(model.sidebarSelection == .agent("devbox:agent-1"))
+
+    let paneIdentity = try #require(withPane.watchPaneIdentity)
+    #expect(paneIdentity == MuxaWatchPaneIdentity(hostAlias: "devbox", socket: "work", paneID: "%7"))
+    #expect(withoutPane.watchPaneIdentity == nil)
+
+    // "Open in Live Watch" is the old row behaviour: follow the pane…
+    model.openInLiveWatch(withPane)
+    #expect(model.sidebarMode == .watch)
+    #expect(model.sidebarSelection == .pane(paneIdentity))
+    #expect(model.watchSelection == paneIdentity)
+
+    // …or, with no pane, select the agent and stay in the Inbox.
+    model.openInLiveWatch(withoutPane)
+    #expect(model.sidebarMode == .inbox)
+    #expect(model.sidebarSelection == .agent("devbox:agent-2"))
+}
+
+@Test func inboxAgentOpenRequestsMatchHostAndSession() throws {
+    func request(id: String, to: String, status: String, reply: String?) throws -> MuxaCollaborationRequest {
+        let replyField = reply.map {
+            #","reply":{"status":"completed","body":"\#($0)","at":"2026-09-03T10:05:00Z"}"#
+        } ?? ""
+        return try JSONDecoder().decode(
+            MuxaCollaborationRequest.self,
+            from: Data(#"""
+            {
+              "id":"\#(id)",
+              "from":{"agent_kind":"unknown","agent_session_id":"__muxa_console__","pane":"console","room":{"host":"tmux","window_id":"@4"},"console":true},
+              "to":{"agent_kind":"claude_code","agent_session_id":"\#(to)","pane":"%7","room":{"host":"tmux","window_id":"@2"},"alias":"impl"},
+              "kind":"task","body":"Body of \#(id)","expects_reply":true,"work_mode":"read_only","status":"\#(status)","created_at":"2026-09-03T10:00:00Z"\#(replyField)
+            }
+            """#.utf8)
+        )
+    }
+    let devbox = MuxaFleetHostIdentity(alias: "devbox", local: false, state: "online", mode: "control")
+    let other = MuxaFleetHostIdentity(alias: "other", local: false, state: "online", mode: "control")
+    let route = try inboxShellsTestPane(id: "%1")
+    let messages = [
+        MuxaOperatorMessage(host: devbox, routePane: route, request: try request(id: "waiting", to: "agent-1", status: "claimed", reply: nil)),
+        MuxaOperatorMessage(host: devbox, routePane: route, request: try request(id: "unread", to: "agent-1", status: "completed", reply: "done")),
+        MuxaOperatorMessage(host: devbox, routePane: route, request: try request(id: "elsewhere", to: "agent-9", status: "queued", reply: nil)),
+        MuxaOperatorMessage(host: other, routePane: route, request: try request(id: "other-host", to: "agent-1", status: "queued", reply: nil)),
+    ]
+    let participant = MuxaHostedAgent(
+        host: devbox,
+        agent: try inboxShellsTestAgent(id: "agent-1"),
+        pane: nil
+    )
+
+    let open = participant.openRequests(in: messages)
+
+    // Unread replies lead, then the request the agent still owes; other
+    // agents and other hosts never appear.
+    #expect(open.map(\.request.id) == ["unread", "waiting"])
+}
