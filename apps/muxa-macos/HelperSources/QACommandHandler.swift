@@ -100,13 +100,16 @@ final class QACommandHandler {
                 return .failure("x and y are required")
             }
             do {
-                _ = try await focusMuxa()
+                let targetPID = try await focusMuxaIfPossible()
                 let window = try await muxaWindow(titled: request.window)
                 guard x >= 0, y >= 0, x <= window.frame.width, y <= window.frame.height else {
                     return .failure("click point is outside the Muxa window")
                 }
                 try postClick(
-                    at: CGPoint(x: window.frame.minX + x, y: window.frame.minY + y)
+                    at: CGPoint(x: window.frame.minX + x, y: window.frame.minY + y),
+                    targetPID: NSRunningApplication
+                        .runningApplications(withBundleIdentifier: Self.muxaBundleIdentifier)
+                        .first?.isActive == true ? nil : targetPID
                 )
                 return .success()
             } catch {
@@ -122,14 +125,17 @@ final class QACommandHandler {
                 return .failure("x, y, and delta_y (|delta_y| <= 4000) are required")
             }
             do {
-                _ = try await focusMuxa()
+                let targetPID = try await focusMuxaIfPossible()
                 let window = try await muxaWindow(titled: request.window)
                 guard x >= 0, y >= 0, x <= window.frame.width, y <= window.frame.height else {
                     return .failure("scroll point is outside the Muxa window")
                 }
                 try postScroll(
                     at: CGPoint(x: window.frame.minX + x, y: window.frame.minY + y),
-                    deltaY: deltaY
+                    deltaY: deltaY,
+                    targetPID: NSRunningApplication
+                        .runningApplications(withBundleIdentifier: Self.muxaBundleIdentifier)
+                        .first?.isActive == true ? nil : targetPID
                 )
                 return .success()
             } catch {
@@ -159,6 +165,23 @@ final class QACommandHandler {
                 try await Task.sleep(for: .milliseconds(400))
                 let window = try await muxaWindow(titled: request.window)
                 return .success(window: Self.info(for: window))
+            } catch {
+                return .failure(error.localizedDescription)
+            }
+        case "menu":
+            guard AXIsProcessTrusted() else {
+                return .failure("Accessibility permission is required")
+            }
+            guard let path = request.path, !path.isEmpty, path.count <= 5 else {
+                return .failure("path is required (1-5 menu titles)")
+            }
+            do {
+                // Menu items are pressed through the Accessibility API, so
+                // Settings and the Welcome guide open without taking focus.
+                let pid = try muxaProcessIdentifier()
+                try pressMenuItem(path: path, pid: pid)
+                try await Task.sleep(for: .milliseconds(500))
+                return .success()
             } catch {
                 return .failure(error.localizedDescription)
             }
@@ -259,6 +282,72 @@ final class QACommandHandler {
         } catch QAHelperError.muxaActivationFailed {
             return try muxaProcessIdentifier()
         }
+    }
+
+    /// Presses a menu item by title path, e.g. ["Muxa", "Settings…"].
+    /// Titles match case-insensitively on a prefix, so "Settings" finds
+    /// "Settings…" and a localized menu still resolves by its own title.
+    private func pressMenuItem(path: [String], pid: pid_t) throws {
+        let application = AXUIElementCreateApplication(pid)
+        var menuBarValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            application,
+            kAXMenuBarAttribute as CFString,
+            &menuBarValue
+        ) == .success, let menuBarValue else {
+            throw QAHelperError.menuItemNotFound(path.joined(separator: " > "))
+        }
+        // swiftlint:disable:next force_cast
+        let menuBar = menuBarValue as! AXUIElement
+
+        var element: AXUIElement = menuBar
+        for (index, title) in path.enumerated() {
+            guard let match = Self.childElement(of: element, titled: title) else {
+                throw QAHelperError.menuItemNotFound(path.prefix(index + 1).joined(separator: " > "))
+            }
+            if index == path.count - 1 {
+                guard AXUIElementPerformAction(match, kAXPressAction as CFString) == .success else {
+                    throw QAHelperError.menuItemNotFound(path.joined(separator: " > "))
+                }
+                return
+            }
+            // A menu bar item owns one AXMenu child that holds the items.
+            var menuValue: CFTypeRef?
+            if AXUIElementCopyAttributeValue(match, kAXChildrenAttribute as CFString, &menuValue) == .success,
+               let children = menuValue as? [AXUIElement],
+               let menu = children.first
+            {
+                element = menu
+            } else {
+                element = match
+            }
+        }
+        throw QAHelperError.menuItemNotFound(path.joined(separator: " > "))
+    }
+
+    private static func childElement(of element: AXUIElement, titled title: String) -> AXUIElement? {
+        var childrenValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXChildrenAttribute as CFString,
+            &childrenValue
+        ) == .success, let children = childrenValue as? [AXUIElement] else {
+            return nil
+        }
+        let wanted = title.lowercased()
+        for child in children {
+            var titleValue: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                child,
+                kAXTitleAttribute as CFString,
+                &titleValue
+            ) == .success, let childTitle = titleValue as? String else { continue }
+            let candidate = childTitle.lowercased()
+            if candidate == wanted || candidate.hasPrefix(wanted) {
+                return child
+            }
+        }
+        return nil
     }
 
     /// Muxa's pid without activating it.
@@ -409,7 +498,7 @@ final class QACommandHandler {
     /// Posts a pixel-precise scroll wheel event at `point`. Positive
     /// `deltaY` scrolls content up (like dragging the wheel toward you on
     /// a natural-scrolling Mac), negative scrolls it down.
-    private func postScroll(at point: CGPoint, deltaY: Double) throws {
+    private func postScroll(at point: CGPoint, deltaY: Double, targetPID: pid_t? = nil) throws {
         guard let event = CGEvent(
             scrollWheelEvent2Source: nil,
             units: .pixel,
@@ -421,10 +510,17 @@ final class QACommandHandler {
             throw QAHelperError.eventCreationFailed
         }
         event.location = point
-        event.post(tap: .cghidEventTap)
+        if let targetPID {
+            event.postToPid(targetPID)
+        } else {
+            event.post(tap: .cghidEventTap)
+        }
     }
 
-    private func postClick(at point: CGPoint) throws {
+    /// Posts a click. With `targetPID` the events go straight to Muxa's event
+    /// queue, so a layout check works while another app holds focus; without
+    /// it they go through the HID tap, which is what a real user's click is.
+    private func postClick(at point: CGPoint, targetPID: pid_t? = nil) throws {
         guard
             let mouseDown = CGEvent(
                 mouseEventSource: nil,
@@ -441,8 +537,13 @@ final class QACommandHandler {
         else {
             throw QAHelperError.eventCreationFailed
         }
-        mouseDown.post(tap: .cghidEventTap)
-        mouseUp.post(tap: .cghidEventTap)
+        if let targetPID {
+            mouseDown.postToPid(targetPID)
+            mouseUp.postToPid(targetPID)
+        } else {
+            mouseDown.post(tap: .cghidEventTap)
+            mouseUp.post(tap: .cghidEventTap)
+        }
     }
 
     private func postKey(
@@ -491,12 +592,14 @@ private enum QAHelperError: LocalizedError {
     case captureFailed
     case eventCreationFailed
     case resizeFailed(Int32)
+    case menuItemNotFound(String)
 
     var errorDescription: String? {
         switch self {
         case .muxaNotRunning: "Muxa is not running"
         case .muxaWindowNotFound: "No onscreen Muxa window was found"
         case .muxaActivationFailed: "Muxa could not be activated"
+        case .menuItemNotFound(let path): "menu item not found: \(path)"
         case .pngEncodingFailed: "The captured image could not be encoded as PNG"
         case .captureTooLarge: "The captured PNG exceeds the 32 MiB safety limit"
         case .captureFailed: "Muxa window capture failed"

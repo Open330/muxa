@@ -17,10 +17,15 @@ struct QARequest: Codable, Sendable {
     /// Optional window-title substring; the largest on-screen Muxa window
     /// is used when absent (Settings and Welcome are separate windows).
     let window: String?
+    /// `menu` command: menu titles from the menu bar down, e.g.
+    /// ["Muxa", "Settings…"]. Matching is case-insensitive and prefix-based
+    /// so a localized ellipsis or trailing shortcut does not matter.
+    let path: [String]?
 
     enum CodingKeys: String, CodingKey {
         case command
         case window
+        case path
         case text
         case pressReturn = "press_return"
         case x, y, width, height
@@ -40,7 +45,8 @@ struct QARequest: Codable, Sendable {
         key: String? = nil,
         modifiers: [String]? = nil,
         deltaY: Double? = nil,
-        window: String? = nil
+        window: String? = nil,
+        path: [String]? = nil
     ) {
         self.command = command
         self.text = text
@@ -53,6 +59,7 @@ struct QARequest: Codable, Sendable {
         self.key = key
         self.modifiers = modifiers
         self.window = window
+        self.path = path
     }
 }
 

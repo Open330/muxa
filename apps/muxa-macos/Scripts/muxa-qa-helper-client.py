@@ -72,6 +72,17 @@ def main() -> int:
     type_command.add_argument("--text", required=True)
     type_command.add_argument("--return", dest="press_return", action="store_true")
 
+    menu = commands.add_parser(
+        "menu",
+        help="press a menu item by title path, e.g. --path Muxa 'Settings'",
+    )
+    menu.add_argument(
+        "--path",
+        nargs="+",
+        required=True,
+        help="menu titles from the menu bar down; prefix match, case-insensitive",
+    )
+
     key = commands.add_parser("key", help="press one key, optionally with modifiers")
     key.add_argument(
         "--key",
@@ -111,6 +122,8 @@ def main() -> int:
         )
     elif args.command == "new-shell":
         result = request({"command": "new_shell"})
+    elif args.command == "menu":
+        result = request({"command": "menu", "path": args.path})
     elif args.command == "key":
         result = request({"command": "key", "key": args.key, "modifiers": args.modifiers})
     elif args.command == "click":
