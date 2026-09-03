@@ -220,6 +220,7 @@ import Testing
     #expect(definition.problems().isEmpty)
     #expect(MuxaPipelineDefinition.isValidName("implement-review"))
     #expect(!MuxaPipelineDefinition.isValidName("bad name"))
+    #expect(!MuxaPipelineDefinition.isValidName("qa-pair바나나"))
 
     let json = try definition.jsonString()
     #expect(json.contains(#""alias":"plan""#))

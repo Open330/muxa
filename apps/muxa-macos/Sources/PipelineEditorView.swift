@@ -183,22 +183,23 @@ struct PipelineEditorView: View {
             HStack(spacing: 8) {
                 TextField("", text: agent.alias, prompt: Text("alias"))
                     .labelsHidden()
-                    .frame(width: 120)
+                    .frame(width: 100)
                 Picker("", selection: agent.program) {
                     ForEach(MuxaPipelineDefinition.allowedPrograms, id: \.self) { program in
                         Text(program).tag(program)
                     }
                 }
                 .labelsHidden()
-                .frame(width: 110)
-                TextField("", text: agent.role, prompt: Text("role, for example reviewer"))
+                .frame(width: 100)
+                TextField("", text: agent.role, prompt: Text("role"))
                     .labelsHidden()
+                    .frame(minWidth: 120, maxWidth: .infinity)
                 Picker("", selection: agent.direction) {
                     Text("split right").tag("")
                     Text("split down").tag("down")
                 }
                 .labelsHidden()
-                .frame(width: 110)
+                .frame(width: 104)
                 Menu {
                     Button("Move up") { move(agent.wrappedValue.id, by: -1) }
                     Button("Move down") { move(agent.wrappedValue.id, by: 1) }

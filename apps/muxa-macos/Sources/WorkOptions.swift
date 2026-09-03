@@ -383,10 +383,13 @@ struct MuxaPipelineDefinition: Codable, Equatable, Sendable {
 
     var optionsAgents: [MuxaWorkOptions.Agent] { agents.map(\.toOptionsAgent) }
 
-    /// TOML bare-key characters, the same rule the CLI applies to `<name>`.
+    /// TOML bare-key characters, the same rule the CLI applies to `<name>`:
+    /// ASCII letters and digits, `-`, and `_` only.
     static func isValidName(_ name: String) -> Bool {
         !name.isEmpty && name.unicodeScalars.allSatisfy { scalar in
-            CharacterSet.alphanumerics.contains(scalar) || scalar == "-" || scalar == "_"
+            scalar.isASCII && (
+                CharacterSet.alphanumerics.contains(scalar) || scalar == "-" || scalar == "_"
+            )
         }
     }
 
