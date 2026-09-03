@@ -25,6 +25,7 @@ mod tmux_work;
 mod upgrade;
 mod watch;
 mod work_init;
+mod work_options;
 mod work_up;
 
 use anyhow::{Context, Result};
@@ -544,6 +545,12 @@ enum WorkCmd {
     Close(tmux_work::WorkCloseArgs),
     /// Counterpart to `up`: close the work window and every agent in it.
     Down(tmux_work::WorkCloseArgs),
+    /// Print the routes, pipelines, message skills, and built-in presets a
+    /// Work launcher can offer, so a GUI never has to parse config.toml.
+    Options(work_options::OptionsArgs),
+    /// Built-in pipeline presets: list them, or write one into config.toml
+    /// as `[pipeline.<name>]` without spending an agent turn.
+    Preset(work_options::PresetArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -734,6 +741,8 @@ async fn run_work_cmd(
         WorkCmd::Done(args) => tmux_work::run_work_done(args, client).await,
         WorkCmd::Reconcile(args) => work_up::run_reconcile(args, client).await,
         WorkCmd::Close(args) | WorkCmd::Down(args) => tmux_work::run_work_close(args),
+        WorkCmd::Options(args) => work_options::run_options(args, cfg, config_path),
+        WorkCmd::Preset(args) => work_options::run_preset(args, config_path),
     }
 }
 

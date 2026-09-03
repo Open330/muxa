@@ -59,6 +59,37 @@ muxa work init --dry-run                      # show the proposal, write nothing
 muxa work init --agent codex                  # use a different resolver
 ```
 
+Do not want to spend a turn? Three built-in presets cover the common
+line-ups, and `muxa work preset apply` writes one into `config.toml` the
+same way — through `toml_edit`, validated as a whole `Config` before the
+file is touched, and refusing to replace an existing `[pipeline.<name>]`
+unless you pass `--overwrite`:
+
+| Preset | Line-up |
+| --- | --- |
+| `solo` | one `claude` implementer |
+| `pair` | `claude` implementer → `codex` reviewer, the reviewer waiting on `muxa work done` |
+| `triad` | `codex` planner → `codex` implementer → `claude` reviewer, `main-vertical` layout |
+
+```console
+muxa work preset list                              # what each preset staffs
+muxa work preset apply solo --route '.*'           # [pipeline.solo] + a catch-all [[route]]
+muxa work preset apply triad --route '^cal-'       # add a second pipeline and its route
+muxa work preset apply pair --overwrite            # replace [pipeline.pair] you edited
+muxa work preset apply solo --json                 # {"pipeline","route","route_added","replaced","config_path"}
+```
+
+`--route` appends `[[route]] match = <regex>, pipeline = <name>` only when
+no route with that exact `match` exists; an existing one is reported and
+left pointing wherever it pointed. Once applied, a preset is an ordinary
+pipeline in your file — edit it freely.
+
+Launchers ask what is configured with `muxa work options`: routes in config
+order, pipelines by name, `[message.skills]` with a one-line summary, the
+presets above, and `[ticket].agent`. `--json` is the contract Muxa.app's
+Start Work sheet is built on; `configured` is `false` until at least one
+`[pipeline.*]` exists.
+
 Prefer to write it by hand? The annotated reference is in
 [`config.example.toml`](../config.example.toml), and everything below
 explains what each part does.
@@ -313,6 +344,9 @@ So an agent's launch prompt is three layers, outermost first:
 
 ```console
 muxa work init                       # write the config by describing it
+muxa work preset list                # built-in line-ups: solo, pair, triad
+muxa work preset apply <name> --route '<regex>'   # write one, no agent turn
+muxa work options [--json]           # routes, pipelines, skills, presets for a launcher
 muxa work up <work> --external <id>  # link issue, route, create what is missing
 muxa work up <id>                    # compatibility: also look up <id> as an issue
 muxa work up <id> --dry-run          # print the plan, touch nothing

@@ -54,6 +54,34 @@ muxa work init --dry-run                      # 제안만 보고 안 씀
 muxa work init --agent codex                  # 다른 resolver 사용
 ```
 
+턴을 쓰고 싶지 않다면 내장 preset 셋이 흔한 구성을 덮습니다. `muxa work preset
+apply`는 같은 방식으로 — `toml_edit`으로, 파일을 건드리기 전에 전체 `Config`로
+검증하고, `--overwrite` 없이는 이미 있는 `[pipeline.<name>]`을 덮어쓰지 않으며 —
+`config.toml`에 씁니다:
+
+| Preset | 구성 |
+| --- | --- |
+| `solo` | `claude` 구현자 하나 |
+| `pair` | `claude` 구현자 → `codex` 리뷰어, 리뷰어는 `muxa work done`을 기다림 |
+| `triad` | `codex` 기획자 → `codex` 구현자 → `claude` 리뷰어, `main-vertical` 레이아웃 |
+
+```console
+muxa work preset list                              # 각 preset이 무엇을 띄우는지
+muxa work preset apply solo --route '.*'           # [pipeline.solo] + catch-all [[route]]
+muxa work preset apply triad --route '^cal-'       # 두 번째 pipeline과 route 추가
+muxa work preset apply pair --overwrite            # 손본 [pipeline.pair]를 교체
+muxa work preset apply solo --json                 # {"pipeline","route","route_added","replaced","config_path"}
+```
+
+`--route`는 같은 `match`를 가진 route가 없을 때만 `[[route]] match = <regex>,
+pipeline = <name>`을 덧붙입니다. 이미 있으면 알려만 주고 원래 가리키던 곳을 그대로
+둡니다. 적용된 preset은 파일 안의 평범한 pipeline이니 마음껏 고치면 됩니다.
+
+런처는 `muxa work options`로 무엇이 설정돼 있는지 묻습니다: 설정 순서의 route,
+이름순 pipeline, 한 줄 요약이 붙은 `[message.skills]`, 위의 preset, 그리고
+`[ticket].agent`. `--json`이 Muxa.app Start Work 시트가 기대는 계약이고,
+`configured`는 `[pipeline.*]`이 하나라도 생기기 전까지 `false`입니다.
+
 손으로 쓰는 게 편하시면 주석 달린 레퍼런스가
 [`config.example.toml`](../config.example.toml)에 있고, 아래가 각 부분의 설명입니다.
 
@@ -273,6 +301,9 @@ prompt는 일의 모양과 URL을 나르고, 나머지는 agent가 직접 읽으
 
 ```console
 muxa work init                       # 말로 설명해 설정 쓰기
+muxa work preset list                # 내장 구성: solo, pair, triad
+muxa work preset apply <name> --route '<regex>'   # 턴 없이 하나 쓰기
+muxa work options [--json]           # 런처용 route·pipeline·skill·preset
 muxa work up <work> --external <id>  # 외부 이슈 연결 → routing → 없는 것만 생성
 muxa work up <id>                    # 호환 경로: <id>를 외부 이슈로도 조회
 muxa work up <id> --dry-run          # 계획만 출력, tmux는 건드리지 않음

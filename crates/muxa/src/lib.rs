@@ -69,6 +69,7 @@ pub mod topology;
 pub mod work;
 #[doc(hidden)]
 pub mod work_control;
+pub mod work_presets;
 
 // ---------------------------------------------------------------------------
 // Stable public surface.

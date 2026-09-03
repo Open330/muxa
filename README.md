@@ -292,6 +292,7 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
 | `muxa agent start --agent codex [--host auto\|native\|tmux]` | Start an allowlisted agent. `auto` uses tmux inside tmux and a muxa-owned PTY in a plain terminal. |
 | `muxa work init` | Describe a work pipeline in your own words; an agent writes the `[ticket]`/`[[route]]`/`[pipeline.*]` config, validated and shown before anything is written. |
+| `muxa work preset apply solo --route '.*'` | Write a built-in pipeline (`solo`, `pair`, `triad`) into `config.toml` without an agent turn; `muxa work options --json` prints the routes, pipelines, skills, and presets a launcher can offer. |
 | `muxa work up cal-1234 --body "..."` | Resolve the ticket, route it to a workspace, and create whichever pipeline agent panes are missing — delivering the request to the ones already running. Re-running converges; also `muxa_start_work` over MCP. See [docs/PIPELINE.md](docs/PIPELINE.md). |
 | `muxa work start muxa-onboarding --workspace muxa --agent codex ...` | Create/reuse workspace session `muxa`, create/reuse its work window, and add an agent pane. |
 | `muxa workspace list/show/view/close` | Inspect, give the current terminal an independent grouped view of, or explicitly close workspace/project sessions. |
