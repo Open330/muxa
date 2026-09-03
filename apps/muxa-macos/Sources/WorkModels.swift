@@ -14,7 +14,7 @@ struct MuxaWorkGroup: Identifiable, Sendable {
     }
 
     var pipelineLabel: String {
-        pipelineRun?.pipeline ?? "Managed Fleet Work"
+        pipelineRun?.pipeline ?? "Observed Work"
     }
 
     var cwd: String? {
@@ -166,6 +166,45 @@ struct MuxaOperatorMessage: Identifiable, Hashable, Sendable {
     var needsHumanDecision: Bool {
         let terminalStatus = request.reply?.status ?? request.status
         return ["blocked", "declined", "failed"].contains(terminalStatus)
+    }
+
+    /// A request whose own status already reached `blocked`, `declined`, or
+    /// `failed` without a reply will not be answered by the agent, so the
+    /// Inbox must not present it as "waiting". `needsReply` keeps counting it
+    /// for the activity badge; this flag drives the Waiting scope, the
+    /// Waiting metric, and the row wording.
+    var isAwaitingAgentReply: Bool { needsReply && !needsHumanDecision }
+
+    /// Most recent durable change on the conversation: the reply time when a
+    /// reply exists, otherwise the time the command was sent. muxad emits
+    /// ISO-8601 timestamps, so lexical order is chronological.
+    var activityAt: String { request.reply?.at ?? request.createdAt }
+
+    /// Needs Action is a work queue rather than a log: decisions the operator
+    /// has not read yet come first, then the most recently changed
+    /// conversation, with the stable id as the final tie-breaker.
+    static func needsActionOrder(_ lhs: Self, _ rhs: Self) -> Bool {
+        if lhs.hasUnreadReply != rhs.hasUnreadReply { return lhs.hasUnreadReply }
+        if lhs.activityAt != rhs.activityAt { return lhs.activityAt > rhs.activityAt }
+        return lhs.id < rhs.id
+    }
+}
+
+/// Presentation for per-host operator-mailbox failures. The state itself is
+/// the plain `[hostAlias: reason]` dictionary `AppModel.inboxHostFailures`, so
+/// the Inbox editor and, later, the sidebar render the same wording.
+enum MuxaInboxHostFailureText {
+    /// One compact line, e.g. "2 hosts unreachable: jiun-mbp, rtzr".
+    static func summary(_ failures: [String: String]) -> String? {
+        guard !failures.isEmpty else { return nil }
+        let hosts = failures.keys.sorted()
+        let noun = hosts.count == 1 ? "host" : "hosts"
+        return "\(hosts.count) \(noun) unreachable: \(hosts.joined(separator: ", "))"
+    }
+
+    /// One "alias: reason" line per host, sorted by alias.
+    static func details(_ failures: [String: String]) -> [String] {
+        failures.keys.sorted().map { "\($0): \(failures[$0] ?? "")" }
     }
 }
 

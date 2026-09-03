@@ -416,18 +416,18 @@ private struct WorkspaceTabBar: View {
         case .fleetSession(let id):
             model.executionSnapshot.watchSession(id: id).map {
                 "\($0.hostAlias) · \($0.name.isEmpty ? $0.sessionID : $0.name)"
-            } ?? "Fleet session"
+            } ?? "Session"
         case .fleetWindow(let id):
             model.executionSnapshot.watchWindow(id: id).map {
                 $0.name.isEmpty ? $0.windowID : $0.name
-            } ?? "Fleet window"
+            } ?? "Window"
         case .shell(let id):
             model.sessions.first { $0.id == id }.map { $0.displayName ?? $0.id }
                 ?? "Shell"
         case .pane(let id):
             model.executionSnapshot.watchPane(id: id).map {
                 "\($0.host.alias) · \($0.pane.windowName.isEmpty ? $0.pane.paneID : $0.pane.windowName)"
-            } ?? "Fleet pane"
+            } ?? "Pane"
         }
     }
 
@@ -745,8 +745,8 @@ private struct MuxaSidebar: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var filterText = ""
     @State private var statusScope: StatusScope = .all
-    @State private var exploreSort: ExploreSort = .topology
-    @State private var exploreGrouping: ExploreGrouping = .host
+    @AppStorage("muxa.explore.sort") private var exploreSort: ExploreSort = .topology
+    @AppStorage("muxa.explore.grouping") private var exploreGrouping: ExploreGrouping = .host
 
     private var background: Color {
         MuxaSurfacePalette.sidebar(for: colorScheme)
@@ -1262,9 +1262,7 @@ private struct MuxaSidebar: View {
                     ForEach(filteredWatchHosts) { host in
                         WatchHostTree(
                             group: host,
-                            selectedPaneID: model.watchSelection,
-                            selectedHostAlias: selectedHostAlias,
-                            selectedSessionID: selectedSessionID,
+                            selection: watchTreeSelection,
                             selectHost: { model.select(.host($0)) },
                             selectSession: model.selectWatchSession,
                             openPinnedSession: openPinnedSession,
@@ -1283,7 +1281,10 @@ private struct MuxaSidebar: View {
                         ForEach(group.panes) { pane in
                             WatchFlatPaneRow(
                                 pane: pane,
-                                selected: model.watchSelection == pane.id,
+                                highlight: watchTreeSelection.highlight(
+                                    for: .pane(pane.id),
+                                    containsFollowedPane: model.watchSelection == pane.id
+                                ),
                                 selectPane: model.selectWatchPane,
                                 openPinnedPane: openPinnedPane
                             )
@@ -1297,7 +1298,10 @@ private struct MuxaSidebar: View {
                     ForEach(filteredWatchPanes) { pane in
                         WatchFlatPaneRow(
                             pane: pane,
-                            selected: model.watchSelection == pane.id,
+                            highlight: watchTreeSelection.highlight(
+                                for: .pane(pane.id),
+                                containsFollowedPane: model.watchSelection == pane.id
+                            ),
                             selectPane: model.selectWatchPane,
                             openPinnedPane: openPinnedPane
                         )
@@ -1322,14 +1326,8 @@ private struct MuxaSidebar: View {
         }
     }
 
-    private var selectedHostAlias: String? {
-        guard case .host(let alias) = model.sidebarSelection else { return nil }
-        return alias
-    }
-
-    private var selectedSessionID: MuxaWatchSessionIdentity? {
-        guard case .fleetSession(let id) = model.sidebarSelection else { return nil }
-        return id
+    private var watchTreeSelection: WatchTreeSelection {
+        WatchTreeSelection(editor: model.sidebarSelection, followedPane: model.watchSelection)
     }
 }
 
@@ -1790,7 +1788,7 @@ private struct FleetAgentRow: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .padding(.vertical, 2)
-        .help("Independent fleet agent session: \(participant.agent.agentSessionID)")
+        .help("Independent agent session: \(participant.agent.agentSessionID)")
     }
 }
 
@@ -2108,13 +2106,7 @@ struct MarkdownContent: View {
     }
 
     private var attributed: AttributedString {
-        (try? AttributedString(
-            markdown: normalizedSource,
-            options: AttributedString.MarkdownParsingOptions(
-                interpretedSyntax: .full,
-                failurePolicy: .returnPartiallyParsedIfPossible
-            )
-        )) ?? AttributedString(normalizedSource)
+        MuxaMarkdownText.attributedString(markdown: normalizedSource)
     }
 
     private var normalizedSource: String {

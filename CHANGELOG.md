@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`muxa fleet attach --fit` restores the tmux window when its terminal
+  hangs up.** The fit guard restored window size, sizing policy, zoom, and
+  active pane only when the tmux client detached normally. Ending the PTY
+  around it (Muxa.app's Live Pane **Stop**, a closed terminal, `kill -HUP`)
+  killed the process before any destructor ran and left the target pane
+  zoomed and sized to a viewport that no longer existed. SIGHUP/SIGTERM are
+  now forwarded to the tmux or ssh child and the wait returns normally, so
+  the guard restores the window on every exit path.
+
+- **Muxa.app renders Markdown block structure in summaries and responses.**
+  Agent recaps, latest responses, collaboration bodies, and Inbox previews
+  no longer collapse headings, paragraphs, lists, and tables into one run of
+  text; pipe tables render as grids in the Inbox and Ask views.
+
+- **Muxa.app minimum window size keeps the Live Pane usable.** The bottom
+  panel header, prompt composer, and status bar are no longer clipped at the
+  smallest supported window, and the read-only preview uses an installed
+  Nerd Font for prompt glyphs when one is available.
+
+- **Agents in a tmux pane inside a cmux tab are attributed to their tmux
+  server.** Such a pane's shell inherits cmux's `CMUX_WORKSPACE_ID` and
+  `CMUX_SOCKET_PATH`, and host detection let those win over `$TMUX`, so hook
+  events recorded `%N` panes with `tmux_socket = "cmux.sock"`. No pane scan
+  could match that pairing: `muxa_room_context`, `muxa_call_peer`, and
+  `muxa_inbox` failed with "collaboration origin is not a hook-correlated
+  tracked pane agent", and Muxa.app's Explore tree showed the pane without an
+  agent. tmux now wins presence ties over cmux (a GUI terminal is always the
+  outermost host; `MUXA_HOST=cmux` still forces cmux), the hook endpoint is
+  read for the host that owns the pane id, and the daemon re-attributes an
+  existing row when a later hook names the same pane with a different socket,
+  so running agents heal on their next event once both binaries are updated.
+
+- **Hook ingest attributes a tmux pane inside a cmux tab to tmux.** A tmux
+  server started from a cmux.app tab hands every `CMUX_*` variable to its
+  pane shells, and host detection let those inherited variables win over a
+  real `$TMUX`/`$TMUX_PANE`. Agents were stamped with the cmux socket, so
+  `muxa_room_context`/`muxa_call_peer` from such a pane failed with
+  "collaboration origin is not a hook-correlated tracked pane agent" and the
+  macOS Explore tree showed the pane without its agent. tmux now wins the tie;
+  cmux is detected only without a tmux pane or with `MUXA_HOST=cmux`.
+
+- **Muxa.app read-only Live Pane keeps the pane's colors.** The preview
+  renders the daemon's raw capture (`capture_raw_base64`) with SGR colors and
+  attributes through the same sanitizing scanner; older daemons fall back to
+  the plain text path.
+
+- **Operator Inbox failures are per host.** One unreachable host no longer
+  hides the whole Inbox behind a banner; its last messages stay visible, the
+  failure clears when the host recovers, and blocked/declined requests are
+  listed as decisions instead of waits.
+
+### Changed
+
+- **Muxa.app says "Hosts" everywhere the user can see it.** "Fleet" remains
+  only in protocol and type names. Explore's grouping and sort choices
+  persist across launches, and the Inbox badge is populated right after
+  connecting instead of after the Inbox is first opened.
+
 ## [0.8.42] - 2026-09-01
 
 ### Fixed

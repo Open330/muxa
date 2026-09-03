@@ -11,7 +11,7 @@ and encodes user input.
 - lists muxa-owned native PTY sessions;
 - starts a shell without tmux;
 - starts or converges configured `muxa work up` pipelines from a native form;
-- presents a native Live Watch hierarchy across Fleet hosts;
+- presents a native Live Watch hierarchy across registered hosts;
 - attaches a libghostty surface to an existing session;
 - sends input, resize, and attach state over the owner-only Unix socket;
 - reconnects terminal output by byte offset;
@@ -36,17 +36,17 @@ The native workspace follows two proven desktop navigation patterns:
   roots, so it does not duplicate them in a separate Hosts activity.
 - Lens separates resource navigation from contextual details and supports
   drilling into a resource without flattening infrastructure identity. Muxa
-  keeps each fleet agent session independent and treats host, tmux session,
+  keeps each host's agent sessions independent and treats host, tmux session,
   window, and pane as execution-location metadata rather than Work identity.
 
 The detail area is deliberately task-oriented:
 
 - **Work** exists for a pipeline run or for panes carrying an explicit complete
-  `workspace_id/work_id` stamp, including Fleet panes started by `muxa work` on
+  `workspace_id/work_id` stamp, including panes started by `muxa work` on
   another host. Session and window names alone never create fake Work.
 - **Agent** opens on a Markdown summary and provides separate
-  **Conversation** and read-only live **Shell** tabs. The Shell tab can switch
-  between a safe screen capture and an escaped **Raw** byte view.
+  **Conversation** and read-only live **Shell** tabs. The Shell tab shows a
+  sanitized screen capture; raw bytes are not exposed there.
 - **Host** leads with execution-session cards and their retained agent
   summaries. Selecting a session opens a second resource summary grouped by
   window; connection strings and topology identifiers remain available behind
@@ -58,7 +58,7 @@ The detail area is deliberately task-oriented:
   and open this report instead of truncating a multi-agent window into two
   indistinguishable pane rows.
 - **Inbox** is an operator queue rather than another agent list. It reads the
-  console's sent mailbox once per reachable Fleet host, deduplicates requests,
+  console's sent mailbox once per reachable host, deduplicates requests,
   and exposes waiting, replied, and unread states together with Global Ask
   history. Opening a command returns to its exact agent pane; reading a reply
   uses the durable collaboration get operation.
@@ -93,7 +93,7 @@ wrapping. **Click to Type** attaches the exact pane in place, swaps the panel to
 an interactive Ghostty surface, and focuses it for immediate keyboard input.
 Raw bytes are intentionally not exposed in Live Pane.
 
-Shells and monitored Fleet panes are workspace modules. They participate in
+Shells and monitored panes are workspace modules. They participate in
 preview/pin tabs and can be detached into independent macOS windows. Attaching
 from Live Watch runs the bundled `muxa fleet attach` inside a muxad-owned PTY
 and reuses the bottom Live Pane instead of navigating away. **Open in Shell**
@@ -103,10 +103,19 @@ detach closes the ended tab. Interactive app attach temporarily applies tmux's
 `latest` window sizing and zooms the exact pane, making it follow the Live Pane
 viewport instead of retaining a narrow split width. Detach restores the prior
 window dimensions, sizing policy, zoom state, and active pane. The controller
-applies this over SSH for remote nodes, so it remains compatible with a Fleet
+applies this over SSH for remote nodes, so it remains compatible with a
 host running the previous additive CLI endpoint. This keeps the monitoring
 safety boundary while still making exact local and remote panes directly
 usable.
+
+Agent summaries, latest responses, collaboration bodies, and Ask answers are
+Markdown. Apple's Markdown parser records paragraphs, headings, lists, tables,
+and code blocks only as presentation intents that SwiftUI `Text` ignores, so
+Muxa rebuilds those block boundaries before display: `MuxaMarkdownText` keeps
+a single line-limited `Text` for cards and inspectors, and
+`ReadableMarkdownContent` renders full block layouts (including pipe tables)
+for the Inbox and Ask conversations. The user-facing vocabulary is **Hosts**;
+`fleet` survives only in protocol and type names.
 
 Selecting a new item opens it as a replaceable preview tab. Pinning preserves
 the tab while another Work, Agent, Host, or Shell is inspected. `Command-Shift-P`
@@ -117,7 +126,7 @@ visible even when another context is selected. Editor tab
 close controls and all Explorer disclosure/row targets use full-size hit areas
 rather than relying on the visible glyph alone.
 
-Raw Fleet captures are carried as a bounded `capture_raw_base64` field. The UI
+Raw pane captures are carried as a bounded `capture_raw_base64` field. The UI
 never sends those bytes to a terminal parser or renders control sequences:
 `ESC`, `CR`, `LF`, C0, and C1 controls are converted to visible diagnostic
 notation. The existing sanitized `capture` field remains the default and older
@@ -225,10 +234,28 @@ apps/muxa-macos/Scripts/muxa-qa-helper-client.py inspect
 apps/muxa-macos/Scripts/muxa-qa-helper-client.py capture --output /tmp/muxa.png
 apps/muxa-macos/Scripts/muxa-qa-helper-client.py type --text 'printf qa-ok' --return
 apps/muxa-macos/Scripts/muxa-qa-helper-client.py click --x 600 --y 260
+apps/muxa-macos/Scripts/muxa-qa-helper-client.py resize --width 920 --height 580
+apps/muxa-macos/Scripts/muxa-qa-helper-client.py key --key , --mod command
+apps/muxa-macos/Scripts/muxa-qa-helper-client.py key --key p --mod command --mod shift
+apps/muxa-macos/Scripts/muxa-qa-helper-client.py key --key escape
 ```
 
 Click coordinates are relative to the captured Muxa window and are rejected if
-they fall outside that window.
+they fall outside that window. `resize` moves and resizes the largest Muxa
+window through the Accessibility API, which makes minimum-size and responsive
+layouts reproducible; the window's own minimum size still applies and the
+resulting geometry is returned.
+
+`key` presses one key with optional modifiers so automated checks can open
+Settings (`⌘,`), the command palette (`⌘⇧P`), or close an editor (`⌘W`).
+`--key` takes a single character or one of `return`, `escape`, `tab`, `space`,
+`up`, `down`, `left`, `right`, `delete`; `--mod` is repeatable and accepts
+`command`, `shift`, `option`, `control`. A character is resolved to the key
+that produces it on the current ASCII-capable keyboard layout (the layout macOS
+uses for menu shortcuts, so `⌘W` still works while an input method such as
+2-Set Korean is active), then on the active layout, with a US layout table as
+the last fallback; Shift is added when the layout needs it, and the resolved
+virtual key code is returned as `key_code`.
 
 The helper listens on `/tmp/muxa-qa-helper-<uid>.sock` with mode `0600`,
 rejects peers owned by another user, caps request and text sizes, and always
@@ -290,8 +317,8 @@ and resize control remain responsive while that lane waits.
 ## Event-driven refresh and render budget
 
 Muxa.app opens compact `fleet_subscribe`, `pipeline_subscribe`, and
-`ask_subscribe` streams after its initial coherent load. Fleet bursts are
-coalesced for 75 ms and capped at four snapshot reads per second. A slow
+`ask_subscribe` streams after its initial coherent load. Host update bursts
+are coalesced for 75 ms and capped at four snapshot reads per second. A slow
 15-second full reconciliation repairs stream disconnects and lag gaps; it is
 not the primary freshness path. Collaboration revisions travel per host, so
 the operator inbox and an open Collaborate module re-read only the affected

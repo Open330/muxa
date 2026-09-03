@@ -1003,7 +1003,7 @@ actor MuxaIPCClient {
                 throw MuxaIPCError.missingField("fleet_result")
             }
             guard result.accepted else {
-                throw MuxaIPCError.server(result.message ?? "Fleet capture was rejected")
+                throw MuxaIPCError.server(result.message ?? "Pane capture was rejected")
             }
             let rawBytes = result.captureRawBase64.flatMap { Data(base64Encoded: $0) }
             if result.captureRawBase64 != nil, rawBytes == nil {
@@ -1013,7 +1013,7 @@ actor MuxaIPCClient {
         }
 
         guard host.local else {
-            throw MuxaIPCError.server("Remote pane capture requires muxad Fleet support")
+            throw MuxaIPCError.server("Remote pane capture requires muxad multi-host support (fleet_v1)")
         }
         let response = try await call([
             "protocol": Self.protocolVersion,
@@ -1033,7 +1033,7 @@ actor MuxaIPCClient {
         submit: Bool = true
     ) async throws {
         guard capabilities.contains("fleet_v1") else {
-            throw MuxaIPCError.server("Prompt control requires muxad Fleet support")
+            throw MuxaIPCError.server("Prompt control requires muxad multi-host support (fleet_v1)")
         }
         let response = try await call([
             "protocol": Self.protocolVersion,
@@ -1050,7 +1050,7 @@ actor MuxaIPCClient {
             throw MuxaIPCError.missingField("fleet_result")
         }
         guard result.accepted else {
-            throw MuxaIPCError.server(result.message ?? "Fleet prompt was rejected")
+            throw MuxaIPCError.server(result.message ?? "Prompt was rejected")
         }
     }
 
@@ -1321,7 +1321,7 @@ actor MuxaIPCClient {
     func fleetUpdates() throws -> AsyncThrowingStream<MuxaFleetUpdate, Error> {
         guard capabilities.contains(Self.fleetSubscribeCapability) else {
             throw MuxaIPCError.server(
-                "muxad does not support Fleet invalidation subscriptions; update muxa and restart muxad"
+                "muxad does not support host invalidation subscriptions; update muxa and restart muxad"
             )
         }
         let hello = try JSONSerialization.data(withJSONObject: [
@@ -1474,7 +1474,7 @@ actor MuxaIPCClient {
         requestTransport: SerializedIPCTransport? = nil
     ) async throws -> MuxaFleetCommandResult {
         guard capabilities.contains("fleet_v1") else {
-            throw MuxaIPCError.server("This operation requires muxad Fleet support")
+            throw MuxaIPCError.server("This operation requires muxad multi-host support (fleet_v1)")
         }
         let response = try await call(
             [
@@ -1489,7 +1489,7 @@ actor MuxaIPCClient {
             throw MuxaIPCError.missingField("fleet_result")
         }
         guard result.accepted else {
-            throw MuxaIPCError.server(result.message ?? "Fleet operation was rejected")
+            throw MuxaIPCError.server(result.message ?? "Host operation was rejected")
         }
         return result
     }

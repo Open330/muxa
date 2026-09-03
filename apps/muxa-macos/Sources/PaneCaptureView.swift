@@ -8,15 +8,32 @@ struct MuxaPaneTarget: Hashable, Sendable {
 
 @MainActor
 private final class PaneCaptureModel: ObservableObject {
-    @Published private(set) var screenText = "Opening live screen…"
+    /// The screen rendered with the pane's SGR colors and attributes.
+    @Published private(set) var screenContent = AttributedString(PaneCaptureModel.openingPlaceholder)
+    /// Plain text of `screenContent`, for the copy action.
+    private(set) var screenText = PaneCaptureModel.openingPlaceholder
     @Published private(set) var errorMessage: String?
     @Published private(set) var isRefreshing = false
+
+    private static let openingPlaceholder = "Opening live screen…"
+    private static let unavailablePlaceholder = "This backend cannot capture the selected pane."
+
+    /// What the last capture returned. Change detection compares this, not
+    /// the rendered `AttributedString`.
+    private enum CaptureSource: Equatable {
+        case placeholder
+        case raw(Data)
+        case plain(String)
+        case unavailable
+    }
 
     private let client: MuxaIPCClient
     private let target: MuxaPaneTarget
     private var isVisible = true
     private var isApplicationActive = NSApp.isActive
     private var hasLoaded = false
+    private var source = CaptureSource.placeholder
+    private var colorScheme = ColorScheme.dark
 
     init(client: MuxaIPCClient, target: MuxaPaneTarget) {
         self.client = client
@@ -58,6 +75,26 @@ private final class PaneCaptureModel: ObservableObject {
         isApplicationActive = active
     }
 
+    /// Re-renders the last capture with the palette for `scheme` when it
+    /// differs from the one used so far.
+    func setColorScheme(_ scheme: ColorScheme) {
+        guard scheme != colorScheme else { return }
+        colorScheme = scheme
+        render()
+    }
+
+    private func render() {
+        let formatter = TerminalCaptureFormatter(palette: .palette(for: colorScheme))
+        let content: AttributedString = switch source {
+        case .placeholder: AttributedString(PaneCaptureModel.openingPlaceholder)
+        case .raw(let bytes): formatter.render(bytes: bytes)
+        case .plain(let text): formatter.render(text: text)
+        case .unavailable: AttributedString(Self.unavailablePlaceholder)
+        }
+        screenText = String(content.characters)
+        screenContent = content
+    }
+
     private func refresh() async -> Bool {
         guard !isRefreshing else { return false }
         if !hasLoaded { isRefreshing = true }
@@ -67,11 +104,17 @@ private final class PaneCaptureModel: ObservableObject {
         }
         do {
             let capture = try await client.captureFleetPane(host: target.host, pane: target.pane)
-            let nextScreenText = capture.screenText.map(sanitizeTerminalCapture)
-                ?? "This backend cannot capture the selected pane."
-            let changed = nextScreenText != screenText
+            let nextSource: CaptureSource = if let bytes = capture.rawBytes {
+                .raw(bytes)
+            } else if let text = capture.screenText {
+                .plain(text)
+            } else {
+                .unavailable
+            }
+            let changed = nextSource != source
             if changed {
-                screenText = nextScreenText
+                source = nextSource
+                render()
             }
             if errorMessage != nil { errorMessage = nil }
             return changed
@@ -130,9 +173,9 @@ struct PaneCaptureView: View {
 
             GeometryReader { proxy in
                 ScrollView([.horizontal, .vertical]) {
-                    Text(verbatim: model.screenText)
-                        .font(.system(size: 12, weight: .regular, design: .monospaced))
-                        .foregroundStyle(colorScheme == .dark ? Color(white: 0.92) : Color(white: 0.12))
+                    Text(model.screenContent)
+                        .font(TerminalPreviewFont.font)
+                        .foregroundStyle(TerminalCapturePalette.palette(for: colorScheme).foreground)
                         .textSelection(.disabled)
                         .fixedSize(horizontal: true, vertical: true)
                         .frame(
@@ -156,7 +199,7 @@ struct PaneCaptureView: View {
                     .background(MuxaSurfacePalette.sidebar(for: colorScheme))
             }
         }
-        .frame(maxWidth: .infinity, minHeight: 180, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, minHeight: showsHeader ? 180 : 120, maxHeight: .infinity)
         .clipped()
         .overlay {
             if showsHeader {
@@ -168,10 +211,14 @@ struct PaneCaptureView: View {
         .onAppear {
             model.setVisible(true)
             model.setApplicationActive(scenePhase == .active)
+            model.setColorScheme(colorScheme)
         }
         .onDisappear { model.setVisible(false) }
         .onChange(of: scenePhase) { phase in
             model.setApplicationActive(phase == .active)
+        }
+        .onChange(of: colorScheme) { scheme in
+            model.setColorScheme(scheme)
         }
     }
 
@@ -187,46 +234,56 @@ struct PaneCaptureView: View {
     }
 }
 
-private func sanitizeTerminalCapture(_ value: String) -> String {
-    enum EscapeState {
-        case text
-        case escape
-        case csi
-        case osc
-        case oscEscape
+/// Font for the read-only screen preview.
+///
+/// Agent prompts such as powerlevel10k and starship draw with Nerd Font
+/// private-use glyphs. The system monospaced font has no glyphs for them and
+/// shows a "?" box that is also wider than a cell, which shifts the rest of
+/// the line. When the user has a Nerd Font installed (the interactive Ghostty
+/// surface already draws these prompts with one), use its best monospace
+/// variant as the preview font so both views show the same characters at
+/// the same positions. A cascade-list fallback behind the system font is
+/// not honored for system fonts, so the Nerd Font has to be the primary.
+@MainActor
+enum TerminalPreviewFont {
+    static let pointSize: CGFloat = 12
+
+    static let font: Font = Font(nsFont)
+
+    static let nsFont: NSFont = {
+        let system = NSFont.monospacedSystemFont(ofSize: pointSize, weight: .regular)
+        let manager = NSFontManager.shared
+        guard let family = nerdFontFamily(available: manager.availableFontFamilies),
+              let nerd = manager.font(withFamily: family, traits: [], weight: 5, size: pointSize)
+        else { return system }
+        return nerd
+    }()
+
+    /// Prefer the `Mono` Nerd Font variants, whose icons are exactly one cell
+    /// wide, then any other installed Nerd Font family.
+    nonisolated static func nerdFontFamily(available: [String]) -> String? {
+        let families = available.filter { family in
+            family.localizedCaseInsensitiveContains("Nerd Font")
+                || family.hasSuffix(" NF")
+                || family.hasSuffix(" NFM")
+        }
+        guard !families.isEmpty else { return nil }
+        let ranked = families.sorted { left, right in
+            let leftRank = monoVariantRank(left)
+            let rightRank = monoVariantRank(right)
+            if leftRank != rightRank { return leftRank < rightRank }
+            return left.localizedStandardCompare(right) == .orderedAscending
+        }
+        return ranked.first
     }
 
-    var state = EscapeState.text
-    var output = String.UnicodeScalarView()
-    for scalar in value.unicodeScalars {
-        switch state {
-        case .text where scalar.value == 0x1B:
-            state = .escape
-        case .text:
-            if scalar.value >= 0x20 || scalar == "\n" || scalar == "\t" {
-                output.append(scalar)
-            }
-        case .escape where scalar == "[":
-            state = .csi
-        case .escape where scalar == "]":
-            state = .osc
-        case .escape:
-            state = .text
-        case .csi where (0x40...0x7E).contains(scalar.value):
-            state = .text
-        case .csi:
-            break
-        case .osc where scalar.value == 0x07:
-            state = .text
-        case .osc where scalar.value == 0x1B:
-            state = .oscEscape
-        case .osc:
-            break
-        case .oscEscape where scalar == "\\":
-            state = .text
-        case .oscEscape:
-            state = .osc
-        }
+    /// Nerd Fonts ship each family as `X Nerd Font`, `X Nerd Font Mono`
+    /// (icons one cell wide), and `X Nerd Font Propo`. Only the variant
+    /// suffix matters: a base name such as "JetBrainsMono" is not a signal.
+    private nonisolated static func monoVariantRank(_ family: String) -> Int {
+        let lowered = family.lowercased()
+        if lowered.hasSuffix("nerd font mono") || lowered.hasSuffix(" nfm") { return 0 }
+        if lowered.hasSuffix("nerd font propo") || lowered.hasSuffix(" nfp") { return 2 }
+        return 1
     }
-    return String(output)
 }

@@ -31,6 +31,95 @@ import Testing
     ])
 }
 
+@Test func readableMarkdownParsesPipeTablesAsBlocks() {
+    let document = ReadableMarkdownDocument(source: """
+    | Round | Findings | Result |
+    |---|:---:|---:|
+    | 1 | 9 must-fix | **8 accepted** |
+    | 2 | 4 nice-to-have | converged |
+
+    19 of 20 findings accepted.
+    """)
+
+    #expect(document.blocks == [
+        .table(
+            header: ["Round", "Findings", "Result"],
+            rows: [
+                ["1", "9 must-fix", "**8 accepted**"],
+                ["2", "4 nice-to-have", "converged"],
+            ]
+        ),
+        .paragraph("19 of 20 findings accepted."),
+    ])
+}
+
+@Test func singleTextMarkdownKeepsBlockBoundaries() {
+    let source = """
+    Intro line **bold**
+    soft break line
+
+    ## Heading two
+
+    | a | b |
+    |---|---|
+    | 1 | 2 |
+
+    - item one
+    - item two
+      - nested
+
+    1. first
+    2. second
+
+    ```swift
+    let x = 1
+    ```
+
+    > quoted
+
+    Last para
+    """
+
+    let text = MuxaMarkdownText.plainText(markdown: source)
+
+    #expect(text == """
+    Intro line bold soft break line
+    Heading two
+    a  |  b
+    1  |  2
+    • item one
+    • item two
+        • nested
+    1. first
+    2. second
+    let x = 1
+    quoted
+    Last para
+    """)
+}
+
+@Test func inboxPreviewDropsMarkdownMarkersAndLineBreaks() {
+    let preview = MuxaMarkdownText.previewText(markdown: "# 교차 리뷰 루프 완료\n\n**수렴** 리뷰어: Codex\n- one\n- two")
+    #expect(preview == "교차 리뷰 루프 완료 수렴 리뷰어: Codex • one • two")
+}
+
+@Test func previewFontPrefersMonospaceNerdFontVariants() {
+    #expect(TerminalPreviewFont.nerdFontFamily(available: ["Helvetica", "SF Mono"]) == nil)
+    #expect(
+        TerminalPreviewFont.nerdFontFamily(available: [
+            "Helvetica",
+            "JetBrainsMono Nerd Font",
+            "MesloLGS NF",
+            "JetBrainsMono Nerd Font Mono",
+        ]) == "JetBrainsMono Nerd Font Mono"
+    )
+    #expect(TerminalPreviewFont.nerdFontFamily(available: ["MesloLGS NF"]) == "MesloLGS NF")
+    #expect(
+        TerminalPreviewFont.nerdFontFamily(available: ["Hack Nerd Font Propo", "Hack Nerd Font"])
+            == "Hack Nerd Font"
+    )
+}
+
 @Test func readableMarkdownGroupsOrderedListsAndNormalizesNewlines() {
     let document = ReadableMarkdownDocument(source: "1. one\r\n2. two\r\n\r\nnext line")
 
@@ -1271,4 +1360,646 @@ struct MuxaIPCTests {
         #expect(model.sidebarSelection == .fleetWindow(window))
         #expect(model.watchSelection == pane)
     }
+}
+
+// MARK: - Operator Inbox per-host refresh contract
+
+/// Wraps `IPCProbe` so the console mailbox of each fleet host can be scripted
+/// and made to fail independently, which is what the Inbox refresh contract is
+/// about. Every other request is answered by the base probe, including the
+/// two-host `fleet_snapshot` ("local" and "dev") that gives the refresh its
+/// per-host route panes.
+private final class InboxMailboxProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let base = IPCProbe()
+    private var sentByHost: [String: [[String: Any]]] = [:]
+    private var failureByHost: [String: String] = [:]
+    private var mailboxReads: [String] = []
+    private var getReads: [String] = []
+
+    func setMailbox(host: String, sent: [[String: Any]]) {
+        lock.lock()
+        defer { lock.unlock() }
+        sentByHost[host] = sent
+    }
+
+    /// `nil` restores a healthy host.
+    func setFailure(host: String, message: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        failureByHost[host] = message
+    }
+
+    /// Hosts whose mailbox was read since the last reset, in request order.
+    func mailboxReadHosts() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return mailboxReads
+    }
+
+    /// Hosts whose durable collaboration get was called since the last reset.
+    func getReadHosts() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return getReads
+    }
+
+    func resetReadLog() {
+        lock.lock()
+        defer { lock.unlock() }
+        mailboxReads.removeAll()
+        getReads.removeAll()
+    }
+
+    func request(path: String, payload: Data) throws -> Data {
+        let object = try JSONSerialization.jsonObject(with: payload) as? [String: Any]
+        guard object?["kind"] as? String == "fleet_command",
+              let host = object?["host"] as? String,
+              let operation = object?["operation"] as? [String: Any],
+              let kind = operation["kind"] as? String,
+              kind == "collaboration_mailbox" || kind == "collaboration_get"
+        else {
+            return try base.request(path: path, payload: payload)
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+        if kind == "collaboration_mailbox" {
+            mailboxReads.append(host)
+            if let failure = failureByHost[host] {
+                return try JSONSerialization.data(withJSONObject: ["ok": false, "error": failure])
+            }
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true,
+                "fleet_result": [
+                    "accepted": true,
+                    "collaboration_incoming": [],
+                    "collaboration_sent": sentByHost[host] ?? [],
+                ],
+            ])
+        }
+
+        // collaboration_get: like muxad's `get_for`, the sender reading a
+        // replied request stamps `reply_read_at` and returns the request.
+        getReads.append(host)
+        let requestID = operation["request_id"] as? String ?? ""
+        var sent = sentByHost[host] ?? []
+        guard let index = sent.firstIndex(where: { $0["id"] as? String == requestID }) else {
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": false,
+                "error": "collaboration request \(requestID) not found",
+            ])
+        }
+        if sent[index]["reply"] != nil, sent[index]["reply_read_at"] == nil {
+            sent[index]["reply_read_at"] = "2026-09-02T12:00:00Z"
+        }
+        sentByHost[host] = sent
+        return try JSONSerialization.data(withJSONObject: [
+            "ok": true,
+            "fleet_result": ["accepted": true, "collaboration_request": sent[index]],
+        ])
+    }
+}
+
+/// A console-sent request in the wire shape `MuxaCollaborationRequest` decodes.
+private func inboxSentRequest(
+    id: String,
+    createdAt: String,
+    body: String = "Review the release notes",
+    status: String = "queued",
+    reply: (status: String, body: String, at: String)? = nil,
+    replyReadAt: String? = nil
+) -> [String: Any] {
+    var object: [String: Any] = [
+        "id": id,
+        "from": [
+            "agent_kind": "unknown",
+            "agent_session_id": "__muxa_console__",
+            "pane": "console",
+            "room": ["host": "tmux", "window_id": "@4"],
+            "console": true,
+        ],
+        "to": [
+            "agent_kind": "codex",
+            "agent_session_id": "agent-17",
+            "pane": "%17",
+            "room": ["host": "tmux", "window_id": "@4"],
+            "alias": "impl",
+        ],
+        "kind": "task",
+        "body": body,
+        "expects_reply": true,
+        "work_mode": "read_only",
+        "status": status,
+        "created_at": createdAt,
+    ]
+    if let reply {
+        object["reply"] = ["status": reply.status, "body": reply.body, "at": reply.at]
+    }
+    if let replyReadAt {
+        object["reply_read_at"] = replyReadAt
+    }
+    return object
+}
+
+@MainActor
+private func makeInboxModel(probe: InboxMailboxProbe) async throws -> AppModel {
+    let client = MuxaIPCClient(socketPath: "/tmp/muxa-test.sock", request: probe.request)
+    try await client.hello()
+    let model = AppModel(client: client)
+    let execution = try await client.executionSnapshot()
+    model.ingestExecutionSnapshotForTesting(execution)
+    return model
+}
+
+private func decodeInboxRequest(_ object: [String: Any]) throws -> MuxaCollaborationRequest {
+    try JSONDecoder().decode(
+        MuxaCollaborationRequest.self,
+        from: JSONSerialization.data(withJSONObject: object)
+    )
+}
+
+struct MuxaOperatorInboxRefreshTests {
+    private static let sshHiccup = "remote request_failed: reading collaboration mailbox"
+
+    @Test @MainActor
+    func hostFailureKeepsThatHostsMessagesAndClearsWhenItRecovers() async throws {
+        let probe = InboxMailboxProbe()
+        probe.setMailbox(host: "local", sent: [
+            inboxSentRequest(id: "local-old", createdAt: "2026-09-02T10:00:00Z"),
+        ])
+        probe.setMailbox(host: "dev", sent: [
+            inboxSentRequest(id: "dev-old", createdAt: "2026-09-02T09:00:00Z"),
+        ])
+        let model = try await makeInboxModel(probe: probe)
+
+        await model.refreshOperatorInbox(force: true)
+
+        #expect(model.operatorMessages.map(\.id) == ["local:local-old", "dev:dev-old"])
+        #expect(model.inboxHostFailures.isEmpty)
+        #expect(model.inboxHostFailureSummary == nil)
+
+        // Host A changes its mailbox while host B's SSH read fails.
+        probe.setMailbox(host: "local", sent: [
+            inboxSentRequest(id: "local-new", createdAt: "2026-09-02T11:00:00Z"),
+        ])
+        probe.setFailure(host: "dev", message: Self.sshHiccup)
+
+        await model.refreshOperatorInbox(force: true)
+
+        #expect(model.operatorMessages.map(\.id) == ["local:local-new", "dev:dev-old"])
+        #expect(model.inboxHostFailures == ["dev": Self.sshHiccup])
+        #expect(model.inboxHostFailureSummary == "1 host unreachable: dev")
+        #expect(model.inboxError == nil)
+
+        // Host B recovers with new content: its failure clears, nothing else
+        // is disturbed.
+        probe.setFailure(host: "dev", message: nil)
+        probe.setMailbox(host: "dev", sent: [
+            inboxSentRequest(id: "dev-new", createdAt: "2026-09-02T12:00:00Z"),
+        ])
+
+        await model.refreshOperatorInbox(force: true)
+
+        #expect(model.operatorMessages.map(\.id) == ["dev:dev-new", "local:local-new"])
+        #expect(model.inboxHostFailures.isEmpty)
+    }
+
+    @Test @MainActor
+    func repeatedHostFailuresNeverEmptyThatHost() async throws {
+        let probe = InboxMailboxProbe()
+        probe.setMailbox(host: "local", sent: [
+            inboxSentRequest(id: "local-1", createdAt: "2026-09-02T10:00:00Z"),
+        ])
+        probe.setMailbox(host: "dev", sent: [
+            inboxSentRequest(id: "dev-1", createdAt: "2026-09-02T09:00:00Z"),
+        ])
+        let model = try await makeInboxModel(probe: probe)
+        await model.refreshOperatorInbox(force: true)
+        probe.setFailure(host: "dev", message: Self.sshHiccup)
+
+        for _ in 0..<3 {
+            await model.refreshOperatorInbox(force: true)
+        }
+        // A single-host refresh of the failing host alone behaves the same.
+        await model.refreshOperatorInbox(force: true, hostAliases: ["dev"])
+
+        #expect(model.operatorMessages.map(\.id) == ["local:local-1", "dev:dev-1"])
+        #expect(model.inboxHostFailures == ["dev": Self.sshHiccup])
+    }
+
+    @Test @MainActor
+    func singleHostRefreshLeavesOtherHostsFailuresAndMessagesAlone() async throws {
+        let probe = InboxMailboxProbe()
+        probe.setMailbox(host: "local", sent: [
+            inboxSentRequest(id: "local-1", createdAt: "2026-09-02T10:00:00Z"),
+        ])
+        probe.setMailbox(host: "dev", sent: [
+            inboxSentRequest(id: "dev-1", createdAt: "2026-09-02T09:00:00Z"),
+        ])
+        let model = try await makeInboxModel(probe: probe)
+        await model.refreshOperatorInbox(force: true)
+        probe.setFailure(host: "dev", message: Self.sshHiccup)
+        await model.refreshOperatorInbox(force: true)
+        probe.resetReadLog()
+
+        await model.refreshOperatorInbox(force: true, hostAliases: ["local"])
+
+        #expect(probe.mailboxReadHosts() == ["local"])
+        #expect(model.inboxHostFailures == ["dev": Self.sshHiccup])
+        #expect(model.operatorMessages.map(\.id) == ["local:local-1", "dev:dev-1"])
+    }
+
+    @Test @MainActor
+    func markingAReplyReadUpdatesInPlaceAndRefreshesOnlyItsHost() async throws {
+        let probe = InboxMailboxProbe()
+        probe.setMailbox(host: "local", sent: [
+            inboxSentRequest(
+                id: "local-replied",
+                createdAt: "2026-09-02T10:00:00Z",
+                reply: ("completed", "Done", "2026-09-02T10:05:00Z")
+            ),
+        ])
+        probe.setMailbox(host: "dev", sent: [
+            inboxSentRequest(
+                id: "dev-replied",
+                createdAt: "2026-09-02T09:00:00Z",
+                reply: ("completed", "Shipped", "2026-09-02T09:05:00Z")
+            ),
+        ])
+        let model = try await makeInboxModel(probe: probe)
+        await model.refreshOperatorInbox(force: true)
+        let devMessage = try #require(model.operatorMessages.first { $0.host.alias == "dev" })
+        #expect(devMessage.hasUnreadReply)
+        probe.resetReadLog()
+
+        await model.markOperatorMessageRead(devMessage)
+
+        #expect(probe.getReadHosts() == ["dev"])
+        #expect(probe.mailboxReadHosts() == ["dev"])
+        let updated = try #require(model.operatorMessages.first { $0.id == devMessage.id })
+        #expect(!updated.hasUnreadReply)
+        #expect(model.operatorMessages.first { $0.host.alias == "local" }?.hasUnreadReply == true)
+        #expect(model.inboxError == nil)
+    }
+
+    @Test
+    func hostFailureSummaryIsOneCompactLine() {
+        #expect(MuxaInboxHostFailureText.summary([:]) == nil)
+        #expect(MuxaInboxHostFailureText.summary(["jiun-mbp": "ssh timed out"]) == "1 host unreachable: jiun-mbp")
+        #expect(
+            MuxaInboxHostFailureText.summary(["rtzr": "ssh timed out", "jiun-mbp": "remote request_failed"])
+                == "2 hosts unreachable: jiun-mbp, rtzr"
+        )
+        #expect(
+            MuxaInboxHostFailureText.details(["rtzr": "ssh timed out", "jiun-mbp": "remote request_failed"])
+                == ["jiun-mbp: remote request_failed", "rtzr: ssh timed out"]
+        )
+    }
+
+    @Test @MainActor
+    func blockedRequestWithoutReplyIsADecisionNotAWait() async throws {
+        let probe = InboxMailboxProbe()
+        let client = MuxaIPCClient(socketPath: "/tmp/muxa-test.sock", request: probe.request)
+        try await client.hello()
+        let execution = try await client.executionSnapshot()
+        let route = try #require(
+            execution.watchHosts.first(where: { $0.host.alias == "local" })?
+                .sessions.first?.windows.first?.panes.first
+        )
+        func message(_ object: [String: Any]) throws -> MuxaOperatorMessage {
+            let request = try decodeInboxRequest(object)
+            return MuxaOperatorMessage(host: route.host, routePane: route.pane, request: request)
+        }
+
+        let waiting = try message(inboxSentRequest(id: "waiting", createdAt: "2026-09-02T10:00:00Z"))
+        let blocked = try message(inboxSentRequest(id: "blocked", createdAt: "2026-09-02T09:00:00Z", status: "blocked"))
+        let oldUnreadBlockedReply = try message(inboxSentRequest(
+            id: "old-blocked-reply",
+            createdAt: "2026-09-02T08:00:00Z",
+            reply: ("blocked", "Need a decision", "2026-09-02T11:00:00Z")
+        ))
+        let readDeclinedReply = try message(inboxSentRequest(
+            id: "read-declined-reply",
+            createdAt: "2026-09-02T09:30:00Z",
+            reply: ("declined", "Not doing that", "2026-09-02T12:00:00Z"),
+            replyReadAt: "2026-09-02T12:01:00Z"
+        ))
+
+        #expect(waiting.isAwaitingAgentReply)
+        #expect(!waiting.needsHumanDecision)
+        #expect(blocked.needsReply, "the activity badge still counts it")
+        #expect(!blocked.isAwaitingAgentReply)
+        #expect(blocked.needsHumanDecision)
+
+        // Needs Action: unread decisions first, then newest activity, so the
+        // reply that arrived at 11:00 on the oldest request outranks the
+        // read reply from 12:00 and the reply-less blocked request.
+        let ordered = [blocked, readDeclinedReply, oldUnreadBlockedReply]
+            .sorted(by: MuxaOperatorMessage.needsActionOrder)
+        #expect(ordered.map(\.request.id) == ["old-blocked-reply", "read-declined-reply", "blocked"])
+    }
+}
+
+// MARK: - Terminal capture formatter
+
+import AppKit
+import SwiftUI
+
+private struct CaptureRun {
+    let text: String
+    let foreground: Color?
+    let background: Color?
+    let intent: InlinePresentationIntent?
+    let underline: Text.LineStyle?
+    let strikethrough: Text.LineStyle?
+}
+
+private func captureRuns(_ rendered: AttributedString) -> [CaptureRun] {
+    rendered.runs.map { run in
+        CaptureRun(
+            text: String(rendered[run.range].characters),
+            foreground: run[AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self],
+            background: run[AttributeScopes.SwiftUIAttributes.BackgroundColorAttribute.self],
+            intent: run[AttributeScopes.FoundationAttributes.InlinePresentationIntentAttribute.self],
+            underline: run[AttributeScopes.SwiftUIAttributes.UnderlineStyleAttribute.self],
+            strikethrough: run[AttributeScopes.SwiftUIAttributes.StrikethroughStyleAttribute.self]
+        )
+    }
+}
+
+/// sRGB components scaled to 0–255, so palette colors can be compared by value.
+private func srgb(_ color: Color?) -> [Int]? {
+    guard let color, let resolved = NSColor(color).usingColorSpace(.sRGB) else { return nil }
+    return [resolved.redComponent, resolved.greenComponent, resolved.blueComponent]
+        .map { Int(($0 * 255).rounded()) }
+}
+
+private func alpha(_ color: Color?) -> Double? {
+    guard let color, let resolved = NSColor(color).usingColorSpace(.sRGB) else { return nil }
+    return Double(resolved.alphaComponent)
+}
+
+@Test func terminalCaptureFormatterPassesPlainTextThrough() {
+    let formatter = TerminalCaptureFormatter(palette: .dark)
+    let rendered = formatter.render(text: "hello\n\tworld $ ▸ 한글")
+    #expect(String(rendered.characters) == "hello\n\tworld $ ▸ 한글")
+    let runs = captureRuns(rendered)
+    #expect(runs.count == 1)
+    #expect(runs.first?.foreground == nil)
+    #expect(runs.first?.background == nil)
+    #expect(runs.first?.intent == nil)
+    #expect(runs.first?.underline == nil)
+
+    let bytes = formatter.render(bytes: Data("plain bytes".utf8))
+    #expect(String(bytes.characters) == "plain bytes")
+    #expect(captureRuns(bytes).count == 1)
+}
+
+@Test func terminalCaptureFormatterAppliesColorsAndReset() {
+    let formatter = TerminalCaptureFormatter(palette: .dark)
+    let rendered = formatter.render(
+        text: "\u{1B}[31mred\u{1B}[0m plain\u{1B}[1;42mbold\u{1B}[22m\u{1B}[96mcyan\u{1B}[39;49mdefault"
+    )
+    #expect(String(rendered.characters) == "red plainboldcyandefault")
+    let runs = captureRuns(rendered)
+    #expect(runs.map(\.text) == ["red", " plain", "bold", "cyan", "default"])
+
+    #expect(srgb(runs[0].foreground) == [0xAC, 0x41, 0x42])
+    #expect(runs[0].background == nil)
+    #expect(runs[0].intent == nil)
+
+    #expect(runs[1].foreground == nil)
+    #expect(runs[1].background == nil)
+
+    #expect(runs[2].intent?.contains(.stronglyEmphasized) == true)
+    #expect(srgb(runs[2].background) == [0x7E, 0x8E, 0x50])
+    #expect(runs[2].foreground == nil)
+
+    #expect(runs[3].intent == nil)
+    #expect(srgb(runs[3].foreground) == [0x7D, 0xD5, 0xCF])
+    #expect(srgb(runs[3].background) == [0x7E, 0x8E, 0x50])
+
+    #expect(runs[4].foreground == nil)
+    #expect(runs[4].background == nil)
+
+    let light = captureRuns(TerminalCaptureFormatter(palette: .light).render(text: "\u{1B}[91mbright\u{1B}[m"))
+    #expect(srgb(light[0].foreground) == [0xF0, 0x3E, 0x31])
+}
+
+@Test func terminalCaptureFormatterSupports256AndTruecolor() {
+    let formatter = TerminalCaptureFormatter(palette: .dark)
+    let rendered = formatter.render(
+        text: "\u{1B}[38;5;196mA\u{1B}[48;5;244mB\u{1B}[38;2;10;20;30mC\u{1B}[38:2::40:50:60mD"
+            + "\u{1B}[0m\u{1B}[38;5;4mE\u{1B}[0m\u{1B}[38;5mF\u{1B}[38;2;1;2mG\u{1B}[48:5:16mH"
+    )
+    #expect(String(rendered.characters) == "ABCDEFGH")
+    let runs = captureRuns(rendered)
+    #expect(runs.map(\.text) == ["A", "B", "C", "D", "E", "FG", "H"])
+
+    #expect(srgb(runs[0].foreground) == [255, 0, 0])
+    #expect(runs[0].background == nil)
+    #expect(srgb(runs[1].foreground) == [255, 0, 0])
+    #expect(srgb(runs[1].background) == [128, 128, 128])
+    #expect(srgb(runs[2].foreground) == [10, 20, 30])
+    #expect(srgb(runs[3].foreground) == [40, 50, 60])
+    #expect(srgb(runs[4].foreground) == [0x6C, 0x99, 0xBB])
+    // Malformed extended colors leave the style untouched.
+    #expect(runs[5].foreground == nil)
+    #expect(runs[5].background == nil)
+    #expect(srgb(runs[6].background) == [0, 0, 0])
+}
+
+@Test func terminalCaptureFormatterDropsUnknownCSI() {
+    let formatter = TerminalCaptureFormatter(palette: .dark)
+    let rendered = formatter.render(
+        text: "a\u{1B}[2Jb\u{1B}[?25lc\u{1B}[1;1Hd\u{1B}[0Ke\u{1B}[ qf\u{1B}[>4;2mg\u{1B}[31\u{1B}[32mh"
+    )
+    #expect(String(rendered.characters) == "abcdefgh")
+    let runs = captureRuns(rendered)
+    #expect(runs.map(\.text) == ["abcdefg", "h"])
+    #expect(runs[0].foreground == nil)
+    // An ESC inside a CSI aborts it and starts the next sequence.
+    #expect(srgb(runs[1].foreground) == [0x7E, 0x8E, 0x50])
+}
+
+@Test func terminalCaptureFormatterDropsOSCAndOtherStrings() {
+    let formatter = TerminalCaptureFormatter(palette: .dark)
+    let rendered = formatter.render(
+        text: "x\u{1B}]0;title\u{07}y\u{1B}]8;;https://example.com\u{1B}\\z\u{1B}Pq\u{1B}[31m\u{1B}\\w\u{1B}(B\u{1B}7v"
+    )
+    #expect(String(rendered.characters) == "xyzwv")
+    #expect(captureRuns(rendered).count == 1)
+}
+
+@Test func terminalCaptureFormatterNormalizesCRLF() {
+    let formatter = TerminalCaptureFormatter(palette: .dark)
+    #expect(String(formatter.render(text: "one\r\ntwo\r\nthree\r").characters) == "one\ntwo\nthree")
+    #expect(String(formatter.render(bytes: Data("a\r\n\u{1B}[1mb\r\n".utf8)).characters) == "a\nb\n")
+    #expect(sanitizeTerminalCapture("one\r\ntwo") == "one\ntwo")
+}
+
+@Test func terminalCaptureFormatterHandlesReverseDimUnderlineAndItalic() {
+    let formatter = TerminalCaptureFormatter(palette: .dark)
+    let rendered = formatter.render(
+        text: "\u{1B}[7mrev\u{1B}[27m\u{1B}[2mdim\u{1B}[22m\u{1B}[4mline\u{1B}[24m\u{1B}[3mit\u{1B}[9mstr"
+            + "\u{1B}[0m\u{1B}[4:3mcurly\u{1B}[4:0moff\u{1B}[31;7mswap"
+    )
+    let runs = captureRuns(rendered)
+    #expect(runs.map(\.text) == ["rev", "dim", "line", "it", "str", "curly", "off", "swap"])
+
+    #expect(srgb(runs[0].foreground) == [0x21, 0x21, 0x21])
+    #expect(srgb(runs[0].background) == [0xD0, 0xD0, 0xD0])
+
+    #expect(srgb(runs[1].foreground) == [0xD0, 0xD0, 0xD0])
+    #expect(alpha(runs[1].foreground).map { abs($0 - 0.6) < 0.01 } == true)
+    #expect(runs[1].background == nil)
+
+    #expect(runs[2].underline == .single)
+    #expect(runs[2].foreground == nil)
+
+    #expect(runs[3].intent == .emphasized)
+    #expect(runs[3].strikethrough == nil)
+
+    #expect(runs[4].intent == .emphasized)
+    #expect(runs[4].strikethrough == .single)
+
+    #expect(runs[5].underline == .single)
+    #expect(runs[6].underline == nil)
+    #expect(runs[6].foreground == nil)
+
+    #expect(srgb(runs[7].foreground) == [0x21, 0x21, 0x21])
+    #expect(srgb(runs[7].background) == [0xAC, 0x41, 0x42])
+}
+
+@Test func terminalCaptureFormatterSkipsLeadingPartialCharacter() {
+    let formatter = TerminalCaptureFormatter(palette: .dark)
+    var bytes = Data([0x80, 0xBF])
+    bytes.append(contentsOf: "ok".utf8)
+    #expect(String(formatter.render(bytes: bytes).characters) == "ok")
+    #expect(TerminalCaptureFormatter.decode(Data([0x80])) == "")
+}
+
+@Test func sanitizeTerminalCaptureMatchesFormatterPlainText() {
+    let formatter = TerminalCaptureFormatter(palette: .light)
+    let samples = [
+        "\u{1B}[31mred\u{1B}[0m\r\n\u{1B}]0;t\u{07}tab\there\u{07}\u{1B}(B\u{85}\u{7F}!",
+        "no controls at all",
+        "\u{1B}[38;2;1;2;3mtrue\u{1B}[m color\u{1B}[K\u{1B}[?1049h",
+        "trailing escape\u{1B}",
+        "unterminated \u{1B}]2;title",
+    ]
+    for sample in samples {
+        #expect(sanitizeTerminalCapture(sample) == String(formatter.render(text: sample).characters))
+    }
+    #expect(sanitizeTerminalCapture(samples[0]) == "red\ntab\there!")
+    #expect(sanitizeTerminalCapture(samples[2]) == "true color")
+    #expect(sanitizeTerminalCapture(samples[3]) == "trailing escape")
+    #expect(sanitizeTerminalCapture(samples[4]) == "unterminated ")
+}
+
+@Test func terminalCapturePaletteResolvesIndexedColors() {
+    #expect(TerminalCapturePalette.dark.ansi.count == 16)
+    #expect(TerminalCapturePalette.light.ansi.count == 16)
+    #expect(srgb(TerminalCapturePalette.dark.color(for: .indexed(15))) == [0xF5, 0xF5, 0xF5])
+    #expect(srgb(TerminalCapturePalette.dark.color(for: .indexed(16))) == [0, 0, 0])
+    #expect(srgb(TerminalCapturePalette.dark.color(for: .indexed(231))) == [255, 255, 255])
+    #expect(srgb(TerminalCapturePalette.dark.color(for: .indexed(232))) == [8, 8, 8])
+    #expect(srgb(TerminalCapturePalette.dark.color(for: .indexed(255))) == [238, 238, 238])
+    #expect(srgb(TerminalCapturePalette.dark.color(for: .indexed(21))) == [0, 0, 255])
+    #expect(srgb(TerminalCapturePalette.light.color(for: .rgb(9, 8, 7))) == [9, 8, 7])
+}
+
+// MARK: - Explore tree highlight (workbench peer)
+
+@Test
+func exploreTreeHighlightsOnlyTheActiveEditorRow() {
+    let paneA = MuxaWatchPaneIdentity(hostAlias: "local", socket: "default", paneID: "%1")
+    let sessionA = MuxaWatchSessionIdentity(hostAlias: "local", socket: "default", sessionID: "$1")
+    let sessionB = MuxaWatchSessionIdentity(hostAlias: "local", socket: "default", sessionID: "$2")
+    // Session B is the active editor while pane A, in session A, is still the
+    // followed pane. Only session B may look selected.
+    let selection = WatchTreeSelection(editor: .fleetSession(sessionB), followedPane: paneA)
+
+    #expect(selection.highlight(for: .fleetSession(sessionB), containsFollowedPane: false) == .selected)
+    #expect(selection.highlight(for: .fleetSession(sessionA), containsFollowedPane: true) == .idle)
+    #expect(selection.highlight(for: .pane(paneA), containsFollowedPane: true) == .idle)
+    #expect(selection.highlight(for: .host("local"), containsFollowedPane: true) == .idle)
+    #expect(!selection.showsFollowedPath)
+}
+
+@Test
+func exploreTreeMarksFollowedPaneOnlyForPaneFollowingEditors() {
+    let paneA = MuxaWatchPaneIdentity(hostAlias: "local", socket: "default", paneID: "%1")
+    let paneB = MuxaWatchPaneIdentity(hostAlias: "local", socket: "default", paneID: "%2")
+    let sessionA = MuxaWatchSessionIdentity(hostAlias: "local", socket: "default", sessionID: "$1")
+
+    let liveWatch = WatchTreeSelection(editor: .watch, followedPane: paneA)
+    #expect(liveWatch.showsFollowedPath)
+    #expect(liveWatch.highlight(for: .pane(paneA), containsFollowedPane: true) == .followed)
+    #expect(liveWatch.highlight(for: .fleetSession(sessionA), containsFollowedPane: true) == .followed)
+    #expect(liveWatch.highlight(for: .host("remote"), containsFollowedPane: false) == .idle)
+
+    let paneEditor = WatchTreeSelection(editor: .pane(paneA), followedPane: paneA)
+    #expect(paneEditor.highlight(for: .pane(paneA), containsFollowedPane: true) == .selected)
+    #expect(paneEditor.highlight(for: .fleetSession(sessionA), containsFollowedPane: true) == .followed)
+    #expect(paneEditor.highlight(for: .pane(paneB), containsFollowedPane: false) == .idle)
+
+    let otherPaneEditor = WatchTreeSelection(editor: .pane(paneB), followedPane: paneA)
+    #expect(!otherPaneEditor.showsFollowedPath)
+    #expect(otherPaneEditor.highlight(for: .pane(paneA), containsFollowedPane: true) == .idle)
+
+    let workBoard = WatchTreeSelection(editor: .workBoard, followedPane: paneA)
+    #expect(workBoard.highlight(for: .pane(paneA), containsFollowedPane: true) == .idle)
+    #expect(workBoard.highlight(for: .fleetSession(sessionA), containsFollowedPane: true) == .idle)
+}
+
+// MARK: - Workbench tab restore (workbench peer)
+
+@Test @MainActor
+func workbenchRestoresPreviewTabAsPreview() throws {
+    let suite = "dev.muxa.tests.workbench.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let key = "tabs"
+    let pane = MuxaWatchPaneIdentity(hostAlias: "local", socket: "default", paneID: "%3")
+    let tabs = MuxaWorkbenchTabs(persistenceKey: key, defaults: defaults)
+    tabs.openPinned(.host("host-a"))
+    tabs.openPreview(.pane(pane))
+
+    let restored = MuxaWorkbenchTabs(persistenceKey: key, defaults: defaults)
+    let group = try #require(restored.group(id: restored.focusedGroupID))
+
+    #expect(group.tabs == [.workBoard, .host("host-a"), .pane(pane)])
+    #expect(group.active == .pane(pane))
+    #expect(group.preview == .pane(pane))
+    #expect(restored.focusedSelection == .pane(pane))
+}
+
+@Test @MainActor
+func workbenchLaunchReactivationKeepsRestoredPreview() throws {
+    // Mirrors ContentView at launch: `.task` re-activates the focused editor,
+    // then a refresh may reconcile the selection back to the Work board, which
+    // `onChange(of: sidebarSelection)` opens as a preview.
+    let suite = "dev.muxa.tests.workbench.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let key = "tabs"
+    let pane = MuxaWatchPaneIdentity(hostAlias: "local", socket: "default", paneID: "%3")
+    MuxaWorkbenchTabs(persistenceKey: key, defaults: defaults).openPreview(.pane(pane))
+
+    let tabs = MuxaWorkbenchTabs(persistenceKey: key, defaults: defaults)
+    let model = AppModel()
+    model.activateEditor(tabs.focusedSelection)
+    #expect(model.sidebarSelection == tabs.focusedSelection)
+
+    model.select(.workBoard)
+    if let selection = model.sidebarSelection, tabs.focusedSelection != selection {
+        tabs.openPreview(selection)
+    }
+    let group = try #require(tabs.group(id: tabs.focusedGroupID))
+
+    #expect(group.active == .workBoard)
+    #expect(group.tabs == [.workBoard, .pane(pane)])
+    #expect(group.preview == .pane(pane))
 }

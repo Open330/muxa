@@ -203,11 +203,11 @@ struct WorkCommandCenterView: View {
                     CommandCenterMetric(title: "Managed Work", value: model.workGroups.count, color: .accentColor)
                     CommandCenterMetric(title: "Working Agents", value: workingCount, color: .blue)
                     CommandCenterMetric(title: "Needs Attention", value: attentionCount, color: .orange)
-                    CommandCenterMetric(title: "Fleet Hosts", value: model.fleetHosts.count, color: .mint)
+                    CommandCenterMetric(title: "Hosts", value: model.fleetHosts.count, color: .mint)
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Fleet scope")
+                    Text("Hosts")
                         .font(.title2.weight(.semibold))
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 10) {
@@ -445,7 +445,7 @@ private struct FleetPaneWorkspace: View {
                     stopAttach: stopPanelAttach,
                     sessionExited: panelSessionExited
                 )
-                .frame(minHeight: 220, idealHeight: 360)
+                .frame(minHeight: 200, idealHeight: 360)
             }
         }
         .onDisappear(perform: stopPanelAttach)
@@ -661,7 +661,7 @@ struct MuxaAskView: View {
             VStack(alignment: .leading, spacing: 7) {
                 AskComposerEditor(
                     text: $prompt,
-                    placeholder: "Ask about work across your fleet…"
+                    placeholder: "Ask about work across your hosts…"
                 )
                 .frame(minHeight: 72, maxHeight: 112)
                 .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
@@ -1106,7 +1106,7 @@ private struct AskHistoryCard: View {
                     HStack(spacing: 8) {
                         ProgressView()
                             .controlSize(.small)
-                        Text("Waiting for (providerTitle)…")
+                        Text("Waiting for \(providerTitle)…")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
@@ -1192,13 +1192,17 @@ struct MuxaOperatorInboxView: View {
     @State private var search = ""
     @State private var selectedMessageID: String?
     @State private var compactShowingDetail = false
+    @State private var showingHostFailureDetails = false
 
     private var visibleMessages: [MuxaOperatorMessage] {
-        model.operatorMessages.filter { message in
+        let filtered = model.operatorMessages.filter { message in
+            // Waiting shows only requests the agent can still answer; a
+            // blocked/declined/failed request without a reply is an operator
+            // decision and lives under Needs Action instead.
             let scopeMatches = switch scope {
             case .all: true
             case .replies: message.request.reply != nil
-            case .waiting: message.needsReply
+            case .waiting: message.isAwaitingAgentReply
             case .action: message.needsHumanDecision
             case .ask: false
             }
@@ -1218,6 +1222,11 @@ struct MuxaOperatorInboxView: View {
                 $0.localizedCaseInsensitiveContains(search)
             }
         }
+        // Needs Action is a queue: unread decisions first, then the most
+        // recently changed conversation. Other scopes keep the model's
+        // sent-time order so the list does not reorder while reading.
+        guard scope == .action else { return filtered }
+        return filtered.sorted(by: MuxaOperatorMessage.needsActionOrder)
     }
 
     private var visibleAsk: [MuxaAskEntry] {
@@ -1236,7 +1245,7 @@ struct MuxaOperatorInboxView: View {
     }
 
     private var waitingReplies: Int {
-        model.operatorMessages.lazy.filter(\.needsReply).count
+        model.operatorMessages.lazy.filter(\.isAwaitingAgentReply).count
     }
 
     private var humanDecisions: Int {
@@ -1280,6 +1289,10 @@ struct MuxaOperatorInboxView: View {
             }
             .padding(10)
 
+            if let summary = model.inboxHostFailureSummary {
+                inboxHostFailureLine(summary)
+            }
+
             if let error = model.inboxError {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
@@ -1304,6 +1317,52 @@ struct MuxaOperatorInboxView: View {
             compactShowingDetail = false
             reconcileMessageSelection()
         }
+    }
+
+    /// One compact advisory line for hosts whose most recent mailbox read
+    /// failed. The list below still shows the last messages received from
+    /// them, so this never replaces the list. The full per-host reasons are
+    /// available as a tooltip and behind the chevron.
+    private func inboxHostFailureLine(_ summary: String) -> some View {
+        let details = MuxaInboxHostFailureText.details(model.inboxHostFailures)
+        return VStack(alignment: .leading, spacing: 4) {
+            Button {
+                showingHostFailureDetails.toggle()
+            } label: {
+                HStack(spacing: 6) {
+                    Label(summary, systemImage: "wifi.exclamationmark")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                    Image(systemName: showingHostFailureDetails ? "chevron.down" : "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text("Showing their last known messages")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(details.joined(separator: "\n"))
+            .accessibilityLabel("Unreachable hosts")
+            .accessibilityValue(summary)
+
+            if showingHostFailureDetails {
+                ForEach(details, id: \.self) { line in
+                    Text(line)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                        .padding(.leading, 22)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func inboxMetric(_ label: String, _ value: Int, color: Color) -> some View {
@@ -1540,7 +1599,16 @@ private struct OperatorMessageRow: View {
                     (message.hasUnreadReply ? Color.orange : Color.primary).opacity(0.06),
                     in: RoundedRectangle(cornerRadius: 8)
                 )
-            } else if request.expectsReply {
+            } else if message.needsHumanDecision {
+                // The request itself is blocked/declined/failed and no reply
+                // will arrive, so name the decision instead of a wait.
+                Label(
+                    "Needs your decision: \(inboxStatusTitle(request.status))",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.callout)
+                .foregroundStyle(.red)
+            } else if message.isAwaitingAgentReply {
                 Label("Waiting for this agent to reply", systemImage: "clock")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -1665,7 +1733,17 @@ private struct OperatorMessageDetail: View {
                             source: reply.body,
                             tint: message.hasUnreadReply ? .orange : .green
                         )
-                    } else if request.expectsReply {
+                    } else if message.needsHumanDecision {
+                        Label(
+                            "Needs your decision: \(inboxStatusTitle(request.status)). The agent will not reply to this request.",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.red)
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.red.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                    } else if message.isAwaitingAgentReply {
                         Label("Waiting for this agent to reply", systemImage: "clock")
                             .font(.subheadline.weight(.medium))
                             .foregroundStyle(.secondary)
@@ -1716,11 +1794,12 @@ private struct OperatorMessageDetailSection: View {
 }
 
 private func inboxPreview(_ value: String) -> String {
-    value
-        .replacingOccurrences(of: "\r", with: " ")
-        .replacingOccurrences(of: "\n", with: " ")
-        .split(whereSeparator: \.isWhitespace)
-        .joined(separator: " ")
+    MuxaMarkdownText.previewText(markdown: value)
+}
+
+/// "waiting_reply" -> "Waiting Reply", matching the status pill wording.
+private func inboxStatusTitle(_ status: String) -> String {
+    status.replacingOccurrences(of: "_", with: " ").capitalized
 }
 
 private func compactInboxTimestamp(_ value: String) -> String {
@@ -2076,7 +2155,7 @@ struct HostRegistrationView: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Register Fleet Host")
+                    Text("Register Host")
                         .font(.title2.weight(.semibold))
                     Text("Add an OpenSSH target to Muxa's central host inventory.")
                         .foregroundStyle(.secondary)
@@ -2273,7 +2352,7 @@ private struct WatchLivePanePanel: View {
                 .background(MuxaSurfacePalette.sidebar(for: colorScheme))
             }
         }
-        .frame(maxWidth: .infinity, minHeight: 190, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
         .overlay {
             Rectangle()
@@ -2282,11 +2361,74 @@ private struct WatchLivePanePanel: View {
     }
 }
 
+/// How strongly one Explore tree row is highlighted. Only the row that matches
+/// the active editor (`sidebarSelection`) is `selected`; the path down to the
+/// followed pane (`watchSelection`) is a lighter `followed` marker.
+enum WatchTreeHighlight: Equatable {
+    case selected
+    case followed
+    case idle
+}
+
+/// The two selections the Explore tree reflects, and the rule for combining
+/// them so that a row never looks selected because of a stale pane choice.
+struct WatchTreeSelection: Equatable {
+    let editor: MuxaSidebarSelection?
+    let followedPane: MuxaWatchPaneIdentity?
+
+    /// The followed pane path is only meaningful while the active editor
+    /// follows that pane: the Live Watch tool or the pane's own editor.
+    var showsFollowedPath: Bool {
+        switch editor {
+        case .watch: true
+        case .pane(let id): id == followedPane
+        default: false
+        }
+    }
+
+    func highlight(
+        for row: MuxaSidebarSelection,
+        containsFollowedPane: Bool
+    ) -> WatchTreeHighlight {
+        if editor == row { return .selected }
+        if showsFollowedPath, containsFollowedPane { return .followed }
+        return .idle
+    }
+}
+
+/// Explore row fill: a strong accent for the active editor row, a lighter
+/// tint for the followed pane path, otherwise `idle`.
+private func watchHighlightFill(
+    _ highlight: WatchTreeHighlight,
+    selected: Double = 0.18,
+    idle: Color = .clear
+) -> Color {
+    switch highlight {
+    case .selected: Color.accentColor.opacity(selected)
+    case .followed: Color.accentColor.opacity(0.06)
+    case .idle: idle
+    }
+}
+
+/// Thin leading accent bar that marks the followed pane without reading as a
+/// selection. It never participates in hit testing.
+private struct WatchFollowedMarker: View {
+    let highlight: WatchTreeHighlight
+
+    var body: some View {
+        if highlight == .followed {
+            Capsule()
+                .fill(Color.accentColor.opacity(0.65))
+                .frame(width: 3)
+                .padding(.vertical, 9)
+                .allowsHitTesting(false)
+        }
+    }
+}
+
 struct WatchHostTree: View {
     let group: MuxaWatchHost
-    let selectedPaneID: MuxaWatchPaneIdentity?
-    let selectedHostAlias: String?
-    let selectedSessionID: MuxaWatchSessionIdentity?
+    let selection: WatchTreeSelection
     let selectHost: (String) -> Void
     let selectSession: (MuxaWatchSessionIdentity) -> Void
     let openPinnedSession: (MuxaWatchSessionIdentity) -> Void
@@ -2297,7 +2439,7 @@ struct WatchHostTree: View {
     @State private var manualExpansion: Bool?
 
     private var containsSelection: Bool {
-        selectedPaneID.map { selected in
+        selection.followedPane.map { selected in
             group.sessions.contains { session in
                 session.windows.contains { window in
                     window.panes.contains { $0.id == selected }
@@ -2344,17 +2486,21 @@ struct WatchHostTree: View {
                 )
             }
             .background(
-                selectedHostAlias == group.host.alias
-                    ? Color.accentColor.opacity(0.14)
-                    : expanded ? Color.primary.opacity(0.035) : Color.clear
+                watchHighlightFill(
+                    selection.highlight(
+                        for: .host(group.host.alias),
+                        containsFollowedPane: containsSelection
+                    ),
+                    selected: 0.14,
+                    idle: expanded ? Color.primary.opacity(0.035) : Color.clear
+                )
             )
 
             if expanded {
                 ForEach(group.sessions) { session in
                     WatchSessionTree(
                         session: session,
-                        selectedPaneID: selectedPaneID,
-                        selectedSessionID: selectedSessionID,
+                        selection: selection,
                         selectSession: selectSession,
                         openPinnedSession: openPinnedSession,
                         selectPane: selectPane,
@@ -2370,8 +2516,7 @@ struct WatchHostTree: View {
 
 private struct WatchSessionTree: View {
     let session: MuxaWatchSession
-    let selectedPaneID: MuxaWatchPaneIdentity?
-    let selectedSessionID: MuxaWatchSessionIdentity?
+    let selection: WatchTreeSelection
     let selectSession: (MuxaWatchSessionIdentity) -> Void
     let openPinnedSession: (MuxaWatchSessionIdentity) -> Void
     let selectPane: (MuxaWatchPaneIdentity) -> Void
@@ -2381,15 +2526,18 @@ private struct WatchSessionTree: View {
     @State private var manualExpansion: Bool?
 
     private var selectedPath: Bool {
-        selectedPaneID.map { selected in
+        selection.followedPane.map { selected in
             session.windows.contains { window in
                 window.panes.contains { $0.id == selected }
             }
         } ?? false
     }
 
-    private var selected: Bool {
-        selectedSessionID == session.identity
+    private var highlight: WatchTreeHighlight {
+        selection.highlight(
+            for: .fleetSession(session.identity),
+            containsFollowedPane: selectedPath
+        )
     }
 
     private var expanded: Bool {
@@ -2446,18 +2594,17 @@ private struct WatchSessionTree: View {
                     }
                 )
             }
-            .background(
-                selected
-                    ? Color.accentColor.opacity(0.18)
-                    : selectedPath ? Color.accentColor.opacity(0.08) : Color.clear
-            )
+            .background(watchHighlightFill(highlight))
 
             if expanded {
                 if let singleWindow {
                     ForEach(singleWindow.panes) { pane in
                         WatchPaneRow(
                             pane: pane,
-                            selected: selectedPaneID == pane.id,
+                            highlight: selection.highlight(
+                                for: .pane(pane.id),
+                                containsFollowedPane: selection.followedPane == pane.id
+                            ),
                             depth: 2,
                             selectPane: selectPane,
                             openPinnedPane: openPinnedPane
@@ -2467,7 +2614,7 @@ private struct WatchSessionTree: View {
                     ForEach(session.windows) { window in
                         WatchWindowTree(
                             window: window,
-                            selectedPaneID: selectedPaneID,
+                            selection: selection,
                             selectPane: selectPane,
                             openPinnedPane: openPinnedPane,
                             forceExpanded: forceExpanded,
@@ -2482,7 +2629,7 @@ private struct WatchSessionTree: View {
 
 private struct WatchWindowTree: View {
     let window: MuxaWatchWindow
-    let selectedPaneID: MuxaWatchPaneIdentity?
+    let selection: WatchTreeSelection
     let selectPane: (MuxaWatchPaneIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
     let forceExpanded: Bool
@@ -2490,7 +2637,7 @@ private struct WatchWindowTree: View {
     @State private var manualExpansion: Bool?
 
     private var containsSelection: Bool {
-        selectedPaneID.map { selected in window.panes.contains { $0.id == selected } } ?? false
+        selection.followedPane.map { selected in window.panes.contains { $0.id == selected } } ?? false
     }
 
     private var expanded: Bool {
@@ -2535,13 +2682,23 @@ private struct WatchWindowTree: View {
                     }
                 )
             }
-            .background(containsSelection ? Color.accentColor.opacity(0.08) : Color.clear)
+            .background(
+                watchHighlightFill(
+                    selection.highlight(
+                        for: .fleetWindow(window.identity),
+                        containsFollowedPane: containsSelection
+                    )
+                )
+            )
 
             if expanded {
                 ForEach(window.panes) { pane in
                     WatchPaneRow(
                         pane: pane,
-                        selected: selectedPaneID == pane.id,
+                        highlight: selection.highlight(
+                            for: .pane(pane.id),
+                            containsFollowedPane: selection.followedPane == pane.id
+                        ),
                         depth: 3,
                         selectPane: selectPane,
                         openPinnedPane: openPinnedPane
@@ -2554,7 +2711,7 @@ private struct WatchWindowTree: View {
 
 private struct WatchPaneRow: View {
     let pane: MuxaWatchPane
-    let selected: Bool
+    let highlight: WatchTreeHighlight
     let depth: Int
     let selectPane: (MuxaWatchPaneIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
@@ -2603,9 +2760,8 @@ private struct WatchPaneRow: View {
                 .padding(.trailing, 8)
             }
             .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
-            .background(
-                selected ? Color.accentColor.opacity(0.18) : Color.clear
-            )
+            .background(watchHighlightFill(highlight))
+            .overlay(alignment: .leading) { WatchFollowedMarker(highlight: highlight) }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -2624,7 +2780,7 @@ private struct WatchPaneRow: View {
 /// context needed to identify the pane.
 struct WatchFlatPaneRow: View {
     let pane: MuxaWatchPane
-    let selected: Bool
+    let highlight: WatchTreeHighlight
     let selectPane: (MuxaWatchPaneIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
 
@@ -2678,9 +2834,10 @@ struct WatchFlatPaneRow: View {
             .padding(.vertical, 7)
             .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
             .background(
-                selected ? Color.accentColor.opacity(0.18) : Color.clear,
+                watchHighlightFill(highlight),
                 in: RoundedRectangle(cornerRadius: 6)
             )
+            .overlay(alignment: .leading) { WatchFollowedMarker(highlight: highlight) }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -3296,7 +3453,7 @@ struct DetachedModuleView: View {
             if let pane = model.executionSnapshot.watchPane(id: id) {
                 FleetPaneModuleView(pane: pane, model: model)
             } else {
-                moduleMissing("Fleet pane is no longer available")
+                moduleMissing("This pane is no longer available")
             }
         }
     }

@@ -100,7 +100,15 @@ final class AppModel: ObservableObject {
     @Published private(set) var operatorMessages: [MuxaOperatorMessage] = []
     @Published private(set) var mailboxRevisions: [String: UInt64] = [:]
     @Published private(set) var isRefreshingInbox = false
+    /// Errors that are not tied to one host's mailbox read: opening a
+    /// conversation whose agent ended, or a failed mark-read call.
     @Published private(set) var inboxError: String?
+    /// Operator-mailbox reads that failed on their most recent attempt, keyed
+    /// by host alias. A host leaves the map as soon as one of its reads
+    /// succeeds or it is no longer registered; the messages it delivered
+    /// earlier stay in `operatorMessages` the whole time. Kept apart from
+    /// `inboxError` so one flaky SSH host cannot hide the rest of the Inbox.
+    @Published private(set) var inboxHostFailures: [String: String] = [:]
     @Published var isPresentingHostRegistration = false
     @Published private(set) var isRegisteringHost = false
     @Published private(set) var hostRegistrationError: String?
@@ -135,6 +143,11 @@ final class AppModel: ObservableObject {
 
     var agents: [MuxaAgent] { executionSnapshot.agents }
 
+    /// Compact Inbox wording for `inboxHostFailures`, shared with the sidebar.
+    var inboxHostFailureSummary: String? {
+        MuxaInboxHostFailureText.summary(inboxHostFailures)
+    }
+
     var fleetHosts: [MuxaFleetHost] { executionSnapshot.hosts }
 
     var selectedSessionID: String? {
@@ -144,6 +157,13 @@ final class AppModel: ObservableObject {
 
     init(client: MuxaIPCClient = MuxaIPCClient()) {
         self.client = client
+    }
+
+    /// Test seam. The app ingests execution snapshots through `refresh`, which
+    /// needs a live daemon; tests feed a decoded snapshot directly so inbox
+    /// refreshes have hosts to read. Not used by production code.
+    func ingestExecutionSnapshotForTesting(_ snapshot: MuxaExecutionSnapshot) {
+        executionSnapshot = snapshot
     }
 
     nonisolated static func isRunningTests(
@@ -200,6 +220,11 @@ final class AppModel: ObservableObject {
                 guard connectionGeneration == generation else { return }
                 connectionState = .connected
                 await refresh(ifGeneration: generation)
+                // The Inbox badge and sidebar counts are derived from the
+                // operator mailbox. Load it once after connecting so they are
+                // correct before the Inbox editor is ever opened; later
+                // changes arrive through per-host mailbox revision events.
+                Task { [weak self] in await self?.refreshOperatorInbox(force: true) }
                 async let events: Void = runFleetSubscription(ifGeneration: generation)
                 async let askEvents: Void = runAskSubscription(ifGeneration: generation)
                 async let pipelineEvents: Void = runPipelineSubscription(ifGeneration: generation)
@@ -921,7 +946,15 @@ final class AppModel: ObservableObject {
         await refreshOperatorInbox(force: force, hostAliases: nil)
     }
 
-    private func refreshOperatorInbox(
+    /// Reads the console mailbox of every reachable host, or only of
+    /// `hostAliases` when given. Hosts are independent: a host whose read
+    /// fails keeps the messages it delivered earlier and is recorded in
+    /// `inboxHostFailures` until a later read of that same host succeeds.
+    /// Only a full refresh prunes hosts, and only hosts that are no longer
+    /// registered at all; a registered host that is merely offline or timing
+    /// out keeps its history so a transient failure never empties its part of
+    /// the Inbox. Internal (not private) so the contract can be unit-tested.
+    func refreshOperatorInbox(
         force: Bool,
         hostAliases: Set<String>?
     ) async {
@@ -938,12 +971,18 @@ final class AppModel: ObservableObject {
         let targets = hostAliases.map { aliases in
             allTargets.filter { aliases.contains($0.host.alias) }
         } ?? allTargets
-        let liveAliases = Set(targets.map(\.host.alias))
         var messagesByHost = Dictionary(grouping: operatorMessages) { $0.host.alias }
+        var failures = inboxHostFailures
         if hostAliases == nil {
-            messagesByHost = messagesByHost.filter { liveAliases.contains($0.key) }
+            // An empty host list means the fleet snapshot itself is missing
+            // (the local host is always registered), so keep everything
+            // rather than treating that as "every host was unregistered".
+            let registered = Set(executionSnapshot.hosts.map(\.alias))
+            if !registered.isEmpty {
+                messagesByHost = messagesByHost.filter { registered.contains($0.key) }
+                failures = failures.filter { registered.contains($0.key) }
+            }
         }
-        var failures: [String] = []
 
         let results = await withTaskGroup(of: MuxaInboxFetch.self) { group in
             for target in targets {
@@ -980,8 +1019,11 @@ final class AppModel: ObservableObject {
                         request: request
                     )
                 }
+                failures[target.host.alias] = nil
             } else if let error = result.error {
-                failures.append("\(target.host.alias): \(error)")
+                // Leave messagesByHost[alias] untouched: the last successful
+                // read stays visible while the host is unreachable.
+                failures[target.host.alias] = error
             }
         }
 
@@ -994,7 +1036,7 @@ final class AppModel: ObservableObject {
                 return lhs.id < rhs.id
             }
         if operatorMessages != updatedMessages { operatorMessages = updatedMessages }
-        if !failures.isEmpty { inboxError = failures.joined(separator: "\n") }
+        if inboxHostFailures != failures { inboxHostFailures = failures }
     }
 
     func openOperatorMessage(_ message: MuxaOperatorMessage) {
@@ -1090,14 +1132,27 @@ final class AppModel: ObservableObject {
         return nil
     }
 
+    /// Marks a reply read through the durable collaboration get operation.
+    /// muxad stamps `reply_read_at` on the returned request, so it replaces
+    /// the message in place immediately (a refresh that is already in flight
+    /// would otherwise make the "New Reply" badge linger). The follow-up
+    /// refresh is limited to the message's own host instead of re-reading
+    /// every mailbox in the fleet.
     func markOperatorMessageRead(_ message: MuxaOperatorMessage) async {
         do {
-            _ = try await client.collaborationRequest(
+            let updated = try await client.collaborationRequest(
                 host: message.host,
                 pane: message.routePane,
                 requestID: message.request.id
             )
-            await refreshOperatorInbox(force: true)
+            if let index = operatorMessages.firstIndex(where: { $0.id == message.id }) {
+                operatorMessages[index] = MuxaOperatorMessage(
+                    host: message.host,
+                    routePane: message.routePane,
+                    request: updated
+                )
+            }
+            await refreshOperatorInbox(force: true, hostAliases: [message.host.alias])
         } catch {
             inboxError = error.localizedDescription
         }
@@ -1248,7 +1303,7 @@ final class AppModel: ObservableObject {
         ]
         let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         guard let value = String(data: data, encoding: .utf8) else {
-            throw MuxaIPCError.server("Could not encode the exact Fleet pane address")
+            throw MuxaIPCError.server("Could not encode the exact pane address")
         }
         return value
     }
@@ -1257,6 +1312,9 @@ final class AppModel: ObservableObject {
         // Like VS Code's Activity Bar, this changes the visible view
         // container without replacing whichever editor tab is active.
         sidebarMode = mode
+        if mode == .inbox, isConnected {
+            Task { [weak self] in await self?.refreshOperatorInbox() }
+        }
     }
 
     func selectWatchPane(_ id: MuxaWatchPaneIdentity) {

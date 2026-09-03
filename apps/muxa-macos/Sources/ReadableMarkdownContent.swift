@@ -14,6 +14,7 @@ struct ReadableMarkdownDocument: Equatable {
         case list(ordered: Bool, items: [ListItem])
         case quote(String)
         case code(language: String?, source: String)
+        case table(header: [String], rows: [[String]])
         case rule
     }
 
@@ -67,6 +68,12 @@ struct ReadableMarkdownDocument: Equatable {
                 continue
             }
 
+            if let table = table(startingAt: index, in: lines) {
+                result.append(.table(header: table.header, rows: table.rows))
+                index = table.end
+                continue
+            }
+
             if trimmed.hasPrefix(">") {
                 var quoteLines: [String] = []
                 while index < lines.count {
@@ -115,7 +122,47 @@ struct ReadableMarkdownDocument: Equatable {
             || heading(in: trimmed) != nil
             || isRule(trimmed)
             || trimmed.hasPrefix(">")
+            || trimmed.hasPrefix("|")
             || listItem(in: line) != nil
+    }
+
+    /// GitHub-style pipe table: a header row, a delimiter row such as
+    /// `|---|:--:|`, then zero or more body rows. Rows must start with `|`.
+    private static func table(
+        startingAt start: Int,
+        in lines: [String]
+    ) -> (header: [String], rows: [[String]], end: Int)? {
+        guard start + 1 < lines.count,
+              let header = tableCells(lines[start]),
+              let delimiter = tableCells(lines[start + 1]),
+              delimiter.count == header.count,
+              delimiter.allSatisfy(isTableDelimiterCell)
+        else { return nil }
+        var rows: [[String]] = []
+        var index = start + 2
+        while index < lines.count, let cells = tableCells(lines[index]) {
+            rows.append(cells)
+            index += 1
+        }
+        return (header, rows, index)
+    }
+
+    private static func tableCells(_ line: String) -> [String]? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("|") else { return nil }
+        var body = trimmed.dropFirst()
+        if body.hasSuffix("|") { body = body.dropLast() }
+        let cells = body
+            .split(separator: "|", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        return cells.isEmpty ? nil : cells
+    }
+
+    private static func isTableDelimiterCell(_ cell: String) -> Bool {
+        var body = Substring(cell)
+        if body.hasPrefix(":") { body = body.dropFirst() }
+        if body.hasSuffix(":") { body = body.dropLast() }
+        return !body.isEmpty && body.allSatisfy { $0 == "-" }
     }
 
     private static func heading(in line: String) -> (level: Int, text: String)? {
@@ -205,6 +252,8 @@ struct ReadableMarkdownContent: View {
             .padding(.vertical, 3)
         case let .code(language, source):
             ReadableCodeBlock(language: language, source: source)
+        case let .table(header, rows):
+            ReadableMarkdownTable(header: header, rows: rows)
         case .rule:
             Divider()
                 .padding(.vertical, 2)
@@ -217,6 +266,49 @@ struct ReadableMarkdownContent: View {
         case 2: .headline
         default: .subheadline.weight(.semibold)
         }
+    }
+}
+
+private struct ReadableMarkdownTable: View {
+    let header: [String]
+    let rows: [[String]]
+
+    private var columnCount: Int {
+        max(header.count, rows.map(\.count).max() ?? 0)
+    }
+
+    var body: some View {
+        Grid(alignment: .topLeading, horizontalSpacing: 16, verticalSpacing: 7) {
+            GridRow {
+                ForEach(0..<columnCount, id: \.self) { column in
+                    MarkdownContent(
+                        source: cell(header, column),
+                        font: .callout.weight(.semibold)
+                    )
+                }
+            }
+            Divider()
+                .gridCellUnsizedAxes(.horizontal)
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                GridRow {
+                    ForEach(0..<columnCount, id: \.self) { column in
+                        MarkdownContent(source: cell(row, column), font: .callout)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 7))
+        .overlay {
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(Color.primary.opacity(0.09), lineWidth: 1)
+        }
+    }
+
+    private func cell(_ row: [String], _ column: Int) -> String {
+        column < row.count ? row[column] : ""
     }
 }
 
