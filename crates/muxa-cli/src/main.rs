@@ -10,6 +10,7 @@ mod doctor;
 mod fleet_cli;
 mod fleet_watch;
 mod init;
+mod interactive_child;
 mod logs;
 mod mcp;
 mod message_skill;
@@ -2419,18 +2420,17 @@ fn jump_to_pane_tmux_key(key: &muxa::PaneKey) {
     );
     run(&["select-window", "-t", &target]);
     run(&["select-pane", "-t", pane]);
-    match muxa::tmux::tmux_command_on(socket)
-        .args([
-            "attach-session",
-            "-t",
-            key.window.session.session_id.as_str(),
-        ])
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!(
+    // Wait through a hang-up of our own terminal: the client is told to
+    // detach and the caller's `--fit` restore guards still run afterwards.
+    match interactive_child::run_interactive(muxa::tmux::tmux_command_on(socket).args([
+        "attach-session",
+        "-t",
+        key.window.session.session_id.as_str(),
+    ])) {
+        Ok(exit) if exit.is_clean_detach() => {}
+        Ok(exit) => eprintln!(
             "muxa: tmux attach-session exited with {}",
-            status
+            exit.status
                 .code()
                 .map_or_else(|| "signal".into(), |code| code.to_string())
         ),
@@ -2581,18 +2581,17 @@ fn jump_to_pane_tmux(pane_id: &str) {
         // and real session sets collide (`callabo` against `callabo-set`).
         // `.status()` waits for tmux to exit; on detach the user is back at
         // this shell prompt, which is the least-surprising behaviour.
-        match muxa::tmux::tmux_command()
-            .args([
-                "attach-session",
-                "-t",
-                session_target(&info.session_id, &info.session),
-            ])
-            .status()
-        {
-            Ok(s) if s.success() => {}
-            Ok(s) => eprintln!(
+        match interactive_child::run_interactive(muxa::tmux::tmux_command().args([
+            "attach-session",
+            "-t",
+            session_target(&info.session_id, &info.session),
+        ])) {
+            Ok(exit) if exit.is_clean_detach() => {}
+            Ok(exit) => eprintln!(
                 "muxa: tmux attach-session exited with {}",
-                s.code().map_or_else(|| "signal".into(), |c| c.to_string())
+                exit.status
+                    .code()
+                    .map_or_else(|| "signal".into(), |c| c.to_string())
             ),
             Err(e) => eprintln!("muxa: failed to spawn tmux attach-session: {e}"),
         }

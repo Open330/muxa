@@ -645,9 +645,11 @@ pub(crate) fn attach_exact(
         command.arg("--socket").arg(socket);
     }
     command.args(["fleet-remote-attach", &token]);
-    let status = command.status()?;
-    if !status.success() {
-        bail!("remote attach exited with {status}");
+    // A hang-up of our own terminal is forwarded to ssh so the remote client
+    // detaches, and `_fit_guard` then restores the remote window from here.
+    let exit = crate::interactive_child::run_interactive(&mut command)?;
+    if !exit.is_clean_detach() {
+        bail!("remote attach exited with {}", exit.status);
     }
     Ok(())
 }
