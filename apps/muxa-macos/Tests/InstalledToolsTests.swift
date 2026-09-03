@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import Muxa
@@ -33,4 +34,34 @@ import Testing
 
     #expect(InstalledTools.resolve("codex", in: [first.path, second.path]) == executable.path)
     #expect(InstalledTools.resolve("claude", in: [first.path, second.path]) == nil)
+}
+
+/// The guide must close only its own window: the lookup matches the
+/// identifier the tracker stamps, never whatever window happens to be key.
+@Test @MainActor func onboardingLooksUpItsOwnWindowByIdentifier() {
+    #expect(OnboardingPreferences.windowIdentifier == "muxa.onboarding")
+
+    let guideWindow = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: true
+    )
+    // A programmatically created NSWindow releases itself on close, which
+    // over-releases the ARC reference and crashes the test host.
+    guideWindow.isReleasedWhenClosed = false
+    guideWindow.identifier = NSUserInterfaceItemIdentifier(OnboardingPreferences.windowIdentifier)
+    defer { guideWindow.orderOut(nil) }
+
+    let other = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: true
+    )
+    other.isReleasedWhenClosed = false
+    other.identifier = NSUserInterfaceItemIdentifier("muxa.main")
+    defer { other.orderOut(nil) }
+
+    #expect(OnboardingPreferences.existingWindow() === guideWindow)
 }

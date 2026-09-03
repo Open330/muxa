@@ -11,6 +11,13 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
         super.init()
     }
 
+    /// Muxa keeps a menu-bar scene, a daemon connection, and host monitoring
+    /// alive without a window, and the workbench is reopened from the menu
+    /// bar or the Dock. Closing the last window must not quit the app.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         if UserDefaults.standard.bool(forKey: MuxaPreferences.showWorkbenchOnLaunchKey) {
             presentWorkbench(remainingAttempts: 50)

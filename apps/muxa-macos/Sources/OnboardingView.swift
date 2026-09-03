@@ -11,6 +11,8 @@ enum OnboardingPreferences {
     static let completedVersionKey = "muxa.onboarding.completedVersion"
     /// Scene id of the Welcome window (`openWindow(id:)`).
     static let windowID = "onboarding"
+    /// Identifier stamped on the guide window so it can be found again.
+    static let windowIdentifier = "muxa.onboarding"
 
     /// The running app's marketing version; "0" when the bundle has none
     /// (unit-test hosts), which keeps the comparison well defined.
@@ -72,6 +74,13 @@ enum OnboardingPreferences {
             currentVersion: currentVersion,
             completedVersion: defaults.string(forKey: completedVersionKey)
         )
+    }
+
+    /// The guide's own window, found by the identifier the tracker stamps on
+    /// it. Used when the tracked reference is gone.
+    @MainActor
+    static func existingWindow() -> NSWindow? {
+        NSApp.windows.first { $0.identifier?.rawValue == windowIdentifier }
     }
 
     static func markCompleted(version: String = currentVersion, defaults: UserDefaults = .standard) {
@@ -245,7 +254,12 @@ struct OnboardingView: View {
             footer
         }
         .frame(minWidth: 720, minHeight: 560)
-        .background(OnboardingWindowTracker { window in hostWindow = window })
+        .background(OnboardingWindowTracker { window in
+            // Keep the last known guide window: the tracker also reports nil
+            // while the view is being torn down, and a nil here used to make
+            // `finish()` close whatever window happened to be key.
+            if let window { hostWindow = window }
+        })
         .task { await detectTools() }
     }
 
@@ -299,7 +313,9 @@ struct OnboardingView: View {
         if dontShowAgain {
             OnboardingPreferences.markCompleted()
         }
-        (hostWindow ?? NSApp.keyWindow)?.close()
+        // Only ever close the guide itself. Falling back to `NSApp.keyWindow`
+        // could close the workbench, which left the app with no window.
+        (hostWindow ?? OnboardingPreferences.existingWindow())?.close()
     }
 
     private func openMainWindow() {
@@ -845,7 +861,7 @@ private final class OnboardingWindowTrackingView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if let window {
-            window.identifier = NSUserInterfaceItemIdentifier("muxa.onboarding")
+            window.identifier = NSUserInterfaceItemIdentifier(OnboardingPreferences.windowIdentifier)
             window.isRestorable = false
             window.makeKeyAndOrderFront(nil)
         }

@@ -20,7 +20,7 @@ final class QACommandHandler {
             return .success(permissions: permissionStatus())
         case "inspect":
             do {
-                let window = try await muxaWindow()
+                let window = try await muxaWindow(titled: request.window)
                 return .success(window: Self.info(for: window))
             } catch {
                 return .failure(error.localizedDescription)
@@ -30,7 +30,7 @@ final class QACommandHandler {
                 return .failure("Screen Recording permission is required")
             }
             do {
-                let window = try await muxaWindow()
+                let window = try await muxaWindow(titled: request.window)
                 let png = try await capture(window: window)
                 return .success(
                     window: Self.info(for: window),
@@ -101,7 +101,7 @@ final class QACommandHandler {
             }
             do {
                 _ = try await focusMuxa()
-                let window = try await muxaWindow()
+                let window = try await muxaWindow(titled: request.window)
                 guard x >= 0, y >= 0, x <= window.frame.width, y <= window.frame.height else {
                     return .failure("click point is outside the Muxa window")
                 }
@@ -123,7 +123,7 @@ final class QACommandHandler {
             }
             do {
                 _ = try await focusMuxa()
-                let window = try await muxaWindow()
+                let window = try await muxaWindow(titled: request.window)
                 guard x >= 0, y >= 0, x <= window.frame.width, y <= window.frame.height else {
                     return .failure("scroll point is outside the Muxa window")
                 }
@@ -154,7 +154,7 @@ final class QACommandHandler {
                     height: height
                 )
                 try await Task.sleep(for: .milliseconds(400))
-                let window = try await muxaWindow()
+                let window = try await muxaWindow(titled: request.window)
                 return .success(window: Self.info(for: window))
             } catch {
                 return .failure(error.localizedDescription)
@@ -178,16 +178,19 @@ final class QACommandHandler {
         }
     }
 
-    private func muxaWindow() async throws -> SCWindow {
+    private func muxaWindow(titled title: String? = nil) async throws -> SCWindow {
         let content = try await SCShareableContent.excludingDesktopWindows(
             false,
             onScreenWindowsOnly: true
         )
+        let wanted = title?.trimmingCharacters(in: .whitespaces) ?? ""
         let candidates = content.windows.filter { window in
             window.owningApplication?.bundleIdentifier == Self.muxaBundleIdentifier
                 && window.windowLayer == 0
                 && window.frame.width >= 200
                 && window.frame.height >= 200
+                && (wanted.isEmpty
+                    || (window.title ?? "").localizedCaseInsensitiveContains(wanted))
         }
         guard let window = candidates.max(by: {
             $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height

@@ -14,9 +14,13 @@ struct QARequest: Codable, Sendable {
     let key: String?
     /// `key` command: any of command/shift/option/control.
     let modifiers: [String]?
+    /// Optional window-title substring; the largest on-screen Muxa window
+    /// is used when absent (Settings and Welcome are separate windows).
+    let window: String?
 
     enum CodingKeys: String, CodingKey {
         case command
+        case window
         case text
         case pressReturn = "press_return"
         case x, y, width, height
@@ -35,7 +39,8 @@ struct QARequest: Codable, Sendable {
         height: Double? = nil,
         key: String? = nil,
         modifiers: [String]? = nil,
-        deltaY: Double? = nil
+        deltaY: Double? = nil,
+        window: String? = nil
     ) {
         self.command = command
         self.text = text
@@ -47,6 +52,7 @@ struct QARequest: Codable, Sendable {
         self.deltaY = deltaY
         self.key = key
         self.modifiers = modifiers
+        self.window = window
     }
 }
 

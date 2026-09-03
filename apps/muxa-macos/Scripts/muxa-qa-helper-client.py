@@ -16,6 +16,8 @@ def request(payload: dict) -> dict:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(15)
         client.connect(socket_path)
+        if WINDOW_TITLE and "window" not in payload:
+            payload = {**payload, "window": WINDOW_TITLE}
         client.sendall(json.dumps(payload, separators=(",", ":")).encode() + b"\n")
         response = bytearray()
         while b"\n" not in response:
@@ -33,8 +35,15 @@ def request(payload: dict) -> dict:
     return result
 
 
+WINDOW_TITLE = None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Control the owner-only Muxa QA Helper")
+    parser.add_argument(
+        "--window",
+        help="substring of the Muxa window title to target (default: the largest window; e.g. Settings, Welcome)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
     commands.add_parser("prompt-permissions")
@@ -79,6 +88,10 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+
+    global WINDOW_TITLE
+
+    WINDOW_TITLE = args.window
     if args.command == "prompt-permissions":
         result = request({"command": "prompt_permissions"})
     elif args.command == "capture":
