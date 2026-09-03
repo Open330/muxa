@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A Shell tab is just a terminal.** The Terminal/Raw switch, the escaped
+  hex dump behind it, and the 256 KiB byte buffer that fed it are gone.
+
 ### Fixed
+
+- **Muxa.app keeps running when its last window closes, and the Welcome
+  guide closes only itself.** Finishing the guide could close the workbench
+  instead, and the app then had no window at all; muxad, host monitoring,
+  and the menu-bar scene now outlive every window.
 
 - **`muxa fleet attach --fit` restores the tmux window when its terminal
   hangs up.** The fit guard restored window size, sizing policy, zoom, and
@@ -77,6 +87,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launch stages with the model's notes, refine it with follow-ups, then
   open it in the visual editor or save it to the library (optionally with a
   catch-all route). `agy` joins the pipeline program allowlist.
+
+- **Muxa.app speaks Korean.** Every user-facing string moved into a String
+  Catalog with a Korean translation for all 762 keys, counts use plural
+  rules instead of assembled fragments, and daemon vocabulary (host states,
+  collaboration kinds, Ask status) gets display names instead of
+  capitalized wire values. Settings › General has a Language picker
+  (System / English / 한국어) with a Relaunch button. Product names stay
+  English: Work, Explore, Inbox, Shells, Live Watch, Global Ask.
+  `Scripts/l10n-sync.py` merges an export back into the catalog and
+  `--check` (and a unit test) fails while any key lacks Korean.
 
 - **Muxa.app welcomes a first launch.** A Welcome window opens the first
   time a version runs (and from Help › Welcome Guide… or Settings ›
