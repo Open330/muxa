@@ -555,17 +555,27 @@ struct WorkCommandCenterView: View {
             .frame(maxWidth: .infinity, alignment: .top)
         }
         .background(MuxaSurfacePalette.workspace(for: colorScheme).ignoresSafeArea())
-        .task { await model.loadWorkOptions() }
+        .task { await model.loadAllWorkOptions() }
+        .onChange(of: model.workCapableHosts.map(\.alias)) { _ in
+            // The host list arrives with the first fleet snapshot, usually
+            // after this view appeared; read the newly known hosts then.
+            Task { await model.loadAllWorkOptions() }
+        }
     }
 
     private let pipelineColumns = [
         GridItem(.adaptive(minimum: 300, maximum: 460), spacing: 12, alignment: .top),
     ]
 
-    /// Host whose config the Pipelines section shows; "" is the local host.
-    @State private var pipelinesHost = ""
+    /// Host whose routes the Routes editor shows; "" is the local host.
+    /// Pipelines are one library kept in sync across hosts; routes carry
+    /// host-specific folders, so they stay per host.
+    @State private var routesHost = ""
+    @State private var syncingPipelines = Set<String>()
+    @State private var syncFailures: [String: String] = [:]
 
-    private var pipelinesHostAlias: String? { pipelinesHost.isEmpty ? nil : pipelinesHost }
+    private var routesHostAlias: String? { routesHost.isEmpty ? nil : routesHost }
+    private var pipelinesHostAlias: String? { nil }
 
     /// `muxa work init` opens a local Shell tab, so only the local host gets it.
     private var describeWithAgentAction: (() -> Void)? {
@@ -573,17 +583,18 @@ struct WorkCommandCenterView: View {
         return { Task { await model.configureWork(cwd: nil) } }
     }
 
-    /// The configured pipelines drawn as launchable presets. This is where a
-    /// GUI earns its place over the CLI: the stage picture is visible before
-    /// a single agent exists, and an empty config offers muxa's built-in
-    /// presets instead of an error.
+    /// The pipeline library drawn as launchable presets. This is where a GUI
+    /// earns its place over the CLI: the stage picture is visible before a
+    /// single agent exists, every control host shows whether it carries the
+    /// same definition, and an empty config offers muxa's built-in presets
+    /// instead of an error.
     @ViewBuilder
     private var pipelinesSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text("Pipelines")
                     .font(.title2.weight(.semibold))
-                if let path = model.workOptions(for: pipelinesHostAlias)?.configPath {
+                if let path = model.workOptions?.configPath {
                     Text(path)
                         .font(.caption2.monospaced())
                         .foregroundStyle(.tertiary)
@@ -595,43 +606,39 @@ struct WorkCommandCenterView: View {
                 if model.isLoadingWorkOptions {
                     ProgressView().controlSize(.small)
                 }
+                if libraryNeedsSync {
+                    Button {
+                        syncAll()
+                    } label: {
+                        Label("Sync All to Hosts", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!syncingPipelines.isEmpty)
+                    .help("Write every library pipeline to the hosts where it is missing or differs")
+                }
                 Button {
-                    model.presentPipelineEditor(host: pipelinesHostAlias, pipeline: nil)
+                    model.presentPipelineEditor(host: nil, pipeline: nil)
                 } label: {
                     Label("New Pipeline…", systemImage: "plus")
                 }
                 .buttonStyle(.borderless)
-                .disabled(model.workOptions(for: pipelinesHostAlias) == nil)
+                .disabled(model.workOptions == nil)
                 Button {
-                    Task { await model.loadWorkOptions(host: pipelinesHostAlias) }
+                    Task { await model.loadAllWorkOptions() }
                 } label: {
                     Label("Reload", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.borderless)
-                .help("Re-read routes and pipelines from the muxa config")
+                .help("Re-read pipelines and routes from every host")
             }
 
-            if model.workCapableHosts.count > 1 {
-                Picker("Host", selection: $pipelinesHost) {
-                    ForEach(model.workCapableHosts) { candidate in
-                        Text(candidate.local ? "\(candidate.alias) (this Mac)" : candidate.alias)
-                            .tag(candidate.local ? "" : candidate.alias)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: 560, alignment: .leading)
-                .onChange(of: pipelinesHost) { selected in
-                    Task { await model.loadWorkOptions(host: selected.isEmpty ? nil : selected) }
-                }
-                if pipelinesHostAlias != nil, !model.supportsHostWorkCommands {
-                    Label(
-                        "Reading or editing pipelines on \(pipelinesHost) needs the updated muxad on this Mac (Use Bundled muxad).",
-                        systemImage: "exclamationmark.triangle"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                }
+            if model.workCapableHosts.count > 1, !model.supportsHostWorkCommands {
+                Label(
+                    "Host sync needs the updated muxad on this Mac (Settings › Runtime › Reload Bundled muxad).",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
             }
 
             if let options = model.workOptions(for: pipelinesHostAlias) {
@@ -653,13 +660,25 @@ struct WorkCommandCenterView: View {
                             WorkPipelineCard(
                                 pipeline: pipeline,
                                 routes: options.routes.filter { $0.pipeline == pipeline.name },
-                                start: { model.presentWorkStart(pipeline: pipeline.name, host: pipelinesHostAlias) },
-                                edit: { model.presentPipelineEditor(host: pipelinesHostAlias, pipeline: pipeline) }
+                                start: { model.presentWorkStart(pipeline: pipeline.name) },
+                                edit: { model.presentPipelineEditor(host: nil, pipeline: pipeline) },
+                                hostStates: model.pipelineHostStates(for: pipeline),
+                                sync: { sync(pipeline) },
+                                syncing: syncingPipelines.contains(pipeline.name)
                             )
                         }
                     }
-                    WorkRoutesEditor(options: options, host: pipelinesHostAlias, model: model)
-                    if let error = model.workOptionsError(for: pipelinesHostAlias) {
+                    remoteOnlyPipelinesRow
+                    if !syncFailures.isEmpty {
+                        ForEach(syncFailures.keys.sorted(), id: \.self) { key in
+                            Label("\(key): \(syncFailures[key] ?? "")", systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    routesSection
+                    if let error = model.workOptionsError {
                         Label(error, systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
                             .foregroundStyle(.orange)
@@ -681,6 +700,105 @@ struct WorkCommandCenterView: View {
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            }
+        }
+    }
+
+    private var libraryNeedsSync: Bool {
+        (model.workOptions?.pipelines ?? []).contains { pipeline in
+            model.pipelineHostStates(for: pipeline).contains(where: \.needsSync)
+        }
+    }
+
+    private func sync(_ pipeline: MuxaWorkOptions.Pipeline) {
+        guard !syncingPipelines.contains(pipeline.name) else { return }
+        syncingPipelines.insert(pipeline.name)
+        Task {
+            let failures = await model.syncPipeline(pipeline)
+            syncFailures = syncFailures.filter { !$0.key.hasSuffix("/\(pipeline.name)") }
+            for (host, error) in failures { syncFailures["\(host)/\(pipeline.name)"] = error }
+            syncingPipelines.remove(pipeline.name)
+        }
+    }
+
+    private func syncAll() {
+        let names = (model.workOptions?.pipelines ?? []).map(\.name)
+        syncingPipelines.formUnion(names)
+        Task {
+            syncFailures = await model.syncAllPipelines()
+            syncingPipelines.subtract(names)
+        }
+    }
+
+    /// Pipelines that only exist on some host: pull one into the library
+    /// (this Mac's config) so it can be synced everywhere.
+    @ViewBuilder
+    private var remoteOnlyPipelinesRow: some View {
+        let remoteOnly = model.remoteOnlyPipelines
+        if !remoteOnly.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Only on other hosts")
+                    .font(.headline)
+                ForEach(Array(remoteOnly.enumerated()), id: \.offset) { _, entry in
+                    HStack(spacing: 10) {
+                        Text(entry.pipeline.name)
+                            .font(.callout.weight(.medium))
+                        Text("on \(entry.host)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        PipelineStagesView(agents: entry.pipeline.agents, compact: true)
+                            .frame(maxWidth: 420)
+                        Spacer(minLength: 4)
+                        Button {
+                            Task {
+                                _ = await model.savePipeline(
+                                    MuxaPipelineDefinition(entry.pipeline),
+                                    named: entry.pipeline.name,
+                                    host: nil
+                                )
+                            }
+                        } label: {
+                            Label("Add to Library", systemImage: "square.and.arrow.down")
+                        }
+                        .controlSize(.small)
+                        .disabled(model.isSavingPipeline)
+                        .help("Copy this pipeline into this Mac's config so it can be synced to every host")
+                    }
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
+    /// Routes are host-specific (they carry folders and workspaces on that
+    /// host), so the editor keeps its own host switcher.
+    @ViewBuilder
+    private var routesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if model.workCapableHosts.count > 1 {
+                Picker("Routes on", selection: $routesHost) {
+                    ForEach(model.workCapableHosts) { candidate in
+                        Text(candidate.local ? "\(candidate.alias) (this Mac)" : candidate.alias)
+                            .tag(candidate.local ? "" : candidate.alias)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 560, alignment: .leading)
+            }
+            if let options = model.workOptions(for: routesHostAlias) {
+                WorkRoutesEditor(options: options, host: routesHostAlias, model: model)
+            } else if let error = model.workOptionsError(for: routesHostAlias) {
+                Label("\(routesHost): \(error)", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+            } else {
+                Text("Reading routes on \(routesHost)…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }

@@ -276,6 +276,91 @@ import Testing
     #expect(!MuxaWorkRouteEdit().existing)
 }
 
+@Test func pipelineSyncStateComparesLibraryAgainstEachHost() {
+    let library = MuxaWorkOptions.Pipeline(
+        name: "pair",
+        description: "implementer → reviewer",
+        agents: [
+            MuxaWorkOptions.Agent(alias: "impl", program: "claude", role: "implementer"),
+            MuxaWorkOptions.Agent(alias: "review", program: "codex", after: ["impl"]),
+        ]
+    )
+    let same = MuxaWorkOptions(pipelines: [library])
+    let renamedRole = MuxaWorkOptions(pipelines: [MuxaWorkOptions.Pipeline(
+        name: "pair",
+        description: "implementer → reviewer",
+        agents: [
+            MuxaWorkOptions.Agent(alias: "impl", program: "claude", role: "builder"),
+            MuxaWorkOptions.Agent(alias: "review", program: "codex", after: ["impl"]),
+        ]
+    )])
+    let other = MuxaWorkOptions(pipelines: [MuxaWorkOptions.Pipeline(name: "solo", agents: [
+        MuxaWorkOptions.Agent(alias: "claude", program: "claude"),
+    ])])
+
+    #expect(MuxaPipelineSyncState.compare(library: library, hostOptions: same) == .inSync)
+    #expect(MuxaPipelineSyncState.compare(library: library, hostOptions: renamedRole) == .differs)
+    #expect(MuxaPipelineSyncState.compare(library: library, hostOptions: other) == .missing)
+    #expect(MuxaPipelineSyncState.compare(library: library, hostOptions: nil) == .unavailable)
+    #expect(MuxaPipelineHostState(host: "dev", state: .missing).needsSync)
+    #expect(!MuxaPipelineHostState(host: "dev", state: .inSync).needsSync)
+}
+
+/// A TOML multi-line prompt ends in a newline on the host it was written on;
+/// the copy the app writes elsewhere must still count as the same pipeline.
+@Test func pipelineSyncIgnoresRoundTripWhitespace() throws {
+    let library = MuxaWorkOptions.Pipeline(
+        name: "pair",
+        prompt: "Shared.\n",
+        agents: [
+            MuxaWorkOptions.Agent(alias: "impl", program: "claude", role: "implementer", prompt: "Own it.\n"),
+            MuxaWorkOptions.Agent(alias: "review", program: "codex", after: ["impl"]),
+        ]
+    )
+    let trimmedCopy = MuxaWorkOptions(pipelines: [MuxaWorkOptions.Pipeline(
+        name: "pair",
+        prompt: "Shared.",
+        agents: [
+            MuxaWorkOptions.Agent(alias: "Impl", program: "claude", role: "implementer ", prompt: "Own it."),
+            MuxaWorkOptions.Agent(alias: "review", program: "codex", after: ["impl"]),
+        ]
+    )])
+    #expect(MuxaPipelineSyncState.compare(library: library, hostOptions: trimmedCopy) == .inSync)
+
+    // The JSON handed to `pipeline set` keeps the prompt verbatim, so a host
+    // that already has the trailing newline reads back identical.
+    let json = try MuxaPipelineDefinition(library).jsonString()
+    let decoded = try JSONDecoder().decode(MuxaPipelineDefinition.self, from: Data(json.utf8))
+    #expect(decoded.agents[0].prompt == "Own it.\n")
+    #expect(decoded.prompt == "Shared.\n")
+}
+
+/// `direction = "right"` in a host's TOML is the CLI default; the editor's
+/// picker must show it as such rather than an empty selection, and sync must
+/// not report it as a difference.
+@Test func pipelineDefinitionCanonicalizesSplitDirections() {
+    #expect(MuxaPipelineDefinition.Agent.canonicalDirection("right") == "")
+    #expect(MuxaPipelineDefinition.Agent.canonicalDirection(" Horizontal ") == "")
+    #expect(MuxaPipelineDefinition.Agent.canonicalDirection("vertical") == "down")
+    #expect(MuxaPipelineDefinition.Agent.canonicalDirection("down") == "down")
+    #expect(MuxaPipelineDefinition.Agent.canonicalDirection("sideways") == "sideways")
+
+    let explicit = MuxaWorkOptions.Pipeline(name: "pair", agents: [
+        MuxaWorkOptions.Agent(alias: "impl", program: "claude", direction: "right"),
+        MuxaWorkOptions.Agent(alias: "review", program: "codex", direction: "vertical", after: ["impl"]),
+    ])
+    let implicit = MuxaWorkOptions(pipelines: [MuxaWorkOptions.Pipeline(name: "pair", agents: [
+        MuxaWorkOptions.Agent(alias: "impl", program: "claude"),
+        MuxaWorkOptions.Agent(alias: "review", program: "codex", direction: "down", after: ["impl"]),
+    ])])
+    #expect(MuxaPipelineDefinition(explicit).agents.map(\.direction) == ["", "down"])
+    #expect(MuxaPipelineSyncState.compare(library: explicit, hostOptions: implicit) == .inSync)
+
+    var sideways = MuxaPipelineDefinition(explicit)
+    sideways.agents[1].direction = "sideways"
+    #expect(sideways.problems().contains { $0.contains("direction") })
+}
+
 @Test func readableMarkdownGroupsOrderedListsAndNormalizesNewlines() {
     let document = ReadableMarkdownDocument(source: "1. one\r\n2. two\r\n\r\nnext line")
 

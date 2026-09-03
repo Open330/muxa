@@ -56,13 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config offers muxa's built-in presets (`solo`, `pair`, `triad`) with
   one-click install through `muxa work preset apply`.
 
-- **Muxa.app edits pipelines and routes visually, on any control host.** A
-  host switcher on the Command Center and in Start Work reads that host's
-  config through muxad's new `work_command` operation, Start Work launches
-  `muxa work up` on the chosen host with a project folder there, and a
-  visual editor composes agents, prompts, split directions, and `after`
-  edges (saved through `muxa work pipeline set`) while an inline Routes list
-  edits `[[route]]` entries (`muxa work route set/remove`).
+- **Muxa.app edits pipelines visually and keeps them in sync across hosts.**
+  The Command Center treats this Mac's pipelines as the library, shows per
+  host whether each pipeline is in sync, different, or missing (read through
+  muxad's new `work_command` operation), and syncs them with one click;
+  routes stay per host with their own switcher. Start Work launches `muxa
+  work up` on the chosen host with a project folder there, and a visual
+  editor composes agents, prompts, split directions, and `after` edges
+  (saved through `muxa work pipeline set`) while an inline Routes list edits
+  `[[route]]` entries (`muxa work route set/remove`).
 
 - **muxad runs `muxa work …` on any control host.** The `work_up` request
   gains an optional `host` (a `[fleet.hosts]` alias; absent or `"local"` is

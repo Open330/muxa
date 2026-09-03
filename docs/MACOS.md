@@ -87,16 +87,21 @@ operation, so ticket resolution cannot freeze refreshes or terminal I/O. The
 resulting Work opens as the same logical `{workspace_id, work_id}` used by
 CLI and dashboard surfaces.
 
-Work is not limited to this Mac. The Pipelines section has a host switcher
-(the local host plus every fleet host in `control` mode) and reads that
-host's own config through muxad's `work_command` operation, so the routes
-and pipelines shown are the ones `muxa work up` would use there. The Start
-Work sheet has the same host picker: the project folder is then a path on
-that host, workspace suggestions come from that host's sessions, and the
-launch itself runs `muxa work up` on the host through the daemon while the
-app keeps the same asynchronous operation status. A daemon without
+Work is not limited to this Mac. Pipelines are one **library**: this Mac's
+config is the source, and every fleet host in `control` mode shows a badge
+per pipeline (in sync, differs, missing, or unreadable) computed by reading
+that host's config through muxad's `work_command` operation. **Sync to
+hosts** writes the library definition to the hosts where it is missing or
+differs, and pipelines that exist only on a host can be pulled into the
+library. Pipelines are small, portable TOML; **routes** are not, because
+they carry that host's folders and workspaces, so the Routes editor keeps a
+host switcher and edits each host's `[[route]]` table separately. The Start
+Work sheet has a host picker: the project folder is then a path on that
+host, workspace suggestions come from that host's sessions, and the launch
+itself runs `muxa work up` on the host through the daemon while the app
+keeps the same asynchronous operation status. A daemon without
 `work_command_v1` still serves the local host through the bundled CLI and
-says so next to the host picker.
+says so.
 
 Pipelines are editable in place. **Edit…** on a card (or **New Pipeline…**
 and **Design your own…**) opens a visual editor: agents with alias, program,

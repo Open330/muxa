@@ -285,9 +285,20 @@ struct MuxaPipelineDefinition: Codable, Equatable, Sendable {
                 role: agent.role ?? "",
                 task: agent.task ?? "",
                 prompt: agent.prompt ?? "",
-                direction: agent.direction ?? "",
+                direction: Self.canonicalDirection(agent.direction ?? ""),
                 after: agent.after
             )
+        }
+
+        /// The CLI's `SplitDirection::parse` spelling: `right`/`horizontal`
+        /// (and nothing) mean the default split, `down`/`vertical` the other
+        /// one. Anything else stays as typed so validation can name it.
+        static func canonicalDirection(_ value: String) -> String {
+            switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "", "right", "horizontal": ""
+            case "down", "vertical": "down"
+            case let other: other
+            }
         }
 
         init(from decoder: Decoder) throws {
@@ -307,7 +318,10 @@ struct MuxaPipelineDefinition: Codable, Equatable, Sendable {
             try container.encode(program.trimmingCharacters(in: .whitespaces).lowercased(), forKey: .program)
             try container.encode(Self.optional(role), forKey: .role)
             try container.encode(Self.optional(task), forKey: .task)
-            try container.encode(Self.optional(prompt), forKey: .prompt)
+            // Prompts are written verbatim: a trailing newline from a TOML
+            // multi-line string is content on the host it came from, and
+            // rewriting it would make every synced copy read as "differs".
+            try container.encode(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : prompt, forKey: .prompt)
             try container.encode(Self.optional(direction), forKey: .direction)
             try container.encode(after, forKey: .after)
         }
@@ -315,6 +329,32 @@ struct MuxaPipelineDefinition: Codable, Equatable, Sendable {
         private static func optional(_ value: String) -> String? {
             let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
+        }
+
+        /// The agent as two hosts would see it after a round trip: keys
+        /// lowercased, surrounding whitespace dropped, row identity ignored.
+        var normalized: Agent {
+            Agent(
+                alias: alias.trimmingCharacters(in: .whitespaces).lowercased(),
+                program: program.trimmingCharacters(in: .whitespaces).lowercased(),
+                role: role.trimmingCharacters(in: .whitespacesAndNewlines),
+                task: task.trimmingCharacters(in: .whitespacesAndNewlines),
+                prompt: prompt.trimmingCharacters(in: .whitespacesAndNewlines),
+                direction: Self.canonicalDirection(direction),
+                after: after.map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+            )
+        }
+
+        /// Content equality: the `id` only keeps SwiftUI rows stable while
+        /// editing and must not make two identical agents compare unequal.
+        static func == (lhs: Agent, rhs: Agent) -> Bool {
+            lhs.alias == rhs.alias
+                && lhs.program == rhs.program
+                && lhs.role == rhs.role
+                && lhs.task == rhs.task
+                && lhs.prompt == rhs.prompt
+                && lhs.direction == rhs.direction
+                && lhs.after == rhs.after
         }
 
         var toOptionsAgent: MuxaWorkOptions.Agent {
@@ -383,6 +423,16 @@ struct MuxaPipelineDefinition: Codable, Equatable, Sendable {
 
     var optionsAgents: [MuxaWorkOptions.Agent] { agents.map(\.toOptionsAgent) }
 
+    /// Content that survives `pipeline set` on any host; what sync compares.
+    var normalized: MuxaPipelineDefinition {
+        MuxaPipelineDefinition(
+            description: description.trimmingCharacters(in: .whitespacesAndNewlines),
+            layout: layout.trimmingCharacters(in: .whitespacesAndNewlines),
+            prompt: prompt.trimmingCharacters(in: .whitespacesAndNewlines),
+            agents: agents.map(\.normalized)
+        )
+    }
+
     /// TOML bare-key characters, the same rule the CLI applies to `<name>`:
     /// ASCII letters and digits, `-`, and `_` only.
     static func isValidName(_ name: String) -> Bool {
@@ -413,7 +463,7 @@ struct MuxaPipelineDefinition: Codable, Equatable, Sendable {
             if !Self.allowedPrograms.contains(program) {
                 problems.append("@\(agent.alias): program must be one of \(Self.allowedPrograms.joined(separator: ", ")).")
             }
-            if !agent.direction.isEmpty, !["right", "down"].contains(agent.direction) {
+            if !["", "down"].contains(Agent.canonicalDirection(agent.direction)) {
                 problems.append("@\(agent.alias): direction must be right or down.")
             }
             for dependency in agent.after where !aliases.contains(dependency) {
@@ -489,5 +539,39 @@ struct MuxaWorkRouteEdit: Equatable, Sendable {
             cwd: route.cwd ?? "",
             existing: true
         )
+    }
+}
+
+/// Whether one host carries the same definition as the local library.
+enum MuxaPipelineSyncState: Equatable, Sendable {
+    case inSync
+    case differs
+    case missing
+    /// The host's options are not loaded (unreachable, older muxa, or
+    /// still loading), so nothing can be said yet.
+    case unavailable
+}
+
+struct MuxaPipelineHostState: Equatable, Sendable, Identifiable {
+    let host: String
+    let state: MuxaPipelineSyncState
+
+    var id: String { host }
+
+    var needsSync: Bool { state == .differs || state == .missing }
+}
+
+extension MuxaPipelineSyncState {
+    /// Compares a library pipeline against one host's copy the way the CLI
+    /// would after a round trip: names aside, every field that
+    /// `muxa work pipeline set` writes must match.
+    static func compare(
+        library: MuxaWorkOptions.Pipeline,
+        hostOptions: MuxaWorkOptions?
+    ) -> MuxaPipelineSyncState {
+        guard let hostOptions else { return .unavailable }
+        guard let remote = hostOptions.pipeline(named: library.name) else { return .missing }
+        return MuxaPipelineDefinition(remote).normalized == MuxaPipelineDefinition(library).normalized
+            ? .inSync : .differs
     }
 }

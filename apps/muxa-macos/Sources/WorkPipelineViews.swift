@@ -98,6 +98,10 @@ struct WorkPipelineCard: View {
     let routes: [MuxaWorkOptions.Route]
     let start: () -> Void
     var edit: (() -> Void)?
+    /// Sync state on each control host; empty when there is no other host.
+    var hostStates: [MuxaPipelineHostState] = []
+    var sync: (() -> Void)?
+    var syncing = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -120,6 +124,24 @@ struct WorkPipelineCard: View {
             }
 
             PipelineStagesView(agents: pipeline.agents, compact: true)
+
+            if !hostStates.isEmpty {
+                PipelineFlowLayout(spacing: 6) {
+                    ForEach(hostStates) { state in
+                        PipelineHostBadge(state: state)
+                    }
+                    if syncing {
+                        ProgressView().controlSize(.mini)
+                    } else if hostStates.contains(where: \.needsSync), let sync {
+                        Button(action: sync) {
+                            Label("Sync to hosts", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .buttonStyle(.borderless)
+                        .controlSize(.small)
+                        .help("Write this pipeline to every host where it is missing or differs")
+                    }
+                }
+            }
 
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 if routes.isEmpty {
@@ -162,6 +184,77 @@ struct WorkPipelineCard: View {
         if let workspace = route.workspace, !workspace.isEmpty { parts.append("workspace \(workspace)") }
         if route.worktree { parts.append("worktree") }
         return parts.joined(separator: " → ")
+    }
+}
+
+/// One host's copy of a library pipeline: in sync, different, missing, or
+/// not known (host unreachable or running an older muxa).
+struct PipelineHostBadge: View {
+    let state: MuxaPipelineHostState
+
+    private var symbol: (name: String, tint: Color, help: String) {
+        switch state.state {
+        case .inSync: ("checkmark.circle.fill", .green, "Same definition on \(state.host)")
+        case .differs: ("exclamationmark.circle.fill", .orange, "\(state.host) has a different definition; Sync overwrites it")
+        case .missing: ("circle.dashed", .secondary, "Not on \(state.host) yet")
+        case .unavailable: ("questionmark.circle", .secondary, "\(state.host)'s config could not be read")
+        }
+    }
+
+    var body: some View {
+        Label(state.host, systemImage: symbol.name)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(symbol.tint)
+            .labelStyle(.titleAndIcon)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(symbol.tint.opacity(0.1), in: Capsule())
+            .help(symbol.help)
+    }
+}
+
+/// Left-aligned wrapping row: badges and small buttons keep their natural
+/// width and flow onto the next line instead of squeezing mid-word.
+struct PipelineFlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        return arrange(width: width, subviews: subviews).size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let placement = arrange(width: bounds.width, subviews: subviews)
+        for (index, origin) in placement.origins.enumerated() {
+            subviews[index].place(
+                at: CGPoint(x: bounds.minX + origin.x, y: bounds.minY + origin.y),
+                proposal: .unspecified
+            )
+        }
+    }
+
+    private func arrange(width: CGFloat, subviews: Subviews) -> (size: CGSize, origins: [CGPoint]) {
+        var origins: [CGPoint] = []
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var maxX: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > 0, x + size.width > width {
+                x = 0
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            origins.append(CGPoint(x: x, y: y))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+            maxX = max(maxX, x - spacing)
+        }
+        let height = subviews.isEmpty ? 0 : y + rowHeight
+        return (CGSize(width: width.isFinite ? max(width, maxX) : maxX, height: height), origins)
     }
 }
 
@@ -392,12 +485,23 @@ private struct WorkPlanStepRow: View {
 /// pipeline, workspace, and folder. Rows save through `muxa work route set`
 /// and `muxa work route remove`, so the order and the untouched fields
 /// (worktree, prepare) stay exactly as written in the file.
+///
+/// The draft is a plain value plus an `editing` flag rather than an optional
+/// bound with `Binding($optional)`: SwiftUI force-unwraps such a binding on
+/// the next update, and clearing the draft after a save while its text
+/// fields were still alive crashed the app.
 struct WorkRoutesEditor: View {
     let options: MuxaWorkOptions
     let host: String?
     @ObservedObject var model: AppModel
-    @State private var draft: MuxaWorkRouteEdit?
+    @State private var draft = MuxaWorkRouteEdit()
+    @State private var editing = false
     @State private var saving = false
+
+    /// Match text of the existing route being edited, or nil while adding.
+    private var editingMatch: String? {
+        editing && draft.existing ? draft.match : nil
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -410,27 +514,28 @@ struct WorkRoutesEditor: View {
                 Spacer()
                 Button {
                     draft = MuxaWorkRouteEdit(match: "", pipeline: options.pipelines.first?.name ?? "")
+                    editing = true
                 } label: {
                     Label("Add Route", systemImage: "plus")
                 }
                 .buttonStyle(.borderless)
-                .disabled(draft != nil)
+                .disabled(editing)
             }
 
-            if options.routes.isEmpty, draft == nil {
+            if options.routes.isEmpty, !editing {
                 Text("No routes yet. Add one with match .* to send every Work id to a pipeline.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
 
-            ForEach(Array(options.routes.enumerated()), id: \.element.id) { index, route in
-                if let editing = draft, editing.existing, editing.match == route.match {
+            ForEach(Array(options.routes.enumerated()), id: \.offset) { index, route in
+                if editingMatch == route.match {
                     routeForm(position: index)
                 } else {
                     routeRow(route, position: index)
                 }
             }
-            if let editing = draft, !editing.existing {
+            if editing, !draft.existing {
                 routeForm(position: options.routes.count)
             }
         }
@@ -440,6 +545,10 @@ struct WorkRoutesEditor: View {
         .overlay {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
+        }
+        .onChange(of: host) { _ in
+            // A different host has different routes; never carry a draft over.
+            editing = false
         }
     }
 
@@ -486,11 +595,12 @@ struct WorkRoutesEditor: View {
             Spacer(minLength: 6)
             Button {
                 draft = MuxaWorkRouteEdit(route)
+                editing = true
             } label: {
                 Image(systemName: "pencil")
             }
             .buttonStyle(.borderless)
-            .disabled(draft != nil || saving)
+            .disabled(editing || saving)
             .help("Edit this route")
             Button(role: .destructive) {
                 saving = true
@@ -502,60 +612,62 @@ struct WorkRoutesEditor: View {
                 Image(systemName: "trash")
             }
             .buttonStyle(.borderless)
-            .disabled(draft != nil || saving)
+            .disabled(editing || saving)
             .help("Remove this route")
         }
         .padding(.vertical, 3)
     }
 
-    @ViewBuilder
     private func routeForm(position: Int) -> some View {
-        if let binding = Binding($draft) {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    TextField("match (regex, for example ^cal- or .*)", text: binding.match)
-                        .font(.callout.monospaced())
-                        .disabled(binding.wrappedValue.existing)
-                    Picker("Pipeline", selection: binding.pipeline) {
-                        Text("no pipeline").tag("")
-                        ForEach(options.pipelines) { pipeline in
-                            Text(pipeline.name).tag(pipeline.name)
-                        }
-                    }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                TextField("", text: $draft.match, prompt: Text("match (regex, for example ^cal- or .*)"))
                     .labelsHidden()
-                    .frame(width: 170)
-                }
-                HStack(spacing: 8) {
-                    TextField("workspace (optional)", text: binding.workspace)
-                    TextField("folder on the host (optional)", text: binding.cwd)
-                }
-                HStack {
-                    if let error = model.workOptionsError(for: host) {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .lineLimit(2)
+                    .font(.callout.monospaced())
+                    .disabled(draft.existing)
+                Picker("Pipeline", selection: $draft.pipeline) {
+                    Text("no pipeline").tag("")
+                    ForEach(options.pipelines) { pipeline in
+                        Text(pipeline.name).tag(pipeline.name)
                     }
-                    Spacer()
-                    if saving { ProgressView().controlSize(.small) }
-                    Button("Cancel") { draft = nil }
-                    Button(binding.wrappedValue.existing ? "Save Route" : "Add Route") {
-                        var route = binding.wrappedValue
-                        if !route.existing { route.position = position }
-                        saving = true
-                        Task {
-                            if await model.setRoute(route, host: host) { draft = nil }
-                            saving = false
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(saving || binding.wrappedValue.match.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
+                .labelsHidden()
+                .frame(width: 170)
             }
-            .padding(10)
-            .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+            HStack(spacing: 8) {
+                TextField("", text: $draft.workspace, prompt: Text("workspace (optional)"))
+                    .labelsHidden()
+                TextField("", text: $draft.cwd, prompt: Text("folder on the host (optional)"))
+                    .labelsHidden()
+            }
+            HStack {
+                if let error = model.workOptionsError(for: host) {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                }
+                Spacer()
+                if saving { ProgressView().controlSize(.small) }
+                Button("Cancel") { editing = false }
+                    .disabled(saving)
+                Button(draft.existing ? "Save Route" : "Add Route") {
+                    var route = draft
+                    if !route.existing { route.position = position }
+                    saving = true
+                    Task {
+                        let saved = await model.setRoute(route, host: host)
+                        saving = false
+                        if saved { editing = false }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(saving || draft.match.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
         }
+        .padding(10)
+        .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 

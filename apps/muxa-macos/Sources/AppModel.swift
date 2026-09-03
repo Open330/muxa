@@ -248,7 +248,7 @@ final class AppModel: ObservableObject {
                 // correct before the Inbox editor is ever opened; later
                 // changes arrive through per-host mailbox revision events.
                 Task { [weak self] in await self?.refreshOperatorInbox(force: true) }
-                Task { [weak self] in await self?.loadWorkOptions() }
+                Task { [weak self] in await self?.loadAllWorkOptions() }
                 async let events: Void = runFleetSubscription(ifGeneration: generation)
                 async let askEvents: Void = runAskSubscription(ifGeneration: generation)
                 async let pipelineEvents: Void = runPipelineSubscription(ifGeneration: generation)
@@ -807,6 +807,67 @@ final class AppModel: ObservableObject {
             setWorkOptionsError(error.localizedDescription, host: host)
             return false
         }
+    }
+
+    /// Loads the local library and every control host's options together,
+    /// so sync badges and per-host routes are ready in one pass.
+    func loadAllWorkOptions() async {
+        await loadWorkOptions(host: nil)
+        let hosts = workCapableHosts.filter { !$0.local }.map(\.alias)
+        guard !hosts.isEmpty else { return }
+        // One child task per host: each awaits its own remote command, so
+        // the reads overlap instead of running host after host.
+        let reads = hosts.map { host in
+            Task { @MainActor [weak self] in await self?.loadWorkOptions(host: host) }
+        }
+        for read in reads { await read.value }
+    }
+
+    /// Sync state of one library pipeline on every control host.
+    func pipelineHostStates(for pipeline: MuxaWorkOptions.Pipeline) -> [MuxaPipelineHostState] {
+        workCapableHosts.filter { !$0.local }.map { host in
+            MuxaPipelineHostState(
+                host: host.alias,
+                state: .compare(library: pipeline, hostOptions: workOptionsByHost[host.alias])
+            )
+        }
+    }
+
+    /// Pipelines that exist on a host but not in the local library.
+    var remoteOnlyPipelines: [(host: String, pipeline: MuxaWorkOptions.Pipeline)] {
+        let local = Set(workOptions?.pipelines.map(\.name) ?? [])
+        return workCapableHosts.filter { !$0.local }.flatMap { host in
+            (workOptionsByHost[host.alias]?.pipelines ?? [])
+                .filter { !local.contains($0.name) }
+                .map { (host: host.alias, pipeline: $0) }
+        }
+    }
+
+    /// Pushes the library definition of `pipeline` to every host where it is
+    /// missing or differs. Pipelines are small, portable TOML; routes stay
+    /// per host because they carry that host's folders.
+    func syncPipeline(_ pipeline: MuxaWorkOptions.Pipeline, to hosts: [String]? = nil) async -> [String: String] {
+        let targets = hosts ?? pipelineHostStates(for: pipeline).filter(\.needsSync).map(\.host)
+        var failures: [String: String] = [:]
+        let definition = MuxaPipelineDefinition(pipeline)
+        for host in targets {
+            if !(await savePipeline(definition, named: pipeline.name, host: host)) {
+                failures[host] = pipelineEditorError ?? "unknown error"
+            }
+        }
+        pipelineEditorError = nil
+        return failures
+    }
+
+    /// Syncs every library pipeline; returns per-host failures.
+    func syncAllPipelines() async -> [String: String] {
+        var failures: [String: String] = [:]
+        for pipeline in workOptions?.pipelines ?? [] {
+            for (host, error) in await syncPipeline(pipeline) {
+                failures["\(host)/\(pipeline.name)"] = error
+            }
+        }
+        return failures
     }
 
     private func setWorkOptionsError(_ message: String?, host: String?) {

@@ -59,9 +59,9 @@ struct PipelineEditorView: View {
             HSplitView {
                 Form {
                     Section("Pipeline") {
-                        TextField("Name, for example implement-review", text: $name)
+                        TextField("Name", text: $name, prompt: Text("for example implement-review"))
                             .disabled(!isNew)
-                        TextField("Description (optional)", text: $definition.description)
+                        TextField("Description", text: $definition.description, prompt: Text("optional"))
                         Picker("tmux layout", selection: $definition.layout) {
                             Text("tmux default").tag("")
                             ForEach(MuxaPipelineDefinition.layouts, id: \.self) { layout in
@@ -102,8 +102,9 @@ struct PipelineEditorView: View {
                     }
                 }
                 .formStyle(.grouped)
-                .frame(minWidth: 460, idealWidth: 520)
+                .frame(minWidth: 480, idealWidth: 560)
 
+                ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Launch order")
                         .font(.headline)
@@ -137,9 +138,10 @@ struct PipelineEditorView: View {
                             .foregroundStyle(.red)
                             .textSelection(.enabled)
                     }
-                    Spacer()
                 }
                 .padding(18)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
                 .frame(minWidth: 300, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
 
@@ -161,7 +163,7 @@ struct PipelineEditorView: View {
             }
             .padding(16)
         }
-        .frame(minWidth: 860, idealWidth: 940, minHeight: 560, idealHeight: 680)
+        .frame(minWidth: 880, idealWidth: 980, minHeight: 540, idealHeight: 680)
         .alert("Delete pipeline \(name)?", isPresented: $confirmsDelete) {
             Button("Cancel", role: .cancel) {}
             Button("Delete", role: .destructive) { delete() }
@@ -180,26 +182,27 @@ struct PipelineEditorView: View {
             .map { $0.alias.trimmingCharacters(in: .whitespaces).lowercased() }
             .filter { !$0.isEmpty && $0 != agent.wrappedValue.alias.trimmingCharacters(in: .whitespaces).lowercased() }
         VStack(alignment: .leading, spacing: 8) {
+            // Two short rows instead of one wide one: the Form column is
+            // about 460 points, so alias + program + role + direction on a
+            // single line overflowed and clipped the role field.
             HStack(spacing: 8) {
                 TextField("", text: agent.alias, prompt: Text("alias"))
                     .labelsHidden()
-                    .frame(width: 100)
+                    .frame(width: 120)
                 Picker("", selection: agent.program) {
                     ForEach(MuxaPipelineDefinition.allowedPrograms, id: \.self) { program in
                         Text(program).tag(program)
                     }
                 }
                 .labelsHidden()
-                .frame(width: 100)
-                TextField("", text: agent.role, prompt: Text("role"))
-                    .labelsHidden()
-                    .frame(minWidth: 120, maxWidth: .infinity)
+                .frame(width: 104)
                 Picker("", selection: agent.direction) {
                     Text("split right").tag("")
                     Text("split down").tag("down")
                 }
                 .labelsHidden()
-                .frame(width: 104)
+                .frame(width: 112)
+                Spacer(minLength: 0)
                 Menu {
                     Button("Move up") { move(agent.wrappedValue.id, by: -1) }
                     Button("Move down") { move(agent.wrappedValue.id, by: 1) }
@@ -211,9 +214,12 @@ struct PipelineEditorView: View {
                 .menuStyle(.borderlessButton)
                 .fixedSize()
             }
+            TextField("", text: agent.role, prompt: Text("role, for example implementer or reviewer"))
+                .labelsHidden()
             TextField("", text: agent.task, prompt: Text("task label shown in muxa watch (optional)"))
                 .labelsHidden()
             if !others.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
                     Text("after")
                         .font(.caption)
@@ -232,6 +238,7 @@ struct PipelineEditorView: View {
                         .toggleStyle(.button)
                         .controlSize(.small)
                     }
+                }
                 }
             }
             DisclosureGroup(
