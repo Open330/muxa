@@ -97,6 +97,7 @@ struct WorkPipelineCard: View {
     let pipeline: MuxaWorkOptions.Pipeline
     let routes: [MuxaWorkOptions.Route]
     let start: () -> Void
+    var edit: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -133,6 +134,13 @@ struct WorkPipelineCard: View {
                         .lineLimit(2)
                 }
                 Spacer(minLength: 4)
+                if let edit {
+                    Button(action: edit) {
+                        Label("Edit…", systemImage: "slider.horizontal.3")
+                    }
+                    .controlSize(.small)
+                    .help("Edit the agents, prompts, and after edges of this pipeline")
+                }
                 Button(action: start) {
                     Label("Start…", systemImage: "play.fill")
                 }
@@ -162,6 +170,7 @@ struct WorkPipelineCard: View {
 /// `muxa work init` conversation for a custom setup.
 struct WorkPresetGallery: View {
     let options: MuxaWorkOptions
+    var host: String?
     @ObservedObject var model: AppModel
     var onInstalled: ((String) -> Void)?
     var onDescribe: (() -> Void)?
@@ -208,7 +217,7 @@ struct WorkPresetGallery: View {
                             Spacer()
                             Button {
                                 Task {
-                                    if await model.applyWorkPreset(preset.name) {
+                                    if await model.applyWorkPreset(preset.name, host: host) {
                                         onInstalled?(preset.name)
                                     }
                                 }
@@ -238,12 +247,18 @@ struct WorkPresetGallery: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button {
+                    model.presentPipelineEditor(host: host, pipeline: nil)
+                } label: {
+                    Label("Design your own…", systemImage: "slider.horizontal.3")
+                }
+                .help("Compose agents, prompts, and after edges visually")
                 if let onDescribe {
                     Button("Describe with an agent…", action: onDescribe)
                         .help("Runs the interactive `muxa work init` wizard in a Shell tab")
                 }
             }
-            if let error = model.workOptionsError {
+            if let error = model.workOptionsError(for: host) {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.red)
@@ -370,6 +385,177 @@ private struct WorkPlanStepRow: View {
             }
         }
         .padding(.vertical, 2)
+    }
+}
+
+/// The `[[route]]` table as an editable list: which Work ids select which
+/// pipeline, workspace, and folder. Rows save through `muxa work route set`
+/// and `muxa work route remove`, so the order and the untouched fields
+/// (worktree, prepare) stay exactly as written in the file.
+struct WorkRoutesEditor: View {
+    let options: MuxaWorkOptions
+    let host: String?
+    @ObservedObject var model: AppModel
+    @State private var draft: MuxaWorkRouteEdit?
+    @State private var saving = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Routes")
+                    .font(.headline)
+                Text("First match wins; a Work id that matches no route needs an explicit pipeline.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    draft = MuxaWorkRouteEdit(match: "", pipeline: options.pipelines.first?.name ?? "")
+                } label: {
+                    Label("Add Route", systemImage: "plus")
+                }
+                .buttonStyle(.borderless)
+                .disabled(draft != nil)
+            }
+
+            if options.routes.isEmpty, draft == nil {
+                Text("No routes yet. Add one with match .* to send every Work id to a pipeline.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+
+            ForEach(Array(options.routes.enumerated()), id: \.element.id) { index, route in
+                if let editing = draft, editing.existing, editing.match == route.match {
+                    routeForm(position: index)
+                } else {
+                    routeRow(route, position: index)
+                }
+            }
+            if let editing = draft, !editing.existing {
+                routeForm(position: options.routes.count)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
+        }
+    }
+
+    private func routeRow(_ route: MuxaWorkOptions.Route, position: Int) -> some View {
+        HStack(spacing: 10) {
+            Text("\(position + 1)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+                .frame(width: 18, alignment: .trailing)
+            Text(route.match)
+                .font(.callout.monospaced())
+                .lineLimit(1)
+            Image(systemName: "arrow.right")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            Text(route.pipeline ?? "no pipeline")
+                .font(.callout.weight(route.pipeline == nil ? .regular : .medium))
+                .foregroundStyle(route.pipeline == nil ? Color.orange : Color.primary)
+            if let workspace = route.workspace, !workspace.isEmpty {
+                Text("workspace \(workspace)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if route.worktree {
+                Text("worktree")
+                    .font(.caption2.weight(.medium))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.primary.opacity(0.07), in: Capsule())
+            } else if let cwd = route.cwd, !cwd.isEmpty {
+                Text(cwd)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            if route.prepare {
+                Text("prepare")
+                    .font(.caption2.weight(.medium))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.primary.opacity(0.07), in: Capsule())
+            }
+            Spacer(minLength: 6)
+            Button {
+                draft = MuxaWorkRouteEdit(route)
+            } label: {
+                Image(systemName: "pencil")
+            }
+            .buttonStyle(.borderless)
+            .disabled(draft != nil || saving)
+            .help("Edit this route")
+            Button(role: .destructive) {
+                saving = true
+                Task {
+                    _ = await model.removeRoute(match: route.match, host: host)
+                    saving = false
+                }
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .disabled(draft != nil || saving)
+            .help("Remove this route")
+        }
+        .padding(.vertical, 3)
+    }
+
+    @ViewBuilder
+    private func routeForm(position: Int) -> some View {
+        if let binding = Binding($draft) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    TextField("match (regex, for example ^cal- or .*)", text: binding.match)
+                        .font(.callout.monospaced())
+                        .disabled(binding.wrappedValue.existing)
+                    Picker("Pipeline", selection: binding.pipeline) {
+                        Text("no pipeline").tag("")
+                        ForEach(options.pipelines) { pipeline in
+                            Text(pipeline.name).tag(pipeline.name)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 170)
+                }
+                HStack(spacing: 8) {
+                    TextField("workspace (optional)", text: binding.workspace)
+                    TextField("folder on the host (optional)", text: binding.cwd)
+                }
+                HStack {
+                    if let error = model.workOptionsError(for: host) {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .lineLimit(2)
+                    }
+                    Spacer()
+                    if saving { ProgressView().controlSize(.small) }
+                    Button("Cancel") { draft = nil }
+                    Button(binding.wrappedValue.existing ? "Save Route" : "Add Route") {
+                        var route = binding.wrappedValue
+                        if !route.existing { route.position = position }
+                        saving = true
+                        Task {
+                            if await model.setRoute(route, host: host) { draft = nil }
+                            saving = false
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(saving || binding.wrappedValue.match.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+            .padding(10)
+            .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+        }
     }
 }
 

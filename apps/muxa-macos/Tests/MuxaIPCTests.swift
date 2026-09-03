@@ -208,6 +208,73 @@ import Testing
     #expect(result.plan?.steps[2].pane == "%4")
 }
 
+@Test func pipelineDefinitionValidatesLikeTheCLI() throws {
+    var definition = MuxaPipelineDefinition(
+        description: "planner → implementer",
+        layout: "main-vertical",
+        agents: [
+            MuxaPipelineDefinition.Agent(alias: "Plan", program: "codex", role: "planner"),
+            MuxaPipelineDefinition.Agent(alias: "impl", program: "claude", task: "Implement", after: ["plan"]),
+        ]
+    )
+    #expect(definition.problems().isEmpty)
+    #expect(MuxaPipelineDefinition.isValidName("implement-review"))
+    #expect(!MuxaPipelineDefinition.isValidName("bad name"))
+
+    let json = try definition.jsonString()
+    #expect(json.contains(#""alias":"plan""#))
+    #expect(json.contains(#""after":["plan"]"#))
+    #expect(json.contains(#""layout":"main-vertical""#))
+    #expect(json.contains(#""prompt":null"#))
+    let decoded = try JSONDecoder().decode(MuxaPipelineDefinition.self, from: Data(json.utf8))
+    #expect(decoded.agents.map(\.alias) == ["plan", "impl"])
+
+    definition.agents.append(MuxaPipelineDefinition.Agent(alias: "impl", program: "gemini"))
+    #expect(definition.problems().contains { $0.contains("used twice") })
+    definition.agents.removeLast()
+
+    definition.agents[1].program = "bash"
+    #expect(definition.problems().contains { $0.contains("program must be one of") })
+    definition.agents[1].program = "claude"
+
+    definition.agents[1].after = ["ghost"]
+    #expect(definition.problems().contains { $0.contains("unknown alias") })
+
+    definition.agents[0].after = ["impl"]
+    definition.agents[1].after = ["plan"]
+    #expect(definition.problems().contains { $0.contains("cycle") })
+
+    #expect(!MuxaPipelineDefinition(agents: []).problems().isEmpty)
+}
+
+@Test func pipelineDefinitionRoundTripsWorkOptionsAgents() {
+    let pipeline = MuxaWorkOptions.Pipeline(
+        name: "pair",
+        description: "implementer → reviewer",
+        prompt: "Shared {{request}}",
+        agents: [
+            MuxaWorkOptions.Agent(alias: "impl", program: "claude", role: "implementer", prompt: "Own it."),
+            MuxaWorkOptions.Agent(alias: "review", program: "codex", direction: "down", after: ["impl"]),
+        ]
+    )
+    let definition = MuxaPipelineDefinition(pipeline)
+    #expect(definition.prompt == "Shared {{request}}")
+    #expect(definition.agents[0].prompt == "Own it.")
+    #expect(definition.agents[1].direction == "down")
+    #expect(definition.optionsAgents.map(\.alias) == ["impl", "review"])
+    #expect(MuxaPipelineStages.stages(for: definition.optionsAgents).count == 2)
+}
+
+@Test func routeEditStartsFromTheExistingRoute() {
+    let route = MuxaWorkOptions.Route(match: "^cal-", workspace: "callabo", pipeline: "triad", worktree: true)
+    let edit = MuxaWorkRouteEdit(route)
+    #expect(edit.existing)
+    #expect(edit.pipeline == "triad")
+    #expect(edit.workspace == "callabo")
+    #expect(edit.cwd.isEmpty)
+    #expect(!MuxaWorkRouteEdit().existing)
+}
+
 @Test func readableMarkdownGroupsOrderedListsAndNormalizesNewlines() {
     let document = ReadableMarkdownDocument(source: "1. one\r\n2. two\r\n\r\nnext line")
 

@@ -87,6 +87,29 @@ operation, so ticket resolution cannot freeze refreshes or terminal I/O. The
 resulting Work opens as the same logical `{workspace_id, work_id}` used by
 CLI and dashboard surfaces.
 
+Work is not limited to this Mac. The Pipelines section has a host switcher
+(the local host plus every fleet host in `control` mode) and reads that
+host's own config through muxad's `work_command` operation, so the routes
+and pipelines shown are the ones `muxa work up` would use there. The Start
+Work sheet has the same host picker: the project folder is then a path on
+that host, workspace suggestions come from that host's sessions, and the
+launch itself runs `muxa work up` on the host through the daemon while the
+app keeps the same asynchronous operation status. A daemon without
+`work_command_v1` still serves the local host through the bundled CLI and
+says so next to the host picker.
+
+Pipelines are editable in place. **Edit…** on a card (or **New Pipeline…**
+and **Design your own…**) opens a visual editor: agents with alias, program,
+role, task, split direction, prompt, and `after` toggles, a shared prompt
+prefix, and the tmux layout, with the launch-stage picture redrawn as edges
+change. Saving goes through `muxa work pipeline set <name> --from-json -`,
+so the same validation the CLI applies (allowlisted programs, unique
+aliases, acyclic `after` edges) runs before and after the round trip, and
+**Delete…** uses `muxa work pipeline remove`. The **Routes** list under the
+cards edits `[[route]]` entries (match, pipeline, workspace, folder) through
+`muxa work route set` and `route remove`, keeping order and untouched
+`worktree`/`prepare` tables as written.
+
 When the config has no pipeline yet, both the Command Center and the sheet
 show muxa's built-in presets (`solo`, `pair`, `triad`) with their stage
 diagrams. **Install** writes the preset through `muxa work preset apply`

@@ -92,6 +92,9 @@ struct ContentView: View {
         .sheet(isPresented: $model.isPresentingHostRegistration) {
             HostRegistrationView(model: model)
         }
+        .sheet(item: $model.pipelineEditorTarget) { target in
+            PipelineEditorView(target: target, model: model)
+        }
         .task {
             model.activateEditor(tabs.focusedSelection)
             model.start()

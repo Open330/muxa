@@ -28,19 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   smallest supported window, and the read-only preview uses an installed
   Nerd Font for prompt glyphs when one is available.
 
-- **Agents in a tmux pane inside a cmux tab are attributed to their tmux
-  server.** Such a pane's shell inherits cmux's `CMUX_WORKSPACE_ID` and
-  `CMUX_SOCKET_PATH`, and host detection let those win over `$TMUX`, so hook
-  events recorded `%N` panes with `tmux_socket = "cmux.sock"`. No pane scan
-  could match that pairing: `muxa_room_context`, `muxa_call_peer`, and
-  `muxa_inbox` failed with "collaboration origin is not a hook-correlated
-  tracked pane agent", and Muxa.app's Explore tree showed the pane without an
-  agent. tmux now wins presence ties over cmux (a GUI terminal is always the
-  outermost host; `MUXA_HOST=cmux` still forces cmux), the hook endpoint is
-  read for the host that owns the pane id, and the daemon re-attributes an
-  existing row when a later hook names the same pane with a different socket,
-  so running agents heal on their next event once both binaries are updated.
-
 - **Hook ingest attributes a tmux pane inside a cmux tab to tmux.** A tmux
   server started from a cmux.app tab hands every `CMUX_*` variable to its
   pane shells, and host detection let those inherited variables win over a
@@ -69,6 +56,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config offers muxa's built-in presets (`solo`, `pair`, `triad`) with
   one-click install through `muxa work preset apply`.
 
+- **Muxa.app edits pipelines and routes visually, on any control host.** A
+  host switcher on the Command Center and in Start Work reads that host's
+  config through muxad's new `work_command` operation, Start Work launches
+  `muxa work up` on the chosen host with a project folder there, and a
+  visual editor composes agents, prompts, split directions, and `after`
+  edges (saved through `muxa work pipeline set`) while an inline Routes list
+  edits `[[route]]` entries (`muxa work route set/remove`).
+
+- **muxad runs `muxa work …` on any control host.** The `work_up` request
+  gains an optional `host` (a `[fleet.hosts]` alias; absent or `"local"` is
+  unchanged), and the new `work_command` IPC kind runs one allowlisted `muxa
+  work options|preset|pipeline|route …` argv, with optional stdin, bounded
+  to 30 s and 1 MiB, returning exit code, stdout, and stderr. Observe-only
+  hosts may run just `work options`. Remote argv travels as a new
+  `work_command` relay operation when the host's relay advertises it, and
+  otherwise over a one-shot `ssh -o BatchMode=yes … <muxa_path> 'work' …`
+  command with single-quoted arguments, so hosts still running an older muxa
+  keep working. Advertised as `work_command_v1`.
+
 - **`muxa work options` and `muxa work preset`.** `muxa work options
   [--json]` prints the routes, pipelines, message skills, built-in presets,
   and ticket agent a Work launcher needs, so Muxa.app and other GUIs never
@@ -79,6 +85,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing pipeline without `--overwrite`, and appending a `[[route]]` only
   when no route with that `match` exists — so a fresh config becomes
   launchable without spending an agent turn.
+
+- **`muxa work pipeline` and `muxa work route` edit `config.toml` from the
+  shape `work options` prints.** `muxa work options --json` now carries the
+  raw `prompt` template on every pipeline and agent, so an editor can
+  round-trip an entry. `muxa work pipeline set <name> --from-json <path|->`
+  validates one pipeline the way a launch would (allowlisted programs,
+  unique aliases, `after` edges that resolve and do not cycle, `direction`
+  right or down) and writes `[pipeline.<name>]` through `toml_edit`,
+  replacing an existing pipeline where it stands and leaving every other
+  section, comment, and value alone; `muxa work pipeline remove <name>`
+  refuses while a `[[route]]` still names the pipeline unless `--force`,
+  which also clears `pipeline` on those routes. `muxa work route set --match
+  <regex>` adds or updates the one `[[route]]` with exactly that `match`
+  (`--pipeline`, `--workspace`, `--cwd`, `--position <n>`, `--clear-*`;
+  `worktree` and `prepare` are never touched) and `muxa work route remove`
+  deletes it. Every command validates the merged file as a whole `Config`
+  before an atomic write, refuses without touching the file otherwise, and
+  prints only JSON with `--json`.
 
 ### Changed
 

@@ -13,9 +13,20 @@ struct WorkStartView: View {
     @State private var taskBody = ""
     @State private var context = ""
     @State private var dryRun = false
+    @State private var host = ""
     @AppStorage("nativeWorkDirectory") private var cwd = ""
+    @State private var remoteFolder = ""
 
-    private var options: MuxaWorkOptions? { model.workOptions }
+    private var isLocalHost: Bool { model.isLocalHost(host) }
+
+    private var options: MuxaWorkOptions? { model.workOptions(for: isLocalHost ? nil : host) }
+
+    /// The folder field edits the persisted local default for the local host
+    /// and a per-sheet path for a remote host, because remote paths mean
+    /// nothing here and must not be remembered as the local default.
+    private var folderBinding: Binding<String> {
+        isLocalHost ? $cwd : $remoteFolder
+    }
 
     private var matchedRoute: MuxaWorkOptions.Route? {
         options?.route(matching: work)
@@ -31,7 +42,7 @@ struct WorkStartView: View {
 
     private var localSessionNames: [String] {
         model.executionSnapshot.watchHosts
-            .first(where: { $0.host.local })?
+            .first(where: { isLocalHost ? $0.host.local : $0.host.alias == host })?
             .sessions
             .map(\.name)
             .filter { !$0.isEmpty } ?? []
@@ -58,10 +69,12 @@ struct WorkStartView: View {
     /// GUI-launched daemon is `/`. Never let that become an agent's project
     /// folder: when neither the form nor the route names one, use home.
     private var effectiveDirectory: String? {
-        let trimmed = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = folderBinding.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { return trimmed }
         if routePinsDirectory { return nil }
-        return FileManager.default.homeDirectoryForCurrentUser.path
+        // A remote host's home is not known here; let the remote CLI use its
+        // own cwd rules (the route, else the login directory).
+        return isLocalHost ? FileManager.default.homeDirectoryForCurrentUser.path : nil
     }
 
     private var canSubmit: Bool {
@@ -98,6 +111,7 @@ struct WorkStartView: View {
 
             Form {
                 Section("Identity") {
+                    hostPicker
                     TextField("Work ID, for example auth-cleanup", text: $work)
                     routeSummary
                     HStack {
@@ -116,14 +130,23 @@ struct WorkStartView: View {
                         }
                     }
                     HStack {
-                        TextField("Project folder (use configured route when empty)", text: $cwd)
-                        Button("Choose…", action: chooseDirectory)
+                        TextField(
+                            isLocalHost
+                                ? "Project folder (use configured route when empty)"
+                                : "Project folder on \(host) (use its route when empty)",
+                            text: folderBinding
+                        )
+                        if isLocalHost {
+                            Button("Choose…", action: chooseDirectory)
+                        }
                     }
-                    if cwd.trimmingCharacters(in: .whitespaces).isEmpty, options != nil {
+                    if folderBinding.wrappedValue.trimmingCharacters(in: .whitespaces).isEmpty, options != nil {
                         Text(
                             routePinsDirectory
                                 ? "The route decides the folder."
-                                : "Defaults to your home folder because the route names none; choose the project you want the agents to work in."
+                                : isLocalHost
+                                    ? "Defaults to your home folder because the route names none; choose the project you want the agents to work in."
+                                    : "The route on \(host) names no folder; type the project path on that host."
                         )
                         .font(.caption)
                         .foregroundStyle(routePinsDirectory ? Color.secondary : Color.orange)
@@ -222,6 +245,14 @@ struct WorkStartView: View {
             if let preselected = model.workStartPreselectedPipeline {
                 pipeline = preselected
             }
+            if let preselectedHost = model.workStartPreselectedHost, !model.isLocalHost(preselectedHost) {
+                host = preselectedHost
+            }
+        }
+        .onChange(of: host) { selected in
+            pipeline = ""
+            workspace = ""
+            Task { await model.loadWorkOptions(host: model.isLocalHost(selected) ? nil : selected) }
         }
         .onChange(of: model.workOptions) { updated in
             // A preset installed from this sheet becomes the selection; a
@@ -230,6 +261,31 @@ struct WorkStartView: View {
             guard let updated else { return }
             if !pipeline.isEmpty, updated.pipeline(named: pipeline) == nil {
                 pipeline = ""
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var hostPicker: some View {
+        let hosts = model.workCapableHosts
+        if hosts.count > 1 {
+            Picker("Host", selection: $host) {
+                ForEach(hosts) { candidate in
+                    Text(candidate.local ? "\(candidate.alias) (this Mac)" : candidate.alias)
+                        .tag(candidate.local ? "" : candidate.alias)
+                }
+            }
+            if !isLocalHost, !model.supportsHostWorkCommands {
+                Label(
+                    "Starting Work on \(host) needs the updated muxad on this Mac (Use Bundled muxad), and muxa on \(host) must know `work options`.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            } else if !isLocalHost {
+                Text("The pipeline and route come from \(host)'s config; agents start in tmux on that host.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -274,9 +330,10 @@ struct WorkStartView: View {
             if options.pipelines.isEmpty {
                 WorkPresetGallery(
                     options: options,
+                    host: isLocalHost ? nil : host,
                     model: model,
                     onInstalled: { installed in pipeline = installed },
-                    onDescribe: configureWork
+                    onDescribe: describeWithAgent
                 )
             } else {
                 Picker("Pipeline", selection: $pipeline) {
@@ -305,7 +362,7 @@ struct WorkStartView: View {
                         .foregroundStyle(.orange)
                 }
             }
-        } else if let error = model.workOptionsError {
+        } else if let error = model.workOptionsError(for: isLocalHost ? nil : host) {
             TextField("Pipeline (use configured route when empty)", text: $pipeline)
             Label(error, systemImage: "exclamationmark.triangle.fill")
                 .font(.caption)
@@ -313,10 +370,17 @@ struct WorkStartView: View {
                 .textSelection(.enabled)
         } else {
             TextField("Pipeline (use configured route when empty)", text: $pipeline)
-            Text("Reading pipelines from the muxa config…")
+            Text("Reading pipelines from \(isLocalHost ? "the muxa config" : host)…")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    /// `muxa work init` runs in a local Shell tab, so it is offered for the
+    /// local host only.
+    private var describeWithAgent: (() -> Void)? {
+        guard isLocalHost else { return nil }
+        return { configureWork() }
     }
 
     private var defaultPipelineLabel: String {
@@ -353,7 +417,8 @@ struct WorkStartView: View {
             skill: skill,
             body: taskBody,
             context: context,
-            dryRun: dryRun
+            dryRun: dryRun,
+            host: isLocalHost ? nil : host
         )
         Task {
             if await model.startWork(request) {
@@ -497,6 +562,17 @@ struct WorkCommandCenterView: View {
         GridItem(.adaptive(minimum: 300, maximum: 460), spacing: 12, alignment: .top),
     ]
 
+    /// Host whose config the Pipelines section shows; "" is the local host.
+    @State private var pipelinesHost = ""
+
+    private var pipelinesHostAlias: String? { pipelinesHost.isEmpty ? nil : pipelinesHost }
+
+    /// `muxa work init` opens a local Shell tab, so only the local host gets it.
+    private var describeWithAgentAction: (() -> Void)? {
+        guard pipelinesHostAlias == nil else { return nil }
+        return { Task { await model.configureWork(cwd: nil) } }
+    }
+
     /// The configured pipelines drawn as launchable presets. This is where a
     /// GUI earns its place over the CLI: the stage picture is visible before
     /// a single agent exists, and an empty config offers muxa's built-in
@@ -507,7 +583,7 @@ struct WorkCommandCenterView: View {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text("Pipelines")
                     .font(.title2.weight(.semibold))
-                if let path = model.workOptions?.configPath {
+                if let path = model.workOptions(for: pipelinesHostAlias)?.configPath {
                     Text(path)
                         .font(.caption2.monospaced())
                         .foregroundStyle(.tertiary)
@@ -520,7 +596,14 @@ struct WorkCommandCenterView: View {
                     ProgressView().controlSize(.small)
                 }
                 Button {
-                    Task { await model.loadWorkOptions() }
+                    model.presentPipelineEditor(host: pipelinesHostAlias, pipeline: nil)
+                } label: {
+                    Label("New Pipeline…", systemImage: "plus")
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.workOptions(for: pipelinesHostAlias) == nil)
+                Button {
+                    Task { await model.loadWorkOptions(host: pipelinesHostAlias) }
                 } label: {
                     Label("Reload", systemImage: "arrow.clockwise")
                 }
@@ -528,13 +611,39 @@ struct WorkCommandCenterView: View {
                 .help("Re-read routes and pipelines from the muxa config")
             }
 
-            if let options = model.workOptions {
+            if model.workCapableHosts.count > 1 {
+                Picker("Host", selection: $pipelinesHost) {
+                    ForEach(model.workCapableHosts) { candidate in
+                        Text(candidate.local ? "\(candidate.alias) (this Mac)" : candidate.alias)
+                            .tag(candidate.local ? "" : candidate.alias)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 560, alignment: .leading)
+                .onChange(of: pipelinesHost) { selected in
+                    Task { await model.loadWorkOptions(host: selected.isEmpty ? nil : selected) }
+                }
+                if pipelinesHostAlias != nil, !model.supportsHostWorkCommands {
+                    Label(
+                        "Reading or editing pipelines on \(pipelinesHost) needs the updated muxad on this Mac (Use Bundled muxad).",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
+            }
+
+            if let options = model.workOptions(for: pipelinesHostAlias) {
                 if options.pipelines.isEmpty {
                     WorkPresetGallery(
                         options: options,
+                        host: pipelinesHostAlias,
                         model: model,
-                        onInstalled: { installed in model.presentWorkStart(pipeline: installed) },
-                        onDescribe: { Task { await model.configureWork(cwd: nil) } }
+                        onInstalled: { installed in
+                            model.presentWorkStart(pipeline: installed, host: pipelinesHostAlias)
+                        },
+                        onDescribe: describeWithAgentAction
                     )
                     .padding(16)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
@@ -543,20 +652,21 @@ struct WorkCommandCenterView: View {
                         ForEach(options.pipelines) { pipeline in
                             WorkPipelineCard(
                                 pipeline: pipeline,
-                                routes: options.routes.filter { $0.pipeline == pipeline.name }
-                            ) {
-                                model.presentWorkStart(pipeline: pipeline.name)
-                            }
+                                routes: options.routes.filter { $0.pipeline == pipeline.name },
+                                start: { model.presentWorkStart(pipeline: pipeline.name, host: pipelinesHostAlias) },
+                                edit: { model.presentPipelineEditor(host: pipelinesHostAlias, pipeline: pipeline) }
+                            )
                         }
                     }
-                    if let error = model.workOptionsError {
+                    WorkRoutesEditor(options: options, host: pipelinesHostAlias, model: model)
+                    if let error = model.workOptionsError(for: pipelinesHostAlias) {
                         Label(error, systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
                             .foregroundStyle(.orange)
                             .textSelection(.enabled)
                     }
                 }
-            } else if let error = model.workOptionsError {
+            } else if let error = model.workOptionsError(for: pipelinesHostAlias) {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)

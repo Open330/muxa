@@ -84,11 +84,23 @@ final class AppModel: ObservableObject {
     /// Pipeline the Start Work sheet should preselect when opened from a
     /// pipeline card; nil leaves the route default.
     @Published var workStartPreselectedPipeline: String?
-    /// Routes, pipelines, skills, and presets from `muxa work options`.
+    /// Routes, pipelines, skills, and presets from `muxa work options` on
+    /// the local host. Per-host copies live in `workOptionsByHost`.
     @Published private(set) var workOptions: MuxaWorkOptions?
+    @Published private(set) var workOptionsByHost: [String: MuxaWorkOptions] = [:]
+    @Published private(set) var workOptionsErrorsByHost: [String: String] = [:]
     @Published private(set) var workOptionsError: String?
     @Published private(set) var isLoadingWorkOptions = false
     @Published private(set) var isApplyingWorkPreset = false
+    @Published private(set) var isSavingPipeline = false
+    @Published private(set) var pipelineEditorError: String?
+    /// Host the Start Work sheet should preselect; nil is local.
+    @Published var workStartPreselectedHost: String?
+    /// The pipeline editor sheet: which host's config it edits and which
+    /// pipeline (nil creates a new one).
+    @Published var pipelineEditorTarget: MuxaPipelineEditorTarget?
+    /// Whether the connected daemon can run Work commands on fleet hosts.
+    @Published private(set) var supportsHostWorkCommands = false
     @Published private(set) var isStartingWork = false
     /// The last dry-run result, shown in the sheet so the operator sees the
     /// exact agents and prompts before launching for real.
@@ -662,62 +674,242 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func presentWorkStart(pipeline: String? = nil) {
+    func presentWorkStart(pipeline: String? = nil, host: String? = nil) {
         workStartError = nil
         workStartStatus = nil
         workStartPlan = nil
         workStartPreselectedPipeline = pipeline
+        workStartPreselectedHost = host
         isPresentingWorkStart = true
-        Task { [weak self] in await self?.loadWorkOptions() }
+        Task { [weak self] in await self?.loadWorkOptions(host: host) }
     }
 
-    /// Reads routes, pipelines, message skills, and presets through the
-    /// bundled CLI so the Start Work form and the Command Center can offer
-    /// real choices. The config file is the source of truth, so this is a
-    /// fresh read every time rather than daemon state.
-    func loadWorkOptions() async {
-        guard !isLoadingWorkOptions else { return }
-        isLoadingWorkOptions = true
-        defer { isLoadingWorkOptions = false }
-        do {
-            let output = try await Self.runBundledMuxa(
-                arguments: ["work", "options", "--json"],
-                socketPath: client.socketPath
+    /// Alias of the local fleet host, or "local" before the snapshot arrives.
+    var localHostAlias: String {
+        fleetHosts.first(where: \.local)?.alias ?? "local"
+    }
+
+    func isLocalHost(_ alias: String?) -> Bool {
+        guard let alias, !alias.isEmpty else { return true }
+        return fleetHosts.first { $0.alias == alias }?.local ?? (alias == "local")
+    }
+
+    /// Hosts that can start Work: the local host plus control-mode hosts.
+    var workCapableHosts: [MuxaFleetHost] {
+        fleetHosts.filter { $0.local || $0.mode == "control" }
+            .sorted { left, right in
+                if left.local != right.local { return left.local }
+                return left.alias.localizedStandardCompare(right.alias) == .orderedAscending
+            }
+    }
+
+    /// Work options for a host: the local copy for the local host, else the
+    /// per-host cache.
+    func workOptions(for host: String?) -> MuxaWorkOptions? {
+        isLocalHost(host) ? workOptions : workOptionsByHost[host ?? ""]
+    }
+
+    func workOptionsError(for host: String?) -> String? {
+        isLocalHost(host) ? workOptionsError : workOptionsErrorsByHost[host ?? ""]
+    }
+
+    /// Runs one allowlisted `muxa work …` subcommand and returns its stdout.
+    /// The daemon path (`work_command`) reaches fleet hosts; an older daemon
+    /// without it still serves the local host through the bundled CLI.
+    func runWorkCommand(
+        host: String?,
+        arguments: [String],
+        stdin: String? = nil
+    ) async throws -> String {
+        let local = isLocalHost(host)
+        if await client.supports(MuxaIPCClient.workCommandCapability) {
+            let output = try await client.workCommand(
+                host: local ? nil : host,
+                arguments: arguments,
+                stdin: stdin
             )
+            guard output.exitCode == 0 else {
+                let detail = output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                throw MuxaIPCError.server(
+                    detail.isEmpty ? "muxa \(arguments.prefix(3).joined(separator: " ")) exited with \(output.exitCode)" : detail
+                )
+            }
+            return output.stdout
+        }
+        guard local else {
+            throw MuxaIPCError.server(
+                "Running Work commands on \(host ?? "a remote host") needs the updated muxad; choose Use Bundled muxad or restart it"
+            )
+        }
+        return try await Self.runBundledMuxa(
+            arguments: arguments,
+            socketPath: client.socketPath,
+            input: stdin
+        )
+    }
+
+    /// Reads routes, pipelines, message skills, and presets for one host
+    /// through the canonical CLI so the Start Work form and the Command
+    /// Center can offer real choices. The config file on that host is the
+    /// source of truth, so this is a fresh read every time.
+    func loadWorkOptions(host: String? = nil) async {
+        let local = isLocalHost(host)
+        if local {
+            guard !isLoadingWorkOptions else { return }
+            isLoadingWorkOptions = true
+        }
+        defer { if local { isLoadingWorkOptions = false } }
+        supportsHostWorkCommands = await client.supports(MuxaIPCClient.workCommandCapability)
+        do {
+            let output = try await runWorkCommand(host: host, arguments: ["work", "options", "--json"])
             let decoded = try MuxaWorkOptions.decode(Data(output.utf8))
-            if workOptions != decoded { workOptions = decoded }
-            workOptionsError = nil
+            if local {
+                if workOptions != decoded { workOptions = decoded }
+                workOptionsError = nil
+            } else if let host {
+                if workOptionsByHost[host] != decoded { workOptionsByHost[host] = decoded }
+                workOptionsErrorsByHost[host] = nil
+            }
         } catch {
             MuxaLog.app.warning(
-                "work options unavailable: \(error.localizedDescription, privacy: .public)"
+                "work options unavailable on \(host ?? "local", privacy: .public): \(error.localizedDescription, privacy: .public)"
             )
-            workOptionsError = error.localizedDescription
+            if local {
+                workOptionsError = error.localizedDescription
+            } else if let host {
+                workOptionsErrorsByHost[host] = error.localizedDescription
+            }
         }
     }
 
-    /// Writes one of muxa's built-in pipeline presets into the config through
-    /// the canonical CLI (`muxa work preset apply`). A catch-all route is
-    /// added only when the config has no route yet, so an existing routing
-    /// table is never reordered from the app.
-    func applyWorkPreset(_ name: String) async -> Bool {
+    /// Writes one of muxa's built-in pipeline presets into a host's config
+    /// through the canonical CLI (`muxa work preset apply`). A catch-all
+    /// route is added only when that config has no route yet, so an existing
+    /// routing table is never reordered from the app.
+    func applyWorkPreset(_ name: String, host: String? = nil) async -> Bool {
         guard !isApplyingWorkPreset else { return false }
         isApplyingWorkPreset = true
         defer { isApplyingWorkPreset = false }
         var arguments = ["work", "preset", "apply", name, "--json"]
-        if workOptions?.routes.isEmpty ?? true {
+        if workOptions(for: host)?.routes.isEmpty ?? true {
             arguments += ["--route", ".*"]
         }
         do {
-            _ = try await Self.runBundledMuxa(arguments: arguments, socketPath: client.socketPath)
-            workOptionsError = nil
+            _ = try await runWorkCommand(host: host, arguments: arguments)
+            setWorkOptionsError(nil, host: host)
             workStartError = nil
-            await loadWorkOptions()
+            await loadWorkOptions(host: host)
             return true
         } catch {
             MuxaLog.app.error(
                 "work preset apply failed: \(error.localizedDescription, privacy: .public)"
             )
-            workOptionsError = error.localizedDescription
+            setWorkOptionsError(error.localizedDescription, host: host)
+            return false
+        }
+    }
+
+    private func setWorkOptionsError(_ message: String?, host: String?) {
+        if isLocalHost(host) {
+            workOptionsError = message
+        } else if let host {
+            workOptionsErrorsByHost[host] = message
+        }
+    }
+
+    func presentPipelineEditor(host: String?, pipeline: MuxaWorkOptions.Pipeline?) {
+        pipelineEditorError = nil
+        pipelineEditorTarget = MuxaPipelineEditorTarget(
+            host: isLocalHost(host) ? nil : host,
+            pipeline: pipeline
+        )
+    }
+
+    /// Saves an edited or new pipeline into the host's config through
+    /// `muxa work pipeline set <name> --from-json -`.
+    func savePipeline(
+        _ definition: MuxaPipelineDefinition,
+        named name: String,
+        host: String?
+    ) async -> Bool {
+        guard !isSavingPipeline else { return false }
+        isSavingPipeline = true
+        pipelineEditorError = nil
+        defer { isSavingPipeline = false }
+        do {
+            let json = try definition.jsonString()
+            _ = try await runWorkCommand(
+                host: host,
+                arguments: ["work", "pipeline", "set", name, "--from-json", "-", "--json"],
+                stdin: json
+            )
+            await loadWorkOptions(host: host)
+            return true
+        } catch {
+            MuxaLog.app.error("pipeline save failed: \(error.localizedDescription, privacy: .public)")
+            pipelineEditorError = error.localizedDescription
+            return false
+        }
+    }
+
+    func removePipeline(named name: String, host: String?, force: Bool) async -> Bool {
+        guard !isSavingPipeline else { return false }
+        isSavingPipeline = true
+        pipelineEditorError = nil
+        defer { isSavingPipeline = false }
+        var arguments = ["work", "pipeline", "remove", name, "--json"]
+        if force { arguments.append("--force") }
+        do {
+            _ = try await runWorkCommand(host: host, arguments: arguments)
+            await loadWorkOptions(host: host)
+            return true
+        } catch {
+            pipelineEditorError = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Upserts a `[[route]]` by its match text through `muxa work route set`.
+    func setRoute(_ route: MuxaWorkRouteEdit, host: String?) async -> Bool {
+        var arguments = ["work", "route", "set", "--match", route.match, "--json"]
+        if route.pipeline.isEmpty {
+            if route.existing { arguments.append("--clear-pipeline") }
+        } else {
+            arguments += ["--pipeline", route.pipeline]
+        }
+        if route.workspace.isEmpty {
+            if route.existing { arguments.append("--clear-workspace") }
+        } else {
+            arguments += ["--workspace", route.workspace]
+        }
+        if route.cwd.isEmpty {
+            if route.existing { arguments.append("--clear-cwd") }
+        } else {
+            arguments += ["--cwd", route.cwd]
+        }
+        if let position = route.position { arguments += ["--position", String(position)] }
+        do {
+            _ = try await runWorkCommand(host: host, arguments: arguments)
+            setWorkOptionsError(nil, host: host)
+            await loadWorkOptions(host: host)
+            return true
+        } catch {
+            setWorkOptionsError(error.localizedDescription, host: host)
+            return false
+        }
+    }
+
+    func removeRoute(match: String, host: String?) async -> Bool {
+        do {
+            _ = try await runWorkCommand(
+                host: host,
+                arguments: ["work", "route", "remove", "--match", match, "--json"]
+            )
+            setWorkOptionsError(nil, host: host)
+            await loadWorkOptions(host: host)
+            return true
+        } catch {
+            setWorkOptionsError(error.localizedDescription, host: host)
             return false
         }
     }
@@ -1273,7 +1465,8 @@ final class AppModel: ObservableObject {
 
     nonisolated private static func runBundledMuxa(
         arguments: [String],
-        socketPath: String
+        socketPath: String,
+        input: String? = nil
     ) async throws -> String {
         let bundled = Bundle.main.bundleURL
             .appendingPathComponent("Contents", isDirectory: true)
@@ -1291,7 +1484,13 @@ final class AppModel: ObservableObject {
             let errors = Pipe()
             process.standardOutput = output
             process.standardError = errors
+            let stdin = Pipe()
+            process.standardInput = input == nil ? FileHandle.nullDevice : stdin
             try process.run()
+            if let input {
+                stdin.fileHandleForWriting.write(Data(input.utf8))
+                try? stdin.fileHandleForWriting.close()
+            }
             process.waitUntilExit()
             let standardOutput = output.fileHandleForReading.readDataToEndOfFile()
             let standardError = errors.fileHandleForReading.readDataToEndOfFile()

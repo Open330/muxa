@@ -108,6 +108,45 @@ struct MuxaWorkStartRequest: Hashable, Sendable {
     let body: String?
     let context: String?
     let dryRun: Bool
+    /// Fleet host alias to run `muxa work up` on; nil is the local host.
+    let host: String?
+
+    init(
+        work: String,
+        workspace: String?,
+        pipeline: String?,
+        cwd: String?,
+        external: String?,
+        skill: String?,
+        body: String?,
+        context: String?,
+        dryRun: Bool,
+        host: String? = nil
+    ) {
+        self.work = work
+        self.workspace = workspace
+        self.pipeline = pipeline
+        self.cwd = cwd
+        self.external = external
+        self.skill = skill
+        self.body = body
+        self.context = context
+        self.dryRun = dryRun
+        self.host = host
+    }
+}
+
+/// Output of one allowlisted `muxa work …` invocation run by muxad on the
+/// local host or on a fleet host (`work_command`).
+struct MuxaWorkCommandOutput: Decodable, Equatable, Sendable {
+    let exitCode: Int32
+    let stdout: String
+    let stderr: String
+
+    enum CodingKeys: String, CodingKey {
+        case stdout, stderr
+        case exitCode = "exit_code"
+    }
 }
 
 /// One step of `muxa work up`'s reconciliation plan: `launch` a missing
@@ -785,6 +824,7 @@ private struct MuxaIPCResponse: Decodable, Sendable {
     let askConversation: MuxaAskConversation?
     let askAgent: String?
     let askEnabled: Bool?
+    let workCommand: MuxaWorkCommandOutput?
 
     enum CodingKeys: String, CodingKey {
         case ok, error, capabilities, agents, sessions, session, output, capture, fleet
@@ -792,6 +832,7 @@ private struct MuxaIPCResponse: Decodable, Sendable {
         case maxProtocol = "max_protocol"
         case fleetResult = "fleet_result"
         case pipelineRuns = "pipeline_runs"
+        case workCommand = "work_command"
         case workOperation = "work_operation"
         case askEntries = "ask_entries"
         case askEntry = "ask_entry"
@@ -861,6 +902,7 @@ actor MuxaIPCClient {
     static let byteSafeCapability = "session_bytes_v1"
     static let attachmentIdentityCapability = "session_attachment_identity_v1"
     static let workControlCapability = "work_control_v1"
+    static let workCommandCapability = "work_command_v1"
     static let askCredentialCapability = "ask_one_turn_credential_v1"
     static let askConversationCapability = "ask_conversations_v1"
     static let fleetSubscribeCapability = "fleet_subscribe"
@@ -971,6 +1013,7 @@ actor MuxaIPCClient {
         Self.put(request.skill, key: "skill", in: &workRequest)
         Self.put(request.body, key: "body", in: &workRequest)
         Self.put(request.context, key: "context", in: &workRequest)
+        Self.put(request.host, key: "host", in: &workRequest)
         let response = try await call([
             "protocol": Self.protocolVersion,
             "kind": "work_up",
@@ -980,6 +1023,34 @@ actor MuxaIPCClient {
             throw MuxaIPCError.missingField("work_operation")
         }
         return operation
+    }
+
+    /// Runs one allowlisted `muxa work …` subcommand (options, preset,
+    /// pipeline, route) through muxad, locally or on a fleet host. Requires
+    /// `work_command_v1`; callers fall back to the bundled CLI for the local
+    /// host when an older daemon lacks it.
+    func workCommand(
+        host: String?,
+        arguments: [String],
+        stdin: String? = nil
+    ) async throws -> MuxaWorkCommandOutput {
+        guard capabilities.contains(Self.workCommandCapability) else {
+            throw MuxaIPCError.server(
+                "muxad does not support Work commands on hosts; update muxa and restart muxad"
+            )
+        }
+        var request: [String: Any] = [
+            "protocol": Self.protocolVersion,
+            "kind": "work_command",
+            "args": arguments,
+        ]
+        if let host, !host.isEmpty { request["host"] = host }
+        if let stdin { request["stdin"] = stdin }
+        let response = try await call(request, timeout: 40)
+        guard let output = response.workCommand else {
+            throw MuxaIPCError.missingField("work_command")
+        }
+        return output
     }
 
     func workOperation(id: String) async throws -> MuxaWorkOperation {
