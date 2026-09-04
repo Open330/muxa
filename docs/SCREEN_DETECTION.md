@@ -248,9 +248,10 @@ Each tick (`interval` with `MissedTickBehavior::Skip`; a tick is fully awaited
 before the next, so **a slow tick skips rather than overlaps**):
 
 1. **Gather candidates** — one `list_panes` per detectable backend inside a
-   single `spawn_blocking`, keeping panes whose `current_command` matches a
-   manifest. When **nothing matches, zero captures run** — idle cost is ≈ one
-   pane list.
+   single `spawn_blocking`, keeping panes selected by a direct command match,
+   supported wrapper/process discovery, or a live Codex registry row needing
+   recap observation. When **nothing matches, zero captures run** — idle cost
+   is ≈ one pane list.
 2. **Stop dropped rows** — any previously-tracked pane no longer a candidate is
    driven to `Stopped` (see Row liveness).
 3. **Per candidate** — skip if a live non-Codex hook owns it; for live Codex,
@@ -288,8 +289,9 @@ the same registry key.
   than the pane or already scrolled away before a detection tick cannot be
   recovered from the rollout's opaque compaction item. Once observed, it is
   retained in the agent snapshot. Paneless Codex sessions have no screen source.
-- Foreground-command match only (no wrapper/process-tree walk) — see the
-  `[agent].command` note.
+- Hook-less custom launch wrappers remain undiscoverable unless their command
+  is declared in a manifest. A live hooked Codex row can still select the
+  metadata-only recap path even when the launcher owns `pane_current_command`.
 - Best-effort bundled patterns (see the confidence table).
 - Blocked notifications carry a generic `"<name> is waiting"` message; screen
   inference does not extract the specific prompt text.

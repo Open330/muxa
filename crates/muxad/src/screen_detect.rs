@@ -234,16 +234,20 @@ impl ScreenDetector {
             .into_iter()
             .filter_map(|(i, p, discovered)| {
                 let direct = self.manifests.manifest_for_command(&p.current_command);
+                let registry_kind = by_pane.get(&p.pane_id).copied();
                 // The registry knows which agent muxa put on the pane; the
                 // foreground command only knows which process is in front, and
                 // for an npm install that is the `node` shim. So prefer the
                 // registry — but only while the command still looks like an
-                // agent host. A pane that fell back to a shell has lost its
-                // agent, and must drop out of candidacy even though a row may
-                // still (briefly) point at it.
+                // agent host. Codex is the narrow exception: launch wrappers
+                // can put their own name (for example `aas`) in this field,
+                // and a live hook row is authoritative enough to select the
+                // metadata-only recap path without enabling synthetic state
+                // inference for arbitrary commands.
                 let registry = (direct.is_some()
-                    || muxa::discovery::is_wrapper_command(&p.current_command))
-                .then(|| by_pane.get(&p.pane_id).copied())
+                    || muxa::discovery::is_wrapper_command(&p.current_command)
+                    || registry_kind == Some(AgentKind::Codex))
+                .then_some(registry_kind)
                 .flatten();
                 let by_kind = registry
                     .or(discovered)
@@ -745,12 +749,11 @@ mod tests {
 › Ask Codex to do anything\n"
                 .into(),
         );
-        // npm-installed Codex commonly presents `node`; registry identity is
-        // therefore the selector, as it is for the startup-gate path.
-        let backend: SharedBackend = Arc::new(FakeBackend::tmux(
-            vec![pane("%1", "node")],
-            captures.clone(),
-        ));
+        // A custom launcher can present its own foreground command even though
+        // the authoritative row and descendant process are Codex. Registry
+        // identity must still select the metadata-only recap path.
+        let backend: SharedBackend =
+            Arc::new(FakeBackend::tmux(vec![pane("%1", "aas")], captures.clone()));
         let store = Store::shared();
         let started_at = OffsetDateTime::now_utc() - time::Duration::minutes(10);
         store
