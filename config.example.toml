@@ -51,14 +51,16 @@
 # visible tail to infer Working / WaitingInput / Idle. Last-resort only: hooks
 # stay authoritative, herdr hosts are covered by herdr's own detection, and the
 # synthetic rows are evicted the instant a real hook claims the pane. Bundled
+# Codex panes are the metadata-only exception: their visible Conversation recap
+# is retained for watch/peek summaries without changing hook-owned state.
 # manifests ship in the binary; drop overrides at
 # $XDG_CONFIG_HOME/muxa/agents/<name>.toml (same name replaces a bundled one).
 # See docs/SCREEN_DETECTION.md.
 [screen_detect]
 # enabled       = true
 # interval_secs = 3                 # 3s default — capture/classify cadence; a tick is skipped
-#                                   # if the previous is still running, and no captures run when
-#                                   # no pane matches a manifest (idle cost ≈ one pane list).
+#                                   # if the previous is still running. Hook-owned Codex panes
+#                                   # add one recap capture per matching pane on each tick.
 
 # Defaults and conventions advertised to MCP-connected agents. These values
 # are included in the MCP initialization guide, returned by `muxa_guide`, and
@@ -244,11 +246,12 @@
 #   summary = "recap"   # recap → session title → last prompt (default)
 #   summary = "title"   # session title → last prompt; skips the sparse recap
 #   summary = "prompt"  # last prompt only (pre-recap behavior)
-# "recap" is Claude Code's own `※ recap: …` line, read from the session
-# transcript — it is not exposed via any hook, and Claude only writes one when
-# you return after being away, so the title tier keeps the column useful in
-# between. Codex/Gemini have no recap or title source and fall straight
-# through to the last prompt. The header reads SUMMARY unless set to "prompt".
+# "recap" is the agent's own summary: Claude Code's `※ recap: …` is read
+# from its transcript, while Codex's `Conversation recap` is observed from a
+# capture-capable pane when context compaction renders it. Neither is in the
+# normal hook payload and both are sparse, so the title/prompt tiers keep the
+# column useful between recaps. Gemini currently falls through to last prompt.
+# The header reads SUMMARY unless set to "prompt".
 # summary = "recap"
 # Hide agents that aren't bound to a tmux pane (Claude SDK sub-processes,
 # agents launched outside tmux). Default true because picker actions

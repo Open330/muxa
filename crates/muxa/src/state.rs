@@ -214,13 +214,12 @@ pub struct Agent {
     /// text (e.g., Codex/Gemini today). Optional so the field is purely
     /// additive on the wire and in the UI.
     pub last_response: Option<String>,
-    /// Claude Code's session "recap" (`※ recap: …`), scraped from the
-    /// transcript at turn end. The richest "what is this agent actually
-    /// doing" signal muxa can get, but sparse — Claude only writes one
-    /// when the user returns after being away — so it is never cleared by
-    /// a turn that didn't produce one, and the UI falls back to
-    /// [`Self::ai_title`] then [`Self::last_prompt`]. `None` for agents
-    /// with no recap source (Codex/Gemini have no equivalent).
+    /// Agent-authored session recap: Claude Code's `※ recap: …` read from
+    /// its transcript, or Codex's `Conversation recap` observed in its TUI.
+    /// This is the richest "what is this agent actually doing" signal muxa
+    /// can get, but sparse, so it is never cleared when a later observation
+    /// carries none; the UI falls back to [`Self::ai_title`] then
+    /// [`Self::last_prompt`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recap: Option<String>,
     /// Claude Code's rolling short session title — the same string it puts
@@ -1337,6 +1336,30 @@ impl Store {
 
     pub async fn by_session(&self, session_id: &str) -> Option<Agent> {
         self.agents.read().await.get(session_id).cloned()
+    }
+
+    /// Persist a best-effort recap observed outside the hook event stream.
+    ///
+    /// Codex's compacted rollout item is opaque, but its TUI renders a
+    /// plaintext `Conversation recap`. The screen detector feeds that text
+    /// here. Metadata-only observations deliberately do not advance
+    /// `last_activity_at`, alter agent state, or emit a transition; they only
+    /// wake snapshot persistence when the value actually changes.
+    pub async fn update_recap_if_changed(&self, session_id: &str, recap: String) -> bool {
+        if recap.trim().is_empty() {
+            return false;
+        }
+        let mut agents = self.agents.write().await;
+        let Some(agent) = agents.get_mut(session_id) else {
+            return false;
+        };
+        if agent.recap.as_deref() == Some(recap.as_str()) {
+            return false;
+        }
+        agent.recap = Some(recap);
+        drop(agents);
+        self.dirty.notify_one();
+        true
     }
 
     /// Most-recent-first prompt history. `pane = None` returns prompts
@@ -3753,6 +3776,49 @@ mod tests {
             .await;
         let agent = store.by_session("s").await.unwrap();
         assert_eq!(agent.last_response.as_deref(), Some("first answer"));
+    }
+
+    #[tokio::test]
+    async fn observed_recap_updates_metadata_without_advancing_activity() {
+        let store = Store::shared();
+        let started_at = datetime!(2026-04-24 12:00:00 UTC);
+        let active_at = datetime!(2026-04-24 12:01:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: started_at,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::ToolStarted {
+                id: id("s"),
+                tool: "review".into(),
+                subagent: None,
+                at: active_at,
+            })
+            .await;
+
+        assert!(
+            store
+                .update_recap_if_changed("s", "Review is complete.".into())
+                .await
+        );
+        let agent = store.by_session("s").await.unwrap();
+        assert_eq!(agent.recap.as_deref(), Some("Review is complete."));
+        assert_eq!(agent.state, AgentState::Working);
+        assert_eq!(agent.last_activity_at, active_at);
+
+        assert!(
+            !store
+                .update_recap_if_changed("s", "Review is complete.".into())
+                .await,
+            "an unchanged capture must be a no-op",
+        );
+        assert!(
+            !store
+                .update_recap_if_changed("missing", "orphan recap".into())
+                .await,
+        );
     }
 
     #[tokio::test]

@@ -12,6 +12,9 @@ aider, goose, and anything a user declares — there is no event stream at all.
 because agy's hooks cannot report an approval prompt, so screen inference stays
 live on agy panes even when hooks are wired. See
 [Attention refinement](#attention-refinement-the-one-exception).
+Codex has a different, metadata-only exception: its compacted rollout payload
+is opaque, while the TUI renders a plaintext `Conversation recap`. The screen
+task captures that recap into the real row without inferring or changing state.
 Screen-manifest detection is the last-resort fallback herdr validated: capture
 the pane and match TOML-declared regex rules against the visible tail to infer
 `Working` / `WaitingInput` / `Idle`.
@@ -32,11 +35,13 @@ invariant from existing machinery:
   synthetic-eviction pass drops any synthetic row for a pane the moment a real
   hook `Started`/tool/prompt event claims it (same rule the herdr bridge relies
   on). The hook row then owns the pane.
-- **The screen task never clobbers a live authoritative row.** Before capturing
-  *or* applying, it checks `synthetic::occupant_is_authoritative`: a live
-  (non-`Stopped`), non-synthetic occupant means "skip this pane entirely — no
-  capture, no update." A `Stopped` real row is a stale tombstone, not an owner,
-  so a fresh hook-less agent in that same pane is still detectable.
+- **The screen task never clobbers a live authoritative row's state.** Before
+  applying inferred state, it checks `synthetic::occupant_is_authoritative`: a
+  live (non-`Stopped`), non-synthetic occupant means "no synthetic state
+  update." Hook-owned Codex panes are still captured for their recap only;
+  that metadata update does not touch state, activity time, or transitions. A
+  `Stopped` real row is a stale tombstone, not an owner, so a fresh hook-less
+  agent in that same pane is still detectable.
 - **herdr hosts are skipped wholesale.** A herdr backend is never a screen
   candidate — herdr's own detection plus the herdr bridge already cover those
   panes. (`detectable_backends` filters `HostKind::Herdr` out.)
@@ -162,6 +167,31 @@ pane a real row owns, so one would flap in and out on every hook event. Such
 panes are also never added to the detector's `tracked` set: that set drives the
 stop-sweep, and a real row is not screen detection's to stop.
 
+## Codex conversation recap observation
+
+Codex emits only an opaque compaction item in its rollout, but renders a short
+plaintext block in the terminal:
+
+```text
+─ Conversation recap ─────
+
+  Reviewed all 18 tickets; the remaining step is to verify their states.
+
+› Ask Codex to do anything
+```
+
+For a live hook-owned Codex row, the detector captures the pane and strictly
+matches that box-rule header, then keeps only the indented body before the next
+composer/status row. Ordinary prompt text mentioning "Conversation recap" does
+not match. The newest visible recap is capped at 2 KB and stored in
+`Agent::recap`; an identical observation is a no-op. The update does not advance
+`last_activity_at`, change state, create a synthetic row, or emit a transition.
+
+That single field already feeds the existing summary priority (`recap → title
+→ prompt`) in `muxa watch`, `muxa status`, Fleet/macOS views, and `muxa
+peek`. Peek also parses the fresh backdrop capture locally, closing the interval
+between Codex rendering a recap and the daemon's next detection tick.
+
 ## Manifest sources
 
 1. **Bundled** — `agy`, `cursor`, `amp`, `copilot`, `aider`, `goose` ship in the
@@ -223,8 +253,9 @@ before the next, so **a slow tick skips rather than overlaps**):
    pane list.
 2. **Stop dropped rows** — any previously-tracked pane no longer a candidate is
    driven to `Stopped` (see Row liveness).
-3. **Per candidate** — skip if a live hook owns it (no capture); else
-   `capture_pane` inside `spawn_blocking` (bounded by tmux's 1s command
+3. **Per candidate** — skip if a live non-Codex hook owns it; for live Codex,
+   capture only the recap metadata; otherwise run endpoint-scoped
+   `capture_pane_on` inside `spawn_blocking` (bounded by tmux's 1s command
    timeout), `prepare_capture`, `classify`, and **on a state change** ingest the
    synthetic events through `synthetic::apply_if_unowned` (which re-checks
    authoritative ownership as a final guard against races).
@@ -253,6 +284,10 @@ the same registry key.
 
 ## Limitations
 
+- Codex recap capture is visible-screen, best-effort observation: a recap longer
+  than the pane or already scrolled away before a detection tick cannot be
+  recovered from the rollout's opaque compaction item. Once observed, it is
+  retained in the agent snapshot. Paneless Codex sessions have no screen source.
 - Foreground-command match only (no wrapper/process-tree walk) — see the
   `[agent].command` note.
 - Best-effort bundled patterns (see the confidence table).

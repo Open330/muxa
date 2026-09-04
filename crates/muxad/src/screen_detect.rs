@@ -10,15 +10,21 @@
 //! machinery (hook-authoritative precedence, row liveness, event building) is
 //! shared with the herdr bridge via [`crate::synthetic`].
 //!
+//! Hook-owned Codex panes are the metadata-only exception: Codex's compaction
+//! payload is opaque, but its TUI prints a plaintext `Conversation recap`.
+//! Captures may populate the real row's `recap` without changing its state or
+//! weakening hook precedence.
+//!
 //! ## Precedence — hooks > herdr bridge > screen detection
 //!
 //! Screen rows are synthetic, so:
 //!
 //! * A real hook `Started`/tool/prompt event on the pane evicts the screen row
 //!   the instant it fires (`Store::apply`'s synthetic-eviction pass).
-//! * Before capturing OR applying, the task checks
+//! * Before applying inferred state, the task checks
 //!   [`synthetic::occupant_is_authoritative`]: if a live non-synthetic row owns
-//!   the pane, the pane is skipped entirely — no capture, no update.
+//!   the pane, no synthetic state update may land. Hook-owned Codex is still
+//!   captured for recap metadata only.
 //! * **herdr hosts are skipped wholesale**: herdr's own detection + the herdr
 //!   bridge already cover those panes, so a herdr backend is never a screen
 //!   candidate (see [`detectable_backends`]).
@@ -83,6 +89,20 @@ fn synthetic_id(pane: &PaneInfo) -> AgentId {
         pane: Some(pane.pane_id.clone()),
         tmux_socket: pane.socket.clone(),
         cwd: None,
+    }
+}
+
+/// Pane ids repeat across tmux servers. A missing endpoint remains compatible
+/// for legacy hook rows, but when both sides know one they must name the same
+/// server before an occupant can own (or receive metadata from) this capture.
+fn same_pane_endpoint(agent: &muxa::Agent, pane: &PaneInfo) -> bool {
+    match (agent.tmux_socket.as_deref(), pane.socket.as_deref()) {
+        (Some(agent_endpoint), Some(pane_endpoint)) => muxa::backend::pane_endpoints_match(
+            agent.pane.as_deref(),
+            agent_endpoint,
+            pane_endpoint,
+        ),
+        _ => true,
     }
 }
 
@@ -234,9 +254,10 @@ impl ScreenDetector {
             .collect()
     }
 
-    /// Capture, classify, and (on a state change) ingest one candidate pane.
-    /// Returns `true` iff a state change was ingested. Skips panes a live hook
-    /// owns (no capture) and classifications that don't move the state.
+    /// Capture, classify, and (on a state or recap change) ingest one candidate
+    /// pane. Returns `true` iff stored data changed. Hook-owned panes are
+    /// skipped except for Codex, whose visible `Conversation recap` is observed
+    /// as metadata without touching hook-owned state.
     /// `manifest` is the one `gather_candidates` already resolved for this
     /// pane's command, carried forward so there is no second lookup.
     async fn process_candidate(
@@ -247,29 +268,72 @@ impl ScreenDetector {
     ) -> bool {
         let pane_id = pane.pane_id.clone();
 
-        let occupants = self.store.by_pane(&pane_id).await;
+        let occupants: Vec<_> = self
+            .store
+            .by_pane(&pane_id)
+            .await
+            .into_iter()
+            .filter(|agent| same_pane_endpoint(agent, pane))
+            .collect();
+        let codex_owner = occupants
+            .iter()
+            .filter(|agent| {
+                agent.kind == AgentKind::Codex && synthetic::occupant_is_authoritative(agent)
+            })
+            .max_by_key(|agent| agent.last_activity_at)
+            .cloned();
         let ownership = synthetic::pane_ownership(&occupants, OffsetDateTime::now_utc());
-        if matches!(ownership, synthetic::PaneOwnership::Hooked) {
-            // Hook-authoritative: a live real row owns the pane and its hooks
-            // report every state — don't even capture. Forget any tracking so
-            // a later stop-sweep doesn't touch the real row.
+        let hook_owned = matches!(&ownership, synthetic::PaneOwnership::Hooked);
+        if hook_owned {
+            // Hook-authoritative state is never classified or refined. Forget
+            // any tracking so a later stop-sweep cannot touch the real row.
             self.tracked.remove(&pane_id);
             self.last_state.remove(&pane_id);
-            return false;
+            // Other hook-driven agents expose all metadata muxa consumes via
+            // hooks/transcripts. Codex alone needs one capture for its opaque
+            // compaction recap.
+            if codex_owner.is_none() {
+                return false;
+            }
         }
 
-        let Some(raw) = self.capture(backend_idx, &pane_id).await else {
+        let Some(raw) = self.capture(backend_idx, pane).await else {
             return false;
         };
+        let recap_changed = if let Some(owner) = codex_owner {
+            match muxa::adapters::codex::conversation_recap_from_capture(&raw) {
+                Some(recap) => {
+                    let changed = self
+                        .store
+                        .update_recap_if_changed(&owner.session_id, recap)
+                        .await;
+                    if changed {
+                        tracing::debug!(
+                            pane = %pane_id,
+                            session_id = %owner.session_id,
+                            "screen detection observed Codex conversation recap",
+                        );
+                    }
+                    changed
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+        if hook_owned {
+            return recap_changed;
+        }
+
         let prepared = muxa::screen::prepare_capture(&raw, CAPTURE_TAIL_LINES);
 
         // `None` = unknown screen → keep previous state, no change.
         let Some(state) = manifest.classify(&prepared) else {
-            return false;
+            return recap_changed;
         };
 
         if self.last_state.get(&pane_id) == Some(&state) {
-            return false; // no change since last capture
+            return recap_changed; // no state change since last capture
         }
         self.last_state.insert(pane_id.clone(), state);
 
@@ -291,7 +355,7 @@ impl ScreenDetector {
                 OffsetDateTime::now_utc(),
             );
             if events.is_empty() {
-                return false;
+                return recap_changed;
             }
             for ev in &events {
                 self.store.apply(ev).await;
@@ -319,10 +383,11 @@ impl ScreenDetector {
     }
 
     /// Capture one pane on the given backend, off the async runtime.
-    async fn capture(&self, backend_idx: usize, pane_id: &str) -> Option<String> {
+    async fn capture(&self, backend_idx: usize, pane: &PaneInfo) -> Option<String> {
         let backend = self.backends[backend_idx].clone();
-        let pane_id = pane_id.to_owned();
-        spawn_blocking(move || backend.capture_pane(&pane_id))
+        let pane_id = pane.pane_id.clone();
+        let socket = pane.socket.clone();
+        spawn_blocking(move || backend.capture_pane_on(socket.as_deref(), &pane_id))
             .await
             .ok()
             .flatten()
@@ -500,6 +565,31 @@ mod tests {
         assert_eq!(out[0].kind(), HostKind::Tmux);
     }
 
+    #[tokio::test]
+    async fn recap_ownership_respects_repeated_pane_ids_across_tmux_servers() {
+        let mut candidate = pane("%1", "node");
+        candidate.socket = Some("amux".into());
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "codex-on-amux".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    tmux_socket: Some("/tmp/tmux-501/amux".into()),
+                    cwd: None,
+                },
+                at: AT,
+            })
+            .await;
+        let mut owner = store.by_session("codex-on-amux").await.unwrap();
+
+        assert!(same_pane_endpoint(&owner, &candidate));
+        owner.tmux_socket = Some("default".into());
+        assert!(!same_pane_endpoint(&owner, &candidate));
+    }
+
     /// The regression this pairs with the `STARTUP_ATTENTION_WINDOW` carve-out:
     /// an npm-installed codex runs as `node`, so command-based manifest
     /// selection never even considered the pane, and its startup gate — the one
@@ -642,6 +732,78 @@ mod tests {
         let rows = store.by_pane("%1").await;
         assert_eq!(rows.len(), 1, "no synthetic row added");
         assert_eq!(rows[0].session_id, "real");
+    }
+
+    #[tokio::test]
+    async fn hook_owned_codex_recap_is_persisted_without_touching_state() {
+        let captures = Arc::new(Mutex::new(HashMap::new()));
+        captures.lock().unwrap().insert(
+            "%1".into(),
+            "─ Worked for 14m 27s ───\n\n\
+─ Conversation recap ───\n\n\
+  Reviewed all 18 tickets and recorded the current evidence.\n\n\
+› Ask Codex to do anything\n"
+                .into(),
+        );
+        // npm-installed Codex commonly presents `node`; registry identity is
+        // therefore the selector, as it is for the startup-gate path.
+        let backend: SharedBackend = Arc::new(FakeBackend::tmux(
+            vec![pane("%1", "node")],
+            captures.clone(),
+        ));
+        let store = Store::shared();
+        let started_at = OffsetDateTime::now_utc() - time::Duration::minutes(10);
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "codex-real".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: None,
+                },
+                at: started_at,
+            })
+            .await;
+
+        let mut det = detector(vec![backend], store.clone());
+        assert_eq!(det.run_tick().await, 1, "new recap changes metadata");
+        let row = store.by_session("codex-real").await.unwrap();
+        assert_eq!(
+            row.recap.as_deref(),
+            Some("Reviewed all 18 tickets and recorded the current evidence."),
+        );
+        assert_eq!(row.state, AgentState::Idle, "hooks still own state");
+        assert_eq!(
+            row.last_activity_at, started_at,
+            "summary observation is not agent activity",
+        );
+        assert!(
+            !det.tracked.contains("%1"),
+            "a real row is never synthetic-tracked",
+        );
+
+        assert_eq!(det.run_tick().await, 0, "identical recap is a no-op");
+        captures.lock().unwrap().insert(
+            "%1".into(),
+            "─ Conversation recap ──\n\n  Implementation is now complete.\n\n› Ask Codex to do anything\n"
+                .into(),
+        );
+        assert_eq!(
+            det.run_tick().await,
+            1,
+            "a later recap replaces the old one"
+        );
+        assert_eq!(
+            store
+                .by_session("codex-real")
+                .await
+                .unwrap()
+                .recap
+                .as_deref(),
+            Some("Implementation is now complete."),
+        );
     }
 
     /// A hook-owned agy pane is the one exception to "hooks own the pane": agy

@@ -59,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Codex context-compaction recaps now feed muxa summaries.** The daemon
+  observes the TUI's visible `Conversation recap` without altering hook-owned
+  state or activity timestamps, persists it in the existing recap field used
+  by watch/Fleet views, and `muxa peek` reuses its fresh pane capture so the
+  summary is available before the next detector tick.
+
 - **A pipeline agent's pane split follows the window.** `direction` defaults
   to `auto`: muxa splits along the target pane's longer side, so a line-up
   that grows past two agents stays readable instead of collapsing into thin

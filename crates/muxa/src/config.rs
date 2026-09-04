@@ -1139,14 +1139,16 @@ fn default_binary_poll_secs() -> u64 {
 /// `Working` / `WaitingInput` / `Idle`. This is the *last-resort* fallback:
 /// hooks stay authoritative when present, herdr hosts are covered by herdr's
 /// own detection + bridge (and are skipped here), and the synthetic rows this
-/// task mints are evicted the instant a real hook claims the pane. See
+/// task mints are evicted the instant a real hook claims the pane. Hook-owned
+/// Codex panes are captured only to retain their visible `Conversation recap`;
+/// that metadata path does not infer state. See
 /// `docs/SCREEN_DETECTION.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScreenDetectConfig {
     /// Master switch. Default `true` — the detector only does real work when a
-    /// pane's foreground command matches a manifest AND no authoritative row
-    /// owns the pane, so its idle cost is ~one pane list per tick.
+    /// pane's foreground command matches a manifest. Authoritative rows skip
+    /// state inference; Codex rows still contribute one recap capture.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Cadence of the capture/classify pass, in seconds. Default 3 — brisk
@@ -1894,10 +1896,10 @@ pub struct WatchConfig {
     ///
     /// Default `recap`: the agent's own session recap when it has one,
     /// else its rolling session title, else the last prompt. Claude Code
-    /// writes a recap only when you come back after being away — rich but
-    /// sparse — so the title tier keeps the column meaningful in between.
-    /// Agents with no recap source (Codex, Gemini) fall straight through
-    /// to the last prompt.
+    /// writes a recap only when you come back after being away; Codex prints
+    /// one when it compacts conversation context, which muxa observes from
+    /// capture-capable panes. Agents with no recap source (for example,
+    /// Gemini) fall straight through to the last prompt.
     #[serde(default)]
     pub summary: WatchSummary,
     /// Hide agents that aren't bound to a tmux pane.

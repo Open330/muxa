@@ -7,6 +7,11 @@
 //! infer whether the agent is `Working`, `Blocked` (waiting on the operator),
 //! or `Idle`.
 //!
+//! The daemon also reuses the prepared capture for one metadata-only signal:
+//! Codex's plaintext `Conversation recap`. That parser lives with the Codex
+//! adapter; it may update `Agent::recap` but never participates in state
+//! classification or hook precedence.
+//!
 //! The daemon side (candidate selection, pane capture, synthetic-row ingest)
 //! lives in `muxad::screen_detect`; this module is the pure, unit-testable core:
 //! manifest parsing, bundled + user-override loading, capture preparation

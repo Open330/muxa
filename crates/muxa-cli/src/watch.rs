@@ -17096,9 +17096,10 @@ fn resolve_var_chain(
 ///
 /// Each mode names the highest tier it will show and then *degrades*: the
 /// default `Recap` falls through recap → session title → last prompt. That
-/// matters because a recap is sparse (Claude Code writes one only when you
-/// return after being away) and agents with no recap source at all — Codex,
-/// Gemini — would otherwise render an empty column.
+/// matters because recaps are sparse (Claude Code writes one only when you
+/// return after being away; Codex prints one only after context compaction)
+/// and agents with no recap source, such as Gemini, would otherwise render an
+/// empty column.
 fn summary_line(a: &Agent, mode: WatchSummary) -> String {
     let picked = match mode {
         WatchSummary::Recap => a
@@ -22112,8 +22113,8 @@ mod tests {
         );
         assert_eq!(summary_line(&a, WatchSummary::Title), "infra cleanup");
 
-        // Codex/Gemini shape: no recap or title source, and nothing typed
-        // yet — renders the placeholder rather than an empty cell.
+        // No recap or title source, and nothing typed yet — renders the
+        // placeholder rather than an empty cell (the common Gemini shape).
         a.recap = None;
         a.ai_title = None;
         a.last_prompt = None;

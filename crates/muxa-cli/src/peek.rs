@@ -364,9 +364,30 @@ fn attach_captures(cells: &mut [PeekCell], zoomed: bool) {
             cell.capture.clear();
             continue;
         }
-        cell.capture = muxa::tmux::layout::capture_pane_plain(&cell.geo.pane_id)
-            .map(|raw| raw.lines().map(str::to_string).collect())
-            .unwrap_or_default();
+        let Some(raw) = muxa::tmux::layout::capture_pane_plain(&cell.geo.pane_id) else {
+            cell.capture.clear();
+            continue;
+        };
+        observe_codex_recap(cell, &raw);
+        cell.capture = raw.lines().map(str::to_string).collect();
+    }
+}
+
+/// Fill the overlay's cloned agent row from the same fresh capture it already
+/// took for the backdrop. The daemon normally persists this observation on its
+/// three-second screen-detection tick; doing it here as well closes the small
+/// race where peek opens immediately after Codex prints a recap (and keeps peek
+/// useful when screen detection was explicitly disabled).
+fn observe_codex_recap(cell: &mut PeekCell, raw: &str) {
+    let Some(agent) = cell
+        .agent
+        .as_mut()
+        .filter(|agent| agent.kind == muxa::AgentKind::Codex)
+    else {
+        return;
+    };
+    if let Some(recap) = muxa::adapters::codex::conversation_recap_from_capture(raw) {
+        agent.recap = Some(recap);
     }
 }
 
@@ -1584,6 +1605,32 @@ mod tests {
             .collect::<Vec<_>>()
             .join("|");
         assert!(joined.contains("added a JWT expiry guard"), "{joined}");
+    }
+
+    #[test]
+    fn fresh_capture_supplies_codex_recap_before_daemon_poll() {
+        let mut a = agent("%0", AgentState::Idle);
+        a.kind = muxa::AgentKind::Codex;
+        assert!(a.recap.is_none());
+        let mut cell = PeekCell {
+            geo: geo("0", 0, 0, 40, 10, true),
+            agent: Some(a),
+            extra: 0,
+            last_prompt_at: None,
+            capture: Vec::new(),
+        };
+
+        observe_codex_recap(
+            &mut cell,
+            "─ Conversation recap ───\n\n  Fixed the auth flow and verified it.\n\n› Ask Codex to do anything\n",
+        );
+
+        let agent = cell.agent.as_ref().unwrap();
+        assert_eq!(
+            agent.recap.as_deref(),
+            Some("Fixed the auth flow and verified it."),
+        );
+        assert_eq!(summary_source(agent), agent.recap.as_deref());
     }
 
     #[test]
