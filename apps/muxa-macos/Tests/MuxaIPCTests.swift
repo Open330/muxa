@@ -338,28 +338,38 @@ import Testing
     #expect(decoded.prompt == "Shared.\n")
 }
 
-/// `direction = "right"` in a host's TOML is the CLI default; the editor's
-/// picker must show it as such rather than an empty selection, and sync must
-/// not report it as a difference.
+/// An absent `direction` means `auto`: muxa splits along the pane's longer
+/// side. `right` and `down` are their own values, and tmux's spellings map
+/// onto them, so the editor's picker and sync agree with the daemon.
 @Test func pipelineDefinitionCanonicalizesSplitDirections() {
-    #expect(MuxaPipelineDefinition.Agent.canonicalDirection("right") == "")
-    #expect(MuxaPipelineDefinition.Agent.canonicalDirection(" Horizontal ") == "")
+    #expect(MuxaPipelineDefinition.Agent.canonicalDirection("") == "")
+    #expect(MuxaPipelineDefinition.Agent.canonicalDirection("auto") == "")
+    #expect(MuxaPipelineDefinition.Agent.canonicalDirection("right") == "right")
+    #expect(MuxaPipelineDefinition.Agent.canonicalDirection(" Horizontal ") == "right")
     #expect(MuxaPipelineDefinition.Agent.canonicalDirection("vertical") == "down")
     #expect(MuxaPipelineDefinition.Agent.canonicalDirection("down") == "down")
     #expect(MuxaPipelineDefinition.Agent.canonicalDirection("sideways") == "sideways")
 
-    let explicit = MuxaWorkOptions.Pipeline(name: "pair", agents: [
-        MuxaWorkOptions.Agent(alias: "impl", program: "claude", direction: "right"),
+    let spelled = MuxaWorkOptions.Pipeline(name: "pair", agents: [
+        MuxaWorkOptions.Agent(alias: "impl", program: "claude", direction: "auto"),
         MuxaWorkOptions.Agent(alias: "review", program: "codex", direction: "vertical", after: ["impl"]),
     ])
-    let implicit = MuxaWorkOptions(pipelines: [MuxaWorkOptions.Pipeline(name: "pair", agents: [
+    let implied = MuxaWorkOptions(pipelines: [MuxaWorkOptions.Pipeline(name: "pair", agents: [
         MuxaWorkOptions.Agent(alias: "impl", program: "claude"),
         MuxaWorkOptions.Agent(alias: "review", program: "codex", direction: "down", after: ["impl"]),
     ])])
-    #expect(MuxaPipelineDefinition(explicit).agents.map(\.direction) == ["", "down"])
-    #expect(MuxaPipelineSyncState.compare(library: explicit, hostOptions: implicit) == .inSync)
+    #expect(MuxaPipelineDefinition(spelled).agents.map(\.direction) == ["", "down"])
+    #expect(MuxaPipelineSyncState.compare(library: spelled, hostOptions: implied) == .inSync)
 
-    var sideways = MuxaPipelineDefinition(explicit)
+    // `right` is a choice, not the absence of one, so a host that pins it
+    // differs from one that left the split to muxa.
+    let pinned = MuxaWorkOptions.Pipeline(name: "pair", agents: [
+        MuxaWorkOptions.Agent(alias: "impl", program: "claude", direction: "right"),
+        MuxaWorkOptions.Agent(alias: "review", program: "codex", direction: "down", after: ["impl"]),
+    ])
+    #expect(MuxaPipelineSyncState.compare(library: pinned, hostOptions: implied) == .differs)
+
+    var sideways = MuxaPipelineDefinition(spelled)
     sideways.agents[1].direction = "sideways"
     #expect(sideways.problems().contains { $0.contains("direction") })
 }

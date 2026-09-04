@@ -152,26 +152,65 @@ impl Placement {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum SplitDirection {
+    /// Split along the pane's longer side, which is what a person reaching
+    /// for the divider would do. The default: a line-up that keeps growing
+    /// stays readable instead of collapsing into thin columns.
     #[default]
+    Auto,
     Right,
     Down,
 }
 
 impl SplitDirection {
     pub fn parse(value: Option<&str>) -> std::result::Result<Self, String> {
-        match value
-            .unwrap_or("right")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
+        match value.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
+            "auto" | "" => Ok(Self::Auto),
             "right" | "horizontal" => Ok(Self::Right),
             "down" | "vertical" => Ok(Self::Down),
             other => Err(format!(
-                "unknown direction {other:?}; expected right or down"
+                "unknown direction {other:?}; expected auto, right, or down"
             )),
         }
     }
+
+    /// The tmux flag for this split, resolving `auto` against the target
+    /// pane's shape. A cell is about twice as tall as it is wide, so the
+    /// comparison is on the pane's visual proportions rather than its rows
+    /// and columns.
+    #[must_use]
+    pub fn tmux_flag(self, target: &str) -> &'static str {
+        match self {
+            Self::Right => "-h",
+            Self::Down => "-v",
+            Self::Auto => match pane_shape(target) {
+                Some((columns, rows)) if columns < rows.saturating_mul(2) => "-v",
+                Some(_) => "-h",
+                // Without a measurement, keep the historical behaviour.
+                None => "-h",
+            },
+        }
+    }
+}
+
+/// `#{pane_width}x#{pane_height}` for a target pane, or `None` when tmux
+/// cannot answer (no server, unknown target).
+fn pane_shape(target: &str) -> Option<(u32, u32)> {
+    let output = std::process::Command::new("tmux")
+        .args([
+            "display",
+            "-p",
+            "-t",
+            target,
+            "#{pane_width}x#{pane_height}",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (width, height) = text.trim().split_once('x')?;
+    Some((width.parse().ok()?, height.parse().ok()?))
 }
 
 #[derive(Debug, clap::Args)]
@@ -427,7 +466,7 @@ async fn run_native(args: StartArgs, client: &Client, socket_path: &Path) -> Res
             "--target and non-pane --placement require tmux; omit them for a native session or use --host tmux"
         );
     }
-    if args.direction != SplitDirection::Right {
+    if !matches!(args.direction, SplitDirection::Auto) {
         bail!("--direction requires tmux; omit it for a native session or use --host tmux");
     }
     if args.role.is_some() || args.task.is_some() || args.alias.is_some() {
@@ -912,10 +951,7 @@ fn tmux_args(request: &StartRequest, cwd: &Path, command: &str) -> Result<Vec<St
     let args = match request.placement {
         Placement::Pane => {
             let target = current_target()?;
-            let split = match request.direction {
-                SplitDirection::Right => "-h",
-                SplitDirection::Down => "-v",
-            };
+            let split = request.direction.tmux_flag(&target);
             vec![
                 "split-window".into(),
                 split.into(),

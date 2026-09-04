@@ -57,7 +57,7 @@ stats while newer activity ledger intervals are accumulating.
 placement = "window" # pane (default) | window | session
 agent = "codex"      # claude | codex | gemini | agy | opencode
 options = ["--model", "preferred-model"]
-direction = "right"  # right (default) | down
+direction = "auto"   # auto (default) | right | down
 instructions = "Keep one task per window; use a new session for unrelated projects."
 ```
 

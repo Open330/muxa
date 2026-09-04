@@ -7252,7 +7252,9 @@ mod tests {
         rule.wait = Some(crate::automation::parse_wait("reset+2m").unwrap());
         let rules = client.automation_set_rule(&rule).await.unwrap();
         assert_eq!(rules.rules.len(), 1);
-        assert_eq!(rules.rules[0].wait, "reset+2m");
+        // The daemon rewrites the anchor into the template spelling every
+        // other muxa value uses.
+        assert_eq!(rules.rules[0].wait, "{{reset}}+2m");
         assert!(std::fs::read_to_string(&config_path)
             .unwrap()
             .contains("[[automation.rule]]"));

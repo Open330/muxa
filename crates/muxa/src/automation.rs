@@ -206,7 +206,7 @@ pub enum WaitAnchor {
 }
 
 /// A rule's `wait`: `5m` (from the event) or `reset+2m` / `reset` /
-/// `reset-30s` (from the cap's reset time).
+/// `{{reset}}-30s` (from the cap's reset time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WaitSpec {
     pub anchor: WaitAnchor,
@@ -243,15 +243,26 @@ impl WaitSpec {
     }
 }
 
+/// The reset anchor, spelled the way muxa spells every other value a
+/// template fills in (`{{work}}`, `{{cwd}}`). The bare `reset` spelling is
+/// still accepted so rules written before this keep loading.
+pub const RESET_ANCHOR: &str = "{{reset}}";
+
 impl std::fmt::Display for WaitSpec {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.anchor {
             WaitAnchor::Event => formatter.write_str(&render_duration(self.offset)),
-            WaitAnchor::Reset if self.offset.is_zero() => formatter.write_str("reset"),
+            WaitAnchor::Reset if self.offset.is_zero() => formatter.write_str(RESET_ANCHOR),
             WaitAnchor::Reset if self.offset.is_negative() => {
-                write!(formatter, "reset-{}", render_duration(-self.offset))
+                write!(
+                    formatter,
+                    "{RESET_ANCHOR}-{}",
+                    render_duration(-self.offset)
+                )
             }
-            WaitAnchor::Reset => write!(formatter, "reset+{}", render_duration(self.offset)),
+            WaitAnchor::Reset => {
+                write!(formatter, "{RESET_ANCHOR}+{}", render_duration(self.offset))
+            }
         }
     }
 }
@@ -269,11 +280,14 @@ impl<'de> Deserialize<'de> for WaitSpec {
     }
 }
 
-/// Parse a `wait` value: `reset`, `reset+2m`, `reset-30s`, or a plain
-/// duration.
+/// Parse a `wait` value: `{{reset}}`, `{{reset}}+2m`, `{{reset}}-30s`, or a
+/// plain duration. The older bare `reset` spelling is accepted too.
 pub fn parse_wait(text: &str) -> Result<WaitSpec, String> {
     let trimmed = text.trim();
-    let Some(rest) = trimmed.strip_prefix("reset") else {
+    let Some(rest) = trimmed
+        .strip_prefix(RESET_ANCHOR)
+        .or_else(|| trimmed.strip_prefix("reset"))
+    else {
         return parse_duration(trimmed).map(WaitSpec::after_event);
     };
     let rest = rest.trim();
@@ -285,7 +299,7 @@ pub fn parse_wait(text: &str) -> Result<WaitSpec, String> {
         ("-", tail) => (-1, tail),
         _ => {
             return Err(format!(
-                "{trimmed:?} is not a wait: use `reset`, `reset+2m`, `reset-30s`, or `5m`"
+                "{trimmed:?} is not a wait: use `{RESET_ANCHOR}`, `{RESET_ANCHOR}+2m`, `{RESET_ANCHOR}-30s`, or `5m`"
             ))
         }
     };
@@ -2235,7 +2249,9 @@ mod tests {
 
     #[test]
     fn wait_round_trips_through_its_rendering() {
-        for text in ["reset", "reset+2m", "reset-30s", "20m", "45s"] {
+        // The canonical spellings round-trip; the older bare `reset` forms
+        // still parse and are rewritten to the template spelling.
+        for text in ["{{reset}}", "{{reset}}+2m", "{{reset}}-30s", "20m", "45s"] {
             assert_eq!(parse_wait(text).unwrap().to_string(), text);
         }
     }
@@ -3152,7 +3168,7 @@ waaait = "5m"
         let views = store.views(NOW).await;
         assert!(views.enabled);
         let view = &views.rules[0];
-        assert_eq!(view.wait, "reset+2m");
+        assert_eq!(view.wait, "{{reset}}+2m");
         assert_eq!(view.fallback, "20m");
         assert_eq!(view.cooldown, "2m");
         assert_eq!(view.max_per_hour, 3);

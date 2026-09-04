@@ -206,11 +206,13 @@ struct PipelineEditorView: View {
                 .labelsHidden()
                 .frame(width: 104)
                 Picker("Split direction", selection: agent.direction) {
-                    Text("split right").tag("")
+                    Text("split automatically").tag("")
+                    Text("split right").tag("right")
                     Text("split down").tag("down")
                 }
                 .labelsHidden()
-                .frame(width: 112)
+                .frame(width: 150)
+                .help("Automatic splits along the pane's longer side, so a growing line-up stays readable")
                 Spacer(minLength: 0)
                 Menu {
                     Button("Move up") { move(agent.wrappedValue.id, by: -1) }

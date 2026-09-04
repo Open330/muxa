@@ -11,13 +11,42 @@ enum MuxaIPCError: LocalizedError {
     case incompatibleProtocol(minimum: UInt32?, maximum: UInt32?)
     case missingField(String)
     case invalidBase64
+    /// A failure that reached muxad, so the request must not be replayed.
+    indirect case afterRequestReached(MuxaIPCError)
+
+    /// True while the request provably never reached muxad: the connect or
+    /// the write failed on a socket muxad had already dropped.
+    var isReconnectable: Bool {
+        switch self {
+        case .posix(let operation, let code):
+            (operation == "connect" || operation == "write" || operation == "socket")
+                && [EPIPE, ECONNRESET, ECONNREFUSED, ENOENT].contains(code)
+        default:
+            false
+        }
+    }
+
+    /// The same error, marked as "muxad may have seen this", so a caller
+    /// that retries connection failures leaves it alone.
+    var notReconnectable: MuxaIPCError {
+        if case .afterRequestReached = self { return self }
+        return .afterRequestReached(self)
+    }
 
     var errorDescription: String? {
         switch self {
         case .invalidSocketPath(let path):
             "The muxad socket path is too long: \(path)"
         case .posix(let operation, let code):
-            "\(operation) failed: \(String(cString: strerror(code)))"
+            // A dropped connection almost always means muxad restarted (its
+            // own binary watch re-execs it, and an app update replaces it),
+            // so say that rather than handing over an errno.
+            switch code {
+            case EPIPE, ECONNRESET, ECONNREFUSED, ENOENT:
+                "muxad is not answering — it may be restarting. Try again in a moment."
+            default:
+                "\(operation) failed: \(String(cString: strerror(code)))"
+            }
         case .responseTooLarge:
             "muxad returned an oversized IPC response"
         case .emptyResponse:
@@ -28,6 +57,8 @@ enum MuxaIPCError: LocalizedError {
             "Incompatible muxad protocol (server supports \(minimum.map(String.init) ?? "?")…\(maximum.map(String.init) ?? "?"), app requires \(MuxaIPCClient.protocolVersion))"
         case .missingField(let name):
             "muxad response is missing \(name)"
+        case .afterRequestReached(let underlying):
+            underlying.errorDescription
         case .invalidBase64:
             "muxad returned invalid byte-safe terminal data"
         }
@@ -1808,16 +1839,44 @@ actor MuxaIPCClient {
 enum UnixSocket {
     private static let maximumResponseBytes = 8 * 1024 * 1024
 
+    /// One request, one connection. A failure to connect or to write means
+    /// the request never reached muxad — which is what a restart looks like
+    /// from here, and muxad restarts routinely (its binary watch re-execs
+    /// it, an app update replaces it). Those two are retried once after a
+    /// short pause. A failure while reading is never retried: the daemon may
+    /// already have applied the request.
     static func request(
         path: String,
         payload: Data,
         timeout: TimeInterval = 3
     ) throws -> Data {
+        var attempt = 0
+        while true {
+            do {
+                return try attemptRequest(path: path, payload: payload, timeout: timeout)
+            } catch let error as MuxaIPCError {
+                guard attempt == 0, error.isReconnectable else { throw error }
+                attempt += 1
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+        }
+    }
+
+    private static func attemptRequest(
+        path: String,
+        payload: Data,
+        timeout: TimeInterval
+    ) throws -> Data {
         let descriptor = try connect(path: path, timeout: timeout)
         defer { Darwin.close(descriptor) }
         try writeLine(descriptor: descriptor, payload: payload)
         var buffered = Data()
-        return try readLine(descriptor: descriptor, buffered: &buffered)
+        do {
+            return try readLine(descriptor: descriptor, buffered: &buffered)
+        } catch let error as MuxaIPCError {
+            // Mark a read failure so the retry above leaves it alone.
+            throw error.notReconnectable
+        }
     }
 
     static func subscribe(

@@ -129,20 +129,16 @@ pub fn check_name(name: &str) -> Result<(), PipelineSpecError> {
     }
 }
 
-/// The split direction a pane joins with: `right` (the default) or
-/// `down`, with tmux's `horizontal`/`vertical` accepted as spellings.
-/// Returns the canonical name.
+/// The split direction a pane joins with: `auto` (the default, which splits
+/// along the target pane's longer side), `right`, or `down`, with tmux's
+/// `horizontal`/`vertical` accepted as spellings. Returns the canonical name.
 pub fn parse_direction(value: Option<&str>) -> Result<&'static str, String> {
-    match value
-        .unwrap_or("right")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    match value.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
+        "auto" | "" => Ok("auto"),
         "right" | "horizontal" => Ok("right"),
         "down" | "vertical" => Ok("down"),
         other => Err(format!(
-            "unknown direction {other:?}; expected right or down"
+            "unknown direction {other:?}; expected auto, right, or down"
         )),
     }
 }
@@ -239,14 +235,15 @@ mod tests {
     }
 
     #[test]
-    fn directions_are_right_or_down_in_either_spelling() {
-        assert_eq!(parse_direction(None).unwrap(), "right");
+    fn directions_default_to_auto_and_accept_either_spelling() {
+        assert_eq!(parse_direction(None).unwrap(), "auto");
+        assert_eq!(parse_direction(Some("auto")).unwrap(), "auto");
         assert_eq!(parse_direction(Some(" Horizontal ")).unwrap(), "right");
         assert_eq!(parse_direction(Some("vertical")).unwrap(), "down");
         assert_eq!(parse_direction(Some("down")).unwrap(), "down");
         assert_eq!(
             parse_direction(Some("left")).unwrap_err(),
-            "unknown direction \"left\"; expected right or down"
+            "unknown direction \"left\"; expected auto, right, or down"
         );
     }
 

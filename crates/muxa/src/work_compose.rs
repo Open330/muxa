@@ -70,7 +70,7 @@ program = 'codex'             # ONLY claude, codex, gemini, agy, or opencode
 role    = 'implementer'       # optional; peers address it as role:<role>
 task    = 'fix the reaper'    # optional; short label in `muxa work show`/`watch`
 prompt  = '...'               # optional; this agent's own instructions
-direction = 'right'           # optional: right (default) or down
+direction = 'auto'            # optional: auto (default), right, or down
 after   = ['impl']            # optional: aliases that must report finishing
                               # before this one starts. Omit for work that is
                               # genuinely parallel; use it when one agent must
@@ -109,7 +109,7 @@ emits and `muxa work pipeline set --from-json` reads:
       "role": "implementer",          // or null; peers address it as role:<role>
       "task": "fix the reaper",       // or null; short label in `muxa work show`/`watch`
       "prompt": "this agent's own instructions",   // or null
-      "direction": "right",           // "right" (default), "down", or null
+      "direction": "auto",            // "auto" (default), "right", "down", or null
       "after": ["plan"]               // aliases that must report finishing first; [] for parallel work
     }}
   ]

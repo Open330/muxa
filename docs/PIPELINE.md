@@ -110,7 +110,7 @@ Editors write back through the same shape. `muxa work pipeline set <name>
 --from-json <path|->` takes one `pipelines[]` entry as `options --json`
 prints it (with or without its `name`), runs the checks a launch would fail
 — allowlisted programs, unique aliases, `after` edges that resolve and do
-not cycle, `direction` right or down — and writes `[pipeline.<name>]`
+not cycle, `direction` auto, right, or down — and writes `[pipeline.<name>]`
 through `toml_edit`, replacing an existing pipeline where it stands and
 leaving every other section, comment, and value alone. `muxa work pipeline
 remove <name>` refuses while a `[[route]]` still names the pipeline unless

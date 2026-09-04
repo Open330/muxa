@@ -295,7 +295,9 @@ struct MuxaPipelineDefinition: Codable, Equatable, Sendable {
         /// one. Anything else stays as typed so validation can name it.
         static func canonicalDirection(_ value: String) -> String {
             switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "", "right", "horizontal": ""
+            // Absent means `auto`: muxa splits along the pane's longer side.
+            case "", "auto": ""
+            case "right", "horizontal": "right"
             case "down", "vertical": "down"
             case let other: other
             }
@@ -464,7 +466,7 @@ struct MuxaPipelineDefinition: Codable, Equatable, Sendable {
                 let allowed = Self.allowedPrograms.joined(separator: ", ")
                 problems.append(String(localized: "@\(agent.alias): program must be one of \(allowed)."))
             }
-            if !["", "down"].contains(Agent.canonicalDirection(agent.direction)) {
+            if !["", "right", "down"].contains(Agent.canonicalDirection(agent.direction)) {
                 problems.append(String(localized: "@\(agent.alias): direction must be right or down."))
             }
             for dependency in agent.after where !aliases.contains(dependency) {
