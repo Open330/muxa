@@ -74,7 +74,7 @@ enum MuxaAutomationRuleIssue: Hashable, Sendable {
         case .zeroIdleDuration:
             String(localized: "Idle for must be greater than zero.")
         case .invalidWait:
-            String(localized: "Wait must be a duration, reset, or reset plus or minus a duration.")
+            String(localized: "Wait must be a duration such as 5m, or an offset from the limit reset.")
         case .resetWaitNeedsRateLimit:
             String(localized: "Only a rate limit carries a reset time, so a reset wait needs that event.")
         case .invalidWorkRegex:
@@ -168,7 +168,7 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
         }
 
         if !wait.trimmingCharacters(in: .whitespaces).isEmpty {
-            switch MuxaAutomationDuration.parseWait(wait) {
+            switch MuxaAutomationWaitText.parse(wait) {
             case nil:
                 issues.append(.invalidWait)
             case .afterReset(let offset):
@@ -252,7 +252,7 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
     var timing: MuxaAutomationWait? {
         let trimmed = wait.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty { return event.defaultWait }
-        return MuxaAutomationDuration.parseWait(trimmed)
+        return MuxaAutomationWaitText.parse(trimmed)
     }
 
     /// Seconds `fallback` names, or the daemon's default when it names none.
@@ -349,6 +349,212 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
 
     private static func sorted(_ values: Set<String>) -> [String] {
         values.sorted()
+    }
+}
+
+// MARK: - The reset anchor
+
+/// The reset anchor, and the two spellings the app reads it in.
+///
+/// muxad writes `{{reset}}+2m` — the `{{…}}` shape it uses for every value a
+/// template fills in — and still reads the older bare `reset`. The wire
+/// file's duration grammar predates the braces, so the app strips them here
+/// rather than teaching the parser a second spelling.
+///
+/// Reading is all this type does; the one place that *writes* an anchor is
+/// `MuxaAutomationWaitDraft.text`, which composes it from the editor's
+/// controls.
+enum MuxaAutomationWaitText {
+    /// How muxad spells the anchor, and how the app writes it back.
+    static let anchor = "{{reset}}"
+    /// The spelling rules written before the braces still carry.
+    static let legacyAnchor = "reset"
+
+    /// True while the value anchors on the cap's reset time, in either
+    /// spelling — including an anchor whose offset does not parse.
+    static func isAnchored(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        return trimmed.hasPrefix(anchor) || trimmed.hasPrefix(legacyAnchor)
+    }
+
+    /// `{{reset}}`, `{{reset}}+2m`, `reset-30s` or `5m` → what it means.
+    static func parse(_ text: String) -> MuxaAutomationWait? {
+        MuxaAutomationDuration.parseWait(withoutBraces(text))
+    }
+
+    /// The offset a reset-anchored wait names. Nil when the wait is not
+    /// anchored on the reset — or when its offset does not parse.
+    static func resetOffset(_ text: String) -> TimeInterval? {
+        guard case .afterReset(let offset)? = parse(text) else { return nil }
+        return offset
+    }
+
+    /// What a row shows beside the anchor chip: the offset in the daemon's
+    /// own grammar, or — when it does not parse — the text as it was
+    /// written after the anchor. Either way the token itself stays off the
+    /// screen, and no part of the value is dropped.
+    static func anchorOffsetText(_ text: String) -> String {
+        if let offset = resetOffset(text) {
+            guard offset != 0 else { return "" }
+            return (offset < 0 ? "-" : "+") + MuxaAutomationDuration.render(abs(offset))
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        for spelling in [anchor, legacyAnchor] where trimmed.hasPrefix(spelling) {
+            return String(trimmed.dropFirst(spelling.count))
+        }
+        return trimmed
+    }
+
+    /// The anchor spelled the way the wire file's grammar expects it.
+    private static func withoutBraces(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix(anchor) else { return trimmed }
+        return legacyAnchor + trimmed.dropFirst(anchor.count)
+    }
+}
+
+/// The Timing section's anchor control as a value: which anchor the operator
+/// picked, which way the offset runs, and the duration they typed.
+///
+/// It exists so `{{reset}}+2m` is composed by a pure function the tests
+/// exercise rather than typed by hand into a text field. A value the
+/// controls cannot express — an odd spelling someone wrote in the file —
+/// becomes `.freeform` and is handed back exactly as it arrived.
+struct MuxaAutomationWaitDraft: Hashable, Sendable {
+    enum Anchor: Hashable, Sendable {
+        /// The cap's own reset time, plus or minus the offset.
+        case reset
+        /// A fixed delay measured from the event.
+        case event
+        /// A spelling the controls cannot express; kept verbatim.
+        case freeform
+    }
+
+    var anchor: Anchor = .event
+    /// `reset` only: the offset runs backwards from the reset time.
+    var isBefore = false
+    /// The duration the operator typed. Empty means no offset at all.
+    var offset = ""
+    /// The value as it was written, while `anchor` is `.freeform`.
+    var freeform = ""
+
+    /// Reads a rule's `wait` into the controls. An empty wait is the event's
+    /// own default, so the anchor starts where the daemon would put it.
+    static func read(_ wait: String, event: MuxaAutomationEvent) -> Self {
+        let trimmed = wait.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty {
+            return Self(anchor: event.supportsResetTiming ? .reset : .event)
+        }
+        switch MuxaAutomationWaitText.parse(trimmed) {
+        case .afterReset(let offset):
+            return Self(
+                anchor: .reset,
+                isBefore: offset < 0,
+                offset: offset == 0 ? "" : MuxaAutomationDuration.render(abs(offset))
+            )
+        case .delay(let seconds):
+            return Self(anchor: .event, offset: MuxaAutomationDuration.render(seconds))
+        case nil:
+            return Self(anchor: .freeform, freeform: trimmed)
+        }
+    }
+
+    /// What the controls compose, for `MuxaAutomationRuleDraft.wait`.
+    var text: String {
+        switch anchor {
+        case .freeform:
+            return freeform
+        case .event:
+            return offset.trimmingCharacters(in: .whitespaces)
+        case .reset:
+            let magnitude = offset.trimmingCharacters(in: .whitespaces)
+            guard !magnitude.isEmpty else { return MuxaAutomationWaitText.anchor }
+            return MuxaAutomationWaitText.anchor + (isBefore ? "-" : "+") + magnitude
+        }
+    }
+
+    /// True while a hand-written value could be read by the controls after
+    /// all, so the sheet can offer the way back without rewriting anything
+    /// on its own.
+    var freeformIsReadable: Bool {
+        guard anchor == .freeform else { return false }
+        let trimmed = freeform.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty || MuxaAutomationWaitText.parse(trimmed) != nil
+    }
+}
+
+// MARK: - Wire values with a face
+
+/// How an agent kind is drawn: the product's own name and a tinted SF
+/// Symbol. muxa ships no third-party logos, so the mark is the symbol plus
+/// the name — never a vendor image.
+///
+/// The symbol comes from `AskProviderEngine` and the tint from
+/// `agentProgramTint` wherever those already know the product, so there is
+/// one table per question rather than three. Lives here rather than in the
+/// Automations pane because any later pane showing an agent kind wants it.
+struct MuxaAgentMark: Hashable, Sendable {
+    /// The value on the wire (`claude_code`), which is what a rule stores.
+    let wire: String
+    /// The product's name. A proper noun, so it is not localized.
+    let name: String
+    /// The Ask engine that already owns this product's symbol, when there
+    /// is one; `antigravity` and `opencode` have no Ask engine yet.
+    let engine: AskProviderEngine?
+    /// The same product as `agentProgramTint` spells it.
+    let program: String
+    /// Used only where no Ask engine carries the symbol.
+    let ownSymbol: String?
+
+    var symbol: String { engine?.symbolName ?? ownSymbol ?? "terminal" }
+    var tint: Color { agentProgramTint(program) }
+
+    /// Every agent kind this build can put a face on. A rule may name one
+    /// that is not here — the daemon knows agents this build does not — and
+    /// that value keeps working under its own wire spelling.
+    static let all: [MuxaAgentMark] = [
+        MuxaAgentMark(
+            wire: "claude_code", name: "Claude Code",
+            engine: .claude, program: "claude", ownSymbol: nil
+        ),
+        MuxaAgentMark(
+            wire: "codex", name: "Codex",
+            engine: .codex, program: "codex", ownSymbol: nil
+        ),
+        MuxaAgentMark(
+            wire: "gemini_cli", name: "Gemini",
+            engine: .gemini, program: "gemini", ownSymbol: nil
+        ),
+        MuxaAgentMark(
+            wire: "antigravity", name: "Antigravity",
+            engine: nil, program: "agy", ownSymbol: "arrow.up.circle"
+        ),
+        MuxaAgentMark(
+            wire: "opencode", name: "opencode",
+            engine: nil, program: "opencode", ownSymbol: "terminal"
+        ),
+    ]
+
+    /// The mark for a wire value, or nil when this build does not know it.
+    static func known(for wire: String) -> MuxaAgentMark? {
+        all.first { $0.wire == wire }
+    }
+
+    /// What to print for a wire value: the product's name, or the value as
+    /// it arrived.
+    static func title(for wire: String) -> String {
+        known(for: wire)?.name ?? wire
+    }
+}
+
+/// muxad's `RateLimitScope` in words. A window this build does not know is
+/// shown verbatim rather than hidden.
+func automationLimitScopeTitle(_ scope: String) -> String {
+    switch scope {
+    case "five_hour": String(localized: "5-hour limit")
+    case "seven_day": String(localized: "Weekly limit")
+    case "unknown": String(localized: "Unspecified")
+    default: scope
     }
 }
 

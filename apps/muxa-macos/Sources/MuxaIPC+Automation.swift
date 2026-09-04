@@ -399,7 +399,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         MuxaAutomationRule(
             name: "resume-after-limit",
             on: .rateLimited,
-            wait: "reset+2m",
+            wait: "\(MuxaAutomationDuration.resetAnchor)+2m",
             fallback: "20m",
             action: .sendPrompt,
             // Prompt text, not UI chrome: it is typed into the agent.
@@ -655,13 +655,23 @@ enum MuxaAutomationDuration {
 
     /// `wait`'s grammar, which adds the reset-relative forms. The offset may
     /// be negative — `reset-30s` acts just before the window reopens.
+    /// The daemon spells the anchor `{{reset}}`, the way it spells every
+    /// value it fills in from context. Builds before that wrote a bare
+    /// `reset`, and muxad still loads those, so both are read here.
+    static let resetAnchor = "{{reset}}"
+
     static func parseWait(_ text: String) -> MuxaAutomationWait? {
         let trimmed = text.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("reset") else {
+        let anchor: String
+        if trimmed.hasPrefix(resetAnchor) {
+            anchor = resetAnchor
+        } else if trimmed.hasPrefix("reset") {
+            anchor = "reset"
+        } else {
             guard let seconds = parse(trimmed) else { return nil }
             return .delay(seconds)
         }
-        let rest = String(trimmed.dropFirst("reset".count)).trimmingCharacters(in: .whitespaces)
+        let rest = String(trimmed.dropFirst(anchor.count)).trimmingCharacters(in: .whitespaces)
         if rest.isEmpty { return .afterReset(0) }
         let sign: TimeInterval
         switch rest.first {

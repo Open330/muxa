@@ -3984,7 +3984,7 @@ func automationRequestBodiesMatchTheDocumentedWireShapes() throws {
     #expect(rule["action"] as? String == "send_prompt")
     #expect(rule["text"] as? String == "continue")
     #expect(rule["submit"] as? Bool == true)
-    #expect(rule["wait"] as? String == "reset+2m")
+    #expect(rule["wait"] as? String == "{{reset}}+2m")
     #expect(rule["fallback"] as? String == "20m")
     #expect(rule["max_per_hour"] as? Int == 2)
     #expect(rule["cooldown"] as? String == "5m")
@@ -4192,6 +4192,9 @@ func automationDurationGrammarMatchesTheDaemons() {
     // `wait` adds the reset anchor, in both directions.
     #expect(MuxaAutomationDuration.parseWait("reset") == .afterReset(0))
     #expect(MuxaAutomationDuration.parseWait("reset+2m") == .afterReset(120))
+    #expect(MuxaAutomationDuration.parseWait("{{reset}}+2m") == .afterReset(120))
+    #expect(MuxaAutomationDuration.parseWait("{{reset}}") == .afterReset(0))
+    #expect(MuxaAutomationDuration.parseWait("{{reset}}-30s") == .afterReset(-30))
     #expect(MuxaAutomationDuration.parseWait("reset-30s") == .afterReset(-30))
     #expect(MuxaAutomationDuration.parseWait("reset + 2m") == .afterReset(120))
     #expect(MuxaAutomationDuration.parseWait("10m") == .delay(600))
@@ -4222,7 +4225,7 @@ func automationRuleDraftValidationTable() {
     #expect(recommended.originalName == nil)
     #expect(recommended.isReady(existingNames: []))
     #expect(recommended.rule.name == "resume-after-limit")
-    #expect(recommended.rule.wait == "reset+2m")
+    #expect(recommended.rule.wait == "{{reset}}+2m")
     #expect(recommended.rule.maxPerHour == 2)
     #expect(recommended.timing == .afterReset(120))
     #expect(recommended.fallbackSeconds == 1200)
@@ -4378,7 +4381,7 @@ func automationRuleRendersAsAPastableTOMLBlock() {
     name = "resume-after-limit"
     on = "rate_limited"
     enabled = true
-    wait = "reset+2m"
+    wait = "{{reset}}+2m"
     fallback = "20m"
     action = "send_prompt"
     text = "continue"
@@ -4729,4 +4732,184 @@ func behaviourSettingsReadDefaultsAndWriteOnlyWhatChanged() {
     // A value muxa does not know is left alone rather than silently reset.
     let odd = MuxaBehaviourSettings.read(from: "[collaboration]\nwake = \"whenever\"\n")
     #expect(odd.collaborationWake == .idleOnly)
+}
+
+// MARK: - Automations: the anchor, the marks, and the empty filters
+
+@Test
+func theResetAnchorIsReadInBothSpellingsAndSaidRatherThanPrinted() {
+    // What muxad writes now, and what rules written before the braces carry.
+    #expect(MuxaAutomationWaitText.parse("{{reset}}") == .afterReset(0))
+    #expect(MuxaAutomationWaitText.parse("{{reset}}+10m") == .afterReset(600))
+    #expect(MuxaAutomationWaitText.parse("{{reset}}-30s") == .afterReset(-30))
+    #expect(MuxaAutomationWaitText.parse("reset+2m") == .afterReset(120))
+    #expect(MuxaAutomationWaitText.parse("reset") == .afterReset(0))
+    #expect(MuxaAutomationWaitText.parse("5m") == .delay(300))
+    // A half-written or malformed anchor is not one.
+    #expect(MuxaAutomationWaitText.parse("{{reset}}*2m") == nil)
+    #expect(MuxaAutomationWaitText.parse("{{reset}") == nil)
+    #expect(MuxaAutomationWaitText.parse("20") == nil)
+
+    #expect(MuxaAutomationWaitText.isAnchored("{{reset}}+2m"))
+    #expect(MuxaAutomationWaitText.isAnchored("reset"))
+    #expect(!MuxaAutomationWaitText.isAnchored("5m"))
+
+    // The chip reads the offset off the anchor rather than the raw token.
+    #expect(MuxaAutomationWaitText.resetOffset("{{reset}}+2m") == 120)
+    #expect(MuxaAutomationWaitText.resetOffset("{{reset}}-30s") == -30)
+    #expect(MuxaAutomationWaitText.resetOffset("{{reset}}") == 0)
+    #expect(MuxaAutomationWaitText.resetOffset("5m") == nil)
+    #expect(MuxaAutomationWaitText.resetOffset("nonsense") == nil)
+
+    // Beside the chip goes the offset, never the token — and a malformed
+    // offset is still shown in full rather than dropped.
+    #expect(MuxaAutomationWaitText.anchorOffsetText("{{reset}}+2m") == "+2m")
+    #expect(MuxaAutomationWaitText.anchorOffsetText("reset+2m") == "+2m")
+    #expect(MuxaAutomationWaitText.anchorOffsetText("{{reset}}-30s") == "-30s")
+    #expect(MuxaAutomationWaitText.anchorOffsetText("{{reset}}").isEmpty)
+    #expect(MuxaAutomationWaitText.anchorOffsetText("{{reset}}*2m") == "*2m")
+}
+
+@Test
+func waitControlsComposeTheAnchorSoNobodyTypesIt() {
+    // Every spelling the controls can express round-trips unchanged.
+    for text in ["{{reset}}", "{{reset}}+2m", "{{reset}}-30s", "5m", "0s"] {
+        let draft = MuxaAutomationWaitDraft.read(text, event: .rateLimited)
+        #expect(draft.anchor != .freeform, "\(text) should be expressible")
+        #expect(draft.text == text)
+    }
+
+    let after = MuxaAutomationWaitDraft.read("{{reset}}+2m", event: .rateLimited)
+    #expect(after.anchor == .reset)
+    #expect(!after.isBefore)
+    #expect(after.offset == "2m")
+
+    let before = MuxaAutomationWaitDraft.read("{{reset}}-30s", event: .rateLimited)
+    #expect(before.anchor == .reset)
+    #expect(before.isBefore)
+    #expect(before.offset == "30s")
+
+    // A rule written before the braces reads, and is written back the way
+    // muxad spells it now.
+    #expect(MuxaAutomationWaitDraft.read("reset+2m", event: .rateLimited).text == "{{reset}}+2m")
+    #expect(MuxaAutomationWaitDraft.read("reset", event: .rateLimited).text == "{{reset}}")
+
+    // A plain delay stays a delay.
+    let delay = MuxaAutomationWaitDraft.read("5m", event: .idleFor)
+    #expect(delay.anchor == .event)
+    #expect(delay.offset == "5m")
+
+    // An empty wait starts the controls where the daemon's own default is,
+    // and an event with no reset time never starts on the anchor.
+    #expect(MuxaAutomationWaitDraft.read("", event: .rateLimited).anchor == .reset)
+    #expect(MuxaAutomationWaitDraft.read("", event: .idleFor).anchor == .event)
+    #expect(MuxaAutomationWaitDraft.read("", event: .idleFor).text.isEmpty)
+
+    // A spelling the controls cannot express is handed back untouched.
+    for odd in ["reset*2m", "20", "whenever", "{{reset}}~1h"] {
+        let draft = MuxaAutomationWaitDraft.read(odd, event: .rateLimited)
+        #expect(draft.anchor == .freeform, "\(odd) should stay as it was written")
+        #expect(draft.text == odd)
+        #expect(!draft.freeformIsReadable)
+    }
+    // …unless it is edited into something readable, which is the way back
+    // to the controls.
+    var edited = MuxaAutomationWaitDraft.read("reset*2m", event: .rateLimited)
+    edited.freeform = "10m"
+    #expect(edited.freeformIsReadable)
+
+    // The direction control, not a typed sign, decides which way it runs.
+    var composed = MuxaAutomationWaitDraft(anchor: .reset, isBefore: true, offset: "45s")
+    #expect(composed.text == "{{reset}}-45s")
+    composed.isBefore = false
+    #expect(composed.text == "{{reset}}+45s")
+    composed.offset = "  "
+    #expect(composed.text == "{{reset}}")
+
+    // A composed value the daemon would refuse is refused here first.
+    var rule = MuxaAutomationRuleDraft()
+    rule.name = "resume"
+    rule.text = "continue"
+    rule.wait = MuxaAutomationWaitDraft(anchor: .reset, offset: "2x").text
+    #expect(rule.wait == "{{reset}}+2x")
+    #expect(rule.issues(existingNames: []) == [.invalidWait])
+    rule.wait = "whenever"
+    #expect(rule.issues(existingNames: []) == [.invalidWait])
+    // The braces validate exactly as the bare spelling did.
+    rule.wait = "{{reset}}+2m"
+    #expect(rule.issues(existingNames: []).isEmpty)
+    #expect(rule.timing == .afterReset(120))
+}
+
+@Test
+func agentMarksAndLimitWindowsSayWhatTheWireValueMeans() {
+    #expect(MuxaAgentMark.title(for: "claude_code") == "Claude Code")
+    #expect(MuxaAgentMark.title(for: "codex") == "Codex")
+    #expect(MuxaAgentMark.title(for: "gemini_cli") == "Gemini")
+    #expect(MuxaAgentMark.title(for: "antigravity") == "Antigravity")
+    #expect(MuxaAgentMark.title(for: "opencode") == "opencode")
+
+    // Every kind the editor offers has a mark.
+    for kind in MuxaAutomationRuleDraft.agentKinds {
+        #expect(MuxaAgentMark.known(for: kind) != nil, "\(kind) has no mark")
+    }
+
+    // The symbols and tints come from the tables the app already had, not a
+    // third one.
+    #expect(MuxaAgentMark.known(for: "claude_code")?.symbol == AskProviderEngine.claude.symbolName)
+    #expect(MuxaAgentMark.known(for: "codex")?.symbol == AskProviderEngine.codex.symbolName)
+    #expect(MuxaAgentMark.known(for: "gemini_cli")?.symbol == AskProviderEngine.gemini.symbolName)
+    #expect(MuxaAgentMark.known(for: "antigravity")?.symbol == "arrow.up.circle")
+    #expect(MuxaAgentMark.known(for: "opencode")?.symbol == "terminal")
+    #expect(MuxaAgentMark.known(for: "claude_code")?.tint == agentProgramTint("claude"))
+    #expect(MuxaAgentMark.known(for: "codex")?.tint == agentProgramTint("codex"))
+    #expect(MuxaAgentMark.known(for: "gemini_cli")?.tint == agentProgramTint("gemini"))
+    #expect(MuxaAgentMark.known(for: "antigravity")?.tint == agentProgramTint("agy"))
+    #expect(MuxaAgentMark.known(for: "opencode")?.tint == agentProgramTint("opencode"))
+
+    // An agent the daemon knows and this build does not keeps working under
+    // its own wire spelling, and gets no invented symbol.
+    #expect(MuxaAgentMark.known(for: "aider") == nil)
+    #expect(MuxaAgentMark.title(for: "aider") == "aider")
+    #expect(AutomationTokenStyle.agent.title(for: "aider") == "aider")
+
+    #expect(automationLimitScopeTitle("five_hour") == "5-hour limit")
+    #expect(automationLimitScopeTitle("seven_day") == "Weekly limit")
+    #expect(automationLimitScopeTitle("unknown") == "Unspecified")
+    // No window the editor offers is left showing its wire spelling…
+    for scope in MuxaAutomationRuleDraft.rateLimitScopes {
+        #expect(automationLimitScopeTitle(scope) != scope, "\(scope) reads as a wire value")
+    }
+    // …and one this build does not know shows verbatim.
+    #expect(automationLimitScopeTitle("thirty_day") == "thirty_day")
+    #expect(AutomationTokenStyle.limitScope.title(for: "thirty_day") == "thirty_day")
+}
+
+/// A filter takes a *value*, so none of its fields may carry a placeholder:
+/// an empty filter matches everything, and a greyed example reads like a
+/// value that is already set. A field that takes a *format* keeps its
+/// example. The rule is about the source — a SwiftUI `TextField` has nothing
+/// to ask at runtime — so the test reads the pane.
+@Test
+func filterFieldsCarryNoPlaceholderAndFormatFieldsKeepTheirs() throws {
+    let pane = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("Sources/AutomationSettingsView.swift")
+    let source = try String(contentsOf: pane, encoding: .utf8)
+    let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+
+    for field in ["Workspace", "Work id matches", "Pane"] {
+        let declaration = lines.first { $0.contains("TextField(\"\(field)\"") }
+        #expect(declaration != nil, "the \(field) filter field is gone")
+        #expect(declaration?.contains("prompt:") == false, "\(field) shows an example value")
+    }
+    // The operator's own team prefix must not ship as a hint.
+    #expect(!source.contains("^CAL-"))
+
+    // Durations and the text typed into a pane take a format, so they keep
+    // their examples.
+    #expect(source.contains("TextField(\"Cooldown\", text: $draft.cooldown, prompt:"))
+    #expect(source.contains("TextField(\"Jitter\", text: $draft.jitter, prompt:"))
+    #expect(source.contains("TextField(\"Text\", text: $draft.text, prompt:"))
 }

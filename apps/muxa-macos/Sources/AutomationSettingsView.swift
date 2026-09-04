@@ -9,6 +9,7 @@ struct AutomationSettingsPane: View {
     @ObservedObject var configStore: MuxaConfigStore
     @State private var editorTarget: AutomationRuleEditorTarget?
     @State private var removalTarget: MuxaAutomationRule?
+    @State private var safetyExpanded = false
 
     var body: some View {
         ScrollView {
@@ -87,6 +88,7 @@ struct AutomationSettingsPane: View {
             }
         }
         .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
@@ -139,6 +141,7 @@ struct AutomationSettingsPane: View {
             .disabled(store.isMutating || !store.isSupported)
         }
         .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
@@ -155,30 +158,50 @@ struct AutomationSettingsPane: View {
 
     // MARK: Safety
 
+    /// What a rule may do, said once and calmly, with the guard list behind
+    /// a disclosure: it is worth reading once and re-opening later, not a
+    /// warning poster to scroll past on every visit. The accent turns orange
+    /// only once a rule that types into a pane actually exists.
     private var safetyCard: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("A rule types into a live agent", systemImage: "exclamationmark.triangle.fill")
-                .font(.headline)
-                .foregroundStyle(.orange)
-            Text("Send prompt injects text and presses Enter in the agent's pane, exactly as you would. These guards bound it:")
-                .font(.callout)
-            VStack(alignment: .leading, spacing: 3) {
-                Text("• The master switch and the pause above stop every rule.")
-                Text("• Each rule has its own switch.")
-                Text("• Firings per hour and the cooldown cap how often one rule may act on one pane.")
-                Text("• A ceiling of \(store.snapshot.globalMaxPerHour) firings an hour bounds every rule together.")
-                Text("• The condition is re-checked at fire time; a recovered agent is left alone.")
-                Text("• One rate-limit episode fires a rule once.")
-                Text("• Every firing and every skip is written to the run log below.")
+            Label {
+                Text("A rule types into a live agent's pane, exactly as a person would.")
+                    .font(.callout)
+            } icon: {
+                Image(systemName: "keyboard")
+                    .foregroundStyle(hasTypingRule ? Color.orange : Color.secondary)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            Text("Test on a rule shows what it would do right now without firing anything.")
+
+            DisclosureGroup(isExpanded: $safetyExpanded) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("• The master switch and the pause above stop every rule.")
+                    Text("• Each rule has its own switch.")
+                    Text("• Firings per hour and the cooldown cap how often one rule may act on one pane.")
+                    Text("• A ceiling of \(store.snapshot.globalMaxPerHour) firings an hour bounds every rule together.")
+                    Text("• The condition is re-checked at fire time; a recovered agent is left alone.")
+                    Text("• One rate-limit episode fires a rule once.")
+                    Text("• Every firing and every skip is written to the run log below.")
+                    Text("Test on a rule shows what it would do right now without firing anything.")
+                        .padding(.top, 3)
+                }
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 5)
+            } label: {
+                Text("What bounds this")
+                    .font(.caption.weight(.medium))
+            }
         }
         .padding(14)
-        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    /// `send_prompt` is the action that reaches the keyboard, so it is the
+    /// one that earns the accent.
+    private var hasTypingRule: Bool {
+        store.rules.contains { $0.action == .sendPrompt }
     }
 
     // MARK: Rules
@@ -233,6 +256,7 @@ struct AutomationSettingsPane: View {
             }
         }
         .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
@@ -269,6 +293,7 @@ struct AutomationSettingsPane: View {
             }
         }
         .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
@@ -366,18 +391,26 @@ private struct AutomationRuleRow: View {
     }
 }
 
-/// The filters a rule matches on. Values are configuration identifiers, so
-/// they are shown verbatim next to a localized label.
+/// The filters a rule matches on. An agent kind and a limit window are said
+/// the way the rest of the app says them; the rest are configuration
+/// identifiers with no face of their own, shown verbatim next to a
+/// localized label.
 private struct AutomationTargetSummary: View {
     let rule: MuxaAutomationRule
 
     var body: some View {
-        if chipList.isEmpty {
+        if !hasFilter {
             Text("Every agent on every host")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         } else {
             HStack(spacing: 10) {
+                if !rule.agent.isEmpty {
+                    AutomationTokenChips(title: "Agent", tokens: rule.agent, style: .agent)
+                }
+                if showsScope {
+                    AutomationTokenChips(title: "Limit window", tokens: rule.scope, style: .limitScope)
+                }
                 ForEach(Array(chipList.enumerated()), id: \.offset) { _, chip in
                     AutomationChip(title: chip.title, value: chip.value)
                 }
@@ -385,14 +418,18 @@ private struct AutomationTargetSummary: View {
         }
     }
 
+    private var showsScope: Bool {
+        rule.on.supportsScopeFilter && !rule.scope.isEmpty
+    }
+
+    private var hasFilter: Bool {
+        !rule.agent.isEmpty || showsScope || !chipList.isEmpty
+    }
+
+    /// The filters whose values are configuration identifiers with no face
+    /// of their own — a path, a regex, a pane id.
     private var chipList: [(title: LocalizedStringKey, value: String)] {
         var chips: [(title: LocalizedStringKey, value: String)] = []
-        if !rule.agent.isEmpty {
-            chips.append((title: "Agent", value: rule.agent.joined(separator: ", ")))
-        }
-        if rule.on.supportsScopeFilter, !rule.scope.isEmpty {
-            chips.append((title: "Window", value: rule.scope.joined(separator: ", ")))
-        }
         if let value = nonEmpty(rule.workspace) { chips.append((title: "Workspace", value: value)) }
         if let value = nonEmpty(rule.work) { chips.append((title: "Work", value: value)) }
         if let value = nonEmpty(rule.pane) { chips.append((title: "Pane", value: value)) }
@@ -412,7 +449,7 @@ private struct AutomationGuardSummary: View {
     var body: some View {
         HStack(spacing: 10) {
             if let wait = rule.wait, !wait.isEmpty {
-                AutomationChip(title: "Wait", value: wait)
+                AutomationWaitChip(wait: wait)
             }
             if rule.on.supportsResetTiming, let fallback = rule.fallback, !fallback.isEmpty {
                 AutomationChip(title: "Fallback", value: fallback)
@@ -445,6 +482,72 @@ private struct AutomationActivitySummary: View {
                         value: date.formatted(date: .abbreviated, time: .shortened)
                     )
                 }
+            }
+        }
+    }
+}
+
+/// A rule's `wait`, read rather than printed: the reset anchor becomes a
+/// capsule saying what it anchors on, followed by the offset. The
+/// `{{reset}}` token itself never reaches the screen.
+private struct AutomationWaitChip: View {
+    let wait: String
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text("Wait")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if MuxaAutomationWaitText.isAnchored(wait) {
+                AutomationResetChip()
+                if !offsetText.isEmpty {
+                    Text(verbatim: offsetText)
+                        .font(.caption.monospaced())
+                }
+            } else {
+                Text(verbatim: wait)
+                    .font(.caption.monospaced())
+            }
+        }
+    }
+
+    /// A signed duration is a value, not a sentence: the sign and the unit
+    /// are the daemon's own grammar.
+    private var offsetText: String {
+        MuxaAutomationWaitText.anchorOffsetText(wait)
+    }
+}
+
+/// The reset anchor, said. Small enough to sit inside a row of chips.
+struct AutomationResetChip: View {
+    var body: some View {
+        Text("limit resets")
+            .font(.caption2.weight(.medium))
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(Color.accentColor.opacity(0.14), in: Capsule())
+    }
+}
+
+/// A filter whose values have a face of their own: the label, then each
+/// value as a tinted capsule. A value this build does not know keeps its
+/// wire spelling, because the daemon may know agents this build does not.
+private struct AutomationTokenChips: View {
+    let title: LocalizedStringKey
+    let tokens: [String]
+    let style: AutomationTokenStyle
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            ForEach(tokens, id: \.self) { token in
+                AutomationTokenLabel(token: token, style: style)
+                    .font(.caption2.weight(.medium))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(style.tint(for: token).opacity(0.12), in: Capsule())
             }
         }
     }
@@ -524,7 +627,7 @@ private struct AutomationLogRow: View {
                         AutomationChip(title: "Pane", value: pane)
                     }
                     if let agent = entry.agent, !agent.isEmpty {
-                        AutomationChip(title: "Agent", value: agent)
+                        AutomationTokenChips(title: "Agent", tokens: [agent], style: .agent)
                     }
                 }
                 detailLine
@@ -646,7 +749,7 @@ private struct AutomationTestRow: View {
                     if let pane = candidate.pane, !pane.isEmpty {
                         AutomationChip(title: "Pane", value: pane)
                     }
-                    AutomationChip(title: "Agent", value: candidate.agent)
+                    AutomationTokenChips(title: "Agent", tokens: [candidate.agent], style: .agent)
                     AutomationChip(title: "State", value: candidate.state)
                 }
                 if let detail = candidate.detail, !detail.isEmpty {
@@ -677,6 +780,7 @@ struct AutomationRuleEditor: View {
     @ObservedObject var store: AutomationStore
     let existingNames: Set<String>
     @State private var draft: MuxaAutomationRuleDraft
+    @State private var wait: MuxaAutomationWaitDraft
     @State private var copiedTOML = false
 
     init(
@@ -686,6 +790,9 @@ struct AutomationRuleEditor: View {
         store: AutomationStore
     ) {
         _draft = State(initialValue: draft)
+        _wait = State(
+            initialValue: MuxaAutomationWaitDraft.read(draft.wait, event: draft.event)
+        )
         self.existingNames = existingNames
         self.model = model
         self.store = store
@@ -693,6 +800,80 @@ struct AutomationRuleEditor: View {
 
     private var issues: [MuxaAutomationRuleIssue] {
         draft.issues(existingNames: existingNames)
+    }
+
+    /// The Timing controls and `draft.wait` move together: every change
+    /// recomposes the value, so what the daemon is sent is only ever what
+    /// the controls composed.
+    private var waitBinding: Binding<MuxaAutomationWaitDraft> {
+        Binding(
+            get: { wait },
+            set: { newValue in
+                wait = newValue
+                draft.wait = newValue.text
+            }
+        )
+    }
+
+    /// When the rule acts: which clock the wait is measured from, and how
+    /// far off it. The operator never types `{{reset}}` — these controls
+    /// compose it — and a value they cannot express is handed back as the
+    /// text it was, so an odd spelling written by hand is never silently
+    /// rewritten.
+    ///
+    /// Rows of the Timing section rather than a view of their own: a custom
+    /// `View` would be one row, and these need the form's own alignment.
+    @ViewBuilder
+    private var waitControls: some View {
+        if wait.anchor == .freeform {
+            TextField("Wait", text: waitBinding.freeform)
+                .font(.callout.monospaced())
+            HStack {
+                Text("This wait was written by hand, so muxa keeps it exactly as it is.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                if wait.freeformIsReadable {
+                    Button("Use the Controls") {
+                        wait = MuxaAutomationWaitDraft.read(wait.freeform, event: draft.event)
+                        draft.wait = wait.text
+                    }
+                    .controlSize(.small)
+                }
+            }
+        } else {
+            if draft.event.supportsResetTiming {
+                Picker("Wait", selection: waitBinding.anchor) {
+                    Text("When the limit resets")
+                        .tag(MuxaAutomationWaitDraft.Anchor.reset)
+                    Text("A fixed delay after the event")
+                        .tag(MuxaAutomationWaitDraft.Anchor.event)
+                }
+            }
+            if wait.anchor == .reset {
+                LabeledContent {
+                    HStack(spacing: 8) {
+                        TextField("Offset", text: waitBinding.offset, prompt: Text(verbatim: "2m"))
+                            .labelsHidden()
+                            .frame(width: 92)
+                        Picker("Offset direction", selection: waitBinding.isBefore) {
+                            Text("After the reset").tag(false)
+                            Text("Before the reset").tag(true)
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .fixedSize()
+                        // Before or after nothing means nothing, so the
+                        // direction only opens once an offset is typed.
+                        .disabled(wait.offset.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                } label: {
+                    Text("Offset")
+                }
+            } else {
+                TextField("Delay", text: waitBinding.offset, prompt: Text(verbatim: "5m"))
+            }
+        }
     }
 
     var body: some View {
@@ -724,18 +905,24 @@ struct AutomationRuleEditor: View {
                     AutomationTokenPicker(
                         title: "Agents",
                         tokens: MuxaAutomationRuleDraft.agentKinds,
+                        style: .agent,
                         selection: $draft.agents
                     )
                     if draft.event.supportsScopeFilter {
                         AutomationTokenPicker(
                             title: "Limit window",
                             tokens: MuxaAutomationRuleDraft.rateLimitScopes,
+                            style: .limitScope,
                             selection: $draft.scopes
                         )
                     }
+                    // No placeholders here: an empty filter matches
+                    // everything, and a greyed example reads like a value
+                    // that is already set. The caption below is the
+                    // explanation.
                     TextField("Workspace", text: $draft.workspace)
-                    TextField("Work id matches", text: $draft.work, prompt: Text(verbatim: "^CAL-"))
-                    TextField("Pane", text: $draft.pane, prompt: Text(verbatim: "%42"))
+                    TextField("Work id matches", text: $draft.work)
+                    TextField("Pane", text: $draft.pane)
                     Picker("Host", selection: $draft.host) {
                         Text("Any").tag("")
                         ForEach(MuxaAutomationRuleDraft.hosts, id: \.self) { host in
@@ -748,11 +935,7 @@ struct AutomationRuleEditor: View {
                 }
 
                 Section("Timing") {
-                    TextField(
-                        "Wait",
-                        text: $draft.wait,
-                        prompt: Text(verbatim: draft.event.supportsResetTiming ? "reset+2m" : "5m")
-                    )
+                    waitControls
                     if draft.event.supportsResetTiming {
                         TextField("Fallback", text: $draft.fallback, prompt: Text(verbatim: "20m"))
                     }
@@ -856,34 +1039,84 @@ struct AutomationRuleEditor: View {
         }
         .frame(width: 620, height: 660)
         .onChange(of: draft) { _ in copiedTOML = false }
+        .onChange(of: draft.event) { _ in
+            // Only a cap carries a reset time, so an event that has none
+            // cannot keep the reset anchor the operator had picked.
+            guard !draft.event.supportsResetTiming, wait.anchor == .reset else { return }
+            wait.anchor = .event
+            draft.wait = wait.text
+        }
     }
 }
 
-/// A small multi-select over configuration identifiers (agent kinds, limit
-/// windows). Values are shown verbatim because they are what goes on the wire.
+/// How a wire value is drawn wherever it is offered or displayed: an agent
+/// kind carries its mark, a limit window is said in words.
+enum AutomationTokenStyle {
+    case agent
+    case limitScope
+
+    func title(for token: String) -> String {
+        switch self {
+        case .agent: MuxaAgentMark.title(for: token)
+        case .limitScope: automationLimitScopeTitle(token)
+        }
+    }
+
+    func tint(for token: String) -> Color {
+        switch self {
+        case .agent: MuxaAgentMark.known(for: token)?.tint ?? .secondary
+        case .limitScope: .accentColor
+        }
+    }
+}
+
+/// One token with whatever face it has. A value this build does not know
+/// gets no symbol — inventing one would say something untrue — and keeps
+/// its wire spelling.
+private struct AutomationTokenLabel: View {
+    let token: String
+    let style: AutomationTokenStyle
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if let mark {
+                Image(systemName: mark.symbol)
+                    .foregroundStyle(mark.tint)
+            }
+            Text(verbatim: style.title(for: token))
+        }
+    }
+
+    private var mark: MuxaAgentMark? {
+        style == .agent ? MuxaAgentMark.known(for: token) : nil
+    }
+}
+
+/// A small multi-select over the values a filter matches on. Values a rule
+/// already carries that this build does not list come last, so editing a
+/// rule never silently drops them.
 private struct AutomationTokenPicker: View {
     let title: LocalizedStringKey
     let tokens: [String]
+    let style: AutomationTokenStyle
     @Binding var selection: Set<String>
 
     var body: some View {
         LabeledContent {
             VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    ForEach(tokens, id: \.self) { token in
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 128), spacing: 6, alignment: .leading)],
+                    alignment: .leading,
+                    spacing: 6
+                ) {
+                    ForEach(offered, id: \.self) { token in
                         Toggle(isOn: binding(for: token)) {
-                            Text(verbatim: token)
+                            AutomationTokenLabel(token: token, style: style)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .toggleStyle(.button)
                         .controlSize(.small)
                     }
-                }
-                ForEach(extras, id: \.self) { token in
-                    Toggle(isOn: binding(for: token)) {
-                        Text(verbatim: token)
-                    }
-                    .toggleStyle(.button)
-                    .controlSize(.small)
                 }
                 if selection.isEmpty {
                     Text("Any").font(.caption).foregroundStyle(.secondary)
@@ -894,10 +1127,8 @@ private struct AutomationTokenPicker: View {
         }
     }
 
-    /// Values a rule already carries that this build does not list, so
-    /// editing a rule never silently drops them.
-    private var extras: [String] {
-        selection.subtracting(tokens).sorted()
+    private var offered: [String] {
+        tokens + selection.subtracting(tokens).sorted()
     }
 
     private func binding(for token: String) -> Binding<Bool> {

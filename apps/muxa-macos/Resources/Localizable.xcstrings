@@ -1332,6 +1332,16 @@
         }
       }
     },
+    "5-hour limit" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "5시간 한도"
+          }
+        }
+      }
+    },
     "@%@ needs a person first" : {
       "localizations" : {
         "ko" : {
@@ -1460,6 +1470,16 @@
         }
       }
     },
+    "A fixed delay after the event" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이벤트 후 고정 지연"
+          }
+        }
+      }
+    },
     "A fresh install ships none, so nothing fires until you add one. Add the session-limit rule to resume a capped agent when its window reopens." : {
       "localizations" : {
         "ko" : {
@@ -1520,12 +1540,12 @@
         }
       }
     },
-    "A rule types into a live agent" : {
+    "A rule types into a live agent's pane, exactly as a person would." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "규칙은 실행 중인 에이전트에 직접 입력합니다"
+            "value" : "규칙은 사람이 하듯 실행 중인 에이전트의 페인에 직접 입력합니다."
           }
         }
       }
@@ -1838,6 +1858,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "고급 탭에 저장하지 않은 변경이 있습니다. 저장하거나 다시 로드한 뒤에 바꿔 주세요."
+          }
+        }
+      }
+    },
+    "After the reset" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "리셋 후"
           }
         }
       }
@@ -2254,6 +2284,16 @@
         }
       }
     },
+    "Automatic splits along the pane's longer side, so a growing line-up stays readable" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동 분할은 페인의 긴 쪽을 따라 나누므로, 늘어나도 읽기 좋게 유지됩니다"
+          }
+        }
+      }
+    },
     "Automatically" : {
       "localizations" : {
         "ko" : {
@@ -2330,6 +2370,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "백엔드"
+          }
+        }
+      }
+    },
+    "Before the reset" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "리셋 전"
           }
         }
       }
@@ -3210,6 +3260,16 @@
         }
       }
     },
+    "Delay" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "지연"
+          }
+        }
+      }
+    },
     "Delete" : {
       "localizations" : {
         "ko" : {
@@ -3596,16 +3656,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "사용"
-          }
-        }
-      }
-    },
-    "Enabling this is a grant: a request may be typed into a peer agent's pane." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "켜는 것은 곧 허가입니다. 요청이 동료 에이전트의 페인에 직접 입력될 수 있습니다."
           }
         }
       }
@@ -6013,12 +6063,42 @@
         }
       }
     },
+    "Off stops every rule and is remembered in muxa configuration. Pause stops them until a time you choose." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "끄면 모든 규칙이 멈추고 muxa 설정에 기록됩니다. 일시 중지는 지정한 시각까지만 멈춥니다."
+          }
+        }
+      }
+    },
     "Offline" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "오프라인"
+          }
+        }
+      }
+    },
+    "Offset" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오프셋"
+          }
+        }
+      }
+    },
+    "Offset direction" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오프셋 방향"
           }
         }
       }
@@ -7923,6 +8003,7 @@
       }
     },
     "Saved to configuration. muxad reads it at start, so reload it to apply." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -8058,16 +8139,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "프롬프트 보내기"
-          }
-        }
-      }
-    },
-    "Send prompt injects text and presses Enter in the agent's pane, exactly as you would. These guards bound it:" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "프롬프트 보내기는 사람이 하듯 에이전트 페인에 텍스트를 입력하고 Enter를 누릅니다. 다음 안전장치가 이를 제한합니다:"
           }
         }
       }
@@ -9131,6 +9202,7 @@
       }
     },
     "The master switch lives in muxa configuration and applies when muxad restarts. Pause takes effect immediately." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -9371,6 +9443,7 @@
       }
     },
     "This muxad cannot edit its configuration from the app. Change [automation] enabled in the file, then reload muxad." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -9466,6 +9539,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 tmux 윈도우"
+          }
+        }
+      }
+    },
+    "This wait was written by hand, so muxa keeps it exactly as it is." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "직접 작성한 대기 값이라 muxa가 그대로 둡니다."
           }
         }
       }
@@ -9566,6 +9649,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "연결할 수 없는 호스트"
+          }
+        }
+      }
+    },
+    "Unspecified" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "지정되지 않음"
           }
         }
       }
@@ -9671,6 +9764,16 @@
         }
       }
     },
+    "Use the Controls" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "컨트롤로 전환"
+          }
+        }
+      }
+    },
     "Use the route's workspace or an existing session" : {
       "localizations" : {
         "ko" : {
@@ -9752,6 +9855,16 @@
         }
       }
     },
+    "Wait must be a duration such as 5m, or an offset from the limit reset." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "대기는 5m 같은 시간이거나, 한도 리셋 기준 오프셋이어야 합니다."
+          }
+        }
+      }
+    },
     "Wait must be a duration, reset, or reset plus a duration." : {
       "extractionState" : "stale",
       "localizations" : {
@@ -9759,16 +9872,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "대기는 시간, reset, 또는 reset에 시간을 더한 값이어야 합니다."
-          }
-        }
-      }
-    },
-    "Wait must be a duration, reset, or reset plus or minus a duration." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "대기는 시간, reset, 또는 reset에 시간을 더하거나 뺀 값이어야 합니다."
           }
         }
       }
@@ -9884,6 +9987,16 @@
         }
       }
     },
+    "Weekly limit" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "주간 한도"
+          }
+        }
+      }
+    },
     "Welcome Guide…" : {
       "localizations" : {
         "ko" : {
@@ -9900,6 +10013,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Muxa에 오신 것을 환영합니다"
+          }
+        }
+      }
+    },
+    "What bounds this" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 동작을 제한하는 가드"
           }
         }
       }
@@ -9960,6 +10083,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "한도에 해제 시각이 없으면 muxad는 기본값인 %@ 동안 기다립니다."
+          }
+        }
+      }
+    },
+    "When the limit resets" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "한도가 리셋될 때"
           }
         }
       }
@@ -10323,6 +10456,16 @@
         }
       }
     },
+    "limit resets" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "한도 리셋"
+          }
+        }
+      }
+    },
     "local" : {
       "localizations" : {
         "ko" : {
@@ -10654,6 +10797,16 @@
         }
       }
     },
+    "split automatically" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동 분할"
+          }
+        }
+      }
+    },
     "split down" : {
       "localizations" : {
         "ko" : {
@@ -10815,7 +10968,18 @@
         }
       }
     },
+    "• A ceiling of %lld firings an hour bounds every rule together." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "• 시간당 %lld회 상한이 모든 규칙을 함께 제한합니다."
+          }
+        }
+      }
+    },
     "• A ceiling of 30 firings an hour bounds every rule together." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {

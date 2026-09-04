@@ -38,9 +38,6 @@ struct BehaviourSettingsPane: View {
 
             Section("Collaboration") {
                 Toggle("Let agents send each other requests", isOn: $settings.collaborationEnabled)
-                Text("Enabling this is a grant: a request may be typed into a peer agent's pane.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 Group {
                     Picker("Wake", selection: $settings.collaborationWake) {
                         ForEach(MuxaCollaborationWake.allCases) { wake in
