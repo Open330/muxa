@@ -182,11 +182,13 @@ impl SplitDirection {
         match self {
             Self::Right => "-h",
             Self::Down => "-v",
+            // A cell is about twice as tall as it is wide, so a pane is
+            // "wider than tall" when its columns exceed twice its rows.
+            // Without a measurement — no tmux server, unknown target — the
+            // historical right split stands.
             Self::Auto => match pane_shape(target) {
                 Some((columns, rows)) if columns < rows.saturating_mul(2) => "-v",
-                Some(_) => "-h",
-                // Without a measurement, keep the historical behaviour.
-                None => "-h",
+                _ => "-h",
             },
         }
     }
