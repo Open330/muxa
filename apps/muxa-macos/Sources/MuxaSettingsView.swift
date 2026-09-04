@@ -30,6 +30,7 @@ enum MuxaSettingsTab: String, CaseIterable, Identifiable {
     case providers
     case automations
     case behaviour
+    case modules
     case fleet
     case runtime
     case advanced
@@ -77,6 +78,10 @@ struct MuxaSettingsView: View {
             BehaviourSettingsPane(model: model, store: MuxaConfigStore.shared)
                 .tabItem { Label("Behaviour", systemImage: "bell.badge") }
                 .tag(MuxaSettingsTab.behaviour.rawValue)
+
+            ModulesSettingsPane(model: model, registry: MuxaModuleRegistry.shared)
+                .tabItem { Label("Modules", systemImage: "puzzlepiece.extension") }
+                .tag(MuxaSettingsTab.modules.rawValue)
 
             MuxaFleetSettingsPane(model: model)
                 .tabItem { Label("Hosts", systemImage: "server.rack") }
