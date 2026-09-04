@@ -26,7 +26,7 @@ name = "resume-after-limit"
 on = "rate_limited"
 action = "send_prompt"
 text = "continue"
-wait = "reset+2m"
+wait = "{{reset}}+2m"
 fallback = "20m"
 ```
 
@@ -44,7 +44,7 @@ and needs no restart:
 
 ```console
 $ echo '{"name":"resume-after-limit","on":"rate_limited","action":"send_prompt",
-         "text":"continue","wait":"reset+2m","fallback":"20m"}' |
+         "text":"continue","wait":"{{reset}}+2m","fallback":"20m"}' |
     muxa automation add --from-json -
 wrote resume-after-limit
 ```
@@ -89,7 +89,7 @@ host = "local"                   # `local`, or tmux / cmux / rmux / zellij / her
 scope = ["five_hour"]            # rate-limit window (rate_limited only)
 
 # --- when to act ---
-wait = "reset+2m"                # anchor on the cap's own reset time
+wait = "{{reset}}+2m"                # anchor on the cap's own reset time
 fallback = "20m"                 # used when the cap carries no reset time
 jitter = "30s"                   # random 0..jitter added; default 15s
 
@@ -136,7 +136,8 @@ a "resume" turns into arbitrary key bindings.
 ### Timing
 
 `wait` is either a plain duration counted from the event (`5m`) or
-anchored on the cap's own reset time (`reset`, `reset+2m`, `reset-30s`).
+anchored on the cap's own reset time (`{{reset}}`, `{{reset}}+2m`,
+`{{reset}}-30s`). The bare `reset` spelling from earlier builds still loads.
 A `reset` anchor only makes sense for `on = "rate_limited"` — nothing else
 carries a reset time — and is refused elsewhere.
 
@@ -263,7 +264,7 @@ succeeding — an editor that lost sync should be told.
       "scope": ["five_hour"],
       "text": "continue",
       "submit": true,
-      "wait": "reset+2m",
+      "wait": "{{reset}}+2m",
       "fallback": "20m",
       "jitter": "30s",
       "cooldown": "5m",

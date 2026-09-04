@@ -59,11 +59,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A pipeline agent's pane split follows the window.** `direction` defaults
+  to `auto`: muxa splits along the target pane's longer side, so a line-up
+  that grows past two agents stays readable instead of collapsing into thin
+  columns. `right` and `down` stay available as explicit choices, in
+  `config.toml` and in Muxa.app's pipeline editor.
+
 - **Automations: muxa can act on what it observes.** A rule engine in muxad
   watches the agent events it already collects and, when a rule matches,
   waits and then acts. The first rule that matters: an agent that hits its
   session limit is sent `continue` a couple of minutes after the limit
-  resets (or after a fallback delay when the cap carries no reset time).
+  resets (`wait = "{{reset}}+2m"`), or after a fallback delay when the cap
+  carries no reset time.
   Rules live in `[[automation.rule]]`, guards are not optional (master
   switch, per-rule enable, pause, per-hour cap, cooldown, a re-check at fire
   time, one firing per limit episode), and every firing is recorded.
