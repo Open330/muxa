@@ -4913,3 +4913,584 @@ func filterFieldsCarryNoPlaceholderAndFormatFieldsKeepTheirs() throws {
     #expect(source.contains("TextField(\"Jitter\", text: $draft.jitter, prompt:"))
     #expect(source.contains("TextField(\"Text\", text: $draft.text, prompt:"))
 }
+
+// MARK: - aas module
+
+/// `aas usage --json` in the shape it prints today, plus everything a newer
+/// aas could add: a provider this build has never heard of, an account whose
+/// numbers failed, a meter with no reset time, and fields nobody here knows.
+private let aasUsageFixture = """
+{
+  "accounts": [
+    {
+      "provider": "claude",
+      "name": "e-ed@claude",
+      "email": "e-ed@example.com",
+      "active": false,
+      "cached": true,
+      "fetchedAtMs": 1788504756336,
+      "plan": "max",
+      "planLabel": "max · 20x",
+      "headline": "subscription=max tier=default_claude_max_20x",
+      "error": null,
+      "notes": [],
+      "meters": [
+        {"label": "5h", "usedPct": 6.0, "resetMs": 1788520200297},
+        {"label": "7d", "usedPct": 79.0, "resetMs": 1788642000297}
+      ],
+      "remainingPct": 21.0
+    },
+    {
+      "provider": "codex",
+      "name": "e-ed@codex",
+      "email": "e-ed@example.com",
+      "active": true,
+      "cached": false,
+      "plan": "pro",
+      "planLabel": "pro",
+      "error": "429 Too Many Requests from the usage endpoint",
+      "notes": ["backing off for ten minutes"],
+      "meters": [],
+      "remainingPct": null
+    },
+    {
+      "provider": "zai",
+      "name": "work@zai",
+      "active": false,
+      "planLabel": "lite",
+      "meters": [{"label": "5h", "usedPct": 12.5, "resetMs": null}],
+      "somethingALaterAasAdded": {"any": "shape"}
+    }
+  ],
+  "providerGroups": [
+    {
+      "provider": "claude",
+      "title": "Claude",
+      "accounts": [{"provider": "claude", "name": "e-ed@claude", "active": false}]
+    },
+    {
+      "provider": "zai",
+      "title": "Z.ai",
+      "accounts": [{"provider": "zai", "name": "work@zai", "active": false}]
+    }
+  ],
+  "worstRemainingPct": 0.0,
+  "aFieldThisBuildHasNeverSeen": true
+}
+"""
+
+@Test
+func aasUsageDecodesEveryAccountIncludingOnesThisBuildDoesNotKnow() throws {
+    let snapshot = try JSONDecoder().decode(
+        AasUsageSnapshot.self,
+        from: Data(aasUsageFixture.utf8)
+    )
+    #expect(snapshot.accounts.count == 3)
+
+    let claude = snapshot.accounts[0]
+    #expect(claude.name == "e-ed@claude")
+    #expect(claude.email == "e-ed@example.com")
+    #expect(claude.active == false)
+    #expect(claude.planText == "max · 20x")
+    #expect(claude.error == nil)
+    #expect(claude.meters.map(\.label) == ["5h", "7d"])
+    #expect(claude.meters[1].usedPct == 79)
+    #expect(claude.meters[1].resetMs == 1_788_642_000_297)
+    #expect(claude.meters[0].fraction == 0.06)
+
+    // One account failing does not cost the others their numbers, and its
+    // error stays exactly as the provider worded it.
+    let codex = snapshot.accounts[1]
+    #expect(codex.active)
+    #expect(codex.error == "429 Too Many Requests from the usage endpoint")
+    #expect(codex.notes == ["backing off for ten minutes"])
+    #expect(codex.meters.isEmpty)
+    #expect(codex.remainingPct == nil)
+
+    // A provider added to aas after this build still decodes, keeps its own
+    // spelling, and a meter with no reset time is simply a meter with none.
+    let unknown = snapshot.accounts[2]
+    #expect(unknown.provider == "zai")
+    #expect(unknown.planText == "lite")
+    #expect(unknown.meters[0].resetMs == nil)
+    #expect(unknown.email == nil)
+    #expect(unknown.notes.isEmpty)
+
+    // Headings come from aas, so Muxa never invents a name for a provider.
+    #expect(snapshot.groups.map(\.title) == ["Claude", "Z.ai"])
+    #expect(snapshot.groups[1].accounts.map(\.name) == ["work@zai"])
+
+    // An aas old enough to send no groups is grouped here instead, in the
+    // order the accounts arrived.
+    let flat = try JSONDecoder().decode(
+        AasUsageSnapshot.self,
+        from: Data(#"{"accounts":[{"provider":"codex","name":"a@codex"},{"provider":"claude","name":"b@claude"},{"provider":"codex","name":"c@codex"}]}"#.utf8)
+    )
+    #expect(flat.groups.map(\.provider) == ["codex", "claude"])
+    #expect(flat.groups[0].accounts.map(\.name) == ["a@codex", "c@codex"])
+    #expect(flat.groups[0].title == "codex")
+}
+
+/// The parser reads `export KEY=value` and nothing else: whatever aas prints
+/// around it, and whatever a later version starts printing, is ignored rather
+/// than guessed at.
+@Test
+func aasExportParserTakesOnlyWellFormedExportLines() {
+    let environment = AasEnvironment.parse("""
+    # written by aas 0.1.10
+    export CLAUDE_CONFIG_DIR="/Users/june/Library/Application Support/aas/claude/e-ed"
+    export CODEX_HOME=/Users/june/.aas/codex
+    export SINGLE='no expansion here'
+    export ESCAPED="a \\"quoted\\" word"
+    export KEEPS_BACKSLASH="C:\\new"
+    export _UNDERSCORE=fine
+
+    CLAUDE_CONFIG_DIR=/not/exported
+    export
+    export =novalue
+    export 1BAD=value
+    export BAD-NAME=value
+    unset SOMETHING_ELSE
+    """)
+
+    #expect(environment["CLAUDE_CONFIG_DIR"] == "/Users/june/Library/Application Support/aas/claude/e-ed")
+    #expect(environment["CODEX_HOME"] == "/Users/june/.aas/codex")
+    #expect(environment["SINGLE"] == "no expansion here")
+    #expect(environment["ESCAPED"] == "a \"quoted\" word")
+    // Only what the shell itself escapes is unescaped; a stray backslash is
+    // part of the value.
+    #expect(environment["KEEPS_BACKSLASH"] == "C:\\new")
+    #expect(environment["_UNDERSCORE"] == "fine")
+
+    // Everything malformed, and everything that is not an export, is gone.
+    #expect(environment.count == 6)
+    #expect(environment["1BAD"] == nil)
+    #expect(environment["BAD-NAME"] == nil)
+    #expect(environment[""] == nil)
+    #expect(environment["SOMETHING_ELSE"] == nil)
+
+    #expect(AasEnvironment.parse("").isEmpty)
+    #expect(AasEnvironment.parse("✗ Account not found: nope@nowhere").isEmpty)
+    #expect(AasEnvironment.isEnvironmentName("A1_b"))
+    #expect(!AasEnvironment.isEnvironmentName("2A"))
+    #expect(!AasEnvironment.isEnvironmentName(""))
+}
+
+@Test
+func aasResetTimesCountDownInWholeUnits() {
+    let now = Date(timeIntervalSince1970: 1_788_500_000)
+    func text(inSeconds seconds: Int) -> String? {
+        let reset = Int64((now.timeIntervalSince1970 + Double(seconds)) * 1000)
+        return AasFormat.resets(atMilliseconds: reset, now: now)
+    }
+
+    #expect(AasFormat.resets(atMilliseconds: nil, now: now) == nil)
+    #expect(AasFormat.resets(atMilliseconds: 0, now: now) == nil)
+    #expect(text(inSeconds: -600) == "Resets now")
+    #expect(text(inSeconds: 30) == "Resets in under a minute")
+    #expect(text(inSeconds: 45 * 60) == "Resets in 45m")
+    #expect(text(inSeconds: 4 * 3600 + 12 * 60) == "Resets in 4h 12m")
+    #expect(text(inSeconds: 33 * 3600) == "Resets in 1d 9h")
+    #expect(AasFormat.percent(79).contains("79"))
+}
+
+/// A tool the operator has not installed is not a failure — it is a module
+/// with a one-line answer for how to get it. A tool that is installed and
+/// broken is a different thing, and must not read as missing.
+@Test @MainActor
+func aasProbeCallsAMissingBinaryMissingAndABrokenOneUnusable() {
+    let missing = AasModule.availability(
+        from: .failure(MuxaModuleProcess.Failure.notFound("aas"))
+    )
+    #expect(missing == .missing(hint: AasModule.installHint))
+    #expect(!missing.isAvailable)
+    #expect(AasModule.installHint.contains("install.sh"))
+
+    let found = AasModule.availability(from: .success(
+        MuxaModuleProcess.Output(status: 0, stdout: "aas 0.1.10\n", stderr: "")
+    ))
+    #expect(found == .available(version: "aas 0.1.10", detail: nil))
+    #expect(found.isAvailable)
+
+    let broken = AasModule.availability(from: .success(
+        MuxaModuleProcess.Output(status: 2, stdout: "", stderr: "dyld: library not loaded\n")
+    ))
+    #expect(broken == .unusable(reason: "dyld: library not loaded"))
+
+    let hung = AasModule.availability(
+        from: .failure(MuxaModuleProcess.Failure.timedOut("aas", 10))
+    )
+    #expect(!hung.isAvailable)
+    if case .missing = hung { Issue.record("an aas that hangs is not an aas that is absent") }
+
+    #expect(AasModule.identity.id == "aas")
+    #expect(AasModule.identity.executable == "aas")
+    #expect(AasModule.identity.homepage?.absoluteString == "https://github.com/Open330/aas")
+}
+
+/// The switch menu on an agent pane offers the accounts of that agent's own
+/// provider, through the wire spellings the daemon uses.
+@Test @MainActor
+func aasMapsAgentKindsOntoTheProvidersItStores() {
+    let stored: Set<String> = ["claude", "codex", "zai"]
+    #expect(AasModule.provider(forAgentKind: "claude_code", known: stored) == "claude")
+    #expect(AasModule.provider(forAgentKind: "codex", known: stored) == "codex")
+    #expect(AasModule.provider(forAgentKind: "ZAI", known: stored) == "zai")
+    // Stored nothing for it, or no aas provider at all: no switch offered.
+    #expect(AasModule.provider(forAgentKind: "gemini_cli", known: stored) == nil)
+    #expect(AasModule.provider(forAgentKind: "opencode", known: stored) == nil)
+    #expect(AasModule.provider(forAgentKind: "claude_code", known: []) == nil)
+}
+
+/// The account shell is one of Muxa's own PTYs with the account's variables
+/// on top of the terminal environment every native shell gets.
+@Test
+func aasAccountShellCarriesTheAccountEnvironment() {
+    let account = AasAccount(provider: "claude", name: "e-ed@claude")
+    let launch = AasShellLaunch.launch(
+        account: account,
+        accountEnvironment: ["CLAUDE_CONFIG_DIR": "/Users/june/Library/Application Support/aas/claude/e-ed"],
+        base: [
+            "SHELL": "/bin/zsh",
+            "PATH": "/usr/bin:/bin",
+            "TMUX": "/tmp/tmux-501/default,1234,0",
+            "TMUX_PANE": "%31",
+        ],
+        shell: "/bin/zsh",
+        appVersion: "0.1.0",
+        home: "/Users/june"
+    )
+
+    #expect(launch.command == "/bin/zsh")
+    #expect(launch.arguments.isEmpty)
+    #expect(launch.cwd == "/Users/june")
+    #expect(launch.name == "e-ed@claude shell")
+    #expect(launch.environment["CLAUDE_CONFIG_DIR"] == "/Users/june/Library/Application Support/aas/claude/e-ed")
+    #expect(launch.environment[AasShellLaunch.accountVariable] == "e-ed@claude")
+    #expect(launch.environment["PATH"] == "/usr/bin:/bin")
+    #expect(launch.environment["TERM_PROGRAM"] == "Muxa")
+    #expect(launch.environment["TERM_PROGRAM_VERSION"] == "0.1.0")
+    // The app owns a fresh PTY: a development terminal's tmux markers would
+    // make an agent started here believe it runs inside tmux.
+    #expect(launch.environment["TMUX"] == nil)
+    #expect(launch.environment["TMUX_PANE"] == nil)
+}
+
+/// `aas export` prints credentials-adjacent values. They go into a shell's
+/// environment and nowhere else — so the file that touches them logs nothing
+/// at all, and the message a failed export shows is built from the account's
+/// name rather than from what aas printed.
+@Test @MainActor
+func aasNeverLogsOrShowsWhatAnExportPrinted() throws {
+    let module = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("Sources/AasModule.swift")
+    let source = try String(contentsOf: module, encoding: .utf8)
+    #expect(!source.contains("MuxaLog"))
+    #expect(!source.contains("print("))
+    #expect(!source.contains("write(to:"))
+
+    let account = AasAccount(provider: "claude", name: "e-ed@claude")
+    let message = AasModule.exportFailureMessage(for: account)
+    #expect(message.contains("e-ed@claude"))
+
+    // What a failed `aas usage` or `aas switch` said is a status line, and
+    // that one is worth showing.
+    #expect(AasAccountStore.failureMessage(
+        MuxaModuleProcess.Output(status: 1, stdout: "✗ Account not found: nope\n", stderr: "")
+    ) == "✗ Account not found: nope")
+    #expect(AasAccountStore.failureMessage(
+        MuxaModuleProcess.Output(status: 1, stdout: "", stderr: "  \n")
+    ) == "aas could not read your accounts.")
+}
+
+// MARK: - AIR
+
+/// The pipeline every AIR test starts from: two stages, a fan-in, a prompt
+/// with a fence and a heading in it, and a task with a newline — the things
+/// that would break a Markdown rendering if it were not sanitized.
+private func airPipelineFixture() -> MuxaPipelineDefinition {
+    MuxaPipelineDefinition(
+        description: "Review then fix",
+        layout: "main-vertical",
+        prompt: "Ship the change.",
+        agents: [
+            MuxaPipelineDefinition.Agent(
+                alias: "plan", program: "claude", role: "planner",
+                task: "Plan the change", prompt: "You are the planner.\nBe brief."
+            ),
+            MuxaPipelineDefinition.Agent(
+                alias: "review", program: "codex", role: "reviewer",
+                task: "Review\nthe diff", direction: "down", after: ["plan"]
+            ),
+            MuxaPipelineDefinition.Agent(
+                alias: "fix", program: "claude",
+                prompt: "### not a heading\n```\nfence\n```", after: ["plan", "review"]
+            ),
+        ]
+    )
+}
+
+/// Everything muxa runs on has to survive the trip, including the prompts
+/// AIR has no place for and the split direction it does not model.
+@Test func airWorkflowRoundTripKeepsEveryFieldMuxaRunsOn() throws {
+    let definition = airPipelineFixture()
+    let document = AirWorkflow.document(name: "resolve", definition, producer: "0.1.0")
+    let reread = try AirDocument.decode(document.fileData)
+    let pipeline = try AirWorkflow.pipeline(from: reread)
+
+    #expect(pipeline.name == "resolve")
+    #expect(MuxaPipelineDefinition(pipeline).normalized == definition.normalized)
+    // The graph a reader with no muxa extension sees is the real one, not
+    // the linear chain heading order would imply.
+    let edges = reread.body["graph"]?["edges"]?.arrayValue ?? []
+    #expect(edges.count == 3)
+    #expect(reread.body["graph"]?["entry_node_ids"]?.arrayValue == [.string("step-plan")])
+    // A prompt is named in the document but never quoted into it.
+    let source = Data(base64Encoded: reread.body["source"]?["bytes_base64"]?.stringValue ?? "") ?? Data()
+    let markdown = String(decoding: source, as: UTF8.self)
+    #expect(!markdown.contains("You are the planner"))
+    #expect(!markdown.contains("```"))
+    #expect(markdown.contains("### @plan"))
+}
+
+/// AIR's own reader recomputes these, and refuses the artifact when they do
+/// not hold: the source bytes must describe themselves, the step ranges and
+/// the opaque ranges must partition the document exactly once, and every
+/// node's title and body must be the bytes its range points at.
+@Test func airWorkflowSourceMapsPartitionTheDocumentTheyDescribe() throws {
+    let document = AirWorkflow.document(name: "resolve", airPipelineFixture(), producer: "0.1.0")
+    let body = document.body
+    let bytes = try #require(Data(base64Encoded: body["source"]?["bytes_base64"]?.stringValue ?? ""))
+
+    #expect(body["source"]?["byte_length"]?.intValue == bytes.count)
+    #expect(body["source"]?["sha256"]?.stringValue == AirDocument.sha256(bytes))
+    #expect(body["source"]?["final_newline"] == AirJSON.bool(true))
+    #expect(bytes.last == UInt8(ascii: "\n"))
+    #expect(!String(decoding: bytes, as: UTF8.self).contains("\r"))
+
+    func span(_ value: AirJSON?) -> Range<Int> {
+        (value?["start_byte"]?.intValue ?? 0)..<(value?["end_byte"]?.intValue ?? 0)
+    }
+    let maps = body["source_maps"]?.arrayValue ?? []
+    let opaque = body["opaque_ranges"]?.arrayValue ?? []
+    var covered = maps.map { span($0["span"]) } + opaque.map { span($0) }
+    covered.sort { $0.lowerBound < $1.lowerBound }
+    var cursor = 0
+    for range in covered {
+        #expect(range.lowerBound == cursor)
+        #expect(range.upperBound > range.lowerBound)
+        cursor = range.upperBound
+    }
+    #expect(cursor == bytes.count)
+    for range in opaque {
+        #expect(range["sha256"]?.stringValue == AirDocument.sha256(bytes[span(range)]))
+    }
+
+    let nodes = body["graph"]?["nodes"]?.arrayValue ?? []
+    #expect(nodes.count == maps.count)
+    for (node, map) in zip(nodes, maps) {
+        #expect(node["id"]?.stringValue == map["node_id"]?.stringValue)
+        let heading = span(map["heading"])
+        let title = span(map["title"])
+        let inner = span(map["body"])
+        let whole = span(map["span"])
+        #expect(whole.lowerBound == heading.lowerBound)
+        #expect(heading.lowerBound <= title.lowerBound && title.upperBound <= heading.upperBound)
+        #expect(heading.upperBound <= inner.lowerBound && inner.upperBound <= whole.upperBound)
+        #expect(node["title"]?.stringValue == String(decoding: bytes[title], as: UTF8.self))
+        #expect(node["body"]?.stringValue == String(decoding: bytes[inner], as: UTF8.self))
+    }
+}
+
+/// The identity of an artifact is a digest over its bytes, so the rendering
+/// is a compatibility surface: this id is the one AIR Workbench's own
+/// `air validate` accepted for this pipeline. Changing the rendering is
+/// allowed; doing it by accident is not.
+@Test func airWorkflowDigestsAreTheOnesWorkbenchRecomputes() throws {
+    let document = AirWorkflow.document(name: "resolve", airPipelineFixture(), producer: "0.1.0")
+    #expect(
+        document.artifactID
+            == "urn:air:sha256:0c17a3d99c521049adf2f0541ff9254668a81f26bf3960a38034d8d9b97b32e0"
+    )
+    #expect(document.artifactID == "urn:air:sha256:\(document.contentDigest)")
+    // Recomputing agrees, and a body that has been edited no longer does.
+    try document.verifyIntegrity()
+    var tampered = try #require(document.json.objectValue)
+    tampered["body"] = .object(["source": .string("swapped")])
+    #expect(throws: AirError.integrity) {
+        try AirDocument(json: .object(tampered)).verifyIntegrity()
+    }
+}
+
+/// An extension muxa has never heard of is somebody else's business: it must
+/// neither break the read nor change what muxa takes out of the document.
+/// Without muxa's own extension the graph still yields a line-up.
+@Test func airImportKeepsWhatItUnderstandsBesideAnotherVendorsExtension() throws {
+    let definition = airPipelineFixture()
+    let document = AirWorkflow.document(name: "resolve", definition, producer: "0.1.0")
+    var envelope = try #require(document.json.objectValue)
+    var extensions = try #require(envelope["extensions"]?.objectValue)
+    extensions["https://example.invalid/somebody-else/1"] = .object([
+        "notes": .array([.string("not muxa's")]),
+    ])
+    envelope["extensions"] = .object(extensions)
+
+    let beside = try AirWorkflow.pipeline(from: AirDocument(json: .object(envelope)))
+    #expect(MuxaPipelineDefinition(beside).normalized == definition.normalized)
+
+    // Strip muxa's payload entirely: a foreign workflow still reads as a
+    // line-up, with the aliases and the waits-for graph the document states.
+    extensions.removeValue(forKey: AirDocument.Spec.muxaExtension)
+    envelope["extensions"] = .object(extensions)
+    let foreign = try AirWorkflow.pipeline(from: AirDocument(json: .object(envelope)))
+    #expect(foreign.agents.map(\.alias) == ["plan", "review", "fix"])
+    #expect(foreign.agents.map(\.after) == [[], ["plan"], ["plan", "review"]])
+    #expect(Set(foreign.agents.map(\.program)) == ["claude"])
+    #expect(foreign.name == "resolve")
+}
+
+/// An AIR file is untrusted input, so an import goes through exactly the
+/// rules `muxa work pipeline set` applies — before anything is offered for
+/// saving.
+@Test func airImportRefusesAWorkflowThatWouldNotLaunch() throws {
+    let ghost = MuxaPipelineDefinition(agents: [
+        MuxaPipelineDefinition.Agent(alias: "fix", program: "claude", after: ["ghost"]),
+    ])
+    #expect(throws: AirError.self) {
+        try AirWorkflow.pipeline(from: AirWorkflow.document(name: "g", ghost, producer: "0.1.0"))
+    }
+    let strange = MuxaPipelineDefinition(agents: [
+        MuxaPipelineDefinition.Agent(alias: "fix", program: "rm -rf"),
+    ])
+    #expect(throws: AirError.self) {
+        try AirWorkflow.pipeline(from: AirWorkflow.document(name: "s", strange, producer: "0.1.0"))
+    }
+    // A trace is not a workflow, and is refused as one rather than half-read.
+    let trace = AirTrace.exports(
+        for: AirRunEvidence(
+            workspaceID: "muxa", workID: "w", pipeline: "p", cwd: "/tmp",
+            participants: [.init(alias: "solo", program: "claude")]
+        ),
+        producer: "0.1.0"
+    ).exports[0].document
+    #expect(throws: AirError.self) { try AirWorkflow.pipeline(from: trace) }
+}
+
+/// Run evidence is metadata only *by construction*: `AirRunEvidence` has no
+/// field a prompt or an agent's output could land in, and the exporter sees
+/// nothing else. This test guards both halves — the shape of the type, and
+/// the bytes that come out of a Work whose agents are full of text.
+@Test func airTraceCarriesNoPromptOrOutputFromAWorkThatHasThem() throws {
+    let secrets = [
+        "You are the planner.",
+        "I have finished the refactor.",
+        "Renamed 14 call sites",
+        "Fix the login crash",
+        "rm -rf /",
+    ]
+    let agent = try JSONDecoder().decode(MuxaAgent.self, from: Data("""
+    {
+      "kind": "claude_code",
+      "agent_session_id": "sess-1",
+      "pane": "%31",
+      "cwd": "/Users/june/personal/muxa",
+      "state": "working",
+      "last_prompt": "\(secrets[0])",
+      "last_response": "\(secrets[1])",
+      "recap": "\(secrets[2])",
+      "ai_title": "\(secrets[3])",
+      "last_notification": "\(secrets[4])",
+      "started_at": "2026-09-04T09:00:00Z",
+      "state_entered_at": "2026-09-04T09:00:04Z",
+      "last_activity_at": "2026-09-04T09:12:00Z"
+    }
+    """.utf8))
+    let pane = MuxaPaneInfo(
+        paneID: "%31", sessionID: "$1", session: "muxa", windowID: "@1",
+        windowName: "work", windowIndex: "1", paneIndex: "0",
+        currentCommand: "claude", title: "muxa", currentPath: "/Users/june/personal/muxa",
+        socket: "default", workspaceID: "muxa", workID: "CAL-1201",
+        agentRole: "planner", agentAlias: "plan"
+    )
+    let identity = MuxaWorkIdentity(workspaceID: "muxa", workID: "CAL-1201")
+    let run = try JSONDecoder().decode(MuxaPipelineRun.self, from: Data("""
+    {
+      "identity": {"workspace_id": "muxa", "work_id": "CAL-1201"},
+      "pipeline": "resolve",
+      "desired": [
+        {"alias": "plan", "program": "claude", "role": "planner", "task": "\(secrets[3])"},
+        {"alias": "poly", "program": "gemini", "after": ["plan"]}
+      ],
+      "cwd": "/Users/june/personal/muxa",
+      "generation": 3,
+      "aliases": {"plan": {"alias": "plan", "status": "running", "generation": 3, "pane": "%31"}}
+    }
+    """.utf8))
+    let group = MuxaWorkGroup(
+        identity: identity,
+        pipelineRun: run,
+        participants: [MuxaHostedAgent(
+            host: MuxaFleetHostIdentity(alias: "local", local: true, state: "online", mode: "control"),
+            agent: agent,
+            pane: pane
+        )]
+    )
+
+    // The shape: every field the exporter can even see, named. A new field
+    // here is a deliberate decision, which is the point.
+    let evidence = AirRunEvidence(group)
+    let fields = Set(Mirror(reflecting: evidence.participants[0]).children.compactMap(\.label))
+    #expect(fields == [
+        "alias", "role", "program", "state", "status", "stage", "host", "pane",
+        "startedAt", "stateEnteredAt", "lastActivityAt", "after",
+    ])
+    #expect(evidence.participants.map(\.alias) == ["plan", "poly"])
+    #expect(evidence.participants.map(\.stage) == [1, 2])
+
+    // The bytes: nothing the app holds as text reaches the artifact, and the
+    // one agent AIR 1 cannot describe is named rather than relabelled.
+    let result = AirTrace.exports(for: evidence, producer: "0.1.0")
+    #expect(result.exports.map(\.fileName) == ["cal-1201-plan.air.json"])
+    #expect(result.skipped.map(\.alias) == ["poly"])
+    let written = result.exports
+        .map { String(decoding: $0.document.fileData, as: UTF8.self) }
+        .joined()
+    for secret in secrets {
+        #expect(!written.contains(secret), "\(secret) reached the trace")
+    }
+    // …and it never claims a run finished, because muxa never saw one finish.
+    let body = result.exports[0].document.body
+    #expect(body["terminal"]?["status"]?.stringValue == "truncated")
+    #expect(body["terminal"]?["completeness"]?.stringValue == "partial")
+    #expect(body["process"]?["exit_code"] == AirJSON.null)
+    #expect(body["agent"]?.stringValue == "claude")
+    let codes = (body["diagnostics"]?.arrayValue ?? []).compactMap { $0["code"]?.stringValue }
+    #expect(codes.contains("AIR_MUXA_SAFETY_UNOBSERVED"))
+}
+
+/// AIR Workbench needs Node 22.22; a build that is one patch short is not
+/// "close enough", and a nightly's tag is not part of the comparison.
+@Test func airNodeGateAcceptsOnlyWhatWorkbenchRuns() {
+    func accepts(_ output: String) -> Bool {
+        AirModule.nodeVersion(output).map(AirModule.meetsMinimum) ?? false
+    }
+    #expect(accepts("v22.22.0\n"))
+    #expect(accepts("v22.22.1"))
+    #expect(accepts("v23.1.0"))
+    #expect(accepts("v24.0.0-nightly20260101abcdef"))
+    #expect(!accepts("v20.19.4\n"))
+    #expect(!accepts("v22.21.9"))
+    #expect(!accepts("v18.20.0"))
+    #expect(AirModule.nodeVersion("command not found") == nil)
+    let parsed = AirModule.nodeVersion("v22.22.0")
+    #expect(parsed?.major == 22 && parsed?.minor == 22 && parsed?.patch == 0)
+
+    // The address Workbench prints is taken whole, token and all.
+    let url = AirWorkbenchProcess.loopbackURL(
+        in: "starting…\nhttp://127.0.0.1:60995/?token=abc&initial=explicit\n"
+    )
+    #expect(url?.absoluteString == "http://127.0.0.1:60995/?token=abc&initial=explicit")
+    #expect(AirWorkbenchProcess.loopbackURL(in: "no address here") == nil)
+}

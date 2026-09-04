@@ -51,14 +51,18 @@ private struct ModuleCard: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(verbatim: module.identity.title)
                         .font(.headline)
-                    Text(verbatim: module.identity.blurb)
+                    // The blurb is the app's own sentence, so it is
+                    // translated; the title is a product name and is not.
+                    Text(module.identity.blurb)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     availabilityLine
                 }
                 Spacer(minLength: 8)
-                Toggle("", isOn: Binding(
+                // The module's own name as the label: hidden on screen, read
+                // by VoiceOver, and not an empty key in the String Catalog.
+                Toggle(module.identity.title, isOn: Binding(
                     get: { isEnabled },
                     set: { registry.setEnabled(module.id, $0) }
                 ))

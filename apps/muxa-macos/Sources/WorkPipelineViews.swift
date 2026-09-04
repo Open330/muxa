@@ -102,6 +102,10 @@ struct WorkPipelineCard: View {
     var hostStates: [MuxaPipelineHostState] = []
     var sync: (() -> Void)?
     var syncing = false
+    /// Everything the enabled modules offer for this pipeline. Nil keeps the
+    /// card usable from a call site with no model.
+    var moduleContext: (model: AppModel, host: String?)?
+
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -156,6 +160,14 @@ struct WorkPipelineCard: View {
                         .lineLimit(2)
                 }
                 Spacer(minLength: 4)
+                if let moduleContext {
+                    MuxaModuleMenu(
+                        context: .pipeline(pipeline, host: moduleContext.host),
+                        model: moduleContext.model,
+                        registry: MuxaModuleRegistry.shared,
+                        label: "More"
+                    )
+                }
                 if let edit {
                     Button(action: edit) {
                         Label("Edit…", systemImage: "slider.horizontal.3")

@@ -857,6 +857,11 @@ private struct MuxaSidebar: View {
                             .fixedSize()
                             .disabled(!model.isConnected || isOpeningRemoteShell)
                             .help("New shell on a fleet host")
+                            MuxaModuleMenu(
+                                context: .app,
+                                model: model,
+                                registry: MuxaModuleRegistry.shared
+                            )
                         }
                         Text(verbatim: sidebarCountLabel)
                             .font(.caption.monospacedDigit())
@@ -2395,17 +2400,26 @@ private struct FleetAgentDetailView: View {
                             .textSelection(.enabled)
                     }
                     Spacer(minLength: 12)
-                    if !needsAttention {
-                        Button {
-                            model.openInLiveWatch(participant)
-                        } label: {
-                            Label("Open in Live Watch", systemImage: "rectangle.on.rectangle")
+                    VStack(alignment: .trailing, spacing: 6) {
+                        if !needsAttention {
+                            Button {
+                                model.openInLiveWatch(participant)
+                            } label: {
+                                Label("Open in Live Watch", systemImage: "rectangle.on.rectangle")
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(participant.pane == nil)
+                            .help("Follow this agent's pane in Live Watch")
                         }
-                        .buttonStyle(.bordered)
-                        .disabled(participant.pane == nil)
-                        .help("Follow this agent's pane in Live Watch")
-                        .padding(.top, 6)
+                        // Whatever the enabled modules offer for this agent;
+                        // nothing at all when none is switched on.
+                        MuxaModuleMenu(
+                            context: .agent(participant),
+                            model: model,
+                            registry: MuxaModuleRegistry.shared
+                        )
                     }
+                    .padding(.top, 6)
                 }
 
                 if needsAttention {

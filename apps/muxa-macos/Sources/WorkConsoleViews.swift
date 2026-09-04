@@ -560,9 +560,11 @@ struct WorkCommandCenterView: View {
                     } else {
                         LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
                             ForEach(model.workGroups) { work in
-                                WorkCommandCard(work: work) {
-                                    model.select(.work(work.identity))
-                                }
+                                WorkCommandCard(
+                                    work: work,
+                                    open: { model.select(.work(work.identity)) },
+                                    moduleModel: model
+                                )
                             }
                         }
                     }
@@ -698,7 +700,8 @@ struct WorkCommandCenterView: View {
                                 edit: { model.presentPipelineEditor(host: nil, pipeline: pipeline) },
                                 hostStates: model.pipelineHostStates(for: pipeline),
                                 sync: { sync(pipeline) },
-                                syncing: syncingPipelines.contains(pipeline.name)
+                                syncing: syncingPipelines.contains(pipeline.name),
+                                moduleContext: (model: model, host: pipelinesHostAlias)
                             )
                         }
                     }
@@ -904,6 +907,9 @@ private struct CommandCenterMetric: View {
 private struct WorkCommandCard: View {
     let work: MuxaWorkGroup
     let open: () -> Void
+    /// What the enabled modules offer for this Work; nil when there is no
+    /// model to give them.
+    var moduleModel: AppModel?
 
     private var statusText: Text {
         if work.attentionCount > 0 {
@@ -934,6 +940,14 @@ private struct WorkCommandCard: View {
                     }
                     .font(.caption.weight(.medium))
                     .foregroundStyle(work.attentionCount > 0 ? .orange : work.workingCount > 0 ? .blue : .green)
+                    if let moduleModel {
+                        MuxaModuleMenu(
+                            context: .work(work),
+                            model: moduleModel,
+                            registry: MuxaModuleRegistry.shared,
+                            label: "More"
+                        )
+                    }
                 }
                 Text(work.pipelineLabel)
                     .font(.subheadline)

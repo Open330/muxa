@@ -52,6 +52,22 @@ AIR file can never write a pipeline that would not launch.
 
 ## Plan
 
+**Where the converter lives (decided after this plan was written).** The
+integration ships in **Muxa.app only** — not in muxad, not in the `muxa` CLI
+— as a module the operator switches on under Settings › Modules, with the
+converter written in Swift (`Sources/Air*.swift`). Reason 2 above still
+holds and is the reason for the change rather than against it: keeping AIR
+out of the daemon and the CLI is exactly what keeps `muxa work up` working
+on a headless host with no Node, and the app is the only surface that ever
+had a graph to show. The phases below stand; read "Rust crate" as "Swift in
+the app" and "CLI subcommand" as "module action". One thing did not survive
+contact with the schema: AIR 1's two trace profiles each describe a *single*
+`claude` or `codex` session, so a Work becomes one trace per agent — panes
+running anything else are named and left out rather than relabelled — and
+the fields muxa never observed (the provider's safety posture, the process
+exit) are written at AIR's least-claiming values with an `info` diagnostic
+in the artifact saying they are not measurements.
+
 ### Phase 0 — the converter, and one artifact that proves it
 
 - `crates/muxa/src/air.rs`: `PipelineSpec ⇄ AIR 1 workflow`. muxa's runtime

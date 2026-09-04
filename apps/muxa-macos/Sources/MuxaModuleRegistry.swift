@@ -66,10 +66,12 @@ final class MuxaModuleRegistry: ObservableObject {
         probeGeneration &+= 1
     }
 
-    /// Everything the enabled, available modules offer for this object.
+    /// Everything the enabled modules offer for this object. A module whose
+    /// tool is missing contributes nothing unless it says its actions work
+    /// without one — a converter does not need the editor installed.
     func actions(for context: MuxaModuleContext, model: AppModel) -> [MuxaModuleAction] {
         enabledModules
-            .filter { $0.availability.isAvailable }
+            .filter { $0.availability.isAvailable || $0.worksWithoutTool }
             .flatMap { $0.actions(for: context, model: model) }
     }
 }

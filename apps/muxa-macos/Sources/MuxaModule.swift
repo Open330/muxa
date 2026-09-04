@@ -28,14 +28,21 @@ protocol MuxaModule: AnyObject, Identifiable {
     /// The module's own settings, shown under Settings › Modules.
     func settingsPane(model: AppModel) -> AnyView
 
-    /// What this module offers to do with a given object. Called only while
-    /// the module is enabled and available.
+    /// What this module offers to do with a given object. Called while the
+    /// module is enabled; a module that can do something without its tool
+    /// installed says so with `worksWithoutTool`.
     func actions(for context: MuxaModuleContext, model: AppModel) -> [MuxaModuleAction]
+
+    /// Actions that need nothing installed — a converter is pure code, so
+    /// importing a file should not wait on a runtime the import never uses.
+    /// Default false: most modules are a face on a tool.
+    var worksWithoutTool: Bool { get }
 }
 
 extension MuxaModule {
     nonisolated var id: String { Self.identity.id }
     var identity: MuxaModuleIdentity { Self.identity }
+    var worksWithoutTool: Bool { false }
 
     func actions(for context: MuxaModuleContext, model: AppModel) -> [MuxaModuleAction] {
         _ = (context, model)
@@ -47,8 +54,10 @@ extension MuxaModule {
 struct MuxaModuleIdentity: Sendable, Identifiable, Equatable {
     /// Preference key and action namespace; never changes.
     let id: String
+    /// The module's own name. A product name, so it is shown verbatim.
     let title: String
-    /// One line: what having this module gets the operator.
+    /// One line: what having this module gets the operator. A sentence the
+    /// app wrote, so it is translated — modules pass a `String(localized:)`.
     let blurb: String
     let symbolName: String
     /// The command the module needs, shown when it is missing.
