@@ -225,6 +225,72 @@ Set `MUXA_SOCKET` before opening from a shell to select a non-default daemon
 socket. Otherwise, the app uses `/tmp/muxa-<uid>.sock`, matching muxa's macOS
 fallback.
 
+## Distribution
+
+Muxa for Mac ships as a **notarized DMG on the GitHub release**, not through
+the Mac App Store. That is not a preference. The app runs the operator's own
+binaries (tmux, the agent CLIs, `ssh`), talks to a daemon that outlives it
+over a socket in `/tmp`, and reads whatever project directory the work is in.
+The App Sandbox forbids all three, and an unsandboxed app cannot be submitted.
+Developer ID with notarization is the supported route for exactly this kind of
+tool.
+
+Build one locally:
+
+```bash
+MUXA_SIGN_IDENTITY="Developer ID Application: NAME (TEAMID)" \
+MUXA_TEAM_ID=TEAMID \
+MUXA_NOTARY_PROFILE=muxa-notary \
+apps/muxa-macos/Scripts/package-dmg.sh
+```
+
+The script builds Release, signs every nested executable before the bundle
+that contains them, builds the DMG, submits it to Apple, staples the ticket,
+and finishes with the only check that matters:
+
+```text
+spctl -a -vvv -t install dist/Muxa-<version>.dmg
+  → accepted, source=Notarized Developer ID
+```
+
+That is what a stranger's Mac decides about the file, and the script fails if
+the answer is anything else.
+
+Two escape hatches. `MUXA_SKIP_NOTARIZE=1` signs without submitting, for a
+fast local check. Omitting `MUXA_SIGN_IDENTITY` entirely produces a DMG named
+`-unsigned`, which exercises the packaging path on a machine with no
+certificate and will not open anywhere else.
+
+Notarization credentials come either from a keychain profile
+(`xcrun notarytool store-credentials`) or, in CI, from an App Store Connect
+API key via `NOTARY_KEY_PATH`, `NOTARY_KEY_ID` and `NOTARY_ISSUER_ID`.
+
+### On a tag
+
+`release.yml`'s `macos-app` job does the same thing on `macos-15`, importing
+the certificate into a keychain it creates for the job and deletes afterwards,
+so the runner's login keychain is never touched. It reads:
+
+| Secret | What it holds |
+|---|---|
+| `MACOS_CERT_P12` | base64 of a Developer ID Application `.p12` |
+| `MACOS_CERT_PASSWORD` | that file's export password |
+| `MACOS_NOTARY_KEY_P8` | base64 of the App Store Connect `.p8` |
+| `MACOS_NOTARY_KEY_ID` | the key's ID |
+| `MACOS_NOTARY_ISSUER_ID` | the issuer UUID |
+| `MACOS_TEAM_ID` (variable) | the team the submission is filed under |
+
+With no certificate secret the job still builds, warns, and uploads the
+unsigned DMG as a workflow artifact instead of attaching it to the release —
+a fork stays green, and a release never carries a DMG Gatekeeper would refuse.
+`publish` waits for this job along with the Rust matrix, so a release is only
+flipped out of draft once every asset it advertises exists.
+
+The version comes from `[workspace.package]` in `Cargo.toml` and is pushed
+into the app's `MARKETING_VERSION` at build time, then verified against the
+built bundle. The daemon and the app that embeds it cannot disagree about
+which release a user is running.
+
 ## Headless providers and API keys
 
 Global Ask uses the installed `claude` and `codex` CLIs in their structured

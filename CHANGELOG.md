@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Muxa for Mac ships as a notarized DMG on the release.** A new
+  `apps/muxa-macos/Scripts/package-dmg.sh` builds Release, signs every nested
+  executable before the bundle around them, packages a DMG, submits it to
+  Apple, staples the ticket, and refuses to finish unless `spctl` reports
+  `accepted, source=Notarized Developer ID` — what a stranger's Mac decides
+  about the file, rather than what the signing machine believes. The release
+  workflow's `macos-app` job does the same on a tag, in a keychain it creates
+  and deletes for the job. Without signing secrets it still builds, warns,
+  and uploads a workflow artifact, so a fork stays green and no release ever
+  carries a DMG Gatekeeper would refuse. The Mac App Store is not an option
+  for muxa: the app runs the operator's own binaries, talks to a daemon that
+  outlives it over a socket in `/tmp`, and reads arbitrary project
+  directories, all of which the App Sandbox forbids.
+
 ### Changed
 
 - **A Shell tab is just a terminal.** The Terminal/Raw switch, the escaped

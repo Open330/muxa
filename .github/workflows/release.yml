@@ -152,6 +152,153 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # The Mac app ships as a notarized DMG rather than through the App Store:
+  # Muxa runs the operator's own binaries, talks to a daemon that outlives it
+  # over a socket in /tmp, and reads whatever directory the work is in. The
+  # App Sandbox forbids all three, so Developer ID is the only route.
+  #
+  # Without signing secrets this still builds and uploads a workflow artifact,
+  # so a fork — or this repo before the certificate existed — gets a green run
+  # instead of a failure. What it will not do is attach an unsigned DMG to a
+  # release, because a DMG Gatekeeper refuses is worse than no DMG at all.
+  macos-app:
+    name: macOS app
+    needs: [create-release]
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || needs.create-release.result == 'success') }}
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve ref name
+        id: ref
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ref="${{ inputs.dry_run_tag }}"
+          else
+            ref="${GITHUB_REF_NAME}"
+          fi
+          echo "name=${ref}" >> "$GITHUB_OUTPUT"
+          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      # libghostty is cloned, patched and built from pinned commits; that is
+      # minutes of Zig on a cold runner and unchanged between most releases.
+      - name: Cache libghostty
+        uses: actions/cache@v4
+        with:
+          path: |
+            apps/muxa-macos/.build/dependencies
+            apps/muxa-macos/.build/toolchains
+            apps/muxa-macos/.build/libghostty.stamp
+          key: libghostty-${{ runner.os }}-${{ hashFiles('apps/muxa-macos/Dependencies.lock', 'apps/muxa-macos/Patches/libghostty-spm/*.patch') }}
+
+      # A keychain of its own, unlocked only for this job and deleted after it,
+      # so the certificate never touches the runner's login keychain.
+      - name: Import the Developer ID certificate
+        id: signing
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_P12:-}" ]; then
+            echo "::warning::MACOS_CERT_P12 is not set — building an unsigned DMG"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/muxa-signing.keychain-db"
+          password="$(openssl rand -base64 24)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign -A
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Without this, codesign blocks on a UI prompt no one can answer.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" \
+            $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application: .*\)".*/\1/p' | head -1)
+          if [ -z "$identity" ]; then
+            echo "::error::the p12 holds no Developer ID Application identity" >&2
+            exit 1
+          fi
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+          echo "keychain=$keychain" >> "$GITHUB_OUTPUT"
+          echo "::notice::signing as $identity"
+
+      - name: Stage the notarization key
+        id: notary
+        env:
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NOTARY_KEY:-}" ] || [ "${{ steps.signing.outputs.signed }}" != "true" ]; then
+            echo "::warning::no notarization credentials — the DMG will not be notarized"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          key="$RUNNER_TEMP/notary.p8"
+          printf '%s' "$NOTARY_KEY" | base64 --decode > "$key"
+          chmod 600 "$key"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "path=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Build, sign, notarize and package
+        env:
+          MUXA_VERSION: ${{ steps.ref.outputs.version }}
+          MUXA_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          MUXA_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+          MUXA_SKIP_NOTARIZE: ${{ steps.notary.outputs.enabled == 'true' && '0' || '1' }}
+          NOTARY_KEY_PATH: ${{ steps.notary.outputs.path }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: apps/muxa-macos/Scripts/package-dmg.sh
+
+      - name: Checksum
+        id: dmg
+        run: |
+          set -euo pipefail
+          dmg=$(/bin/ls apps/muxa-macos/dist/*.dmg | head -1)
+          shasum -a 256 "$dmg" | awk '{print $1 "  " FILENAME}' FILENAME="$(basename "$dmg")" > "$dmg.sha256"
+          echo "path=$dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Attach the DMG to the release
+        if: github.event_name == 'push' && steps.signing.outputs.signed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" \
+            "${{ steps.dmg.outputs.path }}" "${{ steps.dmg.outputs.path }}.sha256" --clobber
+
+      - name: Upload the DMG as a workflow artifact
+        if: github.event_name == 'workflow_dispatch' || steps.signing.outputs.signed != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Muxa-${{ steps.ref.outputs.name }}-dmg
+          path: apps/muxa-macos/dist/*.dmg*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove the signing keychain
+        if: always() && steps.signing.outputs.keychain != ''
+        run: |
+          security delete-keychain "${{ steps.signing.outputs.keychain }}" || true
+          rm -f "$RUNNER_TEMP/notary.p8"
+
   # Flip the draft once — and only once — every archive is attached.
   #
   # Ordering is the whole point. `tap-bump` fires on `release: published`, and
@@ -162,7 +309,7 @@ jobs:
   # draft for a human to look at instead of publishing a partial set.
   publish:
     name: publish release
-    needs: [create-release, build]
+    needs: [create-release, build, macos-app]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
