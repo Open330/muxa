@@ -235,6 +235,20 @@ The App Sandbox forbids all three, and an unsandboxed app cannot be submitted.
 Developer ID with notarization is the supported route for exactly this kind of
 tool.
 
+Users install it with:
+
+```bash
+brew install --cask open330/tap/muxa-app
+```
+
+The cask is named `muxa-app` rather than `muxa` because the tap already
+ships `Formula/muxa.rb`, and a formula and cask of one name make
+`brew install muxa` ambiguous. It matters more here than it does for a
+typical app: Muxa.app has no Sparkle and no updater of its own, so
+`brew upgrade` is the only way an installed copy ever moves forward.
+`tap-bump` rewrites the cask from the release's DMG checksum, and skips it
+when a release carries no DMG rather than pointing at a download that 404s.
+
 Build one locally:
 
 ```bash

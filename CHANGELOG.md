@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outlives it over a socket in `/tmp`, and reads arbitrary project
   directories, all of which the App Sandbox forbids.
 
+- **`brew install --cask open330/tap/muxa-app` installs the Mac app.** The
+  app has no Sparkle and no updater of its own, so Homebrew is not a nicer
+  way to install it, it is the only way an installed copy ever moves
+  forward. `tap-bump` now writes the cask from the release's DMG checksum
+  alongside the formula, and leaves it untouched when a release carries no
+  DMG rather than pointing at a download that 404s. The cask is `muxa-app`,
+  not `muxa`, because the tap already ships a formula of that name. Its
+  `zap` clears the app's own preferences and caches and deliberately spares
+  `~/Library/Application Support/muxa`, which holds the `config.toml` the
+  daemon and CLI read too.
+
 ### Changed
 
 - **A Shell tab is just a terminal.** The Terminal/Raw switch, the escaped

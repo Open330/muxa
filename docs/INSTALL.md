@@ -80,6 +80,29 @@ brew services start muxa   # or run `muxad` yourself / via muxa init
 The formula tracks the latest release automatically (the `tap-bump`
 workflow rewrites it whenever a release is published).
 
+
+### Muxa for Mac
+
+The Mac app is a separate cask, because the tap already has a formula named
+`muxa` and one name cannot mean both:
+
+```bash
+brew install --cask open330/tap/muxa-app
+```
+
+That installs the notarized `Muxa.app` into `/Applications`. The app carries
+its own `muxa` and `muxad` in `Contents/Helpers`, so it works without the
+formula; install both if you also want `muxa` on your `PATH`.
+
+Muxa.app has no built-in updater, which makes Homebrew its update path:
+`brew upgrade` moves an installed app to the newest release. Downloading the
+DMG from the release page works too, but then updating is on you.
+
+`brew uninstall --cask muxa-app` removes the app. `--zap` additionally
+removes its preferences and caches; it deliberately leaves
+`~/Library/Application Support/muxa` alone, since `config.toml` there belongs
+to the daemon and the CLI as much as to the app.
+
 ## Pre-Built Binaries
 
 Download an archive from the

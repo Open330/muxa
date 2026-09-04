@@ -272,8 +272,12 @@ jobs:
         run: |
           set -euo pipefail
           dmg=$(/bin/ls apps/muxa-macos/dist/*.dmg | head -1)
-          shasum -a 256 "$dmg" | awk '{print $1 "  " FILENAME}' FILENAME="$(basename "$dmg")" > "$dmg.sha256"
+          name=$(basename "$dmg")
+          # Same "<sha256>  <file>" shape the Rust archives publish, so the
+          # tap bump can read every sidecar the same way.
+          (cd "$(dirname "$dmg")" && shasum -a 256 "$name" > "$name.sha256")
           echo "path=$dmg" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - name: Attach the DMG to the release
         if: github.event_name == 'push' && steps.signing.outputs.signed == 'true'

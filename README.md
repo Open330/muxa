@@ -116,6 +116,13 @@ brew install open330/tap/muxa
 muxa init
 ```
 
+For the Mac app (notarized, updates through Homebrew since it has no
+built-in updater):
+
+```bash
+brew install --cask open330/tap/muxa-app
+```
+
 Or the one-shot installer (builds from source, requires Rust 1.89+):
 
 ```bash
