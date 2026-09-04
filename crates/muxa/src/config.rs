@@ -108,10 +108,25 @@ pub enum ConfigError {
 
     #[error("automation: {0}")]
     InvalidAutomation(String),
+
+    #[error(
+        "unknown top-level key `{0}`. muxa keeps sections it does not know \
+         (a newer build may have written them) but a bare key at the top \
+         level is a typo"
+    )]
+    UnknownTopLevelKey(String),
 }
 
+/// The whole configuration file.
+///
+/// Unknown **top-level** sections are kept rather than refused. muxa is
+/// installed in several places at once — the app bundle, `~/.cargo/bin`, and
+/// every fleet host — and they update at different times. A section a newer
+/// muxa writes (`[automation]`, say) must not stop an older `muxa watch`
+/// from starting; it is reported once and ignored. Inside a section,
+/// unknown keys are still refused: that is where typos live.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     /// Unix socket path. Overrides the XDG default.
     pub socket: Option<PathBuf>,
@@ -153,6 +168,32 @@ pub struct Config {
     pub route: Vec<RouteConfig>,
     /// Named agent line-ups, keyed by pipeline name.
     pub pipeline: BTreeMap<String, PipelineConfig>,
+
+    /// Top-level tables this build does not know. Carried so a round trip
+    /// through `Config` never drops a newer muxa's section, and so the
+    /// loader can name them once.
+    #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unknown: BTreeMap<String, toml::Value>,
+}
+
+impl Config {
+    /// Section names this build does not understand, in file order.
+    #[must_use]
+    pub fn unknown_sections(&self) -> Vec<&str> {
+        self.unknown.keys().map(String::as_str).collect()
+    }
+
+    /// Unknown top-level entries that are not sections. A feature always
+    /// arrives as a table (`[automation]`) or an array of tables
+    /// (`[[route]]`); a bare `key = value` at the top level is a typo, and
+    /// saying so beats ignoring it.
+    fn stray_top_level_keys(&self) -> Vec<&str> {
+        self.unknown
+            .iter()
+            .filter(|(_, value)| !matches!(value, toml::Value::Table(_) | toml::Value::Array(_)))
+            .map(|(key, _)| key.as_str())
+            .collect()
+    }
 }
 
 /// Fleet-wide connection and refresh policy. Inventory keys are stable local
@@ -1366,6 +1407,9 @@ impl Config {
     /// home, and so the always-on / daemon-only split stays legible to
     /// callers.
     pub fn validate(&self) -> std::result::Result<(), ConfigError> {
+        if let Some(key) = self.stray_top_level_keys().first() {
+            return Err(ConfigError::UnknownTopLevelKey((*key).to_string()));
+        }
         validate_fleet(&self.fleet)?;
         validate_mcp(&self.mcp)?;
         validate_ask(&self.ask)?;
@@ -1402,6 +1446,15 @@ impl Config {
     /// `[watch.detail] template`. Never errors. Keeping these as warnings
     /// means a config written for a newer/older `muxa` version still loads.
     fn warn_soft_issues(&self) {
+        if !self.unknown.is_empty() {
+            // A newer muxa wrote a section this build does not know, or a
+            // top-level table is misspelled. Either way, running on the
+            // rest of the file beats refusing to start.
+            tracing::warn!(
+                sections = ?self.unknown_sections(),
+                "config.toml: sections this muxa does not know — ignored; update muxa if they should apply",
+            );
+        }
         for key in &self.watch.columns {
             if !WATCH_COLUMN_KEYS.contains(&key.as_str()) {
                 tracing::warn!(
@@ -2442,6 +2495,38 @@ instructions = "Keep one task per window."
         ));
     }
 
+    /// muxa is installed in several places that update at different times.
+    /// A section a newer build writes must not stop an older one from
+    /// starting — that turned a `muxa watch` popup into `returned 1`.
+    #[test]
+    fn an_unknown_top_level_section_is_kept_rather_than_refused() {
+        let cfg: Config = toml::from_str(
+            r#"
+[ui]
+[from_the_future]
+enabled = true
+knobs = ["a", "b"]
+"#,
+        )
+        .expect("a section this build does not know must not fail the load");
+
+        assert_eq!(cfg.unknown_sections(), vec!["from_the_future"]);
+        cfg.validate().expect("unknown sections are not invalid");
+
+        // And it survives a round trip, so writing the file back does not
+        // silently delete the newer build's settings.
+        let rendered = toml::to_string(&cfg).expect("serialize");
+        assert!(rendered.contains("from_the_future"), "{rendered}");
+    }
+
+    /// Inside a section, an unknown key is still a typo worth refusing.
+    #[test]
+    fn an_unknown_key_inside_a_known_section_is_still_refused() {
+        let error = toml::from_str::<Config>("[ask]\nnot_a_key = 1\n")
+            .expect_err("a typo inside a known section stays an error");
+        assert!(error.to_string().contains("not_a_key"), "{error}");
+    }
+
     #[test]
     fn discovery_can_be_disabled() {
         let cfg: Config = toml::from_str("[discovery]\nenabled = false\n").unwrap();
@@ -2506,8 +2591,11 @@ instructions = "Keep one task per window."
 
     #[test]
     fn rejects_unknown_fields() {
-        let err = toml::from_str::<Config>("unknown_field = 1").unwrap_err();
-        assert!(err.to_string().contains("unknown"));
+        // A bare top-level key is a typo, not a newer build's section, so it
+        // is refused — at validation, where the message can explain itself.
+        let cfg: Config = toml::from_str("unknown_field = 1").expect("parses");
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("unknown_field"), "{err}");
     }
 
     #[test]
