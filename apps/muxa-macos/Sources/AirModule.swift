@@ -148,6 +148,10 @@ final class AirModule: MuxaModule, ObservableObject {
 
     func actions(for context: MuxaModuleContext, model: AppModel) -> [MuxaModuleAction] {
         let busy = isWorking ? String(localized: "Still finishing the last one.") : nil
+        // Converting is pure Swift and always available. Only opening the
+        // editor needs Node and a checkout, so that one action carries the
+        // reason it cannot run rather than failing when it is clicked.
+        let needsWorkbench = busy ?? workbenchUnavailableReason
         switch context {
         case .pipeline(let pipeline, _):
             return [
@@ -155,7 +159,7 @@ final class AirModule: MuxaModule, ObservableObject {
                     id: "air.workbench",
                     title: "Open in AIR Workbench",
                     symbolName: "point.3.connected.trianglepath.dotted",
-                    disabledReason: busy
+                    disabledReason: needsWorkbench
                 ) { [weak self] in
                     guard let self else { return }
                     await self.openInWorkbench(pipeline)
@@ -193,6 +197,19 @@ final class AirModule: MuxaModule, ObservableObject {
             ]
         case .agent:
             return []
+        }
+    }
+
+    /// Why "Open in AIR Workbench" cannot run, in the words the Modules
+    /// pane already uses; nil when it can.
+    var workbenchUnavailableReason: String? {
+        switch availability {
+        case .available:
+            nil
+        case .probing:
+            String(localized: "Still looking for AIR Workbench.")
+        case .missing(let hint), .unusable(let hint):
+            hint
         }
     }
 
