@@ -2316,7 +2316,7 @@ checksum = "dce6dd36094cac388f119d2e9dc82dc730ef91c32a6222170d630e5414b956e6"
 
 [[package]]
 name = "muxa"
-version = "0.8.43"
+version = "0.8.44"
 dependencies = [
  "axum",
  "base64",
@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "muxa-cli"
-version = "0.8.43"
+version = "0.8.44"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -2383,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "muxa-zellij-plugin"
-version = "0.8.43"
+version = "0.8.44"
 dependencies = [
  "serde",
  "serde_json",
@@ -2392,7 +2392,7 @@ dependencies = [
 
 [[package]]
 name = "muxad"
-version = "0.8.43"
+version = "0.8.44"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
