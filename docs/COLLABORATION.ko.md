@@ -49,6 +49,12 @@ identity입니다. watch에서 사람이 보낸 요청도 예전에는 이 agent
 
 ## 활성화
 
+`standard` preset은 Codex와 Claude Code에 전역 진입 지침, 공통
+`muxa-collaboration` 스킬, MCP 등록도 설치합니다. 기존 설치에는
+`muxa init --component agent-instructions,agent-skills,agent-mcp`로 추가합니다.
+자세한 내용은 [전역 에이전트 연동](AGENT_INTEGRATION.ko.md)을 참고하세요.
+아래 수동 MCP 등록은 해당 컴포넌트를 선택하지 않았을 때 사용할 수 있습니다.
+
 협업은 명시적으로 켜야 합니다. 요청이 도착하면 상대 pane에 짧은 prompt를 넣어
 깨우기 때문입니다. `muxa init`이 다른 항목과 함께 이 권한을 묻고, `standard`
 preset에 포함돼 있습니다.

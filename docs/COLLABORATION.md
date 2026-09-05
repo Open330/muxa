@@ -54,6 +54,13 @@ muxa watch (caller %N, pid …)`.
 
 ## Enable
 
+The standard init preset also installs global entry points, a shared
+`muxa-collaboration` skill, and user MCP registrations for Codex and Claude Code.
+Existing installations can add them with
+`muxa init --component agent-instructions,agent-skills,agent-mcp`.
+See [Global agent integration](AGENT_INTEGRATION.md). The manual wiring below is
+only needed when those components were not selected.
+
 Collaboration is off until you grant it, because an incoming request can wake a
 peer by typing a short prompt into its pane. `muxa init` asks for that grant
 along with everything else it touches, and the `standard` preset includes it:

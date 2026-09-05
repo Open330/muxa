@@ -1310,7 +1310,7 @@ async fn main() -> Result<()> {
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket, config_path).await,
-        Cmd::Doctor => doctor::run(socket).await,
+        Cmd::Doctor => doctor::run(socket, config_path.as_deref()).await,
         Cmd::Daemon { action } => {
             daemon::run(action, &client, &socket, config_path.as_deref()).await
         }

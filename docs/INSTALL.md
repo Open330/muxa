@@ -149,6 +149,13 @@ JSON/TOML agent config edits use command-prefix matching so uninstall can
 remove muxa hook entries without deleting user hooks. Files are backed up
 to `<file>.muxa-backup-<unix_ts>` before writes.
 
+The `standard` and `full` presets also install global entry points, a shared
+symlinked collaboration skill, and MCP registrations for detected Codex and
+Claude Code installations. Existing installs can add them with
+`muxa init --component agent-instructions,agent-skills,agent-mcp`.
+See [Global agent integration](AGENT_INTEGRATION.md) for paths, ownership,
+updates, and component-specific uninstall. Restart agents after installing.
+
 ## Daemon Lifecycle
 
 The CLI resolves `--socket`, `MUXA_SOCKET`, config, and the XDG default in

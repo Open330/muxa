@@ -145,13 +145,16 @@ wake = "idle_only"
 wake_payload = "operator_full"
 ```
 
-두 agent가 메시지를 직접 읽고 답할 수 있도록 MCP도 한 번 등록한 뒤 실행 중인
-agent를 다시 시작합니다.
+감지된 Codex와 Claude Code에 공통 협업 지침·스킬 심링크·MCP를 연결한 뒤 실행 중인
+agent를 다시 시작합니다. `standard` preset에도 포함됩니다.
 
 ```bash
-claude mcp add --scope user muxa -- muxa mcp
-codex mcp add muxa -- muxa mcp
+muxa init --component agent-instructions,agent-skills,agent-mcp
 ```
+
+기존 사용자 설정을 보존하고 Codex에 필요한 pane 환경변수 전달도 설정합니다.
+정본 경로와 업데이트·제거는 [전역 에이전트 연동](docs/AGENT_INTEGRATION.ko.md),
+수동 MCP 등록은 [MCP 문서](docs/MCP.md)를 참고하세요.
 
 연결된 agent에는 같은 room의 peer를 read-only reviewer 또는 좁은 범위의 실행
 subagent로 활용하라는 협업 지침이 자동으로 노출됩니다. 요청과 응답에는 검증된

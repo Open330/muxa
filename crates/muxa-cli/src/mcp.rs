@@ -74,7 +74,8 @@ const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team c
     work use muxa_call_peer; requests for an existing report use muxa_peer_report. \
     Never substitute a GitHub/PR workflow without an explicit PR number or URL. Peer \
     calls default to review + read_only. Never set execute=true or \
-    spawn_if_missing=true without explicit user authorization; keep primary ownership \
+    spawn_if_missing=true without explicit user authorization. Prior authorization within \
+    scope counts; do not ask again. Keep primary ownership \
     and verify replies. Use muxa_start_work for a configured Work pipeline, \
     muxa_start_agent for one agent, and muxa_manage_tmux for lifecycle; never invent \
     raw tmux commands. Prefer pane-scoped muxa_status; no-argument status is compact \

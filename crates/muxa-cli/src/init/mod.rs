@@ -13,6 +13,7 @@ pub mod apply;
 pub mod components;
 pub mod detect;
 pub mod files;
+pub mod integration;
 pub mod marker;
 pub mod plan;
 pub mod ui;
@@ -85,13 +86,15 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
     ui::intro(mode);
 
     let detect = Detection::run();
-    // A native client may request only the Ask config grant after muxa is
-    // already installed. That edit neither builds muxa nor wires a terminal,
-    // so requiring cargo/tmux here would make the app's Enable action fail on
-    // otherwise valid headless-provider installations.
-    let ask_grant_only =
-        !args.component.is_empty() && args.component.iter().all(|component| component == "ask");
-    if !preflight_ok(mode, &detect, args.uninstall, ask_grant_only) {
+    // Config-only wiring also works with prebuilt binaries, outside tmux.
+    let config_only = !args.component.is_empty()
+        && args.component.iter().all(|component| {
+            matches!(
+                component.as_str(),
+                "ask" | "agent-instructions" | "agent-skills" | "agent-mcp"
+            )
+        });
+    if !preflight_ok(mode, &detect, args.uninstall, config_only) {
         anyhow::bail!("pre-flight blockers");
     }
 
@@ -107,6 +110,7 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
         Direction::Install
     };
     let mut plan = plan::build(direction, &chosen, &detect, &socket)?;
+    integration::extend_plan(&mut plan, &detect, config_path.as_deref(), &socket)?;
     if matches!(direction, Direction::Install) && args.start_daemon && !manages_daemon(&chosen) {
         // Append last so disk edits + service enablement happen first;
         // by the time we try to start muxad the file/socket layout it
@@ -140,7 +144,14 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
     }
 
     if !plan.has_changes() {
-        ui::outro(mode, "Already in the desired state.");
+        ui::outro(
+            mode,
+            if plan.warnings.is_empty() {
+                "Already in the desired state."
+            } else {
+                "No managed changes to apply; see the warnings above."
+            },
+        );
         return Ok(());
     }
 

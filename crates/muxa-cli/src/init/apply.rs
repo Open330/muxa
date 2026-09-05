@@ -78,6 +78,28 @@ fn apply_one(action: &Action, dry_run: bool, stamp: i64, report: &mut ApplyRepor
             stamp,
             report,
         ),
+        Action::ManageSymlink {
+            path,
+            target,
+            remove,
+        } => apply_symlink(path, target, *remove, dry_run, report),
+        Action::RemoveOwnedFile { path, expected } => {
+            if !dry_run {
+                match fs::read_to_string(path) {
+                    Ok(current)
+                        if current == *expected
+                            && !fs::symlink_metadata(path)?.file_type().is_symlink() => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    _ => {
+                        return Err(anyhow!(
+                            "bundle asset changed after planning: {}",
+                            path.display()
+                        ))
+                    }
+                }
+            }
+            apply_delete(path, dry_run, report)
+        }
         Action::DeleteFile { path, .. } => apply_delete(path, dry_run, report),
         Action::EnableSystemdUnit => {
             if dry_run {
@@ -135,6 +157,49 @@ fn apply_one(action: &Action, dry_run: bool, stamp: i64, report: &mut ApplyRepor
     }
 }
 
+fn apply_symlink(
+    path: &Path,
+    target: &Path,
+    remove: bool,
+    dry_run: bool,
+    report: &mut ApplyReport,
+) -> Result<()> {
+    if dry_run {
+        if remove {
+            report.deleted.push(path.to_path_buf());
+        } else {
+            report.edited.push(path.to_path_buf());
+        }
+        return Ok(());
+    }
+    if remove {
+        match fs::read_link(path) {
+            Ok(current) if current == target => apply_delete(path, false, report),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && fs::symlink_metadata(path).is_err() =>
+            {
+                Ok(())
+            }
+            _ => Err(anyhow!(
+                "skill link changed after planning: {}",
+                path.display()
+            )),
+        }
+    } else {
+        if fs::read_link(path).ok().as_deref() == Some(target) {
+            return Ok(());
+        }
+        ensure_parent(path)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, path)?;
+        #[cfg(not(unix))]
+        anyhow::bail!("agent skill symlinks require a Unix host");
+        report.edited.push(path.to_path_buf());
+        Ok(())
+    }
+}
+
 fn apply_edit(
     path: &Path,
     before: Option<&str>,
@@ -151,6 +216,23 @@ fn apply_edit(
         report.edited.push(path.to_path_buf());
         return Ok(());
     }
+    // Keep dotfile symlinks intact: replace their resolved target atomically.
+    // This also makes hook and integration edits sharing a config compose.
+    let resolved = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Some(fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?)
+        }
+        _ => None,
+    };
+    let path = resolved.as_deref().unwrap_or(path);
+    let current = match fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).context("checking file before apply"),
+    };
+    if current.as_deref() != before {
+        anyhow::bail!("{} changed after planning; re-run init", path.display());
+    }
     ensure_parent(path)?;
     let permissions = match fs::metadata(path) {
         Ok(metadata) => Some(metadata.permissions()),
@@ -162,9 +244,13 @@ fn apply_edit(
             .as_ref()
             .ok_or_else(|| anyhow!("cannot back up missing file {}", path.display()))?;
         let backup = backup_path(path, stamp);
-        atomic_write_with_permissions(&backup, prev, Some(permissions))
-            .with_context(|| format!("writing backup {}", backup.display()))?;
-        report.backups.push(backup);
+        // Several components can edit one config in a plan. Keep its first
+        // pre-apply snapshot instead of replacing it with an intermediate edit.
+        if !report.backups.contains(&backup) {
+            atomic_write_with_permissions(&backup, prev, Some(permissions))
+                .with_context(|| format!("writing backup {}", backup.display()))?;
+            report.backups.push(backup);
+        }
     }
     atomic_write(path, after)?;
     report.edited.push(path.to_path_buf());
@@ -352,6 +438,8 @@ fn describe(a: &Action) -> String {
     match a {
         Action::EditFile { path, .. } => format!("editing {}", path.display()),
         Action::DeleteFile { path, .. } => format!("removing {}", path.display()),
+        Action::ManageSymlink { path, .. } => format!("updating skill link {}", path.display()),
+        Action::RemoveOwnedFile { path, .. } => format!("removing owned asset {}", path.display()),
         Action::EnableSystemdUnit => "enabling muxad.service".into(),
         Action::DisableSystemdUnit => "disabling muxad.service".into(),
         Action::EnableLaunchdUnit { .. } => "loading launchd LaunchAgent".into(),
@@ -395,6 +483,17 @@ pub fn render_dry_run(plan: &Plan) -> String {
             }
             Action::DeleteFile { component, path } => {
                 let _ = writeln!(s, "  ✗ remove {} ({})", path.display(), label(*component));
+            }
+            Action::ManageSymlink {
+                path,
+                target,
+                remove,
+            } => {
+                let verb = if *remove { "unlink" } else { "symlink" };
+                let _ = writeln!(s, "  ↗ {verb} {} -> {}", path.display(), target.display());
+            }
+            Action::RemoveOwnedFile { path, .. } => {
+                let _ = writeln!(s, "  ✗ remove owned asset {}", path.display());
             }
             Action::EnableSystemdUnit => {
                 let _ = writeln!(s, "  ⚙ systemctl --user enable --now muxad.service");

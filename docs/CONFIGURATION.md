@@ -52,6 +52,10 @@ stats while newer activity ledger intervals are accumulating.
 
 ## MCP orchestration guide
 
+`muxa init` can install a canonical collaboration skill and global agent entry
+points beside this config. Keep user preferences here; see
+[Global agent integration](AGENT_INTEGRATION.md) for the bundle and host adapters.
+
 ```toml
 [mcp.guide]
 placement = "window" # pane (default) | window | session

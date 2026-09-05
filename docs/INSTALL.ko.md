@@ -101,6 +101,12 @@ tmux edit은 marker block으로 감쌉니다:
 JSON/TOML agent config는 command-prefix matching으로 muxa hook entry만
 제거할 수 있게 처리합니다. write 전에는 `<file>.muxa-backup-<unix_ts>` 백업을 만듭니다.
 
+`standard`, `full` preset은 Codex와 Claude Code에 전역 진입 지침, 공통 협업 스킬
+심링크, MCP 등록도 제공합니다. 기존 설치에는
+`muxa init --component agent-instructions,agent-skills,agent-mcp`로 추가합니다.
+설치 후 에이전트를 재시작합니다. 경로, 업데이트와 개별 제거 방법은
+[전역 에이전트 연동](AGENT_INTEGRATION.ko.md)을 참고하세요.
+
 ## Daemon 생명주기
 
 CLI가 `--socket`, `MUXA_SOCKET`, config, XDG 기본값 순서로 소켓을 결정하므로

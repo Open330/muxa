@@ -14,6 +14,19 @@ do what a shell on the same machine could already do through `muxa` and tmux.
 
 ## Wire it into Claude Code and Codex
 
+The recommended setup is `muxa init --preset standard`, which installs hooks,
+collaboration, the daemon manager, and the shared agent integration. For an
+existing installation, add the latter with:
+
+```bash
+muxa init --component agent-instructions,agent-skills,agent-mcp
+```
+
+This installs canonical guidance beside muxa config, links the personal skill,
+and merges each detected host's user MCP registration, including Codex `env_vars`.
+See [Global agent integration](AGENT_INTEGRATION.md) for updates and removal.
+Restart running agents. The manual setup below remains available.
+
 Start the daemon (`muxad`) first — the MCP server **refuses to start** when
 the socket is unreachable, with a clear error, so an agent never talks to a
 dead control plane. Then register it:
@@ -198,6 +211,8 @@ is accepted only with `intent="task"`, so a conversational review cannot
 silently acquire edit authority. When there is no eligible peer, the tool
 returns `action_required="confirm_spawn"`; only repeat the call with
 `spawn_if_missing=true` after the user explicitly confirms creating a pane.
+An earlier explicit authorization for that bypass-permission launch remains
+valid within the same scope; do not ask the user to repeat it.
 Automatic spawning defaults to the other provider when possible. Before it
 creates the pane, the tool arms muxad's transition stream and then re-reads the
 authoritative room only when the spawned pane registers. This removes the old

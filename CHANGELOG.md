@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `muxa init` now ships `agent-instructions`, `agent-skills`, and `agent-mcp`
+  in standard/full presets for Codex and Claude Code. A canonical collaboration
+  bundle lives beside muxa config, personal skills link to it, and managed global
+  entry points teach agents when to use it. MCP setup merges Codex pane environment
+  forwarding and preserves existing servers. A private ownership manifest supports
+  updates, drift diagnostics in `muxa doctor`, and component-specific removal.
+  Existing dotfile symlinks and locally modified integration files are preserved.
+
 ## [0.8.44] - 2026-09-05
 
 ### Fixed

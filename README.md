@@ -190,17 +190,16 @@ wake = "idle_only"
 wake_payload = "operator_full"
 ```
 
-Register the MCP server once for both agent hosts, then restart agents that
-were already running so they can read and reply to requests themselves.
+Install shared collaboration instructions, the symlinked skill, and MCP for
+detected Codex and Claude Code installations, then restart running agents.
+The standard preset includes this setup.
 
 ```bash
-claude mcp add --scope user muxa -- muxa mcp
-codex mcp add muxa -- muxa mcp
+muxa init --component agent-instructions,agent-skills,agent-mcp
 ```
 
-Codex only forwards explicitly allowed environment variables to stdio MCP
-servers. Add this line to the generated `[mcp_servers.muxa]` table in
-`~/.codex/config.toml` (especially when using a custom muxa/tmux socket):
+Init adds Codex's required pane environment forwarding to `[mcp_servers.muxa]`
+while preserving existing variables and other settings:
 
 ```toml
 env_vars = ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE", "MUXA_SOCKET"]
@@ -209,6 +208,9 @@ env_vars = ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE", "MUXA_SOCKET"]
 Muxa also recovers the pane from process ancestry across active pane backends
 for existing default-endpoint Codex registrations, so older setups fail safely
 rather than appearing paneless.
+
+See [Global agent integration](docs/AGENT_INTEGRATION.md) for canonical paths,
+updates, and removal; [MCP setup](docs/MCP.md) also covers manual registration.
 
 Connected agents are told that room peers can serve as read-only reviewers or
 narrowly scoped execution subagents. Requests and replies can also carry

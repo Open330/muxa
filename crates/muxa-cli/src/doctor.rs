@@ -53,7 +53,7 @@ const MUXAD_ERR_LOG: &str = "/tmp/muxad.err";
 /// computes from `--socket` / `MUXA_SOCKET` / `cfg.socket` / the default.
 /// Threading it in (rather than re-deriving from defaults here) keeps
 /// `muxa doctor` honest about which socket muxa would actually talk to.
-pub async fn run(socket: PathBuf) -> Result<()> {
+pub async fn run(socket: PathBuf, config: Option<&Path>) -> Result<()> {
     let _ = cliclack::intro("muxa doctor");
 
     let mut issues = 0u32;
@@ -83,6 +83,24 @@ pub async fn run(socket: PathBuf) -> Result<()> {
             CheckResult::Fail(m) => CheckResult::Fail(format!("{label} — {m}")),
         };
         tally(labelled, &mut issues);
+    }
+    match crate::init::integration::diagnostics(config) {
+        Ok(checks) => {
+            for (healthy, message) in checks {
+                tally(
+                    if healthy {
+                        CheckResult::Ok(message)
+                    } else {
+                        CheckResult::Warn(message)
+                    },
+                    &mut issues,
+                );
+            }
+        }
+        Err(error) => tally(
+            CheckResult::Warn(format!("Agent integration: {error}")),
+            &mut issues,
+        ),
     }
 
     // 4¾. What the tmux server and client this doctor run is talking to
