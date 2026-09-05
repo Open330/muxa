@@ -44,7 +44,7 @@ use crossterm::terminal::{
 use muxa::config::IconSet;
 use muxa::ipc::Client;
 use muxa::state::Agent;
-use muxa::tmux::layout::{PaneGeometry, WindowFrame, WindowTarget};
+use muxa::tmux::layout::{ClientSurface, PaneGeometry, WindowFrame, WindowTarget};
 use muxa::AgentState;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -126,6 +126,14 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
     // it, so a keystroke in another terminal can't reroute the overlay
     // onto a different session mid-read.
     let target = WindowTarget::resolve();
+    // Before any work: can this client show an overlay at all? `--plain`
+    // prints to stdout and is exempt — it is the answer we hand the user
+    // when it cannot.
+    if !args.plain {
+        if let Some(reason) = control_mode_refusal(muxa::tmux::layout::client_surface(&target)) {
+            anyhow::bail!(reason);
+        }
+    }
     let (panes, zoomed) = muxa::tmux::layout::current_window_panes(&target);
     if panes.is_empty() {
         anyhow::bail!(
@@ -165,6 +173,30 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
             .ok();
     }
     Ok(())
+}
+
+/// Why the overlay is refusing to open, or `None` when it can open.
+///
+/// A control-mode client makes `display-popup` a no-op that still reports
+/// success (see [`ClientSurface`]), so without this check `prefix + q`
+/// leaves a live `muxa peek` sitting on an unrendered pane — no output, no
+/// way to dismiss it, and nothing anywhere saying why. Failing here turns
+/// that into one line the user can act on.
+///
+/// Split out from [`run`] so the wording is covered by a test: it is the
+/// only thing this path ever produces, and it is the whole fix.
+fn control_mode_refusal(surface: ClientSurface) -> Option<String> {
+    if surface.draws_overlays() {
+        return None;
+    }
+    Some(
+        "this tmux client runs in control mode (`tmux -CC`), which draws panes natively and is \
+         never sent popup content by tmux — the overlay would open invisibly and wait for keys \
+         that cannot reach it. Front-ends that work this way include amux/cmux and iTerm2's tmux \
+         integration. Run `muxa peek --plain` to print the same per-pane lines into this pane \
+         instead, or open the window from a terminal tmux client."
+            .into(),
+    )
 }
 
 enum Outcome {
@@ -1328,6 +1360,30 @@ mod tests {
     use muxa::state::Agent;
     use muxa::AgentKind;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn a_control_mode_client_is_refused_with_the_plain_way_out() {
+        let refusal = control_mode_refusal(ClientSurface::ControlMode)
+            .expect("a control-mode client cannot show the overlay");
+        // The user's next move has to be in the message: the overlay they
+        // pressed a key for is never going to appear on this client.
+        assert!(
+            refusal.contains("muxa peek --plain"),
+            "the refusal must name the command that does work here: {refusal}"
+        );
+        assert!(
+            refusal.contains("-CC"),
+            "name the mode so the cause is searchable: {refusal}"
+        );
+    }
+
+    #[test]
+    fn a_drawable_client_is_never_refused() {
+        assert!(control_mode_refusal(ClientSurface::Terminal).is_none());
+        // An inconclusive probe must not block the overlay — see
+        // `ClientSurface::Unknown`.
+        assert!(control_mode_refusal(ClientSurface::Unknown).is_none());
+    }
 
     fn geo(
         index: &str,

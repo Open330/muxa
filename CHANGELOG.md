@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`muxa peek` says why it cannot draw on a control-mode tmux client instead
+  of starting invisibly.** A `tmux -CC` client — amux/cmux mirroring tmux
+  windows into native surfaces, or iTerm2's tmux integration — is sent pane
+  content and nothing else: tmux never forwards popup, menu, or
+  `display-panes` output to it. `display-popup -E` against such a client
+  still runs its command and still exits 0, so `prefix + q` left a live
+  `muxa peek` attached to a pane nobody renders, waiting for keys that could
+  not reach it, with nothing anywhere saying so. peek now reads
+  `#{client_control_mode}` first and fails with one line naming the cause and
+  `muxa peek --plain`, which prints the same per-pane lines into the pane. An
+  unreadable answer (no attached client, a tmux too old for the format) still
+  draws, so nothing changes on the clients that were working.
+
+- **`muxa doctor` stops prescribing `~/.tmux.conf` fixes to servers that never
+  read it.** A front-end that owns its own tmux server starts it isolated —
+  amux runs `tmux -f /dev/null -L amux -CC` precisely so the user's config,
+  and any session-restoring plugin in it, stays out. doctor read the absent
+  `muxa watch` binding and the absent `MUXA_SOCKET` pin there as a broken
+  install and told the user to run `muxa init` and
+  `tmux source-file ~/.tmux.conf` — the second of which imports the very
+  config the server was started to exclude. doctor now reports the client's
+  rendering mode and the server's `#{config_files}`, treats a missing binding
+  on an isolated server as expected rather than as an issue, and downgrades
+  the socket-pin warning to a note whenever muxad is on the default path that
+  unpinned panes already fall back to. Servers the user owns get exactly the
+  advice they got before.
+
 ## [0.8.43] - 2026-09-05
 
 ### Added

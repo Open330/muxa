@@ -28,6 +28,13 @@
 //! the status line: with `status-position top` the window starts below it.
 //! [`WindowFrame::pane_origin_y`] resolves the offset, and it is the only
 //! place that conversion should live.
+//!
+//! ## Whether an overlay can be drawn at all
+//!
+//! Geometry answers "where does the box go". [`ClientSurface`] answers the
+//! question before it: whether the client showing the window can render a
+//! `display-popup` in the first place. Not every tmux client can, and the
+//! one that cannot fails silently — see that type.
 
 use super::{command_output_with_timeout, tmux_command, TMUX_COMMAND_TIMEOUT};
 
@@ -38,6 +45,14 @@ const PANE_GEOMETRY_FMT: &str = "#{pane_id}\t#{pane_index}\t#{pane_left}\t#{pane
 /// `tmux -F` columns behind [`current_window_frame`].
 const FRAME_FMT: &str =
     "#{window_width}\t#{window_height}\t#{client_width}\t#{client_height}\t#{status-position}";
+
+/// `tmux -F` column behind [`client_surface`]. Expands to the empty string
+/// on a server with no attached client, which is what makes
+/// [`ClientSurface::Unknown`] reachable.
+const CONTROL_MODE_FMT: &str = "#{client_control_mode}";
+
+/// `tmux -F` column behind [`server_config_files`].
+const CONFIG_FILES_FMT: &str = "#{config_files}";
 
 /// Where one pane sits on screen, plus the little bit of identity the
 /// overlay needs to label it when no agent is attached.
@@ -337,6 +352,146 @@ pub fn current_window_frame(target: &WindowTarget) -> Option<WindowFrame> {
     parse_window_frame_line(&String::from_utf8(out.stdout).ok()?)
 }
 
+/// What the client showing the target window is able to draw.
+///
+/// tmux has two kinds of client. A *terminal* client owns a tty and tmux
+/// paints everything onto it — panes, the status line, and the
+/// client-drawn overlays (`display-popup`, `display-menu`,
+/// `display-panes`, copy-mode). A *control-mode* client (`tmux -CC`) owns
+/// no tty: tmux streams pane content to it as `%output` notifications and
+/// the front-end draws the panes itself, natively. Overlays have no such
+/// notification, so tmux never mentions them to that client at all.
+///
+/// The silence is the trap. `display-popup -E` raised on a control-mode
+/// client still *runs* its command and still exits 0 — the program starts,
+/// attaches to a pane nobody renders, and waits for input that can never
+/// arrive. So a caller whose entire output reaches the user through an
+/// overlay has to ask this first and say plainly that it cannot draw,
+/// rather than starting and appearing to hang.
+///
+/// This is the current client specifically, not a survey of the server:
+/// with both a terminal and a control-mode client attached, the popup
+/// lands on whichever one raised it. [`super::list_clients`] is the
+/// server-wide counterpart, used for activity tracking rather than for
+/// deciding whether to draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientSurface {
+    /// A terminal client. Overlays draw normally.
+    Terminal,
+    /// A control-mode client — amux/cmux's native window mirroring,
+    /// iTerm2's tmux integration, any `tmux -CC` consumer. Overlays are
+    /// silently dropped.
+    ControlMode,
+    /// Nothing conclusive could be read: no server, no attached client, or
+    /// a tmux old enough that `#{client_control_mode}` expands to the empty
+    /// string instead of erroring.
+    ///
+    /// Callers must read this as "assume overlays work". Refusing to draw
+    /// on an unreadable answer would break the overlay everywhere the
+    /// probe is merely inconclusive, which is a far larger population than
+    /// the control-mode clients it exists to catch.
+    Unknown,
+}
+
+impl ClientSurface {
+    /// Whether a `display-popup` raised on this client would reach a human.
+    /// [`Self::Unknown`] counts as yes, per that variant's contract.
+    #[must_use]
+    pub fn draws_overlays(self) -> bool {
+        !matches!(self, Self::ControlMode)
+    }
+}
+
+/// Read the [`ClientSurface`] of the client showing `target`.
+///
+/// Scoped to the session for the same reason as [`current_window_frame`]:
+/// the reading is a property of the client, and a bare window id does not
+/// tell tmux which client to report on.
+pub fn client_surface(target: &WindowTarget) -> ClientSurface {
+    let mut cmd = tmux_command();
+    cmd.args(["display-message", "-p", "-F", CONTROL_MODE_FMT]);
+    if let Some(session) = &target.session {
+        cmd.args(["-t", session]);
+    }
+    let Ok(out) = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        "tmux display-message (client control mode)".into(),
+    ) else {
+        return ClientSurface::Unknown;
+    };
+    if !out.status.success() {
+        return ClientSurface::Unknown;
+    }
+    String::from_utf8(out.stdout).map_or(ClientSurface::Unknown, |stdout| {
+        parse_client_surface(&stdout)
+    })
+}
+
+/// Pure half of [`client_surface`].
+fn parse_client_surface(raw: &str) -> ClientSurface {
+    match raw.lines().next().map(str::trim) {
+        Some("1") => ClientSurface::ControlMode,
+        Some("0") => ClientSurface::Terminal,
+        _ => ClientSurface::Unknown,
+    }
+}
+
+/// Config files the running tmux server loaded at startup
+/// (`#{config_files}`), in tmux's own order.
+///
+/// muxa installs its bindings by writing `~/.tmux.conf`, which is worth
+/// nothing on a server started with `-f` pointed somewhere else. Front-ends
+/// that drive a private tmux server do exactly that — amux starts its
+/// engine as `tmux -f /dev/null -L amux` specifically so the user's
+/// `~/.tmux.conf` (and any session-restoring plugin in it) stays out of the
+/// server it owns. Reading the list is the only way to tell that apart from
+/// a server that simply has not re-read the file yet, and the two want
+/// opposite advice.
+///
+/// Empty when tmux is unavailable, when no server is running, or on a tmux
+/// too old to know the format — never confuse that with "loaded nothing".
+pub fn server_config_files() -> Vec<String> {
+    let mut cmd = tmux_command();
+    cmd.args(["display-message", "-p", "-F", CONFIG_FILES_FMT]);
+    let Ok(out) = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        "tmux display-message (config files)".into(),
+    ) else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8(out.stdout).map_or_else(|_| Vec::new(), |s| parse_config_files(&s))
+}
+
+/// Pure half of [`server_config_files`]. tmux prints one comma-separated
+/// line.
+fn parse_config_files(raw: &str) -> Vec<String> {
+    raw.lines()
+        .next()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Whether the server loaded no configuration a user could have put muxa's
+/// bindings in.
+///
+/// `-f /dev/null` is the idiom for an isolated server, and tmux reports it
+/// literally. A server that read nothing at all is *not* isolated — that is
+/// an unknown reading (see [`server_config_files`]), and saying "isolated"
+/// there would send a user chasing a problem they do not have.
+#[must_use]
+pub fn config_isolated(config_files: &[String]) -> bool {
+    !config_files.is_empty() && config_files.iter().all(|path| path == "/dev/null")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +596,58 @@ mod tests {
         // as "no match".
         assert!(socket_name_from_tmux_env("").is_none());
         assert!(socket_name_from_tmux_env(",32037,30").is_none());
+    }
+
+    #[test]
+    fn control_mode_clients_are_told_apart_from_terminal_ones() {
+        // `tmux -CC` (amux/cmux, iTerm2) — overlays are dropped silently,
+        // so callers must refuse to draw rather than start invisibly.
+        assert_eq!(parse_client_surface("1\n"), ClientSurface::ControlMode);
+        assert!(!ClientSurface::ControlMode.draws_overlays());
+
+        assert_eq!(parse_client_surface("0\n"), ClientSurface::Terminal);
+        assert!(ClientSurface::Terminal.draws_overlays());
+    }
+
+    #[test]
+    fn an_unreadable_control_mode_answer_still_draws() {
+        // A detached server expands the format to nothing, and a tmux that
+        // predates it does the same. Neither is evidence of control mode,
+        // and treating it as such would disable the overlay for everyone
+        // on an older tmux.
+        for raw in ["", "\n", "unexpected"] {
+            assert_eq!(
+                parse_client_surface(raw),
+                ClientSurface::Unknown,
+                "{raw:?} is not evidence either way"
+            );
+        }
+        assert!(ClientSurface::Unknown.draws_overlays());
+    }
+
+    #[test]
+    fn config_files_split_on_commas() {
+        assert_eq!(
+            parse_config_files("/etc/tmux.conf,/Users/x/.tmux.conf\n"),
+            vec!["/etc/tmux.conf", "/Users/x/.tmux.conf"]
+        );
+        assert_eq!(parse_config_files("/dev/null\n"), vec!["/dev/null"]);
+        assert!(parse_config_files("").is_empty());
+    }
+
+    #[test]
+    fn only_a_dev_null_server_counts_as_isolated() {
+        assert!(config_isolated(&["/dev/null".into()]));
+        // A real config was read, so `~/.tmux.conf` edits can reach this
+        // server — whatever else is wrong, isolation is not it.
+        assert!(!config_isolated(&["/Users/x/.tmux.conf".into()]));
+        assert!(!config_isolated(&[
+            "/dev/null".into(),
+            "/Users/x/.tmux.conf".into()
+        ]));
+        // Unknown reading (no server, no tmux, tmux too old) — not a claim
+        // that the server loaded nothing.
+        assert!(!config_isolated(&[]));
     }
 
     #[test]
