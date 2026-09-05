@@ -126,13 +126,13 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
     // it, so a keystroke in another terminal can't reroute the overlay
     // onto a different session mid-read.
     let target = WindowTarget::resolve();
-    // Before any work: can this client show an overlay at all? `--plain`
-    // prints to stdout and is exempt — it is the answer we hand the user
-    // when it cannot.
-    if !args.plain {
-        if let Some(reason) = control_mode_refusal(muxa::tmux::layout::client_surface(&target)) {
-            anyhow::bail!(reason);
-        }
+    // Before any work: is there a viewer a popup could be drawn on? When
+    // there isn't, peek reports in text rather than painting a full-client
+    // overlay into a pane-sized hole (or into a popup nobody renders).
+    let surface = muxa::tmux::layout::client_surface(&target);
+    let plain = args.plain || !surface.draws_overlays();
+    if plain && !args.plain {
+        eprintln!("{}", undrawable_note(surface));
     }
     let (panes, zoomed) = muxa::tmux::layout::current_window_panes(&target);
     if panes.is_empty() {
@@ -149,7 +149,7 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
     let mut cells = build_cells(panes, &agents);
     attach_prompt_times(client, &mut cells).await;
 
-    if args.plain {
+    if plain {
         for line in plain_lines(&cells) {
             println!("{line}");
         }
@@ -175,28 +175,41 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Why the overlay is refusing to open, or `None` when it can open.
+/// The one line explaining why this run printed text instead of drawing.
 ///
-/// A control-mode client makes `display-popup` a no-op that still reports
-/// success (see [`ClientSurface`]), so without this check `prefix + q`
-/// leaves a live `muxa peek` sitting on an unrendered pane — no output, no
-/// way to dismiss it, and nothing anywhere saying why. Failing here turns
-/// that into one line the user can act on.
+/// peek falls back rather than failing because the fallback is the same
+/// report: `--plain` answers "which pane is doing what" in full, and on
+/// these front-ends it is the only form of the answer that can reach the
+/// user. Erroring out would make them retype the command to get output
+/// muxa could simply have produced.
 ///
-/// Split out from [`run`] so the wording is covered by a test: it is the
-/// only thing this path ever produces, and it is the whole fix.
-fn control_mode_refusal(surface: ClientSurface) -> Option<String> {
-    if surface.draws_overlays() {
-        return None;
-    }
-    Some(
-        "this tmux client runs in control mode (`tmux -CC`), which draws panes natively and is \
-         never sent popup content by tmux — the overlay would open invisibly and wait for keys \
-         that cannot reach it. Front-ends that work this way include amux/cmux and iTerm2's tmux \
-         integration. Run `muxa peek --plain` to print the same per-pane lines into this pane \
-         instead, or open the window from a terminal tmux client."
-            .into(),
-    )
+/// The note goes to stderr so the report itself stays pipeable, and it is
+/// printed only when peek chose the fallback — an explicit `--plain` needs
+/// no explanation.
+///
+/// # Panics
+///
+/// Only if called for a surface that draws overlays, which has no note to
+/// give; callers gate on [`ClientSurface::draws_overlays`].
+fn undrawable_note(surface: ClientSurface) -> String {
+    let cause = match surface {
+        // cmux: panes driven by `capture-pane`/`send-keys` with nothing
+        // attached. `display-popup` fails with "no current client" here,
+        // and no client means no key-binding resolution either — which is
+        // why `prefix + q` does nothing on such a server.
+        ClientSurface::Detached => {
+            "no tmux client is attached to this session, so there is no screen to draw a popup on"
+        }
+        // amux, iTerm2: a client exists but is sent pane content only.
+        ClientSurface::ControlMode => {
+            "this tmux client runs in control mode (`tmux -CC`), which is sent pane content but \
+             never popup content"
+        }
+        ClientSurface::Terminal | ClientSurface::Unknown => {
+            unreachable!("only an undrawable surface has a note")
+        }
+    };
+    format!("muxa peek: {cause} — printing the per-pane report instead of the overlay.")
 }
 
 enum Outcome {
@@ -1362,27 +1375,34 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
-    fn a_control_mode_client_is_refused_with_the_plain_way_out() {
-        let refusal = control_mode_refusal(ClientSurface::ControlMode)
-            .expect("a control-mode client cannot show the overlay");
-        // The user's next move has to be in the message: the overlay they
-        // pressed a key for is never going to appear on this client.
+    fn the_fallback_names_its_own_cause() {
+        // cmux and amux fail for different reasons, and a user chasing
+        // either one needs the one that applies to them.
+        let detached = undrawable_note(ClientSurface::Detached);
         assert!(
-            refusal.contains("muxa peek --plain"),
-            "the refusal must name the command that does work here: {refusal}"
+            detached.contains("no tmux client is attached"),
+            "{detached}"
         );
-        assert!(
-            refusal.contains("-CC"),
-            "name the mode so the cause is searchable: {refusal}"
-        );
+
+        let control = undrawable_note(ClientSurface::ControlMode);
+        assert!(control.contains("-CC"), "{control}");
+
+        for note in [detached, control] {
+            assert!(
+                note.contains("per-pane report"),
+                "say what the user is getting instead: {note}"
+            );
+        }
     }
 
     #[test]
-    fn a_drawable_client_is_never_refused() {
-        assert!(control_mode_refusal(ClientSurface::Terminal).is_none());
-        // An inconclusive probe must not block the overlay — see
-        // `ClientSurface::Unknown`.
-        assert!(control_mode_refusal(ClientSurface::Unknown).is_none());
+    fn only_undrawable_surfaces_fall_back() {
+        assert!(!ClientSurface::Detached.draws_overlays());
+        assert!(!ClientSurface::ControlMode.draws_overlays());
+        // The overlay is the whole point where it can be drawn, and an
+        // inconclusive probe must not cost anyone their overlay.
+        assert!(ClientSurface::Terminal.draws_overlays());
+        assert!(ClientSurface::Unknown.draws_overlays());
     }
 
     fn geo(

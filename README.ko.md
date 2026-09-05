@@ -220,7 +220,7 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 | `muxa dashboard [--since today]` | Run capture와 agent별/Work 일괄 prompt·abort, ACT/WACT total을 보여주는 Work-card TUI. |
 | `muxa attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |
 | `muxa status-line [--pane %N]` | tmux status-line 출력. |
-| `muxa peek [--plain]` | 현재 tmux window의 pane별 오버레이. `--plain`은 텍스트로 출력. 오버레이는 tmux popup이라 control mode 클라이언트(`tmux -CC` — amux/cmux, iTerm2)에는 전달되지 않으므로, 그 환경에서는 실행을 거부하고 `--plain`을 안내함. |
+| `muxa peek [--plain]` | 현재 tmux window의 pane별 오버레이. `--plain`은 텍스트로 출력. 오버레이는 tmux popup이므로 이를 그릴 수 없는 환경 — client를 붙이지 않는 프런트엔드(cmux), control mode 클라이언트(`tmux -CC` — amux, iTerm2) — 에서는 텍스트 리포트로 대체하고 이유를 stderr에 알림. |
 | `muxa recap [--pane %N]` | 보관된 disk history에서 최근 prompt 조회. |
 | `muxa peers` / `muxa identity` / `muxa msg` | 같은 tmux window의 agent를 찾고 이름/역할을 지정해 durable request/reply 메시지를 주고받음. |
 | `muxa skill add/list/show/remove` | watch/dashboard 메시지, watch ask, MCP peer call에서 사용할 `/` prompt 템플릿 관리. |

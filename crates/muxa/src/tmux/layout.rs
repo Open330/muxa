@@ -32,9 +32,11 @@
 //! ## Whether an overlay can be drawn at all
 //!
 //! Geometry answers "where does the box go". [`ClientSurface`] answers the
-//! question before it: whether the client showing the window can render a
-//! `display-popup` in the first place. Not every tmux client can, and the
-//! one that cannot fails silently — see that type.
+//! question before it: whether anything showing this window can render a
+//! `display-popup` in the first place. A front-end that paints tmux panes
+//! itself — through control mode, or through `capture-pane` with no client
+//! attached at all — cannot, and neither case leaves the user anything to
+//! read. See that type.
 
 use super::{command_output_with_timeout, tmux_command, TMUX_COMMAND_TIMEOUT};
 
@@ -46,10 +48,14 @@ const PANE_GEOMETRY_FMT: &str = "#{pane_id}\t#{pane_index}\t#{pane_left}\t#{pane
 const FRAME_FMT: &str =
     "#{window_width}\t#{window_height}\t#{client_width}\t#{client_height}\t#{status-position}";
 
-/// `tmux -F` column behind [`client_surface`]. Expands to the empty string
-/// on a server with no attached client, which is what makes
-/// [`ClientSurface::Unknown`] reachable.
-const CONTROL_MODE_FMT: &str = "#{client_control_mode}";
+/// `tmux -F` columns behind [`client_surface`].
+///
+/// `client_control_mode` and `client_name` describe the *current client*, and
+/// both expand to the empty string when there is none — which alone cannot
+/// tell "no client" from "a tmux too old to know the format".
+/// `session_attached` settles it: it is a count, always printed, and it
+/// counts the clients showing the session the overlay would be drawn over.
+const CLIENT_SURFACE_FMT: &str = "#{client_control_mode}\t#{client_name}\t#{session_attached}";
 
 /// `tmux -F` column behind [`server_config_files`].
 const CONFIG_FILES_FMT: &str = "#{config_files}";
@@ -352,53 +358,59 @@ pub fn current_window_frame(target: &WindowTarget) -> Option<WindowFrame> {
     parse_window_frame_line(&String::from_utf8(out.stdout).ok()?)
 }
 
-/// What the client showing the target window is able to draw.
+/// Whether the window's viewer can be shown a `display-popup`, and if not,
+/// why not.
 ///
-/// tmux has two kinds of client. A *terminal* client owns a tty and tmux
-/// paints everything onto it — panes, the status line, and the
-/// client-drawn overlays (`display-popup`, `display-menu`,
-/// `display-panes`, copy-mode). A *control-mode* client (`tmux -CC`) owns
-/// no tty: tmux streams pane content to it as `%output` notifications and
-/// the front-end draws the panes itself, natively. Overlays have no such
-/// notification, so tmux never mentions them to that client at all.
+/// A tmux popup is drawn by a *client* onto its terminal. muxa's overlays
+/// assume one exists, and two kinds of front-end break that assumption in
+/// different ways — each failing in its own direction, and neither leaving
+/// the user anything to read:
 ///
-/// The silence is the trap. `display-popup -E` raised on a control-mode
-/// client still *runs* its command and still exits 0 — the program starts,
-/// attaches to a pane nobody renders, and waits for input that can never
-/// arrive. So a caller whose entire output reaches the user through an
-/// overlay has to ask this first and say plainly that it cannot draw,
-/// rather than starting and appearing to hang.
+/// - A **control-mode** client (`tmux -CC`) owns no tty. tmux streams pane
+///   content to it as `%output` and the front-end paints the panes itself;
+///   overlays have no such notification, so tmux never mentions them.
+///   `display-popup -E` still runs its command and still exits 0, so the
+///   program starts, attaches to a pane nobody renders, and waits for keys
+///   that cannot arrive.
+/// - A **viewer** front-end attaches no client at all. cmux reads panes
+///   with `capture-pane` and writes them with `send-keys`, which leaves the
+///   sessions at `attached=0`; `display-popup` then fails outright with
+///   "no current client", and — because tmux resolves key bindings per
+///   client — a `prefix + q` binding never fires either.
 ///
-/// This is the current client specifically, not a survey of the server:
-/// with both a terminal and a control-mode client attached, the popup
-/// lands on whichever one raised it. [`super::list_clients`] is the
-/// server-wide counterpart, used for activity tracking rather than for
-/// deciding whether to draw.
+/// So this asks about the *current* client, not the server: with both a
+/// terminal and a control-mode client attached, a popup lands on whichever
+/// one raised it. [`super::list_clients`] is the server-wide counterpart,
+/// used for activity tracking rather than for deciding whether to draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientSurface {
     /// A terminal client. Overlays draw normally.
     Terminal,
-    /// A control-mode client — amux/cmux's native window mirroring,
-    /// iTerm2's tmux integration, any `tmux -CC` consumer. Overlays are
-    /// silently dropped.
+    /// A control-mode client — amux's native window mirroring, iTerm2's
+    /// tmux integration, any `tmux -CC` consumer. Overlays are accepted
+    /// and silently dropped.
     ControlMode,
-    /// Nothing conclusive could be read: no server, no attached client, or
-    /// a tmux old enough that `#{client_control_mode}` expands to the empty
-    /// string instead of erroring.
+    /// No client is showing this session, so there is nothing for a popup
+    /// to be drawn on and no client to resolve key bindings. cmux drives
+    /// panes this way; so does any plain detached session.
+    Detached,
+    /// Nothing conclusive could be read: no server, or a tmux old enough
+    /// that `#{client_control_mode}` expands to the empty string instead of
+    /// erroring.
     ///
-    /// Callers must read this as "assume overlays work". Refusing to draw
-    /// on an unreadable answer would break the overlay everywhere the
-    /// probe is merely inconclusive, which is a far larger population than
-    /// the control-mode clients it exists to catch.
+    /// Callers must read this as "assume overlays work". Standing down on
+    /// an unreadable answer would change behaviour everywhere the probe is
+    /// merely inconclusive, which is a far larger population than the
+    /// front-ends it exists to catch.
     Unknown,
 }
 
 impl ClientSurface {
-    /// Whether a `display-popup` raised on this client would reach a human.
+    /// Whether a `display-popup` raised here would reach a human.
     /// [`Self::Unknown`] counts as yes, per that variant's contract.
     #[must_use]
     pub fn draws_overlays(self) -> bool {
-        !matches!(self, Self::ControlMode)
+        !matches!(self, Self::ControlMode | Self::Detached)
     }
 }
 
@@ -409,14 +421,14 @@ impl ClientSurface {
 /// tell tmux which client to report on.
 pub fn client_surface(target: &WindowTarget) -> ClientSurface {
     let mut cmd = tmux_command();
-    cmd.args(["display-message", "-p", "-F", CONTROL_MODE_FMT]);
+    cmd.args(["display-message", "-p", "-F", CLIENT_SURFACE_FMT]);
     if let Some(session) = &target.session {
         cmd.args(["-t", session]);
     }
     let Ok(out) = command_output_with_timeout(
         cmd,
         TMUX_COMMAND_TIMEOUT,
-        "tmux display-message (client control mode)".into(),
+        "tmux display-message (client surface)".into(),
     ) else {
         return ClientSurface::Unknown;
     };
@@ -428,11 +440,29 @@ pub fn client_surface(target: &WindowTarget) -> ClientSurface {
     })
 }
 
-/// Pure half of [`client_surface`].
+/// Pure half of [`client_surface`], over one [`CLIENT_SURFACE_FMT`] line.
+///
+/// `session_attached` is read first and decides on its own when it is zero:
+/// a session nobody is watching cannot be shown a popup whatever the
+/// (then empty) client columns say. Only with a viewer present does the
+/// control-mode flag matter.
 fn parse_client_surface(raw: &str) -> ClientSurface {
-    match raw.lines().next().map(str::trim) {
+    let cols: Vec<&str> = raw
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split('\t')
+        .map(str::trim)
+        .collect();
+    if cols.get(2).and_then(|a| a.parse::<u32>().ok()) == Some(0) {
+        return ClientSurface::Detached;
+    }
+    match cols.first().copied() {
         Some("1") => ClientSurface::ControlMode,
         Some("0") => ClientSurface::Terminal,
+        // No control-mode column but a named client: a tmux too old for the
+        // format, drawing on a real terminal. Nothing to stand down for.
+        _ if cols.get(1).is_some_and(|name| !name.is_empty()) => ClientSurface::Terminal,
         _ => ClientSurface::Unknown,
     }
 }
@@ -599,22 +629,43 @@ mod tests {
     }
 
     #[test]
-    fn control_mode_clients_are_told_apart_from_terminal_ones() {
-        // `tmux -CC` (amux/cmux, iTerm2) — overlays are dropped silently,
-        // so callers must refuse to draw rather than start invisibly.
-        assert_eq!(parse_client_surface("1\n"), ClientSurface::ControlMode);
-        assert!(!ClientSurface::ControlMode.draws_overlays());
-
-        assert_eq!(parse_client_surface("0\n"), ClientSurface::Terminal);
+    fn a_terminal_client_draws_and_a_control_mode_one_does_not() {
+        assert_eq!(
+            parse_client_surface("0\t/dev/ttys004\t1\n"),
+            ClientSurface::Terminal
+        );
         assert!(ClientSurface::Terminal.draws_overlays());
+
+        // `tmux -CC` (amux, iTerm2) accepts the popup and drops it.
+        assert_eq!(
+            parse_client_surface("1\t/dev/ttys059\t1\n"),
+            ClientSurface::ControlMode
+        );
+        assert!(!ClientSurface::ControlMode.draws_overlays());
     }
 
     #[test]
-    fn an_unreadable_control_mode_answer_still_draws() {
-        // A detached server expands the format to nothing, and a tmux that
-        // predates it does the same. Neither is evidence of control mode,
-        // and treating it as such would disable the overlay for everyone
-        // on an older tmux.
+    fn a_session_nobody_is_attached_to_is_detached() {
+        // cmux's viewer model, verified live: panes are driven by
+        // `capture-pane`/`send-keys` with no client attached, the client
+        // columns come back empty, and `display-popup` fails with "no
+        // current client".
+        assert_eq!(parse_client_surface("\t\t0\n"), ClientSurface::Detached);
+        assert!(!ClientSurface::Detached.draws_overlays());
+
+        // Zero attaches decides on its own — the client columns cannot
+        // describe a viewer that does not exist.
+        assert_eq!(
+            parse_client_surface("1\t/dev/ttys059\t0\n"),
+            ClientSurface::Detached
+        );
+    }
+
+    #[test]
+    fn an_unreadable_answer_still_draws() {
+        // No server and no columns at all: not evidence of anything, and
+        // standing down here would change behaviour for everyone whose
+        // probe merely failed.
         for raw in ["", "\n", "unexpected"] {
             assert_eq!(
                 parse_client_surface(raw),
@@ -623,6 +674,13 @@ mod tests {
             );
         }
         assert!(ClientSurface::Unknown.draws_overlays());
+
+        // A tmux too old to know `client_control_mode` still names its
+        // client and counts the attach — that is a terminal, so draw.
+        assert_eq!(
+            parse_client_surface("\t/dev/ttys004\t1\n"),
+            ClientSurface::Terminal
+        );
     }
 
     #[test]

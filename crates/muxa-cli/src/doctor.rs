@@ -697,17 +697,24 @@ impl TmuxEnvironment {
         }
         let server = self.server_label();
         match self.surface {
+            ClientSurface::Detached => CheckResult::Ok(format!(
+                "tmux: nothing is attached to {server} — cmux drives panes this way, and so does \
+                 any session nobody has attached. tmux resolves key bindings per client, so \
+                 muxa's prefix keys never fire and `display-popup` fails with \"no current \
+                 client\"; run `muxa peek`, `muxa watch` and `muxa dashboard` as commands \
+                 instead — peek prints its per-pane report here"
+            )),
             ClientSurface::ControlMode => CheckResult::Ok(format!(
-                "tmux: {server} is shown through a control-mode client (`tmux -CC` — amux/cmux, \
-                 iTerm2), which tmux sends no popup content, so `muxa peek` and the prefix \
-                 popups cannot draw on it — use `muxa peek --plain`, and run `muxa watch` in a \
-                 pane"
+                "tmux: {server} is shown through a control-mode client (`tmux -CC` — amux, \
+                 iTerm2), which tmux sends no popup content, so the prefix popups cannot draw \
+                 on it; run `muxa watch` and `muxa dashboard` as commands, and `muxa peek` \
+                 prints its per-pane report instead of the overlay"
             )),
             ClientSurface::Terminal => {
                 CheckResult::Ok(format!("tmux: {server} — terminal client, overlays render"))
             }
             ClientSurface::Unknown => {
-                CheckResult::Ok(format!("tmux: {server} — no attached client to inspect"))
+                CheckResult::Ok(format!("tmux: {server} — no client reading to inspect"))
             }
         }
     }
@@ -758,6 +765,16 @@ fn watch_binding_verdict(binding: Option<&str>, env: &TmuxEnvironment) -> CheckR
         None => CheckResult::Warn(
             "tmux: no prefix key runs `muxa watch` — run `muxa init --component tmux-popup`, then `tmux source-file ~/.tmux.conf`".into(),
         ),
+        // Correct in the file, but "prefix+s opens muxa watch" would be a
+        // false claim on a server whose viewer cannot run it: tmux resolves
+        // bindings per client, and these have none that draws.
+        Some(binding) if popup_binding_is_full_client(binding) && !env.surface.draws_overlays() => {
+            CheckResult::Ok(
+                "tmux: the managed full-client `muxa watch` binding is installed, but no viewer \
+                 on this server can run it (see the line above) — run `muxa watch` as a command"
+                    .into(),
+            )
+        }
         Some(binding) if popup_binding_is_full_client(binding) => {
             CheckResult::Ok("tmux: prefix+s opens muxa watch full-client".into())
         }
@@ -1000,13 +1017,23 @@ mod tests {
         }
     }
 
-    /// A front-end-owned server, as amux/cmux starts one:
+    /// A front-end-owned server, as amux starts one:
     /// `tmux -f /dev/null -L amux -CC`.
     fn front_end_owned_server() -> TmuxEnvironment {
         TmuxEnvironment {
             socket: Some("amux".into()),
             surface: ClientSurface::ControlMode,
             config_files: vec!["/dev/null".into()],
+        }
+    }
+
+    /// cmux: the user's own `~/.tmux.conf` server, driven by a front-end
+    /// that attaches no client.
+    fn viewer_driven_server() -> TmuxEnvironment {
+        TmuxEnvironment {
+            socket: Some("default".into()),
+            surface: ClientSurface::Detached,
+            config_files: vec!["/Users/x/.tmux.conf".into()],
         }
     }
 
@@ -1024,10 +1051,10 @@ mod tests {
     fn a_control_mode_client_is_reported_with_the_way_around_it() {
         let msg = message(&front_end_owned_server().describe()).to_string();
         assert!(msg.contains("-CC"), "{msg}");
-        assert!(
-            msg.contains("muxa peek --plain"),
-            "the line has to carry the command that does work: {msg}"
-        );
+        // What still works has to be in the line: the prefix popups do not,
+        // the commands do, and peek answers in text rather than not at all.
+        assert!(msg.contains("as commands"), "{msg}");
+        assert!(msg.contains("per-pane report"), "{msg}");
     }
 
     #[test]
@@ -1035,6 +1062,29 @@ mod tests {
         let result = user_owned_server().describe();
         assert!(is_ok(&result));
         assert!(message(&result).contains("overlays render"));
+    }
+
+    #[test]
+    fn a_server_with_no_client_explains_why_prefix_keys_do_nothing() {
+        // The cmux symptom the user actually hits: the binding is right
+        // there in `list-keys` and pressing it does nothing, because tmux
+        // resolves bindings per client and there is no client.
+        let msg = message(&viewer_driven_server().describe()).to_string();
+        assert!(msg.contains("nothing is attached"), "{msg}");
+        assert!(msg.contains("key bindings per client"), "{msg}");
+        assert!(msg.contains("no current client"), "{msg}");
+    }
+
+    #[test]
+    fn an_installed_binding_no_viewer_can_run_is_not_reported_as_working() {
+        // The file is correct, so this is not a failure — but claiming
+        // "prefix+s opens muxa watch" would contradict the line above it.
+        let binding = Some("bind-key -T prefix s display-popup -BE -w \"100%\" \"muxa watch\"");
+        let result = watch_binding_verdict(binding, &viewer_driven_server());
+        assert!(is_ok(&result));
+        let msg = message(&result);
+        assert!(!msg.contains("prefix+s opens"), "{msg}");
+        assert!(msg.contains("no viewer"), "{msg}");
     }
 
     #[test]

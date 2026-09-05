@@ -9,32 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`muxa peek` says why it cannot draw on a control-mode tmux client instead
-  of starting invisibly.** A `tmux -CC` client — amux/cmux mirroring tmux
-  windows into native surfaces, or iTerm2's tmux integration — is sent pane
-  content and nothing else: tmux never forwards popup, menu, or
-  `display-panes` output to it. `display-popup -E` against such a client
-  still runs its command and still exits 0, so `prefix + q` left a live
-  `muxa peek` attached to a pane nobody renders, waiting for keys that could
-  not reach it, with nothing anywhere saying so. peek now reads
-  `#{client_control_mode}` first and fails with one line naming the cause and
-  `muxa peek --plain`, which prints the same per-pane lines into the pane. An
-  unreadable answer (no attached client, a tmux too old for the format) still
-  draws, so nothing changes on the clients that were working.
+- **`muxa peek` works on front-ends that render tmux panes themselves.** Its
+  overlay is a `display-popup`, which tmux draws through a *client* — and two
+  kinds of front-end leave it without one, each failing in its own direction.
+  cmux drives panes with `capture-pane`/`send-keys` and attaches no client at
+  all, so sessions sit at `attached=0`, `display-popup` fails with "no current
+  client", and — since tmux resolves key bindings per client — `prefix + q`
+  never fires either. A control-mode client (`tmux -CC`: amux, iTerm2's tmux
+  integration) is sent pane content and nothing else, so the popup is accepted
+  and dropped: the command runs, exits 0, and waits on a pane nobody renders.
+  Typed into a pane, peek used to paint a full-client layout into one pane's
+  viewport, with no client geometry to place it by. It now reads the client
+  before drawing anything and, where the overlay cannot reach a human, prints
+  the same per-pane report `--plain` produces and says why on stderr — so the
+  report still pipes cleanly and nobody has to retype the command. An
+  inconclusive reading (no server, a tmux too old for the format) still draws,
+  leaving working clients untouched.
 
-- **`muxa doctor` stops prescribing `~/.tmux.conf` fixes to servers that never
-  read it.** A front-end that owns its own tmux server starts it isolated —
-  amux runs `tmux -f /dev/null -L amux -CC` precisely so the user's config,
-  and any session-restoring plugin in it, stays out. doctor read the absent
-  `muxa watch` binding and the absent `MUXA_SOCKET` pin there as a broken
-  install and told the user to run `muxa init` and
-  `tmux source-file ~/.tmux.conf` — the second of which imports the very
-  config the server was started to exclude. doctor now reports the client's
-  rendering mode and the server's `#{config_files}`, treats a missing binding
-  on an isolated server as expected rather than as an issue, and downgrades
-  the socket-pin warning to a note whenever muxad is on the default path that
-  unpinned panes already fall back to. Servers the user owns get exactly the
-  advice they got before.
+- **`muxa doctor` describes the tmux front-end instead of prescribing fixes
+  that cannot apply.** On a server with no attached client it reported the
+  managed binding as live (`prefix+s opens muxa watch`) when no client existed
+  to run it. On a config-isolated server — amux starts its engine as
+  `tmux -f /dev/null -L amux -CC` precisely to keep the user's `~/.tmux.conf`,
+  and any session-restoring plugin in it, out — it read the absent binding and
+  absent `MUXA_SOCKET` pin as a broken install and prescribed `muxa init` and
+  `tmux source-file ~/.tmux.conf`, the second of which imports the very config
+  the server exists to exclude. doctor now reports the client's rendering mode
+  and the server's `#{config_files}`, treats a missing binding on an isolated
+  server as expected, marks an installed binding no viewer can run as such,
+  and downgrades the socket-pin warning to a note when muxad is on the default
+  path unpinned panes already fall back to. Servers the user owns get exactly
+  the advice they got before.
 
 ## [0.8.43] - 2026-09-05
 
