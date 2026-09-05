@@ -43,6 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`muxa onboard` says a terminal is missing instead of pretending you quit.**
+  The live tour hands the learner a real interactive shell and follows what
+  they type into it. With no terminal on stdin that shell read EOF and exited
+  before step one could be read, so the tour built a whole sandbox — its own
+  tmux server and daemon — printed the first step, and reported "Stopped
+  early", which is exactly what a learner who gave up would have seen. It now
+  refuses up front, in both languages, and names `muxa onboard --print`, the
+  guide that teaches the same sixteen actions with nothing but stdout. The
+  installer script goes further: piped into a shell with no `/dev/tty` at all,
+  a container or a CI step, it prints the written guide rather than failing.
+
 - **Muxa.app keeps running when its last window closes, and the Welcome
   guide closes only itself.** Finishing the guide could close the workbench
   instead, and the app then had no window at all; muxad, host monitoring,

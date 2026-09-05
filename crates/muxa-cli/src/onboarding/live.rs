@@ -2243,6 +2243,32 @@ pub(super) fn run(language: UiLanguage, no_quiz: bool) -> Result<()> {
 }
 
 fn preflight(language: UiLanguage) -> Result<()> {
+    use std::io::IsTerminal;
+    preflight_in(language, std::io::stdin().is_terminal())
+}
+
+/// The preflight checks, with the one fact the process cannot fake passed in.
+///
+/// Split out so the terminal rule can be tested: whether the test binary's
+/// own stdin is a terminal depends on how `cargo test` was invoked, and a
+/// check that only holds when a human ran it is not a check.
+fn preflight_in(language: UiLanguage, stdin_is_terminal: bool) -> Result<()> {
+    // The tour hands the learner a real interactive shell and watches what
+    // they type into it. With no terminal on stdin that shell reads EOF and
+    // exits before the first step can be read, and the tour then reported
+    // "Stopped early" — indistinguishable from a learner who quit, after
+    // building a whole sandbox that never had a chance of working. Say what
+    // is actually missing, and name the guide that needs no terminal.
+    //
+    // stdin alone, not stdout: `curl … | sh` leaves stdout a terminal while
+    // stdin is the pipe, and that is exactly the case that failed silently.
+    if !stdin_is_terminal {
+        bail!(tr(
+            language,
+            "The live tour needs a terminal: it gives you a real shell and follows the commands you type.\nRun it from a terminal, or read the written guide with `muxa onboard --print`.",
+            "라이브 tour에는 터미널이 필요합니다. 실제 셸을 띄우고 입력하는 명령을 따라가기 때문입니다.\n터미널에서 실행하거나, `muxa onboard --print`로 문서 가이드를 보세요.",
+        ));
+    }
     if std::env::var_os("TMUX").is_some() {
         bail!(tr(
             language,
@@ -2481,6 +2507,26 @@ fn section(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without a terminal the tour used to build a sandbox, print step one,
+    /// and stop instantly, because the interactive shell it spawns reads EOF
+    /// and exits. It looked like the learner had quit. Refuse up front, in
+    /// both languages, and name the guide that works anyway.
+    #[test]
+    fn the_live_tour_refuses_a_terminal_less_run_and_names_the_written_guide() {
+        for language in [UiLanguage::En, UiLanguage::Ko] {
+            let error = preflight_in(language, false)
+                .expect_err("a tour with no terminal can never reach step one");
+            let message = error.to_string();
+            assert!(
+                message.contains("muxa onboard --print"),
+                "{language:?} should point at the guide that needs no terminal: {message}"
+            );
+        }
+        // The English text is what the sh installer's users see first.
+        let message = preflight_in(UiLanguage::En, false).unwrap_err().to_string();
+        assert!(message.contains("needs a terminal"), "{message}");
+    }
 
     /// Each scripted beat fires on the step whose action it belongs to.
     ///

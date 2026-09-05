@@ -156,8 +156,15 @@ run_release_onboarding() {
   status=0
   if ( : </dev/tty ) 2>/dev/null; then
     "$muxa_bin" "$@" </dev/tty || status=$?
-  else
+  elif [ "$print_only" -eq 1 ]; then
     "$muxa_bin" "$@" || status=$?
+  else
+    # Nowhere to hand the tour a terminal — a container started without one,
+    # a CI step, a hook. The live tour would open a shell that reads EOF and
+    # exits before the first step, so give the written guide, which teaches
+    # the same actions and needs only stdout.
+    printf 'muxa-onboard: no terminal available; showing the written guide instead\n' >&2
+    "$muxa_bin" "$@" --print || status=$?
   fi
   discard_download
   exit "$status"
