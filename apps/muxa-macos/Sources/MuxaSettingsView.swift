@@ -10,9 +10,9 @@ enum MuxaAppearance: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .system: "System"
-        case .light: "Light"
-        case .dark: "Dark"
+        case .system: String(localized: "System")
+        case .light: String(localized: "Light")
+        case .dark: String(localized: "Dark")
         }
     }
 
@@ -28,8 +28,12 @@ enum MuxaAppearance: String, CaseIterable, Identifiable {
 enum MuxaSettingsTab: String, CaseIterable, Identifiable {
     case general
     case providers
+    case automations
+    case behaviour
+    case modules
     case fleet
     case runtime
+    case advanced
 
     var id: Self { self }
 }
@@ -59,9 +63,25 @@ struct MuxaSettingsView: View {
                 .tabItem { Label("General", systemImage: "gearshape") }
                 .tag(MuxaSettingsTab.general.rawValue)
 
-            MuxaProviderSettingsPane(model: model)
+            AskProvidersSettingsPane(model: model, store: AskProviderStore.shared)
                 .tabItem { Label("Providers", systemImage: "brain.head.profile") }
                 .tag(MuxaSettingsTab.providers.rawValue)
+
+            AutomationSettingsPane(
+                model: model,
+                store: AutomationStore.shared,
+                configStore: MuxaConfigStore.shared
+            )
+            .tabItem { Label("Automations", systemImage: "wand.and.rays") }
+            .tag(MuxaSettingsTab.automations.rawValue)
+
+            BehaviourSettingsPane(model: model, store: MuxaConfigStore.shared)
+                .tabItem { Label("Behaviour", systemImage: "bell.badge") }
+                .tag(MuxaSettingsTab.behaviour.rawValue)
+
+            ModulesSettingsPane(model: model, registry: MuxaModuleRegistry.shared)
+                .tabItem { Label("Modules", systemImage: "puzzlepiece.extension") }
+                .tag(MuxaSettingsTab.modules.rawValue)
 
             MuxaFleetSettingsPane(model: model)
                 .tabItem { Label("Hosts", systemImage: "server.rack") }
@@ -70,8 +90,12 @@ struct MuxaSettingsView: View {
             MuxaRuntimeSettingsPane(model: model)
                 .tabItem { Label("Runtime", systemImage: "terminal") }
                 .tag(MuxaSettingsTab.runtime.rawValue)
+
+            AdvancedSettingsPane(model: model, store: MuxaConfigStore.shared)
+                .tabItem { Label("Advanced", systemImage: "gearshape.2") }
+                .tag(MuxaSettingsTab.advanced.rawValue)
         }
-        .frame(width: 700, height: 560)
+        .frame(width: 760, height: 640)
     }
 }
 
@@ -79,6 +103,7 @@ private struct MuxaGeneralSettingsView: View {
     @AppStorage(MuxaPreferences.appearanceKey) private var appearance = MuxaAppearance.system.rawValue
     @AppStorage(MuxaPreferences.showWorkbenchOnLaunchKey) private var showWorkbenchOnLaunch = true
     @AppStorage(MuxaPreferences.workDirectoryKey) private var workDirectory = ""
+    @Environment(\.openWindow) private var openWindow
 
     private var directoryExists: Bool {
         workDirectory.isEmpty || FileManager.default.fileExists(atPath: workDirectory)
@@ -98,11 +123,22 @@ private struct MuxaGeneralSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            MuxaLanguageSettingsSection()
+
             Section("Startup") {
                 Toggle("Show the Workbench when Muxa launches", isOn: $showWorkbenchOnLaunch)
                 Text("When disabled, Muxa starts in the menu bar and keeps host monitoring available.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                HStack {
+                    Button("Show Welcome Guide…") {
+                        openWindow(id: OnboardingPreferences.windowID)
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
+                    Text("The first-launch tour of Work, Explore, Inbox, and Shells, with the setup checklist.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Work") {
@@ -131,8 +167,8 @@ private struct MuxaGeneralSettingsView: View {
 
     private func chooseWorkDirectory() {
         let panel = NSOpenPanel()
-        panel.title = "Choose the default Muxa Work folder"
-        panel.prompt = "Choose"
+        panel.title = String(localized: "Choose the default Muxa Work folder")
+        panel.prompt = String(localized: "Choose")
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
@@ -141,68 +177,6 @@ private struct MuxaGeneralSettingsView: View {
         }
         if panel.runModal() == .OK, let url = panel.url {
             workDirectory = url.path
-        }
-    }
-}
-
-private struct MuxaProviderSettingsPane: View {
-    @ObservedObject var model: AppModel
-    @State private var confirmsReload = false
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                settingsHeading(
-                    "Ask Providers",
-                    detail: "Use Claude Code or Codex sign-in, or store an optional API key in the macOS login Keychain."
-                )
-
-                if model.askEnabled == false {
-                    HStack {
-                        Label("Global Ask is disabled in muxa configuration.", systemImage: "exclamationmark.circle")
-                            .foregroundStyle(.orange)
-                        Spacer()
-                        Button("Enable Global Ask") {
-                            Task { await model.enableAsk() }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(model.isEnablingAsk)
-                    }
-                    .padding(12)
-                    .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-                }
-
-                ForEach(MuxaAskProvider.allCases) { provider in
-                    AskProviderCredentialRow(provider: provider, model: model)
-                }
-
-                if let status = model.askSettingsStatus {
-                    Label(status, systemImage: "checkmark.circle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.green)
-                }
-                if let error = model.askSettingsError {
-                    Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .textSelection(.enabled)
-                }
-
-                HStack {
-                    Text("Reload only after installing a provider CLI in a new PATH.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Reload muxad PATH…") { confirmsReload = true }
-                }
-            }
-            .padding(20)
-        }
-        .alert("Reload the bundled muxad?", isPresented: $confirmsReload) {
-            Button("Cancel", role: .cancel) {}
-            Button("Reload", role: .destructive) { model.replaceRunningDaemon() }
-        } message: {
-            Text("Native PTY sessions owned by muxad will end. tmux sessions are not terminated.")
         }
     }
 }
@@ -292,21 +266,41 @@ private struct MuxaFleetSettingsRow: View {
                 HStack(spacing: 7) {
                     Circle().fill(stateColor).frame(width: 7, height: 7)
                     Text(host.alias).font(.headline)
-                    Text(host.local ? "Local" : host.mode.capitalized)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
-                Text(host.sshTarget ?? (host.local ? "local://" : "SSH target unavailable"))
-                    .font(.caption.monospaced())
+                    Group {
+                        if host.local {
+                            Text("Local")
+                        } else {
+                            Text(fleetHostModeLabel(host.mode))
+                        }
+                    }
+                    .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                }
+                Group {
+                    if let target = host.sshTarget {
+                        Text(target)
+                    } else if host.local {
+                        Text(verbatim: "local://")
+                    } else {
+                        Text("SSH target unavailable")
+                    }
+                }
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
             }
 
             Spacer()
 
             VStack(alignment: .trailing, spacing: 4) {
-                Text(host.muxaVersion.map { "muxa \($0)" } ?? "Version unavailable")
-                    .font(.caption.monospacedDigit())
+                Group {
+                    if let version = host.muxaVersion {
+                        Text("muxa \(version)")
+                    } else {
+                        Text("Version unavailable")
+                    }
+                }
+                .font(.caption.monospacedDigit())
                 Text("\(host.remote?.agents.count ?? 0) agents · \(host.remote?.panes.count ?? 0) panes")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -319,7 +313,6 @@ private struct MuxaFleetSettingsRow: View {
 
 private struct MuxaRuntimeSettingsPane: View {
     @ObservedObject var model: AppModel
-    @State private var confirmsReload = false
 
     private var localHost: MuxaFleetHost? {
         model.fleetHosts.first(where: \.local)
@@ -327,10 +320,10 @@ private struct MuxaRuntimeSettingsPane: View {
 
     private var connectionTitle: String {
         switch model.connectionState {
-        case .connecting: "Connecting"
-        case .connected: "Connected"
-        case .upgradeRequired: "Upgrade required"
-        case .failed: "Connection failed"
+        case .connecting: String(localized: "Connecting")
+        case .connected: String(localized: "Connected")
+        case .upgradeRequired: String(localized: "Upgrade required")
+        case .failed: String(localized: "Connection failed")
         }
     }
 
@@ -364,11 +357,24 @@ private struct MuxaRuntimeSettingsPane: View {
 
             Section("Runtime") {
                 LabeledContent("muxa") {
-                    Text(localHost?.muxaVersion ?? "Unavailable").monospacedDigit()
+                    Group {
+                        if let version = localHost?.muxaVersion {
+                            Text(version)
+                        } else {
+                            Text("Unavailable")
+                        }
+                    }
+                    .monospacedDigit()
                 }
                 LabeledContent("Daemon generation") {
-                    Text(localHost?.daemonGeneration.map(String.init) ?? "Unavailable")
-                        .monospacedDigit()
+                    Group {
+                        if let generation = localHost?.daemonGeneration {
+                            Text(verbatim: String(generation))
+                        } else {
+                            Text("Unavailable")
+                        }
+                    }
+                    .monospacedDigit()
                 }
                 LabeledContent("Native shells") {
                     Text("\(model.sessions.lazy.filter { !$0.exited }.count) active")
@@ -385,7 +391,7 @@ private struct MuxaRuntimeSettingsPane: View {
                     Button("Retry Connection") { model.retryConnection() }
                         .disabled(model.connectionState == .connecting)
                     Spacer()
-                    Button("Reload Bundled muxad…") { confirmsReload = true }
+                    MuxaDaemonReloadButton(model: model, title: "Reload Bundled muxad…")
                 }
                 Text("Reloading replaces the process on the owner-only socket. tmux sessions remain, but native PTY sessions end.")
                     .font(.caption)
@@ -394,17 +400,30 @@ private struct MuxaRuntimeSettingsPane: View {
         }
         .formStyle(.grouped)
         .padding(.top, 8)
-        .alert("Reload the bundled muxad?", isPresented: $confirmsReload) {
-            Button("Cancel", role: .cancel) {}
-            Button("Reload", role: .destructive) { model.replaceRunningDaemon() }
-        } message: {
-            Text("\(model.sessions.lazy.filter { !$0.exited }.count) active native shell(s) will end. tmux sessions are not terminated.")
-        }
     }
 }
 
+/// The Runtime tab's daemon reload, shared by every pane that has to say a
+/// change only applies after muxad restarts. One button, one confirmation.
+struct MuxaDaemonReloadButton: View {
+    @ObservedObject var model: AppModel
+    var title: LocalizedStringKey = "Reload muxad…"
+    @State private var confirmsReload = false
+
+    var body: some View {
+        Button(title) { confirmsReload = true }
+            .alert("Reload the bundled muxad?", isPresented: $confirmsReload) {
+                Button("Cancel", role: .cancel) {}
+                Button("Reload", role: .destructive) { model.replaceRunningDaemon() }
+            } message: {
+                Text("\(model.sessions.lazy.filter { !$0.exited }.count) active native shells will end. tmux sessions are not terminated.")
+            }
+    }
+}
+
+/// Shared by the settings panes, including `AskProvidersSettingsPane`.
 @ViewBuilder
-private func settingsHeading(_ title: String, detail: String) -> some View {
+func settingsHeading(_ title: LocalizedStringKey, detail: LocalizedStringKey) -> some View {
     VStack(alignment: .leading, spacing: 3) {
         Text(title).font(.title2.weight(.semibold))
         Text(detail).font(.subheadline).foregroundStyle(.secondary)

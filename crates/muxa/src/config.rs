@@ -99,10 +99,34 @@ pub enum ConfigError {
 
     #[error("{path}: {message}")]
     InvalidFleet { path: String, message: String },
+
+    #[error("{path}: {message}")]
+    InvalidMcp { path: String, message: String },
+
+    #[error("{path}: {message}")]
+    InvalidAsk { path: String, message: String },
+
+    #[error("automation: {0}")]
+    InvalidAutomation(String),
+
+    #[error(
+        "unknown top-level key `{0}`. muxa keeps sections it does not know \
+         (a newer build may have written them) but a bare key at the top \
+         level is a typo"
+    )]
+    UnknownTopLevelKey(String),
 }
 
+/// The whole configuration file.
+///
+/// Unknown **top-level** sections are kept rather than refused. muxa is
+/// installed in several places at once — the app bundle, `~/.cargo/bin`, and
+/// every fleet host — and they update at different times. A section a newer
+/// muxa writes (`[automation]`, say) must not stop an older `muxa watch`
+/// from starting; it is reported once and ignored. Inside a section,
+/// unknown keys are still refused: that is where typos live.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     /// Unix socket path. Overrides the XDG default.
     pub socket: Option<PathBuf>,
@@ -119,10 +143,19 @@ pub struct Config {
     pub reconciler: ReconcilerConfig,
     pub screen_detect: ScreenDetectConfig,
     pub collaboration: CollaborationConfig,
+    /// Preferences advertised to MCP-connected agents and used when an MCP
+    /// launch call omits the corresponding arguments.
+    pub mcp: McpConfig,
     /// Reusable text templates for the interactive `m` message composer.
     pub message: MessageConfig,
     #[serde(default)]
     pub ask: AskConfig,
+    /// Rules that watch agent state and act on it — the
+    /// session-limit resume being the first of them. Enabled by
+    /// default with no rules, so a fresh install does nothing until
+    /// one is written.
+    #[serde(default)]
+    pub automation: crate::automation::AutomationConfig,
     pub history: HistoryConfig,
     pub activity: ActivityConfig,
     pub state: StateConfig,
@@ -135,6 +168,32 @@ pub struct Config {
     pub route: Vec<RouteConfig>,
     /// Named agent line-ups, keyed by pipeline name.
     pub pipeline: BTreeMap<String, PipelineConfig>,
+
+    /// Top-level tables this build does not know. Carried so a round trip
+    /// through `Config` never drops a newer muxa's section, and so the
+    /// loader can name them once.
+    #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unknown: BTreeMap<String, toml::Value>,
+}
+
+impl Config {
+    /// Section names this build does not understand, in file order.
+    #[must_use]
+    pub fn unknown_sections(&self) -> Vec<&str> {
+        self.unknown.keys().map(String::as_str).collect()
+    }
+
+    /// Unknown top-level entries that are not sections. A feature always
+    /// arrives as a table (`[automation]`) or an array of tables
+    /// (`[[route]]`); a bare `key = value` at the top level is a typo, and
+    /// saying so beats ignoring it.
+    fn stray_top_level_keys(&self) -> Vec<&str> {
+        self.unknown
+            .iter()
+            .filter(|(_, value)| !matches!(value, toml::Value::Table(_) | toml::Value::Array(_)))
+            .map(|(key, _)| key.as_str())
+            .collect()
+    }
 }
 
 /// Fleet-wide connection and refresh policy. Inventory keys are stable local
@@ -245,6 +304,84 @@ pub struct MessageConfig {
     pub skills: BTreeMap<String, String>,
 }
 
+/// `[mcp]` config — user-authored defaults for agent-driven orchestration.
+///
+/// The actual preferences live below `[mcp.guide]` so the config makes their
+/// purpose explicit: they are sent to MCP hosts during initialization and can
+/// be retrieved again with `muxa_guide`. The deterministic launcher also uses
+/// them when a tool call omits a value, which keeps the written guidance and
+/// the behavior from drifting apart.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    pub guide: McpGuideConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpGuideConfig {
+    /// Preferred surface for an unmanaged `muxa_start_agent` call.
+    pub placement: McpPlacement,
+    /// Default provider. When omitted, MCP callers must still name `agent`.
+    pub agent: Option<String>,
+    /// Additional provider CLI arguments, inserted after Muxa's built-in
+    /// launch profile and before the initial prompt.
+    pub options: Vec<String>,
+    /// Preferred pane split direction.
+    pub direction: McpSplitDirection,
+    /// Optional free-form instructions for conventions not represented by
+    /// the structured fields above.
+    pub instructions: Option<String>,
+}
+
+impl Default for McpGuideConfig {
+    fn default() -> Self {
+        Self {
+            placement: McpPlacement::Pane,
+            agent: None,
+            options: Vec::new(),
+            direction: McpSplitDirection::Right,
+            instructions: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpPlacement {
+    #[default]
+    Pane,
+    Window,
+    Session,
+}
+
+impl McpPlacement {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pane => "pane",
+            Self::Window => "window",
+            Self::Session => "session",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpSplitDirection {
+    #[default]
+    Right,
+    Down,
+}
+
+impl McpSplitDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Right => "right",
+            Self::Down => "down",
+        }
+    }
+}
+
 /// Default wall-clock ceiling for one headless ask turn.
 pub const DEFAULT_ASK_TIMEOUT_SECS: u64 = 30 * 60;
 
@@ -256,7 +393,11 @@ pub const DEFAULT_ASK_TIMEOUT_SECS: u64 = 30 * 60;
 #[serde(default, deny_unknown_fields)]
 pub struct AskConfig {
     pub enabled: bool,
-    /// `claude` or `codex`.
+    /// Provider instance the next question goes to. Either one of the
+    /// built-in ids — `claude`, `codex`, `gemini` (agent CLIs), or
+    /// `anthropic`, `openai` (HTTPS APIs) — or the id of an
+    /// `[ask.providers.<id>]` instance the operator added. See
+    /// [`crate::ask::supported_agents`] for the built-ins.
     pub agent: String,
     /// Directory the headless process runs in. Defaults to `$HOME`; a neutral
     /// cwd keeps default-mode questions away from a working tree. Explicit
@@ -277,6 +418,11 @@ pub struct AskConfig {
     pub path: Option<PathBuf>,
     /// Answers retained before the oldest are dropped.
     pub keep: usize,
+    /// Provider instances, `[ask.providers.<id>]` — one table per id the
+    /// operator composed, plus any override of a built-in. Only a model
+    /// name, a binary path, and the *name* of an environment variable
+    /// holding the API key live here; the key itself never does.
+    pub providers: BTreeMap<String, AskProviderConfig>,
 }
 
 impl Default for AskConfig {
@@ -290,8 +436,38 @@ impl Default for AskConfig {
             timeout_secs: DEFAULT_ASK_TIMEOUT_SECS,
             path: None,
             keep: 200,
+            providers: BTreeMap::new(),
         }
     }
+}
+
+/// `[ask.providers.<id>]` — one provider *instance*.
+///
+/// The table id is the instance's name on the wire, in `[ask] agent`, and
+/// in `muxa ask --agent`. `engine` names the closed set of code that
+/// drives it (`claude`, `codex`, `gemini`, `anthropic`, `openai`), so the
+/// operator can keep several instances of one engine side by side — a
+/// work and a personal `OpenAI` account, two Anthropic keys, a second
+/// `claude` binary — each with its own key.
+///
+/// Every key is optional. `engine` may be omitted only when the id *is* a
+/// built-in engine id, which is what makes an existing
+/// `[ask.providers.anthropic] model = "…"` keep meaning "the built-in
+/// anthropic provider, with this model". `title` is what clients show and
+/// defaults to a humanized id. `model` overrides the engine's default
+/// (`claude-sonnet-5` for `anthropic`, `gpt-5` for `openai`; the agent
+/// CLIs use their own unless one is named here). `api_key_env` names an
+/// environment variable the daemon reads the key from — a pointer, so a
+/// raw secret is never written into this file. `executable` overrides the
+/// binary a CLI engine spawns and is ignored by the API engines.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AskProviderConfig {
+    pub engine: Option<String>,
+    pub title: Option<String>,
+    pub model: Option<String>,
+    pub api_key_env: Option<String>,
+    pub executable: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +475,10 @@ impl Default for AskConfig {
 pub enum AskPermissionMode {
     /// Preserve the selected agent CLI's normal permission behavior.
     Default,
+    /// Read-only: the agent may inspect the tree but never write to it.
+    /// `muxa work compose` runs under this so a drafting turn cannot edit
+    /// files however the operator configured `[ask]`.
+    Plan,
     /// Permit workspace edits while retaining sandbox/review protection.
     Edit,
     /// Disable approval and sandbox checks for unattended automation.
@@ -959,14 +1139,16 @@ fn default_binary_poll_secs() -> u64 {
 /// `Working` / `WaitingInput` / `Idle`. This is the *last-resort* fallback:
 /// hooks stay authoritative when present, herdr hosts are covered by herdr's
 /// own detection + bridge (and are skipped here), and the synthetic rows this
-/// task mints are evicted the instant a real hook claims the pane. See
+/// task mints are evicted the instant a real hook claims the pane. Hook-owned
+/// Codex panes are captured only to retain their visible `Conversation recap`;
+/// that metadata path does not infer state. See
 /// `docs/SCREEN_DETECTION.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScreenDetectConfig {
     /// Master switch. Default `true` — the detector only does real work when a
-    /// pane's foreground command matches a manifest AND no authoritative row
-    /// owns the pane, so its idle cost is ~one pane list per tick.
+    /// pane's foreground command matches a manifest. Authoritative rows skip
+    /// state inference; Codex rows still contribute one recap capture.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Cadence of the capture/classify pass, in seconds. Default 3 — brisk
@@ -1227,7 +1409,18 @@ impl Config {
     /// home, and so the always-on / daemon-only split stays legible to
     /// callers.
     pub fn validate(&self) -> std::result::Result<(), ConfigError> {
-        validate_fleet(&self.fleet)
+        if let Some(key) = self.stray_top_level_keys().first() {
+            return Err(ConfigError::UnknownTopLevelKey((*key).to_string()));
+        }
+        validate_fleet(&self.fleet)?;
+        validate_mcp(&self.mcp)?;
+        validate_ask(&self.ask)?;
+        // An automation types into a live agent, so a rule that does
+        // not hold together fails the load rather than sitting in the
+        // file waiting to surprise someone.
+        self.automation
+            .validate()
+            .map_err(ConfigError::InvalidAutomation)
     }
 
     /// Run hard semantic checks that only matter when the daemon is
@@ -1255,6 +1448,15 @@ impl Config {
     /// `[watch.detail] template`. Never errors. Keeping these as warnings
     /// means a config written for a newer/older `muxa` version still loads.
     fn warn_soft_issues(&self) {
+        if !self.unknown.is_empty() {
+            // A newer muxa wrote a section this build does not know, or a
+            // top-level table is misspelled. Either way, running on the
+            // rest of the file beats refusing to start.
+            tracing::warn!(
+                sections = ?self.unknown_sections(),
+                "config.toml: sections this muxa does not know — ignored; update muxa if they should apply",
+            );
+        }
         for key in &self.watch.columns {
             if !WATCH_COLUMN_KEYS.contains(&key.as_str()) {
                 tracing::warn!(
@@ -1281,6 +1483,99 @@ impl Config {
             );
         }
     }
+}
+
+fn validate_mcp(cfg: &McpConfig) -> std::result::Result<(), ConfigError> {
+    let invalid = |path: &str, message: String| ConfigError::InvalidMcp {
+        path: path.into(),
+        message,
+    };
+    if let Some(agent) = cfg.guide.agent.as_deref() {
+        if !matches!(agent, "claude" | "codex" | "gemini" | "agy" | "opencode") {
+            return Err(invalid(
+                "mcp.guide.agent",
+                format!(
+                    "unknown agent {agent:?}; expected claude, codex, gemini, agy, or opencode"
+                ),
+            ));
+        }
+    } else if !cfg.guide.options.is_empty() {
+        return Err(invalid(
+            "mcp.guide.options",
+            "options require mcp.guide.agent so they cannot be applied to the wrong CLI".into(),
+        ));
+    }
+    if let Some((index, _)) = cfg
+        .guide
+        .options
+        .iter()
+        .enumerate()
+        .find(|(_, option)| option.contains('\0'))
+    {
+        return Err(invalid(
+            &format!("mcp.guide.options[{index}]"),
+            "option must not contain a NUL byte".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `[ask.providers.<id>]` has to name an engine muxa can actually drive.
+/// An entry that names none, or names one that does not exist, would be
+/// silently inert — the operator would see their new provider missing from
+/// `muxa ask providers` with nothing saying why — so it fails the load
+/// instead.
+fn validate_ask(cfg: &AskConfig) -> std::result::Result<(), ConfigError> {
+    for (id, provider) in &cfg.providers {
+        let path = format!("ask.providers.{id}");
+        let invalid = |message: String| ConfigError::InvalidAsk {
+            path: path.clone(),
+            message,
+        };
+        if !is_bare_key(id) {
+            return Err(invalid(
+                "a provider id must be a TOML bare key: letters, digits, `-`, or `_`".into(),
+            ));
+        }
+        let builtin = crate::ask::builtin_engine(id);
+        match provider.engine.as_deref() {
+            Some(engine) => {
+                let parsed = crate::ask::AskEngine::parse(engine).ok_or_else(|| {
+                    invalid(format!(
+                        "engine = {engine:?} is not one of {}",
+                        crate::ask::supported_agents().join(", ")
+                    ))
+                })?;
+                if let Some(builtin) = builtin {
+                    if builtin != parsed {
+                        return Err(invalid(format!(
+                            "`{id}` is a built-in provider and always uses the `{id}` engine; \
+                             name a different id to run engine = {engine:?}"
+                        )));
+                    }
+                }
+            }
+            None if builtin.is_some() => {}
+            None => {
+                return Err(invalid(format!(
+                    "a provider id that is not built in needs `engine`, one of {}",
+                    crate::ask::supported_agents().join(", ")
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `key` can be written as a TOML bare key. Provider ids travel on
+/// the wire, through argv, and back into `[ask.providers.<id>]`, so they
+/// stay in the one spelling every surface renders the same.
+#[must_use]
+pub fn is_bare_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn validate_fleet(cfg: &FleetConfig) -> std::result::Result<(), ConfigError> {
@@ -1601,10 +1896,10 @@ pub struct WatchConfig {
     ///
     /// Default `recap`: the agent's own session recap when it has one,
     /// else its rolling session title, else the last prompt. Claude Code
-    /// writes a recap only when you come back after being away — rich but
-    /// sparse — so the title tier keeps the column meaningful in between.
-    /// Agents with no recap source (Codex, Gemini) fall straight through
-    /// to the last prompt.
+    /// writes a recap only when you come back after being away; Codex prints
+    /// one when it compacts conversation context, which muxa observes from
+    /// capture-capable panes. Agents with no recap source (for example,
+    /// Gemini) fall straight through to the last prompt.
     #[serde(default)]
     pub summary: WatchSummary,
     /// Hide agents that aren't bound to a tmux pane.
@@ -2046,6 +2341,98 @@ additional_dirs = ["/nfs/home/june", "/srv/shared"]
     }
 
     #[test]
+    fn parses_ask_provider_overrides_and_plan_mode() {
+        let cfg: Config = toml::from_str(
+            r#"
+[ask]
+agent = "anthropic"
+permission_mode = "plan"
+
+[ask.providers.anthropic]
+model = "claude-opus-5"
+api_key_env = "WORK_ANTHROPIC_KEY"
+
+[ask.providers.codex]
+model = "gpt-5-codex"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.ask.agent, "anthropic");
+        assert_eq!(cfg.ask.permission_mode, AskPermissionMode::Plan);
+        let anthropic = &cfg.ask.providers["anthropic"];
+        assert_eq!(anthropic.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(anthropic.api_key_env.as_deref(), Some("WORK_ANTHROPIC_KEY"));
+        let codex = &cfg.ask.providers["codex"];
+        assert_eq!(codex.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(codex.api_key_env, None);
+        // A raw key has no home here: the table only takes a model and an
+        // environment variable *name*.
+        let refused: Result<Config, _> = toml::from_str(
+            r#"
+[ask.providers.openai]
+api_key = "sk-live-never"
+"#,
+        );
+        assert!(refused.is_err());
+    }
+
+    #[test]
+    fn parses_composed_ask_providers_and_refuses_the_ones_that_drive_nothing() {
+        let cfg: Config = toml::from_str(
+            r#"
+[ask]
+agent = "anthropic-work"
+
+[ask.providers.anthropic-work]
+engine = "anthropic"
+title = "Anthropic (work)"
+api_key_env = "WORK_ANTHROPIC_KEY"
+
+[ask.providers.claude_alt]
+engine = "claude"
+executable = "/opt/homebrew/bin/claude"
+
+[ask.providers.anthropic]
+model = "claude-opus-5"
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.ask.agent, "anthropic-work");
+        let work = &cfg.ask.providers["anthropic-work"];
+        assert_eq!(work.engine.as_deref(), Some("anthropic"));
+        assert_eq!(work.title.as_deref(), Some("Anthropic (work)"));
+        assert_eq!(
+            cfg.ask.providers["claude_alt"].executable.as_deref(),
+            Some("/opt/homebrew/bin/claude")
+        );
+        // A built-in id with no engine still means that built-in.
+        assert_eq!(cfg.ask.providers["anthropic"].engine, None);
+
+        // An entry that names no usable engine would be inert, so it fails
+        // the load rather than going missing from `muxa ask providers`.
+        for (broken, expected) in [
+            (
+                "[ask.providers.anthropic-work]\nmodel = \"claude-opus-5\"\n",
+                "needs `engine`",
+            ),
+            ("[ask.providers.mine]\nengine = \"bard\"\n", "is not one of"),
+            (
+                "[ask.providers.claude]\nengine = \"codex\"\n",
+                "always uses the `claude` engine",
+            ),
+            (
+                "[ask.providers.\"has a space\"]\nengine = \"claude\"\n",
+                "TOML bare key",
+            ),
+        ] {
+            let cfg: Config = toml::from_str(broken).unwrap();
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains(expected), "{broken}: {error}");
+        }
+    }
+
+    #[test]
     fn parses_sorted_message_skills() {
         let cfg: Config = toml::from_str(
             r#"
@@ -2064,6 +2451,82 @@ agent-review = "create a codex pane and pass our changes for review"
             cfg.message.skills.get("agent-review").map(String::as_str),
             Some("create a codex pane and pass our changes for review")
         );
+    }
+
+    #[test]
+    fn parses_mcp_launch_guide() {
+        let cfg: Config = toml::from_str(
+            r#"
+[mcp.guide]
+placement = "window"
+agent = "codex"
+options = ["--model", "gpt-5.3-codex", "--search"]
+direction = "down"
+instructions = "Keep one task per window."
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.mcp.guide.placement, McpPlacement::Window);
+        assert_eq!(cfg.mcp.guide.agent.as_deref(), Some("codex"));
+        assert_eq!(
+            cfg.mcp.guide.options,
+            ["--model", "gpt-5.3-codex", "--search"]
+        );
+        assert_eq!(cfg.mcp.guide.direction, McpSplitDirection::Down);
+        assert_eq!(
+            cfg.mcp.guide.instructions.as_deref(),
+            Some("Keep one task per window.")
+        );
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn mcp_guide_rejects_unknown_agents_and_unscoped_options() {
+        let mut cfg = Config::default();
+        cfg.mcp.guide.agent = Some("mystery".into());
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidMcp { .. })
+        ));
+
+        cfg.mcp.guide.agent = None;
+        cfg.mcp.guide.options = vec!["--model".into(), "large".into()];
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidMcp { .. })
+        ));
+    }
+
+    /// muxa is installed in several places that update at different times.
+    /// A section a newer build writes must not stop an older one from
+    /// starting — that turned a `muxa watch` popup into `returned 1`.
+    #[test]
+    fn an_unknown_top_level_section_is_kept_rather_than_refused() {
+        let cfg: Config = toml::from_str(
+            r#"
+[ui]
+[from_the_future]
+enabled = true
+knobs = ["a", "b"]
+"#,
+        )
+        .expect("a section this build does not know must not fail the load");
+
+        assert_eq!(cfg.unknown_sections(), vec!["from_the_future"]);
+        cfg.validate().expect("unknown sections are not invalid");
+
+        // And it survives a round trip, so writing the file back does not
+        // silently delete the newer build's settings.
+        let rendered = toml::to_string(&cfg).expect("serialize");
+        assert!(rendered.contains("from_the_future"), "{rendered}");
+    }
+
+    /// Inside a section, an unknown key is still a typo worth refusing.
+    #[test]
+    fn an_unknown_key_inside_a_known_section_is_still_refused() {
+        let error = toml::from_str::<Config>("[ask]\nnot_a_key = 1\n")
+            .expect_err("a typo inside a known section stays an error");
+        assert!(error.to_string().contains("not_a_key"), "{error}");
     }
 
     #[test]
@@ -2130,8 +2593,11 @@ agent-review = "create a codex pane and pass our changes for review"
 
     #[test]
     fn rejects_unknown_fields() {
-        let err = toml::from_str::<Config>("unknown_field = 1").unwrap_err();
-        assert!(err.to_string().contains("unknown"));
+        // A bare top-level key is a typo, not a newer build's section, so it
+        // is refused — at validation, where the message can explain itself.
+        let cfg: Config = toml::from_str("unknown_field = 1").expect("parses");
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("unknown_field"), "{err}");
     }
 
     #[test]

@@ -24,10 +24,20 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .work: "Work"
-        case .watch: "Explore"
-        case .inbox: "Inbox"
-        case .shells: "Shells"
+        case .work: String(localized: "Work")
+        case .watch: String(localized: "Explore")
+        case .inbox: String(localized: "Inbox")
+        case .shells: String(localized: "Shells")
+        }
+    }
+
+    /// Placeholder of the sidebar filter field while this container is shown.
+    var filterPrompt: String {
+        switch self {
+        case .work: String(localized: "Filter work")
+        case .watch: String(localized: "Filter Explore")
+        case .inbox: String(localized: "Filter inbox")
+        case .shells: String(localized: "Filter shells")
         }
     }
 
@@ -81,7 +91,30 @@ final class AppModel: ObservableObject {
     @Published private(set) var isAttachingPane = false
     @Published private(set) var attachError: String?
     @Published var isPresentingWorkStart = false
+    /// Pipeline the Start Work sheet should preselect when opened from a
+    /// pipeline card; nil leaves the route default.
+    @Published var workStartPreselectedPipeline: String?
+    /// Routes, pipelines, skills, and presets from `muxa work options` on
+    /// the local host. Per-host copies live in `workOptionsByHost`.
+    @Published private(set) var workOptions: MuxaWorkOptions?
+    @Published private(set) var workOptionsByHost: [String: MuxaWorkOptions] = [:]
+    @Published private(set) var workOptionsErrorsByHost: [String: String] = [:]
+    @Published private(set) var workOptionsError: String?
+    @Published private(set) var isLoadingWorkOptions = false
+    @Published private(set) var isApplyingWorkPreset = false
+    @Published private(set) var isSavingPipeline = false
+    @Published private(set) var pipelineEditorError: String?
+    /// Host the Start Work sheet should preselect; nil is local.
+    @Published var workStartPreselectedHost: String?
+    /// The pipeline editor sheet: which host's config it edits and which
+    /// pipeline (nil creates a new one).
+    @Published var pipelineEditorTarget: MuxaPipelineEditorTarget?
+    /// Whether the connected daemon can run Work commands on fleet hosts.
+    @Published private(set) var supportsHostWorkCommands = false
     @Published private(set) var isStartingWork = false
+    /// The last dry-run result, shown in the sheet so the operator sees the
+    /// exact agents and prompts before launching for real.
+    @Published private(set) var workStartPlan: MuxaWorkStartResult?
     @Published private(set) var workStartStatus: String?
     @Published private(set) var workStartError: String?
     @Published var isConfirmingDaemonReplacement = false
@@ -94,13 +127,20 @@ final class AppModel: ObservableObject {
     @Published private(set) var isSendingAsk = false
     @Published private(set) var isEnablingAsk = false
     @Published private(set) var askError: String?
-    @Published var isPresentingAskSettings = false
     @Published private(set) var askSettingsStatus: String?
     @Published private(set) var askSettingsError: String?
     @Published private(set) var operatorMessages: [MuxaOperatorMessage] = []
     @Published private(set) var mailboxRevisions: [String: UInt64] = [:]
     @Published private(set) var isRefreshingInbox = false
+    /// Errors that are not tied to one host's mailbox read: opening a
+    /// conversation whose agent ended, or a failed mark-read call.
     @Published private(set) var inboxError: String?
+    /// Operator-mailbox reads that failed on their most recent attempt, keyed
+    /// by host alias. A host leaves the map as soon as one of its reads
+    /// succeeds or it is no longer registered; the messages it delivered
+    /// earlier stay in `operatorMessages` the whole time. Kept apart from
+    /// `inboxError` so one flaky SSH host cannot hide the rest of the Inbox.
+    @Published private(set) var inboxHostFailures: [String: String] = [:]
     @Published var isPresentingHostRegistration = false
     @Published private(set) var isRegisteringHost = false
     @Published private(set) var hostRegistrationError: String?
@@ -135,6 +175,11 @@ final class AppModel: ObservableObject {
 
     var agents: [MuxaAgent] { executionSnapshot.agents }
 
+    /// Compact Inbox wording for `inboxHostFailures`, shared with the sidebar.
+    var inboxHostFailureSummary: String? {
+        MuxaInboxHostFailureText.summary(inboxHostFailures)
+    }
+
     var fleetHosts: [MuxaFleetHost] { executionSnapshot.hosts }
 
     var selectedSessionID: String? {
@@ -144,6 +189,13 @@ final class AppModel: ObservableObject {
 
     init(client: MuxaIPCClient = MuxaIPCClient()) {
         self.client = client
+    }
+
+    /// Test seam. The app ingests execution snapshots through `refresh`, which
+    /// needs a live daemon; tests feed a decoded snapshot directly so inbox
+    /// refreshes have hosts to read. Not used by production code.
+    func ingestExecutionSnapshotForTesting(_ snapshot: MuxaExecutionSnapshot) {
+        executionSnapshot = snapshot
     }
 
     nonisolated static func isRunningTests(
@@ -200,6 +252,12 @@ final class AppModel: ObservableObject {
                 guard connectionGeneration == generation else { return }
                 connectionState = .connected
                 await refresh(ifGeneration: generation)
+                // The Inbox badge and sidebar counts are derived from the
+                // operator mailbox. Load it once after connecting so they are
+                // correct before the Inbox editor is ever opened; later
+                // changes arrive through per-host mailbox revision events.
+                Task { [weak self] in await self?.refreshOperatorInbox(force: true) }
+                Task { [weak self] in await self?.loadAllWorkOptions() }
                 async let events: Void = runFleetSubscription(ifGeneration: generation)
                 async let askEvents: Void = runAskSubscription(ifGeneration: generation)
                 async let pipelineEvents: Void = runPipelineSubscription(ifGeneration: generation)
@@ -614,8 +672,8 @@ final class AppModel: ObservableObject {
                     environment: terminalEnvironment
                 )
                 shellNumber += 1
+                registerSpawnedSession(session)
                 await refresh()
-                select(.shell(session.id))
             } catch {
                 MuxaLog.app.error(
                     "session creation failed: \(error.localizedDescription, privacy: .public)"
@@ -625,17 +683,319 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func presentWorkStart() {
+    func presentWorkStart(pipeline: String? = nil, host: String? = nil) {
         workStartError = nil
         workStartStatus = nil
+        workStartPlan = nil
+        workStartPreselectedPipeline = pipeline
+        workStartPreselectedHost = host
         isPresentingWorkStart = true
+        Task { [weak self] in await self?.loadWorkOptions(host: host) }
+    }
+
+    /// Alias of the local fleet host, or "local" before the snapshot arrives.
+    var localHostAlias: String {
+        fleetHosts.first(where: \.local)?.alias ?? "local"
+    }
+
+    func isLocalHost(_ alias: String?) -> Bool {
+        guard let alias, !alias.isEmpty else { return true }
+        return fleetHosts.first { $0.alias == alias }?.local ?? (alias == "local")
+    }
+
+    /// Hosts that can start Work: the local host plus control-mode hosts.
+    var workCapableHosts: [MuxaFleetHost] {
+        fleetHosts.filter { $0.local || $0.mode == "control" }
+            .sorted { left, right in
+                if left.local != right.local { return left.local }
+                return left.alias.localizedStandardCompare(right.alias) == .orderedAscending
+            }
+    }
+
+    /// Work options for a host: the local copy for the local host, else the
+    /// per-host cache.
+    func workOptions(for host: String?) -> MuxaWorkOptions? {
+        isLocalHost(host) ? workOptions : workOptionsByHost[host ?? ""]
+    }
+
+    func workOptionsError(for host: String?) -> String? {
+        isLocalHost(host) ? workOptionsError : workOptionsErrorsByHost[host ?? ""]
+    }
+
+    /// Runs one allowlisted `muxa work …` subcommand and returns its stdout.
+    /// The daemon path (`work_command`) reaches fleet hosts; an older daemon
+    /// without it still serves the local host through the bundled CLI.
+    func runWorkCommand(
+        host: String?,
+        arguments: [String],
+        stdin: String? = nil
+    ) async throws -> String {
+        let local = isLocalHost(host)
+        if await client.supports(MuxaIPCClient.workCommandCapability) {
+            let output = try await client.workCommand(
+                host: local ? nil : host,
+                arguments: arguments,
+                stdin: stdin
+            )
+            guard output.exitCode == 0 else {
+                let detail = output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                let command = arguments.prefix(3).joined(separator: " ")
+                throw MuxaIPCError.server(
+                    detail.isEmpty
+                        ? String(localized: "muxa \(command) exited with \(output.exitCode)")
+                        : detail
+                )
+            }
+            return output.stdout
+        }
+        guard local else {
+            let target = host ?? String(localized: "a remote host")
+            throw MuxaIPCError.server(
+                String(localized: "Running Work commands on \(target) needs the updated muxad; choose Use Bundled muxad or restart it")
+            )
+        }
+        return try await Self.runBundledMuxa(
+            arguments: arguments,
+            socketPath: client.socketPath,
+            input: stdin
+        )
+    }
+
+    /// Reads routes, pipelines, message skills, and presets for one host
+    /// through the canonical CLI so the Start Work form and the Command
+    /// Center can offer real choices. The config file on that host is the
+    /// source of truth, so this is a fresh read every time.
+    func loadWorkOptions(host: String? = nil) async {
+        let local = isLocalHost(host)
+        if local {
+            guard !isLoadingWorkOptions else { return }
+            isLoadingWorkOptions = true
+        }
+        defer { if local { isLoadingWorkOptions = false } }
+        supportsHostWorkCommands = await client.supports(MuxaIPCClient.workCommandCapability)
+        do {
+            let output = try await runWorkCommand(host: host, arguments: ["work", "options", "--json"])
+            let decoded = try MuxaWorkOptions.decode(Data(output.utf8))
+            if local {
+                if workOptions != decoded { workOptions = decoded }
+                workOptionsError = nil
+            } else if let host {
+                if workOptionsByHost[host] != decoded { workOptionsByHost[host] = decoded }
+                workOptionsErrorsByHost[host] = nil
+            }
+        } catch {
+            MuxaLog.app.warning(
+                "work options unavailable on \(host ?? "local", privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+            if local {
+                workOptionsError = error.localizedDescription
+            } else if let host {
+                workOptionsErrorsByHost[host] = error.localizedDescription
+            }
+        }
+    }
+
+    /// Writes one of muxa's built-in pipeline presets into a host's config
+    /// through the canonical CLI (`muxa work preset apply`). A catch-all
+    /// route is added only when that config has no route yet, so an existing
+    /// routing table is never reordered from the app.
+    func applyWorkPreset(_ name: String, host: String? = nil) async -> Bool {
+        guard !isApplyingWorkPreset else { return false }
+        isApplyingWorkPreset = true
+        defer { isApplyingWorkPreset = false }
+        var arguments = ["work", "preset", "apply", name, "--json"]
+        if workOptions(for: host)?.routes.isEmpty ?? true {
+            arguments += ["--route", ".*"]
+        }
+        do {
+            _ = try await runWorkCommand(host: host, arguments: arguments)
+            setWorkOptionsError(nil, host: host)
+            workStartError = nil
+            await loadWorkOptions(host: host)
+            return true
+        } catch {
+            MuxaLog.app.error(
+                "work preset apply failed: \(error.localizedDescription, privacy: .public)"
+            )
+            setWorkOptionsError(error.localizedDescription, host: host)
+            return false
+        }
+    }
+
+    /// Loads the local library and every control host's options together,
+    /// so sync badges and per-host routes are ready in one pass.
+    func loadAllWorkOptions() async {
+        await loadWorkOptions(host: nil)
+        let hosts = workCapableHosts.filter { !$0.local }.map(\.alias)
+        guard !hosts.isEmpty else { return }
+        // One child task per host: each awaits its own remote command, so
+        // the reads overlap instead of running host after host.
+        let reads = hosts.map { host in
+            Task { @MainActor [weak self] in await self?.loadWorkOptions(host: host) }
+        }
+        for read in reads { await read.value }
+    }
+
+    /// Sync state of one library pipeline on every control host.
+    func pipelineHostStates(for pipeline: MuxaWorkOptions.Pipeline) -> [MuxaPipelineHostState] {
+        workCapableHosts.filter { !$0.local }.map { host in
+            MuxaPipelineHostState(
+                host: host.alias,
+                state: .compare(library: pipeline, hostOptions: workOptionsByHost[host.alias])
+            )
+        }
+    }
+
+    /// Pipelines that exist on a host but not in the local library.
+    var remoteOnlyPipelines: [(host: String, pipeline: MuxaWorkOptions.Pipeline)] {
+        let local = Set(workOptions?.pipelines.map(\.name) ?? [])
+        return workCapableHosts.filter { !$0.local }.flatMap { host in
+            (workOptionsByHost[host.alias]?.pipelines ?? [])
+                .filter { !local.contains($0.name) }
+                .map { (host: host.alias, pipeline: $0) }
+        }
+    }
+
+    /// Pushes the library definition of `pipeline` to every host where it is
+    /// missing or differs. Pipelines are small, portable TOML; routes stay
+    /// per host because they carry that host's folders.
+    func syncPipeline(_ pipeline: MuxaWorkOptions.Pipeline, to hosts: [String]? = nil) async -> [String: String] {
+        let targets = hosts ?? pipelineHostStates(for: pipeline).filter(\.needsSync).map(\.host)
+        var failures: [String: String] = [:]
+        let definition = MuxaPipelineDefinition(pipeline)
+        for host in targets {
+            if !(await savePipeline(definition, named: pipeline.name, host: host)) {
+                failures[host] = pipelineEditorError ?? String(localized: "unknown error")
+            }
+        }
+        pipelineEditorError = nil
+        return failures
+    }
+
+    /// Syncs every library pipeline; returns per-host failures.
+    func syncAllPipelines() async -> [String: String] {
+        var failures: [String: String] = [:]
+        for pipeline in workOptions?.pipelines ?? [] {
+            for (host, error) in await syncPipeline(pipeline) {
+                failures["\(host)/\(pipeline.name)"] = error
+            }
+        }
+        return failures
+    }
+
+    private func setWorkOptionsError(_ message: String?, host: String?) {
+        if isLocalHost(host) {
+            workOptionsError = message
+        } else if let host {
+            workOptionsErrorsByHost[host] = message
+        }
+    }
+
+    func presentPipelineEditor(host: String?, pipeline: MuxaWorkOptions.Pipeline?) {
+        pipelineEditorError = nil
+        pipelineEditorTarget = MuxaPipelineEditorTarget(
+            host: isLocalHost(host) ? nil : host,
+            pipeline: pipeline
+        )
+    }
+
+    /// Saves an edited or new pipeline into the host's config through
+    /// `muxa work pipeline set <name> --from-json -`.
+    func savePipeline(
+        _ definition: MuxaPipelineDefinition,
+        named name: String,
+        host: String?
+    ) async -> Bool {
+        guard !isSavingPipeline else { return false }
+        isSavingPipeline = true
+        pipelineEditorError = nil
+        defer { isSavingPipeline = false }
+        do {
+            let json = try definition.jsonString()
+            _ = try await runWorkCommand(
+                host: host,
+                arguments: ["work", "pipeline", "set", name, "--from-json", "-", "--json"],
+                stdin: json
+            )
+            await loadWorkOptions(host: host)
+            return true
+        } catch {
+            MuxaLog.app.error("pipeline save failed: \(error.localizedDescription, privacy: .public)")
+            pipelineEditorError = error.localizedDescription
+            return false
+        }
+    }
+
+    func removePipeline(named name: String, host: String?, force: Bool) async -> Bool {
+        guard !isSavingPipeline else { return false }
+        isSavingPipeline = true
+        pipelineEditorError = nil
+        defer { isSavingPipeline = false }
+        var arguments = ["work", "pipeline", "remove", name, "--json"]
+        if force { arguments.append("--force") }
+        do {
+            _ = try await runWorkCommand(host: host, arguments: arguments)
+            await loadWorkOptions(host: host)
+            return true
+        } catch {
+            pipelineEditorError = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Upserts a `[[route]]` by its match text through `muxa work route set`.
+    func setRoute(_ route: MuxaWorkRouteEdit, host: String?) async -> Bool {
+        var arguments = ["work", "route", "set", "--match", route.match, "--json"]
+        if route.pipeline.isEmpty {
+            if route.existing { arguments.append("--clear-pipeline") }
+        } else {
+            arguments += ["--pipeline", route.pipeline]
+        }
+        if route.workspace.isEmpty {
+            if route.existing { arguments.append("--clear-workspace") }
+        } else {
+            arguments += ["--workspace", route.workspace]
+        }
+        if route.cwd.isEmpty {
+            if route.existing { arguments.append("--clear-cwd") }
+        } else {
+            arguments += ["--cwd", route.cwd]
+        }
+        if let position = route.position { arguments += ["--position", String(position)] }
+        do {
+            _ = try await runWorkCommand(host: host, arguments: arguments)
+            setWorkOptionsError(nil, host: host)
+            await loadWorkOptions(host: host)
+            return true
+        } catch {
+            setWorkOptionsError(error.localizedDescription, host: host)
+            return false
+        }
+    }
+
+    func removeRoute(match: String, host: String?) async -> Bool {
+        do {
+            _ = try await runWorkCommand(
+                host: host,
+                arguments: ["work", "route", "remove", "--match", match, "--json"]
+            )
+            setWorkOptionsError(nil, host: host)
+            await loadWorkOptions(host: host)
+            return true
+        } catch {
+            setWorkOptionsError(error.localizedDescription, host: host)
+            return false
+        }
     }
 
     func startWork(_ request: MuxaWorkStartRequest) async -> Bool {
         guard isConnected, !isStartingWork else { return false }
         isStartingWork = true
         workStartError = nil
-        workStartStatus = "Submitting Work to muxad…"
+        workStartPlan = nil
+        workStartStatus = request.dryRun
+            ? String(localized: "Building the Work plan…")
+            : String(localized: "Submitting Work to muxad…")
         defer { isStartingWork = false }
         do {
             var operation = try await client.startWork(request)
@@ -650,8 +1010,14 @@ final class AppModel: ObservableObject {
                 return false
             }
             await refresh()
-            if operation.result?.dryRun != true,
-               let result = operation.result {
+            if request.dryRun || operation.result?.dryRun == true {
+                // A plan is something to read, not a reason to close the
+                // sheet: keep it open with the steps muxad would take.
+                workStartPlan = operation.result
+                workStartStatus = operation.message
+                return false
+            }
+            if let result = operation.result {
                 let identity = MuxaWorkIdentity(
                     workspaceID: result.workspace,
                     workID: result.work
@@ -666,7 +1032,7 @@ final class AppModel: ObservableObject {
             }
             return true
         } catch is CancellationError {
-            workStartError = "The app stopped waiting, but muxad may still be running this Work operation."
+            workStartError = String(localized: "The app stopped waiting, but muxad may still be running this Work operation.")
             return false
         } catch {
             MuxaLog.app.error(
@@ -684,7 +1050,7 @@ final class AppModel: ObservableObject {
         guard isConnected, !isCreatingSession else { return false }
         isCreatingSession = true
         workStartError = nil
-        workStartStatus = "Opening the Work pipeline setup wizard…"
+        workStartStatus = String(localized: "Opening the Work pipeline setup wizard…")
         defer { isCreatingSession = false }
         do {
             let bundled = Bundle.main.bundleURL
@@ -806,7 +1172,7 @@ final class AppModel: ObservableObject {
                 askConfigurationPendingReload = true
             }
             askEnabled = false
-            askSettingsStatus = "Global Ask is enabled in config. Reloading muxad applies the grant."
+            askSettingsStatus = String(localized: "Global Ask is enabled in config. Reloading muxad applies the grant.")
             if sessions.contains(where: { !$0.exited }) {
                 isConfirmingDaemonReplacement = true
             } else {
@@ -858,17 +1224,11 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func presentAskSettings() {
-        askSettingsError = nil
-        askSettingsStatus = nil
-        isPresentingAskSettings = true
-    }
-
     func saveProviderKey(_ key: String, provider: MuxaAskProvider) -> Bool {
         askSettingsError = nil
         do {
             try MuxaProviderCredentialStore.save(key, for: provider)
-            askSettingsStatus = "Saved \(provider.title) key in the login Keychain. It will be passed only to the next matching Ask process."
+            askSettingsStatus = String(localized: "Saved \(provider.title) key in the login Keychain. It will be passed only to the next matching Ask process.")
             return true
         } catch {
             askSettingsError = error.localizedDescription
@@ -880,21 +1240,26 @@ final class AppModel: ObservableObject {
         askSettingsError = nil
         do {
             try MuxaProviderCredentialStore.remove(for: provider)
-            askSettingsStatus = "Removed the \(provider.title) API key. Future Ask processes will use CLI sign-in or their inherited environment."
+            askSettingsStatus = String(localized: "Removed the \(provider.title) API key. Future Ask processes will use CLI sign-in or their inherited environment.")
         } catch {
             askSettingsError = error.localizedDescription
         }
     }
 
-    func requestDaemonRestartForProviderSettings() {
-        isPresentingAskSettings = false
-        isConfirmingDaemonReplacement = true
-    }
-
+    /// Opens the provider's CLI sign-in in a native shell. The executable
+    /// is looked up the same way the Providers pane detects it (login-shell
+    /// PATH plus the usual per-user install folders), so a CLI the pane
+    /// shows as installed can always be launched from here.
     func openProviderCLI(_ provider: MuxaAskProvider) async {
         askSettingsError = nil
-        guard let executable = MuxaExecutableResolver.executablePath(provider.executable) else {
-            askSettingsError = "\(provider.title) CLI was not found in ~/.local/bin, Homebrew, or PATH."
+        let name = provider.executable
+        let executable: String
+        if let resolved = MuxaExecutableResolver.executablePath(name) {
+            executable = resolved
+        } else if let resolved = InstalledTools.resolve(name, in: await InstalledTools.searchDirectories()) {
+            executable = resolved
+        } else {
+            askSettingsError = String(localized: "\(provider.title) CLI was not found on your PATH or in the usual install folders.")
             return
         }
         do {
@@ -903,14 +1268,13 @@ final class AppModel: ObservableObject {
                 command: executable,
                 arguments: arguments,
                 cwd: FileManager.default.homeDirectoryForCurrentUser.path,
-                name: provider == .codex ? "Codex Login" : "Claude Code Login",
+                name: String(localized: "\(provider.title) Login"),
                 environment: MuxaProviderCredentialStore.environment(
                     ProcessInfo.processInfo.environment,
                     for: provider
                 )
             )
             await refresh()
-            isPresentingAskSettings = false
             select(.shell(session.id))
         } catch {
             askSettingsError = error.localizedDescription
@@ -921,7 +1285,15 @@ final class AppModel: ObservableObject {
         await refreshOperatorInbox(force: force, hostAliases: nil)
     }
 
-    private func refreshOperatorInbox(
+    /// Reads the console mailbox of every reachable host, or only of
+    /// `hostAliases` when given. Hosts are independent: a host whose read
+    /// fails keeps the messages it delivered earlier and is recorded in
+    /// `inboxHostFailures` until a later read of that same host succeeds.
+    /// Only a full refresh prunes hosts, and only hosts that are no longer
+    /// registered at all; a registered host that is merely offline or timing
+    /// out keeps its history so a transient failure never empties its part of
+    /// the Inbox. Internal (not private) so the contract can be unit-tested.
+    func refreshOperatorInbox(
         force: Bool,
         hostAliases: Set<String>?
     ) async {
@@ -938,12 +1310,18 @@ final class AppModel: ObservableObject {
         let targets = hostAliases.map { aliases in
             allTargets.filter { aliases.contains($0.host.alias) }
         } ?? allTargets
-        let liveAliases = Set(targets.map(\.host.alias))
         var messagesByHost = Dictionary(grouping: operatorMessages) { $0.host.alias }
+        var failures = inboxHostFailures
         if hostAliases == nil {
-            messagesByHost = messagesByHost.filter { liveAliases.contains($0.key) }
+            // An empty host list means the fleet snapshot itself is missing
+            // (the local host is always registered), so keep everything
+            // rather than treating that as "every host was unregistered".
+            let registered = Set(executionSnapshot.hosts.map(\.alias))
+            if !registered.isEmpty {
+                messagesByHost = messagesByHost.filter { registered.contains($0.key) }
+                failures = failures.filter { registered.contains($0.key) }
+            }
         }
-        var failures: [String] = []
 
         let results = await withTaskGroup(of: MuxaInboxFetch.self) { group in
             for target in targets {
@@ -980,8 +1358,11 @@ final class AppModel: ObservableObject {
                         request: request
                     )
                 }
+                failures[target.host.alias] = nil
             } else if let error = result.error {
-                failures.append("\(target.host.alias): \(error)")
+                // Leave messagesByHost[alias] untouched: the last successful
+                // read stays visible while the host is unreachable.
+                failures[target.host.alias] = error
             }
         }
 
@@ -994,7 +1375,7 @@ final class AppModel: ObservableObject {
                 return lhs.id < rhs.id
             }
         if operatorMessages != updatedMessages { operatorMessages = updatedMessages }
-        if !failures.isEmpty { inboxError = failures.joined(separator: "\n") }
+        if inboxHostFailures != failures { inboxHostFailures = failures }
     }
 
     func openOperatorMessage(_ message: MuxaOperatorMessage) {
@@ -1002,7 +1383,7 @@ final class AppModel: ObservableObject {
             for: message,
             in: executionSnapshot
         ) else {
-            inboxError = "\(message.request.to.label) is no longer present on \(message.host.alias). The conversation is still available, but its live agent cannot be opened."
+            inboxError = String(localized: "\(message.request.to.label) is no longer present on \(message.host.alias). The conversation is still available, but its live agent cannot be opened.")
             return
         }
         inboxError = nil
@@ -1090,14 +1471,27 @@ final class AppModel: ObservableObject {
         return nil
     }
 
+    /// Marks a reply read through the durable collaboration get operation.
+    /// muxad stamps `reply_read_at` on the returned request, so it replaces
+    /// the message in place immediately (a refresh that is already in flight
+    /// would otherwise make the "New Reply" badge linger). The follow-up
+    /// refresh is limited to the message's own host instead of re-reading
+    /// every mailbox in the fleet.
     func markOperatorMessageRead(_ message: MuxaOperatorMessage) async {
         do {
-            _ = try await client.collaborationRequest(
+            let updated = try await client.collaborationRequest(
                 host: message.host,
                 pane: message.routePane,
                 requestID: message.request.id
             )
-            await refreshOperatorInbox(force: true)
+            if let index = operatorMessages.firstIndex(where: { $0.id == message.id }) {
+                operatorMessages[index] = MuxaOperatorMessage(
+                    host: message.host,
+                    routePane: message.routePane,
+                    request: updated
+                )
+            }
+            await refreshOperatorInbox(force: true, hostAliases: [message.host.alias])
         } catch {
             inboxError = error.localizedDescription
         }
@@ -1117,7 +1511,7 @@ final class AppModel: ObservableObject {
         let alias = request.alias.trimmingCharacters(in: .whitespacesAndNewlines)
         let ssh = request.ssh.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !alias.isEmpty, !ssh.isEmpty else {
-            hostRegistrationError = "Host alias and SSH target are required."
+            hostRegistrationError = String(localized: "Host alias and SSH target are required.")
             return false
         }
         isRegisteringHost = true
@@ -1145,7 +1539,8 @@ final class AppModel: ObservableObject {
 
     nonisolated private static func runBundledMuxa(
         arguments: [String],
-        socketPath: String
+        socketPath: String,
+        input: String? = nil
     ) async throws -> String {
         let bundled = Bundle.main.bundleURL
             .appendingPathComponent("Contents", isDirectory: true)
@@ -1163,7 +1558,13 @@ final class AppModel: ObservableObject {
             let errors = Pipe()
             process.standardOutput = output
             process.standardError = errors
+            let stdin = Pipe()
+            process.standardInput = input == nil ? FileHandle.nullDevice : stdin
             try process.run()
+            if let input {
+                stdin.fileHandleForWriting.write(Data(input.utf8))
+                try? stdin.fileHandleForWriting.close()
+            }
             process.waitUntilExit()
             let standardOutput = output.fileHandleForReading.readDataToEndOfFile()
             let standardError = errors.fileHandleForReading.readDataToEndOfFile()
@@ -1171,7 +1572,10 @@ final class AppModel: ObservableObject {
             let errorMessage = String(data: standardError, encoding: .utf8) ?? ""
             guard process.terminationStatus == 0 else {
                 let reason = errorMessage.isEmpty ? message : errorMessage
-                throw MuxaIPCError.server(reason.isEmpty ? "Host registration failed" : reason)
+                let command = arguments.prefix(2).joined(separator: " ")
+                throw MuxaIPCError.server(
+                    reason.isEmpty ? String(localized: "muxa \(command) failed") : reason
+                )
             }
             return message
         }.value
@@ -1248,7 +1652,7 @@ final class AppModel: ObservableObject {
         ]
         let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         guard let value = String(data: data, encoding: .utf8) else {
-            throw MuxaIPCError.server("Could not encode the exact Fleet pane address")
+            throw MuxaIPCError.server("Could not encode the exact pane address")
         }
         return value
     }
@@ -1257,6 +1661,9 @@ final class AppModel: ObservableObject {
         // Like VS Code's Activity Bar, this changes the visible view
         // container without replacing whichever editor tab is active.
         sidebarMode = mode
+        if mode == .inbox, isConnected {
+            Task { [weak self] in await self?.refreshOperatorInbox() }
+        }
     }
 
     func selectWatchPane(_ id: MuxaWatchPaneIdentity) {
@@ -1327,10 +1734,38 @@ final class AppModel: ObservableObject {
     }
 
     private func reconcileSelection() {
-        if let sidebarSelection, isSelectionAvailable(sidebarSelection) { return }
+        guard let sidebarSelection else {
+            // Nothing selected: the Shells tab may legitimately be empty (or
+            // show only exited shells); every other mode falls back to the
+            // Work board.
+            if sidebarMode != .shells {
+                sidebarMode = .work
+                self.sidebarSelection = .workBoard
+            }
+            return
+        }
+        if isSelectionAvailable(sidebarSelection) { return }
+        if sidebarMode == .shells {
+            // A shell that exited stays listed in the tab until the user
+            // removes it; losing the selection must not throw the user out
+            // of the Shells tab.
+            self.sidebarSelection = nil
+            return
+        }
 
         sidebarMode = .work
-        sidebarSelection = .workBoard
+        self.sidebarSelection = .workBoard
+    }
+
+    /// Lists a session muxad just spawned and selects it right away. A
+    /// `refresh()` that is already in flight would otherwise return before
+    /// the new session is known, and the editor showed an empty placeholder
+    /// until the next 15 s refresh.
+    func registerSpawnedSession(_ session: MuxaSession) {
+        if !sessions.contains(where: { $0.id == session.id }) {
+            sessions.append(session)
+        }
+        select(.shell(session.id))
     }
 
     private func reconcileWatchSelection() {

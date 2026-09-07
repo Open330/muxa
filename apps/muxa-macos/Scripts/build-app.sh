@@ -14,6 +14,14 @@ CONFIGURATION=${CONFIGURATION:-Debug}
     xcodegen generate
 )
 
+# The version the release carries lives in Cargo.toml, not in project.yml —
+# muxa the daemon and Muxa the app ship together and must not disagree about
+# which release a user is running. Callers that know the version pass it in.
+VERSION_SETTING=()
+if [ -n "${MUXA_MARKETING_VERSION:-}" ]; then
+    VERSION_SETTING=(MARKETING_VERSION="$MUXA_MARKETING_VERSION")
+fi
+
 xcodebuild \
     -project "$APP_DIR/Muxa.xcodeproj" \
     -scheme Muxa \
@@ -21,6 +29,7 @@ xcodebuild \
     -derivedDataPath "$DERIVED_DATA" \
     -destination 'platform=macOS' \
     CODE_SIGNING_ALLOWED=NO \
+    ${VERSION_SETTING[@]+"${VERSION_SETTING[@]}"} \
     build
 
 APP_PATH="$DERIVED_DATA/Build/Products/$CONFIGURATION/Muxa.app"

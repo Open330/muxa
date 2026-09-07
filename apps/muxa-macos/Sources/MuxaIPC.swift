@@ -11,13 +11,42 @@ enum MuxaIPCError: LocalizedError {
     case incompatibleProtocol(minimum: UInt32?, maximum: UInt32?)
     case missingField(String)
     case invalidBase64
+    /// A failure that reached muxad, so the request must not be replayed.
+    indirect case afterRequestReached(MuxaIPCError)
+
+    /// True while the request provably never reached muxad: the connect or
+    /// the write failed on a socket muxad had already dropped.
+    var isReconnectable: Bool {
+        switch self {
+        case .posix(let operation, let code):
+            (operation == "connect" || operation == "write" || operation == "socket")
+                && [EPIPE, ECONNRESET, ECONNREFUSED, ENOENT].contains(code)
+        default:
+            false
+        }
+    }
+
+    /// The same error, marked as "muxad may have seen this", so a caller
+    /// that retries connection failures leaves it alone.
+    var notReconnectable: MuxaIPCError {
+        if case .afterRequestReached = self { return self }
+        return .afterRequestReached(self)
+    }
 
     var errorDescription: String? {
         switch self {
         case .invalidSocketPath(let path):
             "The muxad socket path is too long: \(path)"
         case .posix(let operation, let code):
-            "\(operation) failed: \(String(cString: strerror(code)))"
+            // A dropped connection almost always means muxad restarted (its
+            // own binary watch re-execs it, and an app update replaces it),
+            // so say that rather than handing over an errno.
+            switch code {
+            case EPIPE, ECONNRESET, ECONNREFUSED, ENOENT:
+                "muxad is not answering — it may be restarting. Try again in a moment."
+            default:
+                "\(operation) failed: \(String(cString: strerror(code)))"
+            }
         case .responseTooLarge:
             "muxad returned an oversized IPC response"
         case .emptyResponse:
@@ -28,6 +57,8 @@ enum MuxaIPCError: LocalizedError {
             "Incompatible muxad protocol (server supports \(minimum.map(String.init) ?? "?")…\(maximum.map(String.init) ?? "?"), app requires \(MuxaIPCClient.protocolVersion))"
         case .missingField(let name):
             "muxad response is missing \(name)"
+        case .afterRequestReached(let underlying):
+            underlying.errorDescription
         case .invalidBase64:
             "muxad returned invalid byte-safe terminal data"
         }
@@ -108,17 +139,97 @@ struct MuxaWorkStartRequest: Hashable, Sendable {
     let body: String?
     let context: String?
     let dryRun: Bool
+    /// Fleet host alias to run `muxa work up` on; nil is the local host.
+    let host: String?
+
+    init(
+        work: String,
+        workspace: String?,
+        pipeline: String?,
+        cwd: String?,
+        external: String?,
+        skill: String?,
+        body: String?,
+        context: String?,
+        dryRun: Bool,
+        host: String? = nil
+    ) {
+        self.work = work
+        self.workspace = workspace
+        self.pipeline = pipeline
+        self.cwd = cwd
+        self.external = external
+        self.skill = skill
+        self.body = body
+        self.context = context
+        self.dryRun = dryRun
+        self.host = host
+    }
 }
 
-struct MuxaWorkStartResult: Decodable, Sendable {
+/// Output of one allowlisted `muxa work …` invocation run by muxad on the
+/// local host or on a fleet host (`work_command`).
+struct MuxaWorkCommandOutput: Decodable, Equatable, Sendable {
+    let exitCode: Int32
+    let stdout: String
+    let stderr: String
+
+    enum CodingKeys: String, CodingKey {
+        case stdout, stderr
+        case exitCode = "exit_code"
+    }
+}
+
+/// One step of `muxa work up`'s reconciliation plan: `launch` a missing
+/// pane, `reprompt` or `keep` a live one, `waiting` on an `after` edge, or
+/// `attention` when a person has to act first.
+struct MuxaWorkPlanStep: Decodable, Equatable, Sendable, Identifiable {
+    let action: String
+    let alias: String
+    let program: String?
+    let role: String?
+    let task: String?
+    let prompt: String?
+    let pane: String?
+    let state: String?
+    let waitingOn: [String]
+
+    var id: String { "\(action):\(alias)" }
+
+    enum CodingKeys: String, CodingKey {
+        case action, alias, program, role, task, prompt, pane, state
+        case waitingOn = "waiting_on"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        action = try values.decodeIfPresent(String.self, forKey: .action) ?? "launch"
+        alias = try values.decodeIfPresent(String.self, forKey: .alias) ?? ""
+        program = try values.decodeIfPresent(String.self, forKey: .program)
+        role = try values.decodeIfPresent(String.self, forKey: .role)
+        task = try values.decodeIfPresent(String.self, forKey: .task)
+        prompt = try values.decodeIfPresent(String.self, forKey: .prompt)
+        pane = try values.decodeIfPresent(String.self, forKey: .pane)
+        state = try values.decodeIfPresent(String.self, forKey: .state)
+        waitingOn = try values.decodeIfPresent([String].self, forKey: .waitingOn) ?? []
+    }
+}
+
+struct MuxaWorkPlan: Decodable, Equatable, Sendable {
+    let steps: [MuxaWorkPlanStep]
+}
+
+struct MuxaWorkStartResult: Decodable, Equatable, Sendable {
     let work: String
     let workspace: String
     let pipeline: String?
     let cwd: String?
     let dryRun: Bool?
+    let layout: String?
+    let plan: MuxaWorkPlan?
 
     enum CodingKeys: String, CodingKey {
-        case work, workspace, pipeline, cwd
+        case work, workspace, pipeline, cwd, layout, plan
         case dryRun = "dry_run"
     }
 }
@@ -620,6 +731,32 @@ struct MuxaAskConversationSnapshot: Sendable {
     let active: MuxaAskConversation?
 }
 
+/// One optional `[ask.providers.<id>]` key in an `ask_provider_configure`
+/// request: omitted from the request (`keep`), sent as JSON `null` so the
+/// daemon clears it, or set to a value.
+enum MuxaAskProviderFieldUpdate: Equatable, Sendable {
+    case keep
+    case clear
+    case set(String)
+
+    /// `nil` or blank clears; anything else sets the trimmed value.
+    init(_ value: String?) {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        self = trimmed.isEmpty ? .clear : .set(trimmed)
+    }
+
+    fileprivate func apply(to request: inout [String: Any], key: String) {
+        switch self {
+        case .keep:
+            break
+        case .clear:
+            request[key] = NSNull()
+        case .set(let value):
+            request[key] = value
+        }
+    }
+}
+
 struct MuxaCollaborationRoom: Decodable, Hashable, Sendable {
     let host: String
     let socket: String?
@@ -744,6 +881,8 @@ private struct MuxaIPCResponse: Decodable, Sendable {
     let askConversation: MuxaAskConversation?
     let askAgent: String?
     let askEnabled: Bool?
+    let askProviders: [MuxaAskProvider]?
+    let workCommand: MuxaWorkCommandOutput?
 
     enum CodingKeys: String, CodingKey {
         case ok, error, capabilities, agents, sessions, session, output, capture, fleet
@@ -751,6 +890,7 @@ private struct MuxaIPCResponse: Decodable, Sendable {
         case maxProtocol = "max_protocol"
         case fleetResult = "fleet_result"
         case pipelineRuns = "pipeline_runs"
+        case workCommand = "work_command"
         case workOperation = "work_operation"
         case askEntries = "ask_entries"
         case askEntry = "ask_entry"
@@ -758,6 +898,7 @@ private struct MuxaIPCResponse: Decodable, Sendable {
         case askConversation = "ask_conversation"
         case askAgent = "ask_agent"
         case askEnabled = "ask_enabled"
+        case askProviders = "ask_providers"
     }
 }
 
@@ -820,8 +961,10 @@ actor MuxaIPCClient {
     static let byteSafeCapability = "session_bytes_v1"
     static let attachmentIdentityCapability = "session_attachment_identity_v1"
     static let workControlCapability = "work_control_v1"
+    static let workCommandCapability = "work_command_v1"
     static let askCredentialCapability = "ask_one_turn_credential_v1"
     static let askConversationCapability = "ask_conversations_v1"
+    static let askProvidersCapability = "ask_providers_v1"
     static let fleetSubscribeCapability = "fleet_subscribe"
     static let sessionWaitCapability = "session_wait_v1"
     static let askSubscribeCapability = "ask_subscribe"
@@ -930,6 +1073,7 @@ actor MuxaIPCClient {
         Self.put(request.skill, key: "skill", in: &workRequest)
         Self.put(request.body, key: "body", in: &workRequest)
         Self.put(request.context, key: "context", in: &workRequest)
+        Self.put(request.host, key: "host", in: &workRequest)
         let response = try await call([
             "protocol": Self.protocolVersion,
             "kind": "work_up",
@@ -939,6 +1083,34 @@ actor MuxaIPCClient {
             throw MuxaIPCError.missingField("work_operation")
         }
         return operation
+    }
+
+    /// Runs one allowlisted `muxa work …` subcommand (options, preset,
+    /// pipeline, route) through muxad, locally or on a fleet host. Requires
+    /// `work_command_v1`; callers fall back to the bundled CLI for the local
+    /// host when an older daemon lacks it.
+    func workCommand(
+        host: String?,
+        arguments: [String],
+        stdin: String? = nil
+    ) async throws -> MuxaWorkCommandOutput {
+        guard capabilities.contains(Self.workCommandCapability) else {
+            throw MuxaIPCError.server(
+                "muxad does not support Work commands on hosts; update muxa and restart muxad"
+            )
+        }
+        var request: [String: Any] = [
+            "protocol": Self.protocolVersion,
+            "kind": "work_command",
+            "args": arguments,
+        ]
+        if let host, !host.isEmpty { request["host"] = host }
+        if let stdin { request["stdin"] = stdin }
+        let response = try await call(request, timeout: 40)
+        guard let output = response.workCommand else {
+            throw MuxaIPCError.missingField("work_command")
+        }
+        return output
     }
 
     func workOperation(id: String) async throws -> MuxaWorkOperation {
@@ -1003,7 +1175,7 @@ actor MuxaIPCClient {
                 throw MuxaIPCError.missingField("fleet_result")
             }
             guard result.accepted else {
-                throw MuxaIPCError.server(result.message ?? "Fleet capture was rejected")
+                throw MuxaIPCError.server(result.message ?? "Pane capture was rejected")
             }
             let rawBytes = result.captureRawBase64.flatMap { Data(base64Encoded: $0) }
             if result.captureRawBase64 != nil, rawBytes == nil {
@@ -1013,7 +1185,7 @@ actor MuxaIPCClient {
         }
 
         guard host.local else {
-            throw MuxaIPCError.server("Remote pane capture requires muxad Fleet support")
+            throw MuxaIPCError.server("Remote pane capture requires muxad multi-host support (fleet_v1)")
         }
         let response = try await call([
             "protocol": Self.protocolVersion,
@@ -1033,7 +1205,7 @@ actor MuxaIPCClient {
         submit: Bool = true
     ) async throws {
         guard capabilities.contains("fleet_v1") else {
-            throw MuxaIPCError.server("Prompt control requires muxad Fleet support")
+            throw MuxaIPCError.server("Prompt control requires muxad multi-host support (fleet_v1)")
         }
         let response = try await call([
             "protocol": Self.protocolVersion,
@@ -1050,7 +1222,7 @@ actor MuxaIPCClient {
             throw MuxaIPCError.missingField("fleet_result")
         }
         guard result.accepted else {
-            throw MuxaIPCError.server(result.message ?? "Fleet prompt was rejected")
+            throw MuxaIPCError.server(result.message ?? "Prompt was rejected")
         }
     }
 
@@ -1119,6 +1291,117 @@ actor MuxaIPCClient {
             "agent": agent,
         ])
         return response.askAgent ?? agent
+    }
+
+    /// The daemon's Ask providers (`ask_providers`, capability
+    /// `ask_providers_v1`). Callers fall back to `MuxaAskProvider.builtIn`
+    /// when the capability is absent; see `AskProviderStore.reload`.
+    func listAskProviders() async throws -> [MuxaAskProvider] {
+        guard capabilities.contains(Self.askProvidersCapability) else {
+            throw MuxaIPCError.server(
+                "The running muxad does not list Ask providers; update muxa or choose Use Bundled muxad"
+            )
+        }
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "ask_providers",
+        ])
+        guard let providers = response.askProviders else {
+            throw MuxaIPCError.missingField("ask_providers")
+        }
+        return providers
+    }
+
+    /// Writes `title` / `model` / `api_key_env` / `executable` under
+    /// `[ask.providers.<id>]` in the daemon's config and returns the
+    /// refreshed provider list. `.keep` leaves the key out of the request so
+    /// the daemon does not touch it, `.clear` sends null so it is removed.
+    func configureAskProvider(
+        _ providerID: String,
+        title: MuxaAskProviderFieldUpdate = .keep,
+        model: MuxaAskProviderFieldUpdate = .keep,
+        apiKeyEnv: MuxaAskProviderFieldUpdate = .keep,
+        executable: MuxaAskProviderFieldUpdate = .keep
+    ) async throws -> [MuxaAskProvider] {
+        guard capabilities.contains(Self.askProvidersCapability) else {
+            throw MuxaIPCError.server(
+                "The running muxad cannot configure Ask providers; update muxa or choose Use Bundled muxad"
+            )
+        }
+        var request: [String: Any] = [
+            "protocol": Self.protocolVersion,
+            "kind": "ask_provider_configure",
+            "provider": providerID,
+        ]
+        title.apply(to: &request, key: "title")
+        model.apply(to: &request, key: "model")
+        apiKeyEnv.apply(to: &request, key: "api_key_env")
+        executable.apply(to: &request, key: "executable")
+        let response = try await call(request, timeout: 10)
+        guard let providers = response.askProviders else {
+            throw MuxaIPCError.missingField("ask_providers")
+        }
+        return providers
+    }
+
+    /// Writes a new `[ask.providers.<id>]` entry (`ask_provider_add`) and
+    /// returns the refreshed list. `id` is the config key, the Ask agent
+    /// name and the Keychain account, so several instances of one engine
+    /// stay independent. Optional fields are sent only when non-empty; the
+    /// daemon refuses an id that is not a TOML bare key, an unknown engine,
+    /// and an id that is already configured.
+    func addAskProvider(
+        id providerID: String,
+        engine: String,
+        title: String? = nil,
+        model: String? = nil,
+        apiKeyEnv: String? = nil,
+        executable: String? = nil
+    ) async throws -> [MuxaAskProvider] {
+        guard capabilities.contains(Self.askProvidersCapability) else {
+            throw MuxaIPCError.server(
+                "The running muxad cannot add Ask providers; update muxa or choose Use Bundled muxad"
+            )
+        }
+        var request: [String: Any] = [
+            "protocol": Self.protocolVersion,
+            "kind": "ask_provider_add",
+            "id": providerID,
+            "engine": engine,
+        ]
+        for (key, value) in [
+            ("title", title), ("model", model),
+            ("api_key_env", apiKeyEnv), ("executable", executable),
+        ] {
+            if case .set(let text) = MuxaAskProviderFieldUpdate(value) {
+                request[key] = text
+            }
+        }
+        let response = try await call(request, timeout: 10)
+        guard let providers = response.askProviders else {
+            throw MuxaIPCError.missingField("ask_providers")
+        }
+        return providers
+    }
+
+    /// Deletes `[ask.providers.<id>]` (`ask_provider_remove`) and returns the
+    /// refreshed list. The daemon refuses a built-in that has no config entry
+    /// and re-points `[ask] agent` when it named the removed instance.
+    func removeAskProvider(_ providerID: String) async throws -> [MuxaAskProvider] {
+        guard capabilities.contains(Self.askProvidersCapability) else {
+            throw MuxaIPCError.server(
+                "The running muxad cannot remove Ask providers; update muxa or choose Use Bundled muxad"
+            )
+        }
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "ask_provider_remove",
+            "id": providerID,
+        ], timeout: 10)
+        guard let providers = response.askProviders else {
+            throw MuxaIPCError.missingField("ask_providers")
+        }
+        return providers
     }
 
     func sendAsk(
@@ -1321,7 +1604,7 @@ actor MuxaIPCClient {
     func fleetUpdates() throws -> AsyncThrowingStream<MuxaFleetUpdate, Error> {
         guard capabilities.contains(Self.fleetSubscribeCapability) else {
             throw MuxaIPCError.server(
-                "muxad does not support Fleet invalidation subscriptions; update muxa and restart muxad"
+                "muxad does not support host invalidation subscriptions; update muxa and restart muxad"
             )
         }
         let hello = try JSONSerialization.data(withJSONObject: [
@@ -1474,7 +1757,7 @@ actor MuxaIPCClient {
         requestTransport: SerializedIPCTransport? = nil
     ) async throws -> MuxaFleetCommandResult {
         guard capabilities.contains("fleet_v1") else {
-            throw MuxaIPCError.server("This operation requires muxad Fleet support")
+            throw MuxaIPCError.server("This operation requires muxad multi-host support (fleet_v1)")
         }
         let response = try await call(
             [
@@ -1489,7 +1772,7 @@ actor MuxaIPCClient {
             throw MuxaIPCError.missingField("fleet_result")
         }
         guard result.accepted else {
-            throw MuxaIPCError.server(result.message ?? "Fleet operation was rejected")
+            throw MuxaIPCError.server(result.message ?? "Host operation was rejected")
         }
         return result
     }
@@ -1556,16 +1839,44 @@ actor MuxaIPCClient {
 enum UnixSocket {
     private static let maximumResponseBytes = 8 * 1024 * 1024
 
+    /// One request, one connection. A failure to connect or to write means
+    /// the request never reached muxad — which is what a restart looks like
+    /// from here, and muxad restarts routinely (its binary watch re-execs
+    /// it, an app update replaces it). Those two are retried once after a
+    /// short pause. A failure while reading is never retried: the daemon may
+    /// already have applied the request.
     static func request(
         path: String,
         payload: Data,
         timeout: TimeInterval = 3
     ) throws -> Data {
+        var attempt = 0
+        while true {
+            do {
+                return try attemptRequest(path: path, payload: payload, timeout: timeout)
+            } catch let error as MuxaIPCError {
+                guard attempt == 0, error.isReconnectable else { throw error }
+                attempt += 1
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+        }
+    }
+
+    private static func attemptRequest(
+        path: String,
+        payload: Data,
+        timeout: TimeInterval
+    ) throws -> Data {
         let descriptor = try connect(path: path, timeout: timeout)
         defer { Darwin.close(descriptor) }
         try writeLine(descriptor: descriptor, payload: payload)
         var buffered = Data()
-        return try readLine(descriptor: descriptor, buffered: &buffered)
+        do {
+            return try readLine(descriptor: descriptor, buffered: &buffered)
+        } catch let error as MuxaIPCError {
+            // Mark a read failure so the retry above leaves it alone.
+            throw error.notReconnectable
+        }
     }
 
     static func subscribe(

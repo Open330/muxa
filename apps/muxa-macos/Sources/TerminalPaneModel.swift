@@ -9,8 +9,6 @@ final class TerminalPaneModel: ObservableObject {
     @Published private(set) var outputWasTruncated = false
     @Published private(set) var exited = false
     @Published private(set) var exitStatus: Int32?
-    @Published private(set) var rawOutputText = "Waiting for PTY output…"
-    @Published private(set) var rawOutputByteCount = 0
 
     private let client: MuxaIPCClient
     private let sessionID: String
@@ -22,11 +20,6 @@ final class TerminalPaneModel: ObservableObject {
     private var detachTask: Task<Void, Never>?
     private var lifecycleGeneration: UInt64 = 0
     private var attachedGeneration: UInt64?
-    private var rawOutput = Data()
-    private var rawDisplayEnabled = false
-    private var lastRawPublish = Date.distantPast
-
-    private static let maximumRawOutputBytes = 256 * 1024
 
     init(client: MuxaIPCClient, sessionID: String, replayInitialHistory: Bool) {
         self.client = client
@@ -110,15 +103,6 @@ final class TerminalPaneModel: ObservableObject {
         }
     }
 
-    func setRawDisplayEnabled(_ enabled: Bool) {
-        rawDisplayEnabled = enabled
-        if enabled {
-            publishRawOutput()
-        } else {
-            terminalState.requestFocus()
-        }
-    }
-
     private func poll(generation: UInt64) async {
         do {
             try Task.checkCancellation()
@@ -154,7 +138,6 @@ final class TerminalPaneModel: ObservableObject {
                 }
                 if output.truncated { outputWasTruncated = true }
                 if !bytes.isEmpty {
-                    appendRawOutput(bytes)
                     if shouldReplayInitialHistory {
                         terminalSession.replay(bytes)
                     } else {
@@ -176,7 +159,6 @@ final class TerminalPaneModel: ObservableObject {
                     // normal `exit 0`. Keep the final grid intact and let the
                     // native host present the terminal state instead.
                     await ioPump.setActive(false)
-                    if rawDisplayEnabled { publishRawOutput() }
                     break
                 }
             } catch is CancellationError {
@@ -194,25 +176,5 @@ final class TerminalPaneModel: ObservableObject {
             MuxaLog.terminal.error("terminal polling failed: \(message, privacy: .public)")
         }
         errorMessage = message
-    }
-
-    private func appendRawOutput(_ bytes: Data) {
-        rawOutput.append(bytes)
-        if rawOutput.count > Self.maximumRawOutputBytes {
-            rawOutput.removeFirst(rawOutput.count - Self.maximumRawOutputBytes)
-        }
-        guard rawDisplayEnabled else { return }
-        let now = Date()
-        if now.timeIntervalSince(lastRawPublish) >= 0.12 {
-            publishRawOutput(now: now)
-        }
-    }
-
-    private func publishRawOutput(now: Date = Date()) {
-        rawOutputText = rawOutput.isEmpty
-            ? "Waiting for PTY output…"
-            : terminalRawDescription(rawOutput)
-        rawOutputByteCount = rawOutput.count
-        lastRawPublish = now
     }
 }

@@ -17,6 +17,11 @@ muxa activity --since today --type human
 muxa activity --since today --type agent --format json
 ```
 
+Session groups in `muxa stats` and `muxa report` fold generated views such as
+`callabo~view~123` into `callabo`, including retained history. Grouping happens
+before sorting and limiting rows. Overlapping human-presence intervals and
+ACT/WACT time are not counted twice for those views; agent work remains additive.
+
 `--since` accepts:
 
 - `today`: local calendar day from 00:00 to now.

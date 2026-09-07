@@ -33,6 +33,14 @@ pub enum Action {
     },
     /// Delete a file (currently only the systemd unit on uninstall).
     DeleteFile { component: Component, path: PathBuf },
+    /// Only change an absent link or remove the exact recorded link.
+    ManageSymlink {
+        path: PathBuf,
+        target: PathBuf,
+        remove: bool,
+    },
+    /// Remove a bundle asset only if it still contains the installed bytes.
+    RemoveOwnedFile { path: PathBuf, expected: String },
     /// Run `systemctl --user enable --now muxad.service`.
     EnableSystemdUnit,
     /// Run `systemctl --user disable --now muxad.service`.
@@ -73,6 +81,8 @@ impl Plan {
         self.actions.iter().any(|a| match a {
             Action::EditFile { outcome, .. } => outcome.changed(),
             Action::DeleteFile { .. }
+            | Action::ManageSymlink { .. }
+            | Action::RemoveOwnedFile { .. }
             | Action::EnableSystemdUnit
             | Action::DisableSystemdUnit
             | Action::EnableLaunchdUnit { .. }
@@ -98,6 +108,8 @@ pub fn build(
 
     for c in &comps {
         match c {
+            // These share a manifest and are planned together after ordinary edits.
+            Component::AgentInstructions | Component::AgentSkills | Component::AgentMcp => {}
             Component::TmuxPopup
             | Component::TmuxStatusLine
             | Component::TmuxPeek
@@ -314,13 +326,20 @@ fn needs_socket_pin(socket: &Path, default_socket: &Path) -> bool {
 /// Returning the pending text as `before` also keeps the chain honest: the
 /// backup `apply` takes is the file as it stood a moment earlier, and the
 /// dry-run diff for each component shows only that component's change.
-fn file_base(actions: &[Action], path: &Path) -> Result<(Option<String>, String)> {
+pub(super) fn file_base(actions: &[Action], path: &Path) -> Result<(Option<String>, String)> {
+    let resolved = std::fs::canonicalize(path).ok();
     let pending = actions.iter().rev().find_map(|action| match action {
         Action::EditFile {
             path: planned,
             after,
             ..
-        } if planned == path => Some(after.clone()),
+        } if planned == path
+            || resolved.as_ref().is_some_and(|target| {
+                std::fs::canonicalize(planned).ok().as_ref() == Some(target)
+            }) =>
+        {
+            Some(after.clone())
+        }
         _ => None,
     });
     if let Some(pending) = pending {

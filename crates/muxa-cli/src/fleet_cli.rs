@@ -18,6 +18,7 @@ use muxa::fleet::{
     FLEET_PROTOCOL_VERSION, LOCAL_HOST_ALIAS, LOCAL_MANAGED_LABELS,
 };
 use muxa::ipc::Client;
+use muxa::work_control::shell_quote;
 use muxa::{Config, PaneKey};
 use tokio::io::BufReader;
 use tokio::process::Command;
@@ -645,9 +646,11 @@ pub(crate) fn attach_exact(
         command.arg("--socket").arg(socket);
     }
     command.args(["fleet-remote-attach", &token]);
-    let status = command.status()?;
-    if !status.success() {
-        bail!("remote attach exited with {status}");
+    // A hang-up of our own terminal is forwarded to ssh so the remote client
+    // detaches, and `_fit_guard` then restores the remote window from here.
+    let exit = crate::interactive_child::run_interactive(&mut command)?;
+    if !exit.is_clean_detach() {
+        bail!("remote attach exited with {}", exit.status);
     }
     Ok(())
 }
@@ -876,10 +879,6 @@ fn remote_tmux_command(
         &remote,
     ]);
     command
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 async fn doctor(client: &Client, cfg: &Config, alias: &str, timeout: Duration) -> Result<()> {

@@ -20,6 +20,7 @@ use muxa::fleet::{
 };
 use muxa::ipc::Client;
 use muxa::tmux::SessionInfo;
+use muxa::work_control::{self, WorkCommandLimits, WorkCommandSurface};
 use muxa::{HostKind, PaneKey, SharedBackend};
 use time::OffsetDateTime;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -375,6 +376,33 @@ async fn handle_request(
             Ok(RelayFrame::Result {
                 request_id,
                 result: FleetCommandResult::sent(outcome),
+            })
+        }
+        RelayRequest::WorkCommand {
+            request_id,
+            args,
+            stdin,
+        } => {
+            // The controller already applied this allowlist; a relay never
+            // trusts that and refuses anything else before a process exists.
+            work_control::validate_work_command(
+                &args,
+                stdin.as_deref(),
+                WorkCommandSurface::Relay,
+            )?;
+            let binary = std::env::current_exe().context("locating this muxa binary")?;
+            let limits = WorkCommandLimits::for_args(&args);
+            let output = work_control::execute_work_command(
+                &binary,
+                &args,
+                stdin.as_deref(),
+                Some(client.socket()),
+                limits,
+            )
+            .await?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: FleetCommandResult::command(output),
             })
         }
         RelayRequest::CollaborationSend {

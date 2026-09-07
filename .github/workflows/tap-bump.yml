@@ -82,6 +82,17 @@ jobs:
             echo "linux_x86=$(sum_for x86_64-unknown-linux-gnu)"
           } >> "$GITHUB_OUTPUT"
 
+          # The Mac app is optional: a release cut without signing secrets
+          # carries no DMG, and the cask is then left pointing at the last
+          # release that had one rather than at a download that 404s.
+          version="${{ steps.ref.outputs.version }}"
+          if [ -f "Muxa-${version}.dmg.sha256" ]; then
+            echo "dmg=$(awk '{print $1; exit}' "Muxa-${version}.dmg.sha256")" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::release $tag has no Muxa DMG — leaving the cask untouched"
+            echo "dmg=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Render and push formula
         env:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
@@ -90,6 +101,7 @@ jobs:
           MAC_X86: ${{ steps.sums.outputs.mac_x86 }}
           LINUX_ARM: ${{ steps.sums.outputs.linux_arm }}
           LINUX_X86: ${{ steps.sums.outputs.linux_x86 }}
+          DMG_SHA: ${{ steps.sums.outputs.dmg }}
         run: |
           set -euo pipefail
           if [ -z "${TAP_GITHUB_TOKEN}" ]; then
@@ -162,13 +174,55 @@ jobs:
             end
           end
           EOF
+          # Muxa.app has no self-updater, so `brew upgrade` is the only way an
+          # installed app ever moves forward. That is what earns the cask its
+          # place; it is not merely a nicer install.
+          #
+          # Named muxa-app, not muxa: the tap already ships Formula/muxa.rb,
+          # and a formula and cask of the same name make `brew install muxa`
+          # ambiguous.
+          if [ -n "${DMG_SHA}" ]; then
+          mkdir -p tap/Casks
+          cat > tap/Casks/muxa-app.rb <<EOF
+          cask "muxa-app" do
+            version "${VERSION}"
+            sha256 "${DMG_SHA}"
+
+            url "https://github.com/Open330/muxa/releases/download/v#{version}/Muxa-#{version}.dmg"
+            name "Muxa"
+            desc "Native workbench for the muxa agent orchestration daemon"
+            homepage "https://github.com/Open330/muxa"
+
+            # No Sparkle in this app: Homebrew is the update path, so leave
+            # auto_updates at its default of false.
+            depends_on macos: :ventura
+
+            app "Muxa.app"
+
+            uninstall quit: "dev.muxa.mac"
+
+            # Only what the app alone owns. The muxa CLI shares
+            # ~/Library/Application Support/muxa, config.toml included, and
+            # removing the app must not take the daemon's configuration with
+            # it.
+            zap trash: [
+              "~/Library/Caches/dev.muxa.mac",
+              "~/Library/HTTPStorages/dev.muxa.mac",
+              "~/Library/Preferences/dev.muxa.mac.plist",
+              "~/Library/Saved Application State/dev.muxa.mac.savedState",
+            ]
+          end
+          EOF
+          fi
           cd tap
-          if git diff --quiet; then
-            echo "formula already up to date"
+          # --porcelain, not `git diff`: the cask can be a file that did not
+          # exist in this clone, and a plain diff does not see an untracked one.
+          git add -- Formula/muxa.rb Casks 2>/dev/null || git add -- Formula/muxa.rb
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "tap already up to date"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/muxa.rb
           git commit -m "muxa ${VERSION}"
           git push

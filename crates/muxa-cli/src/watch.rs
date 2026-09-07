@@ -1874,7 +1874,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         // clipped by the terminal, so a row added here pushes the last
         // binding off a short screen.
         "  C / n / w / R  shell window / agent pane / work up / rename the row",
-        "  a / A          ask / history; Enter reads one · d/D delete one/all",
+        "  a/A · Ctrl-E/n ask / conversations · new mode/draft · Enter read · d/D delete",
         "",
         "Commands & inspection",
         "  :              command palette (Tab completes)",
@@ -1940,6 +1940,10 @@ pub(crate) struct ConfirmPopup {
 struct AskComposer {
     input: String,
     cursor: usize,
+    /// `true` means Enter creates the conversation together with its first
+    /// turn. This is only intent until submit, so cancelling never leaves an
+    /// empty durable conversation.
+    new_conversation: bool,
     /// Ask shares the reusable text palette with message composition, but
     /// selection never changes the daemon-owned agent/permission contract.
     skill_palette: Option<MessageSkillPalette>,
@@ -2023,10 +2027,10 @@ impl MessageSkillEditor {
     }
 }
 
-/// History filter. Reading past answers and choosing the next agent are
-/// different jobs, so the panel filters rather than switching: `All` is
-/// the common case, and the per-agent views answer "what did codex say
-/// about this" without disturbing who the next question goes to.
+/// Compatibility filter for a daemon from before durable conversations.
+/// Current daemons show one conversation transcript and use Tab to select
+/// another; this preserves the former provider-filtered history instead of
+/// blanking the panel during a rolling CLI/daemon upgrade.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum AskFilter {
     #[default]
@@ -2061,9 +2065,9 @@ impl AskFilter {
     }
 }
 
-/// `A` — the ask history panel. Same shape as the collaboration mailbox
-/// because it answers the same question ("what did I send, what came
-/// back"), down to `|` cycling the detail height.
+/// `A` — one durable Ask conversation at a time. Same shape as the
+/// collaboration mailbox because it answers the same question ("what did I
+/// send, what came back"), down to `|` cycling the detail height.
 #[derive(Debug, Clone, Default)]
 struct AskPanelState {
     open: bool,
@@ -3171,6 +3175,12 @@ pub(crate) struct App {
     rename: Option<RenameComposer>,
     ask_panel: AskPanelState,
     ask_entries: Vec<muxa::ask::AskEntry>,
+    /// Durable conversations, newest first, and the one whose transcript the
+    /// Ask panel is showing. Older daemons leave both empty and retain the
+    /// legacy provider-filtered history behavior.
+    ask_conversations: Vec<muxa::ask::AskConversation>,
+    active_ask_conversation_id: Option<String>,
+    ask_conversations_available: bool,
     /// Agent the next question goes to, as the daemon reports it.
     ask_agent: String,
     /// Editable `:` command palette. Like other overlays it owns keyboard
@@ -3436,6 +3446,9 @@ impl App {
             rename: None,
             ask_panel: AskPanelState::default(),
             ask_entries: Vec::new(),
+            ask_conversations: Vec::new(),
+            active_ask_conversation_id: None,
+            ask_conversations_available: false,
             ask_agent: "claude".into(),
             command_palette: None,
             help_open: false,
@@ -7914,14 +7927,17 @@ pub async fn run(
                     }
                 }
                 Action::OpenAsk => {
-                    if let Ok(agent) = client.ask_agent(None).await {
-                        app.ask_agent = agent;
-                    }
+                    refresh_ask_entries(client, &mut app).await;
                     app.ask_composer = Some(AskComposer::default());
                 }
-                Action::SubmitAsk => {
+                Action::SubmitAsk { new_conversation } => {
                     if let Some(ask) = app.ask_composer.take() {
-                        match client.ask_send(&ask.input).await {
+                        let result = if new_conversation {
+                            client.ask_send_new(&ask.input).await
+                        } else {
+                            client.ask_send(&ask.input).await
+                        };
+                        match result {
                             Ok(entry) => {
                                 app.set_hint(
                                     format!("asked {} — answer lands in A", entry.agent),
@@ -7935,6 +7951,10 @@ pub async fn run(
                             }
                             Err(e) => {
                                 app.set_hint(format!("ask failed: {e}"), HintLevel::Err);
+                                // Busy conversations are the common reason to
+                                // retry as new. Keep the exact draft so Ctrl-E
+                                // and Enter can do that without retyping it.
+                                app.ask_composer = Some(ask);
                             }
                         }
                     }
@@ -7957,14 +7977,26 @@ pub async fn run(
                         Ok(agent) => {
                             app.set_hint(format!("ask agent: {agent}"), HintLevel::Ok);
                             app.ask_agent = agent;
+                            refresh_ask_entries(client, &mut app).await;
                         }
                         Err(e) => app.set_hint(format!("ask agent failed: {e}"), HintLevel::Err),
                     }
                 }
-                Action::ResetAskThread => match client.ask_reset().await {
-                    Ok(_) => app.set_hint("ask: new conversation", HintLevel::Ok),
-                    Err(e) => app.set_hint(format!("ask reset failed: {e}"), HintLevel::Err),
-                },
+                Action::SelectAskConversation(id) => {
+                    match client.ask_conversation_select(&id).await {
+                        Ok(conversation) => {
+                            app.ask_agent.clone_from(&conversation.agent);
+                            app.active_ask_conversation_id = Some(conversation.id);
+                            refresh_ask_entries(client, &mut app).await;
+                            let newest = visible_ask_entries(&app).len().saturating_sub(1);
+                            app.ask_panel.open_at(newest);
+                        }
+                        Err(e) => app.set_hint(
+                            format!("ask conversation select failed: {e}"),
+                            HintLevel::Err,
+                        ),
+                    }
+                }
                 Action::OpenCollaborationMessage => {
                     refresh_watch_collaboration(client, &mut app).await;
                     open_watch_collaboration_composer(&mut app);
@@ -8862,11 +8894,30 @@ fn host_scope_target(app: &App) -> Option<(String, String, Option<PaneKey>)> {
     Some((pane, label, None))
 }
 
-/// The entries the panel currently shows, oldest first.
+/// The turns in the selected conversation, oldest first. An older daemon has
+/// no muxa-owned conversation ids, so it falls back to the former provider
+/// filter rather than presenting an empty panel.
+fn active_ask_conversation(app: &App) -> Option<&muxa::ask::AskConversation> {
+    let id = app.active_ask_conversation_id.as_ref()?;
+    app.ask_conversations
+        .iter()
+        .find(|conversation| &conversation.id == id && conversation.agent == app.ask_agent)
+}
+
 fn visible_ask_entries(app: &App) -> Vec<&muxa::ask::AskEntry> {
     app.ask_entries
         .iter()
-        .filter(|e| app.ask_panel.filter.matches(&e.agent))
+        .filter(|entry| {
+            if app.ask_conversations_available {
+                app.active_ask_conversation_id
+                    .as_ref()
+                    .is_some_and(|conversation_id| {
+                        entry.conversation_id.as_deref() == Some(conversation_id.as_str())
+                    })
+            } else {
+                app.ask_panel.filter.matches(&entry.agent)
+            }
+        })
         .collect()
 }
 
@@ -8875,10 +8926,20 @@ fn is_ask_running(entry: &muxa::ask::AskEntry) -> bool {
 }
 
 async fn refresh_ask_entries(client: &Client, app: &mut App) {
-    if let Ok(agent) = client.ask_agent(None).await {
+    let (agent, entries, conversations) = tokio::join!(
+        client.ask_agent(None),
+        client.ask_list(),
+        client.ask_conversation_list()
+    );
+    if let Ok(agent) = agent {
         app.ask_agent = agent;
     }
-    match client.ask_list().await {
+    if let Ok((listed, active)) = conversations {
+        app.ask_conversations = listed;
+        app.active_ask_conversation_id = active.map(|conversation| conversation.id);
+        app.ask_conversations_available = true;
+    }
+    match entries {
         Ok(entries) => {
             app.ask_entries = entries;
             let visible = visible_ask_entries(app).len();
@@ -9557,12 +9618,15 @@ pub(crate) enum Action {
     CollaborationDefaultsChanged,
     /// `a` — open the headless-question composer.
     OpenAsk,
-    /// Submit the composed question to the daemon.
-    SubmitAsk,
-    /// `A` — refresh and open the ask history panel.
+    /// Submit the composed question, either continuing the selected
+    /// conversation or atomically creating its replacement with the turn.
+    SubmitAsk {
+        new_conversation: bool,
+    },
+    /// `A` — refresh and open the selected Ask conversation.
     OpenAskPanel,
-    /// Start a fresh ask conversation; history is kept.
-    ResetAskThread,
+    /// Select the durable conversation whose transcript the panel shows.
+    SelectAskConversation(String),
     /// Point the next question at the other agent.
     CycleAskAgent,
     /// `|` moved the list/inspector divider; the run loop persists the new
@@ -10663,13 +10727,22 @@ fn handle_ask_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut A
                 app.set_hint("ask needs a question", HintLevel::Warn);
                 Action::None
             } else {
-                Action::SubmitAsk
+                Action::SubmitAsk {
+                    new_conversation: ask.new_conversation,
+                }
             }
         }
         // Deciding who to ask belongs here, next to the question — the
         // composer title names the agent, so Tab changes what the title
         // says before Enter commits to it.
         KeyCode::Tab | KeyCode::BackTab => Action::CycleAskAgent,
+        // Mode only: no conversation is created until a non-empty draft is
+        // submitted. This makes cancelling harmless and lets a busy draft be
+        // retried independently without losing its text.
+        KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
+            ask.new_conversation = !ask.new_conversation;
+            Action::None
+        }
         KeyCode::Char('/') if !modifiers.contains(KeyModifiers::CONTROL) => {
             ask.skill_palette = Some(MessageSkillPalette::default());
             Action::None
@@ -10687,9 +10760,9 @@ fn handle_ask_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut A
     }
 }
 
-/// Ask history panel. `n` starts a new conversation, `d` confirms deleting the
-/// selected completed entry, and uppercase `D` confirms clearing all completed
-/// history. `r` remains the global refresh.
+/// Ask conversation panel. `n` drafts the first turn of a new conversation,
+/// `d` confirms deleting the selected completed entry, and uppercase `D`
+/// confirms clearing all completed history. `r` remains the global refresh.
 fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
     if app.ask_panel.reader.is_some() {
         return handle_ask_reader_event(code, app);
@@ -10707,7 +10780,13 @@ fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
             Action::None
         }
         KeyCode::Char('a') => Action::OpenAsk,
-        KeyCode::Char('n') => Action::ResetAskThread,
+        KeyCode::Char('n') => {
+            app.ask_composer = Some(AskComposer {
+                new_conversation: true,
+                ..AskComposer::default()
+            });
+            Action::None
+        }
         KeyCode::Char('d') => {
             let selected = visible_ask_entries(app)
                 .get(app.ask_panel.selected)
@@ -10758,14 +10837,17 @@ fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
                 })
             }
         }
-        // Tab, not the arrows: every other overlay here already reads Tab
-        // as "cycle the option" (mailbox tabs, request kind, spawn
-        // fields), while arrows read as list movement — which is what
-        // j/k and Up/Down do in this very handler.
-        // Tab filters here rather than switching the target agent: the
-        // panel is for reading, and silently repointing the next question
-        // from a history view is the kind of side effect nobody predicts.
-        // The composer owns that choice, with its own Tab.
+        // Tab, not the arrows: the arrows stay turn navigation while Tab
+        // changes the conversation whose transcript is on screen. Selecting
+        // one intentionally restores its provider too, exactly as resuming
+        // that conversation requires; the composer still owns choosing a
+        // provider for brand-new work.
+        KeyCode::Tab | KeyCode::BackTab if app.ask_conversations_available => {
+            adjacent_ask_conversation_id(app, code == KeyCode::Tab)
+                .map_or(Action::None, Action::SelectAskConversation)
+        }
+        // Compatibility fallback for a daemon from before durable
+        // conversations: keep the old provider-filtered history navigation.
         KeyCode::Tab | KeyCode::BackTab => {
             app.ask_panel.filter = app.ask_panel.filter.next();
             app.ask_panel.selected = 0;
@@ -10790,6 +10872,28 @@ fn handle_ask_panel_event(code: KeyCode, app: &mut App) -> Action {
         }
         _ => Action::None,
     }
+}
+
+/// Pick the adjacent durable conversation. The daemon list is newest first;
+/// Tab walks toward older work and Shift-Tab walks back toward newer work.
+fn adjacent_ask_conversation_id(app: &App, forward: bool) -> Option<String> {
+    let conversations = &app.ask_conversations;
+    if conversations.is_empty() {
+        return None;
+    }
+    let current = app.active_ask_conversation_id.as_ref().and_then(|id| {
+        conversations
+            .iter()
+            .position(|conversation| &conversation.id == id)
+    });
+    let next = match (current, forward) {
+        (None, _) => 0,
+        (Some(current), true) => (current + 1) % conversations.len(),
+        (Some(current), false) => current.checked_sub(1).unwrap_or(conversations.len() - 1),
+    };
+    conversations
+        .get(next)
+        .map(|conversation| conversation.id.clone())
 }
 
 /// Pin the selected row's answer into the reader.
@@ -12331,6 +12435,60 @@ fn render_work_composer(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn ask_composer_starts_new_conversation(app: &App) -> bool {
+    app.ask_composer.as_ref().is_some_and(|ask| {
+        ask.new_conversation
+            || (app.ask_conversations_available && active_ask_conversation(app).is_none())
+    })
+}
+
+fn ask_composer_title(app: &App, theme: WatchThemeSpec) -> Line<'static> {
+    let starts_new = ask_composer_starts_new_conversation(app);
+    let mut spans = vec![Span::styled(
+        format!(" ask · {} ", app.ask_agent),
+        theme.table_header_style(),
+    )];
+
+    if starts_new {
+        spans.push(Span::styled(
+            " NEW ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" starts when sent ", theme.dim_style()));
+    } else {
+        spans.push(Span::styled(
+            " CONTINUE ",
+            theme.action_badge().add_modifier(Modifier::BOLD),
+        ));
+        let target = active_ask_conversation(app).map_or_else(
+            || "current conversation".into(),
+            |conversation| {
+                let position = app
+                    .ask_conversations
+                    .iter()
+                    .position(|candidate| candidate.id == conversation.id)
+                    .map(|index| index + 1);
+                position.map_or_else(
+                    || truncate_chars(&conversation.title, 36),
+                    |position| {
+                        format!(
+                            "{position}/{} · {}",
+                            app.ask_conversations.len(),
+                            truncate_chars(&conversation.title, 36)
+                        )
+                    },
+                )
+            },
+        );
+        spans.push(Span::styled(format!(" {target} "), theme.dim_style()));
+    }
+
+    Line::from(spans)
+}
+
 fn render_ask_composer(f: &mut Frame, area: Rect, app: &App) {
     use unicode_width::UnicodeWidthStr;
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
@@ -12346,10 +12504,7 @@ fn render_ask_composer(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.action))
         .border_type(theme.border_type)
-        .title(Span::styled(
-            format!(" ask · {} ", app.ask_agent),
-            theme.action_badge().add_modifier(Modifier::BOLD),
-        ));
+        .title(ask_composer_title(app, theme));
     let inner = block.inner(area);
     let view = truncate_prompt_input(&ask.input, usize::from(inner.width.saturating_sub(2)));
     f.render_widget(
@@ -12386,23 +12541,63 @@ fn ask_status_badge(entry: &muxa::ask::AskEntry, theme: WatchThemeSpec) -> Span<
     }
 }
 
+fn ask_panel_title(app: &App, theme: WatchThemeSpec) -> Line<'static> {
+    let active = active_ask_conversation(app);
+    let conversation_position = active.and_then(|selected| {
+        app.ask_conversations
+            .iter()
+            .position(|conversation| conversation.id == selected.id)
+            .map(|index| index + 1)
+    });
+    let conversation_label = active.map_or_else(
+        || {
+            if app.ask_conversations_available {
+                "new conversation".into()
+            } else {
+                app.ask_panel.filter.label().into()
+            }
+        },
+        |conversation| conversation.title.clone(),
+    );
+    let agent_label = active.map_or(app.ask_agent.as_str(), |conversation| {
+        conversation.agent.as_str()
+    });
+    Line::from(vec![
+        Span::styled(" ask ", theme.accent_badge()),
+        Span::styled(format!(" {agent_label} "), theme.table_header_style()),
+        Span::styled(
+            format!(" {} ", truncate_chars(&conversation_label, 36)),
+            theme.action_badge(),
+        ),
+        Span::styled(
+            conversation_position.map_or_else(
+                || {
+                    if app.ask_conversations_available {
+                        format!(" {} conversations · 0 turns ", app.ask_conversations.len())
+                    } else {
+                        format!(" {} turns ", visible_ask_entries(app).len())
+                    }
+                },
+                |position| {
+                    format!(
+                        " {position}/{} · {} turns ",
+                        app.ask_conversations.len(),
+                        visible_ask_entries(app).len()
+                    )
+                },
+            ),
+            theme.table_header_style(),
+        ),
+    ])
+}
+
 fn render_ask_panel(f: &mut Frame, area: Rect, app: &App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border_style())
         .border_type(theme.border_type)
-        .title(Line::from(vec![
-            Span::styled(" ask ", theme.accent_badge()),
-            Span::styled(
-                format!(" {} ", app.ask_panel.filter.label()),
-                theme.action_badge(),
-            ),
-            Span::styled(
-                format!(" {} ", visible_ask_entries(app).len()),
-                theme.table_header_style(),
-            ),
-        ]));
+        .title(ask_panel_title(app, theme));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let visible = visible_ask_entries(app);
@@ -12411,7 +12606,7 @@ fn render_ask_panel(f: &mut Frame, area: Rect, app: &App) {
             Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "no questions yet — press a to ask one",
+                    "no turns in this conversation — press a to continue or n to start another",
                     theme.dim_style(),
                 )),
                 Line::from(""),
@@ -17096,9 +17291,10 @@ fn resolve_var_chain(
 ///
 /// Each mode names the highest tier it will show and then *degrades*: the
 /// default `Recap` falls through recap → session title → last prompt. That
-/// matters because a recap is sparse (Claude Code writes one only when you
-/// return after being away) and agents with no recap source at all — Codex,
-/// Gemini — would otherwise render an empty column.
+/// matters because recaps are sparse (Claude Code writes one only when you
+/// return after being away; Codex prints one only after context compaction)
+/// and agents with no recap source, such as Gemini, would otherwise render an
+/// empty column.
 fn summary_line(a: &Agent, mode: WatchSummary) -> String {
     let picked = match mode {
         WatchSummary::Recap => a
@@ -17532,11 +17728,18 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
             render_message_skill_palette_footer(f, area, theme);
             return true;
         }
+        let new_conversation = ask_composer_starts_new_conversation(app);
         let spans = vec![
             Span::styled(" Enter ", theme.action_badge()),
-            Span::raw("ask  "),
+            Span::raw(if new_conversation {
+                "start  "
+            } else {
+                "continue  "
+            }),
             Span::styled(" Tab ", theme.key_badge()),
             Span::raw("agent  "),
+            Span::styled(" Ctrl-E ", theme.key_badge()),
+            Span::raw("new/continue  "),
             Span::styled(" Ctrl-V ", theme.key_badge()),
             Span::raw("paste  "),
             Span::styled(" / ", theme.key_badge()),
@@ -17568,17 +17771,17 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
     if app.ask_panel.open {
         let spans = vec![
             Span::styled(" a ", theme.action_badge()),
-            Span::raw("ask  "),
+            Span::raw("continue  "),
+            Span::styled(" n ", theme.action_badge()),
+            Span::raw("new conversation  "),
+            Span::styled(" Tab/⇧Tab ", theme.key_badge()),
+            Span::raw("conversation  "),
             Span::styled(" ⏎ ", theme.action_badge()),
             Span::raw("full answer  "),
             Span::styled(" j/k ", theme.key_badge()),
             Span::raw("select  "),
             Span::styled(" | ", theme.key_badge()),
             Span::raw("detail size  "),
-            Span::styled(" Tab ", theme.key_badge()),
-            Span::raw("filter  "),
-            Span::styled(" n ", theme.key_badge()),
-            Span::raw("new thread  "),
             Span::styled(" Esc/A ", theme.key_badge()),
             Span::raw("close"),
         ];
@@ -20257,7 +20460,9 @@ mod tests {
         assert_eq!(app.ask_agent, "codex");
         assert!(matches!(
             handle_ask_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
-            Action::SubmitAsk
+            Action::SubmitAsk {
+                new_conversation: false
+            }
         ));
     }
 
@@ -20619,6 +20824,145 @@ mod tests {
             &mut app,
         );
         assert!(matches!(action, Action::CycleAskAgent), "got {action:?}");
+    }
+
+    #[test]
+    fn tab_cycles_durable_ask_conversations_and_filters_the_transcript() {
+        let mut app = app_with_paneless_and_pane();
+        let now = OffsetDateTime::now_utc();
+        let conversation = |id: &str, title: &str| muxa::ask::AskConversation {
+            id: id.into(),
+            title: title.into(),
+            agent: "claude".into(),
+            agent_session_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let entry = |id: &str, conversation_id: &str| muxa::ask::AskEntry {
+            id: id.into(),
+            conversation_id: Some(conversation_id.into()),
+            prompt: id.into(),
+            answer: String::new(),
+            status: muxa::ask::AskStatus::Running,
+            agent: "claude".into(),
+            agent_session_id: None,
+            cwd: "/tmp".into(),
+            asked_at: now,
+            answered_at: None,
+            cost_usd: None,
+            error: None,
+        };
+        app.ask_conversations = vec![
+            conversation("newer", "Newer work"),
+            conversation("older", "Older work"),
+        ];
+        app.ask_conversations_available = true;
+        app.active_ask_conversation_id = Some("newer".into());
+        app.ask_entries = vec![entry("newer-turn", "newer"), entry("older-turn", "older")];
+        app.ask_panel.open = true;
+
+        assert_eq!(visible_ask_entries(&app)[0].id, "newer-turn");
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut app,
+            ),
+            Action::SelectAskConversation(id) if id == "older"
+        ));
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+                &mut app,
+            ),
+            Action::SelectAskConversation(id) if id == "older"
+        ));
+    }
+
+    #[test]
+    fn ctrl_e_marks_the_draft_new_without_creating_or_discarding_it() {
+        let mut app = app_with_paneless_and_pane();
+        app.ask_composer = Some(AskComposer {
+            input: "independent question".into(),
+            cursor: "independent question".chars().count(),
+            ..AskComposer::default()
+        });
+
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            &mut app,
+        );
+
+        assert!(matches!(action, Action::None), "got {action:?}");
+        let ask = app.ask_composer.as_ref().expect("composer stays open");
+        assert_eq!(ask.input, "independent question");
+        assert_eq!(ask.cursor, "independent question".chars().count());
+        assert!(ask.new_conversation);
+        assert!(matches!(
+            handle_ask_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
+            Action::SubmitAsk {
+                new_conversation: true
+            }
+        ));
+    }
+
+    #[test]
+    fn ask_composer_title_identifies_new_or_continued_conversation() {
+        let mut app = app_with_paneless_and_pane();
+        let now = OffsetDateTime::now_utc();
+        app.ask_conversations = vec![muxa::ask::AskConversation {
+            id: "selected".into(),
+            title: "Release checklist".into(),
+            agent: "claude".into(),
+            agent_session_id: None,
+            created_at: now,
+            updated_at: now,
+        }];
+        app.ask_conversations_available = true;
+        app.active_ask_conversation_id = Some("selected".into());
+        app.ask_composer = Some(AskComposer::default());
+
+        let title_text = |app: &App| {
+            ask_composer_title(app, watch_theme(app.watch_cfg.theme.unwrap_or_default()))
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let continued = title_text(&app);
+        assert!(continued.contains("CONTINUE"), "{continued}");
+        assert!(continued.contains("1/1 · Release checklist"), "{continued}");
+
+        assert!(matches!(
+            handle_ask_composer_event(KeyCode::Char('e'), KeyModifiers::CONTROL, &mut app),
+            Action::None
+        ));
+        let new = title_text(&app);
+        assert!(new.contains("NEW"), "{new}");
+        assert!(new.contains("starts when sent"), "{new}");
+        assert!(!new.contains("CONTINUE"), "{new}");
+        assert!(!new.contains("Release checklist"), "{new}");
+
+        app.ask_composer.as_mut().unwrap().new_conversation = false;
+        app.active_ask_conversation_id = None;
+        let first = title_text(&app);
+        assert!(first.contains("NEW"), "{first}");
+    }
+
+    #[test]
+    fn n_in_the_ask_panel_opens_a_new_conversation_draft_without_resetting() {
+        let mut app = app_with_paneless_and_pane();
+        app.ask_panel.open = true;
+
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            &mut app,
+        );
+
+        assert!(matches!(action, Action::None), "got {action:?}");
+        assert!(app
+            .ask_composer
+            .as_ref()
+            .is_some_and(|ask| ask.new_conversation && ask.input.is_empty()));
     }
 
     #[test]
@@ -22112,8 +22456,8 @@ mod tests {
         );
         assert_eq!(summary_line(&a, WatchSummary::Title), "infra cleanup");
 
-        // Codex/Gemini shape: no recap or title source, and nothing typed
-        // yet — renders the placeholder rather than an empty cell.
+        // No recap or title source, and nothing typed yet — renders the
+        // placeholder rather than an empty cell (the common Gemini shape).
         a.recap = None;
         a.ai_title = None;
         a.last_prompt = None;
@@ -25887,9 +26231,9 @@ sort = ["state"]
             | Action::CollaborationDefaultsChanged
             | Action::InspectorSplitChanged
             | Action::OpenAsk
-            | Action::SubmitAsk
+            | Action::SubmitAsk { .. }
             | Action::OpenAskPanel
-            | Action::ResetAskThread
+            | Action::SelectAskConversation(_)
             | Action::CycleAskAgent
             | Action::ClaimCollaborationInbox
             | Action::AskConfirm(_)
@@ -27351,7 +27695,9 @@ sort = ["state"]
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
         assert!(body.contains("m / M / Space  message selected or marked / mailbox / mark agent"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
-        assert!(body.contains("a / A          ask / history; Enter reads one · d/D delete one/all"));
+        assert!(body.contains(
+            "a/A · Ctrl-E/n ask / conversations · new mode/draft · Enter read · d/D delete"
+        ));
         assert!(
             body.contains("C / n / w / R  shell window / agent pane / work up / rename the row")
         );

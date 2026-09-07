@@ -214,13 +214,12 @@ pub struct Agent {
     /// text (e.g., Codex/Gemini today). Optional so the field is purely
     /// additive on the wire and in the UI.
     pub last_response: Option<String>,
-    /// Claude Code's session "recap" (`※ recap: …`), scraped from the
-    /// transcript at turn end. The richest "what is this agent actually
-    /// doing" signal muxa can get, but sparse — Claude only writes one
-    /// when the user returns after being away — so it is never cleared by
-    /// a turn that didn't produce one, and the UI falls back to
-    /// [`Self::ai_title`] then [`Self::last_prompt`]. `None` for agents
-    /// with no recap source (Codex/Gemini have no equivalent).
+    /// Agent-authored session recap: Claude Code's `※ recap: …` read from
+    /// its transcript, or Codex's `Conversation recap` observed in its TUI.
+    /// This is the richest "what is this agent actually doing" signal muxa
+    /// can get, but sparse, so it is never cleared when a later observation
+    /// carries none; the UI falls back to [`Self::ai_title`] then
+    /// [`Self::last_prompt`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recap: Option<String>,
     /// Claude Code's rolling short session title — the same string it puts
@@ -1090,6 +1089,41 @@ fn reconcile_pane_for_started(
     true
 }
 
+/// Keep an agent row's endpoint in step with the hook that reports it.
+///
+/// tmux scan rows carry short socket names; rmux needs the native full
+/// endpoint for `rmux -S`. Normalize according to the pane's namespace rather
+/// than treating every host endpoint as tmux. A row with no endpoint adopts
+/// the incoming one. A row whose endpoint disagrees with a hook naming the
+/// *same* pane is re-attributed: the hook reads `$TMUX` from inside the pane,
+/// so it is the authority on which server owns it, and a row stamped with the
+/// wrong endpoint (older hook binaries recorded a `%N` pane inside a cmux tab
+/// with the cmux socket) would otherwise never match a pane scan and stay
+/// invisible to collaboration until the agent restarted. A socket-less event
+/// never clears an endpoint, and a respelling of the same endpoint is not a
+/// change.
+fn refresh_endpoint(agent: &mut Agent, id: &AgentId) {
+    let incoming = id
+        .tmux_socket
+        .as_deref()
+        .map(|endpoint| crate::backend::pane_endpoint_identity(id.pane.as_deref(), endpoint));
+    match (agent.tmux_socket.as_deref(), incoming) {
+        (None, socket) => agent.tmux_socket = socket,
+        (Some(current), Some(incoming))
+            if agent.pane.is_some()
+                && agent.pane == id.pane
+                && !crate::backend::pane_endpoints_match(
+                    id.pane.as_deref(),
+                    current,
+                    &incoming,
+                ) =>
+        {
+            agent.tmux_socket = Some(incoming);
+        }
+        _ => {}
+    }
+}
+
 /// Replace the pid-tracked placeholder created for a muxa-owned PTY once the
 /// real agent runtime claims that same execution surface.
 fn remove_surface_task_placeholder(agents: &mut HashMap<String, Agent>, id: &AgentId) {
@@ -1207,14 +1241,7 @@ impl Store {
         if agent.pane.is_none() {
             agent.pane.clone_from(&id.pane);
         }
-        if agent.tmux_socket.is_none() {
-            // tmux scan rows carry short socket names; rmux needs the native
-            // full endpoint for `rmux -S`. Normalize according to the pane's
-            // namespace rather than treating every host endpoint as tmux.
-            agent.tmux_socket = id.tmux_socket.as_deref().map(|endpoint| {
-                crate::backend::pane_endpoint_identity(id.pane.as_deref(), endpoint)
-            });
-        }
+        refresh_endpoint(agent, id);
         if agent.surface.is_none() {
             agent.surface.clone_from(&id.surface);
         } else if let (Some(existing), Some(incoming)) = (&mut agent.surface, &id.surface) {
@@ -1309,6 +1336,30 @@ impl Store {
 
     pub async fn by_session(&self, session_id: &str) -> Option<Agent> {
         self.agents.read().await.get(session_id).cloned()
+    }
+
+    /// Persist a best-effort recap observed outside the hook event stream.
+    ///
+    /// Codex's compacted rollout item is opaque, but its TUI renders a
+    /// plaintext `Conversation recap`. The screen detector feeds that text
+    /// here. Metadata-only observations deliberately do not advance
+    /// `last_activity_at`, alter agent state, or emit a transition; they only
+    /// wake snapshot persistence when the value actually changes.
+    pub async fn update_recap_if_changed(&self, session_id: &str, recap: String) -> bool {
+        if recap.trim().is_empty() {
+            return false;
+        }
+        let mut agents = self.agents.write().await;
+        let Some(agent) = agents.get_mut(session_id) else {
+            return false;
+        };
+        if agent.recap.as_deref() == Some(recap.as_str()) {
+            return false;
+        }
+        agent.recap = Some(recap);
+        drop(agents);
+        self.dirty.notify_one();
+        true
     }
 
     /// Most-recent-first prompt history. `pane = None` returns prompts
@@ -3728,6 +3779,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observed_recap_updates_metadata_without_advancing_activity() {
+        let store = Store::shared();
+        let started_at = datetime!(2026-04-24 12:00:00 UTC);
+        let active_at = datetime!(2026-04-24 12:01:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: started_at,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::ToolStarted {
+                id: id("s"),
+                tool: "review".into(),
+                subagent: None,
+                at: active_at,
+            })
+            .await;
+
+        assert!(
+            store
+                .update_recap_if_changed("s", "Review is complete.".into())
+                .await
+        );
+        let agent = store.by_session("s").await.unwrap();
+        assert_eq!(agent.recap.as_deref(), Some("Review is complete."));
+        assert_eq!(agent.state, AgentState::Working);
+        assert_eq!(agent.last_activity_at, active_at);
+
+        assert!(
+            !store
+                .update_recap_if_changed("s", "Review is complete.".into())
+                .await,
+            "an unchanged capture must be a no-op",
+        );
+        assert!(
+            !store
+                .update_recap_if_changed("missing", "orphan recap".into())
+                .await,
+        );
+    }
+
+    #[tokio::test]
     async fn responseless_stop_keeps_real_waiting_row_waiting() {
         // A REAL (hook) row waiting on a permission prompt must stay waiting on
         // a response-less TurnStopped — the Codex Stop-during-permission guard.
@@ -4184,6 +4278,74 @@ mod tests {
         assert!(snap
             .iter()
             .any(|agent| agent.tmux_socket.as_deref() == Some("amux")));
+    }
+
+    /// A row stamped with the wrong endpoint for its pane (older hook binaries
+    /// attributed a tmux pane inside a cmux tab to the cmux socket) heals on
+    /// the next hook event that names the same pane with the right socket: the
+    /// hook reads `$TMUX` from inside the pane, so it is the authority. A
+    /// socket-less follow-up never clears the endpoint, and a respelling of
+    /// the same endpoint is not a change.
+    #[tokio::test]
+    async fn apply_reattributes_same_pane_to_the_hook_endpoint() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-09-02 12:00:00 UTC);
+        let t1 = datetime!(2026-09-02 12:01:00 UTC);
+        let t2 = datetime!(2026-09-02 12:02:00 UTC);
+        let id_with = |socket: Option<&str>| AgentId {
+            kind: AgentKind::ClaudeCode,
+            session_id: "s-31".into(),
+            surface: None,
+            pane: Some("%31".into()),
+            tmux_socket: socket.map(Into::into),
+            cwd: None,
+        };
+
+        store
+            .apply(&AgentEvent::Started {
+                id: id_with(Some("/Users/me/.local/state/cmux/cmux.sock")),
+                at: t0,
+            })
+            .await;
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].tmux_socket.as_deref(), Some("cmux.sock"));
+
+        // The corrected hook names the same pane with the real tmux socket.
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id_with(Some("/private/tmp/tmux-501/default")),
+                prompt: "hello".into(),
+                at: t1,
+            })
+            .await;
+        let snap = store.snapshot().await;
+        assert_eq!(
+            snap.len(),
+            1,
+            "same session id: the row is updated, not duplicated"
+        );
+        assert_eq!(snap[0].tmux_socket.as_deref(), Some("default"));
+
+        // Socket-less and respelled follow-ups leave the healed endpoint alone.
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id_with(None),
+                prompt: "again".into(),
+                at: t2,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id_with(Some("/tmp/tmux-501/default")),
+                prompt: "respelled".into(),
+                at: t2,
+            })
+            .await;
+        assert_eq!(
+            store.snapshot().await[0].tmux_socket.as_deref(),
+            Some("default")
+        );
     }
 
     #[tokio::test]

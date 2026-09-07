@@ -172,10 +172,10 @@ function age(iso: string, now: number): string {
 
 /// The caption falls through recap → session title → prompt, the same
 /// precedence `muxa watch` uses for its SUMMARY column, so the shelf and the
-/// console describe an agent identically. A recap is sparse (Claude Code
-/// writes one only when you come back after being away) and Codex/Gemini rows
-/// have no recap source at all, which is exactly why every tier degrades
-/// instead of blanking.
+/// console describe an agent identically. Recaps are sparse (Claude Code
+/// writes one only when you come back after being away; Codex prints one after
+/// context compaction), and rows such as Gemini still have no recap source,
+/// which is exactly why every tier degrades instead of blanking.
 function pickSummary(value: Record<string, unknown>): MuxaSummary | null {
   const tiers: Array<[SummarySource, unknown]> = [
     ["recap", value.recap],

@@ -266,11 +266,11 @@ pub enum AgentEvent {
         /// stay wire-compatible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response: Option<String>,
-        /// Claude Code's session "recap" (`※ recap: …`), scraped from the
-        /// transcript on the same pass that reads `response`. It is not in
-        /// any hook payload — the transcript is the only stable read path.
-        /// Sparse by nature (only written when the user returns after being
-        /// away), so consumers fall back to `ai_title`/`last_prompt`.
+        /// Session recap found on the same pass that reads `response`. Claude
+        /// Code supplies this as `※ recap: …` in its transcript. Codex's
+        /// equivalent is not available to this hook event; its screen observer
+        /// updates the same `Agent::recap` field separately. Sparse by nature,
+        /// so consumers fall back to `ai_title`/`last_prompt`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recap: Option<String>,
         /// Claude Code's rolling short session title (the string it also

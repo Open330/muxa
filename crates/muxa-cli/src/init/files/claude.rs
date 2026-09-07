@@ -55,7 +55,7 @@ pub struct UpsertReport {
 
 /// Default path: `~/.claude/settings.json`.
 pub fn default_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
+    crate::init::integration::claude_home().map(|h| h.join("settings.json"))
 }
 
 /// Insert muxa hooks + statusLine into the JSON text. An empty input

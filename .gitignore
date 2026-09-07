@@ -6,6 +6,7 @@
 .direnv/
 .context/
 /apps/muxa-macos/.build/
+/apps/muxa-macos/dist/
 /apps/muxa-macos/.derived-data/
 /apps/muxa-macos/.qa-derived/
 /apps/muxa-macos/*.xcresult/

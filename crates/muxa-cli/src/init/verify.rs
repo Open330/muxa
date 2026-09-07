@@ -37,6 +37,14 @@ pub async fn run(plan: &Plan, socket: PathBuf) -> Result<VerifyReport> {
             report.current_pane_seen = Some(check_current_pane(socket.as_path()).await);
         }
     }
+    if plan.direction == super::plan::Direction::Install
+        && plan
+            .components
+            .iter()
+            .any(|c| super::integration::is_component(*c))
+    {
+        report.notes.push("Restart Codex / Claude Code to reload global instructions and MCP registrations. Run muxa doctor to inspect links and registration drift.".into());
+    }
 
     Ok(report)
 }

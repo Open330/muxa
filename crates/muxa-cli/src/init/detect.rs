@@ -39,8 +39,8 @@ impl Detection {
             tmux: tool_version("tmux", &["-V"]),
             zellij: tool_version("zellij", &["--version"]),
             cargo: tool_version("cargo", &["--version"]),
-            claude_settings: existing_file(home_join(".claude/settings.json")),
-            codex_config: existing_file(home_join(".codex/config.toml")),
+            claude_settings: agent_config(super::files::claude::default_path(), "claude"),
+            codex_config: agent_config(super::files::codex::default_path(), "codex"),
             gemini_settings: existing_file(home_join(".gemini/settings.json")),
             antigravity_home: detect_antigravity(),
             opencode_config: existing_dir(opencode_config_dir()),
@@ -87,6 +87,13 @@ impl Detection {
         }
         if self.codex_config.is_some() {
             out.push(Component::CodexHooks);
+        }
+        if self.claude_settings.is_some() || self.codex_config.is_some() {
+            out.extend([
+                Component::AgentInstructions,
+                Component::AgentSkills,
+                Component::AgentMcp,
+            ]);
         }
         if self.gemini_settings.is_some() {
             out.push(Component::GeminiHooks);
@@ -184,6 +191,10 @@ fn existing_file(p: PathBuf) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+fn agent_config(path: Option<PathBuf>, program: &str) -> Option<PathBuf> {
+    path.filter(|p| p.is_file() || which::which(program).is_ok())
 }
 
 fn existing_dir(p: Option<PathBuf>) -> Option<PathBuf> {

@@ -36,10 +36,12 @@
 pub mod activity;
 pub mod adapters;
 pub mod ask;
+pub mod automation;
 pub mod backend;
 pub mod collaboration;
 pub mod collaboration_audit;
 pub mod config;
+pub mod config_file;
 pub mod dashboard;
 pub mod discovery;
 pub mod error;
@@ -67,8 +69,11 @@ pub mod timeline;
 pub mod tmux;
 pub mod topology;
 pub mod work;
+pub mod work_compose;
 #[doc(hidden)]
 pub mod work_control;
+pub mod work_pipeline_spec;
+pub mod work_presets;
 
 // ---------------------------------------------------------------------------
 // Stable public surface.
