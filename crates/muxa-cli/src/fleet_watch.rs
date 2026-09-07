@@ -16,7 +16,9 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use muxa::ask::{AskEntry, AskStatus};
-use muxa::collaboration::{CollaborationRequest, NewRequest, RequestKind, RequestStatus, WorkMode};
+use muxa::collaboration::{
+    CollaborationOrigin, CollaborationRequest, NewRequest, RequestKind, RequestStatus, WorkMode,
+};
 use muxa::config::{
     WatchCollaborationMode, WatchLayout, WatchSortKey, WatchTheme, WatchTreeExpansion, WatchView,
 };
@@ -158,6 +160,98 @@ struct MailboxState {
     tab: MailboxTab,
 }
 
+/// One Fleet collaboration recipient. Local and remote panes have exactly the
+/// same address; only dispatch decides which transport that address needs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FleetRecipient {
+    host_alias: String,
+    pane: PaneKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CollaborationMark {
+    recipient: FleetRecipient,
+    agent_session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BroadcastTarget {
+    recipient: FleetRecipient,
+    label: String,
+    /// The mark's agent identity, used only when consuming a successful mark.
+    /// Addressing remains the `(host_alias, pane)` pair above.
+    agent_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecipientTransport {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedRecipient {
+    target: BroadcastTarget,
+    transport: std::result::Result<RecipientTransport, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BroadcastPlan {
+    recipients: Vec<PlannedRecipient>,
+}
+
+impl BroadcastPlan {
+    fn refused(&self) -> usize {
+        self.recipients
+            .iter()
+            .filter(|recipient| recipient.transport.is_err())
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BroadcastOutcome {
+    Delivered(String),
+    WillBeRefused(String),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BroadcastRow {
+    target: BroadcastTarget,
+    outcome: BroadcastOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BroadcastReport {
+    rows: Vec<BroadcastRow>,
+}
+
+impl BroadcastReport {
+    fn delivered(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|row| matches!(row.outcome, BroadcastOutcome::Delivered(_)))
+            .count()
+    }
+
+    fn failed(&self) -> usize {
+        self.rows.len() - self.delivered()
+    }
+
+    fn title(&self) -> String {
+        let failed = self.failed();
+        if failed == 0 {
+            format!("broadcast · {} delivered", self.delivered())
+        } else {
+            format!(
+                "broadcast · {} delivered, {failed} failed",
+                self.delivered()
+            )
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum SkillEditorField {
     #[default]
@@ -206,6 +300,12 @@ struct App {
     ask_panel: bool,
     message_kind: RequestKind,
     message_mode: WatchCollaborationMode,
+    /// Frozen recipients for the active message composer. A refresh while the
+    /// operator types cannot add, remove, or retarget a recipient.
+    message_targets: Vec<BroadcastTarget>,
+    message_broadcast: bool,
+    collaboration_marks: HashSet<CollaborationMark>,
+    broadcast_report: Option<BroadcastReport>,
     mailbox: MailboxState,
     reply_request_id: Option<String>,
     skill_editor: Option<SkillEditor>,
@@ -258,6 +358,10 @@ impl App {
             ask_panel: false,
             message_kind: RequestKind::Question,
             message_mode: WatchCollaborationMode::ReadOnly,
+            message_targets: Vec::new(),
+            message_broadcast: false,
+            collaboration_marks: HashSet::new(),
+            broadcast_report: None,
             mailbox: MailboxState::default(),
             reply_request_id: None,
             skill_editor: None,
@@ -390,6 +494,115 @@ impl App {
             NodeKey::Host(_) | NodeKey::PanelessAgent { .. } => None,
         }?;
         Some((host_alias.to_string(), pane.key.clone()))
+    }
+
+    /// Marking stays exact even though `m` may resolve a parent: a mark names
+    /// the live agent session in one collision-free pane, never a structural
+    /// row whose eventual recipient could drift after a refresh.
+    fn selected_mark_target(&self) -> Option<(BroadcastTarget, String)> {
+        let (host_alias, pane_key) = self.selected_pane()?;
+        let pane = self
+            .topologies
+            .get(&host_alias)
+            .and_then(|topology| find_pane(topology, &pane_key))?;
+        let agent = pane
+            .agent
+            .as_ref()
+            .filter(|agent| agent.state != AgentState::Stopped)?;
+        Some((
+            BroadcastTarget {
+                recipient: FleetRecipient {
+                    host_alias: host_alias.clone(),
+                    pane: pane_key,
+                },
+                label: format!("{}@{host_alias}:{}", agent.kind, pane.key.pane_id),
+                agent_session_id: Some(agent.session_id.clone()),
+            },
+            agent.session_id.clone(),
+        ))
+    }
+
+    /// Resolve marks against the latest Fleet topology in its stable host /
+    /// session / window / pane order. A replaced agent cannot inherit a mark
+    /// merely by occupying the same pane.
+    fn resolved_marks(&self) -> Vec<BroadcastTarget> {
+        let mut targets = Vec::new();
+        for host in &self.snapshot.hosts {
+            let Some(topology) = self.topologies.get(&host.alias) else {
+                continue;
+            };
+            for pane in topology
+                .sessions
+                .iter()
+                .flat_map(|session| &session.windows)
+                .flat_map(|window| &window.panes)
+            {
+                let Some(agent) = pane
+                    .agent
+                    .as_ref()
+                    .filter(|agent| agent.state != AgentState::Stopped)
+                else {
+                    continue;
+                };
+                let recipient = FleetRecipient {
+                    host_alias: host.alias.clone(),
+                    pane: pane.key.clone(),
+                };
+                let mark = CollaborationMark {
+                    recipient: recipient.clone(),
+                    agent_session_id: agent.session_id.clone(),
+                };
+                if self.collaboration_marks.contains(&mark) {
+                    targets.push(BroadcastTarget {
+                        recipient,
+                        label: format!("{}@{}:{}", agent.kind, host.alias, pane.key.pane_id),
+                        agent_session_id: Some(agent.session_id.clone()),
+                    });
+                }
+            }
+        }
+        targets
+    }
+
+    fn stale_mark_count(&self) -> usize {
+        self.collaboration_marks
+            .len()
+            .saturating_sub(self.resolved_marks().len())
+    }
+
+    fn pane_is_marked(&self, host_alias: &str, pane: &PaneNode) -> bool {
+        let Some(agent) = pane.agent.as_ref() else {
+            return false;
+        };
+        self.collaboration_marks.contains(&CollaborationMark {
+            recipient: FleetRecipient {
+                host_alias: host_alias.to_string(),
+                pane: pane.key.clone(),
+            },
+            agent_session_id: agent.session_id.clone(),
+        })
+    }
+
+    fn toggle_collaboration_mark(&mut self) -> bool {
+        let Some((target, agent_session_id)) = self.selected_mark_target() else {
+            return false;
+        };
+        let mark = CollaborationMark {
+            recipient: target.recipient,
+            agent_session_id,
+        };
+        let action = if self.collaboration_marks.remove(&mark) {
+            "unmarked"
+        } else {
+            self.collaboration_marks.insert(mark);
+            "marked"
+        };
+        self.status(format!(
+            "{action} {} · {} marked",
+            target.label,
+            self.collaboration_marks.len()
+        ));
+        true
     }
 
     /// Return a Work identity only when the selected pane carries the complete
@@ -742,6 +955,7 @@ enum BackgroundResult {
     AskSent(std::result::Result<AskEntry, String>),
     AskList(std::result::Result<Vec<AskEntry>, String>),
     CollaborationSent(std::result::Result<FleetCommandResult, String>),
+    BroadcastSent(BroadcastReport),
     Mailbox(std::result::Result<FleetCommandResult, String>),
     MailboxClaimed(std::result::Result<FleetCommandResult, String>),
     CollaborationReply(std::result::Result<FleetCommandResult, String>),
@@ -949,6 +1163,11 @@ pub(crate) async fn run(
                     }
                     Err(error) => app.status(format!("message failed: {error}")),
                 },
+                BackgroundResult::BroadcastSent(report) => {
+                    clear_delivered_broadcast_marks(&mut app, &report);
+                    app.status(report.title());
+                    app.broadcast_report = Some(report);
+                }
                 BackgroundResult::Mailbox(result) => {
                     app.mailbox.loading = false;
                     match result {
@@ -1104,49 +1323,52 @@ fn handle_key(
                     app.mode = InputMode::Normal;
                     app.composer.clear();
                     app.skill_palette = None;
+                    app.message_targets.clear();
+                    app.message_broadcast = false;
                 }
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     app.composer.push('\n');
                 }
                 KeyCode::Enter => {
-                    let Some((host, pane)) = app.selected_message_pane() else {
-                        app.status("selected node has no live agent pane");
+                    let Some(target) = app.message_targets.first().cloned() else {
+                        app.status("message recipients are no longer available");
                         return Ok(false);
                     };
                     if app.composer.trim().is_empty() {
                         app.status("message is empty");
                         return Ok(false);
                     }
-                    if app.message_mode != WatchCollaborationMode::JustSend
-                        && !host_supports_collaboration(app, &host)
-                    {
-                        app.status(format!(
-                            "host '{host}' needs a muxa upgrade for Fleet collaboration"
-                        ));
-                        return Ok(false);
-                    }
+                    let mode = effective_message_mode(app);
                     let text = std::mem::take(&mut app.composer);
                     app.mode = InputMode::Normal;
-                    if app.message_mode == WatchCollaborationMode::JustSend {
+                    if mode == WatchCollaborationMode::JustSend {
                         spawn_command(
                             client,
                             background,
-                            host,
+                            target.recipient.host_alias,
                             FleetOperation::SendPrompt {
-                                pane,
+                                pane: target.recipient.pane,
                                 text,
                                 submit: true,
                             },
                         );
+                        app.message_targets.clear();
+                        app.message_broadcast = false;
                         app.status("sending prompt…");
                     } else {
-                        let (workspace_id, work_id) =
-                            app.work_identity_for_message_pane(&host, &pane);
+                        let (workspace_id, work_id) = if app.message_broadcast {
+                            (None, None)
+                        } else {
+                            app.work_identity_for_message_pane(
+                                &target.recipient.host_alias,
+                                &target.recipient.pane,
+                            )
+                        };
                         let request = NewRequest {
                             kind: app.message_kind,
                             body: text,
                             expects_reply: app.message_kind != RequestKind::Notice,
-                            work_mode: match app.message_mode {
+                            work_mode: match mode {
                                 WatchCollaborationMode::Execute => WorkMode::Execute,
                                 WatchCollaborationMode::ReadOnly
                                 | WatchCollaborationMode::JustSend => WorkMode::ReadOnly,
@@ -1161,8 +1383,32 @@ fn handle_key(
                             links: Vec::new(),
                             air_artifacts: Vec::new(),
                         };
-                        spawn_collaboration_send(client, background, app, host, pane, request);
-                        app.status("sending collaboration request…");
+                        if app.message_broadcast {
+                            let targets = std::mem::take(&mut app.message_targets);
+                            let plan = plan_broadcast(&app.snapshot, targets);
+                            let refused = plan.refused();
+                            let total = plan.recipients.len();
+                            spawn_collaboration_broadcast(client, background, plan, request);
+                            app.message_broadcast = false;
+                            if refused == 0 {
+                                app.status(format!("sending to {total} marked agents…"));
+                            } else {
+                                app.status(format!(
+                                    "sending to {total} marked agents · {refused} will be refused"
+                                ));
+                            }
+                        } else {
+                            app.message_targets.clear();
+                            spawn_collaboration_send(
+                                client,
+                                background,
+                                app,
+                                target.recipient.host_alias,
+                                target.recipient.pane,
+                                request,
+                            );
+                            app.status("sending collaboration request…");
+                        }
                     }
                 }
                 KeyCode::Tab => {
@@ -1170,7 +1416,11 @@ fn handle_key(
                     persist_message_defaults_or_status(config_path, app);
                 }
                 KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.message_mode = next_message_mode(app.message_mode);
+                    app.message_mode = if app.message_broadcast {
+                        next_broadcast_message_mode(app.message_mode)
+                    } else {
+                        next_message_mode(app.message_mode)
+                    };
                     persist_message_defaults_or_status(config_path, app);
                 }
                 KeyCode::Backspace => {
@@ -1328,11 +1578,7 @@ fn handle_key(
             KeyCode::Esc | KeyCode::Char('q' | 'M' | 'b') => app.mailbox.open = false,
             KeyCode::Char('m') => {
                 app.mailbox.open = false;
-                if app.selected_message_pane().is_some() {
-                    app.mode = InputMode::Message;
-                    app.composer.clear();
-                    app.skill_palette = None;
-                }
+                open_message_composer(app);
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 app.mailbox.tab = match app.mailbox.tab {
@@ -1363,6 +1609,12 @@ fn handle_key(
         return Ok(false);
     }
 
+    if app.broadcast_report.is_some() {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
+            app.broadcast_report = None;
+        }
+        return Ok(false);
+    }
     if app.popup.is_some() {
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
             app.popup = None;
@@ -1422,7 +1674,11 @@ fn handle_key(
         }
         KeyCode::Left | KeyCode::Char('h') => app.collapse_or_parent(),
         KeyCode::Right | KeyCode::Char('l') => app.expand_or_child(),
-        KeyCode::Char(' ') => app.toggle_selected(),
+        KeyCode::Char(' ') => {
+            if !app.toggle_collaboration_mark() {
+                app.toggle_selected();
+            }
+        }
         KeyCode::Char('/') => app.mode = InputMode::Search,
         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
             app.attention_only = !app.attention_only;
@@ -1470,15 +1726,7 @@ fn handle_key(
                 app.status("capturing selected pane…");
             }
         }
-        KeyCode::Char('m') => {
-            if app.selected_message_pane().is_some() {
-                app.mode = InputMode::Message;
-                app.composer.clear();
-                app.skill_palette = None;
-            } else {
-                app.status("select a session, window, or pane with a live agent");
-            }
-        }
+        KeyCode::Char('m') => open_message_composer(app),
         KeyCode::Char('M' | 'b') => open_mailbox(client, app, background),
         KeyCode::Enter => {
             if let Some((host_alias, pane)) = app.selected_pane() {
@@ -1514,6 +1762,56 @@ fn handle_key(
         _ => {}
     }
     Ok(false)
+}
+
+fn open_message_composer(app: &mut App) {
+    if !app.collaboration_marks.is_empty() {
+        let targets = app.resolved_marks();
+        if targets.is_empty() {
+            app.status("no marked agent sessions remain in the Fleet snapshot");
+            return;
+        }
+        app.message_targets = targets;
+        app.message_broadcast = true;
+        app.mode = InputMode::Message;
+        app.composer.clear();
+        app.skill_palette = None;
+        return;
+    }
+    let Some((host_alias, pane)) = app.selected_message_pane() else {
+        app.status("select a session, window, or pane with a live agent");
+        return;
+    };
+    let target_label = app
+        .topologies
+        .get(&host_alias)
+        .and_then(|topology| find_pane(topology, &pane))
+        .and_then(|pane| {
+            pane.agent
+                .as_ref()
+                .map(|agent| format!("{}@{host_alias}:{}", agent.kind, pane.key.pane_id))
+        })
+        .unwrap_or_else(|| format!("{host_alias}:{}", pane.pane_id));
+    let label = app.selected_key().map_or(target_label.clone(), |key| {
+        format!("{target_label} · {}", key_path(key))
+    });
+    app.message_targets = vec![BroadcastTarget {
+        recipient: FleetRecipient { host_alias, pane },
+        label,
+        agent_session_id: None,
+    }];
+    app.message_broadcast = false;
+    app.mode = InputMode::Message;
+    app.composer.clear();
+    app.skill_palette = None;
+}
+
+fn effective_message_mode(app: &App) -> WatchCollaborationMode {
+    if app.message_broadcast && app.message_mode == WatchCollaborationMode::JustSend {
+        WatchCollaborationMode::ReadOnly
+    } else {
+        app.message_mode
+    }
 }
 
 fn open_ask_composer(
@@ -1692,6 +1990,177 @@ fn host_supports_collaboration(app: &App, alias: &str) -> bool {
         })
 }
 
+/// Resolve every refusal the Fleet snapshot can answer before the first send.
+/// `local` is an ordinary alias in the target list; the snapshot's `local`
+/// bit selects direct IPC, while remote recipients require explicit control
+/// and both halves of durable collaboration support.
+fn plan_broadcast(snapshot: &FleetSnapshot, targets: Vec<BroadcastTarget>) -> BroadcastPlan {
+    let recipients = targets
+        .into_iter()
+        .map(|target| PlannedRecipient {
+            transport: recipient_transport(snapshot, &target.recipient),
+            target,
+        })
+        .collect();
+    BroadcastPlan { recipients }
+}
+
+fn recipient_transport(
+    snapshot: &FleetSnapshot,
+    recipient: &FleetRecipient,
+) -> std::result::Result<RecipientTransport, String> {
+    let host = snapshot
+        .hosts
+        .iter()
+        .find(|host| host.alias == recipient.host_alias)
+        .ok_or_else(|| {
+            format!(
+                "host '{}' is no longer in the Fleet snapshot",
+                recipient.host_alias
+            )
+        })?;
+    if host.local {
+        return Ok(RecipientTransport::Local);
+    }
+    if host.mode != muxa::HostAccessMode::Control {
+        return Err(format!(
+            "host '{}' is observe-only; grant mode='control' first",
+            recipient.host_alias
+        ));
+    }
+    for capability in ["collaboration", "collaboration_get"] {
+        if !host
+            .capabilities
+            .iter()
+            .any(|candidate| candidate == capability)
+        {
+            return Err(format!(
+                "host '{}' does not advertise '{capability}'; connect it and upgrade muxa there",
+                recipient.host_alias
+            ));
+        }
+    }
+    Ok(RecipientTransport::Remote)
+}
+
+/// Execute a fully preflighted plan sequentially. The two callbacks keep the
+/// transport split testable without teaching the production code a fake IPC
+/// client; each successful callback returns the ordinary request id that its
+/// transport received from the target daemon.
+async fn execute_broadcast_plan<LocalSend, LocalFuture, RemoteSend, RemoteFuture>(
+    plan: BroadcastPlan,
+    request: NewRequest,
+    mut send_local: LocalSend,
+    mut send_remote: RemoteSend,
+) -> BroadcastReport
+where
+    LocalSend: FnMut(BroadcastTarget, NewRequest) -> LocalFuture,
+    LocalFuture: std::future::Future<Output = std::result::Result<String, String>>,
+    RemoteSend: FnMut(BroadcastTarget, NewRequest) -> RemoteFuture,
+    RemoteFuture: std::future::Future<Output = std::result::Result<String, String>>,
+{
+    let mut rows = Vec::with_capacity(plan.recipients.len());
+    for planned in plan.recipients {
+        let target = planned.target;
+        let outcome = match planned.transport {
+            Err(reason) => BroadcastOutcome::WillBeRefused(reason),
+            Ok(RecipientTransport::Local) => {
+                match send_local(target.clone(), request.clone()).await {
+                    Ok(request_id) => BroadcastOutcome::Delivered(request_id),
+                    Err(error) => BroadcastOutcome::Failed(error),
+                }
+            }
+            Ok(RecipientTransport::Remote) => {
+                match send_remote(target.clone(), request.clone()).await {
+                    Ok(request_id) => BroadcastOutcome::Delivered(request_id),
+                    Err(error) => BroadcastOutcome::Failed(error),
+                }
+            }
+        };
+        rows.push(BroadcastRow { target, outcome });
+    }
+    BroadcastReport { rows }
+}
+
+fn clear_delivered_broadcast_marks(app: &mut App, report: &BroadcastReport) {
+    let delivered = report
+        .rows
+        .iter()
+        .filter_map(|row| {
+            if !matches!(row.outcome, BroadcastOutcome::Delivered(_)) {
+                return None;
+            }
+            Some(CollaborationMark {
+                recipient: row.target.recipient.clone(),
+                agent_session_id: row.target.agent_session_id.clone()?,
+            })
+        })
+        .collect::<HashSet<_>>();
+    app.collaboration_marks
+        .retain(|mark| !delivered.contains(mark));
+}
+
+fn fleet_watch_console_origin(pane: &PaneKey) -> CollaborationOrigin {
+    let endpoint = &pane.window.session.endpoint;
+    CollaborationOrigin {
+        pane: pane.pane_id.clone(),
+        socket: matches!(endpoint.host, HostKind::Tmux | HostKind::Rmux)
+            .then(|| endpoint.socket.clone()),
+        console: true,
+    }
+}
+
+fn spawn_collaboration_broadcast(
+    client: &Client,
+    background: &mpsc::UnboundedSender<BackgroundResult>,
+    plan: BroadcastPlan,
+    request: NewRequest,
+) {
+    let client = client.clone();
+    let sender = background.clone();
+    tokio::spawn(async move {
+        let local_client = client.clone();
+        let remote_client = client;
+        let report = execute_broadcast_plan(
+            plan,
+            request,
+            move |target, request| {
+                let client = local_client.clone();
+                async move {
+                    let origin = fleet_watch_console_origin(&target.recipient.pane);
+                    let wire_target = format!("pane:{}", target.recipient.pane.pane_id);
+                    client
+                        .collaboration_send(&origin, &wire_target, &request)
+                        .await
+                        .map(|sent| sent.id)
+                        .map_err(|error| error.to_string())
+                }
+            },
+            move |target, request| {
+                let client = remote_client.clone();
+                async move {
+                    let result = client
+                        .fleet_execute(
+                            &target.recipient.host_alias,
+                            &FleetOperation::CollaborationSend {
+                                pane: target.recipient.pane,
+                                request,
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    result
+                        .collaboration_request
+                        .map(|sent| sent.id)
+                        .ok_or_else(|| "Fleet collaboration send returned no request id".into())
+                }
+            },
+        )
+        .await;
+        let _ = sender.send(BackgroundResult::BroadcastSent(report));
+    });
+}
+
 fn spawn_collaboration_send(
     client: &Client,
     background: &mpsc::UnboundedSender<BackgroundResult>,
@@ -1849,6 +2318,15 @@ fn next_message_mode(mode: WatchCollaborationMode) -> WatchCollaborationMode {
         WatchCollaborationMode::ReadOnly => WatchCollaborationMode::Execute,
         WatchCollaborationMode::Execute => WatchCollaborationMode::JustSend,
         WatchCollaborationMode::JustSend => WatchCollaborationMode::ReadOnly,
+    }
+}
+
+fn next_broadcast_message_mode(mode: WatchCollaborationMode) -> WatchCollaborationMode {
+    match mode {
+        WatchCollaborationMode::ReadOnly | WatchCollaborationMode::JustSend => {
+            WatchCollaborationMode::Execute
+        }
+        WatchCollaborationMode::Execute => WatchCollaborationMode::ReadOnly,
     }
 }
 
@@ -2680,9 +3158,12 @@ fn render(frame: &mut Frame, app: &App) {
             frame,
             area,
             " fleet keys ",
-            "↑/↓ · j/k siblings in focus; visible nodes otherwise\nJ/K previous/next agent pane across Fleet\nh/l collapse/expand    Space toggle\nEnter attach pane      p capture pane\na ask · A history      m message · M mailbox (b alias)\nTab kind · Ctrl-E mode i claim · e reply in mailbox\nr refresh host         c connect/disconnect\nAlt-a attention only   / search · ? help · q quit",
+            "↑/↓ · j/k siblings in focus; visible nodes otherwise\nJ/K previous/next agent pane across Fleet\nh/l collapse/expand    Space mark pane / toggle parent\nEnter attach pane      p capture pane\na ask · A history      m message selected or marked · M mailbox\nTab kind · Ctrl-E mode i claim · e reply in mailbox\nr refresh host         c connect/disconnect\nAlt-a attention only   / search · ? help · q quit",
             app.theme,
         );
+    }
+    if let Some(report) = &app.broadcast_report {
+        render_broadcast_report(frame, area, report, app.theme);
     }
 }
 
@@ -2714,7 +3195,10 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Percentage(52),
     ];
     let rows = app.rows.iter().map(|row| {
-        let branch = if row.children == 0 {
+        let marked = tree_row_is_marked(app, row);
+        let branch = if marked {
+            "◆"
+        } else if row.children == 0 {
             "•"
         } else if app.expanded.contains(&row.key) || !app.query.is_empty() || app.attention_only {
             "▾"
@@ -2755,9 +3239,13 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
             InputMode::Search => format!(" search: {}_ ", app.query),
             _ if !app.query.is_empty() => format!(" filter: {} · Esc/q clear/quit ", app.query),
             _ if app.attention_only => " attention only · Alt-a/Esc clear ".into(),
-            _ => {
+            _ if app.collaboration_marks.is_empty() => {
                 " j/k move · J/K agents · Enter attach · a/A ask · m/M collaborate · ? help ".into()
             }
+            _ => format!(
+                " {} marked · Space unmark · m broadcast · failed marks stay ",
+                app.collaboration_marks.len()
+            ),
         },
         |status| format!(" {} ", safe_text(status)),
     );
@@ -2776,6 +3264,16 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
         .highlight_spacing(HighlightSpacing::Always);
     let mut state = TableState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn tree_row_is_marked(app: &App, row: &TreeRow) -> bool {
+    let NodeKey::Pane { host, key } = &row.key else {
+        return false;
+    };
+    app.topologies
+        .get(host)
+        .and_then(|topology| find_pane(topology, key))
+        .is_some_and(|pane| app.pane_is_marked(host, pane))
 }
 
 fn render_swarm(frame: &mut Frame, area: Rect, app: &App) {
@@ -2810,8 +3308,13 @@ fn render_swarm(frame: &mut Frame, area: Rect, app: &App) {
         app.snapshot.hosts.len(),
         nodes.len()
     );
-    let footer = if app.query.is_empty() {
-        " j/k move · Enter attach · a/A ask · m/M collaborate · / search · ? help ".to_string()
+    let footer = if app.query.is_empty() && app.collaboration_marks.is_empty() {
+        " j/k move · Enter attach · Space mark · m/M collaborate · / search · ? help ".to_string()
+    } else if app.query.is_empty() {
+        format!(
+            " {} marked · Space unmark · m broadcast · failed marks stay ",
+            app.collaboration_marks.len()
+        )
     } else {
         format!(" filter: {} · Esc clear ", app.query)
     };
@@ -2855,7 +3358,7 @@ fn swarm_row(
     now: OffsetDateTime,
 ) -> Option<Row<'static>> {
     let host = key.host();
-    let (agent, state, age, summary) = match key {
+    let (mut agent, state, age, summary) = match key {
         NodeKey::Pane { key, .. } => {
             let pane = app
                 .topologies
@@ -2902,6 +3405,16 @@ fn swarm_row(
         }
         _ => return None,
     };
+    if let NodeKey::Pane { host, key } = key {
+        if app
+            .topologies
+            .get(host)
+            .and_then(|topology| find_pane(topology, key))
+            .is_some_and(|pane| app.pane_is_marked(host, pane))
+        {
+            agent = format!("◆ {agent}");
+        }
+    }
     Some(Row::new(vec![
         Cell::from(safe_text(host)),
         Cell::from(agent),
@@ -3458,12 +3971,23 @@ fn render_composer(frame: &mut Frame, area: Rect, app: &App) {
             " Enter reply · Shift-Enter newline · / skills · Esc cancel ".into(),
         ),
         InputMode::Message => {
-            let path = app.selected_key().map_or_else(|| "agent".into(), key_path);
+            let target = if app.message_broadcast {
+                let stale = app.stale_mark_count();
+                if stale == 0 {
+                    format!("{} marked agents", app.message_targets.len())
+                } else {
+                    format!("{} marked agents ({stale} gone)", app.message_targets.len())
+                }
+            } else {
+                app.message_targets
+                    .first()
+                    .map_or_else(|| "agent".into(), |target| target.label.clone())
+            };
             (
                 format!(
-                    " message · {} · {} · {path} ",
+                    " message · {} · {} · {target} ",
                     request_kind_label(app.message_kind),
-                    message_mode_label(app.message_mode)
+                    message_mode_label(effective_message_mode(app))
                 ),
                 " Enter send · Shift-Enter newline · Tab kind · Ctrl-E mode · / skills · Esc cancel ".into(),
             )
@@ -3824,6 +4348,61 @@ fn render_popup(frame: &mut Frame, area: Rect, title: &str, body: &str, watch_th
                 Block::default()
                     .title(title.to_string())
                     .title_bottom(" Esc/Enter close ")
+                    .borders(Borders::ALL)
+                    .border_type(theme.border_type)
+                    .border_style(theme.border_style()),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn render_broadcast_report(
+    frame: &mut Frame,
+    area: Rect,
+    report: &BroadcastReport,
+    watch_theme: WatchTheme,
+) {
+    let theme = crate::watch::watch_theme(watch_theme);
+    let popup = centered(area, 88, 70);
+    frame.render_widget(Clear, popup);
+    let mut lines = Vec::with_capacity(report.rows.len().saturating_mul(2));
+    for row in &report.rows {
+        let label = safe_text(&row.target.label);
+        match &row.outcome {
+            BroadcastOutcome::Delivered(request_id) => lines.push(Line::from(vec![
+                Span::styled("✓ ", theme.state_style(AgentState::Idle)),
+                Span::styled(format!("{label:<32} "), theme.table_header_style()),
+                Span::raw(short_request_id(request_id).to_string()),
+            ])),
+            BroadcastOutcome::WillBeRefused(reason) => lines.push(Line::from(vec![
+                Span::styled("! ", theme.state_style(AgentState::WaitingChoice)),
+                Span::styled(format!("{label:<32} "), theme.table_header_style()),
+                Span::styled(
+                    format!("will be refused · {}", safe_text(reason)),
+                    theme.state_style(AgentState::WaitingChoice),
+                ),
+            ])),
+            BroadcastOutcome::Failed(error) => lines.push(Line::from(vec![
+                Span::styled("× ", theme.state_style(AgentState::Error)),
+                Span::styled(format!("{label:<32} "), theme.table_header_style()),
+                Span::styled(safe_text(error), theme.state_style(AgentState::Error)),
+            ])),
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Delivered recipients were unmarked; refused and failed recipients remain marked.",
+        theme.dim_style(),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(format!(" {} ", report.title()))
+                    .title_bottom(
+                        " Esc/Enter close · delivery was sequential; nothing was retried ",
+                    )
                     .borders(Borders::ALL)
                     .border_type(theme.border_type)
                     .border_style(theme.border_style()),
@@ -4210,6 +4789,56 @@ mod tests {
         agent
     }
 
+    fn collaborating_host(alias: &str, local: bool, agent_session_id: &str) -> FleetHostSnapshot {
+        let mut host = host();
+        host.alias = alias.into();
+        host.local = local;
+        host.capabilities = vec!["collaboration".into(), "collaboration_get".into()];
+        host.remote
+            .as_mut()
+            .unwrap()
+            .agents
+            .push(attached_agent(agent_session_id, "%1"));
+        host
+    }
+
+    fn host_pane(host: &FleetHostSnapshot) -> PaneKey {
+        PaneKey::from_pane(HostKind::Tmux, &host.remote.as_ref().unwrap().panes[0])
+    }
+
+    fn broadcast_target(host: &FleetHostSnapshot) -> BroadcastTarget {
+        BroadcastTarget {
+            recipient: FleetRecipient {
+                host_alias: host.alias.clone(),
+                pane: host_pane(host),
+            },
+            label: format!("codex@{}:%1", host.alias),
+            agent_session_id: host
+                .remote
+                .as_ref()
+                .and_then(|remote| remote.agents.first())
+                .map(|agent| agent.session_id.clone()),
+        }
+    }
+
+    fn broadcast_request() -> NewRequest {
+        NewRequest {
+            kind: RequestKind::Question,
+            body: "coordinate this change".into(),
+            expects_reply: true,
+            work_mode: WorkMode::ReadOnly,
+            thread_id: None,
+            parent_request_id: None,
+            workspace_id: None,
+            work_id: None,
+            run_id: None,
+            paths: Vec::new(),
+            artifacts: Vec::new(),
+            links: Vec::new(),
+            air_artifacts: Vec::new(),
+        }
+    }
+
     #[test]
     fn focus_tree_keeps_structural_nodes_and_global_jump_targets_panes() {
         let host = host();
@@ -4240,6 +4869,207 @@ mod tests {
             .rows
             .iter()
             .any(|row| matches!(row.key, NodeKey::Window { .. })));
+    }
+
+    #[test]
+    fn marked_fleet_agents_freeze_one_host_and_pane_recipient_shape() {
+        let local = collaborating_host("local", true, "agent-local");
+        let remote = collaborating_host("dev", false, "agent-dev");
+        let local_pane = host_pane(&local);
+        let remote_pane = host_pane(&remote);
+        let mut app = App::new(
+            None,
+            WatchTheme::Classic,
+            BTreeMap::new(),
+            WatchLayout::Tree,
+            WatchView::Pane,
+            WatchTreeExpansion::Focus,
+            WatchSortKey::Name,
+        );
+        app.apply_snapshot(FleetSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            hosts: vec![remote, local],
+        });
+
+        for (host, pane) in [("local", local_pane), ("dev", remote_pane)] {
+            app.reveal_key(NodeKey::Pane {
+                host: host.into(),
+                key: pane,
+            });
+            assert!(app.toggle_collaboration_mark());
+        }
+        open_message_composer(&mut app);
+
+        assert!(app.message_broadcast);
+        assert_eq!(
+            app.message_targets
+                .iter()
+                .map(|target| target.recipient.host_alias.as_str())
+                .collect::<Vec<_>>(),
+            ["local", "dev"]
+        );
+        assert!(app
+            .message_targets
+            .iter()
+            .all(|target| target.recipient.pane.pane_id == "%1"));
+
+        let report = BroadcastReport {
+            rows: vec![
+                BroadcastRow {
+                    target: app.message_targets[0].clone(),
+                    outcome: BroadcastOutcome::Delivered("req-local".into()),
+                },
+                BroadcastRow {
+                    target: app.message_targets[1].clone(),
+                    outcome: BroadcastOutcome::Failed("relay closed".into()),
+                },
+            ],
+        };
+        clear_delivered_broadcast_marks(&mut app, &report);
+        assert_eq!(
+            app.resolved_marks()
+                .iter()
+                .map(|target| target.recipient.host_alias.as_str())
+                .collect::<Vec<_>>(),
+            ["dev"]
+        );
+    }
+
+    #[test]
+    fn broadcast_preflight_refuses_remote_observe_and_old_hosts_only() {
+        let mut local = collaborating_host("local", true, "agent-local");
+        local.mode = HostAccessMode::Observe;
+        local.capabilities.clear();
+        let control = collaborating_host("control", false, "agent-control");
+        let mut observe = collaborating_host("observe", false, "agent-observe");
+        observe.mode = HostAccessMode::Observe;
+        let mut old = collaborating_host("old", false, "agent-old");
+        old.capabilities = vec!["collaboration".into()];
+        let snapshot = FleetSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            hosts: vec![local.clone(), control.clone(), observe.clone(), old.clone()],
+        };
+
+        let plan = plan_broadcast(
+            &snapshot,
+            [&local, &control, &observe, &old]
+                .into_iter()
+                .map(broadcast_target)
+                .collect(),
+        );
+
+        assert_eq!(plan.refused(), 2);
+        assert_eq!(
+            plan.recipients[0].transport,
+            Ok(RecipientTransport::Local),
+            "local is selected by the same host alias shape, not capabilities"
+        );
+        assert_eq!(plan.recipients[1].transport, Ok(RecipientTransport::Remote));
+        assert!(plan.recipients[2]
+            .transport
+            .as_ref()
+            .unwrap_err()
+            .contains("observe-only"));
+        assert!(plan.recipients[3]
+            .transport
+            .as_ref()
+            .unwrap_err()
+            .contains("collaboration_get"));
+
+        let report = BroadcastReport {
+            rows: vec![BroadcastRow {
+                target: plan.recipients[2].target.clone(),
+                outcome: BroadcastOutcome::WillBeRefused(
+                    plan.recipients[2].transport.clone().unwrap_err(),
+                ),
+            }],
+        };
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_broadcast_report(frame, frame.area(), &report, WatchTheme::Classic);
+            })
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("will be refused"), "{rendered}");
+        assert!(rendered.contains("observe-only"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn broadcast_dispatch_is_sequential_transport_aware_and_failure_tolerant() {
+        let local = collaborating_host("local", true, "agent-local");
+        let failing = collaborating_host("dev", false, "agent-dev");
+        let mut observe = collaborating_host("observe", false, "agent-observe");
+        observe.mode = HostAccessMode::Observe;
+        let succeeding = collaborating_host("prod", false, "agent-prod");
+        let snapshot = FleetSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            hosts: vec![
+                local.clone(),
+                failing.clone(),
+                observe.clone(),
+                succeeding.clone(),
+            ],
+        };
+        let plan = plan_broadcast(
+            &snapshot,
+            [&local, &failing, &observe, &succeeding]
+                .into_iter()
+                .map(broadcast_target)
+                .collect(),
+        );
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let local_calls = std::sync::Arc::clone(&calls);
+        let remote_calls = std::sync::Arc::clone(&calls);
+
+        let report = execute_broadcast_plan(
+            plan,
+            broadcast_request(),
+            move |target, request| {
+                assert_eq!(request.body, "coordinate this change");
+                local_calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("local:{}", target.recipient.host_alias));
+                std::future::ready(Ok("req-local".into()))
+            },
+            move |target, request| {
+                assert_eq!(request.body, "coordinate this change");
+                let alias = target.recipient.host_alias;
+                remote_calls.lock().unwrap().push(format!("remote:{alias}"));
+                std::future::ready(if alias == "dev" {
+                    Err("relay closed".into())
+                } else {
+                    Ok("req-prod".into())
+                })
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["local:local", "remote:dev", "remote:prod"],
+            "the refused host is never called and the send after a failure still runs"
+        );
+        assert!(matches!(
+            report.rows[0].outcome,
+            BroadcastOutcome::Delivered(ref id) if id == "req-local"
+        ));
+        assert!(matches!(
+            report.rows[1].outcome,
+            BroadcastOutcome::Failed(ref error) if error == "relay closed"
+        ));
+        assert!(matches!(
+            report.rows[2].outcome,
+            BroadcastOutcome::WillBeRefused(ref reason) if reason.contains("observe-only")
+        ));
+        assert!(matches!(
+            report.rows[3].outcome,
+            BroadcastOutcome::Delivered(ref id) if id == "req-prod"
+        ));
+        assert_eq!(report.delivered(), 2);
+        assert_eq!(report.failed(), 2);
     }
 
     #[test]
