@@ -5,6 +5,9 @@ options:
   deploymentTarget:
     macOS: "13.0"
   createIntermediateGroups: true
+  # English is the development language; Korean lives in
+  # Resources/Localizable.xcstrings (xcodegen derives knownRegions from it).
+  developmentLanguage: en
 
 packages:
   GhosttyKit:
@@ -23,21 +26,29 @@ targets:
     platform: macOS
     sources:
       - path: Sources
+      - path: Resources
     dependencies:
       - package: GhosttyKit
         product: GhosttyTerminal
+      - sdk: Security.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.muxa.mac
         PRODUCT_NAME: Muxa
         MARKETING_VERSION: 0.1.0
         CURRENT_PROJECT_VERSION: 1
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: Muxa
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         INFOPLIST_KEY_NSHighResolutionCapable: YES
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_STYLE: Automatic
+        # Localization: the compiler records every SwiftUI/String(localized:)
+        # literal so `xcodebuild -exportLocalizations` and Scripts/l10n-sync.py
+        # can keep Resources/Localizable.xcstrings complete.
+        SWIFT_EMIT_LOC_STRINGS: YES
+        LOCALIZATION_PREFERS_STRING_CATALOGS: YES
     postBuildScripts:
       - name: Embed muxa runtime
         script: '"$SRCROOT/Scripts/embed-muxad.sh"'
@@ -83,6 +94,10 @@ schemes:
     test:
       targets:
         - MuxaTests
+      # The test host follows the machine's language list; pin it to English
+      # so assertions on UI wording do not depend on the developer's macOS.
+      commandLineArguments:
+        "-AppleLanguages (en)": true
   MuxaQAHelper:
     build:
       targets:

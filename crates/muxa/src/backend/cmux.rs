@@ -163,8 +163,15 @@ impl PaneBackend for CmuxBackend {
 
 #[must_use]
 pub fn endpoint_from_env() -> String {
-    std::env::var("CMUX_SOCKET_PATH")
-        .ok()
+    endpoint_from(|name| std::env::var(name).ok())
+}
+
+/// [`endpoint_from_env`] over an injected reader, for callers that resolve
+/// the endpoint from a captured environment (the hook adapter, tests).
+/// `CMUX_SOCKET_PATH` when set and non-blank, else [`DEFAULT_SOCKET_PATH`].
+#[must_use]
+pub fn endpoint_from(read: impl Fn(&str) -> Option<String>) -> String {
+    read("CMUX_SOCKET_PATH")
         .filter(|path| !path.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_SOCKET_PATH.into())
 }

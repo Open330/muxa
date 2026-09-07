@@ -9,6 +9,378 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `muxa init` now ships `agent-instructions`, `agent-skills`, and `agent-mcp`
+  in standard/full presets for Codex and Claude Code. A canonical collaboration
+  bundle lives beside muxa config, personal skills link to it, and managed global
+  entry points teach agents when to use it. MCP setup merges Codex pane environment
+  forwarding and preserves existing servers. A private ownership manifest supports
+  updates, drift diagnostics in `muxa doctor`, and component-specific removal.
+  Existing dotfile symlinks and locally modified integration files are preserved.
+
+## [0.8.44] - 2026-09-05
+
+### Fixed
+
+- **`muxa peek` works on front-ends that render tmux panes themselves.** Its
+  overlay is a `display-popup`, which tmux draws through a *client* — and two
+  kinds of front-end leave it without one, each failing in its own direction.
+  cmux drives panes with `capture-pane`/`send-keys` and attaches no client at
+  all, so sessions sit at `attached=0`, `display-popup` fails with "no current
+  client", and — since tmux resolves key bindings per client — `prefix + q`
+  never fires either. A control-mode client (`tmux -CC`: amux, iTerm2's tmux
+  integration) is sent pane content and nothing else, so the popup is accepted
+  and dropped: the command runs, exits 0, and waits on a pane nobody renders.
+  Typed into a pane, peek used to paint a full-client layout into one pane's
+  viewport, with no client geometry to place it by. It now reads the client
+  before drawing anything and, where the overlay cannot reach a human, prints
+  the same per-pane report `--plain` produces and says why on stderr — so the
+  report still pipes cleanly and nobody has to retype the command. An
+  inconclusive reading (no server, a tmux too old for the format) still draws,
+  leaving working clients untouched.
+
+- **`muxa doctor` describes the tmux front-end instead of prescribing fixes
+  that cannot apply.** On a server with no attached client it reported the
+  managed binding as live (`prefix+s opens muxa watch`) when no client existed
+  to run it. On a config-isolated server — amux starts its engine as
+  `tmux -f /dev/null -L amux -CC` precisely to keep the user's `~/.tmux.conf`,
+  and any session-restoring plugin in it, out — it read the absent binding and
+  absent `MUXA_SOCKET` pin as a broken install and prescribed `muxa init` and
+  `tmux source-file ~/.tmux.conf`, the second of which imports the very config
+  the server exists to exclude. doctor now reports the client's rendering mode
+  and the server's `#{config_files}`, treats a missing binding on an isolated
+  server as expected, marks an installed binding no viewer can run as such,
+  and downgrades the socket-pin warning to a note when muxad is on the default
+  path unpinned panes already fall back to. Servers the user owns get exactly
+  the advice they got before.
+
+## [0.8.43] - 2026-09-05
+
+### Added
+
+- **Muxa for Mac ships as a notarized DMG on the release.** A new
+  `apps/muxa-macos/Scripts/package-dmg.sh` builds Release, signs every nested
+  executable before the bundle around them, packages a DMG, submits it to
+  Apple, staples the ticket, and refuses to finish unless `spctl` reports
+  `accepted, source=Notarized Developer ID` — what a stranger's Mac decides
+  about the file, rather than what the signing machine believes. The release
+  workflow's `macos-app` job does the same on a tag, in a keychain it creates
+  and deletes for the job. Without signing secrets it still builds, warns,
+  and uploads a workflow artifact, so a fork stays green and no release ever
+  carries a DMG Gatekeeper would refuse. The Mac App Store is not an option
+  for muxa: the app runs the operator's own binaries, talks to a daemon that
+  outlives it over a socket in `/tmp`, and reads arbitrary project
+  directories, all of which the App Sandbox forbids.
+
+- **`brew install --cask open330/tap/muxa-app` installs the Mac app.** The
+  app has no Sparkle and no updater of its own, so Homebrew is not a nicer
+  way to install it, it is the only way an installed copy ever moves
+  forward. `tap-bump` now writes the cask from the release's DMG checksum
+  alongside the formula, and leaves it untouched when a release carries no
+  DMG rather than pointing at a download that 404s. The cask is `muxa-app`,
+  not `muxa`, because the tap already ships a formula of that name. Its
+  `zap` clears the app's own preferences and caches and deliberately spares
+  `~/Library/Application Support/muxa`, which holds the `config.toml` the
+  daemon and CLI read too.
+
+### Changed
+
+- **A Shell tab is just a terminal.** The Terminal/Raw switch, the escaped
+  hex dump behind it, and the 256 KiB byte buffer that fed it are gone.
+
+### Fixed
+
+- **`muxa onboard` says a terminal is missing instead of pretending you quit.**
+  The live tour hands the learner a real interactive shell and follows what
+  they type into it. With no terminal on stdin that shell read EOF and exited
+  before step one could be read, so the tour built a whole sandbox — its own
+  tmux server and daemon — printed the first step, and reported "Stopped
+  early", which is exactly what a learner who gave up would have seen. It now
+  refuses up front, in both languages, and names `muxa onboard --print`, the
+  guide that teaches the same sixteen actions with nothing but stdout. The
+  installer script goes further: piped into a shell with no `/dev/tty` at all,
+  a container or a CI step, it prints the written guide rather than failing.
+
+- **Muxa.app keeps running when its last window closes, and the Welcome
+  guide closes only itself.** Finishing the guide could close the workbench
+  instead, and the app then had no window at all; muxad, host monitoring,
+  and the menu-bar scene now outlive every window.
+
+- **`muxa fleet attach --fit` restores the tmux window when its terminal
+  hangs up.** The fit guard restored window size, sizing policy, zoom, and
+  active pane only when the tmux client detached normally. Ending the PTY
+  around it (Muxa.app's Live Pane **Stop**, a closed terminal, `kill -HUP`)
+  killed the process before any destructor ran and left the target pane
+  zoomed and sized to a viewport that no longer existed. SIGHUP/SIGTERM are
+  now forwarded to the tmux or ssh child and the wait returns normally, so
+  the guard restores the window on every exit path.
+
+- **Muxa.app renders Markdown block structure in summaries and responses.**
+  Agent recaps, latest responses, collaboration bodies, and Inbox previews
+  no longer collapse headings, paragraphs, lists, and tables into one run of
+  text; pipe tables render as grids in the Inbox and Ask views.
+
+- **Muxa.app minimum window size keeps the Live Pane usable.** The bottom
+  panel header, prompt composer, and status bar are no longer clipped at the
+  smallest supported window, and the read-only preview uses an installed
+  Nerd Font for prompt glyphs when one is available.
+
+- **Hook ingest attributes a tmux pane inside a cmux tab to tmux.** A tmux
+  server started from a cmux.app tab hands every `CMUX_*` variable to its
+  pane shells, and host detection let those inherited variables win over a
+  real `$TMUX`/`$TMUX_PANE`. Agents were stamped with the cmux socket, so
+  `muxa_room_context`/`muxa_call_peer` from such a pane failed with
+  "collaboration origin is not a hook-correlated tracked pane agent" and the
+  macOS Explore tree showed the pane without its agent. tmux now wins the tie;
+  cmux is detected only without a tmux pane or with `MUXA_HOST=cmux`.
+
+- **Muxa.app read-only Live Pane keeps the pane's colors.** The preview
+  renders the daemon's raw capture (`capture_raw_base64`) with SGR colors and
+  attributes through the same sanitizing scanner; older daemons fall back to
+  the plain text path.
+
+- **Operator Inbox failures are per host.** One unreachable host no longer
+  hides the whole Inbox behind a banner; its last messages stay visible, the
+  failure clears when the host recovers, and blocked/declined requests are
+  listed as decisions instead of waits.
+
+### Added
+
+- **Codex context-compaction recaps now feed muxa summaries.** The daemon
+  observes the TUI's visible `Conversation recap` without altering hook-owned
+  state or activity timestamps, persists it in the existing recap field used
+  by watch/Fleet views, and `muxa peek` reuses its fresh pane capture so the
+  summary is available before the next detector tick.
+
+- **A pipeline agent's pane split follows the window.** `direction` defaults
+  to `auto`: muxa splits along the target pane's longer side, so a line-up
+  that grows past two agents stays readable instead of collapsing into thin
+  columns. `right` and `down` stay available as explicit choices, in
+  `config.toml` and in Muxa.app's pipeline editor.
+
+- **Automations: muxa can act on what it observes.** A rule engine in muxad
+  watches the agent events it already collects and, when a rule matches,
+  waits and then acts. The first rule that matters: an agent that hits its
+  session limit is sent `continue` a couple of minutes after the limit
+  resets (`wait = "{{reset}}+2m"`), or after a fallback delay when the cap
+  carries no reset time.
+  Rules live in `[[automation.rule]]`, guards are not optional (master
+  switch, per-rule enable, pause, per-hour cap, cooldown, a re-check at fire
+  time, one firing per limit episode), and every firing is recorded.
+  `muxa automation list|log|enable|disable|pause|resume|test|add|remove`
+  drives it from the terminal; `automation_*` requests (`automation_v1`) do
+  the same from Muxa.app. Nothing fires until a rule exists.
+
+- **The whole configuration is editable from Muxa.app.** `config_read` and
+  `config_write` (`config_edit_v1`) hand the daemon's `config.toml` to a
+  client and take a replacement back, parsed and validated before it lands,
+  refusing a write whose base text changed underneath. `muxa config
+  path|show|set|check` is the same thing from the terminal. Muxa.app's
+  Settings grew Automations, Behaviour, and Advanced tabs on top of it.
+
+- **Ask providers are the operator's list, not a fixed five.** A provider
+  is now an instance in `[ask.providers.<id>]` with an `engine`
+  (`claude`, `codex`, `gemini` CLIs; `anthropic`, `openai` APIs), so two
+  Anthropic keys, a work and a personal OpenAI account, or a second Claude
+  Code binary can sit side by side. `muxa ask provider add|remove` and
+  Muxa.app's Providers pane compose the list; the five muxa ships stay
+  available with no config at all. `muxa ask` and Global Ask accept any
+  instance id. API providers replay
+  the conversation from muxa's own store, take the key from a one-turn
+  credential, muxad's environment, or a variable named in
+  `[ask.providers.<id>] api_key_env`, and honour `[ask.providers.<id>]
+  model`. New `ask_providers` / `ask_provider_configure` requests
+  (`ask_providers_v1`) and `muxa ask providers` / `muxa ask provider set`
+  expose the list with what each provider still needs. `[ask]
+  permission_mode = "plan"` runs CLI turns read-only.
+
+- **Muxa.app Settings › Providers is the one place to set up Ask.** Each
+  provider shows whether its CLI is installed (found on the login-shell
+  PATH, with version) or its API key is saved in the Keychain, offers Log
+  In / Save Key / Model, and the default-provider picker only lists
+  providers that can answer. The Global Ask bar lists the same providers,
+  folds "New Conversation" into the conversations menu, and opens that
+  settings tab from a gear instead of its own sheet.
+
+- **Pipelines drafted from a description.** `muxa work compose "<what you
+  want>"` and muxad's `work_compose` request (`work_compose_v1`) ask the
+  selected provider for one pipeline in the exact JSON `muxa work pipeline
+  set` accepts, validated with the same rules, without writing anything.
+  Muxa.app's "Describe with an agent…" (Start Work presets, Command Center
+  "Describe…") opens a composer: describe the line-up, see the draft as
+  launch stages with the model's notes, refine it with follow-ups, then
+  open it in the visual editor or save it to the library (optionally with a
+  catch-all route). `agy` joins the pipeline program allowlist.
+
+- **Muxa.app speaks Korean.** Every user-facing string moved into a String
+  Catalog with a Korean translation for all 762 keys, counts use plural
+  rules instead of assembled fragments, and daemon vocabulary (host states,
+  collaboration kinds, Ask status) gets display names instead of
+  capitalized wire values. Settings › General has a Language picker
+  (System / English / 한국어) with a Relaunch button. Product names stay
+  English: Work, Explore, Inbox, Shells, Live Watch, Global Ask.
+  `Scripts/l10n-sync.py` merges an export back into the catalog and
+  `--check` (and a unit test) fails while any key lacks Korean.
+
+- **Muxa.app welcomes a first launch.** A Welcome window opens the first
+  time a version runs (and from Help › Welcome Guide… or Settings ›
+  General): what the four surfaces are for, a live setup checklist (muxad
+  connected, tmux and agent CLIs found on the login-shell PATH with
+  versions, Global Ask enabled, Work folder set, SSH hosts registered) with
+  the matching actions, and how a Work item flows from Start Work through
+  the pipeline to the Inbox and Live Watch.
+
+- **Muxa.app Inbox selects an agent instead of leaving.** Clicking a
+  "Needs attention" row keeps you in the Inbox and shows that agent's
+  request card (what it waits on, its open operator requests, latest
+  prompt, host and pane) with an explicit **Open in Live Watch** button; the
+  row and its context menu offer the same jump.
+
+- **Muxa.app Shells tab is a place to open shells.** The sidebar header
+  gains "+" for a local shell and a host menu that opens an `ssh` shell to
+  any online fleet host; an empty tab explains itself with a New Shell
+  button; exited shells stay listed with their exit status until you remove
+  them instead of vanishing, and a shell that exits no longer throws the
+  sidebar back to the Work board.
+
+- **Muxa.app Start Work shows real choices and the pipeline picture.** The
+  Command Center lists configured pipelines as launchable cards drawn in
+  launch stages, the Start Work sheet previews the matching route, suggests
+  workspaces, offers pipelines and message skills as pickers, and an empty
+  config offers muxa's built-in presets (`solo`, `pair`, `triad`) with
+  one-click install through `muxa work preset apply`.
+
+- **Muxa.app edits pipelines visually and keeps them in sync across hosts.**
+  The Command Center treats this Mac's pipelines as the library, shows per
+  host whether each pipeline is in sync, different, or missing (read through
+  muxad's new `work_command` operation), and syncs them with one click;
+  routes stay per host with their own switcher. Start Work launches `muxa
+  work up` on the chosen host with a project folder there, and a visual
+  editor composes agents, prompts, split directions, and `after` edges
+  (saved through `muxa work pipeline set`) while an inline Routes list edits
+  `[[route]]` entries (`muxa work route set/remove`).
+
+- **muxad runs `muxa work …` on any control host.** The `work_up` request
+  gains an optional `host` (a `[fleet.hosts]` alias; absent or `"local"` is
+  unchanged), and the new `work_command` IPC kind runs one allowlisted `muxa
+  work options|preset|pipeline|route …` argv, with optional stdin, bounded
+  to 30 s and 1 MiB, returning exit code, stdout, and stderr. Observe-only
+  hosts may run just `work options`. Remote argv travels as a new
+  `work_command` relay operation when the host's relay advertises it, and
+  otherwise over a one-shot `ssh -o BatchMode=yes … <muxa_path> 'work' …`
+  command with single-quoted arguments, so hosts still running an older muxa
+  keep working. Advertised as `work_command_v1`.
+
+- **`muxa work options` and `muxa work preset`.** `muxa work options
+  [--json]` prints the routes, pipelines, message skills, built-in presets,
+  and ticket agent a Work launcher needs, so Muxa.app and other GUIs never
+  parse `config.toml` themselves. `muxa work preset list` shows the built-in
+  `solo`, `pair`, and `triad` line-ups, and `muxa work preset apply <name>
+  [--route <regex>] [--overwrite]` writes one as `[pipeline.<name>]` through
+  `toml_edit` — validated as a full `Config` first, refusing to replace an
+  existing pipeline without `--overwrite`, and appending a `[[route]]` only
+  when no route with that `match` exists — so a fresh config becomes
+  launchable without spending an agent turn.
+
+- **`muxa work pipeline` and `muxa work route` edit `config.toml` from the
+  shape `work options` prints.** `muxa work options --json` now carries the
+  raw `prompt` template on every pipeline and agent, so an editor can
+  round-trip an entry. `muxa work pipeline set <name> --from-json <path|->`
+  validates one pipeline the way a launch would (allowlisted programs,
+  unique aliases, `after` edges that resolve and do not cycle, `direction`
+  right or down) and writes `[pipeline.<name>]` through `toml_edit`,
+  replacing an existing pipeline where it stands and leaving every other
+  section, comment, and value alone; `muxa work pipeline remove <name>`
+  refuses while a `[[route]]` still names the pipeline unless `--force`,
+  which also clears `pipeline` on those routes. `muxa work route set --match
+  <regex>` adds or updates the one `[[route]]` with exactly that `match`
+  (`--pipeline`, `--workspace`, `--cwd`, `--position <n>`, `--clear-*`;
+  `worktree` and `prepare` are never touched) and `muxa work route remove`
+  deletes it. Every command validates the merged file as a whole `Config`
+  before an atomic write, refuses without touching the file otherwise, and
+  prints only JSON with `--json`.
+
+### Changed
+
+- **Muxa.app says "Hosts" everywhere the user can see it.** "Fleet" remains
+  only in protocol and type names. Explore's grouping and sort choices
+  persist across launches, and the Inbox badge is populated right after
+  connecting instead of after the Inbox is first opened.
+
+## [0.8.42] - 2026-09-01
+
+### Fixed
+
+- **Long MCP waits now use fewer host continuation turns.** A 24-hour audit
+  on an actively used machine found 849 Codex host
+  continuation turns around 523 long `muxa_wait_for_change` cells. Those
+  continuations alone carried 124 million input tokens, almost all cached.
+  Muxa now tells Codex to resume the same yielded cell in 60-second intervals,
+  warns against starting a second Muxa wait, and steers durable peer work
+  through `wait=false` plus muxad's existing idle-gated reply wake.
+
+- **MCP results are compact and stop echoing data the model just supplied.**
+  JSON results no longer contain pretty-print whitespace. Send, reply, cancel,
+  local/Fleet peer-call, and reply-wait receipts keep correlation ids, status,
+  resolved routing, and the new structured reply without copying the original
+  request body, provenance, and timestamps back into later model turns.
+
+### Changed
+
+- **A no-argument `muxa_status` is now a bounded fleet summary.** It preserves
+  pane, host, socket, session/window, state, model, and attention information
+  needed for routing without embedding every agent's prompt, response, and
+  workload tree. Pass `full=true` for the canonical complete topology, or
+  `pane` for focused detail. On the audited machine this reduced the default
+  status payload by more than 90 percent.
+
+- **MCP startup guidance now fits below Claude Code's 2 KiB instruction
+  boundary.** Safety and routing rules remain in the startup contract while
+  detailed reviewer/subagent/AIR workflows stay available on demand through
+  `muxa_collaboration_guide`.
+
+## [0.8.41] - 2026-09-01
+
+### Fixed
+
+- **Two terminals on one workspace no longer hide every agent from
+  collaboration.** tmux lists a pane once per session that shows it, and a
+  session *group* shows one window through several sessions — which is exactly
+  what muxa's own `tmux-auto-view` builds, giving each attached client a
+  `<session>~view~<pid>` member of the group. Every pane in such a session was
+  therefore listed twice, and the participant resolver treated the second row
+  as an ambiguity and skipped the pane. With a second terminal attached there
+  were no participants, no origin and no peers: `muxa msg send`, `m` in
+  `muxa watch` and `muxa_call_peer` all refused with *"collaboration origin is
+  not a hook-correlated tracked pane agent"*, advising a restart of an agent
+  that was working fine — and the whole thing healed itself the moment the
+  second terminal detached, which is the worst way for a bug to behave.
+
+  Rows that agree on server, window and pane are now recognised as one pane
+  seen twice, with the durable session naming it rather than a per-client view.
+  The ambiguity that matters — one pane id on two servers — still refuses. The
+  origin resolver, the participant table and the pending-pane resolver all
+  shared the shape and are all fixed.
+
+### Added
+
+- **Muxa for Mac is now a task-oriented Fleet workbench rather than a shell
+  wrapper.** Explore, Work, Operator Inbox, Global Ask, collaboration and
+  detachable Ghostty-backed shell surfaces share stable editor tabs, readable
+  Markdown request/reply views, resumable Claude Code or Codex conversations,
+  host/session/window summaries and exact-pane navigation. Provider API keys
+  remain optional one-turn credentials and are never persisted by muxad.
+
+- **Fleet, Ask, Pipeline, Inbox and native PTY updates are event-driven.** New
+  revision subscriptions replace high-frequency polling, while host-scoped
+  mailbox invalidations fetch only the node whose durable mailbox changed.
+  Terminal readers park on bounded output waits instead of opening 20–125
+  empty reads per second, and detach wakes a parked reader immediately.
+  Coalesced refreshes, immutable snapshot indexes, adaptive selected-pane
+  capture and slow authoritative reconciliation retain correctness after
+  reconnects without paying the old idle cost. Current relays forward mailbox
+  revisions without copying request bodies; older nodes continue through the
+  documented reconciliation fallback until upgraded.
+
 - **`Space` marks agents in `muxa watch`, and `m` then addresses all of
   them.** Composing once for several agents meant sending several times, which
   is both tedious and how the wording drifts between recipients. Marking uses
@@ -25,7 +397,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the error and the fact that nothing was retried. A fan-out that reports "sent
   to 5" cannot say which of the five did not get it.
 
-### Added
+- **Enter reads a full ask answer.** The `A` history could only ever show an
+  answer's first screenful: the detail pane under the list is a few rows tall,
+  `|` grows it to most of a popup and no further, and nothing scrolled. A
+  headless agent's reply is routinely longer than that, and the rest of it —
+  already stored, already paid for — had no reader anywhere in muxa.
+
+  `Enter` (or `o`) now opens the selected entry in a reader that shows the
+  question and the whole answer. `j`/`k` scroll a line, `PgUp`/`PgDn` a page
+  with one line of overlap, `g`/`G` jump to either end, and the foot of the box
+  tracks which lines are on screen. `Esc`, `Enter`, or `q` steps back to the
+  list; `A` closes the panel outright.
+
+  The reader owns every key while it is open, so `d` and `D` cannot delete the
+  answer being read out from under it, and it addresses its entry by id rather
+  than by row: the history is re-fetched from the daemon on a timer, and an
+  index would silently re-point at a neighbour when an answer lands or is
+  deleted. An entry that disappears anyway drops back to the list with a hint
+  instead of painting a blank page.
 
 - **`C` opens a window in watch, where `prefix + c` cannot reach.** Creating a
   plain shell window next to running work meant leaving the console: attach to
@@ -2892,7 +3281,11 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.40...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.44...HEAD
+[0.8.44]: https://github.com/Open330/muxa/compare/v0.8.43...v0.8.44
+[0.8.43]: https://github.com/Open330/muxa/compare/v0.8.42...v0.8.43
+[0.8.42]: https://github.com/Open330/muxa/compare/v0.8.41...v0.8.42
+[0.8.41]: https://github.com/Open330/muxa/compare/v0.8.40...v0.8.41
 [0.8.26]: https://github.com/Open330/muxa/compare/v0.8.25...v0.8.26
 [0.8.25]: https://github.com/Open330/muxa/compare/v0.8.24...v0.8.25
 [0.8.24]: https://github.com/Open330/muxa/compare/v0.8.23...v0.8.24

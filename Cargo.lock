@@ -2316,7 +2316,7 @@ checksum = "dce6dd36094cac388f119d2e9dc82dc730ef91c32a6222170d630e5414b956e6"
 
 [[package]]
 name = "muxa"
-version = "0.8.40"
+version = "0.8.44"
 dependencies = [
  "axum",
  "base64",
@@ -2339,6 +2339,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "toml_edit 0.22.27",
  "tower",
  "tower-http",
  "tracing",
@@ -2350,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "muxa-cli"
-version = "0.8.40"
+version = "0.8.44"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -2362,11 +2363,13 @@ dependencies = [
  "dirs",
  "insta",
  "muxa",
+ "nix 0.29.0",
  "owo-colors 4.3.0",
  "rand 0.8.6",
  "ratatui",
  "serde",
  "serde_json",
+ "signal-hook",
  "tempfile",
  "time",
  "tokio",
@@ -2380,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "muxa-zellij-plugin"
-version = "0.8.40"
+version = "0.8.44"
 dependencies = [
  "serde",
  "serde_json",
@@ -2389,7 +2392,7 @@ dependencies = [
 
 [[package]]
 name = "muxad"
-version = "0.8.40"
+version = "0.8.44"
 dependencies = [
  "anyhow",
  "clap 4.6.1",

@@ -13,7 +13,80 @@ struct WorkStartView: View {
     @State private var taskBody = ""
     @State private var context = ""
     @State private var dryRun = false
+    @State private var host = ""
     @AppStorage("nativeWorkDirectory") private var cwd = ""
+    @State private var remoteFolder = ""
+
+    private var isLocalHost: Bool { model.isLocalHost(host) }
+
+    private var options: MuxaWorkOptions? { model.workOptions(for: isLocalHost ? nil : host) }
+
+    /// The folder field edits the persisted local default for the local host
+    /// and a per-sheet path for a remote host, because remote paths mean
+    /// nothing here and must not be remembered as the local default.
+    private var folderBinding: Binding<String> {
+        isLocalHost ? $cwd : $remoteFolder
+    }
+
+    private var matchedRoute: MuxaWorkOptions.Route? {
+        options?.route(matching: work)
+    }
+
+    /// The pipeline the launch would use: the explicit choice, else the
+    /// matching route's pipeline.
+    private var effectivePipeline: MuxaWorkOptions.Pipeline? {
+        guard let options else { return nil }
+        if pipeline.isEmpty { return options.defaultPipeline(for: work) }
+        return options.pipeline(named: pipeline)
+    }
+
+    private var localSessionNames: [String] {
+        model.executionSnapshot.watchHosts
+            .first(where: { isLocalHost ? $0.host.local : $0.host.alias == host })?
+            .sessions
+            .map(\.name)
+            .filter { !$0.isEmpty } ?? []
+    }
+
+    private var workspaceSuggestions: [String] {
+        var seen = Set<String>()
+        var suggestions: [String] = []
+        for candidate in [matchedRoute?.workspace].compactMap({ $0 }) + localSessionNames
+        where seen.insert(candidate).inserted {
+            suggestions.append(candidate)
+        }
+        return suggestions
+    }
+
+    /// Whether the launch directory is pinned by the route (cwd, worktree,
+    /// or a prepare command) rather than by this form.
+    private var routePinsDirectory: Bool {
+        guard let route = matchedRoute else { return false }
+        return route.worktree || route.prepare || (route.cwd?.isEmpty == false)
+    }
+
+    /// muxad runs `muxa work up` from its own working directory, which for a
+    /// GUI-launched daemon is `/`. Never let that become an agent's project
+    /// folder: when neither the form nor the route names one, use home.
+    private var effectiveDirectory: String? {
+        let trimmed = folderBinding.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        if routePinsDirectory { return nil }
+        // A remote host's home is not known here; let the remote CLI use its
+        // own cwd rules (the route, else the login directory).
+        return isLocalHost ? FileManager.default.homeDirectoryForCurrentUser.path : nil
+    }
+
+    private var canSubmit: Bool {
+        guard !work.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !model.isStartingWork else {
+            return false
+        }
+        // With a loaded config the launch is predictable: refuse the combos
+        // the CLI would refuse instead of surfacing its error afterwards.
+        guard let options else { return true }
+        if options.pipelines.isEmpty { return false }
+        return effectivePipeline != nil
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,10 +97,13 @@ struct WorkStartView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Start Work")
                         .font(.title2.weight(.semibold))
-                    Text("Create or converge the configured collaborator pipeline without leaving Muxa.")
+                    Text("Create or converge a collaborator pipeline without leaving Muxa.")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                if model.isLoadingWorkOptions {
+                    ProgressView().controlSize(.small)
+                }
             }
             .padding(20)
 
@@ -35,23 +111,68 @@ struct WorkStartView: View {
 
             Form {
                 Section("Identity") {
+                    hostPicker
                     TextField("Work ID, for example auth-cleanup", text: $work)
-                    TextField("Workspace (optional)", text: $workspace)
+                    routeSummary
                     HStack {
-                        TextField("Project folder (use configured route when empty)", text: $cwd)
-                        Button("Choose…", action: chooseDirectory)
+                        TextField("Workspace (optional)", text: $workspace)
+                        if !workspaceSuggestions.isEmpty {
+                            Menu {
+                                ForEach(workspaceSuggestions, id: \.self) { suggestion in
+                                    Button(suggestion) { workspace = suggestion }
+                                }
+                            } label: {
+                                Image(systemName: "chevron.up.chevron.down")
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .help("Use the route's workspace or an existing session")
+                        }
+                    }
+                    HStack {
+                        TextField(
+                            isLocalHost
+                                ? "Project folder (use configured route when empty)"
+                                : "Project folder on \(host) (use its route when empty)",
+                            text: folderBinding
+                        )
+                        if isLocalHost {
+                            Button("Choose…", action: chooseDirectory)
+                        }
+                    }
+                    if folderBinding.wrappedValue.trimmingCharacters(in: .whitespaces).isEmpty, options != nil {
+                        Group {
+                            if routePinsDirectory {
+                                Text("The route decides the folder.")
+                            } else if isLocalHost {
+                                Text("Defaults to your home folder because the route names none; choose the project you want the agents to work in.")
+                            } else {
+                                Text("The route on \(host) names no folder; type the project path on that host.")
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(routePinsDirectory ? Color.secondary : Color.orange)
                     }
                 }
 
-                Section("Team") {
-                    TextField("Pipeline (use configured route when empty)", text: $pipeline)
+                if let plan = model.workStartPlan {
+                    Section("Plan") {
+                        WorkPlanView(result: plan) {
+                            dryRun = false
+                            submit()
+                        }
+                    }
+                }
+
+                Section("Pipeline") {
+                    pipelineSection
+                }
+
+                Section("Task") {
                     TextField("External issue, for example CAL-1234 (optional)", text: $external)
                     Text("An empty external issue creates a local Muxa Work; the issue never becomes the Work identity.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                }
-
-                Section("Initial task") {
                     TextEditor(text: $taskBody)
                         .font(.body)
                         .frame(minHeight: 86)
@@ -65,7 +186,7 @@ struct WorkStartView: View {
                             }
                         }
                     DisclosureGroup("Advanced context") {
-                        TextField("Message skill (optional)", text: $skill)
+                        skillField
                         TextField("Additional context (optional)", text: $context)
                         Toggle("Plan only — do not create agents", isOn: $dryRun)
                     }
@@ -81,7 +202,7 @@ struct WorkStartView: View {
                         .textSelection(.enabled)
                     if model.needsWorkConfiguration {
                         HStack {
-                            Text("No Work routing is configured yet. Muxa can guide you through it in an interactive Shell tab.")
+                            Text("No Work routing is configured yet. Install a preset above, or let an agent write the config in an interactive Shell tab.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Spacer()
@@ -116,12 +237,192 @@ struct WorkStartView: View {
                     .disabled(model.isStartingWork)
                 Button(dryRun ? "Build Plan" : "Start Work") { submit() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(work.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isStartingWork)
+                    .disabled(!canSubmit)
                     .keyboardShortcut(.defaultAction)
             }
             .padding(16)
         }
-        .frame(width: 650, height: 650)
+        .frame(width: 700, height: 720)
+        .onAppear {
+            if let preselected = model.workStartPreselectedPipeline {
+                pipeline = preselected
+            }
+            if let preselectedHost = model.workStartPreselectedHost, !model.isLocalHost(preselectedHost) {
+                host = preselectedHost
+            }
+        }
+        .onChange(of: host) { selected in
+            pipeline = ""
+            workspace = ""
+            Task { await model.loadWorkOptions(host: model.isLocalHost(selected) ? nil : selected) }
+        }
+        .onChange(of: model.workOptions) { updated in
+            // A preset installed from this sheet becomes the selection; a
+            // previously chosen pipeline that vanished from the config
+            // returns to the route default.
+            guard let updated else { return }
+            if !pipeline.isEmpty, updated.pipeline(named: pipeline) == nil {
+                pipeline = ""
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var hostPicker: some View {
+        let hosts = model.workCapableHosts
+        if hosts.count > 1 {
+            Picker("Host", selection: $host) {
+                ForEach(hosts) { candidate in
+                    Group {
+                        if candidate.local {
+                            Text("\(candidate.alias) (this Mac)")
+                        } else {
+                            Text(candidate.alias)
+                        }
+                    }
+                    .tag(candidate.local ? "" : candidate.alias)
+                }
+            }
+            if !isLocalHost, !model.supportsHostWorkCommands {
+                Label(
+                    "Starting Work on \(host) needs the updated muxad on this Mac (Use Bundled muxad), and muxa on \(host) must know `work options`.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            } else if !isLocalHost {
+                Text("The pipeline and route come from \(host)'s config; agents start in tmux on that host.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var routeSummary: some View {
+        if let options, !work.trimmingCharacters(in: .whitespaces).isEmpty {
+            if let route = matchedRoute {
+                Label {
+                    Text(routeDescription(route))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } icon: {
+                    Image(systemName: "arrow.triangle.branch")
+                        .foregroundStyle(.tint)
+                }
+            } else if options.pipelines.isEmpty {
+                EmptyView()
+            } else {
+                Label("No route matches this Work id; choose a pipeline below.", systemImage: "arrow.triangle.branch")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private func routeDescription(_ route: MuxaWorkOptions.Route) -> String {
+        var parts = [String(localized: "Route \(route.match)")]
+        if let name = route.pipeline, !name.isEmpty {
+            parts.append(String(localized: "pipeline \(name)"))
+        }
+        if let workspace = route.workspace, !workspace.isEmpty {
+            parts.append(String(localized: "workspace \(workspace)"))
+        }
+        if route.worktree {
+            parts.append(String(localized: "own git worktree"))
+        } else if let cwd = route.cwd, !cwd.isEmpty {
+            parts.append(String(localized: "cwd \(cwd)"))
+        }
+        return parts.joined(separator: " → ")
+    }
+
+    @ViewBuilder
+    private var pipelineSection: some View {
+        if let options {
+            if options.pipelines.isEmpty {
+                WorkPresetGallery(
+                    options: options,
+                    host: isLocalHost ? nil : host,
+                    model: model,
+                    onInstalled: { installed in pipeline = installed },
+                    onDescribe: describeWithAgent
+                )
+            } else {
+                Picker("Pipeline", selection: $pipeline) {
+                    Text(defaultPipelineLabel).tag("")
+                    ForEach(options.pipelines) { candidate in
+                        Text(candidate.name).tag(candidate.name)
+                    }
+                }
+                if let selected = effectivePipeline {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let description = selected.description, !description.isEmpty {
+                            Text(description)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        PipelineStagesView(agents: selected.agents)
+                        if let layout = selected.layout, !layout.isEmpty {
+                            Text("tmux layout \(layout)")
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                } else if pipeline.isEmpty {
+                    Text("The route for this Work id names no pipeline. Pick one to launch.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+        } else if let error = model.workOptionsError(for: isLocalHost ? nil : host) {
+            TextField("Pipeline (use configured route when empty)", text: $pipeline)
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .textSelection(.enabled)
+        } else {
+            TextField("Pipeline (use configured route when empty)", text: $pipeline)
+            Group {
+                if isLocalHost {
+                    Text("Reading pipelines from the muxa config…")
+                } else {
+                    Text("Reading pipelines from \(host)…")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    /// `muxa work init` runs in a local Shell tab, so it is offered for the
+    /// local host only.
+    private var describeWithAgent: (() -> Void)? {
+        guard isLocalHost else { return nil }
+        return { configureWork() }
+    }
+
+    private var defaultPipelineLabel: String {
+        if let name = matchedRoute?.pipeline, !name.isEmpty {
+            return String(localized: "Route default (\(name))")
+        }
+        return work.trimmingCharacters(in: .whitespaces).isEmpty
+            ? String(localized: "Route default")
+            : String(localized: "Route default (none)")
+    }
+
+    @ViewBuilder
+    private var skillField: some View {
+        if let skills = options?.skills, !skills.isEmpty {
+            Picker("Message skill", selection: $skill) {
+                Text("None").tag("")
+                ForEach(skills) { candidate in
+                    Text(verbatim: candidate.summary.map { "\(candidate.name) — \($0)" } ?? candidate.name)
+                        .tag(candidate.name)
+                }
+            }
+        } else {
+            TextField("Message skill (optional)", text: $skill)
+        }
     }
 
     private func submit() {
@@ -129,12 +430,13 @@ struct WorkStartView: View {
             work: work,
             workspace: workspace,
             pipeline: pipeline,
-            cwd: cwd,
+            cwd: effectiveDirectory,
             external: external,
             skill: skill,
             body: taskBody,
             context: context,
-            dryRun: dryRun
+            dryRun: dryRun,
+            host: isLocalHost ? nil : host
         )
         Task {
             if await model.startWork(request) {
@@ -203,11 +505,11 @@ struct WorkCommandCenterView: View {
                     CommandCenterMetric(title: "Managed Work", value: model.workGroups.count, color: .accentColor)
                     CommandCenterMetric(title: "Working Agents", value: workingCount, color: .blue)
                     CommandCenterMetric(title: "Needs Attention", value: attentionCount, color: .orange)
-                    CommandCenterMetric(title: "Fleet Hosts", value: model.fleetHosts.count, color: .mint)
+                    CommandCenterMetric(title: "Hosts", value: model.fleetHosts.count, color: .mint)
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Fleet scope")
+                    Text("Hosts")
                         .font(.title2.weight(.semibold))
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 10) {
@@ -219,7 +521,7 @@ struct WorkCommandCenterView: View {
                                         HostIdentityBadge(host: host, size: 30)
                                         VStack(alignment: .leading, spacing: 1) {
                                             Text(host.alias).fontWeight(.medium)
-                                            Text("\(host.remote?.agents.filter { $0.state != "stopped" }.count ?? 0) agents · \(host.state)")
+                                            Text("\(host.remote?.agents.filter { $0.state != "stopped" }.count ?? 0) agents · \(fleetHostStateLabel(host.state))")
                                                 .font(.caption2)
                                                 .foregroundStyle(.secondary)
                                         }
@@ -233,6 +535,8 @@ struct WorkCommandCenterView: View {
                         }
                     }
                 }
+
+                pipelinesSection
 
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Active Work")
@@ -256,9 +560,11 @@ struct WorkCommandCenterView: View {
                     } else {
                         LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
                             ForEach(model.workGroups) { work in
-                                WorkCommandCard(work: work) {
-                                    model.select(.work(work.identity))
-                                }
+                                WorkCommandCard(
+                                    work: work,
+                                    open: { model.select(.work(work.identity)) },
+                                    moduleModel: model
+                                )
                             }
                         }
                     }
@@ -269,6 +575,283 @@ struct WorkCommandCenterView: View {
             .frame(maxWidth: .infinity, alignment: .top)
         }
         .background(MuxaSurfacePalette.workspace(for: colorScheme).ignoresSafeArea())
+        .task { await model.loadAllWorkOptions() }
+        .onChange(of: model.workCapableHosts.map(\.alias)) { _ in
+            // The host list arrives with the first fleet snapshot, usually
+            // after this view appeared; read the newly known hosts then.
+            Task { await model.loadAllWorkOptions() }
+        }
+        .sheet(item: $pipelineComposer.target) { target in
+            PipelineComposerView(
+                target: target,
+                model: model,
+                shellFallback: pipelineComposer.shellFallback
+            )
+        }
+    }
+
+    private let pipelineColumns = [
+        GridItem(.adaptive(minimum: 300, maximum: 460), spacing: 12, alignment: .top),
+    ]
+
+    /// Host whose routes the Routes editor shows; "" is the local host.
+    /// Pipelines are one library kept in sync across hosts; routes carry
+    /// host-specific folders, so they stay per host.
+    @State private var routesHost = ""
+    @State private var syncingPipelines = Set<String>()
+    @State private var syncFailures: [String: String] = [:]
+    @ObservedObject private var pipelineComposer = PipelineComposerPresenter.shared
+
+    private var routesHostAlias: String? { routesHost.isEmpty ? nil : routesHost }
+    private var pipelinesHostAlias: String? { nil }
+
+    /// `muxa work init` opens a local Shell tab, so only the local host gets it.
+    private var describeWithAgentAction: (() -> Void)? {
+        guard pipelinesHostAlias == nil else { return nil }
+        return { Task { await model.configureWork(cwd: nil) } }
+    }
+
+    /// The pipeline library drawn as launchable presets. This is where a GUI
+    /// earns its place over the CLI: the stage picture is visible before a
+    /// single agent exists, every control host shows whether it carries the
+    /// same definition, and an empty config offers muxa's built-in presets
+    /// instead of an error.
+    @ViewBuilder
+    private var pipelinesSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("Pipelines")
+                    .font(.title2.weight(.semibold))
+                if let path = model.workOptions?.configPath {
+                    Text(path)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(path)
+                }
+                Spacer()
+                if model.isLoadingWorkOptions {
+                    ProgressView().controlSize(.small)
+                }
+                if libraryNeedsSync {
+                    Button {
+                        syncAll()
+                    } label: {
+                        Label("Sync All to Hosts", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!syncingPipelines.isEmpty)
+                    .help("Write every library pipeline to the hosts where it is missing or differs")
+                }
+                Button {
+                    model.presentPipelineComposer(host: pipelinesHostAlias)
+                } label: {
+                    Label("Describe…", systemImage: "sparkles")
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.workOptions == nil || !model.isConnected)
+                .help("Describe a pipeline in plain language and let the Ask provider draft it")
+                Button {
+                    model.presentPipelineEditor(host: nil, pipeline: nil)
+                } label: {
+                    Label("New Pipeline…", systemImage: "plus")
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.workOptions == nil)
+                Button {
+                    Task { await model.loadAllWorkOptions() }
+                } label: {
+                    Label("Reload", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Re-read pipelines and routes from every host")
+            }
+
+            if model.workCapableHosts.count > 1, !model.supportsHostWorkCommands {
+                Label(
+                    "Host sync needs the updated muxad on this Mac (Settings › Runtime › Reload Bundled muxad).",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            }
+
+            if let options = model.workOptions(for: pipelinesHostAlias) {
+                if options.pipelines.isEmpty {
+                    WorkPresetGallery(
+                        options: options,
+                        host: pipelinesHostAlias,
+                        model: model,
+                        onInstalled: { installed in
+                            model.presentWorkStart(pipeline: installed, host: pipelinesHostAlias)
+                        },
+                        onDescribe: describeWithAgentAction
+                    )
+                    .padding(16)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                } else {
+                    LazyVGrid(columns: pipelineColumns, alignment: .leading, spacing: 12) {
+                        ForEach(options.pipelines) { pipeline in
+                            WorkPipelineCard(
+                                pipeline: pipeline,
+                                routes: options.routes.filter { $0.pipeline == pipeline.name },
+                                start: { model.presentWorkStart(pipeline: pipeline.name) },
+                                edit: { model.presentPipelineEditor(host: nil, pipeline: pipeline) },
+                                hostStates: model.pipelineHostStates(for: pipeline),
+                                sync: { sync(pipeline) },
+                                syncing: syncingPipelines.contains(pipeline.name),
+                                moduleContext: (model: model, host: pipelinesHostAlias)
+                            )
+                        }
+                    }
+                    remoteOnlyPipelinesRow
+                    if !syncFailures.isEmpty {
+                        ForEach(syncFailures.keys.sorted(), id: \.self) { key in
+                            Label {
+                                Text(verbatim: "\(key): \(syncFailures[key] ?? "")")
+                            } icon: {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                            }
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    routesSection
+                    if let error = model.workOptionsError {
+                        Label(error, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .textSelection(.enabled)
+                    }
+                }
+            } else if let error = model.workOptionsError(for: pipelinesHostAlias) {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            } else {
+                Text("Reading pipelines from the muxa config…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            }
+        }
+    }
+
+    private var libraryNeedsSync: Bool {
+        (model.workOptions?.pipelines ?? []).contains { pipeline in
+            model.pipelineHostStates(for: pipeline).contains(where: \.needsSync)
+        }
+    }
+
+    private func sync(_ pipeline: MuxaWorkOptions.Pipeline) {
+        guard !syncingPipelines.contains(pipeline.name) else { return }
+        syncingPipelines.insert(pipeline.name)
+        Task {
+            let failures = await model.syncPipeline(pipeline)
+            syncFailures = syncFailures.filter { !$0.key.hasSuffix("/\(pipeline.name)") }
+            for (host, error) in failures { syncFailures["\(host)/\(pipeline.name)"] = error }
+            syncingPipelines.remove(pipeline.name)
+        }
+    }
+
+    private func syncAll() {
+        let names = (model.workOptions?.pipelines ?? []).map(\.name)
+        syncingPipelines.formUnion(names)
+        Task {
+            syncFailures = await model.syncAllPipelines()
+            syncingPipelines.subtract(names)
+        }
+    }
+
+    /// Pipelines that only exist on some host: pull one into the library
+    /// (this Mac's config) so it can be synced everywhere.
+    @ViewBuilder
+    private var remoteOnlyPipelinesRow: some View {
+        let remoteOnly = model.remoteOnlyPipelines
+        if !remoteOnly.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Only on other hosts")
+                    .font(.headline)
+                ForEach(Array(remoteOnly.enumerated()), id: \.offset) { _, entry in
+                    HStack(spacing: 10) {
+                        Text(entry.pipeline.name)
+                            .font(.callout.weight(.medium))
+                        Text("on host \(entry.host)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        PipelineStagesView(agents: entry.pipeline.agents, compact: true)
+                            .frame(maxWidth: 420)
+                        Spacer(minLength: 4)
+                        Button {
+                            Task {
+                                _ = await model.savePipeline(
+                                    MuxaPipelineDefinition(entry.pipeline),
+                                    named: entry.pipeline.name,
+                                    host: nil
+                                )
+                            }
+                        } label: {
+                            Label("Add to Library", systemImage: "square.and.arrow.down")
+                        }
+                        .controlSize(.small)
+                        .disabled(model.isSavingPipeline)
+                        .help("Copy this pipeline into this Mac's config so it can be synced to every host")
+                    }
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
+    /// Routes are host-specific (they carry folders and workspaces on that
+    /// host), so the editor keeps its own host switcher.
+    @ViewBuilder
+    private var routesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if model.workCapableHosts.count > 1 {
+                Picker("Routes on", selection: $routesHost) {
+                    ForEach(model.workCapableHosts) { candidate in
+                        Group {
+                            if candidate.local {
+                                Text("\(candidate.alias) (this Mac)")
+                            } else {
+                                Text(candidate.alias)
+                            }
+                        }
+                        .tag(candidate.local ? "" : candidate.alias)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 560, alignment: .leading)
+            }
+            if let options = model.workOptions(for: routesHostAlias) {
+                WorkRoutesEditor(options: options, host: routesHostAlias, model: model)
+            } else if let error = model.workOptionsError(for: routesHostAlias) {
+                Label {
+                    Text(verbatim: "\(routesHost): \(error)")
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                }
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+            } else {
+                Text("Reading routes on \(routesHost)…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 
     private var commandCenterTitle: some View {
@@ -302,13 +885,13 @@ struct WorkCommandCenterView: View {
 }
 
 private struct CommandCenterMetric: View {
-    let title: String
+    let title: LocalizedStringKey
     let value: Int
     let color: Color
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("\(value)")
+            Text(verbatim: "\(value)")
                 .font(.title.weight(.semibold).monospacedDigit())
                 .foregroundStyle(color)
             Text(title)
@@ -324,6 +907,19 @@ private struct CommandCenterMetric: View {
 private struct WorkCommandCard: View {
     let work: MuxaWorkGroup
     let open: () -> Void
+    /// What the enabled modules offer for this Work; nil when there is no
+    /// model to give them.
+    var moduleModel: AppModel?
+
+    private var statusText: Text {
+        if work.attentionCount > 0 {
+            Text("Attention")
+        } else if work.workingCount > 0 {
+            Text("Running")
+        } else {
+            Text("Ready")
+        }
+    }
 
     var body: some View {
         Button(action: open) {
@@ -337,19 +933,38 @@ private struct WorkCommandCard: View {
                             .font(.headline)
                     }
                     Spacer()
-                    Label(
-                        work.attentionCount > 0 ? "Attention" : work.workingCount > 0 ? "Running" : "Ready",
-                        systemImage: "circle.fill"
-                    )
+                    Label {
+                        statusText
+                    } icon: {
+                        Image(systemName: "circle.fill")
+                    }
                     .font(.caption.weight(.medium))
                     .foregroundStyle(work.attentionCount > 0 ? .orange : work.workingCount > 0 ? .blue : .green)
+                    if let moduleModel {
+                        MuxaModuleMenu(
+                            context: .work(work),
+                            model: moduleModel,
+                            registry: MuxaModuleRegistry.shared,
+                            label: "More"
+                        )
+                    }
                 }
-                Text(work.pipelineRun.pipeline)
+                Text(work.pipelineLabel)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 14) {
-                    Label("\(work.participants.count)", systemImage: "person.2")
-                    Label("\(work.completedCount)/\(work.totalCount)", systemImage: "checkmark.circle")
+                    Label {
+                        Text(verbatim: "\(work.participants.count)")
+                    } icon: {
+                        Image(systemName: "person.2")
+                    }
+                    if work.pipelineRun != nil {
+                        Label {
+                            Text(verbatim: "\(work.completedCount)/\(work.totalCount)")
+                        } icon: {
+                            Image(systemName: "checkmark.circle")
+                        }
+                    }
                     if !work.hostAliases.isEmpty {
                         Label(work.hostAliases.joined(separator: ", "), systemImage: "network")
                     }
@@ -399,11 +1014,18 @@ struct NativeWatchView: View {
 }
 
 private struct FleetPaneWorkspace: View {
-    private enum PaneModule: String, CaseIterable, Identifiable {
-        case overview = "Overview"
-        case collaborate = "Collaborate"
+    private enum PaneModule: CaseIterable, Identifiable {
+        case overview
+        case collaborate
 
         var id: Self { self }
+
+        var title: LocalizedStringKey {
+            switch self {
+            case .overview: "Overview"
+            case .collaborate: "Collaborate"
+            }
+        }
     }
 
     let pane: MuxaWatchPane
@@ -426,7 +1048,11 @@ private struct FleetPaneWorkspace: View {
                             openInShell: { openInShell() }
                         )
                     case .collaborate:
-                        MuxaCollaborationView(pane: pane, client: model.client)
+                        MuxaCollaborationView(
+                            pane: pane,
+                            client: model.client,
+                            mailboxRevision: model.mailboxRevisions[pane.host.alias]
+                        )
                     }
                 }
                 .frame(minHeight: 180)
@@ -439,40 +1065,71 @@ private struct FleetPaneWorkspace: View {
                     stopAttach: stopPanelAttach,
                     sessionExited: panelSessionExited
                 )
-                .frame(minHeight: 220, idealHeight: 360)
+                .frame(minHeight: 200, idealHeight: 360)
             }
         }
         .onDisappear(perform: stopPanelAttach)
     }
 
     private var paneHeader: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                paneIdentity(showsLocation: true)
+                Spacer(minLength: 8)
+                modulePicker(width: 210)
+                Button {
+                    Task { await model.refresh() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+            }
+
+            HStack(spacing: 8) {
+                paneIdentity(showsLocation: false)
+                Spacer(minLength: 4)
+                modulePicker(width: 150)
+                Button {
+                    Task { await model.refresh() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Refresh")
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 48)
+    }
+
+    private func paneIdentity(showsLocation: Bool) -> some View {
         HStack(spacing: 10) {
             HostIdentityBadge(identity: pane.host, size: 28)
             VStack(alignment: .leading, spacing: 1) {
                 Text(pane.agent?.aiTitle ?? pane.pane.agentAlias.map { "@\($0)" } ?? pane.pane.windowName)
                     .font(.headline)
-                Text("\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
                     .lineLimit(1)
-            }
-            Spacer(minLength: 8)
-            Picker("Pane module", selection: $module) {
-                ForEach(PaneModule.allCases) { module in
-                    Text(module.rawValue).tag(module)
+                if showsLocation {
+                    Text(verbatim: "\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
             }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .frame(width: 210)
-            Button {
-                Task { await model.refresh() }
-            } label: {
-                Label("Refresh", systemImage: "arrow.clockwise")
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func modulePicker(width: CGFloat) -> some View {
+        Picker("Pane module", selection: $module) {
+            ForEach(PaneModule.allCases) { module in
+                Text(module.title).tag(module)
             }
         }
-        .padding(.horizontal, 14)
-        .frame(height: 48)
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .frame(width: width)
     }
 
     private func attachInPanel() {
@@ -509,77 +1166,275 @@ private struct FleetPaneWorkspace: View {
 
 struct MuxaAskView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject private var providers = AskProviderStore.shared
     @State private var prompt = ""
     @State private var agent = "claude"
+
+    private var activeConversation: MuxaAskConversation? {
+        model.askConversations.first { $0.id == model.activeAskConversationID }
+    }
+
+    private var providerConversations: [MuxaAskConversation] {
+        model.askConversations.filter { $0.agent == agent }
+    }
+
+    private var conversationEntries: [MuxaAskEntry] {
+        let entries: [MuxaAskEntry]
+        if let conversationID = model.activeAskConversationID {
+            entries = model.askEntries.filter { $0.conversationID == conversationID }
+        } else {
+            // Compatibility with a daemon from before muxa-owned conversation
+            // ids: retain the prior provider-filtered history until it reloads.
+            entries = model.askEntries.filter { $0.agent == agent }
+        }
+        return entries.sorted { $0.askedAt < $1.askedAt }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Label("Ask", systemImage: "sparkles")
+                Label("Global Ask", systemImage: "sparkles")
                     .font(.headline)
-                Picker("Agent", selection: $agent) {
-                    Text("Claude").tag("claude")
-                    Text("Codex").tag("codex")
+                if let activeConversation {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Text(activeConversation.title)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                .labelsHidden()
-                .frame(width: 120)
                 Spacer()
-                Button {
-                    Task { await model.resetAskConversation() }
-                } label: {
-                    Label("New Thread", systemImage: "plus.bubble")
-                }
-                .help("Start a new conversation without deleting history")
+                Text("Conversations resume where the provider left off")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
             }
             .padding(.horizontal, 14)
             .frame(height: 40)
 
             Divider()
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    if model.askEntries.isEmpty {
-                        ConsoleUnavailableView(
-                            title: "No Ask history",
-                            systemImage: "bubble.left.and.bubble.right",
-                            description: "Ask a headless agent a question. Answers remain available after this view closes."
-                        )
-                        .frame(minHeight: 150)
-                    } else {
-                        ForEach(model.askEntries) { entry in
-                            AskHistoryCard(entry: entry)
+            if model.askEnabled == false {
+                HStack(alignment: .center, spacing: 12) {
+                    Image(systemName: "sparkles.rectangle.stack")
+                        .font(.title3)
+                        .foregroundStyle(.tint)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Group {
+                            if model.askConfigurationPendingReload {
+                                Text("Reload to finish enabling Ask")
+                            } else {
+                                Text("Enable Global Ask")
+                            }
+                        }
+                        .font(.subheadline.weight(.semibold))
+                        Group {
+                            if model.askConfigurationPendingReload {
+                                Text("The grant is saved. Reload muxad to apply it; tmux sessions will remain running.")
+                            } else {
+                                Text("Muxa will run the selected provider CLI headlessly. Provider usage may be billed to your account.")
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 12)
+                    if model.isEnablingAsk {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Button {
+                        Task { await model.enableAsk() }
+                    } label: {
+                        if model.askConfigurationPendingReload {
+                            Text("Reload muxad")
+                        } else {
+                            Text("Enable & Reload")
                         }
                     }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isEnablingAsk)
                 }
-                .padding(12)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Color.accentColor.opacity(0.07))
+
+                Divider()
+            }
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        if conversationEntries.isEmpty {
+                            ConsoleUnavailableView(
+                                title: activeConversation == nil ? "Start a conversation" : "No messages yet",
+                                systemImage: "bubble.left.and.bubble.right",
+                                description: "Ask a headless agent a question. You can return to this conversation and continue it later."
+                            )
+                            .frame(minHeight: 150)
+                        } else {
+                            ForEach(Array(conversationEntries.enumerated()), id: \.element.id) { index, entry in
+                                AskConversationTurn(entry: entry)
+                                    .id(entry.id)
+                                if index < conversationEntries.count - 1 {
+                                    Divider().padding(.vertical, 6)
+                                }
+                            }
+                        }
+                    }
+                    .padding(14)
+                    .frame(maxWidth: 980)
+                    .frame(maxWidth: .infinity)
+                }
+                .onAppear { scrollToLatest(proxy) }
+                .onChange(of: conversationEntries.last?.id) { _ in scrollToLatest(proxy) }
             }
 
             Divider()
 
             VStack(alignment: .leading, spacing: 7) {
-                TextEditor(text: $prompt)
-                    .font(.body)
-                    .scrollContentBackground(.hidden)
-                    .padding(7)
-                    .frame(minHeight: 64, maxHeight: 100)
-                    .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 7))
-                HStack {
-                    if let error = model.askError {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .lineLimit(2)
+                AskComposerEditor(
+                    text: $prompt,
+                    placeholder: "Ask about work across your hosts…"
+                )
+                .frame(minHeight: 72, maxHeight: 112)
+                .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                }
+                .disabled(model.askEnabled == false || !model.isConnected)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        askContextControls
+                        Spacer(minLength: 8)
+                        askSendStatus
+                        sendButton
                     }
-                    Spacer()
-                    if model.isSendingAsk { ProgressView().controlSize(.small) }
-                    Button("Ask \(agent.capitalized)") { send() }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(model.isSendingAsk || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            askContextControls
+                            Spacer()
+                        }
+                        HStack {
+                            askSendStatus
+                            Spacer()
+                            sendButton
+                        }
+                    }
                 }
             }
             .padding(12)
         }
         .onAppear { agent = model.askAgent }
+        .onChange(of: model.askAgent) { selected in agent = selected }
+        .onChange(of: agent) { selected in
+            Task { await model.selectAskAgent(selected) }
+        }
+        .task(id: model.isConnected) {
+            await providers.reload(model: model)
+        }
+    }
+
+    private var askContextControls: some View {
+        HStack(spacing: 7) {
+            conversationMenu
+            Picker("Provider", selection: $agent) {
+                ForEach(providers.providers) { provider in
+                    Text(provider.title)
+                        .tag(provider.id)
+                        .disabled(!providers.isUsable(provider))
+                }
+                if !providers.providers.contains(where: { $0.id == agent }) {
+                    Text(providers.title(for: agent)).tag(agent)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 150)
+            .help("Provider for new conversations; disabled entries need a CLI install or an API key in Settings")
+
+        }
+    }
+
+    /// Conversations first: starting a new one is the most common action in
+    /// this bar, so it leads. Provider setup lives in Settings › Providers.
+    private var conversationMenu: some View {
+        Menu {
+            Button {
+                Task { await model.resetAskConversation() }
+            } label: {
+                Label("New Conversation", systemImage: "plus.bubble")
+            }
+            Divider()
+            if providerConversations.isEmpty {
+                Text("No previous conversations")
+            } else {
+                ForEach(providerConversations) { conversation in
+                    Button {
+                        Task { await model.selectAskConversation(conversation.id) }
+                    } label: {
+                        if conversation.id == model.activeAskConversationID {
+                            Label(conversation.title, systemImage: "checkmark")
+                        } else {
+                            Text(conversation.title)
+                        }
+                    }
+                }
+            }
+        } label: {
+            Label {
+                if let activeConversation {
+                    Text(activeConversation.title)
+                } else {
+                    Text("Conversations")
+                }
+            } icon: {
+                Image(systemName: "bubble.left.and.bubble.right")
+            }
+            .lineLimit(1)
+            .frame(width: 190, alignment: .leading)
+        }
+        .menuStyle(.borderlessButton)
+    }
+
+    @ViewBuilder
+    private var askSendStatus: some View {
+        if let error = model.askError {
+            Text(error)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .lineLimit(2)
+        } else {
+            Text("⌘↩ Send")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        if model.isSendingAsk { ProgressView().controlSize(.small) }
+    }
+
+    private var sendButton: some View {
+        Button(action: send) {
+            Label("Send", systemImage: "paperplane.fill")
+        }
+        .buttonStyle(.borderedProminent)
+        .keyboardShortcut(.return, modifiers: [.command])
+        .help("Continue this conversation with the selected provider (⌘↩)")
+        .disabled(
+            model.isSendingAsk
+                || model.askEnabled == false
+                || !model.isConnected
+                || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
+    }
+
+    private func scrollToLatest(_ proxy: ScrollViewProxy) {
+        guard let id = conversationEntries.last?.id else { return }
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.16)) {
+                proxy.scrollTo(id, anchor: .bottom)
+            }
+        }
     }
 
     private func send() {
@@ -592,64 +1447,947 @@ struct MuxaAskView: View {
     }
 }
 
-private struct AskHistoryCard: View {
-    let entry: MuxaAskEntry
+private struct AskComposerEditor: View {
+    @Binding var text: String
+    let placeholder: LocalizedStringKey
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 7) {
-                Text(entry.agent.capitalized)
-                    .font(.caption.weight(.semibold))
-                Text(entry.status.replacingOccurrences(of: "_", with: " ").capitalized)
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(entry.status == "failed" ? Color.red : entry.status == "running" ? Color.blue : Color.green)
-                if entry.status == "running" { ProgressView().controlSize(.mini) }
-                Spacer()
-                Text(entry.askedAt)
-                    .font(.caption2.monospacedDigit())
+        ZStack(alignment: .topLeading) {
+            TextEditor(text: $text)
+                .font(.body)
+                .scrollContentBackground(.hidden)
+
+            if text.isEmpty {
+                Text(placeholder)
+                    .font(.body)
                     .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-            }
-            MarkdownContent(source: entry.prompt)
-                .font(.subheadline.weight(.medium))
-            if !entry.answer.isEmpty {
-                Divider()
-                MarkdownContent(source: entry.answer)
-            }
-            if let error = entry.error, !error.isEmpty {
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .textSelection(.enabled)
+                    // NSTextView uses these insets for its first baseline. Keeping
+                    // the overlay inside the same padded container also gives it
+                    // the exact same wrapping width as the editable text.
+                    .padding(.leading, 5)
+                    .padding(.trailing, 5)
+                    .padding(.top, 8)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .allowsHitTesting(false)
             }
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .padding(7)
     }
 }
 
+private struct AskConversationTurn: View {
+    let entry: MuxaAskEntry
+
+    private var providerTitle: String {
+        AskProviderStore.shared.title(for: entry.agent)
+    }
+
+    private var providerIcon: String {
+        AskProviderStore.shared.symbolName(for: entry.agent)
+    }
+
+    private var statusColor: Color {
+        switch entry.status {
+        case "failed": .red
+        case "running": .blue
+        default: .green
+        }
+    }
+
+    private var askedDate: Date? {
+        (try? Date(entry.askedAt, strategy: .iso8601))
+            ?? ISO8601DateFormatter().date(from: entry.askedAt)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 7) {
+                Text(askedDate?.formatted(date: .abbreviated, time: .shortened) ?? compactInboxTimestamp(entry.askedAt))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Circle().fill(statusColor).frame(width: 6, height: 6)
+                Text(askStatusLabel(entry.status))
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(statusColor)
+                if entry.status == "running" { ProgressView().controlSize(.mini) }
+            }
+
+            AskMessageBlock(
+                role: String(localized: "You"),
+                icon: "person.fill",
+                source: entry.prompt,
+                tint: .accentColor,
+                compact: true
+            )
+
+            if entry.status == "running", entry.answer.isEmpty {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Waiting for \(providerTitle)…")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 4)
+            }
+
+            if !entry.answer.isEmpty {
+                AskMessageBlock(
+                    role: providerTitle,
+                    icon: providerIcon,
+                    source: entry.answer,
+                    tint: .primary,
+                    compact: false
+                )
+            }
+
+            if let error = entry.error, !error.isEmpty {
+                Label {
+                    Text(error).textSelection(.enabled)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                }
+                .font(.caption)
+                .foregroundStyle(.red)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
+            }
+        }
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct AskHistoryCard: View {
+    let entry: MuxaAskEntry
+
+    private var providerTitle: String {
+        AskProviderStore.shared.title(for: entry.agent)
+    }
+
+    private var providerIcon: String {
+        AskProviderStore.shared.symbolName(for: entry.agent)
+    }
+
+    private var statusColor: Color {
+        switch entry.status {
+        case "failed": .red
+        case "running": .blue
+        default: .green
+        }
+    }
+
+    private var statusLabel: String {
+        askStatusLabel(entry.status)
+    }
+
+    private var askedDate: Date? {
+        (try? Date(entry.askedAt, strategy: .iso8601))
+            ?? ISO8601DateFormatter().date(from: entry.askedAt)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: providerIcon)
+                    .foregroundStyle(.tint)
+                Text(providerTitle)
+                    .font(.subheadline.weight(.semibold))
+                Label(statusLabel, systemImage: entry.status == "failed" ? "exclamationmark.circle.fill" : "circle.fill")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                    .labelStyle(.titleAndIcon)
+                if entry.status == "running" {
+                    ProgressView()
+                        .controlSize(.mini)
+                }
+                Spacer()
+                if let cost = entry.costUSD, cost > 0 {
+                    Text(cost, format: .currency(code: "USD"))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                if let askedDate {
+                    Text(askedDate, style: .relative)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help(askedDate.formatted(date: .abbreviated, time: .standard))
+                }
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 38)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 12) {
+                AskMessageBlock(
+                    role: String(localized: "You"),
+                    icon: "person.fill",
+                    source: entry.prompt,
+                    tint: .accentColor,
+                    compact: true
+                )
+
+                if entry.status == "running", entry.answer.isEmpty {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Waiting for \(providerTitle)…")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 4)
+                }
+
+            if !entry.answer.isEmpty {
+                    AskMessageBlock(
+                        role: providerTitle,
+                        icon: providerIcon,
+                        source: entry.answer,
+                        tint: .primary,
+                        compact: false
+                    )
+            }
+
+            if let error = entry.error, !error.isEmpty {
+                    Label {
+                        Text(error)
+                            .textSelection(.enabled)
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
+                }
+            }
+            .padding(12)
+        }
+        .frame(maxWidth: 980, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.76), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.primary.opacity(0.09), lineWidth: 1)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+}
+
+/// Display wording for a Global Ask entry `status` as muxad reports it.
+private func askStatusLabel(_ status: String) -> String {
+    switch status {
+    case "running": String(localized: "Thinking")
+    case "failed": String(localized: "Failed")
+    default: String(localized: "Answered")
+    }
+}
+
+private struct AskMessageBlock: View {
+    let role: String
+    let icon: String
+    let source: String
+    let tint: Color
+    let compact: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+                Label(role, systemImage: icon)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(compact ? tint : Color.secondary)
+
+            ReadableMarkdownContent(source: source)
+        }
+        .padding(12)
+        .frame(maxWidth: compact ? 780 : .infinity, alignment: .leading)
+        .background(tint.opacity(compact ? 0.075 : 0.035), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(tint.opacity(compact ? 0.7 : 0.28))
+                .frame(width: 3)
+                .padding(.vertical, 8)
+        }
+        .frame(maxWidth: .infinity, alignment: compact ? .trailing : .leading)
+    }
+}
+
+struct MuxaOperatorInboxView: View {
+    private enum Scope: CaseIterable, Identifiable {
+        case all
+        case replies
+        case waiting
+        case action
+        case ask
+        var id: Self { self }
+
+        var title: LocalizedStringKey {
+            switch self {
+            case .all: "All"
+            case .replies: "Replies"
+            case .waiting: "Waiting"
+            case .action: "Needs Action"
+            case .ask: "Ask"
+            }
+        }
+    }
+
+    @ObservedObject var model: AppModel
+    @State private var scope: Scope = .all
+    @State private var search = ""
+    @State private var selectedMessageID: String?
+    @State private var compactShowingDetail = false
+    @State private var showingHostFailureDetails = false
+
+    private var visibleMessages: [MuxaOperatorMessage] {
+        let filtered = model.operatorMessages.filter { message in
+            // Waiting shows only requests the agent can still answer; a
+            // blocked/declined/failed request without a reply is an operator
+            // decision and lives under Needs Action instead.
+            let scopeMatches = switch scope {
+            case .all: true
+            case .replies: message.request.reply != nil
+            case .waiting: message.isAwaitingAgentReply
+            case .action: message.needsHumanDecision
+            case .ask: false
+            }
+            guard scopeMatches else { return false }
+            guard !search.isEmpty else { return true }
+            let request = message.request
+            return [
+                request.body,
+                request.reply?.body,
+                request.to.label,
+                request.to.windowName,
+                request.to.sessionName,
+                request.workspaceID,
+                request.workID,
+                message.host.alias,
+            ].compactMap { $0 }.contains {
+                $0.localizedCaseInsensitiveContains(search)
+            }
+        }
+        // Needs Action is a queue: unread decisions first, then the most
+        // recently changed conversation. Other scopes keep the model's
+        // sent-time order so the list does not reorder while reading.
+        guard scope == .action else { return filtered }
+        return filtered.sorted(by: MuxaOperatorMessage.needsActionOrder)
+    }
+
+    private var visibleAsk: [MuxaAskEntry] {
+        guard scope == .ask else { return [] }
+        return model.askEntries
+            .filter { entry in
+                search.isEmpty
+                    || entry.prompt.localizedCaseInsensitiveContains(search)
+                    || entry.answer.localizedCaseInsensitiveContains(search)
+            }
+            .sorted { $0.askedAt > $1.askedAt }
+    }
+
+    private var unreadReplies: Int {
+        model.operatorMessages.lazy.filter(\.hasUnreadReply).count
+    }
+
+    private var waitingReplies: Int {
+        model.operatorMessages.lazy.filter(\.isAwaitingAgentReply).count
+    }
+
+    private var humanDecisions: Int {
+        model.operatorMessages.lazy.filter(\.needsHumanDecision).count
+    }
+
+    private var selectedMessage: MuxaOperatorMessage? {
+        visibleMessages.first { $0.id == selectedMessageID }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Label("Operator Inbox", systemImage: "tray.full")
+                    .font(.headline)
+                inboxMetric(Text("\(unreadReplies) New"), unreadReplies, color: .orange)
+                inboxMetric(Text("\(waitingReplies) Waiting"), waitingReplies, color: .blue)
+                inboxMetric(Text("\(humanDecisions) Action"), humanDecisions, color: .red)
+                Spacer(minLength: 8)
+                if model.isRefreshingInbox { ProgressView().controlSize(.small) }
+                Button {
+                    Task { await model.refreshOperatorInbox(force: true) }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 42)
+
+            Divider()
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    inboxScopePicker.frame(maxWidth: 420)
+                    inboxSearchField
+                }
+                VStack(spacing: 8) {
+                    inboxScopePicker
+                    inboxSearchField
+                }
+            }
+            .padding(10)
+
+            if let summary = model.inboxHostFailureSummary {
+                inboxHostFailureLine(summary)
+            }
+
+            if let error = model.inboxError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if scope == .ask {
+                askHistory
+            } else {
+                operatorMasterDetail
+            }
+        }
+        .task {
+            await model.refreshOperatorInbox(force: true)
+            reconcileMessageSelection()
+        }
+        .onChange(of: visibleMessages.map(\.id)) { _ in reconcileMessageSelection() }
+        .onChange(of: scope) { _ in
+            compactShowingDetail = false
+            reconcileMessageSelection()
+        }
+    }
+
+    /// One compact advisory line for hosts whose most recent mailbox read
+    /// failed. The list below still shows the last messages received from
+    /// them, so this never replaces the list. The full per-host reasons are
+    /// available as a tooltip and behind the chevron.
+    private func inboxHostFailureLine(_ summary: String) -> some View {
+        let details = MuxaInboxHostFailureText.details(model.inboxHostFailures)
+        return VStack(alignment: .leading, spacing: 4) {
+            Button {
+                showingHostFailureDetails.toggle()
+            } label: {
+                HStack(spacing: 6) {
+                    Label(summary, systemImage: "wifi.exclamationmark")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                    Image(systemName: showingHostFailureDetails ? "chevron.down" : "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text("Showing their last known messages")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(details.joined(separator: "\n"))
+            .accessibilityLabel("Unreachable hosts")
+            .accessibilityValue(summary)
+
+            if showingHostFailureDetails {
+                ForEach(details, id: \.self) { line in
+                    Text(line)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                        .padding(.leading, 22)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func inboxMetric(_ text: Text, _ value: Int, color: Color) -> some View {
+        text
+            .font(.caption2.weight(.semibold).monospacedDigit())
+            .foregroundStyle(value > 0 ? color : Color.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background((value > 0 ? color : Color.secondary).opacity(0.1), in: Capsule())
+    }
+
+    private var askHistory: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Global Ask").font(.title3.weight(.semibold))
+                    Text("Headless Claude Code and Codex questions owned by muxad")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if visibleAsk.isEmpty {
+                    Text("No matching Ask history")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 18)
+                } else {
+                    ForEach(visibleAsk) { entry in AskHistoryCard(entry: entry) }
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: 1000, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+    }
+
+    private var operatorMasterDetail: some View {
+        GeometryReader { geometry in
+            if geometry.size.width >= 760 {
+                HSplitView {
+                    operatorMessageList
+                        .frame(minWidth: 300, idealWidth: 380, maxWidth: 470)
+                    operatorMessageDetail
+                        .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+                }
+            } else if compactShowingDetail, selectedMessage != nil {
+                VStack(spacing: 0) {
+                    HStack {
+                        Button {
+                            compactShowingDetail = false
+                        } label: {
+                            Label("Inbox", systemImage: "chevron.left")
+                        }
+                        .buttonStyle(.borderless)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .frame(height: 36)
+                    Divider()
+                    operatorMessageDetail
+                }
+            } else {
+                operatorMessageList
+            }
+        }
+    }
+
+    private var operatorMessageList: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Commands and replies")
+                        .font(.subheadline.weight(.semibold))
+                    Text("\(visibleMessages.count) conversations across reachable hosts")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            Divider()
+
+            if visibleMessages.isEmpty {
+                ConsoleUnavailableView(
+                    title: model.operatorMessages.isEmpty ? LocalizedStringKey("No commands sent yet") : LocalizedStringKey("No matching commands"),
+                    systemImage: "paperplane",
+                    description: "Use Collaborate on an agent pane. Its reply will appear here without reopening that pane."
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 6) {
+                        ForEach(visibleMessages) { message in
+                            Button {
+                                selectedMessageID = message.id
+                                compactShowingDetail = true
+                                if message.hasUnreadReply {
+                                    Task { await model.markOperatorMessageRead(message) }
+                                }
+                            } label: {
+                                OperatorMessageRow(
+                                    message: message,
+                                    selected: message.id == selectedMessageID
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .contentShape(Rectangle())
+                        }
+                    }
+                    .padding(8)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var operatorMessageDetail: some View {
+        if let selectedMessage {
+            OperatorMessageDetail(message: selectedMessage, model: model)
+        } else {
+            ConsoleUnavailableView(
+                title: "Select a message",
+                systemImage: "rectangle.righthalf.inset.filled",
+                description: "Choose a compact preview to read the full sent message and reply."
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func reconcileMessageSelection() {
+        if let selectedMessageID,
+           visibleMessages.contains(where: { $0.id == selectedMessageID }) {
+            return
+        }
+        selectedMessageID = visibleMessages.first?.id
+    }
+
+    private var inboxScopePicker: some View {
+        Picker("Mailbox", selection: $scope) {
+            ForEach(Scope.allCases) { value in Text(value.title).tag(value) }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .accessibilityLabel("Inbox scope")
+    }
+
+    private var inboxSearchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search command, reply, Work, or agent", text: $search)
+                .textFieldStyle(.plain)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 7))
+    }
+}
+
+private struct OperatorMessageRow: View {
+    let message: MuxaOperatorMessage
+    let selected: Bool
+
+    private var request: MuxaCollaborationRequest { message.request }
+    private var statusColor: Color {
+        if request.reply?.status == "completed" { return .green }
+        if ["blocked", "failed", "declined", "expired", "cancelled"].contains(request.status) {
+            return .red
+        }
+        if request.reply != nil { return .green }
+        return request.expectsReply ? .blue : .secondary
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 7) {
+                Circle().fill(statusColor).frame(width: 7, height: 7)
+                Text(request.to.label)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 6)
+                Text(collaborationStatusLabel(request.reply?.status ?? request.status))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                Text(compactInboxTimestamp(request.createdAt))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+
+            HStack(spacing: 8) {
+                Label(message.host.alias, systemImage: "server.rack")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                if let work = request.workID {
+                    Text([request.workspaceID, work].compactMap { $0 }.joined(separator: " / "))
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(Color.accentColor)
+                        .lineLimit(1)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Sent", systemImage: "paperplane.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text(inboxPreview(request.body))
+                    .font(.callout)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+            }
+
+            if let reply = request.reply {
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack {
+                        Label(message.hasUnreadReply ? "New Reply" : "Reply", systemImage: "arrowshape.turn.up.left.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(message.hasUnreadReply ? Color.orange : Color.secondary)
+                        Spacer()
+                        Text(compactInboxTimestamp(reply.at))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                    }
+                    Text(inboxPreview(reply.body))
+                        .font(.callout)
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                }
+                .padding(11)
+                .background(
+                    (message.hasUnreadReply ? Color.orange : Color.primary).opacity(0.06),
+                    in: RoundedRectangle(cornerRadius: 8)
+                )
+            } else if message.needsHumanDecision {
+                // The request itself is blocked/declined/failed and no reply
+                // will arrive, so name the decision instead of a wait.
+                Label(
+                    "Needs your decision: \(inboxStatusTitle(request.status))",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.callout)
+                .foregroundStyle(.red)
+            } else if message.isAwaitingAgentReply {
+                Label("Waiting for this agent to reply", systemImage: "clock")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            selected ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.035),
+            in: RoundedRectangle(cornerRadius: 9)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 9)
+                .stroke(
+                    selected
+                        ? Color.accentColor.opacity(0.65)
+                        : message.hasUnreadReply
+                            ? Color.orange.opacity(0.5)
+                            : Color(nsColor: .separatorColor).opacity(0.4),
+                    lineWidth: selected || message.hasUnreadReply ? 1 : 0.5
+                )
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 9))
+    }
+}
+
+private struct OperatorMessageDetail: View {
+    let message: MuxaOperatorMessage
+    @ObservedObject var model: AppModel
+
+    private var request: MuxaCollaborationRequest { message.request }
+    private var openDestination: MuxaSidebarSelection? {
+        AppModel.operatorSelection(for: message, in: model.executionSnapshot)
+    }
+    private var openDestinationLabel: String {
+        switch openDestination {
+        case .agent, .pane: String(localized: "Open Agent")
+        case .fleetWindow: String(localized: "Open Window")
+        case .fleetSession: String(localized: "Open Session")
+        case .host: String(localized: "Open Host")
+        case nil: String(localized: "Agent Ended")
+        default: String(localized: "Open Context")
+        }
+    }
+    private var statusColor: Color {
+        if request.reply?.status == "completed" { return .green }
+        if ["blocked", "failed", "declined", "expired", "cancelled"].contains(request.status) {
+            return .red
+        }
+        if request.reply != nil { return .green }
+        return request.expectsReply ? .blue : .secondary
+    }
+
+    private var location: String {
+        [request.to.sessionName, request.to.windowName, request.to.pane]
+            .compactMap { $0?.isEmpty == false ? $0 : nil }
+            .joined(separator: " › ")
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 9) {
+                Circle().fill(statusColor).frame(width: 8, height: 8)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(request.to.label)
+                        .font(.headline)
+                        .lineLimit(1)
+                    Text(verbatim: "\(message.host.alias) · \(compactInboxTimestamp(request.createdAt))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if message.hasUnreadReply {
+                    Button("Mark Read") {
+                        Task { await model.markOperatorMessageRead(message) }
+                    }
+                }
+                Button {
+                    model.openOperatorMessage(message)
+                } label: {
+                    Label(openDestinationLabel, systemImage: "rectangle.and.hand.point.up.left")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(openDestination == nil)
+            }
+            .padding(.horizontal, 16)
+            .frame(minHeight: 54)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    HStack(spacing: 10) {
+                        Label(message.host.alias, systemImage: "server.rack")
+                        if let work = request.workID {
+                            Label(
+                                [request.workspaceID, work].compactMap { $0 }.joined(separator: " / "),
+                                systemImage: "briefcase"
+                            )
+                        }
+                        if !location.isEmpty {
+                            Label(location, systemImage: "rectangle.split.3x1")
+                                .lineLimit(1)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                    OperatorMessageDetailSection(
+                        title: "Sent",
+                        icon: "paperplane.fill",
+                        timestamp: compactInboxTimestamp(request.createdAt),
+                        source: request.body,
+                        tint: .accentColor
+                    )
+
+                    if let reply = request.reply {
+                        OperatorMessageDetailSection(
+                            title: message.hasUnreadReply ? "New Reply" : "Reply",
+                            icon: "arrowshape.turn.up.left.fill",
+                            timestamp: compactInboxTimestamp(reply.at),
+                            source: reply.body,
+                            tint: message.hasUnreadReply ? .orange : .green
+                        )
+                    } else if message.needsHumanDecision {
+                        Label(
+                            "Needs your decision: \(inboxStatusTitle(request.status)). The agent will not reply to this request.",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.red)
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.red.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                    } else if message.isAwaitingAgentReply {
+                        Label("Waiting for this agent to reply", systemImage: "clock")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .padding(14)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+                .padding(18)
+                .frame(maxWidth: 860, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+        }
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.28))
+    }
+}
+
+private struct OperatorMessageDetailSection: View {
+    let title: LocalizedStringKey
+    let icon: String
+    let timestamp: String
+    let source: String
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label(title, systemImage: icon)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(tint)
+                Spacer()
+                Text(timestamp)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+            ReadableMarkdownContent(source: source)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.opacity(0.055), in: RoundedRectangle(cornerRadius: 11))
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(tint.opacity(0.7))
+                .frame(width: 3)
+                .padding(.vertical, 10)
+        }
+    }
+}
+
+private func inboxPreview(_ value: String) -> String {
+    MuxaMarkdownText.previewText(markdown: value)
+}
+
+/// "waiting_reply" -> "Waiting Reply", matching the status pill wording.
+private func inboxStatusTitle(_ status: String) -> String {
+    collaborationStatusLabel(status)
+}
+
+private func compactInboxTimestamp(_ value: String) -> String {
+    let normalized = value.replacingOccurrences(of: "T", with: " ")
+    return String(normalized.prefix(16))
+}
+
 private struct MuxaCollaborationView: View {
-    private enum ModuleTab: String, CaseIterable, Identifiable {
-        case activity = "Activity"
-        case compose = "Compose"
+    private enum ModuleTab: CaseIterable, Identifiable {
+        case activity
+        case compose
+        var id: Self { self }
+
+        var title: LocalizedStringKey {
+            switch self {
+            case .activity: "Activity"
+            case .compose: "Compose"
+            }
+        }
+    }
+
+    private enum MailboxTab: CaseIterable, Identifiable {
+        case incoming
+        case sent
         var id: Self { self }
     }
 
-    private enum MailboxTab: String, CaseIterable, Identifiable {
-        case incoming = "Incoming"
-        case sent = "Sent"
+    private enum DisplayMode: CaseIterable, Identifiable {
+        case compact
+        case detailed
         var id: Self { self }
-    }
 
-    private enum DisplayMode: String, CaseIterable, Identifiable {
-        case compact = "Compact"
-        case detailed = "Detailed"
-        var id: Self { self }
+        var title: LocalizedStringKey {
+            switch self {
+            case .compact: "Compact"
+            case .detailed: "Detailed"
+            }
+        }
     }
 
     let pane: MuxaWatchPane
     let client: MuxaIPCClient
+    let mailboxRevision: UInt64?
     @State private var mailbox = MuxaCollaborationMailbox(incoming: [], sent: [])
     @State private var module: ModuleTab = .activity
     @State private var tab: MailboxTab = .sent
@@ -672,7 +2410,7 @@ private struct MuxaCollaborationView: View {
                 Label("Collaborate", systemImage: "person.2.wave.2")
                     .font(.headline)
                 Picker("Collaborate module", selection: $module) {
-                    ForEach(ModuleTab.allCases) { item in Text(item.rawValue).tag(item) }
+                    ForEach(ModuleTab.allCases) { item in Text(item.title).tag(item) }
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
@@ -693,17 +2431,15 @@ private struct MuxaCollaborationView: View {
             case .activity:
                 HStack(spacing: 10) {
                     Picker("Mailbox", selection: $tab) {
-                        ForEach(MailboxTab.allCases) { item in
-                            Text("\(item.rawValue) \(item == .incoming ? mailbox.incoming.count : mailbox.sent.count)")
-                                .tag(item)
-                        }
+                        Text("Incoming \(mailbox.incoming.count)").tag(MailboxTab.incoming)
+                        Text("Sent \(mailbox.sent.count)").tag(MailboxTab.sent)
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
                     .frame(width: 220)
                     Spacer()
                     Picker("Density", selection: $displayMode) {
-                        ForEach(DisplayMode.allCases) { item in Text(item.rawValue).tag(item) }
+                        ForEach(DisplayMode.allCases) { item in Text(item.title).tag(item) }
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
@@ -739,7 +2475,7 @@ private struct MuxaCollaborationView: View {
                 collaborationComposer
             }
         }
-        .task(id: pane.id) { await pollMailbox() }
+        .task(id: "\(pane.id)-\(mailboxRevision ?? 0)") { await load() }
         .sheet(item: $replyingTo) { request in
             CollaborationReplyView(request: request, pane: pane, client: client) {
                 replyingTo = nil
@@ -785,13 +2521,6 @@ private struct MuxaCollaborationView: View {
             }
         }
         .padding(14)
-    }
-
-    private func pollMailbox() async {
-        while !Task.isCancelled {
-            await load()
-            try? await Task.sleep(for: .seconds(2))
-        }
     }
 
     private func load() async {
@@ -850,16 +2579,16 @@ private struct CollaborationRequestCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
-                Text(request.kind.capitalized)
+                Text(collaborationKindLabel(request.kind))
                     .font(.caption.weight(.semibold))
                 Text(request.workMode == "execute" ? "Execute" : "Read only")
                     .font(.caption2)
                     .foregroundStyle(request.workMode == "execute" ? Color.orange : Color.secondary)
-                Text(request.status.capitalized)
+                Text(collaborationStatusLabel(request.status))
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(collaborationStatusColor(request.status))
                 Spacer()
-                Text("\(request.from.label) → \(request.to.label)")
+                Text(verbatim: "\(request.from.label) → \(request.to.label)")
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -870,7 +2599,7 @@ private struct CollaborationRequestCard: View {
                     Divider()
                     MarkdownContent(source: response.body)
                 }
-                Label(response.status.capitalized, systemImage: "arrowshape.turn.up.left.fill")
+                Label(collaborationStatusLabel(response.status), systemImage: "arrowshape.turn.up.left.fill")
                     .font(.caption2)
                     .foregroundStyle(collaborationStatusColor(response.status))
             }
@@ -968,8 +2697,36 @@ private func collaborationStatusColor(_ status: String) -> Color {
     }
 }
 
+/// Display wording for a collaboration request or reply `status`.
+func collaborationStatusLabel(_ status: String) -> String {
+    switch status {
+    case "queued": String(localized: "Queued")
+    case "claimed": String(localized: "Claimed")
+    case "completed": String(localized: "Completed")
+    case "blocked": String(localized: "Blocked")
+    case "declined": String(localized: "Declined")
+    case "failed": String(localized: "Failed")
+    case "expired": String(localized: "Expired")
+    case "cancelled": String(localized: "Cancelled")
+    case "waiting_reply": String(localized: "Waiting Reply")
+    default: status.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+}
+
+/// Display wording for a collaboration request `kind`.
+func collaborationKindLabel(_ kind: String) -> String {
+    switch kind {
+    case "question": String(localized: "Question")
+    case "review": String(localized: "Review")
+    case "task": String(localized: "Task")
+    case "notice": String(localized: "Notice")
+    default: kind.capitalized
+    }
+}
+
 struct HostRegistrationView: View {
     @ObservedObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
     @State private var alias = ""
     @State private var ssh = ""
     @State private var mode = "observe"
@@ -982,13 +2739,16 @@ struct HostRegistrationView: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Register Fleet Host")
+                    Text("Register Host")
                         .font(.title2.weight(.semibold))
                     Text("Add an OpenSSH target to Muxa's central host inventory.")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Cancel") { model.isPresentingHostRegistration = false }
+                Button("Cancel") {
+                    model.isPresentingHostRegistration = false
+                    dismiss()
+                }
                     .keyboardShortcut(.cancelAction)
                 Button("Register") { register() }
                     .keyboardShortcut(.defaultAction)
@@ -1001,7 +2761,7 @@ struct HostRegistrationView: View {
 
             Form {
                 Section("Identity") {
-                    TextField("Alias", text: $alias, prompt: Text("build-mac"))
+                    TextField("Alias", text: $alias, prompt: Text(verbatim: "build-mac"))
                     TextField("SSH target", text: $ssh, prompt: Text("user@host or ~/.ssh/config alias"))
                     Picker("Access", selection: $mode) {
                         Text("Observe only").tag("observe")
@@ -1050,7 +2810,7 @@ struct HostRegistrationView: View {
 
     private func register() {
         Task {
-            _ = await model.registerHost(
+            let registered = await model.registerHost(
                 MuxaHostRegistrationRequest(
                     alias: alias,
                     ssh: ssh,
@@ -1061,6 +2821,7 @@ struct HostRegistrationView: View {
                     overwrite: overwrite
                 )
             )
+            if registered { dismiss() }
         }
     }
 }
@@ -1075,7 +2836,7 @@ private struct WatchLivePanePanel: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var prompt = ""
     @State private var sending = false
-    @State private var feedback: String?
+    @State private var feedback: PromptFeedback?
 
     private var attachedSession: MuxaSession? {
         attachedSessionID.flatMap { id in model.sessions.first(where: { $0.id == id }) }
@@ -1091,16 +2852,21 @@ private struct WatchLivePanePanel: View {
                 Label("Live Pane", systemImage: "terminal")
                     .font(.caption.weight(.semibold))
                     .fixedSize()
-                Text("\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
+                Text(verbatim: "\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                Text(attachedSessionID == nil ? "Read-only" : "Interactive")
+                Text(attachedSessionID == nil ? "Read-only" : "Fitted · Interactive")
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(attachedSessionID == nil ? Color.secondary : Color.green)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
                     .background(Color.primary.opacity(0.07), in: Capsule())
+                    .help(
+                        attachedSessionID == nil
+                            ? "The preview preserves the pane's current tmux dimensions"
+                            : "This pane is temporarily zoomed and follows the Live Pane size; tmux settings are restored on detach"
+                    )
                 Spacer(minLength: 4)
                 if model.isAttachingPane {
                     ProgressView().controlSize(.mini)
@@ -1135,11 +2901,12 @@ private struct WatchLivePanePanel: View {
                     client: model.client,
                     sessionID: session.id,
                     replayInitialHistory: session.hasBeenAttached == true,
-                    allowsRaw: false,
                     showsToolbar: false,
                     onExit: sessionExited
                 )
                 .id(session.id)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
             } else {
                 PaneCaptureView(
                     client: model.client,
@@ -1147,12 +2914,7 @@ private struct WatchLivePanePanel: View {
                     showsHeader: false
                 )
                 .id(pane.id)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    guard canAttach, !model.isAttachingPane else { return }
-                    startAttach()
-                }
-                .help(canAttach ? "Click anywhere in the preview to attach and type" : "Read-only pane preview")
+                .help(canAttach ? "Use Click to Type to enter interactive mode" : "Read-only pane preview")
                 .task(id: attachedSessionID) {
                     if attachedSessionID != nil, attachedSession?.exited == true {
                         sessionExited()
@@ -1173,7 +2935,8 @@ private struct WatchLivePanePanel: View {
                 .background(MuxaSurfacePalette.sidebar(for: colorScheme))
             }
         }
-        .frame(minHeight: 190)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
         .overlay {
             Rectangle()
                 .stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
@@ -1181,9 +2944,77 @@ private struct WatchLivePanePanel: View {
     }
 }
 
+/// How strongly one Explore tree row is highlighted. Only the row that matches
+/// the active editor (`sidebarSelection`) is `selected`; the path down to the
+/// followed pane (`watchSelection`) is a lighter `followed` marker.
+enum WatchTreeHighlight: Equatable {
+    case selected
+    case followed
+    case idle
+}
+
+/// The two selections the Explore tree reflects, and the rule for combining
+/// them so that a row never looks selected because of a stale pane choice.
+struct WatchTreeSelection: Equatable {
+    let editor: MuxaSidebarSelection?
+    let followedPane: MuxaWatchPaneIdentity?
+
+    /// The followed pane path is only meaningful while the active editor
+    /// follows that pane: the Live Watch tool or the pane's own editor.
+    var showsFollowedPath: Bool {
+        switch editor {
+        case .watch: true
+        case .pane(let id): id == followedPane
+        default: false
+        }
+    }
+
+    func highlight(
+        for row: MuxaSidebarSelection,
+        containsFollowedPane: Bool
+    ) -> WatchTreeHighlight {
+        if editor == row { return .selected }
+        if showsFollowedPath, containsFollowedPane { return .followed }
+        return .idle
+    }
+}
+
+/// Explore row fill: a strong accent for the active editor row, a lighter
+/// tint for the followed pane path, otherwise `idle`.
+private func watchHighlightFill(
+    _ highlight: WatchTreeHighlight,
+    selected: Double = 0.18,
+    idle: Color = .clear
+) -> Color {
+    switch highlight {
+    case .selected: Color.accentColor.opacity(selected)
+    case .followed: Color.accentColor.opacity(0.06)
+    case .idle: idle
+    }
+}
+
+/// Thin leading accent bar that marks the followed pane without reading as a
+/// selection. It never participates in hit testing.
+private struct WatchFollowedMarker: View {
+    let highlight: WatchTreeHighlight
+
+    var body: some View {
+        if highlight == .followed {
+            Capsule()
+                .fill(Color.accentColor.opacity(0.65))
+                .frame(width: 3)
+                .padding(.vertical, 9)
+                .allowsHitTesting(false)
+        }
+    }
+}
+
 struct WatchHostTree: View {
     let group: MuxaWatchHost
-    let selectedPaneID: MuxaWatchPaneIdentity?
+    let selection: WatchTreeSelection
+    let selectHost: (String) -> Void
+    let selectSession: (MuxaWatchSessionIdentity) -> Void
+    let openPinnedSession: (MuxaWatchSessionIdentity) -> Void
     let selectPane: (MuxaWatchPaneIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
     let forceExpanded: Bool
@@ -1191,7 +3022,7 @@ struct WatchHostTree: View {
     @State private var manualExpansion: Bool?
 
     private var containsSelection: Bool {
-        selectedPaneID.map { selected in
+        selection.followedPane.map { selected in
             group.sessions.contains { session in
                 session.windows.contains { window in
                     window.panes.contains { $0.id == selected }
@@ -1206,33 +3037,55 @@ struct WatchHostTree: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button { manualExpansion = !expanded } label: {
-                HStack(spacing: 6) {
+            HStack(spacing: 0) {
+                Button { manualExpansion = !expanded } label: {
                     hierarchyChevron(expanded)
-                    HostIdentityBadge(host: group.host, size: 20)
-                    Text(group.host.alias)
-                        .font(.callout.weight(.semibold))
-                        .lineLimit(1)
-                    Spacer(minLength: 4)
-                    Text("\(group.paneCount)")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                    Circle()
-                        .fill(fleetHostColor(group.host.state))
-                        .frame(width: 6, height: 6)
+                        .frame(width: 30, height: 36)
+                        .contentShape(Rectangle())
                 }
-                .padding(.horizontal, 5)
-                .frame(height: 30)
-                .background(expanded ? Color.primary.opacity(0.035) : Color.clear)
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+
+                Button { selectHost(group.host.alias) } label: {
+                    HStack(spacing: 6) {
+                        HostIdentityBadge(host: group.host, size: 20)
+                        Text(group.host.alias)
+                            .font(.callout.weight(.semibold))
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        Text(verbatim: "\(group.paneCount)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        Circle()
+                            .fill(fleetHostColor(group.host.state))
+                            .frame(width: 6, height: 6)
+                    }
+                    .padding(.horizontal, 7)
+                    .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .simultaneousGesture(
+                    TapGesture(count: 2).onEnded { manualExpansion = !expanded }
+                )
             }
-            .buttonStyle(.plain)
+            .background(
+                watchHighlightFill(
+                    selection.highlight(
+                        for: .host(group.host.alias),
+                        containsFollowedPane: containsSelection
+                    ),
+                    selected: 0.14,
+                    idle: expanded ? Color.primary.opacity(0.035) : Color.clear
+                )
+            )
 
             if expanded {
                 ForEach(group.sessions) { session in
                     WatchSessionTree(
                         session: session,
-                        selectedPaneID: selectedPaneID,
+                        selection: selection,
+                        selectSession: selectSession,
+                        openPinnedSession: openPinnedSession,
                         selectPane: selectPane,
                         openPinnedPane: openPinnedPane,
                         forceExpanded: forceExpanded,
@@ -1246,7 +3099,9 @@ struct WatchHostTree: View {
 
 private struct WatchSessionTree: View {
     let session: MuxaWatchSession
-    let selectedPaneID: MuxaWatchPaneIdentity?
+    let selection: WatchTreeSelection
+    let selectSession: (MuxaWatchSessionIdentity) -> Void
+    let openPinnedSession: (MuxaWatchSessionIdentity) -> Void
     let selectPane: (MuxaWatchPaneIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
     let forceExpanded: Bool
@@ -1254,11 +3109,18 @@ private struct WatchSessionTree: View {
     @State private var manualExpansion: Bool?
 
     private var selectedPath: Bool {
-        selectedPaneID.map { selected in
+        selection.followedPane.map { selected in
             session.windows.contains { window in
                 window.panes.contains { $0.id == selected }
             }
         } ?? false
+    }
+
+    private var highlight: WatchTreeHighlight {
+        selection.highlight(
+            for: .fleetSession(session.identity),
+            containsFollowedPane: selectedPath
+        )
     }
 
     private var expanded: Bool {
@@ -1269,21 +3131,18 @@ private struct WatchSessionTree: View {
         session.windows.count == 1 ? session.windows.first : nil
     }
 
-    private var firstPane: MuxaWatchPane? {
-        session.windows.first?.panes.first
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 0) {
                 explorerIndent(depth: 1)
                 Button { manualExpansion = !expanded } label: {
                     hierarchyChevron(expanded)
-                        .frame(width: 18, height: 26)
+                        .frame(width: 30, height: 34)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 Button {
-                    if let firstPane { selectPane(firstPane.id) }
+                    selectSession(session.identity)
                     if !expanded { manualExpansion = true }
                 } label: {
                     HStack(spacing: 6) {
@@ -1303,28 +3162,32 @@ private struct WatchSessionTree: View {
                                 .lineLimit(1)
                         }
                         Spacer(minLength: 3)
-                        Text(singleWindow.map { "\($0.panes.count)" } ?? "\(session.windows.count)")
+                        Text(verbatim: singleWindow.map { "\($0.panes.count)" } ?? "\(session.windows.count)")
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
-                    .frame(height: 26)
+                    .padding(.trailing, 7)
+                    .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .simultaneousGesture(
                     TapGesture(count: 2).onEnded {
-                        if let firstPane { openPinnedPane(firstPane.id) }
+                        openPinnedSession(session.identity)
                     }
                 )
             }
-            .background(selectedPath ? Color.accentColor.opacity(0.08) : Color.clear)
+            .background(watchHighlightFill(highlight))
 
             if expanded {
                 if let singleWindow {
                     ForEach(singleWindow.panes) { pane in
                         WatchPaneRow(
                             pane: pane,
-                            selected: selectedPaneID == pane.id,
+                            highlight: selection.highlight(
+                                for: .pane(pane.id),
+                                containsFollowedPane: selection.followedPane == pane.id
+                            ),
                             depth: 2,
                             selectPane: selectPane,
                             openPinnedPane: openPinnedPane
@@ -1334,7 +3197,7 @@ private struct WatchSessionTree: View {
                     ForEach(session.windows) { window in
                         WatchWindowTree(
                             window: window,
-                            selectedPaneID: selectedPaneID,
+                            selection: selection,
                             selectPane: selectPane,
                             openPinnedPane: openPinnedPane,
                             forceExpanded: forceExpanded,
@@ -1349,7 +3212,7 @@ private struct WatchSessionTree: View {
 
 private struct WatchWindowTree: View {
     let window: MuxaWatchWindow
-    let selectedPaneID: MuxaWatchPaneIdentity?
+    let selection: WatchTreeSelection
     let selectPane: (MuxaWatchPaneIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
     let forceExpanded: Bool
@@ -1357,7 +3220,7 @@ private struct WatchWindowTree: View {
     @State private var manualExpansion: Bool?
 
     private var containsSelection: Bool {
-        selectedPaneID.map { selected in window.panes.contains { $0.id == selected } } ?? false
+        selection.followedPane.map { selected in window.panes.contains { $0.id == selected } } ?? false
     }
 
     private var expanded: Bool {
@@ -1370,7 +3233,8 @@ private struct WatchWindowTree: View {
                 explorerIndent(depth: 2)
                 Button { manualExpansion = !expanded } label: {
                     hierarchyChevron(expanded)
-                        .frame(width: 18, height: 26)
+                        .frame(width: 30, height: 34)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 Button {
@@ -1386,11 +3250,12 @@ private struct WatchWindowTree: View {
                             .fontWeight(logicalWork == nil ? .regular : .medium)
                             .lineLimit(1)
                         Spacer(minLength: 3)
-                        Text("#\(window.index) · \(window.panes.count)")
+                        Text(verbatim: "#\(window.index) · \(window.panes.count)")
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
-                    .frame(height: 26)
+                    .padding(.trailing, 7)
+                    .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -1400,13 +3265,23 @@ private struct WatchWindowTree: View {
                     }
                 )
             }
-            .background(containsSelection ? Color.accentColor.opacity(0.08) : Color.clear)
+            .background(
+                watchHighlightFill(
+                    selection.highlight(
+                        for: .fleetWindow(window.identity),
+                        containsFollowedPane: containsSelection
+                    )
+                )
+            )
 
             if expanded {
                 ForEach(window.panes) { pane in
                     WatchPaneRow(
                         pane: pane,
-                        selected: selectedPaneID == pane.id,
+                        highlight: selection.highlight(
+                            for: .pane(pane.id),
+                            containsFollowedPane: selection.followedPane == pane.id
+                        ),
                         depth: 3,
                         selectPane: selectPane,
                         openPinnedPane: openPinnedPane
@@ -1419,7 +3294,7 @@ private struct WatchWindowTree: View {
 
 private struct WatchPaneRow: View {
     let pane: MuxaWatchPane
-    let selected: Bool
+    let highlight: WatchTreeHighlight
     let depth: Int
     let selectPane: (MuxaWatchPaneIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
@@ -1443,7 +3318,7 @@ private struct WatchPaneRow: View {
         Button { selectPane(pane.id) } label: {
             HStack(spacing: 0) {
                 explorerIndent(depth: depth)
-                Color.clear.frame(width: 18)
+                Color.clear.frame(width: 30)
                 HStack(spacing: 6) {
                     Image(systemName: pane.agent == nil ? "terminal" : "person.crop.circle")
                         .font(.caption)
@@ -1465,12 +3340,91 @@ private struct WatchPaneRow: View {
                             .foregroundStyle(.orange)
                     }
                 }
-                .padding(.trailing, 6)
+                .padding(.trailing, 8)
             }
-            .frame(height: 27)
+            .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+            .background(watchHighlightFill(highlight))
+            .overlay(alignment: .leading) { WatchFollowedMarker(highlight: highlight) }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .simultaneousGesture(
+            TapGesture(count: 2).onEnded { openPinnedPane(pane.id) }
+        )
+        .contextMenu {
+            Button("Open") { selectPane(pane.id) }
+            Button("Open Pinned") { openPinnedPane(pane.id) }
+        }
+    }
+}
+
+/// A globally sortable Explore row. Unlike the topology tree it carries its
+/// host and tmux path in the row, so removing host grouping does not remove the
+/// context needed to identify the pane.
+struct WatchFlatPaneRow: View {
+    let pane: MuxaWatchPane
+    let highlight: WatchTreeHighlight
+    let selectPane: (MuxaWatchPaneIdentity) -> Void
+    let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
+
+    private var title: String {
+        pane.pane.agentAlias.map { "@\($0)" }
+            ?? pane.agent?.aiTitle
+            ?? pane.pane.title.nonEmpty
+            ?? pane.pane.currentCommand.nonEmpty
+            ?? pane.pane.paneID
+    }
+
+    private var location: String {
+        let window = pane.pane.windowName.nonEmpty ?? pane.pane.stableWindowID
+        return "\(pane.host.alias) · \(pane.pane.session) › \(window)"
+    }
+
+    var body: some View {
+        Button { selectPane(pane.id) } label: {
+            HStack(alignment: .top, spacing: 8) {
+                HostIdentityBadge(identity: pane.host, size: 22)
+                    .padding(.top, 1)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(pane.agent.map { agentStateColor($0.state) } ?? Color.secondary)
+                            .frame(width: 6, height: 6)
+                        Text(title)
+                            .font(.callout.weight(.medium))
+                            .lineLimit(1)
+                        Spacer(minLength: 3)
+                        Text(pane.pane.paneID)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.tertiary)
+                    }
+                    Text(location)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    if let agent = pane.agent {
+                        Text(agentStateLabel(agent.state))
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(agentStateColor(agent.state))
+                    } else if let command = pane.pane.currentCommand.nonEmpty {
+                        Text(command)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    } else {
+                        Text("Shell")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 7)
+            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
             .background(
-                selected ? Color.accentColor.opacity(0.18) : Color.clear
+                watchHighlightFill(highlight),
+                in: RoundedRectangle(cornerRadius: 6)
             )
+            .overlay(alignment: .leading) { WatchFollowedMarker(highlight: highlight) }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1492,7 +3446,7 @@ private func explorerIndent(depth: Int) -> some View {
                 .frame(width: 1)
         }
     }
-    .frame(width: CGFloat(depth) * 12, height: 27, alignment: .trailing)
+    .frame(width: CGFloat(depth) * 14, height: 34, alignment: .trailing)
 }
 
 private func hierarchyChevron(_ expanded: Bool) -> some View {
@@ -1500,7 +3454,7 @@ private func hierarchyChevron(_ expanded: Bool) -> some View {
         .font(.caption2.weight(.semibold))
         .foregroundStyle(.secondary)
         .rotationEffect(.degrees(expanded ? 90 : 0))
-        .frame(width: 10)
+        .frame(width: 12, height: 20)
 }
 
 private struct FleetPaneInspector: View {
@@ -1508,6 +3462,12 @@ private struct FleetPaneInspector: View {
     @ObservedObject var model: AppModel
     let compact: Bool
     let openInShell: () -> Void
+    @State private var showsMetadata = false
+    @State private var agentsExpanded = true
+
+    private var window: MuxaWatchWindow? {
+        model.executionSnapshot.watchWindow(containing: pane.id)
+    }
 
     var body: some View {
         ScrollView {
@@ -1526,22 +3486,10 @@ private struct FleetPaneInspector: View {
                     }
                 }
 
-                if let agent = pane.agent {
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 8) {
-                            agentStatus(agent)
-                        }
-                        VStack(alignment: .leading, spacing: 4) {
-                            agentStatus(agent)
-                        }
-                    }
-                    .font(.caption)
-                    if let summary = agent.recap ?? agent.lastNotification ?? agent.lastResponse,
-                       !summary.isEmpty {
-                        MarkdownContent(source: summary, lineLimit: compact ? 5 : 7)
-                            .padding(12)
-                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-                    }
+                selectedPaneOverview
+
+                if let window {
+                    windowOverview(window)
                 }
 
                 if let error = model.attachError {
@@ -1553,7 +3501,253 @@ private struct FleetPaneInspector: View {
 
             }
             .padding(compact ? 12 : 18)
+            .frame(maxWidth: 1100, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
+    }
+
+    @ViewBuilder
+    private func windowOverview(_ window: MuxaWatchWindow) -> some View {
+        DisclosureGroup(isExpanded: $agentsExpanded) {
+            VStack(spacing: 1) {
+                ForEach(window.panes) { item in
+                    Button {
+                        model.selectWatchPane(item.id)
+                    } label: {
+                        HStack(alignment: .top, spacing: 9) {
+                            Circle()
+                                .fill(item.agent.map { agentStateColor($0.state) } ?? Color.secondary)
+                                .frame(width: 7, height: 7)
+                                .padding(.top, 5)
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text(overviewTitle(item))
+                                        .font(.subheadline.weight(item.id == pane.id ? .semibold : .regular))
+                                    if let agent = item.agent {
+                                        Text(agentStateLabel(agent.state))
+                                            .font(.caption2.weight(.medium))
+                                            .foregroundStyle(agentStateColor(agent.state))
+                                    }
+                                    Spacer(minLength: 4)
+                                    Text(item.pane.paneID)
+                                        .font(.caption2.monospaced())
+                                        .foregroundStyle(.tertiary)
+                                }
+                                Text(overviewSummary(item) ?? String(localized: "No task summary has been reported for this pane yet."))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.leading)
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            item.id == pane.id ? Color.accentColor.opacity(0.1) : Color.primary.opacity(0.025),
+                            in: RoundedRectangle(cornerRadius: 7)
+                        )
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.top, 9)
+        } label: {
+            HStack(spacing: 8) {
+                Label("Agents in this window", systemImage: "person.2")
+                    .font(.headline)
+                if let identity = windowWorkIdentity(window) {
+                    Text(verbatim: "\(identity.workspaceID) / \(identity.workID)")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.accentColor.opacity(0.1), in: Capsule())
+                }
+                Spacer(minLength: 6)
+                Text("\(window.panes.count) panes · \(window.panes.compactMap(\.agent).count) agents")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.4), lineWidth: 0.5)
+        }
+    }
+
+    @ViewBuilder
+    private var selectedPaneOverview: some View {
+        if let agent = pane.agent {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Label("Current context", systemImage: "text.alignleft")
+                        .font(.headline.weight(.semibold))
+                    agentStatus(agent)
+                }
+                .font(.caption)
+
+                if let summary = agent.recap?.nonEmpty,
+                   let response = agent.lastResponse?.nonEmpty,
+                   response != summary {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .top, spacing: 12) {
+                            overviewSection(
+                                String(localized: "Summary"),
+                                systemImage: "list.bullet.rectangle",
+                                summary,
+                                lineLimit: compact ? 5 : 8
+                            )
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            overviewSection(
+                                String(localized: "Latest response"),
+                                systemImage: "text.bubble",
+                                response,
+                                lineLimit: compact ? 6 : 12
+                            )
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                        }
+                        VStack(alignment: .leading, spacing: 10) {
+                            overviewSection(
+                                String(localized: "Summary"),
+                                systemImage: "list.bullet.rectangle",
+                                summary,
+                                lineLimit: compact ? 5 : 8
+                            )
+                            overviewSection(
+                                String(localized: "Latest response"),
+                                systemImage: "text.bubble",
+                                response,
+                                lineLimit: compact ? 6 : 12
+                            )
+                        }
+                    }
+                } else if let summary = agent.recap?.nonEmpty {
+                    overviewSection(
+                        String(localized: "Summary"),
+                        systemImage: "list.bullet.rectangle",
+                        summary,
+                        lineLimit: compact ? 5 : 9
+                    )
+                } else if let response = agent.lastResponse?.nonEmpty {
+                    overviewSection(
+                        String(localized: "Latest response"),
+                        systemImage: "text.bubble",
+                        response,
+                        lineLimit: compact ? 6 : 12
+                    )
+                }
+
+                if let activity = latestActivity(agent) {
+                    overviewSection(
+                        activity.title,
+                        systemImage: activity.systemImage,
+                        activity.source,
+                        lineLimit: compact ? 4 : 7
+                    )
+                }
+            }
+        } else {
+            Label(
+                "No agent session is currently associated with this pane.",
+                systemImage: "person.crop.circle.badge.questionmark"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private func overviewSection(
+        _ title: String,
+        systemImage: String,
+        _ source: String,
+        lineLimit: Int
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Label(title, systemImage: systemImage)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(source, forType: .string)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Copy \(title.lowercased())")
+            }
+            MarkdownContent(source: source, lineLimit: lineLimit, selectable: false)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func latestActivity(_ agent: MuxaAgent) -> (title: String, systemImage: String, source: String)? {
+        if let notice = agent.lastNotification?.nonEmpty,
+           notice != agent.recap,
+           notice != agent.lastResponse {
+            return (String(localized: "Latest notice"), "bell", notice)
+        }
+        if agent.recap == nil,
+           agent.lastResponse == nil,
+           let prompt = agent.lastPrompt?.nonEmpty {
+            return (String(localized: "Latest activity"), "clock.arrow.circlepath", humanReadablePrompt(prompt))
+        }
+        return nil
+    }
+
+    private func metadataRow(_ label: LocalizedStringKey, _ value: String) -> some View {
+        GridRow {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .fontDesign(.monospaced)
+        }
+    }
+
+    private func windowWorkIdentity(_ window: MuxaWatchWindow) -> MuxaWorkIdentity? {
+        let identities = Set(window.panes.compactMap(\.pane.workIdentity))
+        return identities.count == 1 ? identities.first : nil
+    }
+
+    private func overviewTitle(_ item: MuxaWatchPane) -> String {
+        item.pane.agentAlias.map { "@\($0)" }
+            ?? item.agent?.aiTitle?.nonEmpty
+            ?? item.pane.title.nonEmpty
+            ?? item.pane.currentCommand.nonEmpty
+            ?? item.pane.paneID
+    }
+
+    private func overviewSummary(_ item: MuxaWatchPane) -> String? {
+        guard let agent = item.agent else { return item.pane.currentPath.nonEmpty }
+        return agent.recap?.nonEmpty
+            ?? agent.lastResponse?.nonEmpty
+            ?? agent.lastNotification?.nonEmpty
+            ?? agent.lastPrompt?.nonEmpty.map(humanReadablePrompt)
+    }
+
+    private func humanReadablePrompt(_ prompt: String) -> String {
+        if prompt.hasPrefix("[muxa:req_") {
+            if prompt.contains("Completed reply") {
+                return String(localized: "A collaborator reply is ready for this agent.")
+            }
+            if prompt.contains("New ") && prompt.contains(" request") {
+                return String(localized: "A collaboration request is waiting for this agent.")
+            }
+            return String(localized: "Recent Muxa collaboration activity.")
+        }
+        if prompt.hasPrefix("<task-notification>") {
+            return String(localized: "A background task reported an update.")
+        }
+        return prompt
     }
 
     private var inspectorIdentity: some View {
@@ -1563,16 +3757,29 @@ private struct FleetPaneInspector: View {
                 Text(pane.agent?.aiTitle ?? pane.pane.agentAlias.map { "@\($0)" } ?? pane.pane.title.nonEmpty ?? pane.pane.currentCommand)
                     .font(.title2.weight(.semibold))
                     .lineLimit(2)
-                Text("\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                HStack(spacing: 7) {
+                    Text(pane.host.alias)
+                    if let agent = pane.agent {
+                        Text(verbatim: "·")
+                        Text(agentStateLabel(agent.state))
+                            .foregroundStyle(agentStateColor(agent.state))
+                    }
+                    if let identity = pane.pane.workIdentity {
+                        Text(verbatim: "·")
+                        Text(verbatim: "\(identity.workspaceID) / \(identity.workID)")
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
             }
         }
     }
 
     private var inspectorActions: some View {
         HStack(spacing: 8) {
+            metadataButton(label: "Details")
             Button {
                 openInShell()
             } label: {
@@ -1583,11 +3790,39 @@ private struct FleetPaneInspector: View {
 
     private var compactInspectorActions: some View {
         HStack(spacing: 8) {
+            metadataButton(label: "Info")
             Button {
                 openInShell()
             } label: {
                 Label("Shell", systemImage: "rectangle.on.rectangle")
             }
+        }
+    }
+
+    private func metadataButton(label: LocalizedStringKey) -> some View {
+        Button {
+            showsMetadata.toggle()
+        } label: {
+            Label(label, systemImage: "info.circle")
+        }
+        .popover(isPresented: $showsMetadata, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Execution location")
+                    .font(.headline)
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+                    metadataRow("Host", pane.host.alias)
+                    metadataRow("Session", pane.pane.session.nonEmpty ?? pane.pane.stableSessionID)
+                    metadataRow("Window", pane.pane.windowName.nonEmpty ?? pane.pane.stableWindowID)
+                    metadataRow("Pane", "\(pane.pane.paneID) · \(pane.pane.currentCommand)")
+                    if let path = pane.pane.currentPath.nonEmpty {
+                        metadataRow("Directory", path)
+                    }
+                }
+                .font(.caption)
+                .textSelection(.enabled)
+            }
+            .padding(16)
+            .frame(minWidth: 420, maxWidth: 560, alignment: .leading)
         }
     }
 
@@ -1597,7 +3832,8 @@ private struct FleetPaneInspector: View {
             .foregroundStyle(agentStateColor(agent.state))
         if let modelName = agent.model { Text(modelName) }
         if let context = agent.contextUsedPercent {
-            Text("context \(context, format: .number.precision(.fractionLength(0)))%")
+            let percent = "\(context.formatted(.number.precision(.fractionLength(0))))%"
+            Text("context \(percent)")
         }
     }
 }
@@ -1611,13 +3847,20 @@ struct FleetPaneModuleView: View {
     }
 }
 
+/// The outcome line under a prompt composer: the wording and whether the
+/// send succeeded, so the colour never depends on the wording's language.
+struct PromptFeedback: Equatable {
+    let message: String
+    let succeeded: Bool
+}
+
 private struct PanePromptComposer: View {
     let host: MuxaFleetHostIdentity
     let pane: MuxaPaneInfo
     let client: MuxaIPCClient
     @Binding var prompt: String
     @Binding var sending: Bool
-    @Binding var feedback: String?
+    @Binding var feedback: PromptFeedback?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1636,9 +3879,9 @@ private struct PanePromptComposer: View {
                     .font(.caption2)
                     .foregroundStyle(.orange)
             } else if let feedback {
-                Text(feedback)
+                Text(feedback.message)
                     .font(.caption2)
-                    .foregroundStyle(feedback.hasPrefix("Sent") ? .green : .red)
+                    .foregroundStyle(feedback.succeeded ? .green : .red)
             }
         }
     }
@@ -1666,9 +3909,9 @@ private struct PanePromptComposer: View {
             do {
                 try await client.sendFleetPrompt(host: host, pane: pane, text: text)
                 prompt = ""
-                feedback = "Sent and submitted"
+                feedback = PromptFeedback(message: String(localized: "Sent and submitted"), succeeded: true)
             } catch {
-                feedback = error.localizedDescription
+                feedback = PromptFeedback(message: error.localizedDescription, succeeded: false)
             }
         }
     }
@@ -1679,7 +3922,7 @@ struct WorkPromptComposer: View {
     @ObservedObject var model: AppModel
     @State private var prompt = ""
     @State private var sending = false
-    @State private var feedback: String?
+    @State private var feedback: PromptFeedback?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -1696,9 +3939,9 @@ struct WorkPromptComposer: View {
                 }
             }
             if let feedback {
-                Text(feedback)
+                Text(feedback.message)
                     .font(.caption)
-                    .foregroundStyle(feedback.hasPrefix("Sent") ? .green : .red)
+                    .foregroundStyle(feedback.succeeded ? .green : .red)
             }
         }
         .padding(14)
@@ -1728,9 +3971,12 @@ struct WorkPromptComposer: View {
             do {
                 let count = try await model.prompt(work: work, text: text)
                 prompt = ""
-                feedback = "Sent to \(count) collaborator\(count == 1 ? "" : "s")"
+                feedback = PromptFeedback(
+                    message: String(localized: "Sent to \(count) collaborators"),
+                    succeeded: true
+                )
             } catch {
-                feedback = error.localizedDescription
+                feedback = PromptFeedback(message: error.localizedDescription, succeeded: false)
             }
         }
     }
@@ -1772,7 +4018,7 @@ struct HostIdentityBadge: View {
                 .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 1.5))
                 .offset(x: 2, y: 2)
         }
-        .help("\(alias) · \(state)")
+        .help(Text(verbatim: "\(alias) · \(fleetHostStateLabel(state))"))
     }
 
     /// A stable per-host accent makes a host recognizable even when every
@@ -1805,12 +4051,12 @@ struct DetachedModuleView: View {
             if let pane = model.executionSnapshot.watchPane(id: id) {
                 FleetPaneModuleView(pane: pane, model: model)
             } else {
-                moduleMissing("Fleet pane is no longer available")
+                moduleMissing("This pane is no longer available")
             }
         }
     }
 
-    private func moduleMissing(_ text: String) -> some View {
+    private func moduleMissing(_ text: LocalizedStringKey) -> some View {
         ConsoleUnavailableView(
             title: "Module unavailable",
             systemImage: "terminal.fill",
@@ -1827,9 +4073,9 @@ private func paneNeedsAttention(_ pane: MuxaWatchPane) -> Bool {
 }
 
 private struct ConsoleUnavailableView: View {
-    let title: String
+    let title: LocalizedStringKey
     let systemImage: String
-    let description: String
+    let description: LocalizedStringKey
 
     var body: some View {
         VStack(spacing: 9) {

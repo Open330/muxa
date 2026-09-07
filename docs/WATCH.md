@@ -67,7 +67,7 @@ children keep their aggregate state markers.
 | `w` | Run a pipeline: type a work id and hand off to a window running `muxa work up`. |
 | `R` / `:rename` | Rename the selected tmux session or window, or set the selected pane title. |
 | `\|` | Cycle the list/inspector split: 50/50 → 70/30 → 30/70. |
-| `a` / `A` | Ask the configured agent a headless question / browse the answers. |
+| `a` / `A` | Continue Ask / open the selected conversation. In the composer, `Ctrl-E` switches to a new conversation; in the panel, `n` drafts one. |
 | `m` / `M` | Message the resolved agent — or every marked one — / open history for the selected topology scope. |
 | `Space` | Mark or unmark the agent under the cursor. With marks set, `m` composes once and sends one ordinary request to each; the result popup keeps a row per recipient. |
 | `b` | Legacy alias for `M`; `i` claims and `e` replies inside the mailbox. |
@@ -239,28 +239,45 @@ rather than silently answered with a caller-scoped listing.
 ## Ask
 
 `a` composes a headless question for the agent named in the composer title;
-`Tab` switches between claude and codex, `Ctrl-V` pastes, `/` opens the shared
-skill palette at any point in the draft, and `Enter` sends.
+`Tab` switches the provider and `Ctrl-E` toggles whether the draft continues
+the selected conversation or starts a new one. The title shows `NEW` until a
+new conversation is sent, or `CONTINUE` followed by the selected conversation's
+position and title. `Ctrl-V` pastes, `/` opens the shared skill palette at any
+point in the draft, and `Enter` sends. A new
+conversation and its first question are committed together, so cancelling a
+draft never leaves an empty conversation. A conversation accepts one running
+question at a time; mark an independent draft as new to let it run alongside
+the current one.
 muxad runs the agent in print mode and captures the answer, so nothing is
 typed into a pane and no session has to be managed. `Esc` cancels; Backspace
 also cancels when the input is already empty.
 
-`A` opens the history: `j`/`k` selects, `|` grows the detail pane, `Tab`
-filters by agent (all → claude → codex), and `n` starts a fresh
-conversation. Everything before that `n` is one thread — each question
-resumes the last, so the second onward reuses the cached context the first
-paid for. Threads are per agent, so switching back picks that conversation
-up where it left off.
+`A` opens the selected conversation as a transcript. `j`/`k` selects a turn,
+`Enter` opens that answer in a full reader, `|` grows the detail pane, and
+`Tab`/`Shift-Tab` moves between durable conversations. `a` continues the
+conversation on screen; `n` opens a draft for a new one. Each question in a
+conversation resumes the last, so the second onward reuses the cached context
+the first paid for. Conversations remember their provider, and selecting one
+also restores that provider for the next turn.
 
 The daemon owns execution: an answer lands in the history whether or not
 the popup is still open, and the history outlives restarts in
 `$XDG_DATA_HOME/muxa/ask.json`. Requires `[ask] enabled = true` — see
 [CONFIGURATION.md](CONFIGURATION.md).
 
-Inside ask history, `n` starts a fresh conversation without deleting entries.
-`d` confirms deletion of the selected completed entry. `D` confirms clearing
-completed history across all agent filters. Running asks and conversation ids
-are preserved by both operations.
+The detail pane under the list only ever shows an answer's first screenful.
+`Enter` (or `o`) opens the selected entry in a reader that shows the question
+and the whole answer: `j`/`k` scroll a line, `PgUp`/`PgDn` a page, `g`/`G`
+jump to the top/bottom, and the foot of the box tracks which lines are on
+screen. `Esc`, `Enter`, or `q` returns to the list; `A` closes the panel. The
+reader is read-only — `d` and `D` do not delete the answer being read — and it
+follows the entry itself, so an answer that arrives while it is open appears
+without reopening it.
+
+Inside the Ask panel, `n` only opens a new-conversation draft; the conversation
+does not exist until that draft is sent. `d` confirms deletion of the selected
+completed entry. `D` confirms clearing completed history. Running asks and
+conversation ids are preserved by both deletion operations.
 
 Ask defaults to `[ask].permission_mode = "bypass"` because headless sessions
 cannot answer approval prompts and ask is designed to run unattended skills.

@@ -59,6 +59,79 @@ muxa work init --dry-run                      # show the proposal, write nothing
 muxa work init --agent codex                  # use a different resolver
 ```
 
+Want one pipeline rather than the whole config? `muxa work compose
+"<description>"` spends one **read-only** agent turn and prints the
+pipeline as the JSON `pipeline set` reads — nothing is written. The draft
+is validated with the same rules as `pipeline set`, and a draft that would
+not launch is sent back once with the reason before muxa gives up.
+`--current <path|->` refines an earlier draft (the description is then the
+change to make), `--agent <id>` picks any `[ask]` provider, and `--json`
+prints the whole response (`pipeline`, `notes`, `raw`) — the same shape
+Muxa.app's pipeline editor gets from the daemon's `work_compose` request.
+
+```console
+muxa work compose "implementer in claude, reviewer in codex after it"
+muxa work compose "add a gemini tester after review" --current pair.json --json
+```
+
+Do not want to spend a turn? Three built-in presets cover the common
+line-ups, and `muxa work preset apply` writes one into `config.toml` the
+same way — through `toml_edit`, validated as a whole `Config` before the
+file is touched, and refusing to replace an existing `[pipeline.<name>]`
+unless you pass `--overwrite`:
+
+| Preset | Line-up |
+| --- | --- |
+| `solo` | one `claude` implementer |
+| `pair` | `claude` implementer → `codex` reviewer, the reviewer waiting on `muxa work done` |
+| `triad` | `codex` planner → `codex` implementer → `claude` reviewer, `main-vertical` layout |
+
+```console
+muxa work preset list                              # what each preset staffs
+muxa work preset apply solo --route '.*'           # [pipeline.solo] + a catch-all [[route]]
+muxa work preset apply triad --route '^cal-'       # add a second pipeline and its route
+muxa work preset apply pair --overwrite            # replace [pipeline.pair] you edited
+muxa work preset apply solo --json                 # {"pipeline","route","route_added","replaced","config_path"}
+```
+
+`--route` appends `[[route]] match = <regex>, pipeline = <name>` only when
+no route with that exact `match` exists; an existing one is reported and
+left pointing wherever it pointed. Once applied, a preset is an ordinary
+pipeline in your file — edit it freely.
+
+Launchers ask what is configured with `muxa work options`: routes in config
+order, pipelines by name, `[message.skills]` with a one-line summary, the
+presets above, and `[ticket].agent`. `--json` is the contract Muxa.app's
+Start Work sheet is built on; `configured` is `false` until at least one
+`[pipeline.*]` exists. Each pipeline and agent carries its raw `prompt`
+template, so an editor can hand the entry straight back.
+
+Editors write back through the same shape. `muxa work pipeline set <name>
+--from-json <path|->` takes one `pipelines[]` entry as `options --json`
+prints it (with or without its `name`), runs the checks a launch would fail
+— allowlisted programs, unique aliases, `after` edges that resolve and do
+not cycle, `direction` auto, right, or down — and writes `[pipeline.<name>]`
+through `toml_edit`, replacing an existing pipeline where it stands and
+leaving every other section, comment, and value alone. `muxa work pipeline
+remove <name>` refuses while a `[[route]]` still names the pipeline unless
+`--force`, which also clears `pipeline` on those routes. `muxa work route
+set --match <regex>` adds or updates the one `[[route]]` with exactly that
+`match` (`--pipeline`, `--workspace`, `--cwd`, `--position <n>`; `--clear-*`
+removes a field; `worktree` and `prepare` are never touched), and `muxa work
+route remove --match <regex>` deletes it. Every command validates the merged
+file as a whole `Config` before an atomic write, refuses without touching
+the file otherwise, and prints only JSON with `--json`.
+
+```console
+muxa work pipeline set pair --from-json pair.json     # {"pipeline","replaced","config_path"}
+muxa work options --json | jq '.pipelines[] | select(.name == "triad")' \
+  | muxa work pipeline set triad --from-json -        # round trip, unchanged
+muxa work pipeline remove pair --force                # {"pipeline","removed","routes_cleared","config_path"}
+muxa work route set --match '^cal-' --pipeline triad --position 0   # {"match","position","created","config_path"}
+muxa work route set --match '.*' --clear-workspace    # unset flags change nothing
+muxa work route remove --match '^cal-'                # {"match","removed","config_path"}
+```
+
 Prefer to write it by hand? The annotated reference is in
 [`config.example.toml`](../config.example.toml), and everything below
 explains what each part does.
@@ -313,6 +386,14 @@ So an agent's launch prompt is three layers, outermost first:
 
 ```console
 muxa work init                       # write the config by describing it
+muxa work compose "<description>" [--agent <id>] [--current <path|->] [--json]   # draft one pipeline as JSON; writes nothing
+muxa work preset list                # built-in line-ups: solo, pair, triad
+muxa work preset apply <name> --route '<regex>'   # write one, no agent turn
+muxa work options [--json]           # routes, pipelines, skills, presets for a launcher
+muxa work pipeline set <name> --from-json <path|->   # write/replace [pipeline.<name>] from that JSON shape
+muxa work pipeline remove <name> [--force]           # drop it; --force also clears routes naming it
+muxa work route set --match '<regex>' [--pipeline <name>] [--position <n>]   # add/update one [[route]]
+muxa work route remove --match '<regex>'             # drop that route
 muxa work up <work> --external <id>  # link issue, route, create what is missing
 muxa work up <id>                    # compatibility: also look up <id> as an issue
 muxa work up <id> --dry-run          # print the plan, touch nothing

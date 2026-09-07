@@ -868,7 +868,7 @@ fn secure_database_files(_path: &Path) -> Result<(), CollaborationError> {
     Ok(())
 }
 
-/// Create the main database with owner-only permissions before SQLite opens
+/// Create the main database with owner-only permissions before `SQLite` opens
 /// it. Chmod existing files as well: relying on the process umask would leave
 /// a short first-open window where collaboration bodies could be world-readable.
 #[cfg(unix)]
@@ -1468,12 +1468,12 @@ fn request_latest_activity(request: &CollaborationRequest) -> OffsetDateTime {
     .fold(request.created_at, std::cmp::max)
 }
 
-/// In-memory mailbox projection backed by indexed SQLite row updates when a
+/// In-memory mailbox projection backed by indexed `SQLite` row updates when a
 /// durable path is configured. The projection keeps wake and routing reads
 /// cheap while `transaction_lock` preserves atomic durable visibility.
 pub struct CollaborationStore {
     opts: CollaborationOptions,
-    /// Indexed SQLite sidecar. The configured JSON path remains the migration
+    /// Indexed `SQLite` sidecar. The configured JSON path remains the migration
     /// source and is deliberately retained as a recoverable backup.
     database_path: Option<PathBuf>,
     requests: RwLock<HashMap<String, CollaborationRequest>>,
@@ -2596,10 +2596,9 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
                     }
             })
             .collect();
-        if candidates.len() != 1 {
+        let Some(pane) = same_pane_seen_twice(&candidates) else {
             continue;
-        }
-        let pane = candidates[0];
+        };
         let socket = pane.socket.clone().or(agent_socket);
         let participant = Participant {
             agent_kind: agent.kind,
@@ -2673,25 +2672,28 @@ fn console_participant(
     origin: &CollaborationOrigin,
     panes: &[PaneInfo],
 ) -> Result<Participant, CollaborationError> {
-    let mut matches = panes.iter().filter(|pane| {
-        pane.pane_id == origin.pane
-            && match origin.socket.as_deref() {
-                Some(socket) => pane.socket.as_deref().is_some_and(|candidate| {
-                    crate::backend::pane_endpoints_match(Some(&origin.pane), candidate, socket)
-                }),
-                None => true,
-            }
-    });
-    let Some(pane) = matches.next() else {
+    let matches: Vec<_> = panes
+        .iter()
+        .filter(|pane| {
+            pane.pane_id == origin.pane
+                && match origin.socket.as_deref() {
+                    Some(socket) => pane.socket.as_deref().is_some_and(|candidate| {
+                        crate::backend::pane_endpoints_match(Some(&origin.pane), candidate, socket)
+                    }),
+                    None => true,
+                }
+        })
+        .collect();
+    if matches.is_empty() {
         return Ok(Participant::console(RoomId {
             host: CONSOLE_PANE.to_string(),
             socket: None,
             window_id: CONSOLE_PANE.to_string(),
         }));
-    };
-    if matches.next().is_some() {
-        return Err(CollaborationError::AmbiguousOrigin(origin.pane.clone()));
     }
+    let Some(pane) = same_pane_seen_twice(&matches) else {
+        return Err(CollaborationError::AmbiguousOrigin(origin.pane.clone()));
+    };
     let socket = pane.socket.clone().or_else(|| origin.socket.clone());
     let mut console = Participant::console(pane_room(&origin.pane, pane, socket));
     console.tmux_session_id = (!pane.session_id.is_empty()).then(|| pane.session_id.clone());
@@ -2915,6 +2917,41 @@ pub fn pending_recipient_ready(
     (ready.same_endpoint(to) && ready.room == to.room).then_some(ready)
 }
 
+/// The single pane a candidate list describes, or `None` when the candidates
+/// are genuinely different panes.
+///
+/// tmux lists a pane once per session that shows it, and a session *group*
+/// shows one window through several sessions. muxa's own `tmux-auto-view`
+/// creates exactly that: every attached client gets a `<session>~view~<pid>`
+/// member of the group, so an ordinary two-terminal setup lists every pane
+/// twice. Those rows differ only in the session they were seen through — same
+/// server, same window, same pane — and treating the second one as ambiguity
+/// made every pane in such a session invisible to collaboration: no
+/// participants, no origin, no peers, and an error telling the operator to
+/// restart an agent that was working fine.
+///
+/// The ambiguity that matters is a pane id repeated across *servers*, which
+/// differs by socket. That still refuses.
+///
+/// The base session wins over a view for display: it is the durable name, and
+/// the one the operator recognises.
+fn same_pane_seen_twice<'a>(candidates: &[&'a PaneInfo]) -> Option<&'a PaneInfo> {
+    let first = *candidates.first()?;
+    if !candidates
+        .iter()
+        .all(|pane| pane.socket == first.socket && pane.window_id == first.window_id)
+    {
+        return None;
+    }
+    Some(
+        candidates
+            .iter()
+            .copied()
+            .find(|pane| !pane.session.contains("~view~"))
+            .unwrap_or(first),
+    )
+}
+
 /// The one pane with this id, disambiguated by control endpoint the same way
 /// [`participants_from`] does — pane ids repeat across tmux servers.
 fn unique_pane<'a>(
@@ -2926,20 +2963,20 @@ fn unique_pane<'a>(
         .iter()
         .filter(|pane| pane.pane_id == pane_id)
         .collect();
-    match candidates.as_slice() {
-        [pane] => Some(pane),
-        [] => None,
-        _ => {
-            let socket = socket?;
-            let mut matching = candidates.into_iter().filter(|pane| {
-                pane.socket.as_deref().is_some_and(|candidate| {
-                    crate::backend::pane_endpoints_match(Some(pane_id), candidate, socket)
-                })
-            });
-            let first = matching.next()?;
-            matching.next().is_none().then_some(first)
-        }
+    if let Some(pane) = same_pane_seen_twice(&candidates) {
+        return Some(pane);
     }
+    // Several real panes share the id, so the control endpoint decides.
+    let socket = socket?;
+    let matching: Vec<_> = candidates
+        .into_iter()
+        .filter(|pane| {
+            pane.socket.as_deref().is_some_and(|candidate| {
+                crate::backend::pane_endpoints_match(Some(pane_id), candidate, socket)
+            })
+        })
+        .collect();
+    same_pane_seen_twice(&matching)
 }
 
 /// The live agent row occupying a pane, real or synthetic. Discovery and
@@ -3653,6 +3690,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replied.to.agent_session_id, "codex-session");
+    }
+
+    /// A pane shown through a session group is listed once per session, and
+    /// muxa's own `tmux-auto-view` puts every attached client in one. Two
+    /// terminals on a workspace therefore list every pane twice — which used
+    /// to make all of them invisible to collaboration, with an error telling
+    /// the operator to restart an agent that was working fine.
+    #[tokio::test]
+    async fn a_pane_seen_through_a_view_session_is_one_participant() {
+        let store = crate::Store::shared();
+        store
+            .apply(&crate::event::AgentEvent::Started {
+                id: crate::event::AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "real-session".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: Some("/repo".into()),
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let agents = store.snapshot().await;
+
+        let mut base = pane_info("%1");
+        base.session = "muxa".into();
+        base.session_group = Some("muxa".into());
+        let mut view = pane_info("%1");
+        view.session = "muxa~view~348778".into();
+        view.session_group = Some("muxa".into());
+        view.session_id = "$99".into();
+
+        let participants = participants_from(&agents, &[base, view]);
+        assert_eq!(participants.len(), 1, "one pane, one participant");
+        assert_eq!(
+            participants[0].tmux_session_name.as_deref(),
+            Some("muxa"),
+            "the durable session names it, not the per-client view",
+        );
+    }
+
+    /// `muxa watch` resolves its origin as a console against the pane list, so
+    /// the same duplication took the operator's own surface out too.
+    #[tokio::test]
+    async fn a_console_origin_resolves_through_a_view_session() {
+        let mut base = pane_info("%1");
+        base.session = "muxa".into();
+        base.session_group = Some("muxa".into());
+        let mut view = pane_info("%1");
+        view.session = "muxa~view~348778".into();
+        view.session_group = Some("muxa".into());
+
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+        };
+        let resolved = resolve_origin(&origin, &[], &[base, view]).expect("console resolves");
+        assert!(resolved.console);
+        assert_eq!(resolved.room.window_id, "@1");
+    }
+
+    /// The ambiguity that matters is a pane id repeated across *servers*. It
+    /// still refuses — this fix narrows the check, it does not remove it.
+    #[tokio::test]
+    async fn the_same_pane_id_on_two_servers_is_still_ambiguous() {
+        let mut here = pane_info("%1");
+        here.socket = Some("default".into());
+        let mut elsewhere = pane_info("%1");
+        elsewhere.socket = Some("other".into());
+        elsewhere.window_id = "@7".into();
+
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: None,
+            console: true,
+        };
+        assert!(matches!(
+            resolve_origin(&origin, &[], &[here, elsewhere]),
+            Err(CollaborationError::AmbiguousOrigin(_))
+        ));
+    }
+
+    /// The pending-pane resolver reads the same pane list and had the same
+    /// shape, so a marked or spawned pane vanished under a view too.
+    #[tokio::test]
+    async fn a_pending_pane_resolves_through_a_view_session() {
+        let sender = participant("%2", "sender");
+        let mut base = pane_info("%1");
+        base.session = "muxa".into();
+        base.agent_role = Some("peer".into());
+        let mut view = pane_info("%1");
+        view.session = "muxa~view~348778".into();
+        view.agent_role = Some("peer".into());
+
+        let pending = resolve_pending_pane_target(
+            &sender,
+            "pane:%1",
+            &[],
+            &[],
+            &[base, view, pane_info("%2")],
+            CollaborationScope::Window,
+        )
+        .expect("a launched pane stays addressable through a view");
+        assert_eq!(pending.pane, "%1");
     }
 
     #[tokio::test]

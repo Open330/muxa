@@ -6,12 +6,60 @@ struct QARequest: Codable, Sendable {
     let pressReturn: Bool?
     let x: Double?
     let y: Double?
+    let width: Double?
+    let height: Double?
+    let deltaY: Double?
+    /// `key` command: a single character or a named key
+    /// (return/escape/tab/space/up/down/left/right/delete).
+    let key: String?
+    /// `key` command: any of command/shift/option/control.
+    let modifiers: [String]?
+    /// Optional window-title substring; the largest on-screen Muxa window
+    /// is used when absent (Settings and Welcome are separate windows).
+    let window: String?
+    /// `menu` command: menu titles from the menu bar down, e.g.
+    /// ["Muxa", "Settings…"]. Matching is case-insensitive and prefix-based
+    /// so a localized ellipsis or trailing shortcut does not matter.
+    let path: [String]?
 
     enum CodingKeys: String, CodingKey {
         case command
+        case window
+        case path
         case text
         case pressReturn = "press_return"
-        case x, y
+        case x, y, width, height
+        case deltaY = "delta_y"
+        case key
+        case modifiers
+    }
+
+    init(
+        command: String,
+        text: String? = nil,
+        pressReturn: Bool? = nil,
+        x: Double? = nil,
+        y: Double? = nil,
+        width: Double? = nil,
+        height: Double? = nil,
+        key: String? = nil,
+        modifiers: [String]? = nil,
+        deltaY: Double? = nil,
+        window: String? = nil,
+        path: [String]? = nil
+    ) {
+        self.command = command
+        self.text = text
+        self.pressReturn = pressReturn
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.deltaY = deltaY
+        self.key = key
+        self.modifiers = modifiers
+        self.window = window
+        self.path = path
     }
 }
 
@@ -41,6 +89,8 @@ struct QAResponse: Codable, Sendable {
     var window: QAWindowInfo?
     var pngBase64: String?
     var socketPath: String?
+    /// Virtual key code that a `key` request resolved to.
+    var keyCode: Int?
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -49,20 +99,23 @@ struct QAResponse: Codable, Sendable {
         case window
         case pngBase64 = "png_base64"
         case socketPath = "socket_path"
+        case keyCode = "key_code"
     }
 
     static func success(
         permissions: QAPermissionStatus? = nil,
         window: QAWindowInfo? = nil,
         pngBase64: String? = nil,
-        socketPath: String? = nil
+        socketPath: String? = nil,
+        keyCode: Int? = nil
     ) -> QAResponse {
         QAResponse(
             ok: true,
             permissions: permissions,
             window: window,
             pngBase64: pngBase64,
-            socketPath: socketPath
+            socketPath: socketPath,
+            keyCode: keyCode
         )
     }
 

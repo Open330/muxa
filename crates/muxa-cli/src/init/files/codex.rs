@@ -24,7 +24,7 @@ const HOOK_EVENTS: &[(&str, &str)] = &[
 const HOOK_CMD_PREFIX: &str = "muxa hook codex";
 
 pub fn default_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".codex").join("config.toml"))
+    crate::init::integration::codex_home().map(|h| h.join("config.toml"))
 }
 
 pub fn upsert(original: &str) -> Result<(String, Outcome)> {

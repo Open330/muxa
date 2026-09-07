@@ -44,7 +44,7 @@ use crossterm::terminal::{
 use muxa::config::IconSet;
 use muxa::ipc::Client;
 use muxa::state::Agent;
-use muxa::tmux::layout::{PaneGeometry, WindowFrame, WindowTarget};
+use muxa::tmux::layout::{ClientSurface, PaneGeometry, WindowFrame, WindowTarget};
 use muxa::AgentState;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -126,6 +126,14 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
     // it, so a keystroke in another terminal can't reroute the overlay
     // onto a different session mid-read.
     let target = WindowTarget::resolve();
+    // Before any work: is there a viewer a popup could be drawn on? When
+    // there isn't, peek reports in text rather than painting a full-client
+    // overlay into a pane-sized hole (or into a popup nobody renders).
+    let surface = muxa::tmux::layout::client_surface(&target);
+    let plain = args.plain || !surface.draws_overlays();
+    if plain && !args.plain {
+        eprintln!("{}", undrawable_note(surface));
+    }
     let (panes, zoomed) = muxa::tmux::layout::current_window_panes(&target);
     if panes.is_empty() {
         anyhow::bail!(
@@ -141,7 +149,7 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
     let mut cells = build_cells(panes, &agents);
     attach_prompt_times(client, &mut cells).await;
 
-    if args.plain {
+    if plain {
         for line in plain_lines(&cells) {
             println!("{line}");
         }
@@ -165,6 +173,43 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
             .ok();
     }
     Ok(())
+}
+
+/// The one line explaining why this run printed text instead of drawing.
+///
+/// peek falls back rather than failing because the fallback is the same
+/// report: `--plain` answers "which pane is doing what" in full, and on
+/// these front-ends it is the only form of the answer that can reach the
+/// user. Erroring out would make them retype the command to get output
+/// muxa could simply have produced.
+///
+/// The note goes to stderr so the report itself stays pipeable, and it is
+/// printed only when peek chose the fallback — an explicit `--plain` needs
+/// no explanation.
+///
+/// # Panics
+///
+/// Only if called for a surface that draws overlays, which has no note to
+/// give; callers gate on [`ClientSurface::draws_overlays`].
+fn undrawable_note(surface: ClientSurface) -> String {
+    let cause = match surface {
+        // cmux: panes driven by `capture-pane`/`send-keys` with nothing
+        // attached. `display-popup` fails with "no current client" here,
+        // and no client means no key-binding resolution either — which is
+        // why `prefix + q` does nothing on such a server.
+        ClientSurface::Detached => {
+            "no tmux client is attached to this session, so there is no screen to draw a popup on"
+        }
+        // amux, iTerm2: a client exists but is sent pane content only.
+        ClientSurface::ControlMode => {
+            "this tmux client runs in control mode (`tmux -CC`), which is sent pane content but \
+             never popup content"
+        }
+        ClientSurface::Terminal | ClientSurface::Unknown => {
+            unreachable!("only an undrawable surface has a note")
+        }
+    };
+    format!("muxa peek: {cause} — printing the per-pane report instead of the overlay.")
 }
 
 enum Outcome {
@@ -364,9 +409,30 @@ fn attach_captures(cells: &mut [PeekCell], zoomed: bool) {
             cell.capture.clear();
             continue;
         }
-        cell.capture = muxa::tmux::layout::capture_pane_plain(&cell.geo.pane_id)
-            .map(|raw| raw.lines().map(str::to_string).collect())
-            .unwrap_or_default();
+        let Some(raw) = muxa::tmux::layout::capture_pane_plain(&cell.geo.pane_id) else {
+            cell.capture.clear();
+            continue;
+        };
+        observe_codex_recap(cell, &raw);
+        cell.capture = raw.lines().map(str::to_string).collect();
+    }
+}
+
+/// Fill the overlay's cloned agent row from the same fresh capture it already
+/// took for the backdrop. The daemon normally persists this observation on its
+/// three-second screen-detection tick; doing it here as well closes the small
+/// race where peek opens immediately after Codex prints a recap (and keeps peek
+/// useful when screen detection was explicitly disabled).
+fn observe_codex_recap(cell: &mut PeekCell, raw: &str) {
+    let Some(agent) = cell
+        .agent
+        .as_mut()
+        .filter(|agent| agent.kind == muxa::AgentKind::Codex)
+    else {
+        return;
+    };
+    if let Some(recap) = muxa::adapters::codex::conversation_recap_from_capture(raw) {
+        agent.recap = Some(recap);
     }
 }
 
@@ -1308,6 +1374,37 @@ mod tests {
     use muxa::AgentKind;
     use ratatui::backend::TestBackend;
 
+    #[test]
+    fn the_fallback_names_its_own_cause() {
+        // cmux and amux fail for different reasons, and a user chasing
+        // either one needs the one that applies to them.
+        let detached = undrawable_note(ClientSurface::Detached);
+        assert!(
+            detached.contains("no tmux client is attached"),
+            "{detached}"
+        );
+
+        let control = undrawable_note(ClientSurface::ControlMode);
+        assert!(control.contains("-CC"), "{control}");
+
+        for note in [detached, control] {
+            assert!(
+                note.contains("per-pane report"),
+                "say what the user is getting instead: {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_undrawable_surfaces_fall_back() {
+        assert!(!ClientSurface::Detached.draws_overlays());
+        assert!(!ClientSurface::ControlMode.draws_overlays());
+        // The overlay is the whole point where it can be drawn, and an
+        // inconclusive probe must not cost anyone their overlay.
+        assert!(ClientSurface::Terminal.draws_overlays());
+        assert!(ClientSurface::Unknown.draws_overlays());
+    }
+
     fn geo(
         index: &str,
         left: u16,
@@ -1360,6 +1457,7 @@ mod tests {
             subagents: Vec::new(),
             state,
             last_prompt: None,
+            last_prompt_at: None,
             last_response: None,
             recap: None,
             ai_title: None,
@@ -1583,6 +1681,32 @@ mod tests {
             .collect::<Vec<_>>()
             .join("|");
         assert!(joined.contains("added a JWT expiry guard"), "{joined}");
+    }
+
+    #[test]
+    fn fresh_capture_supplies_codex_recap_before_daemon_poll() {
+        let mut a = agent("%0", AgentState::Idle);
+        a.kind = muxa::AgentKind::Codex;
+        assert!(a.recap.is_none());
+        let mut cell = PeekCell {
+            geo: geo("0", 0, 0, 40, 10, true),
+            agent: Some(a),
+            extra: 0,
+            last_prompt_at: None,
+            capture: Vec::new(),
+        };
+
+        observe_codex_recap(
+            &mut cell,
+            "─ Conversation recap ───\n\n  Fixed the auth flow and verified it.\n\n› Ask Codex to do anything\n",
+        );
+
+        let agent = cell.agent.as_ref().unwrap();
+        assert_eq!(
+            agent.recap.as_deref(),
+            Some("Fixed the auth flow and verified it."),
+        );
+        assert_eq!(summary_source(agent), agent.recap.as_deref());
     }
 
     #[test]

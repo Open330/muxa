@@ -14,6 +14,19 @@ do what a shell on the same machine could already do through `muxa` and tmux.
 
 ## Wire it into Claude Code and Codex
 
+The recommended setup is `muxa init --preset standard`, which installs hooks,
+collaboration, the daemon manager, and the shared agent integration. For an
+existing installation, add the latter with:
+
+```bash
+muxa init --component agent-instructions,agent-skills,agent-mcp
+```
+
+This installs canonical guidance beside muxa config, links the personal skill,
+and merges each detected host's user MCP registration, including Codex `env_vars`.
+See [Global agent integration](AGENT_INTEGRATION.md) for updates and removal.
+Restart running agents. The manual setup below remains available.
+
 Start the daemon (`muxad`) first — the MCP server **refuses to start** when
 the socket is unreachable, with a clear error, so an agent never talks to a
 dead control plane. Then register it:
@@ -50,12 +63,15 @@ claude mcp add --scope user muxa -e MUXA_SOCKET=/run/user/1000/muxa.sock -- muxa
 ```
 
 Restart agents that were already running, then verify with `claude mcp list`
-or `codex mcp list` (the `muxa` server should list twenty-four tools). Other MCP
+or `codex mcp list` (the `muxa` server should list twenty-five tools). Other MCP
 hosts can run `muxa mcp` as a stdio server command in their config.
 
-At initialization muxa tells the agent how to use same-window peers as a
-reviewer, focused question target, or delegated subagent. The agent can call
-`muxa_collaboration_guide` to retrieve that contract again at any time.
+At initialization muxa tells the agent both the user's configured launch
+preferences and how to use same-window peers as a reviewer, focused question
+target, or delegated subagent. The agent can call `muxa_guide` to retrieve the
+surface/agent defaults and `muxa_collaboration_guide` to retrieve the peer
+contract again at any time. Configure the former under `[mcp.guide]`; see
+[CONFIGURATION.md](CONFIGURATION.md#mcp-orchestration-guide).
 The same instructions map conversational `@peer`, provider mentions, aliases,
 roles, and registered `/skills` to `muxa_call_peer`.
 
@@ -106,6 +122,9 @@ interleave in time; that is expected for concurrent JSON-RPC, and the `id`
 echoed on each response lets the client correlate. Output framing stays
 strict: the shared stdout writer is locked across each whole `write` + newline,
 so two concurrent responses never splice mid-line (one JSON object per line).
+Codex may hand a call lasting over 30 seconds back as a background cell; resume
+that same cell with the host wait function and `yield_time_ms=60000`. The cell
+yield is a host transport boundary, not a reason to start another Muxa wait.
 
 Framing is robust against non-conforming input rather than silently dropping
 it:
@@ -124,9 +143,10 @@ it:
 
 | Tool | Arguments | Does |
 | --- | --- | --- |
-| `muxa_status` | `pane?`, `include_capture?`, `history_limit?`, `max_capture_lines?` | Snapshot all agents plus managed workspace → work → agent topology, or observe one pane. |
+| `muxa_status` | `pane?`, `full?`, `include_capture?`, `history_limit?`, `max_capture_lines?` | Return a compact fleet/agent summary by default, the complete topology with `full=true`, or one focused pane. |
 | `muxa_recent_prompts` | `pane?`, `limit?` | Recent prompt-history entries (newest first), optionally scoped to one pane. |
-| `muxa_start_agent` | `agent`, `workspace?`, `work?`, `role?`, `task?`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Create/reuse a workspace session and work window, or start an allowlisted agent in a lower-level tmux surface. |
+| `muxa_guide` | — | Return the user's configured surface, agent, option, direction, and free-form orchestration preferences. |
+| `muxa_start_agent` | `agent?`, `options?`, `workspace?`, `work?`, `role?`, `task?`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Create/reuse a workspace session and work window, or start an allowlisted agent in a lower-level tmux surface. `agent` is optional only when configured in `[mcp.guide]`. |
 | `muxa_start_work` | `work`, `pipeline?`, `workspace?`, `cwd?`, `body?`, `skill?`, `context?`, `no_ticket?`, `refresh?`, `dry_run?` | Bring a work item's window to the state its pipeline declares: resolve the ticket, route it, create the missing agent panes, and deliver `body` to the ones already running. |
 | `muxa_manage_tmux` | `action`, `pane?`, `workspace?`, `work?`, `confirm?` | List/show/close managed workspaces and work; interrupt/terminate an agent pane. |
 | `muxa_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
@@ -191,6 +211,8 @@ is accepted only with `intent="task"`, so a conversational review cannot
 silently acquire edit authority. When there is no eligible peer, the tool
 returns `action_required="confirm_spawn"`; only repeat the call with
 `spawn_if_missing=true` after the user explicitly confirms creating a pane.
+An earlier explicit authorization for that bypass-permission launch remains
+valid within the same scope; do not ask the user to repeat it.
 Automatic spawning defaults to the other provider when possible. Before it
 creates the pane, the tool arms muxad's transition stream and then re-reads the
 authoritative room only when the spawned pane registers. This removes the old
@@ -207,7 +229,7 @@ Registered message skills can be selected with or without a leading slash:
 ```text
 muxa_call_peer(target="auto", intent="review",
                skill="review-plan-feedback",
-               context="Review commit abc123", wait=true)
+               context="Review commit abc123", wait=false)
 
 muxa_call_peer(target="@codex", intent="task", execute=true,
                body="Add regression tests only",
@@ -217,6 +239,13 @@ muxa_call_peer(target="@codex", intent="task", execute=true,
 The MCP process reads `[message.skills]` at startup. Restart an already-running
 agent after `muxa skill add/remove`, after editing the table, or after upgrading
 Muxa so it loads the current skills and tool definitions.
+
+Mutation results are intentionally receipts, not copies of the durable request:
+they return correlation ids, status, and resolved routing, while terminal waits
+add only the new structured reply. Use `muxa_inbox`, `muxa_list_messages`, or
+`muxa_peer_report` when the stored body and history are actually needed. All
+JSON tool results are compact on the wire. This prevents a body the model just
+sent from being charged again as tool output and retained in later turns.
 
 ### Staffing a whole ticket
 
@@ -265,6 +294,13 @@ part of a larger task. The calling model supplies only the agent profile,
 location, and optional first task; muxa handles the exact tmux invocation and
 returns the new pane id for later `muxa_capture_pane`, `muxa_send_prompt`, and
 `muxa_wait_for_change` calls.
+
+When the request does not choose a surface or provider, call `muxa_guide` (or
+use the same preferences already delivered during MCP initialization).
+Configured `placement`, `agent`, `options`, and `direction` become real defaults
+for omitted `muxa_start_agent` arguments. Explicit tool arguments win. Extra
+options are shell-quoted one argument at a time and appended to Muxa's built-in
+provider profile before the initial prompt.
 
 ```text
 muxa_start_agent {

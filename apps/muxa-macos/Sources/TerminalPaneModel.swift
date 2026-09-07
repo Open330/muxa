@@ -9,8 +9,6 @@ final class TerminalPaneModel: ObservableObject {
     @Published private(set) var outputWasTruncated = false
     @Published private(set) var exited = false
     @Published private(set) var exitStatus: Int32?
-    @Published private(set) var rawOutputText = "Waiting for PTY output…"
-    @Published private(set) var rawOutputByteCount = 0
 
     private let client: MuxaIPCClient
     private let sessionID: String
@@ -22,11 +20,6 @@ final class TerminalPaneModel: ObservableObject {
     private var detachTask: Task<Void, Never>?
     private var lifecycleGeneration: UInt64 = 0
     private var attachedGeneration: UInt64?
-    private var rawOutput = Data()
-    private var rawDisplayEnabled = false
-    private var lastRawPublish = Date.distantPast
-
-    private static let maximumRawOutputBytes = 256 * 1024
 
     init(client: MuxaIPCClient, sessionID: String, replayInitialHistory: Bool) {
         self.client = client
@@ -79,32 +72,34 @@ final class TerminalPaneModel: ObservableObject {
         task.cancel()
         self.pollingTask = nil
         let previousDetach = detachTask
-        detachTask = Task { [client, ioPump, sessionID] in
+        detachTask = Task { [ioPump] in
             await ioPump.setActive(false)
             await previousDetach?.value
+            // Detach an established attachment first. muxad treats this as a
+            // cancellation signal for the parked event read, so the reader
+            // drains without waiting for its bounded deadline.
+            await detach(ifGeneration: generation)
             await task.value
-            guard attachedGeneration == generation else { return }
-            attachedGeneration = nil
-            do {
-                try await client.setAttached(
-                    id: sessionID,
-                    clientID: attachmentClientID,
-                    attached: false
-                )
-            } catch {
-                MuxaLog.terminal.error(
-                    "terminal detach failed: \(error.localizedDescription, privacy: .public)"
-                )
-            }
+            // An attach request can finish after Task cancellation. Re-check
+            // after the reader drains so a rapid stop/start can never leak or
+            // overlap an attachment generation.
+            await detach(ifGeneration: generation)
         }
     }
 
-    func setRawDisplayEnabled(_ enabled: Bool) {
-        rawDisplayEnabled = enabled
-        if enabled {
-            publishRawOutput()
-        } else {
-            terminalState.requestFocus()
+    private func detach(ifGeneration generation: UInt64) async {
+        guard attachedGeneration == generation else { return }
+        attachedGeneration = nil
+        do {
+            try await client.setAttached(
+                id: sessionID,
+                clientID: attachmentClientID,
+                attached: false
+            )
+        } catch {
+            MuxaLog.terminal.error(
+                "terminal detach failed: \(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 
@@ -126,7 +121,12 @@ final class TerminalPaneModel: ObservableObject {
         var offset: UInt64 = 0
         while !Task.isCancelled, lifecycleGeneration == generation {
             do {
-                let output = try await client.readSession(id: sessionID, offset: offset)
+                let output = try await client.readSession(
+                    id: sessionID,
+                    offset: offset,
+                    waitForChanges: true
+                )
+                try Task.checkCancellation()
                 guard let bytes = output.bytes else {
                     throw MuxaIPCError.invalidBase64
                 }
@@ -138,7 +138,6 @@ final class TerminalPaneModel: ObservableObject {
                 }
                 if output.truncated { outputWasTruncated = true }
                 if !bytes.isEmpty {
-                    appendRawOutput(bytes)
                     if shouldReplayInitialHistory {
                         terminalSession.replay(bytes)
                     } else {
@@ -160,10 +159,8 @@ final class TerminalPaneModel: ObservableObject {
                     // normal `exit 0`. Keep the final grid intact and let the
                     // native host present the terminal state instead.
                     await ioPump.setActive(false)
-                    if rawDisplayEnabled { publishRawOutput() }
                     break
                 }
-                try await Task.sleep(for: bytes.isEmpty ? .milliseconds(45) : .milliseconds(8))
             } catch is CancellationError {
                 break
             } catch {
@@ -179,25 +176,5 @@ final class TerminalPaneModel: ObservableObject {
             MuxaLog.terminal.error("terminal polling failed: \(message, privacy: .public)")
         }
         errorMessage = message
-    }
-
-    private func appendRawOutput(_ bytes: Data) {
-        rawOutput.append(bytes)
-        if rawOutput.count > Self.maximumRawOutputBytes {
-            rawOutput.removeFirst(rawOutput.count - Self.maximumRawOutputBytes)
-        }
-        guard rawDisplayEnabled else { return }
-        let now = Date()
-        if now.timeIntervalSince(lastRawPublish) >= 0.12 {
-            publishRawOutput(now: now)
-        }
-    }
-
-    private func publishRawOutput(now: Date = Date()) {
-        rawOutputText = rawOutput.isEmpty
-            ? "Waiting for PTY output…"
-            : terminalRawDescription(rawOutput)
-        rawOutputByteCount = rawOutput.count
-        lastRawPublish = now
     }
 }

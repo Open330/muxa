@@ -5194,6 +5194,7 @@ mod tests {
             subagents: Vec::new(),
             state,
             last_prompt: prompt.map(str::to_string),
+            last_prompt_at: None,
             last_response: None,
             recap: None,
             ai_title: None,

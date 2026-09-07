@@ -256,6 +256,8 @@ extension MuxaSidebarSelection {
             "work-board"
         case .watch:
             "watch"
+        case .inbox:
+            "inbox"
         case .ask:
             "ask"
         case .work(let identity):
@@ -264,6 +266,10 @@ extension MuxaSidebarSelection {
             "agent:\(id)"
         case .host(let id):
             "host:\(id)"
+        case .fleetSession(let id):
+            "fleet-session:\(id.hostAlias):\(id.socket):\(id.sessionID)"
+        case .fleetWindow(let id):
+            "fleet-window:\(id.hostAlias):\(id.socket):\(id.sessionID):\(id.windowID)"
         case .shell(let id):
             "shell:\(id)"
         case .pane(let identity):

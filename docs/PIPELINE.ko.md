@@ -54,6 +54,74 @@ muxa work init --dry-run                      # 제안만 보고 안 씀
 muxa work init --agent codex                  # 다른 resolver 사용
 ```
 
+설정 전체가 아니라 pipeline 하나만 원한다면 `muxa work compose "<설명>"`이
+**읽기 전용** agent 턴 하나를 써서 `pipeline set`이 읽는 JSON으로 pipeline을
+출력합니다 — 아무것도 쓰지 않습니다. 초안은 `pipeline set`과 같은 규칙으로
+검증하고, 실행될 수 없는 초안은 이유를 붙여 한 번 더 요청한 뒤 포기합니다.
+`--current <path|->`는 이전 초안을 다듬고(그때 설명은 바꿀 내용), `--agent <id>`는
+`[ask]` provider 아무거나 고르며, `--json`은 응답 전체(`pipeline`, `notes`,
+`raw`)를 출력합니다 — Muxa.app의 pipeline 편집기가 daemon의 `work_compose`
+요청에서 받는 것과 같은 모양입니다.
+
+```console
+muxa work compose "implementer는 claude, 그 뒤에 codex reviewer"
+muxa work compose "review 뒤에 gemini tester 추가" --current pair.json --json
+```
+
+턴을 쓰고 싶지 않다면 내장 preset 셋이 흔한 구성을 덮습니다. `muxa work preset
+apply`는 같은 방식으로 — `toml_edit`으로, 파일을 건드리기 전에 전체 `Config`로
+검증하고, `--overwrite` 없이는 이미 있는 `[pipeline.<name>]`을 덮어쓰지 않으며 —
+`config.toml`에 씁니다:
+
+| Preset | 구성 |
+| --- | --- |
+| `solo` | `claude` 구현자 하나 |
+| `pair` | `claude` 구현자 → `codex` 리뷰어, 리뷰어는 `muxa work done`을 기다림 |
+| `triad` | `codex` 기획자 → `codex` 구현자 → `claude` 리뷰어, `main-vertical` 레이아웃 |
+
+```console
+muxa work preset list                              # 각 preset이 무엇을 띄우는지
+muxa work preset apply solo --route '.*'           # [pipeline.solo] + catch-all [[route]]
+muxa work preset apply triad --route '^cal-'       # 두 번째 pipeline과 route 추가
+muxa work preset apply pair --overwrite            # 손본 [pipeline.pair]를 교체
+muxa work preset apply solo --json                 # {"pipeline","route","route_added","replaced","config_path"}
+```
+
+`--route`는 같은 `match`를 가진 route가 없을 때만 `[[route]] match = <regex>,
+pipeline = <name>`을 덧붙입니다. 이미 있으면 알려만 주고 원래 가리키던 곳을 그대로
+둡니다. 적용된 preset은 파일 안의 평범한 pipeline이니 마음껏 고치면 됩니다.
+
+런처는 `muxa work options`로 무엇이 설정돼 있는지 묻습니다: 설정 순서의 route,
+이름순 pipeline, 한 줄 요약이 붙은 `[message.skills]`, 위의 preset, 그리고
+`[ticket].agent`. `--json`이 Muxa.app Start Work 시트가 기대는 계약이고,
+`configured`는 `[pipeline.*]`이 하나라도 생기기 전까지 `false`입니다. pipeline과
+agent마다 원본 `prompt` 템플릿이 실려 있어 편집기가 그 항목을 그대로 되돌려 줄 수
+있습니다.
+
+편집기는 같은 모양으로 되씁니다. `muxa work pipeline set <name> --from-json
+<path|->`는 `options --json`이 찍은 `pipelines[]` 항목 하나를 (`name`은 있어도
+없어도) 받아, 실행 때 실패할 검사 — 허용된 program, 겹치지 않는 alias, 실제
+alias를 가리키고 순환하지 않는 `after`, right/down인 `direction` — 를 먼저
+돌리고 `[pipeline.<name>]`을 `toml_edit`으로 씁니다. 이미 있던 pipeline은 제자리에서
+교체되고, 다른 섹션·주석·값은 그대로입니다. `muxa work pipeline remove <name>`은
+그 pipeline을 가리키는 `[[route]]`가 남아 있으면 거절하고, `--force`면 그 route들의
+`pipeline`도 지웁니다. `muxa work route set --match <regex>`는 `match`가 정확히
+같은 `[[route]]` 하나를 추가하거나 고치고(`--pipeline`, `--workspace`, `--cwd`,
+`--position <n>`; `--clear-*`가 필드를 지우며 `worktree`와 `prepare`는 건드리지
+않음), `muxa work route remove --match <regex>`가 지웁니다. 모든 명령은 합쳐진
+파일을 통째로 `Config`로 검증한 뒤에야 원자적으로 쓰고, 아니면 파일을 건드리지
+않으며, `--json`이면 JSON만 찍습니다.
+
+```console
+muxa work pipeline set pair --from-json pair.json     # {"pipeline","replaced","config_path"}
+muxa work options --json | jq '.pipelines[] | select(.name == "triad")' \
+  | muxa work pipeline set triad --from-json -        # 왕복해도 그대로
+muxa work pipeline remove pair --force                # {"pipeline","removed","routes_cleared","config_path"}
+muxa work route set --match '^cal-' --pipeline triad --position 0   # {"match","position","created","config_path"}
+muxa work route set --match '.*' --clear-workspace    # 안 준 플래그는 아무것도 안 바꿈
+muxa work route remove --match '^cal-'                # {"match","removed","config_path"}
+```
+
 손으로 쓰는 게 편하시면 주석 달린 레퍼런스가
 [`config.example.toml`](../config.example.toml)에 있고, 아래가 각 부분의 설명입니다.
 
@@ -273,6 +341,14 @@ prompt는 일의 모양과 URL을 나르고, 나머지는 agent가 직접 읽으
 
 ```console
 muxa work init                       # 말로 설명해 설정 쓰기
+muxa work compose "<설명>" [--agent <id>] [--current <path|->] [--json]   # pipeline 하나를 JSON으로 초안; 쓰지 않음
+muxa work preset list                # 내장 구성: solo, pair, triad
+muxa work preset apply <name> --route '<regex>'   # 턴 없이 하나 쓰기
+muxa work options [--json]           # 런처용 route·pipeline·skill·preset
+muxa work pipeline set <name> --from-json <path|->   # 그 JSON 모양으로 [pipeline.<name>] 쓰기/교체
+muxa work pipeline remove <name> [--force]           # 제거; --force면 가리키는 route도 정리
+muxa work route set --match '<regex>' [--pipeline <name>] [--position <n>]   # [[route]] 하나 추가/수정
+muxa work route remove --match '<regex>'             # 그 route 제거
 muxa work up <work> --external <id>  # 외부 이슈 연결 → routing → 없는 것만 생성
 muxa work up <id>                    # 호환 경로: <id>를 외부 이슈로도 조회
 muxa work up <id> --dry-run          # 계획만 출력, tmux는 건드리지 않음

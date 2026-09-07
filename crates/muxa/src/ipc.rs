@@ -19,7 +19,14 @@
 //! can call `Store::apply` afterwards, so the daemon's final flush
 //! captures every state change the user actually triggered.
 
-use crate::ask::{AskEntry, AskStore};
+use crate::ask::{
+    AskConversation, AskCredential, AskEntry, AskProviderAdd, AskProviderEdit, AskProviderInfo,
+    AskStore,
+};
+use crate::automation::{
+    AutomationLedgerEntry, AutomationRule, AutomationRules, AutomationStore, AutomationSubject,
+    AutomationTestReport,
+};
 use crate::backend::{default_backend, HostKind, SharedBackend};
 use crate::collaboration::{
     self, AirArtifactReference, CollaborationClientKind, CollaborationOptions, CollaborationOrigin,
@@ -44,7 +51,10 @@ use crate::session::{
 use crate::state::{Agent, SharedStore};
 use crate::tmux::PaneInfo;
 use crate::work::WorkIdentity;
-use crate::work_control::{self, WorkUpRequest};
+use crate::work_compose::{self, WorkComposeOutput, WorkComposeRequest};
+use crate::work_control::{
+    self, RemoteWorkRunner, WorkCommandLimits, WorkCommandOutput, WorkCommandSurface, WorkUpRequest,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -56,7 +66,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinSet;
 
 /// Maximum time `Server::run` will wait for in-flight handlers to finish
@@ -89,10 +99,16 @@ const IDLE_CONN_TIMEOUT: Duration = Duration::from_secs(10);
 /// dead stream's fd lifetime to roughly one interval.
 const STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
+const fn default_session_wait_ms() -> u64 {
+    15_000
+}
+
 /// Overall deadline for a client request/response round trip (connect +
 /// hello + write + read). No caller should ever block forever against a
 /// wedged or half-dead daemon.
 const CLIENT_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// A `work_command` waits for a 30 s child plus Fleet transport slack.
+const WORK_COMMAND_CLIENT_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// A collaboration wait occupies one bounded IPC handler and client
 /// connection. Keep the ceiling aligned with the MCP surface so a caller
@@ -164,6 +180,7 @@ enum RequestBody {
     },
     /// Durable desired graph and per-alias execution state for every Work Run.
     PipelineRuns,
+    PipelineSubscribe,
     /// Start the canonical `muxa work up` implementation as a bounded daemon
     /// operation. The initial call returns immediately; native clients poll
     /// `work_up_status` so a ticket lookup never freezes their state stream.
@@ -172,6 +189,31 @@ enum RequestBody {
     },
     WorkUpStatus {
         operation_id: String,
+    },
+    /// Run one allowlisted `muxa work options|preset|pipeline|route …` argv
+    /// on the local host or a Fleet host and return its exit code and
+    /// streams. Bounded to 30 s and 1 MiB of output.
+    WorkCommand {
+        #[serde(default)]
+        host: Option<String>,
+        args: Vec<String>,
+        #[serde(default)]
+        stdin: Option<String>,
+    },
+    /// Draft one pipeline from a description with a read-only headless
+    /// turn, validated with the `pipeline set` rules and retried once on a
+    /// draft that would not launch. Writes nothing.
+    WorkCompose {
+        description: String,
+        /// Provider to draft with; absent means the ask store's selection.
+        #[serde(default)]
+        agent: Option<String>,
+        /// A previous draft to refine; `description` is then the change.
+        #[serde(default)]
+        current: Option<crate::work_pipeline_spec::PipelineSpec>,
+        /// Same shape and handling as `ask_send`'s.
+        #[serde(default)]
+        credential: Option<AskCredential>,
     },
     /// Create or update one desired Run and reconcile live pane evidence.
     PipelineRegister {
@@ -324,8 +366,33 @@ enum RequestBody {
     /// the answer lands in the store when the agent exits.
     AskSend {
         prompt: String,
+        /// Optional one-turn credential. The socket is owner-only (0600);
+        /// the daemon moves this directly into the child environment and the
+        /// Ask store never persists it.
+        #[serde(default)]
+        credential: Option<AskCredential>,
     },
+    /// Queue the first turn of a fresh conversation atomically. This is a
+    /// distinct request kind so an older daemon rejects it instead of
+    /// silently ignoring a new flag and appending to the active conversation.
+    AskSendNew {
+        prompt: String,
+        #[serde(default)]
+        credential: Option<AskCredential>,
+    },
+    AskSubscribe,
+    /// Report whether the daemon accepted the explicit `[ask].enabled`
+    /// grant at startup. This lets native clients present setup before a
+    /// typed question fails with a configuration error.
+    AskStatus {},
     AskList {},
+    /// List durable conversations and identify the selected one for the
+    /// current provider.
+    AskConversationList {},
+    /// Resume a prior muxa conversation, switching provider when needed.
+    AskConversationSelect {
+        conversation_id: String,
+    },
     /// Point the next question at a different agent, or read back which
     /// one is selected when `agent` is omitted.
     AskAgent {
@@ -340,9 +407,117 @@ enum RequestBody {
     AskDelete {
         id: String,
     },
+    /// Every provider instance the daemon can ask — the ones the operator
+    /// composed plus the built-ins — with the engine behind each, the
+    /// effective model, and which one is selected.
+    AskProviders {},
+    /// Hand out the daemon's `config.toml` as text, so a client can edit
+    /// the sections that have no typed request of their own.
+    ConfigRead {},
+    /// Replace `config.toml` with `text`. Refused unless the document
+    /// parses and validates, and unless `expected_text` (when given) still
+    /// matches what is on disk, so two editors cannot clobber each other.
+    ConfigWrite {
+        text: String,
+        #[serde(default)]
+        expected_text: Option<String>,
+    },
+    /// Edit `[ask.providers.<provider>]`. Each key is tri-state: absent
+    /// from the request leaves it unchanged, `null` clears it, a string
+    /// sets it — so a client sends only what it changed. `engine` is not
+    /// among them: it is what the instance is, not a setting. Answers with
+    /// the updated provider list.
+    AskProviderConfigure {
+        provider: String,
+        // `Option<Option<_>>` is the point: the outer level is "was the key
+        // sent", the inner is "null or a value", and clients rely on both.
+        #[allow(clippy::option_option)]
+        #[serde(default, deserialize_with = "double_option")]
+        title: Option<Option<String>>,
+        #[allow(clippy::option_option)]
+        #[serde(default, deserialize_with = "double_option")]
+        model: Option<Option<String>>,
+        #[allow(clippy::option_option)]
+        #[serde(default, deserialize_with = "double_option")]
+        api_key_env: Option<Option<String>>,
+        #[allow(clippy::option_option)]
+        #[serde(default, deserialize_with = "double_option")]
+        executable: Option<Option<String>>,
+    },
+    /// Add an `[ask.providers.<id>]` instance driven by `engine`, so the
+    /// operator can keep two accounts of one provider side by side.
+    /// Answers with the updated provider list.
+    AskProviderAdd {
+        id: String,
+        engine: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+        /// The *name* of an environment variable holding the key, never
+        /// the key: this is written to config.toml.
+        #[serde(default)]
+        api_key_env: Option<String>,
+        /// Binary a CLI engine spawns for this instance.
+        #[serde(default)]
+        executable: Option<String>,
+    },
+    /// Remove an `[ask.providers.<id>]` instance. A built-in id keeps its
+    /// row and only loses its overrides. Answers with the updated list.
+    AskProviderRemove {
+        id: String,
+    },
+    // --- automation_v1 ---------------------------------------------------
+    /// Every `[[automation.rule]]` with its effective timing, its guards,
+    /// and how often it has fired lately, plus the engine's master switch
+    /// and pause. Answers in `automation_rules`.
+    AutomationList {},
+    /// The firing ledger, newest first. Answers in `automation_log`.
+    AutomationLog {
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Flip one rule's `enabled`, or the whole engine's when `name` is
+    /// absent or null. Takes effect immediately and is written back to
+    /// `config.toml`. Answers with the refreshed rule list.
+    AutomationSetEnabled {
+        #[serde(default)]
+        name: Option<String>,
+        enabled: bool,
+    },
+    /// Hold every rule until `until`, or lift the hold with `null`.
+    /// Answers with the refreshed rule list.
+    AutomationPause {
+        #[serde(default, with = "time::serde::rfc3339::option")]
+        until: Option<time::OffsetDateTime>,
+    },
+    /// Write one rule into `config.toml`, replacing the `[[automation.rule]]`
+    /// with the same `name` in place or appending it. Validated exactly as
+    /// the loader validates it, and the merged document has to read back as
+    /// a full `Config` before anything touches disk. Answers with the
+    /// refreshed rule list.
+    AutomationSetRule {
+        rule: AutomationRule,
+    },
+    /// Remove one rule. An unknown name is refused rather than silently
+    /// succeeding — an editor that lost sync should be told. Answers with
+    /// the refreshed rule list.
+    AutomationRemoveRule {
+        name: String,
+    },
+    /// Evaluate one rule against the live registry and report what it
+    /// *would* do, firing nothing and recording nothing. Answers in
+    /// `automation_test`.
+    AutomationTest {
+        name: String,
+    },
     CollaborationInbox {
         origin: CollaborationOrigin,
     },
+    /// Long-lived, content-free durable-mailbox invalidation stream. Reading
+    /// actual requests still goes through the normal participant/operator
+    /// authorization paths.
+    CollaborationSubscribe,
     CollaborationList {
         origin: CollaborationOrigin,
         #[serde(default)]
@@ -414,6 +589,15 @@ enum RequestBody {
         session_id: String,
         offset: u64,
     },
+    /// Bounded event-driven terminal read. The daemon waits on the PTY
+    /// session's output/exit signal instead of requiring native clients to
+    /// issue 20-125 empty reads per second.
+    ReadSessionWait {
+        session_id: String,
+        offset: u64,
+        #[serde(default = "default_session_wait_ms")]
+        timeout_ms: u64,
+    },
     WriteSession {
         session_id: String,
         data: String,
@@ -471,6 +655,17 @@ struct Request {
     body: RequestBody,
 }
 
+/// `Option<Option<T>>` from JSON: a present key — `null` included — is
+/// `Some(...)`, so `#[serde(default)]` alone marks the absent case.
+#[allow(clippy::option_option)]
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// Oldest protocol the server can still serve via the negotiated regime
 /// (i.e. with v1-compat enum downgrade). Bumped when we drop the
 /// downgrade path for an older variant.
@@ -487,6 +682,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_mailbox",
     "collaboration_lifecycle",
     "collaboration_wait",
+    "collaboration_subscribe",
     "collaboration_identity",
     "collaboration_provenance",
     "collaboration_scope",
@@ -494,15 +690,31 @@ const CAPABILITIES: &[&str] = &[
     "fleet_raw_capture_v1",
     "fleet_subscribe",
     "pipeline_runs_v1",
+    "pipeline_subscribe",
     "work_control_v1",
+    "work_command_v1",
     "handle_namespace_v1",
     "session_bytes_v1",
     "session_attachment_identity_v1",
+    "session_wait_v1",
+    "ask_one_turn_credential_v1",
+    "ask_status_v1",
+    "ask_conversations_v1",
+    "ask_send_new_v1",
+    "ask_subscribe",
+    "ask_providers_v1",
+    "work_compose_v1",
+    "automation_v1",
+    "config_edit_v1",
 ];
 
 /// Advertised only when the server has the controller required to come back
 /// after draining. A server without one refuses `restart`.
 const RESTART_CAPABILITY: &str = "restart";
+/// Refusal for the config requests when muxad was started without a config
+/// file path (`--config` absent and no default location).
+const NO_CONFIG_PATH: &str =
+    "this daemon has no config file path; start muxad with --config or a default config location";
 /// Advertised only by a server with a lifecycle controller, which can flush
 /// durable writers and remove the socket before exiting.
 const STOP_CAPABILITY: &str = "stop";
@@ -587,7 +799,17 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ask_entry: Option<AskEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_conversations: Option<Vec<AskConversation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_conversation: Option<AskConversation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ask_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_providers: Option<Vec<AskProviderInfo>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<crate::config_file::ConfigDocument>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fleet: Option<FleetSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -600,6 +822,19 @@ pub struct Response {
     pub pipeline_claims: Option<Vec<PipelineClaim>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_operation: Option<WorkUpOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_command: Option<WorkCommandOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_compose: Option<WorkComposeOutput>,
+    /// `automation_v1`: the rule list plus the engine's switch/pause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automation_rules: Option<AutomationRules>,
+    /// `automation_v1`: the firing ledger, newest first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automation_log: Option<Vec<AutomationLedgerEntry>>,
+    /// `automation_v1`: what one rule would do right now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automation_test: Option<AutomationTestReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -637,13 +872,23 @@ impl Response {
             collaboration_request: None,
             ask_entries: None,
             ask_entry: None,
+            ask_conversations: None,
+            ask_conversation: None,
             ask_agent: None,
+            ask_enabled: None,
+            ask_providers: None,
+            config: None,
             fleet: None,
             fleet_result: None,
             pipeline_runs: None,
             pipeline_run: None,
             pipeline_claims: None,
             work_operation: None,
+            work_command: None,
+            work_compose: None,
+            automation_rules: None,
+            automation_log: None,
+            automation_test: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -685,6 +930,16 @@ impl Response {
     fn with_work_operation(operation: WorkUpOperation) -> Self {
         let mut response = Self::ok();
         response.work_operation = Some(operation);
+        response
+    }
+    fn with_work_command(output: WorkCommandOutput) -> Self {
+        let mut response = Self::ok();
+        response.work_command = Some(output);
+        response
+    }
+    fn with_work_compose(output: WorkComposeOutput) -> Self {
+        let mut response = Self::ok();
+        response.work_compose = Some(output);
         response
     }
     fn with_prompts(prompts: Vec<crate::history::HistoryEntry>) -> Self {
@@ -773,6 +1028,11 @@ impl Response {
         r.ask_entries = Some(entries);
         r
     }
+    fn with_ask_status(enabled: bool) -> Self {
+        let mut response = Self::ok();
+        response.ask_enabled = Some(enabled);
+        response
+    }
     fn with_ask_agent(agent: String) -> Self {
         let mut r = Self::ok();
         r.ask_agent = Some(agent);
@@ -782,6 +1042,46 @@ impl Response {
         let mut r = Self::ok();
         r.ask_entry = Some(entry);
         r
+    }
+    fn with_ask_conversations(
+        conversations: Vec<AskConversation>,
+        active: Option<AskConversation>,
+    ) -> Self {
+        let mut response = Self::ok();
+        response.ask_conversations = Some(conversations);
+        response.ask_conversation = active;
+        response
+    }
+    fn with_ask_conversation(conversation: AskConversation) -> Self {
+        let mut response = Self::ok();
+        response.ask_conversation = Some(conversation);
+        response
+    }
+    fn with_config(document: crate::config_file::ConfigDocument) -> Self {
+        let mut response = Self::ok();
+        response.config = Some(document);
+        response
+    }
+
+    fn with_ask_providers(providers: Vec<AskProviderInfo>) -> Self {
+        let mut response = Self::ok();
+        response.ask_providers = Some(providers);
+        response
+    }
+    fn with_automation_rules(rules: AutomationRules) -> Self {
+        let mut response = Self::ok();
+        response.automation_rules = Some(rules);
+        response
+    }
+    fn with_automation_log(entries: Vec<AutomationLedgerEntry>) -> Self {
+        let mut response = Self::ok();
+        response.automation_log = Some(entries);
+        response
+    }
+    fn with_automation_test(report: AutomationTestReport) -> Self {
+        let mut response = Self::ok();
+        response.automation_test = Some(report);
+        response
     }
     fn hello(restart: Option<&RestartController>) -> Self {
         let mut r = Self::ok();
@@ -874,6 +1174,10 @@ impl RestartController {
 
 const MAX_RETAINED_WORK_OPERATIONS: usize = 32;
 const MAX_CONCURRENT_WORK_OPERATIONS: usize = 4;
+const MAX_CONCURRENT_WORK_COMMANDS: usize = 4;
+/// Transport slack added to a child's own budget when a `work` argv travels
+/// through the Fleet manager (relay round trip or OpenSSH session setup).
+const FLEET_WORK_COMMAND_SLACK: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -907,24 +1211,153 @@ struct WorkUpOperations {
     order: VecDeque<String>,
 }
 
-#[derive(Debug)]
 struct WorkUpManager {
     socket_path: PathBuf,
+    /// Runs `work` argv on remote Fleet hosts. `None` while Fleet is not
+    /// installed, in which case every non-local `host` is refused.
+    remote: Option<Arc<dyn RemoteWorkRunner>>,
     next_id: AtomicU64,
     operations: tokio::sync::Mutex<WorkUpOperations>,
+    commands: tokio::sync::Semaphore,
+}
+
+impl std::fmt::Debug for WorkUpManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkUpManager")
+            .field("socket_path", &self.socket_path)
+            .field("remote", &self.remote.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Routes remote `work` argv through the Fleet manager, which owns per-host
+/// authorization, the SSH relay, and the OpenSSH fallback for older relays.
+struct FleetWorkRunner {
+    fleet: FleetRuntime,
+}
+
+impl RemoteWorkRunner for FleetWorkRunner {
+    fn host_mode<'a>(&'a self, host: &'a str) -> work_control::HostModeFuture<'a> {
+        Box::pin(async move {
+            self.fleet
+                .store
+                .snapshot()
+                .await
+                .hosts
+                .into_iter()
+                .find(|candidate| candidate.alias == host)
+                .map(|candidate| candidate.mode)
+                .ok_or_else(|| {
+                    work_control::WorkCommandError::Invalid(format!(
+                        "fleet host '{host}' is not configured"
+                    ))
+                })
+        })
+    }
+
+    fn run<'a>(
+        &'a self,
+        host: &'a str,
+        args: Vec<String>,
+        stdin: Option<String>,
+        limits: WorkCommandLimits,
+    ) -> work_control::RemoteWorkFuture<'a> {
+        Box::pin(async move {
+            let result = self
+                .fleet
+                .execute(
+                    host,
+                    FleetOperation::WorkCommand { args, stdin },
+                    limits.timeout + FLEET_WORK_COMMAND_SLACK,
+                )
+                .await
+                .map_err(work_control::WorkCommandError::Failed)?;
+            result.command_output().ok_or_else(|| {
+                work_control::WorkCommandError::Failed(format!(
+                    "fleet host '{host}' answered without a command result"
+                ))
+            })
+        })
+    }
 }
 
 impl WorkUpManager {
     fn new(socket_path: PathBuf) -> Arc<Self> {
+        Self::with_remote(socket_path, None)
+    }
+
+    fn with_remote(socket_path: PathBuf, remote: Option<Arc<dyn RemoteWorkRunner>>) -> Arc<Self> {
         Arc::new(Self {
             socket_path,
+            remote,
             next_id: AtomicU64::new(1),
             operations: tokio::sync::Mutex::new(WorkUpOperations::default()),
+            commands: tokio::sync::Semaphore::new(MAX_CONCURRENT_WORK_COMMANDS),
         })
+    }
+
+    /// Resolve and authorize the runner for `host`; `None` means the daemon's
+    /// own host. Observe-only hosts are refused here, before any operation is
+    /// recorded, so the caller gets a synchronous error rather than a failed
+    /// operation.
+    async fn remote_for(
+        &self,
+        host: Option<&str>,
+        args: &[String],
+    ) -> Result<Option<(String, Arc<dyn RemoteWorkRunner>)>, String> {
+        let Some(host) = work_control::remote_host_alias(host) else {
+            return Ok(None);
+        };
+        let runner = self
+            .remote
+            .as_ref()
+            .ok_or_else(|| format!("fleet is not enabled in muxad; cannot reach host '{host}'"))?;
+        let mode = runner
+            .host_mode(host)
+            .await
+            .map_err(|error| error.to_string())?;
+        work_control::authorize_work_command(host, mode, args)
+            .map_err(|error| error.to_string())?;
+        Ok(Some((host.to_string(), Arc::clone(runner))))
+    }
+
+    /// Run one allowlisted `work` subcommand to completion.
+    async fn command(
+        &self,
+        host: Option<String>,
+        args: Vec<String>,
+        stdin: Option<String>,
+    ) -> Result<WorkCommandOutput, String> {
+        work_control::validate_work_command(&args, stdin.as_deref(), WorkCommandSurface::Ipc)
+            .map_err(|error| error.to_string())?;
+        if host.as_deref().is_some_and(|host| host.trim().is_empty()) {
+            return Err("host alias is empty".into());
+        }
+        let remote = self.remote_for(host.as_deref(), &args).await?;
+        let _permit = self.commands.try_acquire().map_err(|_| {
+            format!("at most {MAX_CONCURRENT_WORK_COMMANDS} work commands may run at once")
+        })?;
+        match remote {
+            Some((host, runner)) => runner
+                .run(&host, args, stdin, WorkCommandLimits::COMMAND)
+                .await
+                .map_err(|error| error.to_string()),
+            None => work_control::execute_work_command(
+                &work_control::resolve_muxa_binary(),
+                &args,
+                stdin.as_deref(),
+                Some(&self.socket_path),
+                WorkCommandLimits::COMMAND,
+            )
+            .await
+            .map_err(|error| error.to_string()),
+        }
     }
 
     async fn start(self: &Arc<Self>, request: WorkUpRequest) -> Result<WorkUpOperation, String> {
         request.validate().map_err(|error| error.to_string())?;
+        let arguments = request.arguments();
+        let remote = self.remote_for(request.host.as_deref(), &arguments).await?;
         let mut operations = self.operations.lock().await;
         if let Some(existing) = operations.values.values().find(|tracked| {
             tracked.operation.state == WorkUpOperationState::Running && tracked.request == request
@@ -985,7 +1418,14 @@ impl WorkUpManager {
 
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            let outcome = work_control::execute_work_up(&request, Some(&manager.socket_path)).await;
+            let outcome = match remote {
+                Some((host, runner)) => runner
+                    .run(&host, arguments, None, WorkCommandLimits::WORK_UP)
+                    .await
+                    .map_err(work_control::WorkUpError::from)
+                    .and_then(|output| work_control::work_up_result(&output)),
+                None => work_control::execute_work_up(&request, Some(&manager.socket_path)).await,
+            };
             let mut operations = manager.operations.lock().await;
             let Some(tracked) = operations.values.get_mut(&operation_id) else {
                 return;
@@ -1035,10 +1475,14 @@ pub struct Server {
     collaboration: Arc<CollaborationStore>,
     collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
+    automation: Arc<AutomationStore>,
     restart: Option<Arc<RestartController>>,
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
     work_up: Arc<WorkUpManager>,
+    /// The daemon's `config.toml`, for the requests that read and replace it
+    /// whole. `None` when muxad was started without one.
+    config_path: Option<PathBuf>,
     handler_limit: usize,
 }
 
@@ -1055,10 +1499,12 @@ impl Server {
             collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
             collaboration_audit: CollaborationAuditLog::in_memory(),
             ask: crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
+            automation: AutomationStore::in_memory(crate::automation::AutomationConfig::default()),
             restart: None,
             fleet: None,
             pipeline_runs: PipelineRunStore::in_memory(),
             work_up,
+            config_path: None,
             handler_limit: MAX_INFLIGHT_HANDLERS,
         }
     }
@@ -1089,6 +1535,14 @@ impl Server {
         self
     }
 
+    /// Thread the daemon's config file path in so `config_read` /
+    /// `config_write` can serve it. Without one, both refuse.
+    #[must_use]
+    pub fn with_config_path(mut self, path: Option<PathBuf>) -> Self {
+        self.config_path = path;
+        self
+    }
+
     #[must_use]
     pub fn with_sessions(mut self, sessions: SharedSessionBackend) -> Self {
         self.sessions = sessions;
@@ -1098,6 +1552,14 @@ impl Server {
     #[must_use]
     pub fn with_ask(mut self, ask: Arc<AskStore>) -> Self {
         self.ask = ask;
+        self
+    }
+
+    /// Install the live automation engine state. Optional so embedders and
+    /// tests keep an in-memory store with no rules — which does nothing.
+    #[must_use]
+    pub fn with_automation(mut self, automation: Arc<AutomationStore>) -> Self {
+        self.automation = automation;
         self
     }
 
@@ -1126,6 +1588,12 @@ impl Server {
     /// no SSH processes or background resources.
     #[must_use]
     pub fn with_fleet(mut self, fleet: FleetRuntime) -> Self {
+        self.work_up = WorkUpManager::with_remote(
+            self.socket_path.clone(),
+            Some(Arc::new(FleetWorkRunner {
+                fleet: fleet.clone(),
+            })),
+        );
         self.fleet = Some(fleet);
         self
     }
@@ -1228,10 +1696,12 @@ impl Server {
                     let collaboration = self.collaboration.clone();
                     let collaboration_audit = self.collaboration_audit.clone();
                     let ask = self.ask.clone();
+                    let automation = self.automation.clone();
                     let restart = self.restart.clone();
                     let fleet = self.fleet.clone();
                     let pipeline_runs = self.pipeline_runs.clone();
                     let work_up = self.work_up.clone();
+                    let config_path = self.config_path.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
@@ -1245,10 +1715,12 @@ impl Server {
                                 collaboration,
                                 collaboration_audit,
                                 ask,
+                                automation,
                                 restart,
                                 fleet,
                                 pipeline_runs,
                                 work_up,
+                                config_path,
                             ))
                             .await
                         {
@@ -1576,6 +2048,7 @@ async fn stream_fleet_updates(
                         state: crate::fleet::FleetHostState::Degraded,
                         revision: None,
                         resync: true,
+                        mailbox_revision: None,
                     };
                     let bytes = encode_line(&update, protocol)?;
                     if writer.write_all(&bytes).await.is_err()
@@ -1585,6 +2058,42 @@ async fn stream_fleet_updates(
                     }
                 }
             },
+            _ = keepalive.tick() => {
+                if writer.write_all(b"\n").await.is_err()
+                    || writer.flush().await.is_err()
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// Stream only the monotonic durable-mailbox revision. This signal contains
+/// no request content or participant identity; it is safe to propagate
+/// through Fleet as a cache invalidation while mailbox reads remain scoped.
+async fn stream_revision_updates(
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    mut changes: watch::Receiver<u64>,
+    protocol: u32,
+) -> Result<(), RuntimeError> {
+    let mut keepalive = tokio::time::interval(STREAM_KEEPALIVE_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    keepalive.tick().await;
+    loop {
+        tokio::select! {
+            signal = changes.changed() => {
+                if signal.is_err() {
+                    return Ok(());
+                }
+                let frame = serde_json::json!({ "revision": *changes.borrow_and_update() });
+                let bytes = encode_line(&frame, protocol)?;
+                if writer.write_all(&bytes).await.is_err()
+                    || writer.flush().await.is_err()
+                {
+                    return Ok(());
+                }
+            }
             _ = keepalive.tick() => {
                 if writer.write_all(b"\n").await.is_err()
                     || writer.flush().await.is_err()
@@ -1736,6 +2245,27 @@ impl CollaborationTopology {
             .map_err(|_| error)
         })
     }
+}
+
+/// Every live agent as a rule sees it: the registry row, plus the
+/// workspace/work stamped on its pane when a pane scan can supply them.
+/// The daemon's automation task builds subjects the same way, so
+/// `muxa automation test` and a real firing evaluate identical inputs.
+async fn automation_subjects(
+    store: &SharedStore,
+    backends: &[SharedBackend],
+) -> Vec<AutomationSubject> {
+    let agents = store.snapshot().await;
+    let listed = backends.to_vec();
+    let panes = tokio::task::spawn_blocking(move || {
+        listed
+            .iter()
+            .flat_map(|backend| backend.list_panes())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    crate::automation::subjects_from(&agents, &panes)
 }
 
 async fn collaboration_participants(
@@ -2012,6 +2542,7 @@ async fn record_collaboration_audit(
         collaboration,
         collaboration_audit,
         ask,
+        automation,
         restart,
         fleet,
         pipeline_runs,
@@ -2028,10 +2559,12 @@ async fn handle(
     collaboration: Arc<CollaborationStore>,
     collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
+    automation: Arc<AutomationStore>,
     restart: Option<Arc<RestartController>>,
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
     work_up: Arc<WorkUpManager>,
+    config_path: Option<PathBuf>,
 ) -> Result<(), RuntimeError> {
     let mut collaboration_actor = observe_collaboration_actor(&stream);
     let (reader, mut writer) = stream.into_split();
@@ -2195,6 +2728,15 @@ async fn handle(
                     kind = "pipeline_runs";
                     Response::with_pipeline_runs(pipeline_runs.list().await)
                 }
+                RequestBody::PipelineSubscribe => {
+                    let changes = pipeline_runs.subscribe();
+                    let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
+                    let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
+                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                        return Ok(());
+                    }
+                    return stream_revision_updates(writer, changes, stream_proto).await;
+                }
                 RequestBody::WorkUp { request } => {
                     kind = "work_up";
                     match work_up.start(request).await {
@@ -2209,6 +2751,52 @@ async fn handle(
                         None => {
                             Response::err(format!("Work operation {operation_id:?} was not found"))
                         }
+                    }
+                }
+                RequestBody::WorkCommand { host, args, stdin } => {
+                    kind = "work_command";
+                    match work_up.command(host, args, stdin).await {
+                        Ok(output) => Response::with_work_command(output),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                RequestBody::WorkCompose {
+                    description,
+                    agent,
+                    current,
+                    credential,
+                } => {
+                    kind = "work_compose";
+                    let request = WorkComposeRequest {
+                        description,
+                        agent,
+                        current,
+                    };
+                    let installed = work_compose::installed_programs();
+                    // The drafting turn is read-only whatever `[ask]` says:
+                    // a model describing a pipeline must not edit files.
+                    let drafter = Arc::clone(&ask);
+                    let agent = request.agent.clone();
+                    let result = work_compose::compose(&request, &installed, move |prompt| {
+                        let drafter = Arc::clone(&drafter);
+                        let agent = agent.clone();
+                        let credential = credential.clone();
+                        async move {
+                            drafter
+                                .one_shot_for(
+                                    agent.as_deref(),
+                                    &prompt,
+                                    crate::config::AskPermissionMode::Plan,
+                                    credential,
+                                )
+                                .await
+                                .map_err(|error| error.to_string())
+                        }
+                    })
+                    .await;
+                    match result {
+                        Ok(output) => Response::with_work_compose(output),
+                        Err(error) => Response::err(error.to_string()),
                     }
                 }
                 RequestBody::PipelineRegister { registration } => {
@@ -2614,16 +3202,53 @@ async fn handle(
                     .await;
                     response
                 }
-                RequestBody::AskSend { prompt } => {
+                RequestBody::AskSend { prompt, credential } => {
                     kind = "ask_send";
-                    match ask.ask(&prompt).await {
+                    match ask.ask_with_credential(&prompt, credential).await {
                         Ok(entry) => Response::with_ask_entry(entry),
                         Err(error) => Response::err(error.to_string()),
                     }
                 }
+                RequestBody::AskSendNew { prompt, credential } => {
+                    kind = "ask_send_new";
+                    match ask
+                        .ask_in_new_conversation_with_credential(&prompt, credential)
+                        .await
+                    {
+                        Ok(entry) => Response::with_ask_entry(entry),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::AskSubscribe => {
+                    let changes = ask.subscribe();
+                    let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
+                    let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
+                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                        return Ok(());
+                    }
+                    return stream_revision_updates(writer, changes, stream_proto).await;
+                }
+                RequestBody::AskStatus {} => {
+                    kind = "ask_status";
+                    Response::with_ask_status(ask.enabled())
+                }
                 RequestBody::AskList {} => {
                     kind = "ask_list";
                     Response::with_ask_entries(ask.list().await)
+                }
+                RequestBody::AskConversationList {} => {
+                    kind = "ask_conversation_list";
+                    Response::with_ask_conversations(
+                        ask.list_conversations().await,
+                        ask.active_conversation().await,
+                    )
+                }
+                RequestBody::AskConversationSelect { conversation_id } => {
+                    kind = "ask_conversation_select";
+                    match ask.select_conversation(&conversation_id).await {
+                        Ok(conversation) => Response::with_ask_conversation(conversation),
+                        Err(error) => Response::err(error.to_string()),
+                    }
                 }
                 RequestBody::AskAgent { agent } => {
                     kind = "ask_agent";
@@ -2637,8 +3262,7 @@ async fn handle(
                 }
                 RequestBody::AskReset {} => {
                     kind = "ask_reset";
-                    ask.reset_thread().await;
-                    Response::ok()
+                    Response::with_ask_conversation(ask.reset_thread().await)
                 }
                 RequestBody::AskClear {} => {
                     kind = "ask_clear";
@@ -2647,6 +3271,168 @@ async fn handle(
                 RequestBody::AskDelete { id } => {
                     kind = "ask_delete";
                     Response::with_pruned(usize::from(ask.delete_history_entry(&id).await))
+                }
+                RequestBody::ConfigRead {} => {
+                    kind = "config_read";
+                    match config_path.as_deref() {
+                        Some(path) => match crate::config_file::read(path) {
+                            Ok(document) => Response::with_config(document),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        None => Response::err(NO_CONFIG_PATH.to_string()),
+                    }
+                }
+                RequestBody::ConfigWrite {
+                    text,
+                    expected_text,
+                } => {
+                    kind = "config_write";
+                    match config_path.as_deref() {
+                        Some(path) => {
+                            match crate::config_file::write(path, &text, expected_text.as_deref()) {
+                                Ok(document) => Response::with_config(document),
+                                Err(crate::config_file::ConfigFileError::Conflict { current }) => {
+                                    // Hand the current text back with the
+                                    // refusal so the editor can merge instead
+                                    // of asking for it again.
+                                    let mut response = Response::err(
+                                        crate::config_file::ConfigFileError::Conflict {
+                                            current: current.clone(),
+                                        }
+                                        .to_string(),
+                                    );
+                                    response.config = Some(crate::config_file::ConfigDocument {
+                                        path: path.to_path_buf(),
+                                        exists: true,
+                                        text: current,
+                                    });
+                                    response
+                                }
+                                Err(error) => Response::err(error.to_string()),
+                            }
+                        }
+                        None => Response::err(NO_CONFIG_PATH.to_string()),
+                    }
+                }
+                RequestBody::AskProviders {} => {
+                    kind = "ask_providers";
+                    Response::with_ask_providers(ask.providers().await)
+                }
+                RequestBody::AskProviderConfigure {
+                    provider,
+                    title,
+                    model,
+                    api_key_env,
+                    executable,
+                } => {
+                    kind = "ask_provider_configure";
+                    let edit = AskProviderEdit {
+                        title,
+                        model,
+                        api_key_env,
+                        executable,
+                    };
+                    match ask.configure_provider(&provider, edit).await {
+                        Ok(providers) => Response::with_ask_providers(providers),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::AskProviderAdd {
+                    id,
+                    engine,
+                    title,
+                    model,
+                    api_key_env,
+                    executable,
+                } => {
+                    kind = "ask_provider_add";
+                    let request = AskProviderAdd {
+                        id,
+                        engine,
+                        title,
+                        model,
+                        api_key_env,
+                        executable,
+                    };
+                    match ask.add_provider(request).await {
+                        Ok(providers) => Response::with_ask_providers(providers),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::AskProviderRemove { id } => {
+                    kind = "ask_provider_remove";
+                    match ask.remove_provider(&id).await {
+                        Ok(providers) => Response::with_ask_providers(providers),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::AutomationList {} => {
+                    kind = "automation_list";
+                    Response::with_automation_rules(
+                        automation.views(time::OffsetDateTime::now_utc()).await,
+                    )
+                }
+                RequestBody::AutomationLog { limit } => {
+                    kind = "automation_log";
+                    Response::with_automation_log(
+                        automation
+                            .ledger()
+                            .recent(limit.unwrap_or(crate::automation::MAX_LEDGER_ENTRIES))
+                            .await,
+                    )
+                }
+                RequestBody::AutomationSetEnabled { name, enabled } => {
+                    kind = "automation_set_enabled";
+                    // No name is the master switch: the whole engine, rather
+                    // than one rule.
+                    let applied = match name.as_deref() {
+                        Some(name) => automation.set_rule_enabled(name, enabled).await,
+                        None => automation.set_master_enabled(enabled).await,
+                    };
+                    match applied {
+                        Ok(()) => Response::with_automation_rules(
+                            automation.views(time::OffsetDateTime::now_utc()).await,
+                        ),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                RequestBody::AutomationPause { until } => {
+                    kind = "automation_pause";
+                    match automation.set_paused_until(until).await {
+                        Ok(()) => Response::with_automation_rules(
+                            automation.views(time::OffsetDateTime::now_utc()).await,
+                        ),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                RequestBody::AutomationSetRule { rule } => {
+                    kind = "automation_set_rule";
+                    match automation.upsert_rule(rule).await {
+                        Ok(()) => Response::with_automation_rules(
+                            automation.views(time::OffsetDateTime::now_utc()).await,
+                        ),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                RequestBody::AutomationRemoveRule { name } => {
+                    kind = "automation_remove_rule";
+                    match automation.remove_rule(&name).await {
+                        Ok(()) => Response::with_automation_rules(
+                            automation.views(time::OffsetDateTime::now_utc()).await,
+                        ),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                RequestBody::AutomationTest { name } => {
+                    kind = "automation_test";
+                    let subjects = automation_subjects(&store, &backends).await;
+                    match automation
+                        .test_rule(&name, &subjects, time::OffsetDateTime::now_utc())
+                        .await
+                    {
+                        Ok(report) => Response::with_automation_test(report),
+                        Err(error) => Response::err(error),
+                    }
                 }
                 RequestBody::CollaborationSend {
                     origin,
@@ -2724,6 +3510,22 @@ async fn handle(
                     )
                     .await;
                     response
+                }
+                RequestBody::CollaborationSubscribe => {
+                    kind = "collaboration_subscribe";
+                    let changes = collaboration.subscribe();
+                    let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
+                    let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
+                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                        return Ok(());
+                    }
+                    tracing::debug!(
+                        elapsed_us =
+                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        kind,
+                        "ipc.handle (collaboration stream takeover)",
+                    );
+                    return stream_revision_updates(writer, changes, stream_proto).await;
                 }
                 RequestBody::CollaborationList {
                     origin,
@@ -2957,6 +3759,24 @@ async fn handle(
                     match sessions.read_output(&session_id, offset) {
                         Ok(output) => Response::with_output(output),
                         Err(e) => Response::err(e.to_string()),
+                    }
+                }
+                RequestBody::ReadSessionWait {
+                    session_id,
+                    offset,
+                    timeout_ms,
+                } => {
+                    kind = "read_session_wait";
+                    let sessions = Arc::clone(&sessions);
+                    let timeout = Duration::from_millis(timeout_ms.clamp(1, 30_000));
+                    match tokio::task::spawn_blocking(move || {
+                        sessions.read_output_wait(&session_id, offset, timeout)
+                    })
+                    .await
+                    {
+                        Ok(Ok(output)) => Response::with_output(output),
+                        Ok(Err(e)) => Response::err(e.to_string()),
+                        Err(e) => Response::err(format!("session wait task failed: {e}")),
                     }
                 }
                 RequestBody::WriteSession { session_id, data } => {
@@ -3252,6 +4072,12 @@ pub struct FleetUpdateStream {
     line: String,
 }
 
+/// Content-free durable mailbox revision stream.
+pub struct CollaborationUpdateStream {
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    line: String,
+}
+
 /// Whether a subscribe-stream line is the daemon's `lagged` control marker
 /// (`{"event":"lagged",…}`) rather than a `Transition`. Kept cheap: a real
 /// `Transition` is tagged by `from`/`to`, never an `event` field, so a
@@ -3422,6 +4248,28 @@ impl FleetUpdateStream {
     }
 }
 
+impl CollaborationUpdateStream {
+    pub async fn recv(&mut self) -> Result<Option<u64>, RuntimeError> {
+        loop {
+            self.line.clear();
+            let n = read_limited_line(&mut self.reader, &mut self.line).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            let trimmed = self.line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let frame: serde_json::Value = serde_json::from_str(trimmed)?;
+            return frame["revision"].as_u64().map(Some).ok_or_else(|| {
+                RuntimeError::Json(serde::de::Error::custom(
+                    "collaboration update is missing revision",
+                ))
+            });
+        }
+    }
+}
+
 impl Client {
     pub fn new(socket_path: PathBuf) -> Self {
         Self {
@@ -3548,6 +4396,80 @@ impl Client {
         })
     }
 
+    /// Subscribe to content-free durable collaboration invalidations. This
+    /// does not grant mailbox read access and is primarily used by Fleet
+    /// relays to wake native operator inboxes.
+    pub async fn collaboration_subscribe(&self) -> Result<CollaborationUpdateStream, RuntimeError> {
+        tokio::time::timeout(CLIENT_CALL_TIMEOUT, self.collaboration_subscribe_inner())
+            .await
+            .map_err(|_| RuntimeError::Timeout(CLIENT_CALL_TIMEOUT))?
+    }
+
+    async fn collaboration_subscribe_inner(
+        &self,
+    ) -> Result<CollaborationUpdateStream, RuntimeError> {
+        self.revision_subscribe_inner("collaboration_subscribe")
+            .await
+    }
+
+    pub async fn ask_subscribe(&self) -> Result<CollaborationUpdateStream, RuntimeError> {
+        tokio::time::timeout(
+            CLIENT_CALL_TIMEOUT,
+            self.revision_subscribe_inner("ask_subscribe"),
+        )
+        .await
+        .map_err(|_| RuntimeError::Timeout(CLIENT_CALL_TIMEOUT))?
+    }
+
+    pub async fn pipeline_subscribe(&self) -> Result<CollaborationUpdateStream, RuntimeError> {
+        tokio::time::timeout(
+            CLIENT_CALL_TIMEOUT,
+            self.revision_subscribe_inner("pipeline_subscribe"),
+        )
+        .await
+        .map_err(|_| RuntimeError::Timeout(CLIENT_CALL_TIMEOUT))?
+    }
+
+    async fn revision_subscribe_inner(
+        &self,
+        kind: &str,
+    ) -> Result<CollaborationUpdateStream, RuntimeError> {
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
+                    RuntimeError::NotConnected(self.socket_path.clone())
+                }
+                _ => RuntimeError::Io(error),
+            })?;
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        self.send_hello(&mut reader, &mut writer).await?;
+
+        let mut request = serde_json::to_vec(&serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": kind,
+        }))?;
+        request.push(b'\n');
+        writer.write_all(&request).await?;
+        writer.flush().await?;
+
+        let mut ack = String::new();
+        read_limited_line(&mut reader, &mut ack).await?;
+        let ack: serde_json::Value = serde_json::from_str(ack.trim())?;
+        if !ack["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(format!(
+                "{kind} rejected: {}",
+                ack["error"].as_str().unwrap_or("(no error message)")
+            ))));
+        }
+        drop(writer);
+        Ok(CollaborationUpdateStream {
+            reader,
+            line: String::new(),
+        })
+    }
+
     /// Execute an exact operation on one configured host. Mutations are
     /// authorized again by the manager's per-host access mode.
     pub async fn fleet_execute(
@@ -3573,6 +4495,36 @@ impl Client {
             )));
         }
         serde_json::from_value(response["fleet_result"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Run one allowlisted `muxa work …` argv through the daemon, on its own
+    /// host or on the Fleet host `host`, and return the child's exit code and
+    /// streams. Requires the `work_command_v1` capability.
+    pub async fn work_command(
+        &self,
+        host: Option<&str>,
+        args: &[String],
+        stdin: Option<&str>,
+    ) -> Result<WorkCommandOutput, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "work_command",
+            "host": host,
+            "args": args,
+            "stdin": stdin,
+        });
+        let response = self
+            .call_with_timeout(&req, WORK_COMMAND_CLIENT_TIMEOUT)
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("work command failed")
+                    .to_string(),
+            )));
+        }
+        serde_json::from_value(response["work_command"].clone()).map_err(RuntimeError::Json)
     }
 
     /// Ask the daemon which additive features it supports and, when it can
@@ -3794,10 +4746,39 @@ impl Client {
 
     /// Queue a headless question; the returned entry is `Running`.
     pub async fn ask_send(&self, prompt: &str) -> Result<AskEntry, RuntimeError> {
+        self.ask_send_with_credential(prompt, None, None).await
+    }
+
+    /// Queue a question as the first turn of a new conversation. Creation and
+    /// send are one daemon mutation, so a cancelled composer never creates an
+    /// empty durable conversation.
+    pub async fn ask_send_new(&self, prompt: &str) -> Result<AskEntry, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_send_new",
+            "prompt": prompt,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_entry"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Queue a headless question with an optional one-turn API key. The key
+    /// is serialized only on the owner-only socket and is absent from the
+    /// response and durable Ask history.
+    pub async fn ask_send_with_credential(
+        &self,
+        prompt: &str,
+        agent: Option<&str>,
+        api_key: Option<&str>,
+    ) -> Result<AskEntry, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "ask_send",
             "prompt": prompt,
+            "credential": agent.zip(api_key).map(|(agent, api_key)| serde_json::json!({
+                "agent": agent,
+                "api_key": api_key,
+            })),
         });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["ask_entry"].clone()).map_err(RuntimeError::Json)
@@ -3807,6 +4788,43 @@ impl Client {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_list" });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["ask_entries"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn ask_conversation_list(
+        &self,
+    ) -> Result<(Vec<AskConversation>, Option<AskConversation>), RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_conversation_list",
+        });
+        let resp = self.call_checked(&req).await?;
+        let conversations = serde_json::from_value(resp["ask_conversations"].clone())
+            .map_err(RuntimeError::Json)?;
+        let active =
+            serde_json::from_value(resp["ask_conversation"].clone()).map_err(RuntimeError::Json)?;
+        Ok((conversations, active))
+    }
+
+    pub async fn ask_conversation_select(
+        &self,
+        conversation_id: &str,
+    ) -> Result<AskConversation, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_conversation_select",
+            "conversation_id": conversation_id,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_conversation"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Return the daemon's startup-time Global Ask grant.
+    pub async fn ask_status(&self) -> Result<bool, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_status" });
+        let resp = self.call_checked(&req).await?;
+        resp["ask_enabled"]
+            .as_bool()
+            .ok_or_else(|| RuntimeError::Json(serde::de::Error::custom("missing ask_enabled")))
     }
 
     /// Read the selected agent (`None`) or switch to another (`Some`).
@@ -3820,9 +4838,10 @@ impl Client {
         serde_json::from_value(resp["ask_agent"].clone()).map_err(RuntimeError::Json)
     }
 
-    pub async fn ask_reset(&self) -> Result<(), RuntimeError> {
+    pub async fn ask_reset(&self) -> Result<AskConversation, RuntimeError> {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_reset" });
-        self.call_checked(&req).await.map(|_| ())
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_conversation"].clone()).map_err(RuntimeError::Json)
     }
 
     /// Delete completed ask history while leaving active work and the current
@@ -3845,6 +4864,245 @@ impl Client {
         let removed: usize =
             serde_json::from_value(resp["pruned"].clone()).map_err(RuntimeError::Json)?;
         Ok(removed == 1)
+    }
+
+    /// The daemon's `config.toml` as text. Requires the `config_edit_v1`
+    /// capability.
+    pub async fn config_read(&self) -> Result<crate::config_file::ConfigDocument, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "config_read" });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["config"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Replace `config.toml`. `expected` pins the text the caller edited, so
+    /// a concurrent change is refused instead of overwritten. The daemon
+    /// parses and validates before writing, so a refusal leaves the file
+    /// exactly as it was. Requires the `config_edit_v1` capability.
+    pub async fn config_write(
+        &self,
+        text: &str,
+        expected: Option<&str>,
+    ) -> Result<crate::config_file::ConfigDocument, RuntimeError> {
+        let mut req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "config_write",
+            "text": text,
+        });
+        if let Some(expected) = expected {
+            req["expected_text"] = serde_json::Value::String(expected.to_string());
+        }
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["config"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Every provider instance the daemon can ask, with the engine behind
+    /// it, its effective model, and which one is selected. Requires the
+    /// `ask_providers_v1` capability.
+    pub async fn ask_providers(&self) -> Result<Vec<AskProviderInfo>, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_providers" });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_providers"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Edit `[ask.providers.<provider>]` and read back the updated provider
+    /// list. Each key of `edit` is tri-state: `None` is not sent and leaves
+    /// the key unchanged, `Some(None)` sends `null` to clear it,
+    /// `Some(Some(v))` sets it. Requires the `ask_providers_v1` capability.
+    pub async fn ask_provider_configure(
+        &self,
+        provider: &str,
+        edit: &AskProviderEdit,
+    ) -> Result<Vec<AskProviderInfo>, RuntimeError> {
+        let mut req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_provider_configure",
+            "provider": provider,
+        });
+        for (key, change) in [
+            ("title", edit.title.as_ref()),
+            ("model", edit.model.as_ref()),
+            ("api_key_env", edit.api_key_env.as_ref()),
+            ("executable", edit.executable.as_ref()),
+        ] {
+            if let Some(change) = change {
+                req[key] = serde_json::json!(change);
+            }
+        }
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_providers"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Add an `[ask.providers.<id>]` instance and read back the updated
+    /// list. Requires the `ask_providers_v1` capability.
+    pub async fn ask_provider_add(
+        &self,
+        request: &AskProviderAdd,
+    ) -> Result<Vec<AskProviderInfo>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_provider_add",
+            "id": request.id,
+            "engine": request.engine,
+            "title": request.title,
+            "model": request.model,
+            "api_key_env": request.api_key_env,
+            "executable": request.executable,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_providers"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Remove an `[ask.providers.<id>]` instance and read back the updated
+    /// list. Requires the `ask_providers_v1` capability.
+    pub async fn ask_provider_remove(
+        &self,
+        id: &str,
+    ) -> Result<Vec<AskProviderInfo>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_provider_remove",
+            "id": id,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_providers"].clone()).map_err(RuntimeError::Json)
+    }
+
+    // --- automation_v1 -----------------------------------------------------
+
+    /// Every automation rule with its effective timing, guards, and recent
+    /// activity, plus the engine's master switch and pause.
+    pub async fn automation_list(&self) -> Result<AutomationRules, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "automation_list" });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_rules"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// The firing ledger, newest first.
+    pub async fn automation_log(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<AutomationLedgerEntry>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "automation_log",
+            "limit": limit,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_log"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Flip one rule's `enabled`, live and in `config.toml`.
+    pub async fn automation_set_enabled(
+        &self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<AutomationRules, RuntimeError> {
+        self.automation_set_enabled_target(Some(name), enabled)
+            .await
+    }
+
+    /// `None` flips the engine's own `[automation] enabled`; a name flips
+    /// that rule.
+    pub async fn automation_set_enabled_target(
+        &self,
+        name: Option<&str>,
+        enabled: bool,
+    ) -> Result<AutomationRules, RuntimeError> {
+        let mut req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "automation_set_enabled",
+            "enabled": enabled,
+        });
+        if let Some(name) = name {
+            req["name"] = serde_json::Value::String(name.to_string());
+        }
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_rules"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Hold every rule until `until`; `None` lifts the hold.
+    pub async fn automation_pause(
+        &self,
+        until: Option<time::OffsetDateTime>,
+    ) -> Result<AutomationRules, RuntimeError> {
+        let until = until
+            .map(|until| until.format(&time::format_description::well_known::Rfc3339))
+            .transpose()
+            .map_err(|error| {
+                RuntimeError::Json(serde::de::Error::custom(format!(
+                    "formatting pause deadline: {error}"
+                )))
+            })?;
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "automation_pause",
+            "until": until,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_rules"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Upsert one rule into `config.toml` — replacing the one with the same
+    /// name in place, appending otherwise.
+    pub async fn automation_set_rule(
+        &self,
+        rule: &AutomationRule,
+    ) -> Result<AutomationRules, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "automation_set_rule",
+            "rule": rule,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_rules"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Remove one rule. An unknown name is an error.
+    pub async fn automation_remove_rule(
+        &self,
+        name: &str,
+    ) -> Result<AutomationRules, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "automation_remove_rule",
+            "name": name,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_rules"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Evaluate one rule against the live registry without firing it.
+    pub async fn automation_test(&self, name: &str) -> Result<AutomationTestReport, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "automation_test",
+            "name": name,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["automation_test"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Draft one pipeline from a description with a read-only headless
+    /// turn. `credential` is a one-turn `(agent, api_key)` pair handled
+    /// like `ask_send`'s. Requires the `work_compose_v1` capability.
+    pub async fn work_compose(
+        &self,
+        request: &WorkComposeRequest,
+        credential: Option<(&str, &str)>,
+    ) -> Result<WorkComposeOutput, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "work_compose",
+            "description": request.description,
+            "agent": request.agent,
+            "current": request.current,
+            "credential": credential.map(|(agent, api_key)| serde_json::json!({
+                "agent": agent,
+                "api_key": api_key,
+            })),
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["work_compose"].clone()).map_err(RuntimeError::Json)
     }
 
     pub async fn collaboration_send(
@@ -5636,10 +6894,12 @@ mod tests {
             CollaborationStore::in_memory(CollaborationOptions::default()),
             CollaborationAuditLog::in_memory(),
             crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
+            AutomationStore::in_memory(crate::automation::AutomationConfig::default()),
             None,
             None,
             PipelineRunStore::in_memory(),
             WorkUpManager::new(PathBuf::from("/tmp/muxa-disconnect-test.sock")),
+            None,
         ));
 
         let req = serde_json::json!({
@@ -5808,9 +7068,897 @@ mod tests {
         assert!(caps.contains(&"session_bytes_v1"));
         assert!(caps.contains(&"work_control_v1"));
         assert!(caps.contains(&"session_attachment_identity_v1"));
+        assert!(caps.contains(&"session_wait_v1"));
+        assert!(caps.contains(&"collaboration_subscribe"));
+        assert!(caps.contains(&"pipeline_subscribe"));
+        assert!(caps.contains(&"ask_subscribe"));
+        assert!(caps.contains(&"ask_one_turn_credential_v1"));
+        assert!(caps.contains(&"ask_status_v1"));
+        assert!(caps.contains(&"ask_conversations_v1"));
+        assert!(caps.contains(&"ask_send_new_v1"));
+        assert!(caps.contains(&"ask_providers_v1"));
+        assert!(caps.contains(&"work_compose_v1"));
         assert!(!caps.contains(&RESTART_CAPABILITY));
         assert!(!caps.contains(&STOP_CAPABILITY));
         assert!(resp["generation"].is_null());
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_subscription_wakes_on_store_revision_without_polling() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-subscribe.sock");
+        let ask = crate::ask::AskStore::in_memory(crate::ask::AskOptions::default());
+        let server = Server::new(sock.clone(), Store::shared()).with_ask(Arc::clone(&ask));
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let mut updates = Client::new(sock.clone()).ask_subscribe().await.unwrap();
+        let next_agent = if ask.agent().await == "claude" {
+            "codex"
+        } else {
+            "claude"
+        };
+        ask.set_agent(next_agent).await.unwrap();
+        let revision = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .expect("ask revision should be pushed")
+            .unwrap()
+            .expect("stream should remain open");
+        assert_eq!(revision, 1);
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_status_reports_the_explicit_runtime_grant() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-status.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let client = Client::new(sock);
+        assert!(!client.ask_status().await.unwrap());
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_conversations_can_be_created_listed_and_reselected_over_ipc() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-conversations.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let client = Client::new(sock);
+        let first = client.ask_reset().await.unwrap();
+        let second = client.ask_reset().await.unwrap();
+        assert_ne!(first.id, second.id);
+
+        let (conversations, active) = client.ask_conversation_list().await.unwrap();
+        assert_eq!(conversations.len(), 2);
+        assert_eq!(active.unwrap().id, second.id);
+
+        let selected = client.ask_conversation_select(&first.id).await.unwrap();
+        assert_eq!(selected.id, first.id);
+        let (_, active) = client.ask_conversation_list().await.unwrap();
+        assert_eq!(active.unwrap().id, first.id);
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_send_new_creates_the_conversation_with_its_first_turn() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-send-new.sock");
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "claude".into(),
+            crate::config::AskProviderConfig {
+                executable: Some("/definitely/missing/muxa-test-agent".into()),
+                ..crate::config::AskProviderConfig::default()
+            },
+        );
+        let ask = crate::ask::AskStore::in_memory(crate::ask::AskOptions {
+            enabled: true,
+            providers,
+            ..crate::ask::AskOptions::default()
+        });
+        let server = Server::new(sock.clone(), Store::shared()).with_ask(ask);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let client = Client::new(sock);
+        let entry = client.ask_send_new("independent question").await.unwrap();
+        let (conversations, active) = client.ask_conversation_list().await.unwrap();
+
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(entry.conversation_id, active.map(|item| item.id));
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn automation_requests_deserialize_from_their_documented_shapes() {
+        let list: RequestBody =
+            serde_json::from_value(serde_json::json!({"kind": "automation_list"})).unwrap();
+        assert!(matches!(list, RequestBody::AutomationList {}));
+
+        let log: RequestBody =
+            serde_json::from_value(serde_json::json!({"kind": "automation_log", "limit": 20}))
+                .unwrap();
+        assert!(matches!(
+            log,
+            RequestBody::AutomationLog { limit: Some(20) }
+        ));
+        // `limit` is optional; absent means "the whole retained ledger".
+        let log: RequestBody =
+            serde_json::from_value(serde_json::json!({"kind": "automation_log"})).unwrap();
+        assert!(matches!(log, RequestBody::AutomationLog { limit: None }));
+
+        let toggle: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "automation_set_enabled",
+            "name": "resume-after-limit",
+            "enabled": false,
+        }))
+        .unwrap();
+        match toggle {
+            RequestBody::AutomationSetEnabled { name, enabled } => {
+                assert_eq!(name.as_deref(), Some("resume-after-limit"));
+                assert!(!enabled);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let pause: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "automation_pause",
+            "until": "2026-09-03T13:00:00Z",
+        }))
+        .unwrap();
+        match pause {
+            RequestBody::AutomationPause { until } => assert_eq!(
+                until,
+                Some(time::macros::datetime!(2026-09-03 13:00:00 UTC))
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
+        // `null` is how a client lifts the hold.
+        let resume: RequestBody =
+            serde_json::from_value(serde_json::json!({"kind": "automation_pause", "until": null}))
+                .unwrap();
+        assert!(matches!(
+            resume,
+            RequestBody::AutomationPause { until: None }
+        ));
+
+        let set: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "automation_set_rule",
+            "rule": {
+                "name": "resume-after-limit",
+                "on": "rate_limited",
+                "action": "send_prompt",
+                "text": "continue",
+                "wait": "reset+2m",
+                "agent": ["claude", "codex"],
+            },
+        }))
+        .unwrap();
+        match set {
+            RequestBody::AutomationSetRule { rule } => {
+                assert_eq!(rule.name, "resume-after-limit");
+                assert_eq!(rule.text.as_deref(), Some("continue"));
+                assert_eq!(rule.agent.len(), 2);
+                rule.validate().unwrap();
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let remove: RequestBody = serde_json::from_value(
+            serde_json::json!({"kind": "automation_remove_rule", "name": "resume-after-limit"}),
+        )
+        .unwrap();
+        assert!(
+            matches!(remove, RequestBody::AutomationRemoveRule { name } if name == "resume-after-limit")
+        );
+
+        let test: RequestBody = serde_json::from_value(
+            serde_json::json!({"kind": "automation_test", "name": "resume-after-limit"}),
+        )
+        .unwrap();
+        assert!(
+            matches!(test, RequestBody::AutomationTest { name } if name == "resume-after-limit")
+        );
+
+        // Clients feature-gate on the tag, not the protocol number.
+        assert!(CAPABILITIES.contains(&"automation_v1"));
+    }
+
+    #[tokio::test]
+    async fn automation_rules_can_be_written_toggled_and_removed_over_ipc() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-automation.sock");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "# muxa\n").unwrap();
+        let automation = crate::automation::AutomationStore::new(
+            crate::automation::AutomationConfig::default(),
+            Some(config_path.clone()),
+            crate::automation::AutomationLedger::in_memory(),
+        );
+        let server = Server::new(sock.clone(), Store::shared()).with_automation(automation);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let client = Client::new(sock);
+
+        // A fresh install ships no rules.
+        let rules = client.automation_list().await.unwrap();
+        assert!(rules.enabled);
+        assert!(rules.rules.is_empty());
+
+        let mut rule = crate::automation::AutomationRule::new(
+            "resume-after-limit",
+            crate::automation::AutomationEvent::RateLimited,
+            crate::automation::AutomationAction::SendPrompt,
+        );
+        rule.text = Some("continue".into());
+        rule.wait = Some(crate::automation::parse_wait("reset+2m").unwrap());
+        let rules = client.automation_set_rule(&rule).await.unwrap();
+        assert_eq!(rules.rules.len(), 1);
+        // The daemon rewrites the anchor into the template spelling every
+        // other muxa value uses.
+        assert_eq!(rules.rules[0].wait, "{{reset}}+2m");
+        assert!(std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("[[automation.rule]]"));
+
+        // Same name upserts rather than duplicating.
+        rule.text = Some("keep going".into());
+        let rules = client.automation_set_rule(&rule).await.unwrap();
+        assert_eq!(rules.rules.len(), 1);
+        assert_eq!(rules.rules[0].text.as_deref(), Some("keep going"));
+
+        let rules = client
+            .automation_set_enabled("resume-after-limit", false)
+            .await
+            .unwrap();
+        assert!(!rules.rules[0].enabled);
+
+        let until = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let rules = client.automation_pause(Some(until)).await.unwrap();
+        assert!(rules.paused_until.is_some());
+        let rules = client.automation_pause(None).await.unwrap();
+        assert!(rules.paused_until.is_none());
+
+        // Nothing has fired, so the ledger is empty and `test` finds no
+        // capped agent in an empty registry.
+        assert!(client.automation_log(Some(10)).await.unwrap().is_empty());
+        let report = client.automation_test("resume-after-limit").await.unwrap();
+        assert!(report.candidates.is_empty());
+
+        let rules = client
+            .automation_remove_rule("resume-after-limit")
+            .await
+            .unwrap();
+        assert!(rules.rules.is_empty());
+        // An unknown name is refused rather than silently succeeding.
+        assert!(client.automation_remove_rule("nope").await.is_err());
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[allow(clippy::too_many_lines)] // one documented wire shape per block
+    #[test]
+    fn provider_and_compose_requests_deserialize_from_their_documented_shapes() {
+        let providers: RequestBody =
+            serde_json::from_value(serde_json::json!({"kind": "ask_providers"})).unwrap();
+        assert!(matches!(providers, RequestBody::AskProviders {}));
+
+        let configure: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "ask_provider_configure",
+            "provider": "anthropic",
+            "model": "claude-opus-5",
+            "api_key_env": null,
+            "title": "Anthropic (work)",
+            "executable": null,
+        }))
+        .unwrap();
+        match configure {
+            RequestBody::AskProviderConfigure {
+                provider,
+                title,
+                model,
+                api_key_env,
+                executable,
+            } => {
+                assert_eq!(provider, "anthropic");
+                // A string sets, `null` clears…
+                assert_eq!(model, Some(Some("claude-opus-5".to_string())));
+                assert_eq!(title, Some(Some("Anthropic (work)".to_string())));
+                assert_eq!(api_key_env, Some(None));
+                assert_eq!(executable, Some(None));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // …and an absent key means "leave it unchanged".
+        let partial: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "ask_provider_configure",
+            "provider": "openai",
+            "model": "gpt-5-mini",
+        }))
+        .unwrap();
+        assert!(matches!(
+            partial,
+            RequestBody::AskProviderConfigure {
+                model: Some(Some(_)),
+                title: None,
+                api_key_env: None,
+                executable: None,
+                ..
+            }
+        ));
+
+        // `add` carries the engine and whatever settings came with it…
+        let add: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "ask_provider_add",
+            "id": "anthropic-work",
+            "engine": "anthropic",
+            "title": "Anthropic (work)",
+            "api_key_env": "WORK_ANTHROPIC_KEY",
+        }))
+        .unwrap();
+        match add {
+            RequestBody::AskProviderAdd {
+                id,
+                engine,
+                title,
+                model,
+                api_key_env,
+                executable,
+            } => {
+                assert_eq!(id, "anthropic-work");
+                assert_eq!(engine, "anthropic");
+                assert_eq!(title.as_deref(), Some("Anthropic (work)"));
+                assert_eq!(model, None);
+                assert_eq!(api_key_env.as_deref(), Some("WORK_ANTHROPIC_KEY"));
+                assert_eq!(executable, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // …with only the id and engine required.
+        let minimal: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "ask_provider_add",
+            "id": "personal",
+            "engine": "openai",
+        }))
+        .unwrap();
+        assert!(matches!(
+            minimal,
+            RequestBody::AskProviderAdd {
+                title: None,
+                model: None,
+                api_key_env: None,
+                executable: None,
+                ..
+            }
+        ));
+
+        let remove: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "ask_provider_remove",
+            "id": "anthropic-work",
+        }))
+        .unwrap();
+        match remove {
+            RequestBody::AskProviderRemove { id } => assert_eq!(id, "anthropic-work"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let compose: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "work_compose",
+            "description": "implementer in claude, reviewer in codex after it",
+            "agent": "claude",
+            "current": {
+                "name": "pair", "description": null, "layout": null, "prompt": null,
+                "agents": [{"alias": "impl", "program": "claude", "role": null, "task": null,
+                            "prompt": null, "direction": null, "after": []}],
+            },
+            "credential": {"agent": "claude", "api_key": "sk-one-turn"},
+        }))
+        .unwrap();
+        match compose {
+            RequestBody::WorkCompose {
+                description,
+                agent,
+                current,
+                credential,
+            } => {
+                assert_eq!(
+                    description,
+                    "implementer in claude, reviewer in codex after it"
+                );
+                assert_eq!(agent.as_deref(), Some("claude"));
+                let current = current.unwrap();
+                assert_eq!(current.name.as_deref(), Some("pair"));
+                assert_eq!(current.agents[0].alias, "impl");
+                let credential = credential.unwrap();
+                assert_eq!(credential.agent, "claude");
+                assert_eq!(credential.api_key, "sk-one-turn");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Every optional field really is optional.
+        let minimal: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "work_compose",
+            "description": "solo claude",
+        }))
+        .unwrap();
+        assert!(matches!(
+            minimal,
+            RequestBody::WorkCompose {
+                agent: None,
+                current: None,
+                credential: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_and_compose_responses_serialize_with_their_documented_fields() {
+        let response = Response::with_work_compose(WorkComposeOutput {
+            pipeline: crate::work_pipeline_spec::PipelineSpec {
+                name: Some("pair".into()),
+                ..Default::default()
+            },
+            notes: "two agents".into(),
+            raw: "raw".into(),
+        });
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["work_compose"]["pipeline"]["name"], "pair");
+        assert_eq!(value["work_compose"]["notes"], "two agents");
+        assert_eq!(value["work_compose"]["raw"], "raw");
+        let response = Response::with_ask_providers(crate::ask::provider_infos(
+            &std::collections::BTreeMap::new(),
+            "claude",
+            |_| None,
+        ));
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["ask_providers"][0]["id"], "claude");
+        assert_eq!(value["ask_providers"][0]["kind"], "cli");
+        assert_eq!(value["ask_providers"][0]["engine"], "claude");
+        assert_eq!(value["ask_providers"][0]["builtin"], true);
+        assert_eq!(value["ask_providers"][0]["configured"], false);
+        assert_eq!(value["ask_providers"][3]["kind"], "api");
+        assert!(value["ask_providers"][3]["credential_present"].is_boolean());
+    }
+
+    #[tokio::test]
+    async fn automation_set_enabled_without_a_name_flips_the_engine() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-automation-master.sock");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[automation]\nenabled = true\n").unwrap();
+        let automation = crate::automation::AutomationStore::new(
+            crate::automation::AutomationConfig::default(),
+            Some(config_path.clone()),
+            crate::automation::AutomationLedger::in_memory(),
+        );
+        let server = Server::new(sock.clone(), Store::shared()).with_automation(automation);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let client = Client::new(sock);
+
+        client
+            .automation_set_enabled_target(None, false)
+            .await
+            .unwrap();
+
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(text.contains("enabled = false"), "{text}");
+
+        // A named target still means that one rule, and an unknown name is
+        // refused rather than silently treated as the engine.
+        let error = client
+            .automation_set_enabled("no-such-rule", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no automation rule"), "{error}");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_read_and_write_serve_the_daemons_config_file() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-config.sock");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[ask]\nenabled = true\n").unwrap();
+        let server =
+            Server::new(sock.clone(), Store::shared()).with_config_path(Some(config_path.clone()));
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let client = Client::new(sock);
+
+        let document = client.config_read().await.unwrap();
+        assert!(document.exists);
+        assert_eq!(document.text, "[ask]\nenabled = true\n");
+        assert_eq!(document.path, config_path);
+
+        let written = client
+            .config_write("[ask]\nenabled = false\n", Some(&document.text))
+            .await
+            .unwrap();
+        assert_eq!(written.text, "[ask]\nenabled = false\n");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "[ask]\nenabled = false\n"
+        );
+
+        // A document that would not load is refused, and the file it would
+        // have replaced is untouched.
+        let error = client
+            .config_write("[ask]\nnot_a_key = 1\n", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not written"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "[ask]\nenabled = false\n"
+        );
+
+        // A stale editor is refused rather than allowed to clobber.
+        let stale = client
+            .config_write("[ui]\n", Some("[ask]\nenabled = true\n"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(stale.contains("changed on disk"), "{stale}");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_requests_refuse_a_daemon_without_a_config_path() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-config-none.sock");
+        let server = Server::new(sock.clone(), Store::shared());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let client = Client::new(sock);
+
+        let error = client.config_read().await.unwrap_err().to_string();
+        assert!(error.contains("no config file path"), "{error}");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_providers_lists_every_provider_and_follows_the_selection() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-providers.sock");
+        let server = Server::new(sock.clone(), Store::shared());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let client = Client::new(sock);
+        let providers = client.ask_providers().await.unwrap();
+        let ids: Vec<&str> = providers.iter().map(|info| info.id.as_str()).collect();
+        assert_eq!(ids, crate::ask::supported_agents());
+        assert!(providers[0].selected);
+        assert_eq!(providers[3].model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(providers[4].model.as_deref(), Some("gpt-5"));
+
+        assert_eq!(client.ask_agent(Some("openai")).await.unwrap(), "openai");
+        let providers = client.ask_providers().await.unwrap();
+        let selected: Vec<&str> = providers
+            .iter()
+            .filter(|info| info.selected)
+            .map(|info| info.id.as_str())
+            .collect();
+        assert_eq!(selected, ["openai"]);
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_provider_configure_writes_config_and_answers_with_the_list() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-configure.sock");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[watch]\nspinner = false\n").unwrap();
+        let ask = crate::ask::AskStore::in_memory(crate::ask::AskOptions {
+            config_path: Some(config_path.clone()),
+            ..crate::ask::AskOptions::default()
+        });
+        let server = Server::new(sock.clone(), Store::shared()).with_ask(ask);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let resp = raw_call(
+            &sock,
+            &serde_json::json!({
+                "protocol": PROTOCOL_VERSION,
+                "kind": "ask_provider_configure",
+                "provider": "anthropic",
+                "model": "claude-opus-5",
+                "api_key_env": "WORK_ANTHROPIC_KEY",
+            }),
+        )
+        .await;
+        assert_eq!(resp["ok"], true, "{resp}");
+        // A configured id leads the list; the untouched built-ins follow.
+        let anthropic = &resp["ask_providers"][0];
+        assert_eq!(anthropic["id"], "anthropic");
+        assert_eq!(anthropic["engine"], "anthropic");
+        assert_eq!(anthropic["builtin"], true);
+        assert_eq!(
+            anthropic["configured"], true,
+            "the write gave the built-in a table"
+        );
+        assert_eq!(anthropic["model"], "claude-opus-5");
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(text.starts_with("[watch]\nspinner = false\n"), "{text}");
+        assert!(text.contains("[ask.providers.anthropic]"), "{text}");
+        assert!(
+            text.contains("api_key_env = \"WORK_ANTHROPIC_KEY\""),
+            "{text}"
+        );
+
+        // Sending only `model` leaves `api_key_env` as it was.
+        let client = Client::new(sock.clone());
+        let providers = client
+            .ask_provider_configure(
+                "anthropic",
+                &AskProviderEdit {
+                    model: Some(None),
+                    ..AskProviderEdit::default()
+                },
+            )
+            .await
+            .unwrap();
+        let anthropic = providers
+            .iter()
+            .find(|provider| provider.id == "anthropic")
+            .unwrap();
+        assert_eq!(anthropic.model.as_deref(), Some("claude-sonnet-5"));
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!text.contains("model ="), "{text}");
+        assert!(
+            text.contains("api_key_env = \"WORK_ANTHROPIC_KEY\""),
+            "{text}"
+        );
+        // An empty edit is a no-op that still answers with the list.
+        let providers = client
+            .ask_provider_configure("anthropic", &AskProviderEdit::default())
+            .await
+            .unwrap();
+        assert_eq!(providers.len(), crate::ask::supported_agents().len());
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), text);
+        // `null` clears the last key and the table goes with it.
+        client
+            .ask_provider_configure(
+                "anthropic",
+                &AskProviderEdit {
+                    api_key_env: Some(None),
+                    ..AskProviderEdit::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("providers"));
+
+        let refused = client
+            .ask_provider_configure(
+                "bard",
+                &AskProviderEdit {
+                    model: Some(Some("x".into())),
+                    ..AskProviderEdit::default()
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("is not configured"), "{refused}");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[allow(clippy::too_many_lines)] // one add/refuse/remove lifecycle, in order
+    #[tokio::test]
+    async fn ask_provider_add_and_remove_compose_the_list_over_the_wire() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-compose.sock");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[ask]\nenabled = true\n").unwrap();
+        let ask = crate::ask::AskStore::in_memory(crate::ask::AskOptions {
+            config_path: Some(config_path.clone()),
+            ..crate::ask::AskOptions::default()
+        });
+        let server = Server::new(sock.clone(), Store::shared()).with_ask(ask);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let client = Client::new(sock.clone());
+
+        // Two instances of one engine, each with its own key variable.
+        for (id, env) in [
+            ("anthropic-work", "WORK_ANTHROPIC_KEY"),
+            ("anthropic-personal", "HOME_ANTHROPIC_KEY"),
+        ] {
+            let providers = client
+                .ask_provider_add(&crate::ask::AskProviderAdd {
+                    id: id.into(),
+                    engine: "anthropic".into(),
+                    api_key_env: Some(env.into()),
+                    ..crate::ask::AskProviderAdd::default()
+                })
+                .await
+                .unwrap();
+            let added = providers.iter().find(|info| info.id == id).unwrap();
+            assert_eq!(added.engine, "anthropic");
+            assert_eq!(added.kind, crate::ask::AskProviderKind::Api);
+            assert!(!added.builtin && added.configured);
+        }
+        let providers = client.ask_providers().await.unwrap();
+        let ids: Vec<&str> = providers.iter().map(|info| info.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "anthropic-personal",
+                "anthropic-work",
+                "claude",
+                "codex",
+                "gemini",
+                "anthropic",
+                "openai",
+            ],
+            "composed instances lead, then the built-ins they do not cover"
+        );
+        // And they are selectable by their own ids.
+        assert_eq!(
+            client.ask_agent(Some("anthropic-work")).await.unwrap(),
+            "anthropic-work"
+        );
+
+        // The refusals all come back as daemon errors, not silent no-ops.
+        for (id, engine, expected) in [
+            ("anthropic-work", "anthropic", "already exists"),
+            ("has a space", "anthropic", "TOML bare key"),
+            ("mine", "bard", "is not supported"),
+            ("claude", "codex", "built-in provider"),
+        ] {
+            let error = client
+                .ask_provider_add(&crate::ask::AskProviderAdd {
+                    id: id.into(),
+                    engine: engine.into(),
+                    ..crate::ask::AskProviderAdd::default()
+                })
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{id}/{engine}: {error}");
+        }
+
+        // Removing the selected instance hands the selection to the first
+        // provider that is left.
+        let providers = client.ask_provider_remove("anthropic-work").await.unwrap();
+        assert!(!providers.iter().any(|info| info.id == "anthropic-work"));
+        assert_eq!(
+            providers
+                .iter()
+                .find(|info| info.selected)
+                .map(|info| info.id.as_str()),
+            Some("anthropic-personal")
+        );
+        // A built-in with no config entry has nothing to remove — which is
+        // exactly what `configured` tells a client before it offers to.
+        assert!(providers
+            .iter()
+            .filter(|info| info.builtin)
+            .all(|info| !info.configured));
+        let error = client
+            .ask_provider_remove("gemini")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nothing to remove"), "{error}");
+
+        client
+            .ask_provider_remove("anthropic-personal")
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!text.contains("providers"), "{text}");
+        assert!(text.contains("enabled = true"), "{text}");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn work_compose_refuses_before_spending_a_turn_on_bad_input() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-work-compose.sock");
+        let server = Server::new(sock.clone(), Store::shared());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let blank = raw_call(
+            &sock,
+            &serde_json::json!({
+                "protocol": PROTOCOL_VERSION,
+                "kind": "work_compose",
+                "description": "   ",
+            }),
+        )
+        .await;
+        assert_eq!(blank["ok"], false);
+        assert!(blank["error"]
+            .as_str()
+            .unwrap()
+            .contains("description is empty"));
+
+        // An unknown provider fails inside the turn, so nothing is spawned
+        // and nothing is retried.
+        let client = Client::new(sock.clone());
+        let error = client
+            .work_compose(
+                &WorkComposeRequest {
+                    description: "solo claude".into(),
+                    agent: Some("bard".into()),
+                    current: None,
+                },
+                None,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not configured"), "{error}");
+
+        // A key for the wrong provider is refused the same way `ask_send`
+        // refuses it.
+        let error = client
+            .work_compose(
+                &WorkComposeRequest {
+                    description: "solo claude".into(),
+                    agent: Some("anthropic".into()),
+                    current: None,
+                },
+                Some(("openai", "sk-wrong")),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("selected ask agent is anthropic"), "{error}");
 
         tx.send(()).unwrap();
         handle.await.unwrap();
@@ -7024,5 +9172,344 @@ mod tests {
         tokio::task::yield_now().await;
         let _ = shutdown_tx.send(());
         server_task.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod work_command_tests {
+    use super::*;
+    use crate::fleet::HostAccessMode;
+    use crate::work_control::{WorkCommandError, WorkCommandOutput};
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedRun {
+        host: String,
+        args: Vec<String>,
+        stdin: Option<String>,
+        limits: WorkCommandLimits,
+    }
+
+    /// Fake Fleet transport: one configured host with a fixed mode, recording
+    /// every argv it is asked to run.
+    struct FakeRunner {
+        host: &'static str,
+        mode: HostAccessMode,
+        output: WorkCommandOutput,
+        runs: Mutex<Vec<RecordedRun>>,
+    }
+
+    impl FakeRunner {
+        fn new(mode: HostAccessMode, stdout: &str) -> Arc<Self> {
+            Arc::new(Self {
+                host: "dev",
+                mode,
+                output: WorkCommandOutput {
+                    exit_code: 0,
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                },
+                runs: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn runs(&self) -> Vec<RecordedRun> {
+            self.runs.lock().unwrap().clone()
+        }
+    }
+
+    impl RemoteWorkRunner for FakeRunner {
+        fn host_mode<'a>(&'a self, host: &'a str) -> work_control::HostModeFuture<'a> {
+            Box::pin(async move {
+                if host == self.host {
+                    Ok(self.mode)
+                } else {
+                    Err(WorkCommandError::Invalid(format!(
+                        "fleet host '{host}' is not configured"
+                    )))
+                }
+            })
+        }
+
+        fn run<'a>(
+            &'a self,
+            host: &'a str,
+            args: Vec<String>,
+            stdin: Option<String>,
+            limits: WorkCommandLimits,
+        ) -> work_control::RemoteWorkFuture<'a> {
+            Box::pin(async move {
+                self.runs.lock().unwrap().push(RecordedRun {
+                    host: host.to_string(),
+                    args,
+                    stdin,
+                    limits,
+                });
+                Ok(self.output.clone())
+            })
+        }
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    fn request(host: Option<&str>) -> WorkUpRequest {
+        WorkUpRequest {
+            work: "W-7".into(),
+            external: None,
+            pipeline: Some("solo".into()),
+            workspace: None,
+            cwd: Some(PathBuf::from("/srv/remote/checkout")),
+            skill: None,
+            body: Some("ship it".into()),
+            context: None,
+            no_ticket: true,
+            dry_run: false,
+            host: host.map(str::to_string),
+        }
+    }
+
+    async fn wait_settled(manager: &WorkUpManager, operation_id: &str) -> WorkUpOperation {
+        for _ in 0..200 {
+            let operation = manager.status(operation_id).await.unwrap();
+            if operation.state != WorkUpOperationState::Running {
+                return operation;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("operation {operation_id} never settled");
+    }
+
+    #[test]
+    fn work_command_request_decodes_the_documented_shape() {
+        let request: Request = serde_json::from_str(
+            r#"{"protocol":6,"kind":"work_command","host":"dev","args":["work","options","--json"],"stdin":null}"#,
+        )
+        .unwrap();
+        match request.body {
+            RequestBody::WorkCommand { host, args, stdin } => {
+                assert_eq!(host.as_deref(), Some("dev"));
+                assert_eq!(args, ["work", "options", "--json"]);
+                assert_eq!(stdin, None);
+            }
+            _ => panic!("wrong request kind"),
+        }
+        let request: Request = serde_json::from_str(
+            r#"{"protocol":6,"kind":"work_command","args":["work","pipeline","set","--from-json","-"],"stdin":"{}"}"#,
+        )
+        .unwrap();
+        match request.body {
+            RequestBody::WorkCommand { host, args, stdin } => {
+                assert_eq!(host, None);
+                assert_eq!(args[1], "pipeline");
+                assert_eq!(stdin.as_deref(), Some("{}"));
+            }
+            _ => panic!("wrong request kind"),
+        }
+        let request: Request = serde_json::from_str(
+            r#"{"protocol":6,"kind":"work_up","request":{"work":"W-7","host":"dev","cwd":"/srv/x"}}"#,
+        )
+        .unwrap();
+        match request.body {
+            RequestBody::WorkUp { request } => assert_eq!(request.remote_host(), Some("dev")),
+            _ => panic!("wrong request kind"),
+        }
+        assert!(CAPABILITIES.contains(&"work_command_v1"));
+    }
+
+    #[test]
+    fn work_command_response_encodes_the_documented_shape() {
+        let response = Response::with_work_command(WorkCommandOutput {
+            exit_code: 0,
+            stdout: "{\"routes\":[]}\n".into(),
+            stderr: String::new(),
+        });
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["ok"], true);
+        assert_eq!(
+            encoded["work_command"],
+            serde_json::json!({"exit_code": 0, "stdout": "{\"routes\":[]}\n", "stderr": ""})
+        );
+        let plain = serde_json::to_value(Response::ok()).unwrap();
+        assert!(plain.get("work_command").is_none());
+    }
+
+    #[tokio::test]
+    async fn work_up_with_a_control_host_runs_the_same_argv_on_the_runner() {
+        let runner = FakeRunner::new(HostAccessMode::Control, "{\"work\":\"W-7\",\"agents\":2}\n");
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        let started = manager.start(request(Some("dev"))).await.unwrap();
+        assert_eq!(started.state, WorkUpOperationState::Running);
+        let settled = wait_settled(&manager, &started.operation_id).await;
+        assert_eq!(settled.state, WorkUpOperationState::Succeeded);
+        assert_eq!(settled.message, "Work pipeline started");
+        assert_eq!(settled.result.unwrap()["agents"], 2);
+        assert_eq!(
+            runner.runs(),
+            vec![RecordedRun {
+                host: "dev".into(),
+                args: request(None).arguments(),
+                stdin: None,
+                limits: WorkCommandLimits::WORK_UP,
+            }]
+        );
+        // The remote cwd travelled untouched.
+        assert!(runner.runs()[0]
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--cwd", "/srv/remote/checkout"]));
+    }
+
+    #[tokio::test]
+    async fn work_up_remote_failure_is_reported_from_the_last_stderr_line() {
+        let runner = Arc::new(FakeRunner {
+            host: "dev",
+            mode: HostAccessMode::Control,
+            output: WorkCommandOutput {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "note\nerror: no route matched W-7\n".into(),
+            },
+            runs: Mutex::new(Vec::new()),
+        });
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner),
+        );
+        let started = manager.start(request(Some("dev"))).await.unwrap();
+        let settled = wait_settled(&manager, &started.operation_id).await;
+        assert_eq!(settled.state, WorkUpOperationState::Failed);
+        assert_eq!(
+            settled.message,
+            "muxa work up failed: error: no route matched W-7"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_up_on_an_observe_host_is_refused_before_anything_runs() {
+        let runner = FakeRunner::new(HostAccessMode::Observe, "{}");
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        let error = manager.start(request(Some("dev"))).await.unwrap_err();
+        assert!(error.contains("observe-only"), "{error}");
+        assert!(error.contains("mode = \"control\""), "{error}");
+        assert!(runner.runs().is_empty());
+        let error = manager.start(request(Some("nope"))).await.unwrap_err();
+        assert!(error.contains("not configured"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn remote_hosts_are_refused_when_fleet_is_not_installed() {
+        let manager = WorkUpManager::new(PathBuf::from("/tmp/muxa-work-remote-test.sock"));
+        let error = manager.start(request(Some("dev"))).await.unwrap_err();
+        assert!(error.contains("fleet is not enabled"), "{error}");
+        let error = manager
+            .command(
+                Some("dev".into()),
+                argv(&["work", "options", "--json"]),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("fleet is not enabled"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn work_command_on_a_remote_host_forwards_argv_and_stdin() {
+        let runner = FakeRunner::new(HostAccessMode::Control, "{\"pipeline\":\"solo\"}\n");
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        let output = manager
+            .command(
+                Some("dev".into()),
+                argv(&["work", "pipeline", "set", "--from-json", "-"]),
+                Some("{\"name\":\"solo\"}".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "{\"pipeline\":\"solo\"}\n");
+        assert_eq!(
+            runner.runs(),
+            vec![RecordedRun {
+                host: "dev".into(),
+                args: argv(&["work", "pipeline", "set", "--from-json", "-"]),
+                stdin: Some("{\"name\":\"solo\"}".into()),
+                limits: WorkCommandLimits::COMMAND,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn work_command_on_an_observe_host_may_only_read_options() {
+        let runner = FakeRunner::new(HostAccessMode::Observe, "{}");
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        manager
+            .command(
+                Some("dev".into()),
+                argv(&["work", "options", "--json"]),
+                None,
+            )
+            .await
+            .unwrap();
+        for args in [
+            argv(&["work", "preset", "apply", "solo"]),
+            argv(&["work", "pipeline", "set", "--from-json", "-"]),
+            argv(&["work", "route", "remove", "CAL-.*"]),
+        ] {
+            let error = manager
+                .command(Some("dev".into()), args.clone(), None)
+                .await
+                .unwrap_err();
+            assert!(error.contains("observe-only"), "{args:?}: {error}");
+        }
+        assert_eq!(runner.runs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn work_command_rejects_non_allowlisted_argv_before_dispatch() {
+        let runner = FakeRunner::new(HostAccessMode::Control, "{}");
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        for args in [
+            argv(&["work", "up", "W-7", "--json", "--yes"]),
+            argv(&["fleet", "status"]),
+            argv(&["--socket", "/tmp/x.sock", "work", "options"]),
+            argv(&["work", "options", "--config", "/tmp/other.toml"]),
+            argv(&[]),
+        ] {
+            let error = manager
+                .command(Some("dev".into()), args.clone(), None)
+                .await
+                .unwrap_err();
+            assert!(
+                error.starts_with("invalid work command"),
+                "{args:?}: {error}"
+            );
+            let error = manager.command(None, args.clone(), None).await.unwrap_err();
+            assert!(
+                error.starts_with("invalid work command"),
+                "{args:?}: {error}"
+            );
+        }
+        let error = manager
+            .command(Some("   ".into()), argv(&["work", "options"]), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "host alias is empty");
+        assert!(runner.runs().is_empty());
     }
 }

@@ -60,6 +60,7 @@ fn make_realistic_agent() -> Agent {
         cwd: Some("/home/user/projects/some-large-codebase".into()),
         state: muxa::AgentState::Idle,
         last_prompt: Some(prompt),
+        last_prompt_at: None,
         last_response: Some(response),
         recap: None,
         ai_title: None,

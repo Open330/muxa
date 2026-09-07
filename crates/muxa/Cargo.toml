@@ -27,6 +27,10 @@ tokio-stream = { workspace = true }
 rust-embed = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
+# `ask_provider_configure` edits `[ask.providers.<id>]` in place, keeping
+# the operator's comments and ordering, the same way the CLI's work
+# editors do.
+toml_edit = "0.22"
 notify-rust = "4"
 portable-pty = { workspace = true }
 uuid = { workspace = true }

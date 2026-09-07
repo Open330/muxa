@@ -42,8 +42,9 @@ pub trait HookAdapter {
 /// 2. `$RMUX_PANE`, namespaced to `rmux:%N`.
 /// 3. `$ZELLIJ_PANE_ID` (zellij's "this pane" var).
 /// 4. `$HERDR_PANE_ID` (herdr's analog), namespaced to `herdr:<id>`.
-/// 5. `$CMUX_SURFACE_ID`, namespaced to `cmux:<id>`.
-/// 6. `$TMUX_PANE` (tmux and rmux compatibility set this).
+/// 5. `$TMUX_PANE` (tmux and rmux compatibility set this).
+/// 6. `$CMUX_SURFACE_ID`, namespaced to `cmux:<id>` — after tmux because a
+///    GUI terminal is always the outermost host (see [`host_pane_env`]).
 /// 7. Walk the parent-pid chain and match against the active backend's
 ///    `pane_pid_map()`. Linux reads `/proc`; macOS/BSD take one `ps` process
 ///    snapshot and walk it in memory. Useful when an agent hook subprocess
@@ -86,16 +87,27 @@ where
     // Endpoint metadata belongs to an external pane binding. A muxa-owned PTY
     // may inherit CMUX/TMUX variables from the terminal that requested it, but
     // that outer socket does not own the daemon-created PTY surface.
-    if ev.id().pane.is_some() && ev.id().tmux_socket.is_none() {
-        ev.id_mut().tmux_socket = host_endpoint_env();
+    //
+    // The endpoint is read for the host that *owns the pane id*, never for
+    // whichever host `detect_host_env` would pick on its own. A tmux pane
+    // inside a cmux tab inherits `CMUX_*` variables, and an independent
+    // detection used to stamp `%N` rows with the cmux socket — a pairing no
+    // pane scan can match, which made the agent invisible to collaboration.
+    if ev.id().tmux_socket.is_none() {
+        if let Some(pane) = ev.id().pane.clone() {
+            ev.id_mut().tmux_socket = pane_endpoint_env(&pane);
+        }
     }
     Ok(ev)
 }
 
 /// The tmux server socket path from `$TMUX` (`"<socket>,<pid>,<session>"`),
-/// when the hook process runs inside tmux. Empty/absent yields `None`.
-fn tmux_socket_env() -> Option<String> {
-    let value = std::env::var("TMUX").ok()?;
+/// when the hook process runs inside tmux. Empty/absent yields `None`. The
+/// path is kept verbatim (`/private/tmp/tmux-501/default`); the daemon
+/// shortens it to the scanner's socket name (`default`) on ingest through
+/// `crate::backend::pane_endpoint_identity`.
+fn tmux_socket_env_from(read: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let value = read("TMUX")?;
     let path = value.split(',').next()?.trim();
     if path.is_empty() {
         None
@@ -104,14 +116,33 @@ fn tmux_socket_env() -> Option<String> {
     }
 }
 
-/// Control endpoint for the detected pane host. The persisted field retains
+/// Control endpoint for the host that owns `pane`. The persisted field retains
 /// its historical `tmux_socket` name for protocol compatibility, but rmux and
 /// cmux rows carry their native socket paths here.
-fn host_endpoint_env() -> Option<String> {
-    match crate::backend::detect_host_env() {
-        Some(crate::backend::HostKind::Rmux) => crate::backend::rmux::endpoint_from_env(),
-        Some(crate::backend::HostKind::Cmux) => Some(crate::backend::cmux::endpoint_from_env()),
-        _ => tmux_socket_env(),
+fn pane_endpoint_env(pane: &str) -> Option<String> {
+    pane_endpoint_env_from(pane, |name| std::env::var(name).ok())
+}
+
+/// Decoupled-from-process-env variant of [`pane_endpoint_env`] for tests.
+///
+/// The host is taken from the pane id's namespace (`%N` tmux, `cmux:<id>`,
+/// `rmux:%N`, …) rather than re-detected from the environment, so the pane and
+/// its endpoint can never disagree: a `%N` pane always pairs with `$TMUX`'s
+/// socket even when the shell also carries a parent cmux's variables. The MCP
+/// server applies the same rule when it builds a collaboration origin, which
+/// is what lets the daemon match the two.
+///
+/// zellij and herdr panes keep the historical behaviour of recording the
+/// enclosing `$TMUX` socket when there is one (their hosts have no endpoint of
+/// their own on this protocol field); only tmux-vs-cmux ownership changed.
+fn pane_endpoint_env_from(pane: &str, read: impl Fn(&str) -> Option<String>) -> Option<String> {
+    use crate::backend::HostKind;
+    match crate::backend::pane_id_host_kind(pane) {
+        Some(HostKind::Rmux) => crate::backend::rmux::endpoint_from_value(&read("RMUX")?),
+        Some(HostKind::Cmux) => Some(crate::backend::cmux::endpoint_from(read)),
+        Some(HostKind::Tmux | HostKind::Zellij | HostKind::Herdr) | None => {
+            tmux_socket_env_from(read)
+        }
     }
 }
 
@@ -148,7 +179,7 @@ fn cmux_surface_env_from(read: impl Fn(&str) -> Option<String>) -> Option<Surfac
 
 /// Read whichever host-set "this pane" env var identifies the *innermost*
 /// host, in `MUXA_HOST` override → `RMUX_PANE` → `ZELLIJ_PANE_ID` →
-/// `HERDR_PANE_ID` → `CMUX_SURFACE_ID` → `TMUX_PANE` order. Empty string is
+/// `HERDR_PANE_ID` → `TMUX_PANE` → `CMUX_SURFACE_ID` order. Empty string is
 /// treated as unset. This mirrors
 /// `crate::backend::detect_from`'s host-selection precedence exactly, so the
 /// pane a hook is stamped onto and the backend that observes it always agree.
@@ -170,6 +201,15 @@ fn cmux_surface_env_from(read: impl Fn(&str) -> Option<String>) -> Option<Surfac
 /// tmux running *inside* a herdr pane — is served by the `MUXA_HOST=tmux`
 /// escape hatch, which forces `$TMUX_PANE` here (and the tmux backend in
 /// `detect_from`). `MUXA_HOST=herdr`/`zellij` force the corresponding var.
+///
+/// **tmux wins presence ties over cmux.** cmux is a GUI terminal application
+/// and therefore always the outermost layer: a tmux server started in a cmux
+/// tab hands every pane shell the cmux variables, and cmux can never run
+/// inside a tmux pane. Preferring cmux would stamp such hooks onto the cmux
+/// surface — or, on a cmux build that exports no `CMUX_SURFACE_ID`, leave the
+/// pane on tmux while `detect_from` chose cmux for the endpoint, producing a
+/// `%N` row with a cmux socket that no pane scan can match. `MUXA_HOST=cmux`
+/// forces the surface id when an operator really wants it.
 fn host_pane_env() -> Option<String> {
     host_pane_env_from(|name| std::env::var(name).ok())
 }
@@ -203,13 +243,13 @@ fn host_pane_env_from(read: impl Fn(&str) -> Option<String>) -> Option<String> {
     }
 
     // Auto-detect: native rmux first (it also sets TMUX_PANE), then zellij,
-    // herdr, cmux, and finally tmux. Byte-for-byte the same order as
+    // herdr, tmux, and finally cmux. Byte-for-byte the same order as
     // `detect_from`, so hook stamping and backend observation never disagree.
     pane_env_for(HostKind::Rmux, &read)
         .or_else(|| pane_env_for(HostKind::Zellij, &read))
         .or_else(|| pane_env_for(HostKind::Herdr, &read))
-        .or_else(|| pane_env_for(HostKind::Cmux, &read))
         .or_else(|| pane_env_for(HostKind::Tmux, &read))
+        .or_else(|| pane_env_for(HostKind::Cmux, &read))
 }
 
 /// The muxa pane id for one host from its "this pane" env var, or `None` when
@@ -336,6 +376,113 @@ mod tests {
             ])),
             Some("cmux:surface-8".to_string()),
         );
+    }
+
+    /// A tmux pane inside a cmux tab: the shell carries `CMUX_*` next to the
+    /// real `$TMUX_PANE`, and tmux must win because a GUI terminal is always
+    /// the outermost host — with or without a `CMUX_SURFACE_ID`.
+    #[test]
+    fn host_pane_env_prefers_tmux_pane_over_inherited_cmux_env() {
+        assert_eq!(
+            host_pane_env_from(env_reader(&[
+                ("TMUX_PANE", "%31"),
+                ("CMUX_WORKSPACE_ID", "workspace-2"),
+                ("CMUX_TAB_ID", "tab-2"),
+                ("CMUX_SOCKET_PATH", "/Users/me/.local/state/cmux/cmux.sock"),
+            ])),
+            Some("%31".to_string()),
+        );
+        assert_eq!(
+            host_pane_env_from(env_reader(&[
+                ("TMUX_PANE", "%31"),
+                ("CMUX_SURFACE_ID", "surface-7"),
+                ("CMUX_WORKSPACE_ID", "workspace-2"),
+            ])),
+            Some("%31".to_string()),
+            "tmux pane id must win the presence tie over cmux",
+        );
+    }
+
+    /// `MUXA_HOST=tmux` stays an explicit override in the same situation (it
+    /// is also the default now); `MUXA_HOST=cmux` is covered above.
+    #[test]
+    fn host_pane_env_muxa_host_tmux_beats_cmux_surface() {
+        assert_eq!(
+            host_pane_env_from(env_reader(&[
+                ("MUXA_HOST", "tmux"),
+                ("CMUX_SURFACE_ID", "surface-7"),
+                ("TMUX_PANE", "%3"),
+            ])),
+            Some("%3".to_string()),
+        );
+    }
+
+    /// The endpoint follows the pane's host namespace, not env detection: a
+    /// `%N` pane records `$TMUX`'s socket path even when cmux variables are
+    /// present, a `cmux:` pane records the cmux socket, and an `rmux:` pane
+    /// records `$RMUX`'s socket.
+    #[test]
+    fn pane_endpoint_follows_pane_namespace_not_env_detection() {
+        let nested = env_reader(&[
+            ("TMUX", "/private/tmp/tmux-501/default,3338,4"),
+            ("TMUX_PANE", "%31"),
+            ("CMUX_WORKSPACE_ID", "workspace-2"),
+            ("CMUX_SOCKET_PATH", "/Users/me/.local/state/cmux/cmux.sock"),
+        ]);
+        assert_eq!(
+            pane_endpoint_env_from("%31", &nested),
+            Some("/private/tmp/tmux-501/default".to_string()),
+        );
+        // The daemon shortens that path to the scanner's socket name, which
+        // is what `participants_from` and `resolve_origin` compare against.
+        assert_eq!(
+            crate::backend::pane_endpoint_identity(Some("%31"), "/private/tmp/tmux-501/default"),
+            "default",
+        );
+        assert_eq!(
+            pane_endpoint_env_from("cmux:surface-7", &nested),
+            Some("/Users/me/.local/state/cmux/cmux.sock".to_string()),
+        );
+        assert_eq!(
+            pane_endpoint_env_from("cmux:surface-7", env_reader(&[])),
+            Some(crate::backend::cmux::DEFAULT_SOCKET_PATH.to_string()),
+        );
+        assert_eq!(
+            pane_endpoint_env_from(
+                "rmux:%3",
+                env_reader(&[
+                    ("RMUX", "/tmp/rmux.sock,42,$1"),
+                    ("TMUX", "/tmp/rmux.sock,42,$1"),
+                ]),
+            ),
+            Some("/tmp/rmux.sock".to_string()),
+        );
+        // A tmux pane whose hook env lost `$TMUX` stays endpoint-less rather
+        // than borrowing the cmux socket.
+        assert_eq!(
+            pane_endpoint_env_from("%31", env_reader(&[("CMUX_SOCKET_PATH", "/tmp/cmux.sock")]),),
+            None,
+        );
+    }
+
+    /// `$TMUX` is `<socket>,<server pid>,<session index>`; only the socket
+    /// path is the endpoint, and blank values read as unset.
+    #[test]
+    fn tmux_socket_env_takes_first_field() {
+        assert_eq!(
+            tmux_socket_env_from(env_reader(&[(
+                "TMUX",
+                "/private/tmp/tmux-501/default,3338,4"
+            )])),
+            Some("/private/tmp/tmux-501/default".to_string()),
+        );
+        assert_eq!(
+            tmux_socket_env_from(env_reader(&[("TMUX", " /tmp/t ,1,0")])),
+            Some("/tmp/t".to_string()),
+        );
+        assert_eq!(tmux_socket_env_from(env_reader(&[("TMUX", "")])), None);
+        assert_eq!(tmux_socket_env_from(env_reader(&[("TMUX", ",1,0")])), None);
+        assert_eq!(tmux_socket_env_from(env_reader(&[])), None);
     }
 
     #[test]

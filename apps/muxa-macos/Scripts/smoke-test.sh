@@ -82,7 +82,14 @@ import json
 import sys
 
 response = json.loads(sys.argv[1])
-required = {"session_bytes_v1", "session_attachment_identity_v1", "work_control_v1"}
+required = {
+    "session_bytes_v1",
+    "session_attachment_identity_v1",
+    "work_control_v1",
+    "ask_status_v1",
+    "ask_one_turn_credential_v1",
+    "ask_conversations_v1",
+}
 missing = required.difference(response.get("capabilities", []))
 if missing:
     raise SystemExit(f"muxad did not advertise required capabilities: {sorted(missing)}")

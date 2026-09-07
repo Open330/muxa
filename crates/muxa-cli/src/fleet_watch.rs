@@ -1500,7 +1500,7 @@ fn handle_key(
                     agent_session_id: None,
                 };
                 terminal.suspend()?;
-                let result = crate::fleet_cli::attach_exact(cfg, &host_alias, &target);
+                let result = crate::fleet_cli::attach_exact(cfg, &host_alias, &target, false);
                 terminal.resume()?;
                 if let Err(error) = result {
                     app.status(format!("attach failed: {error}"));

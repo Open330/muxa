@@ -11,10 +11,15 @@ struct ContentView: View {
             HSplitView {
                 MuxaSidebar(
                     model: model,
+                    openPinnedSession: { id in
+                        model.selectWatchSession(id)
+                        tabs.openPinned(.fleetSession(id))
+                    },
                     openPinnedPane: { id in
                         model.selectWatchPane(id)
                         tabs.openPinned(.pane(id))
-                    }
+                    },
+                    closeShell: dismissExitedShell
                 )
                     .frame(minWidth: 260, idealWidth: 300, maxWidth: 380)
                 editorRegion
@@ -88,6 +93,9 @@ struct ContentView: View {
         .sheet(isPresented: $model.isPresentingHostRegistration) {
             HostRegistrationView(model: model)
         }
+        .sheet(item: $model.pipelineEditorTarget) { target in
+            PipelineEditorView(target: target, model: model)
+        }
         .task {
             model.activateEditor(tabs.focusedSelection)
             model.start()
@@ -141,6 +149,8 @@ struct ContentView: View {
             WorkCommandCenterView(model: model)
         case .watch:
             NativeWatchView(model: model)
+        case .inbox:
+            MuxaOperatorInboxView(model: model)
         case .ask:
             MuxaAskView(model: model)
         case .work(let identity):
@@ -152,15 +162,29 @@ struct ContentView: View {
             }
         case .agent(let id):
             if let participant = model.hostedAgents.first(where: { $0.id == id }) {
-                FleetAgentDetailView(participant: participant, client: model.client)
+                FleetAgentDetailView(participant: participant, model: model)
                     .id(participant.id)
             } else {
                 MuxaEmptyDetail(model: model)
             }
         case .host(let id):
             if let host = model.fleetHosts.first(where: { $0.id == id }) {
-                FleetHostDetailView(host: host)
+                FleetHostDetailView(host: host, model: model)
                     .id(host.id)
+            } else {
+                MuxaEmptyDetail(model: model)
+            }
+        case .fleetSession(let id):
+            if let session = model.executionSnapshot.watchSession(id: id) {
+                FleetSessionDetailView(session: session, model: model)
+                    .id(session.id)
+            } else {
+                MuxaEmptyDetail(model: model)
+            }
+        case .fleetWindow(let id):
+            if let window = model.executionSnapshot.watchWindow(id: id) {
+                FleetWindowDetailView(window: window, model: model)
+                    .id(window.id)
             } else {
                 MuxaEmptyDetail(model: model)
             }
@@ -192,6 +216,21 @@ struct ContentView: View {
         let selection = MuxaSidebarSelection.shell(id)
         if tabs.focusedGroupID == groupID {
             model.activateEditor(tabs.close(selection, groupID: groupID))
+        }
+        Task { await model.refresh() }
+    }
+
+    /// The Shells sidebar's close button on an exited row: drop every editor
+    /// tab that still shows the dead session, then refresh like the terminal's
+    /// own exit handling does. muxad keeps the record for a while, so the
+    /// sidebar hides the row itself.
+    private func dismissExitedShell(id: String) {
+        let selection = MuxaSidebarSelection.shell(id)
+        for group in tabs.groups where group.tabs.contains(selection) {
+            let focused = tabs.close(selection, groupID: group.id)
+            if tabs.focusedGroupID == group.id {
+                model.activateEditor(focused)
+            }
         }
         Task { await model.refresh() }
     }
@@ -376,11 +415,13 @@ private struct WorkspaceTabBar: View {
     private func tabLabel(for selection: MuxaSidebarSelection) -> String {
         switch selection {
         case .workBoard:
-            "Work Command Center"
+            String(localized: "Work Command Center")
         case .watch:
-            "Live Watch"
+            String(localized: "Live Watch")
+        case .inbox:
+            String(localized: "Inbox")
         case .ask:
-            "Ask"
+            String(localized: "Ask")
         case .work(let identity):
             model.workGroups.first { $0.identity == identity }?.title ?? identity.workID
         case .agent(let id):
@@ -388,16 +429,24 @@ private struct WorkspaceTabBar: View {
                 $0.agent.aiTitle
                     ?? $0.pane?.agentAlias.map { "@\($0)" }
                     ?? $0.agent.kind.replacingOccurrences(of: "_", with: " ")
-            } ?? "Agent"
+            } ?? String(localized: "Agent")
         case .host(let id):
-            model.fleetHosts.first { $0.id == id }?.alias ?? "Host"
+            model.fleetHosts.first { $0.id == id }?.alias ?? String(localized: "Host")
+        case .fleetSession(let id):
+            model.executionSnapshot.watchSession(id: id).map {
+                "\($0.hostAlias) · \($0.name.isEmpty ? $0.sessionID : $0.name)"
+            } ?? String(localized: "Session")
+        case .fleetWindow(let id):
+            model.executionSnapshot.watchWindow(id: id).map {
+                $0.name.isEmpty ? $0.windowID : $0.name
+            } ?? String(localized: "Window")
         case .shell(let id):
             model.sessions.first { $0.id == id }.map { $0.displayName ?? $0.id }
-                ?? "Shell"
+                ?? String(localized: "Shell")
         case .pane(let id):
             model.executionSnapshot.watchPane(id: id).map {
                 "\($0.host.alias) · \($0.pane.windowName.isEmpty ? $0.pane.paneID : $0.pane.windowName)"
-            } ?? "Fleet pane"
+            } ?? String(localized: "Pane")
         }
     }
 
@@ -405,10 +454,13 @@ private struct WorkspaceTabBar: View {
         switch selection {
         case .workBoard: "rectangle.3.group"
         case .watch: "waveform.path.ecg.rectangle"
+        case .inbox: "tray.full"
         case .ask: "sparkles"
         case .work: "square.stack.3d.up"
         case .agent: "person.crop.circle"
         case .host: "network"
+        case .fleetSession: "square.3.layers.3d"
+        case .fleetWindow: "macwindow"
         case .shell: "terminal"
         case .pane: "terminal.fill"
         }
@@ -430,24 +482,47 @@ private struct EditorTab: View {
     @State private var hovering = false
 
     var body: some View {
-        HStack(spacing: 7) {
-            Image(systemName: systemImage)
-                .foregroundStyle(active ? Color.accentColor : Color.secondary)
-            Text(title)
-                .italic(preview)
-                .lineLimit(1)
-            Spacer(minLength: 4)
-            Button(action: close) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 9, weight: .semibold))
-                    .frame(width: 18, height: 20)
+        ZStack(alignment: .trailing) {
+            Button(action: activate) {
+                HStack(spacing: 7) {
+                    Image(systemName: systemImage)
+                        .foregroundStyle(active ? Color.accentColor : Color.secondary)
+                    Text(title)
+                        .italic(preview)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                }
+                .padding(.leading, 10)
+                .padding(.trailing, 38)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .opacity(active || hovering ? 1 : 0)
-            .accessibilityLabel("Close \(title)")
+            .simultaneousGesture(
+                TapGesture(count: 2).onEnded {
+                    activate()
+                    pin()
+                }
+            )
+
+            if active || hovering {
+                Button(action: close) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .frame(width: 30, height: 34)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .background(
+                    active
+                        ? MuxaSurfacePalette.editor(for: colorScheme)
+                        : Color(nsColor: .controlBackgroundColor)
+                )
+                .accessibilityLabel("Close \(title)")
+                .help("Close \(title)")
+                .zIndex(2)
+            }
         }
-        .padding(.leading, 10)
-        .padding(.trailing, 5)
         .frame(minWidth: 132, maxWidth: 230, minHeight: 35, maxHeight: 35)
         .foregroundStyle(active ? Color.primary : Color.secondary)
         .background(
@@ -465,16 +540,8 @@ private struct EditorTab: View {
                 .fill(Color(nsColor: .separatorColor).opacity(0.55))
                 .frame(width: 1)
         }
-        .contentShape(Rectangle())
-        .onTapGesture(perform: activate)
-        .simultaneousGesture(
-            TapGesture(count: 2).onEnded {
-                activate()
-                pin()
-            }
-        )
         .onHover { hovering = $0 }
-        .help(preview ? "Preview — double-click to keep open" : title)
+        .help(preview ? Text("Preview — double-click to keep open") : Text(title))
         .contextMenu {
             if preview { Button("Keep Open", action: pin) }
             Button("Close", action: close)
@@ -491,18 +558,30 @@ private struct EditorTab: View {
 }
 
 private struct CommandPaletteView: View {
-    private enum PaletteCommand: String, CaseIterable, Identifiable {
-        case startWork = "Start configured Work"
-        case workCommandCenter = "Open Work Command Center"
-        case liveWatch = "Open native Live Watch"
-        case ask = "Open global Ask"
-        case newShell = "New native shell"
-        case showWork = "Show managed work"
-        case showHosts = "Show hosts"
-        case showShells = "Show native shells"
-        case refresh = "Refresh workspace"
+    private enum PaletteCommand: CaseIterable, Identifiable {
+        case startWork
+        case workCommandCenter
+        case liveWatch
+        case ask
+        case newShell
+        case showWork
+        case showShells
+        case refresh
 
         var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .startWork: String(localized: "Start configured Work")
+            case .workCommandCenter: String(localized: "Open Work Command Center")
+            case .liveWatch: String(localized: "Open native Live Watch")
+            case .ask: String(localized: "Open global Ask")
+            case .newShell: String(localized: "New native shell")
+            case .showWork: String(localized: "Show managed work")
+            case .showShells: String(localized: "Show native shells")
+            case .refresh: String(localized: "Refresh workspace")
+            }
+        }
 
         var systemImage: String {
             switch self {
@@ -512,7 +591,6 @@ private struct CommandPaletteView: View {
             case .ask: "sparkles"
             case .newShell: "plus.rectangle.on.rectangle"
             case .showWork: "square.stack.3d.up"
-            case .showHosts: "network"
             case .showShells: "terminal"
             case .refresh: "arrow.clockwise"
             }
@@ -527,7 +605,7 @@ private struct CommandPaletteView: View {
     private var commands: [PaletteCommand] {
         guard !query.isEmpty else { return PaletteCommand.allCases }
         return PaletteCommand.allCases.filter {
-            $0.rawValue.localizedCaseInsensitiveContains(query)
+            $0.title.localizedCaseInsensitiveContains(query)
         }
     }
 
@@ -552,7 +630,7 @@ private struct CommandPaletteView: View {
                 Button {
                     run(command)
                 } label: {
-                    Label(command.rawValue, systemImage: command.systemImage)
+                    Label(command.title, systemImage: command.systemImage)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
                 }
@@ -582,8 +660,6 @@ private struct CommandPaletteView: View {
             model.createShell()
         case .showWork:
             model.show(.work)
-        case .showHosts:
-            model.show(.hosts)
         case .showShells:
             model.show(.shells)
         case .refresh:
@@ -594,12 +670,20 @@ private struct CommandPaletteView: View {
 }
 
 private struct MuxaSidebar: View {
-    private enum StatusScope: String, CaseIterable, Identifiable {
-        case all = "All"
-        case attention = "Attention"
-        case active = "Active"
+    private enum StatusScope: CaseIterable, Identifiable {
+        case all
+        case attention
+        case active
 
         var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .all: String(localized: "All")
+            case .attention: String(localized: "Attention")
+            case .active: String(localized: "Active")
+            }
+        }
 
         var systemImage: String {
             switch self {
@@ -610,11 +694,106 @@ private struct MuxaSidebar: View {
         }
     }
 
+    private enum ExploreGrouping: String, CaseIterable, Identifiable {
+        case host
+        case status
+        case none
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .host: String(localized: "Host tree")
+            case .status: String(localized: "Status groups")
+            case .none: String(localized: "No groups")
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .host: "server.rack"
+            case .status: "circle.grid.2x2"
+            case .none: "list.bullet"
+            }
+        }
+    }
+
+    private enum ExploreStatusBucket: String, CaseIterable, Identifiable {
+        case attention
+        case active
+        case idle
+        case shell
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .attention: String(localized: "Needs attention")
+            case .active: String(localized: "Active")
+            case .idle: String(localized: "Idle agents")
+            case .shell: String(localized: "Shell panes")
+            }
+        }
+    }
+
+    private struct ExplorePaneGroup: Identifiable {
+        let bucket: ExploreStatusBucket
+        let panes: [MuxaWatchPane]
+
+        var id: ExploreStatusBucket { bucket }
+    }
+
+    private enum ExploreSort: String, CaseIterable, Identifiable {
+        case topology
+        case recent
+        case myPrompt
+        case agentActivity
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .topology: String(localized: "Topology")
+            case .recent: String(localized: "Latest activity")
+            case .myPrompt: String(localized: "My latest prompt")
+            case .agentActivity: String(localized: "Agent latest update")
+            }
+        }
+
+        var compactTitle: String {
+            switch self {
+            case .topology: String(localized: "Topology")
+            case .recent: String(localized: "Last activity")
+            case .myPrompt: String(localized: "My prompt")
+            case .agentActivity: String(localized: "Agent update")
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .topology: "point.3.connected.trianglepath.dotted"
+            case .recent: "clock.arrow.circlepath"
+            case .myPrompt: "person.crop.circle.badge.clock"
+            case .agentActivity: "sparkles"
+            }
+        }
+    }
+
     @ObservedObject var model: AppModel
+    let openPinnedSession: (MuxaWatchSessionIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
+    let closeShell: (String) -> Void
     @Environment(\.colorScheme) private var colorScheme
     @State private var filterText = ""
     @State private var statusScope: StatusScope = .all
+    /// Exited shells the user closed from the Shells list. muxad keeps an
+    /// exited session listed for a while, so the sidebar hides these until
+    /// the daemon drops them.
+    @State private var dismissedShellIDs: Set<String> = []
+    @State private var remoteShellError: String?
+    @State private var isOpeningRemoteShell = false
+    @AppStorage("muxa.explore.sort") private var exploreSort: ExploreSort = .topology
+    @AppStorage("muxa.explore.grouping") private var exploreGrouping: ExploreGrouping = .host
 
     private var background: Color {
         MuxaSurfacePalette.sidebar(for: colorScheme)
@@ -636,21 +815,12 @@ private struct MuxaSidebar: View {
                         Spacer()
                         if model.sidebarMode == .watch {
                             Button {
-                                model.select(.ask)
-                            } label: {
-                                Image(systemName: "sparkles")
-                            }
-                            .buttonStyle(.borderless)
-                            .help("Open global Ask")
-                            Button {
                                 model.select(.watch)
                             } label: {
                                 Image(systemName: "rectangle.on.rectangle")
                             }
                             .buttonStyle(.borderless)
                             .help("Open Live Watch")
-                        }
-                        if model.sidebarMode == .hosts {
                             Button {
                                 model.presentHostRegistration()
                             } label: {
@@ -659,7 +829,41 @@ private struct MuxaSidebar: View {
                             .buttonStyle(.borderless)
                             .help("Register SSH Host")
                         }
-                        Text(sidebarCountLabel)
+                        if model.sidebarMode == .shells {
+                            Button {
+                                model.createShell()
+                            } label: {
+                                Image(systemName: "plus")
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(!model.isConnected || model.isCreatingSession)
+                            .help("New native shell")
+                            Menu {
+                                if model.remoteShellHosts.isEmpty {
+                                    Text("No online fleet hosts")
+                                } else {
+                                    ForEach(model.remoteShellHosts) { host in
+                                        Button {
+                                            openRemoteShell(on: host)
+                                        } label: {
+                                            Label(host.alias, systemImage: "server.rack")
+                                        }
+                                    }
+                                }
+                            } label: {
+                                Image(systemName: "network")
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .disabled(!model.isConnected || isOpeningRemoteShell)
+                            .help("New shell on a fleet host")
+                            MuxaModuleMenu(
+                                context: .app,
+                                model: model,
+                                registry: MuxaModuleRegistry.shared
+                            )
+                        }
+                        Text(verbatim: sidebarCountLabel)
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
@@ -670,12 +874,12 @@ private struct MuxaSidebar: View {
                     HStack(spacing: 6) {
                         Image(systemName: "magnifyingglass")
                             .foregroundStyle(.secondary)
-                        TextField("Filter \(model.sidebarMode.title.lowercased())", text: $filterText)
+                        TextField(model.sidebarMode.filterPrompt, text: $filterText)
                             .textFieldStyle(.plain)
                         Menu {
                             Picker("Status", selection: $statusScope) {
                                 ForEach(StatusScope.allCases) { scope in
-                                    Label(scope.rawValue, systemImage: scope.systemImage)
+                                    Label(scope.title, systemImage: scope.systemImage)
                                         .tag(scope)
                                 }
                             }
@@ -693,7 +897,44 @@ private struct MuxaSidebar: View {
                     .padding(.horizontal, 10)
                     .padding(.bottom, 3)
 
-                    List(selection: $model.sidebarSelection) {
+                    if model.sidebarMode == .watch {
+                        HStack(spacing: 6) {
+                            Menu {
+                                Picker("Group", selection: $exploreGrouping) {
+                                    ForEach(ExploreGrouping.allCases) { grouping in
+                                        Label(grouping.title, systemImage: grouping.systemImage)
+                                            .tag(grouping)
+                                    }
+                                }
+                            } label: {
+                                Label(exploreGrouping.title, systemImage: exploreGrouping.systemImage)
+                                    .lineLimit(1)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .help("Group Explore by \(exploreGrouping.title.lowercased())")
+
+                            Menu {
+                                Picker("Order", selection: $exploreSort) {
+                                    ForEach(ExploreSort.allCases) { order in
+                                        Label(order.title, systemImage: order.systemImage)
+                                            .tag(order)
+                                    }
+                                }
+                            } label: {
+                                Label(exploreSort.compactTitle, systemImage: exploreSort.systemImage)
+                                    .lineLimit(1)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .help("Order Explore by \(exploreSort.title.lowercased())")
+                        }
+                        .font(.caption)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                    }
+
+                    List {
                         contextualRows
                     }
                     .listStyle(.sidebar)
@@ -706,14 +947,43 @@ private struct MuxaSidebar: View {
         .onChange(of: model.sidebarMode) { _ in
             filterText = ""
             statusScope = .all
+            remoteShellError = nil
         }
+        .onChange(of: model.sessions) { sessions in
+            dismissedShellIDs = dismissedShellIDs.filter { id in
+                sessions.contains { $0.id == id }
+            }
+        }
+    }
+
+    private func openInLiveWatch(_ participant: MuxaHostedAgent) {
+        model.openInLiveWatch(participant)
+    }
+
+    private func openRemoteShell(on host: MuxaFleetHost) {
+        guard !isOpeningRemoteShell else { return }
+        isOpeningRemoteShell = true
+        remoteShellError = nil
+        Task {
+            defer { isOpeningRemoteShell = false }
+            do {
+                try await model.createShell(sshHost: host)
+            } catch {
+                remoteShellError = error.localizedDescription
+            }
+        }
+    }
+
+    private func dismissShell(_ session: MuxaSession) {
+        dismissedShellIDs.insert(session.id)
+        closeShell(session.id)
     }
 
     private var sidebarCount: Int {
         switch model.sidebarMode {
         case .work: model.workGroups.count
         case .watch: model.executionSnapshot.watchHosts.reduce(0) { $0 + $1.paneCount }
-        case .hosts: model.fleetHosts.count
+        case .inbox: inboxBadgeCount
         case .shells: model.sessions.lazy.filter { !$0.exited }.count
         }
     }
@@ -722,7 +992,7 @@ private struct MuxaSidebar: View {
         switch model.sidebarMode {
         case .work: filteredWorkGroups.count
         case .watch: filteredWatchHosts.reduce(0) { $0 + $1.paneCount }
-        case .hosts: filteredHosts.count
+        case .inbox: inboxBadgeCount
         case .shells: filteredSessions.count
         }
     }
@@ -735,18 +1005,8 @@ private struct MuxaSidebar: View {
 
     private var filteredWorkGroups: [MuxaWorkGroup] {
         model.workGroups.filter {
-            matchesFilter([$0.title, $0.workspaceID, $0.pipelineRun.pipeline])
+            matchesFilter([$0.title, $0.workspaceID, $0.pipelineLabel])
                 && matchesScope(attention: $0.attentionCount > 0, active: $0.workingCount > 0)
-        }
-    }
-
-    private var filteredHosts: [MuxaFleetHost] {
-        model.fleetHosts.filter {
-            matchesFilter([$0.alias, $0.state, $0.mode, $0.error])
-                && matchesScope(
-                    attention: !["online", "connecting"].contains($0.state),
-                    active: ["online", "connecting"].contains($0.state)
-                )
         }
     }
 
@@ -761,8 +1021,50 @@ private struct MuxaSidebar: View {
         }
     }
 
+    /// Exited shells still listed by muxad and not yet closed from the
+    /// sidebar. They are neither "active" nor "attention", so a status
+    /// scope hides them.
+    private var visibleExitedSessions: [MuxaSession] {
+        guard statusScope == .all else { return [] }
+        return model.sessions.filter {
+            $0.exited
+                && !dismissedShellIDs.contains($0.id)
+                && matchesFilter([$0.displayName, $0.id])
+        }
+    }
+
+    private var attentionAgents: [MuxaHostedAgent] {
+        model.hostedAgents.filter {
+            ["waiting_input", "waiting_choice", "blocked", "error", "failed"]
+                .contains($0.agent.state)
+        }
+    }
+
+    private var filteredAttentionAgents: [MuxaHostedAgent] {
+        attentionAgents.filter { participant in
+            matchesFilter([
+                participant.host.alias,
+                participant.agent.aiTitle,
+                participant.agent.agentSessionID,
+                participant.agent.recap,
+                participant.agent.lastResponse,
+                participant.pane?.session,
+                participant.pane?.windowName,
+                participant.pane?.agentAlias,
+            ]) && matchesScope(attention: true, active: false)
+        }
+    }
+
+    private var inboxBadgeCount: Int {
+        let commandAttention = model.operatorMessages.lazy.filter {
+            $0.needsReply || $0.hasUnreadReply
+        }.count
+        let runningAsk = model.askEntries.lazy.filter { $0.status == "running" }.count
+        return commandAttention + runningAsk + attentionAgents.count
+    }
+
     private var filteredWatchHosts: [MuxaWatchHost] {
-        model.executionSnapshot.watchHosts.compactMap { hostGroup in
+        let filtered: [MuxaWatchHost] = model.executionSnapshot.watchHosts.compactMap { hostGroup in
             let sessions = hostGroup.sessions.compactMap { session -> MuxaWatchSession? in
                 let windows = session.windows.compactMap { window -> MuxaWatchWindow? in
                     let panes = window.panes.filter { pane in
@@ -808,6 +1110,132 @@ private struct MuxaSidebar: View {
             guard !sessions.isEmpty else { return nil }
             return MuxaWatchHost(host: hostGroup.host, sessions: sessions)
         }
+        return sortedWatchHosts(filtered)
+    }
+
+    private var filteredWatchPanes: [MuxaWatchPane] {
+        sortedPanes(
+            filteredWatchHosts
+                .flatMap(\.sessions)
+                .flatMap(\.windows)
+                .flatMap(\.panes)
+        )
+    }
+
+    private var filteredStatusPaneGroups: [ExplorePaneGroup] {
+        let grouped = Dictionary(grouping: filteredWatchPanes) { statusBucket(for: $0) }
+        return ExploreStatusBucket.allCases.compactMap { bucket in
+            guard let panes = grouped[bucket], !panes.isEmpty else { return nil }
+            return ExplorePaneGroup(bucket: bucket, panes: panes)
+        }
+    }
+
+    private func statusBucket(for pane: MuxaWatchPane) -> ExploreStatusBucket {
+        guard let state = pane.agent?.state else { return .shell }
+        if ["waiting_input", "waiting_choice", "blocked", "error", "failed"].contains(state) {
+            return .attention
+        }
+        if ["working", "starting"].contains(state) { return .active }
+        return .idle
+    }
+
+    private func sortedWatchHosts(_ hosts: [MuxaWatchHost]) -> [MuxaWatchHost] {
+        let rebuilt = hosts.map { host in
+            let sessions = host.sessions.map { session in
+                let windows = session.windows.map { window in
+                    MuxaWatchWindow(
+                        hostAlias: window.hostAlias,
+                        socket: window.socket,
+                        sessionID: window.sessionID,
+                        windowID: window.windowID,
+                        name: window.name,
+                        index: window.index,
+                        panes: sortedPanes(window.panes)
+                    )
+                }.sorted { ordered($0, before: $1) }
+                return MuxaWatchSession(
+                    hostAlias: session.hostAlias,
+                    socket: session.socket,
+                    sessionID: session.sessionID,
+                    name: session.name,
+                    windows: windows
+                )
+            }.sorted { ordered($0, before: $1) }
+            return MuxaWatchHost(host: host.host, sessions: sessions)
+        }
+        return rebuilt.sorted { ordered($0, before: $1) }
+    }
+
+    private func sortedPanes(_ panes: [MuxaWatchPane]) -> [MuxaWatchPane] {
+        panes.sorted { left, right in
+            let leftDate = activityDate(for: left)
+            let rightDate = activityDate(for: right)
+            if exploreSort != .topology, leftDate != rightDate { return leftDate > rightDate }
+            if left.host.alias != right.host.alias {
+                if left.host.local != right.host.local { return left.host.local }
+                return left.host.alias.localizedStandardCompare(right.host.alias) == .orderedAscending
+            }
+            if left.pane.session != right.pane.session {
+                return left.pane.session.localizedStandardCompare(right.pane.session) == .orderedAscending
+            }
+            let leftWindowIndex = Int(left.pane.windowIndex) ?? Int.max
+            let rightWindowIndex = Int(right.pane.windowIndex) ?? Int.max
+            if leftWindowIndex != rightWindowIndex { return leftWindowIndex < rightWindowIndex }
+            let leftIndex = Int(left.pane.paneIndex) ?? Int.max
+            let rightIndex = Int(right.pane.paneIndex) ?? Int.max
+            if leftIndex != rightIndex { return leftIndex < rightIndex }
+            return left.pane.paneID.localizedStandardCompare(right.pane.paneID) == .orderedAscending
+        }
+    }
+
+    private func ordered(_ left: MuxaWatchWindow, before right: MuxaWatchWindow) -> Bool {
+        let leftDate = latestDate(in: left.panes)
+        let rightDate = latestDate(in: right.panes)
+        if exploreSort != .topology, leftDate != rightDate { return leftDate > rightDate }
+        let leftIndex = Int(left.index) ?? Int.max
+        let rightIndex = Int(right.index) ?? Int.max
+        if leftIndex != rightIndex { return leftIndex < rightIndex }
+        return left.name.localizedStandardCompare(right.name) == .orderedAscending
+    }
+
+    private func ordered(_ left: MuxaWatchSession, before right: MuxaWatchSession) -> Bool {
+        let leftDate = latestDate(in: left.windows.flatMap(\.panes))
+        let rightDate = latestDate(in: right.windows.flatMap(\.panes))
+        if exploreSort != .topology, leftDate != rightDate { return leftDate > rightDate }
+        return left.name.localizedStandardCompare(right.name) == .orderedAscending
+    }
+
+    private func ordered(_ left: MuxaWatchHost, before right: MuxaWatchHost) -> Bool {
+        let leftDate = latestDate(in: left.sessions.flatMap(\.windows).flatMap(\.panes))
+        let rightDate = latestDate(in: right.sessions.flatMap(\.windows).flatMap(\.panes))
+        if exploreSort != .topology, leftDate != rightDate { return leftDate > rightDate }
+        if left.host.local != right.host.local { return left.host.local }
+        return left.host.alias.localizedStandardCompare(right.host.alias) == .orderedAscending
+    }
+
+    private func latestDate(in panes: [MuxaWatchPane]) -> Date {
+        panes.map(activityDate(for:)).max() ?? .distantPast
+    }
+
+    private func activityDate(for pane: MuxaWatchPane) -> Date {
+        guard let agent = pane.agent else { return .distantPast }
+        switch exploreSort {
+        case .topology:
+            return .distantPast
+        case .recent:
+            return max(parsedDate(agent.lastPromptAt), parsedDate(agent.lastActivityAt))
+        case .myPrompt:
+            return parsedDate(agent.lastPromptAt)
+        case .agentActivity:
+            return parsedDate(agent.lastActivityAt)
+        }
+    }
+
+    private func parsedDate(_ value: String?) -> Date {
+        guard let value else { return .distantPast }
+        let fractional = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        if let date = try? fractional.parse(value) { return date }
+        return (try? Date.ISO8601FormatStyle().parse(value)) ?? .distantPast
     }
 
     private func matchesFilter(_ values: [String?]) -> Bool {
@@ -830,8 +1258,16 @@ private struct MuxaSidebar: View {
         switch model.sidebarMode {
         case .work:
             Section("Workspace") {
-                WorkBoardRow(workCount: model.workGroups.count, agentCount: model.hostedAgents.count)
-                    .tag(MuxaSidebarSelection.workBoard)
+                Button {
+                    model.select(.workBoard)
+                } label: {
+                    WorkBoardRow(workCount: model.workGroups.count, agentCount: model.hostedAgents.count)
+                }
+                .buttonStyle(.plain)
+                .listRowBackground(
+                    model.sidebarSelection == .workBoard
+                        ? Color.accentColor.opacity(0.14) : Color.clear
+                )
             }
             Section("Managed work") {
                 if model.workGroups.isEmpty {
@@ -840,22 +1276,163 @@ private struct MuxaSidebar: View {
                     SidebarEmptyRow(title: "No matching work", systemImage: "line.3.horizontal.decrease.circle")
                 } else {
                     ForEach(filteredWorkGroups) { work in
-                        WorkRow(work: work)
-                            .tag(MuxaSidebarSelection.work(work.identity))
+                        Button {
+                            model.select(.work(work.identity))
+                        } label: {
+                            WorkRow(work: work)
+                        }
+                        .buttonStyle(.plain)
+                        .listRowBackground(
+                            model.sidebarSelection == .work(work.identity)
+                                ? Color.accentColor.opacity(0.14) : Color.clear
+                        )
                     }
                 }
             }
         case .watch:
-            Section("Execution topology") {
-                if model.executionSnapshot.watchHosts.allSatisfy({ $0.paneCount == 0 }) {
-                    SidebarEmptyRow(title: "No panes detected", systemImage: "terminal")
-                } else if filteredWatchHosts.isEmpty {
-                    SidebarEmptyRow(title: "No matching panes", systemImage: "line.3.horizontal.decrease.circle")
+            watchContextualRows
+        case .inbox:
+            Section("Operator") {
+                Button {
+                    model.select(.inbox)
+                } label: {
+                    OperatorInboxRow(
+                        commands: model.operatorMessages.count,
+                        attention: inboxBadgeCount
+                    )
+                }
+                .buttonStyle(.plain)
+                Button {
+                    model.select(.ask)
+                } label: {
+                    GlobalAskRow(
+                        conversationCount: model.askConversations.lazy.filter {
+                            $0.agent == model.askAgent
+                        }.count,
+                        agent: model.askAgent
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+            Section("Needs attention") {
+                if attentionAgents.isEmpty {
+                    SidebarEmptyRow(title: "Nothing needs attention", systemImage: "checkmark.circle")
+                } else if filteredAttentionAgents.isEmpty {
+                    SidebarEmptyRow(title: "No matching requests", systemImage: "line.3.horizontal.decrease.circle")
                 } else {
+                    ForEach(filteredAttentionAgents) { participant in
+                        // The row is the selection; the sidebar stays on
+                        // Inbox and the detail explains the request. The
+                        // trailing button keeps one-click access to the
+                        // pane in Live Watch.
+                        HStack(spacing: 2) {
+                            Button {
+                                model.select(.agent(participant.id))
+                            } label: {
+                                InboxAgentRow(participant: participant)
+                            }
+                            .buttonStyle(.plain)
+                            if participant.pane != nil {
+                                Button {
+                                    openInLiveWatch(participant)
+                                } label: {
+                                    Image(systemName: "rectangle.on.rectangle")
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.borderless)
+                                .controlSize(.small)
+                                .help("Open in Live Watch")
+                            }
+                        }
+                        .listRowBackground(
+                            model.sidebarSelection == .agent(participant.id)
+                                ? Color.accentColor.opacity(0.14) : Color.clear
+                        )
+                        .contextMenu {
+                            Button("Open in Live Watch") {
+                                openInLiveWatch(participant)
+                            }
+                            .disabled(participant.pane == nil)
+                        }
+                    }
+                }
+            }
+        case .shells:
+            Section("Native shells") {
+                if let remoteShellError {
+                    Label(remoteShellError, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .lineLimit(3)
+                        .listRowBackground(Color.clear)
+                }
+                if model.sessions.allSatisfy(\.exited), visibleExitedSessions.isEmpty {
+                    ShellsEmptyRow(
+                        canCreate: model.isConnected && !model.isCreatingSession,
+                        create: model.createShell
+                    )
+                } else if filteredSessions.isEmpty, visibleExitedSessions.isEmpty {
+                    SidebarEmptyRow(title: "No matching shells", systemImage: "line.3.horizontal.decrease.circle")
+                } else {
+                    ForEach(filteredSessions) { session in
+                        Button {
+                            model.select(.shell(session.id))
+                        } label: {
+                            SessionRow(session: session)
+                        }
+                        .buttonStyle(.plain)
+                        .listRowBackground(
+                            model.sidebarSelection == .shell(session.id)
+                                ? Color.accentColor.opacity(0.14) : Color.clear
+                        )
+                    }
+                    ForEach(visibleExitedSessions) { session in
+                        // Not selectable: the model drops an exited shell
+                        // from the available selections, so a click would
+                        // only bounce back to the Work board.
+                        HStack(spacing: 2) {
+                            SessionRow(session: session)
+                            Button {
+                                dismissShell(session)
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                            .help("Remove exited shell")
+                        }
+                        .listRowBackground(Color.clear)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var watchContextualRows: some View {
+        if model.executionSnapshot.watchHosts.allSatisfy({ $0.paneCount == 0 }) {
+            Section("Execution topology") {
+                SidebarEmptyRow(title: "No panes detected", systemImage: "terminal")
+            }
+        } else if filteredWatchPanes.isEmpty {
+            Section("Execution topology") {
+                SidebarEmptyRow(
+                    title: "No matching panes",
+                    systemImage: "line.3.horizontal.decrease.circle"
+                )
+            }
+        } else {
+            switch exploreGrouping {
+            case .host:
+                Section("Execution topology") {
                     ForEach(filteredWatchHosts) { host in
                         WatchHostTree(
                             group: host,
-                            selectedPaneID: model.watchSelection,
+                            selection: watchTreeSelection,
+                            selectHost: { model.select(.host($0)) },
+                            selectSession: model.selectWatchSession,
+                            openPinnedSession: openPinnedSession,
                             selectPane: model.selectWatchPane,
                             openPinnedPane: openPinnedPane,
                             forceExpanded: !filterText.isEmpty || statusScope != .all,
@@ -865,30 +1442,40 @@ private struct MuxaSidebar: View {
                         .listRowBackground(Color.clear)
                     }
                 }
-            }
-        case .hosts:
-            Section("Fleet") {
-                if model.fleetHosts.isEmpty {
-                    SidebarEmptyRow(title: "No hosts detected", systemImage: "network.slash")
-                } else if filteredHosts.isEmpty {
-                    SidebarEmptyRow(title: "No matching hosts", systemImage: "line.3.horizontal.decrease.circle")
-                } else {
-                    ForEach(filteredHosts) { host in
-                        FleetHostRow(host: host)
-                            .tag(MuxaSidebarSelection.host(host.id))
+            case .status:
+                ForEach(filteredStatusPaneGroups) { group in
+                    Section {
+                        ForEach(group.panes) { pane in
+                            WatchFlatPaneRow(
+                                pane: pane,
+                                highlight: watchTreeSelection.highlight(
+                                    for: .pane(pane.id),
+                                    containsFollowedPane: model.watchSelection == pane.id
+                                ),
+                                selectPane: model.selectWatchPane,
+                                openPinnedPane: openPinnedPane
+                            )
+                            .listRowInsets(EdgeInsets(top: 1, leading: 5, bottom: 1, trailing: 5))
+                            .listRowBackground(Color.clear)
+                        }
+                    } header: {
+                        Text(verbatim: "\(group.bucket.title) · \(group.panes.count)")
                     }
                 }
-            }
-        case .shells:
-            Section("Native shells") {
-                if model.sessions.isEmpty {
-                    SidebarEmptyRow(title: "No native shells", systemImage: "terminal")
-                } else if filteredSessions.isEmpty {
-                    SidebarEmptyRow(title: "No matching shells", systemImage: "line.3.horizontal.decrease.circle")
-                } else {
-                    ForEach(filteredSessions) { session in
-                        SessionRow(session: session)
-                            .tag(MuxaSidebarSelection.shell(session.id))
+            case .none:
+                Section("All panes · \(filteredWatchPanes.count)") {
+                    ForEach(filteredWatchPanes) { pane in
+                        WatchFlatPaneRow(
+                            pane: pane,
+                            highlight: watchTreeSelection.highlight(
+                                for: .pane(pane.id),
+                                containsFollowedPane: model.watchSelection == pane.id
+                            ),
+                            selectPane: model.selectWatchPane,
+                            openPinnedPane: openPinnedPane
+                        )
+                        .listRowInsets(EdgeInsets(top: 1, leading: 5, bottom: 1, trailing: 5))
+                        .listRowBackground(Color.clear)
                     }
                 }
             }
@@ -896,12 +1483,20 @@ private struct MuxaSidebar: View {
     }
 
     private func watchWorkLabel(_ window: MuxaWatchWindow) -> String? {
+        let stamped = Set(window.panes.compactMap(\.pane.workIdentity))
+        if stamped.count == 1, let identity = stamped.first {
+            return "\(identity.workspaceID) › \(identity.workID)"
+        }
         guard window.hostAlias == model.fleetHosts.first(where: { $0.local })?.alias else {
             return nil
         }
         return model.pipelineRuns.first(where: { $0.windowID == window.windowID }).map {
             "\($0.identity.workspaceID) › \($0.identity.workID)"
         }
+    }
+
+    private var watchTreeSelection: WatchTreeSelection {
+        WatchTreeSelection(editor: model.sidebarSelection, followedPane: model.watchSelection)
     }
 }
 
@@ -933,7 +1528,7 @@ private struct SidebarActivityRail: View {
                         .overlay(alignment: .topTrailing) {
                             let count = attentionCount(for: mode)
                             if count > 0 {
-                                Text(count > 99 ? "99+" : "\(count)")
+                                Text(verbatim: count > 99 ? "99+" : "\(count)")
                                     .font(.system(size: 8, weight: .bold, design: .rounded))
                                     .foregroundStyle(.white)
                                     .padding(.horizontal, count > 9 ? 4 : 3)
@@ -959,28 +1554,160 @@ private struct SidebarActivityRail: View {
     private func attentionCount(for mode: MuxaSidebarMode) -> Int {
         switch mode {
         case .work:
-            model.workGroups.lazy.filter { $0.attentionCount > 0 }.count
+            return model.workGroups.lazy.filter { $0.attentionCount > 0 }.count
         case .watch:
-            model.hostedAgents.lazy.filter {
+            return 0
+        case .inbox:
+            let agentAttention = model.hostedAgents.lazy.filter {
                 ["waiting_input", "waiting_choice", "blocked", "error", "failed"]
                     .contains($0.agent.state)
             }.count
-        case .hosts:
-            model.fleetHosts.lazy.filter { !["online", "connecting"].contains($0.state) }.count
+            let commandAttention = model.operatorMessages.lazy.filter {
+                $0.needsReply || $0.hasUnreadReply
+            }.count
+            let askAttention = model.askEntries.lazy.filter { $0.status == "running" }.count
+            return agentAttention + commandAttention + askAttention
         case .shells:
-            0
+            return 0
         }
     }
 }
 
 private struct SidebarEmptyRow: View {
-    let title: String
+    let title: LocalizedStringKey
     let systemImage: String
 
     var body: some View {
         Label(title, systemImage: systemImage)
             .foregroundStyle(.secondary)
             .listRowBackground(Color.clear)
+    }
+}
+
+/// The Shells tab with nothing to list: a hint plus the same action as the
+/// toolbar's "New shell", so the tab can create what it shows.
+private struct ShellsEmptyRow: View {
+    let canCreate: Bool
+    let create: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("No native shells", systemImage: "terminal")
+                .foregroundStyle(.secondary)
+            Text("Open a terminal on this Mac, or on an online fleet host from the network menu above.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button(action: create) {
+                Label("New Shell", systemImage: "plus")
+            }
+            .controlSize(.small)
+            .disabled(!canCreate)
+        }
+        .padding(.vertical, 4)
+        .listRowBackground(Color.clear)
+    }
+}
+
+private struct GlobalAskRow: View {
+    let conversationCount: Int
+    let agent: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "sparkles")
+                .foregroundStyle(.tint)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Global Ask")
+                    .fontWeight(.medium)
+                Text("@\(agent) · \(conversationCount) conversations")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Image(systemName: "chevron.right")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+}
+
+private struct OperatorInboxRow: View {
+    let commands: Int
+    let attention: Int
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: attention > 0 ? "tray.full.fill" : "tray.full")
+                .foregroundStyle(attention > 0 ? Color.orange : Color.accentColor)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Operator Inbox")
+                    .fontWeight(.medium)
+                Text(attention > 0 ? "\(attention) waiting or new" : "\(commands) sent commands")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Image(systemName: "chevron.right")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+}
+
+private struct InboxAgentRow: View {
+    let participant: MuxaHostedAgent
+
+    private var title: String {
+        participant.pane?.agentAlias.map { "@\($0)" }
+            ?? participant.agent.aiTitle
+            ?? participant.agent.kind.replacingOccurrences(of: "_", with: " ")
+    }
+
+    private var summary: String {
+        presentText(participant.agent.recap)
+            ?? presentText(participant.agent.lastNotification)
+            ?? presentText(participant.agent.lastPrompt)
+            ?? String(localized: "Waiting for input")
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Circle()
+                .fill(agentStateColor(participant.agent.state))
+                .frame(width: 8, height: 8)
+                .padding(.top, 5)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(title)
+                        .fontWeight(.medium)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(participant.host.alias)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                }
+                Text(summary)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+            }
+        }
+        .padding(.horizontal, 4)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+        .contentShape(Rectangle())
     }
 }
 
@@ -1082,7 +1809,7 @@ private struct SidebarConnectionStatus: View {
 
     @ViewBuilder
     private func statusMessage(
-        title: String,
+        title: LocalizedStringKey,
         message: String,
         systemImage: String
     ) -> some View {
@@ -1137,7 +1864,7 @@ private struct NativeWatchRow: View {
             }
             Spacer()
             if attentionCount > 0 {
-                Text("\(attentionCount)")
+                Text(verbatim: "\(attentionCount)")
                     .font(.caption2.bold().monospacedDigit())
                     .foregroundStyle(.white)
                     .padding(.horizontal, 6)
@@ -1161,11 +1888,15 @@ private struct SessionRow: View {
                 .frame(width: 16)
             VStack(alignment: .leading, spacing: 2) {
                 Text(session.displayName ?? session.id)
+                    .foregroundStyle(session.exited ? .secondary : .primary)
                     .lineLimit(1)
                 HStack(spacing: 6) {
-                    if let pid = session.pid { Text("pid \(pid)") }
-                    if session.attachedClients > 0 { Text("\(session.attachedClients) attached") }
-                    if session.exited { Text("exited \(session.exitStatus ?? 0)") }
+                    if session.exited {
+                        Text(session.shellStateText)
+                    } else {
+                        if let pid = session.pid { Text("pid \(pid)") }
+                        if session.attachedClients > 0 { Text("\(session.attachedClients) attached") }
+                    }
                 }
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -1193,7 +1924,7 @@ private struct WorkRow: View {
                 HStack(spacing: 5) {
                     Text(work.workspaceID)
                     if !work.hostAliases.isEmpty {
-                        Text("· \(work.hostAliases.joined(separator: ", "))")
+                        Text(verbatim: "· \(work.hostAliases.joined(separator: ", "))")
                     }
                 }
                     .font(.caption2)
@@ -1201,9 +1932,15 @@ private struct WorkRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
-            Text("\(work.completedCount)/\(work.totalCount)")
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(work.attentionCount > 0 ? .orange : .secondary)
+            Group {
+                if work.pipelineRun == nil {
+                    Text("\(work.participants.count) agents")
+                } else {
+                    Text(verbatim: "\(work.completedCount)/\(work.totalCount)")
+                }
+            }
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(work.attentionCount > 0 ? .orange : .secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
@@ -1221,7 +1958,7 @@ private struct FleetAgentRow: View {
     }
 
     private var executionLocation: String {
-        guard let pane = participant.pane else { return "no pane binding" }
+        guard let pane = participant.pane else { return String(localized: "no pane binding") }
         let window = pane.windowName.isEmpty ? pane.stableWindowID : pane.windowName
         return "\(pane.session) › \(window) › \(pane.paneID)"
     }
@@ -1237,7 +1974,7 @@ private struct FleetAgentRow: View {
                     Text(title)
                         .lineLimit(1)
                 }
-                Text("\(participant.host.alias) · \(participant.agent.agentSessionID)")
+                Text(verbatim: "\(participant.host.alias) · \(participant.agent.agentSessionID)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -1251,38 +1988,7 @@ private struct FleetAgentRow: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .padding(.vertical, 2)
-        .help("Independent fleet agent session: \(participant.agent.agentSessionID)")
-    }
-}
-
-private struct FleetHostRow: View {
-    let host: MuxaFleetHost
-
-    var body: some View {
-        HStack(spacing: 10) {
-            HostIdentityBadge(host: host, size: 28)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(host.alias)
-                    .lineLimit(1)
-                HStack(spacing: 5) {
-                    Text(host.local ? "local" : host.state.replacingOccurrences(of: "_", with: " "))
-                    if let remote = host.remote {
-                        Text("· \(remote.agents.filter { $0.state != "stopped" }.count) agents")
-                    }
-                    if let latency = host.latencyMS, !host.local {
-                        Text("· \(latency) ms")
-                    }
-                }
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 0)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-        .padding(.vertical, 2)
-        .help(host.error ?? "\(host.mode) access")
+        .help("Independent agent session: \(participant.agent.agentSessionID)")
     }
 }
 
@@ -1292,7 +1998,11 @@ private struct WorkDetailView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     private let columns = [
-        GridItem(.adaptive(minimum: 250, maximum: 380), spacing: 12),
+        GridItem(.adaptive(minimum: 250, maximum: 390), spacing: 12, alignment: .top),
+    ]
+
+    private let metricColumns = [
+        GridItem(.adaptive(minimum: 112, maximum: 180), spacing: 12),
     ]
 
     var body: some View {
@@ -1305,22 +2015,28 @@ private struct WorkDetailView: View {
                     Text(work.title)
                         .font(.largeTitle.weight(.semibold))
                     HStack(spacing: 8) {
-                        Label(work.pipelineRun.pipeline, systemImage: "point.3.connected.trianglepath.dotted")
-                        Text("generation \(work.pipelineRun.generation)")
+                        Label(work.pipelineLabel, systemImage: "point.3.connected.trianglepath.dotted")
+                        if let generation = work.pipelineRun?.generation {
+                            Text("generation \(generation)")
+                        } else {
+                            Text("observed from tmux metadata")
+                        }
                         if !work.hostAliases.isEmpty {
-                            Text("·")
+                            Text(verbatim: "·")
                             Label(work.hostAliases.joined(separator: ", "), systemImage: "network")
                         }
                     }
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
-                    Text(work.pipelineRun.cwd)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.tertiary)
-                        .textSelection(.enabled)
+                    if let cwd = work.cwd {
+                        Text(cwd)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.tertiary)
+                            .textSelection(.enabled)
+                    }
                 }
 
-                HStack(spacing: 16) {
+                LazyVGrid(columns: metricColumns, alignment: .leading, spacing: 12) {
                     WorkMetric(
                         title: "Participants",
                         value: "\(work.participants.count)",
@@ -1336,11 +2052,13 @@ private struct WorkDetailView: View {
                         value: "\(work.attentionCount)",
                         color: .orange
                     )
-                    WorkMetric(
-                        title: "Pipeline done",
-                        value: "\(work.completedCount)/\(work.totalCount)",
-                        color: .green
-                    )
+                    if work.pipelineRun != nil {
+                        WorkMetric(
+                            title: "Pipeline done",
+                            value: "\(work.completedCount)/\(work.totalCount)",
+                            color: .green
+                        )
+                    }
                 }
 
                 WorkPromptComposer(work: work, model: model)
@@ -1368,11 +2086,13 @@ private struct WorkDetailView: View {
                                 }
                             )
                         }
-                        ForEach(unboundDesiredAgents(run: work.pipelineRun), id: \.alias) { desired in
-                            PipelinePlaceholderCard(
-                                desired: desired,
-                                state: work.pipelineRun.aliases[desired.alias]
-                            )
+                        if let run = work.pipelineRun {
+                            ForEach(unboundDesiredAgents(run: run), id: \.alias) { desired in
+                                PipelinePlaceholderCard(
+                                    desired: desired,
+                                    state: run.aliases[desired.alias]
+                                )
+                            }
                         }
                     }
                 }
@@ -1390,13 +2110,13 @@ private struct WorkDetailView: View {
 }
 
 private struct WorkMetric: View {
-    let title: String
+    let title: LocalizedStringKey
     let value: String
     let color: Color
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(value)
+            Text(verbatim: value)
                 .font(.title2.weight(.semibold).monospacedDigit())
                 .foregroundStyle(color)
             Text(title)
@@ -1431,33 +2151,42 @@ private struct WorkParticipantCard: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
                         .font(.headline)
-                    Text("\(participant.host.alias) · \(desired?.role ?? participant.agent.kind)")
+                        .lineLimit(1)
+                    Text(verbatim: "\(participant.host.alias) · \(desired?.role ?? participant.agent.kind)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
                 Spacer()
                 Label(agentStateLabel(participant.agent.state), systemImage: "circle.fill")
                     .labelStyle(.titleAndIcon)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(agentStateColor(participant.agent.state))
+                    .lineLimit(1)
+                    .fixedSize()
             }
+            .frame(minHeight: 38, maxHeight: 42, alignment: .top)
 
-            if let summary, !summary.isEmpty {
-                MarkdownContent(source: summary, lineLimit: 4)
-            } else {
-                Text("Waiting for work context")
-                    .font(.subheadline)
-                    .foregroundStyle(.tertiary)
-            }
-
-            HStack(spacing: 8) {
-                if let pane = participant.pane {
-                    Text("\(pane.session) › \(pane.windowName.isEmpty ? pane.stableWindowID : pane.windowName) › \(pane.paneID)")
+            Group {
+                if let summary, !summary.isEmpty {
+                    MarkdownContent(source: summary, lineLimit: 4, selectable: false)
+                } else {
+                    Text("Waiting for work context")
+                        .font(.subheadline)
+                        .foregroundStyle(.tertiary)
                 }
-                if let model = participant.agent.model { Text(model) }
             }
+            .frame(maxHeight: 68, alignment: .topLeading)
+            .clipped()
+
+            Text(executionLabel)
             .font(.caption2.monospaced())
             .foregroundStyle(.tertiary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .help(executionLabel)
+
+            Spacer(minLength: 0)
 
             Button(action: openAgent) {
                 Label("Open agent details", systemImage: "arrow.right.circle")
@@ -1468,12 +2197,22 @@ private struct WorkParticipantCard: View {
             .foregroundStyle(.tint)
         }
         .padding(14)
-        .frame(maxWidth: .infinity, minHeight: 140, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: 210, maxHeight: 210, alignment: .topLeading)
+        .clipped()
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(.separator.opacity(0.55), lineWidth: 0.5)
         }
+    }
+
+    private var executionLabel: String {
+        var parts: [String] = []
+        if let pane = participant.pane {
+            parts.append("\(pane.session) › \(pane.windowName.isEmpty ? pane.stableWindowID : pane.windowName) › \(pane.paneID)")
+        }
+        if let model = participant.agent.model { parts.append(model) }
+        return parts.isEmpty ? String(localized: "No execution binding") : parts.joined(separator: " · ")
     }
 }
 
@@ -1485,43 +2224,57 @@ private struct PipelinePlaceholderCard: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("@\(desired.alias)")
+                    Text(verbatim: "@\(desired.alias)")
                         .font(.headline)
+                        .lineLimit(1)
                     Text(desired.role ?? desired.program)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
                 Spacer()
                 Label(agentStateLabel(state?.status ?? "pending"), systemImage: "circle.fill")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(agentStateColor(state?.status ?? "pending"))
+                    .lineLimit(1)
+                    .fixedSize()
             }
-            if let task = desired.task, !task.isEmpty {
-                MarkdownContent(source: task, lineLimit: 5)
-            } else {
-                Text("No live execution is currently bound.")
-                    .font(.subheadline)
-                    .foregroundStyle(.tertiary)
+            .frame(minHeight: 38, maxHeight: 42, alignment: .top)
+            Group {
+                if let task = desired.task, !task.isEmpty {
+                    MarkdownContent(source: task, lineLimit: 4, selectable: false)
+                } else {
+                    Text("No live execution is currently bound.")
+                        .font(.subheadline)
+                        .foregroundStyle(.tertiary)
+                }
             }
+            .frame(maxHeight: 68, alignment: .topLeading)
+            .clipped()
+            Spacer(minLength: 0)
             if let error = state?.error, !error.isEmpty {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .help(error)
             }
         }
         .padding(14)
-        .frame(maxWidth: .infinity, minHeight: 140, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: 210, maxHeight: 210, alignment: .topLeading)
+        .clipped()
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
 private struct MarkdownSection: View {
-    let title: String
+    let title: LocalizedStringKey
     let source: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(title.uppercased())
+            Text(title)
+                .textCase(.uppercase)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
             if let source, !source.isEmpty {
@@ -1538,50 +2291,88 @@ private struct MarkdownSection: View {
 struct MarkdownContent: View {
     let source: String
     var lineLimit: Int?
+    var selectable: Bool
+    var font: Font
 
-    init(source: String, lineLimit: Int? = nil) {
+    init(
+        source: String,
+        lineLimit: Int? = nil,
+        selectable: Bool = true,
+        font: Font = .subheadline
+    ) {
         self.source = source
         self.lineLimit = lineLimit
+        self.selectable = selectable
+        self.font = font
     }
 
     private var attributed: AttributedString {
-        (try? AttributedString(
-            markdown: source,
-            options: AttributedString.MarkdownParsingOptions(
-                interpretedSyntax: .full,
-                failurePolicy: .returnPartiallyParsedIfPossible
-            )
-        )) ?? AttributedString(source)
+        MuxaMarkdownText.attributedString(markdown: normalizedSource)
+    }
+
+    private var normalizedSource: String {
+        source
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
     }
 
     var body: some View {
-        Text(attributed)
-            .font(.subheadline)
+        selectableText
+    }
+
+    @ViewBuilder
+    private var selectableText: some View {
+        let content = Text(attributed)
+            .font(font)
             .lineLimit(lineLimit)
-            .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
+        if selectable {
+            content.textSelection(.enabled)
+        } else {
+            content.textSelection(.disabled)
+        }
     }
 }
 
 private struct FleetAgentDetailView: View {
-    private enum DetailTab: String, CaseIterable, Identifiable {
-        case summary = "Summary"
-        case conversation = "Conversation"
-        case shell = "Shell"
+    private enum DetailTab: CaseIterable, Identifiable {
+        case summary
+        case conversation
+        case shell
 
         var id: Self { self }
+
+        var title: LocalizedStringKey {
+            switch self {
+            case .summary: "Summary"
+            case .conversation: "Conversation"
+            case .shell: "Shell"
+            }
+        }
     }
 
     let participant: MuxaHostedAgent
-    let client: MuxaIPCClient
+    @ObservedObject var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
     @State private var selectedTab: DetailTab = .summary
+
+    private var client: MuxaIPCClient { model.client }
 
     private var summary: String? {
         participant.agent.recap
             ?? participant.agent.lastNotification
             ?? participant.agent.aiTitle
             ?? participant.agent.lastPrompt
+    }
+
+    /// Agents the Inbox lists under "Needs attention" get the request card
+    /// on top; a working or idle agent opened from elsewhere keeps the
+    /// plain summary.
+    private var needsAttention: Bool {
+        ["waiting_input", "waiting_choice", "blocked", "error", "failed"]
+            .contains(participant.agent.state)
     }
 
     private var title: String {
@@ -1608,11 +2399,41 @@ private struct FleetAgentDetailView: View {
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
                     }
+                    Spacer(minLength: 12)
+                    VStack(alignment: .trailing, spacing: 6) {
+                        if !needsAttention {
+                            Button {
+                                model.openInLiveWatch(participant)
+                            } label: {
+                                Label("Open in Live Watch", systemImage: "rectangle.on.rectangle")
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(participant.pane == nil)
+                            .help("Follow this agent's pane in Live Watch")
+                        }
+                        // Whatever the enabled modules offer for this agent;
+                        // nothing at all when none is switched on.
+                        MuxaModuleMenu(
+                            context: .agent(participant),
+                            model: model,
+                            registry: MuxaModuleRegistry.shared
+                        )
+                    }
+                    .padding(.top, 6)
+                }
+
+                if needsAttention {
+                    InboxAgentRequestCard(
+                        participant: participant,
+                        requests: participant.openRequests(in: model.operatorMessages),
+                        work: model.workGroup(for: participant),
+                        openInLiveWatch: { model.openInLiveWatch(participant) }
+                    )
                 }
 
                 Picker("Agent detail", selection: $selectedTab) {
                     ForEach(availableTabs) { tab in
-                        Text(tab.rawValue).tag(tab)
+                        Text(tab.title).tag(tab)
                     }
                 }
                 .labelsHidden()
@@ -1641,8 +2462,7 @@ private struct FleetAgentDetailView: View {
         case .summary:
             VStack(alignment: .leading, spacing: 18) {
                 if let summary, !summary.isEmpty {
-                    MarkdownContent(source: summary)
-                        .font(.body)
+                    MarkdownContent(source: summary, font: .body)
                 } else {
                     Text("No retained summary")
                         .foregroundStyle(.tertiary)
@@ -1696,10 +2516,27 @@ private struct FleetAgentDetailView: View {
 
 private struct FleetHostDetailView: View {
     let host: MuxaFleetHost
+    @ObservedObject var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
+    @State private var connectionExpanded = false
+
+    private let metricColumns = [
+        GridItem(.adaptive(minimum: 105, maximum: 170), spacing: 12),
+    ]
+    private let sessionColumns = [
+        GridItem(.adaptive(minimum: 260, maximum: 430), spacing: 12, alignment: .top),
+    ]
 
     private var liveAgents: [MuxaAgent] {
         (host.remote?.agents ?? []).filter { $0.state != "stopped" }
+    }
+
+    private var watchHost: MuxaWatchHost? {
+        model.executionSnapshot.watchHosts.first { $0.host.alias == host.alias }
+    }
+
+    private var sessions: [MuxaWatchSession] {
+        watchHost?.sessions ?? []
     }
 
     private var panes: [MuxaPaneInfo] {
@@ -1710,19 +2547,23 @@ private struct FleetHostDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 HStack(alignment: .top, spacing: 14) {
-                    Circle()
-                        .fill(fleetHostColor(host.state))
-                        .frame(width: 12, height: 12)
-                        .padding(.top, 9)
+                    HostIdentityBadge(host: host, size: 40)
                     VStack(alignment: .leading, spacing: 4) {
                         Text(host.alias)
                             .font(.largeTitle.weight(.semibold))
-                        Text(host.local ? "Local host" : host.state.replacingOccurrences(of: "_", with: " ").capitalized)
-                            .foregroundStyle(fleetHostColor(host.state))
+                        Group {
+                            if host.local {
+                                Text("Local host")
+                            } else {
+                                Text(fleetHostStateLabel(host.state))
+                            }
+                        }
+                        .foregroundStyle(fleetHostColor(host.state))
                     }
                 }
 
-                HStack(spacing: 16) {
+                LazyVGrid(columns: metricColumns, alignment: .leading, spacing: 12) {
+                    HostMetric(title: "Sessions", value: sessions.count)
                     HostMetric(title: "Agents", value: liveAgents.count)
                     HostMetric(title: "Panes", value: panes.count)
                     if !host.local, let latency = host.latencyMS {
@@ -1730,11 +2571,40 @@ private struct FleetHostDetailView: View {
                     }
                 }
 
-                GroupBox("Connection") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Execution sessions")
+                        .font(.title2.weight(.semibold))
+                    Text("Each session is summarized by its windows and the latest retained agent context.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+
+                    if sessions.isEmpty {
+                        VStack(spacing: 8) {
+                            Image(systemName: "square.3.layers.3d")
+                                .font(.system(size: 28))
+                                .foregroundStyle(.secondary)
+                            Text("No sessions")
+                                .font(.headline)
+                            Text("No execution sessions are visible on this host.")
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 180)
+                    } else {
+                        LazyVGrid(columns: sessionColumns, alignment: .leading, spacing: 12) {
+                            ForEach(sessions) { session in
+                                FleetSessionSummaryCard(session: session) {
+                                    model.selectWatchSession(session.identity)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                DisclosureGroup("Connection details", isExpanded: $connectionExpanded) {
                     Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 8) {
-                        AgentFact(label: "Mode", value: host.mode)
-                        AgentFact(label: "State", value: host.state)
-                        AgentFact(label: "Scope", value: host.local ? "local" : "remote")
+                        AgentFact(label: "Mode", value: fleetHostModeLabel(host.mode))
+                        AgentFact(label: "State", value: fleetHostStateLabel(host.state))
+                        AgentFact(label: "Scope", value: host.local ? String(localized: "local") : String(localized: "remote"))
                         if let target = host.sshTarget, !host.local {
                             AgentFact(label: "SSH target", value: target)
                         }
@@ -1742,55 +2612,679 @@ private struct FleetHostDetailView: View {
                             AgentFact(label: "Error", value: error)
                         }
                     }
-                    .padding(.vertical, 6)
+                    .padding(.top, 10)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-
-                if !liveAgents.isEmpty {
-                    VStack(alignment: .leading, spacing: 9) {
-                        Text("Agent sessions")
-                            .font(.title2.weight(.semibold))
-                        ForEach(liveAgents) { agent in
-                            HStack(spacing: 10) {
-                                Circle()
-                                    .fill(agentStateColor(agent.state))
-                                    .frame(width: 8, height: 8)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(agent.aiTitle ?? agent.kind.replacingOccurrences(of: "_", with: " "))
-                                    Text(agent.agentSessionID)
-                                        .font(.caption.monospaced())
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Text(agentStateLabel(agent.state))
-                                    .font(.caption)
-                                    .foregroundStyle(agentStateColor(agent.state))
-                            }
-                            .padding(.vertical, 4)
-                        }
-                    }
-                }
+                .padding(12)
+                .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
             }
             .padding(28)
-            .frame(maxWidth: 900, alignment: .leading)
+            .frame(maxWidth: 1250, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(MuxaSurfacePalette.workspace(for: colorScheme).ignoresSafeArea())
     }
 }
 
+private struct FleetSessionSummaryCard: View {
+    let session: MuxaWatchSession
+    let open: () -> Void
+
+    private var panes: [MuxaWatchPane] {
+        session.windows.flatMap(\.panes)
+    }
+
+    private var agents: [MuxaWatchPane] {
+        panes.filter { $0.agent != nil }
+    }
+
+    private var attentionCount: Int {
+        agents.filter(paneNeedsAttentionForSummary).count
+    }
+
+    var body: some View {
+        Button(action: open) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "square.3.layers.3d")
+                        .foregroundStyle(.tint)
+                    Text(session.name.isEmpty ? session.sessionID : session.name)
+                        .font(.headline)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    if attentionCount > 0 {
+                        Label {
+                            Text(verbatim: "\(attentionCount)")
+                        } icon: {
+                            Image(systemName: "exclamationmark.circle.fill")
+                        }
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.orange)
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+
+                Text("\(session.windows.count) windows · \(panes.count) panes · \(agents.count) agents")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(Array(agents.prefix(2))) { pane in
+                        FleetResourceSummaryRow(pane: pane)
+                    }
+                    if agents.isEmpty {
+                        Text("No retained agent summary")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    } else if agents.count > 2 {
+                        Text("+\(agents.count - 2) more agents")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, minHeight: 188, maxHeight: 188, alignment: .topLeading)
+            .contentShape(Rectangle())
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct FleetSessionDetailView: View {
+    let session: MuxaWatchSession
+    @ObservedObject var model: AppModel
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var showsDetails = false
+
+    private let columns = [
+        GridItem(.adaptive(minimum: 260, maximum: 470), spacing: 12, alignment: .top),
+    ]
+
+    private var panes: [MuxaWatchPane] {
+        session.windows.flatMap(\.panes)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: "square.3.layers.3d")
+                        .font(.system(size: 28))
+                        .foregroundStyle(.tint)
+                        .frame(width: 42, height: 42)
+                        .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(session.name.isEmpty ? session.sessionID : session.name)
+                            .font(.largeTitle.weight(.semibold))
+                        Text("\(session.hostAlias) · \(session.windows.count) windows · \(panes.count) panes")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Button {
+                        showsDetails.toggle()
+                    } label: {
+                        Label("Details", systemImage: "info.circle")
+                    }
+                    .popover(isPresented: $showsDetails, arrowEdge: .bottom) {
+                        Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+                            AgentFact(label: "Host", value: session.hostAlias)
+                            AgentFact(label: "Socket", value: session.socket)
+                            AgentFact(label: "Session", value: session.sessionID)
+                        }
+                        .padding(16)
+                        .frame(minWidth: 360)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Windows")
+                        .font(.title2.weight(.semibold))
+                    Text("Open any agent row to inspect its summary, latest response, and Live Pane.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+                    ForEach(session.windows) { window in
+                        FleetWindowSummaryCard(
+                            window: window,
+                            openWindow: { model.selectWatchWindow(window.identity) },
+                            openPane: { model.selectWatchPane($0.id) }
+                        )
+                    }
+                }
+            }
+            .padding(28)
+            .frame(maxWidth: 1250, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(MuxaSurfacePalette.workspace(for: colorScheme).ignoresSafeArea())
+    }
+}
+
+private struct FleetWindowDetailView: View {
+    let window: MuxaWatchWindow
+    @ObservedObject var model: AppModel
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var showsDetails = false
+
+    private let columns = [
+        GridItem(.adaptive(minimum: 330, maximum: 570), spacing: 12, alignment: .top),
+    ]
+
+    private var agents: [MuxaWatchPane] {
+        window.panes.sorted { left, right in
+            let leftPriority = panePriority(left)
+            let rightPriority = panePriority(right)
+            if leftPriority != rightPriority { return leftPriority < rightPriority }
+            return (left.agent?.lastActivityAt ?? "") > (right.agent?.lastActivityAt ?? "")
+        }
+    }
+
+    private var workIdentity: MuxaWorkIdentity? {
+        let identities = Set(window.panes.compactMap(\.pane.workIdentity))
+        return identities.count == 1 ? identities.first : nil
+    }
+
+    private var relatedMessages: [MuxaOperatorMessage] {
+        model.operatorMessages.filter { message in
+            message.host.alias == window.hostAlias
+                && (message.request.from.room.windowID == window.windowID
+                    || message.request.to.room.windowID == window.windowID)
+        }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                header
+                metrics
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Agent reports")
+                        .font(.title2.weight(.semibold))
+                    Text("Recap and latest response are kept separate; runtime and workload facts come directly from muxad.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+                    ForEach(agents) { pane in
+                        WindowAgentReportCard(pane: pane) {
+                            model.selectWatchPane(pane.id)
+                        }
+                    }
+                }
+
+                if !relatedMessages.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Collaboration in this window")
+                            .font(.title2.weight(.semibold))
+                        Text("\(relatedMessages.count) operator commands and their durable replies")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        ForEach(relatedMessages.prefix(5)) { message in
+                            WindowCollaborationRow(message: message) {
+                                model.select(.inbox)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(28)
+            .frame(maxWidth: 1250, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .background(MuxaSurfacePalette.workspace(for: colorScheme).ignoresSafeArea())
+        .task { await model.refreshOperatorInbox() }
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "macwindow")
+                .font(.system(size: 28))
+                .foregroundStyle(.tint)
+                .frame(width: 42, height: 42)
+                .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(window.name.isEmpty ? window.windowID : window.name)
+                    .font(.largeTitle.weight(.semibold))
+                HStack(spacing: 7) {
+                    Text("\(window.hostAlias) · \(window.panes.count) panes")
+                        .foregroundStyle(.secondary)
+                    if let workIdentity {
+                        Text(verbatim: "\(workIdentity.workspaceID) / \(workIdentity.workID)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Color.accentColor.opacity(0.1), in: Capsule())
+                    }
+                }
+            }
+            Spacer(minLength: 8)
+            Button {
+                showsDetails.toggle()
+            } label: {
+                Label("Runtime Details", systemImage: "info.circle")
+            }
+            .popover(isPresented: $showsDetails, arrowEdge: .bottom) {
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+                    AgentFact(label: "Host", value: window.hostAlias)
+                    AgentFact(label: "Socket", value: window.socket)
+                    AgentFact(label: "Session", value: window.sessionID)
+                    AgentFact(label: "Window", value: window.windowID)
+                    AgentFact(label: "Index", value: window.index)
+                }
+                .padding(16)
+                .frame(minWidth: 380)
+            }
+        }
+    }
+
+    private var metrics: some View {
+        let attention = window.panes.lazy.filter(paneNeedsAttentionForSummary).count
+        let working = window.panes.lazy.filter {
+            $0.agent.map { ["working", "starting"].contains($0.state) } ?? false
+        }.count
+        let subagents = window.panes.lazy.compactMap(\.agent?.subagents).reduce(0) { $0 + $1.count }
+        let processes = window.panes.lazy.compactMap(\.agent?.workload?.processCount).reduce(0, +)
+        let metricColumns = [
+            GridItem(.adaptive(minimum: 108, maximum: 170), spacing: 18),
+        ]
+        return LazyVGrid(columns: metricColumns, alignment: .leading, spacing: 12) {
+            HostMetric(title: "Agents", value: window.panes.compactMap(\.agent).count)
+            HostMetric(title: "Working", value: working)
+            HostMetric(title: "Need attention", value: attention)
+            HostMetric(title: "Subagents", value: subagents)
+            HostMetric(title: "Child processes", value: processes)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func panePriority(_ pane: MuxaWatchPane) -> Int {
+        if paneNeedsAttentionForSummary(pane) { return 0 }
+        if pane.agent.map({ ["working", "starting"].contains($0.state) }) == true { return 1 }
+        return pane.agent == nil ? 3 : 2
+    }
+}
+
+private struct WindowAgentReportCard: View {
+    let pane: MuxaWatchPane
+    let open: () -> Void
+
+    private var summary: String? {
+        presentText(pane.agent?.recap)
+            ?? presentText(pane.agent?.lastResponse)
+            ?? presentText(pane.agent?.lastNotification)
+            ?? presentText(pane.agent?.lastPrompt)
+    }
+
+    private var separateResponse: String? {
+        guard let response = presentText(pane.agent?.lastResponse), response != pane.agent?.recap else {
+            return nil
+        }
+        return response
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Button(action: open) {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(pane.agent.map { agentStateColor($0.state) } ?? Color.secondary)
+                        .frame(width: 8, height: 8)
+                    Text(fleetPaneDisplayTitle(pane))
+                        .font(.headline)
+                        .lineLimit(1)
+                    if let agent = pane.agent {
+                        Text(agentStateLabel(agent.state))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(agentStateColor(agent.state))
+                    }
+                    Spacer(minLength: 4)
+                    Text(pane.pane.paneID)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if let summary {
+                reportSection("Summary", source: summary, lineLimit: separateResponse == nil ? 9 : 6)
+            } else {
+                Text("No agent-authored task summary has been retained yet.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            if let separateResponse {
+                reportSection("Latest response", source: separateResponse, lineLimit: 8)
+            }
+
+            if let agent = pane.agent {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 10) { factChips(agent) }
+                    VStack(alignment: .leading, spacing: 5) { factChips(agent) }
+                }
+                if let workload = agent.workload,
+                   workload.processCount > 0 || !(agent.subagents ?? []).isEmpty {
+                    Divider()
+                    HStack(spacing: 10) {
+                        Label("\(workload.processCount) processes", systemImage: "point.3.connected.trianglepath.dotted")
+                        if workload.shellCount > 0 { Text("\(workload.shellCount) shells") }
+                        if workload.helperCount > 0 { Text("\(workload.helperCount) helpers") }
+                        if let count = agent.subagents?.count, count > 0 { Text("\(count) live subagents") }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack(spacing: 6) {
+                Image(systemName: "terminal")
+                Text(pane.pane.currentCommand)
+                Text(verbatim: "·")
+                Text(pane.pane.currentPath)
+                    .lineLimit(1)
+            }
+            .font(.caption2.monospaced())
+            .foregroundStyle(.tertiary)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: 300, alignment: .topLeading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 11))
+        .overlay {
+            RoundedRectangle(cornerRadius: 11)
+                .stroke(
+                    paneNeedsAttentionForSummary(pane) ? Color.orange.opacity(0.5) : Color(nsColor: .separatorColor).opacity(0.45),
+                    lineWidth: paneNeedsAttentionForSummary(pane) ? 1 : 0.5
+                )
+        }
+    }
+
+    private func reportSection(_ label: LocalizedStringKey, source: String, lineLimit: Int) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .textCase(.uppercase)
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(.secondary)
+            MarkdownContent(source: source, lineLimit: lineLimit, selectable: false, font: .callout)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func factChips(_ agent: MuxaAgent) -> some View {
+        if let activity = agent.lastActivityAt {
+            detailChip("Activity", compactWindowTimestamp(activity), systemImage: "clock")
+        }
+        if let model = agent.model { detailChip("Model", model, systemImage: "cpu") }
+        if let context = agent.contextUsedPercent {
+            detailChip("Context", "\(Int(context.rounded()))%", systemImage: "gauge.with.dots.needle.33percent")
+        }
+        if let cost = agent.costUSD {
+            detailChip("Cost", cost.formatted(.currency(code: "USD")), systemImage: "dollarsign.circle")
+        }
+    }
+
+    private func detailChip(_ label: LocalizedStringKey, _ value: String, systemImage: String) -> some View {
+        Label {
+            HStack(spacing: 3) {
+                Text(label)
+                Text(value)
+            }
+        } icon: {
+            Image(systemName: systemImage)
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+    }
+}
+
+private struct WindowCollaborationRow: View {
+    let message: MuxaOperatorMessage
+    let openInbox: () -> Void
+
+    var body: some View {
+        Button(action: openInbox) {
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: message.request.reply == nil ? "clock" : "arrowshape.turn.up.left.fill")
+                    .foregroundStyle(message.request.reply == nil ? Color.blue : Color.green)
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(message.request.body)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(2)
+                    if let reply = message.request.reply {
+                        MarkdownContent(source: reply.body, lineLimit: 3, selectable: false, font: .caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Waiting for \(message.request.to.label) to reply")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct FleetWindowSummaryCard: View {
+    let window: MuxaWatchWindow
+    let openWindow: () -> Void
+    let openPane: (MuxaWatchPane) -> Void
+
+    private var displayedPanes: [MuxaWatchPane] {
+        Array(window.panes.prefix(2))
+    }
+
+    private var workLabel: String? {
+        let identities = Set(window.panes.compactMap(\.pane.workIdentity))
+        guard identities.count == 1, let identity = identities.first else { return nil }
+        return "\(identity.workspaceID) / \(identity.workID)"
+    }
+
+    private var focusPane: MuxaWatchPane? {
+        window.panes.sorted { left, right in
+            let leftPriority = paneNeedsAttentionForSummary(left) ? 0 : left.agent?.state == "working" ? 1 : 2
+            let rightPriority = paneNeedsAttentionForSummary(right) ? 0 : right.agent?.state == "working" ? 1 : 2
+            if leftPriority != rightPriority { return leftPriority < rightPriority }
+            return (left.agent?.lastActivityAt ?? "") > (right.agent?.lastActivityAt ?? "")
+        }.first
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button(action: openWindow) {
+                HStack(spacing: 8) {
+                    Image(systemName: "macwindow")
+                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(window.name.isEmpty ? window.windowID : window.name)
+                            .font(.headline)
+                            .lineLimit(1)
+                        if let workLabel {
+                            Text(workLabel)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(Color.accentColor)
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 4)
+                    Text("#\(window.index) · \(window.panes.count) panes")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if let focusPane, let summary = fleetPaneSummary(focusPane) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Group {
+                        if paneNeedsAttentionForSummary(focusPane) {
+                            Text("Needs attention")
+                        } else {
+                            Text("Current picture")
+                        }
+                    }
+                    .textCase(.uppercase)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(paneNeedsAttentionForSummary(focusPane) ? Color.orange : Color.secondary)
+                    MarkdownContent(source: summary, lineLimit: 3, selectable: false, font: .caption)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+            }
+
+            VStack(spacing: 6) {
+                ForEach(displayedPanes) { pane in
+                    Button {
+                        openPane(pane)
+                    } label: {
+                        FleetResourceSummaryRow(pane: pane, showsChevron: true)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 7)
+                            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+                            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            if window.panes.count > displayedPanes.count {
+                Text("+\(window.panes.count - displayedPanes.count) more panes")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: 276, maxHeight: 276, alignment: .topLeading)
+        .clipped()
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
+        }
+    }
+}
+
+private func compactWindowTimestamp(_ value: String) -> String {
+    let normalized = value.replacingOccurrences(of: "T", with: " ")
+    return String(normalized.prefix(16))
+}
+
+private struct FleetResourceSummaryRow: View {
+    let pane: MuxaWatchPane
+    var showsChevron = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Circle()
+                .fill(pane.agent.map { agentStateColor($0.state) } ?? Color.secondary)
+                .frame(width: 7, height: 7)
+                .padding(.top, 5)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(fleetPaneDisplayTitle(pane))
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+                    if let agent = pane.agent {
+                        Text(agentStateLabel(agent.state))
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(agentStateColor(agent.state))
+                    }
+                }
+                MarkdownContent(
+                    source: fleetPaneSummary(pane) ?? String(localized: "No summary reported"),
+                    lineLimit: 2,
+                    selectable: false,
+                    font: .caption
+                )
+                .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            if showsChevron {
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.top, 5)
+            }
+        }
+    }
+}
+
+private func paneNeedsAttentionForSummary(_ pane: MuxaWatchPane) -> Bool {
+    pane.agent.map {
+        ["waiting_input", "waiting_choice", "blocked", "error", "failed"].contains($0.state)
+    } ?? false
+}
+
+private func fleetPaneDisplayTitle(_ pane: MuxaWatchPane) -> String {
+    pane.pane.agentAlias.map { "@\($0)" }
+        ?? presentText(pane.agent?.aiTitle)
+        ?? presentText(pane.pane.title)
+        ?? presentText(pane.pane.currentCommand)
+        ?? pane.pane.paneID
+}
+
+private func fleetPaneSummary(_ pane: MuxaWatchPane) -> String? {
+    presentText(pane.agent?.recap)
+        ?? presentText(pane.agent?.lastResponse)
+        ?? presentText(pane.agent?.lastNotification)
+        ?? presentText(pane.agent?.lastPrompt)
+        ?? presentText(pane.pane.currentPath)
+}
+
+private func presentText(_ value: String?) -> String? {
+    guard let value, !value.isEmpty else { return nil }
+    return value
+}
+
 private struct HostMetric: View {
-    let title: String
+    let title: LocalizedStringKey
     let value: UInt64
     var suffix = ""
 
-    init(title: String, value: Int, suffix: String = "") {
+    init(title: LocalizedStringKey, value: Int, suffix: String = "") {
         self.title = title
         self.value = UInt64(value)
         self.suffix = suffix
     }
 
-    init(title: String, value: UInt64, suffix: String = "") {
+    init(title: LocalizedStringKey, value: UInt64, suffix: String = "") {
         self.title = title
         self.value = value
         self.suffix = suffix
@@ -1798,7 +3292,7 @@ private struct HostMetric: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text("\(value)\(suffix)")
+            Text(verbatim: "\(value)\(suffix)")
                 .font(.title2.weight(.semibold).monospacedDigit())
             Text(title)
                 .font(.caption)
@@ -1809,7 +3303,7 @@ private struct HostMetric: View {
 }
 
 private struct AgentFact: View {
-    let label: String
+    let label: LocalizedStringKey
     let value: String
 
     var body: some View {
@@ -1855,17 +3349,40 @@ private struct MuxaEmptyDetail: View {
 
 func agentStateLabel(_ state: String) -> String {
     switch state {
-    case "waiting_input": "Waiting for input"
-    case "waiting_choice": "Waiting for choice"
-    case "working": "Working"
-    case "starting": "Starting"
-    case "idle": "Idle"
-    case "error", "failed": "Error"
-    case "blocked": "Blocked"
-    case "done": "Done"
-    case "pending": "Pending"
-    case "stopped": "Stopped"
+    case "waiting_input": String(localized: "Waiting for input")
+    case "waiting_choice": String(localized: "Waiting for choice")
+    case "working": String(localized: "Working")
+    case "starting": String(localized: "Starting")
+    case "idle": String(localized: "Idle")
+    case "error", "failed": String(localized: "Error")
+    case "blocked": String(localized: "Blocked")
+    case "done": String(localized: "Done")
+    case "pending": String(localized: "Pending")
+    case "stopped": String(localized: "Stopped")
     default: state.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+}
+
+/// Display wording for a fleet host `state` as muxad reports it.
+func fleetHostStateLabel(_ state: String) -> String {
+    switch state {
+    case "online": String(localized: "Online")
+    case "offline": String(localized: "Offline")
+    case "connecting": String(localized: "Connecting")
+    case "degraded": String(localized: "Degraded")
+    case "version_skew": String(localized: "Version skew")
+    case "auth_failed": String(localized: "Authentication failed")
+    case "disabled": String(localized: "Disabled")
+    default: state.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+}
+
+/// Display wording for a fleet host access `mode` (`observe` or `control`).
+func fleetHostModeLabel(_ mode: String) -> String {
+    switch mode {
+    case "observe": String(localized: "Observe")
+    case "control": String(localized: "Control")
+    default: mode.capitalized
     }
 }
 
@@ -1892,19 +3409,10 @@ func fleetHostColor(_ state: String) -> Color {
 }
 
 struct TerminalPane: View {
-    private enum DisplayMode: String, CaseIterable, Identifiable {
-        case terminal = "Terminal"
-        case raw = "Raw"
-
-        var id: Self { self }
-    }
-
     @StateObject private var pane: TerminalPaneModel
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.openWindow) private var openWindow
-    @State private var displayMode: DisplayMode = .terminal
     private let sessionID: String
-    private let allowsRaw: Bool
     private let showsToolbar: Bool
     private let onExit: () -> Void
 
@@ -1912,12 +3420,10 @@ struct TerminalPane: View {
         client: MuxaIPCClient,
         sessionID: String,
         replayInitialHistory: Bool,
-        allowsRaw: Bool = true,
         showsToolbar: Bool = true,
         onExit: @escaping () -> Void = {}
     ) {
         self.sessionID = sessionID
-        self.allowsRaw = allowsRaw
         self.showsToolbar = showsToolbar
         self.onExit = onExit
         _pane = StateObject(
@@ -1936,41 +3442,13 @@ struct TerminalPane: View {
 
             TerminalSurfaceView(context: pane.terminalState)
                 .background(MuxaSurfacePalette.terminal(for: colorScheme))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .clipped()
-                .opacity(displayMode == .terminal ? 1 : 0)
-                .allowsHitTesting(displayMode == .terminal)
-
-            if displayMode == .raw {
-                ScrollView([.horizontal, .vertical]) {
-                    Text(verbatim: pane.rawOutputText)
-                        .font(.system(size: 12, weight: .regular, design: .monospaced))
-                        .foregroundStyle(colorScheme == .dark ? Color(white: 0.92) : Color(white: 0.12))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                        .padding(16)
-                }
-                .background(MuxaSurfacePalette.terminal(for: colorScheme))
-            }
 
             if showsToolbar {
                 VStack {
                     HStack(spacing: 8) {
-                        if displayMode == .raw {
-                            Text("\(pane.rawOutputByteCount) bytes retained · controls escaped")
-                                .font(.caption2.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                        }
                         Spacer()
-                        if allowsRaw {
-                            Picker("Shell display", selection: $displayMode) {
-                                ForEach(DisplayMode.allCases) { mode in
-                                    Text(mode.rawValue).tag(mode)
-                                }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.segmented)
-                            .frame(width: 170)
-                        }
                         Button {
                             openWindow(value: MuxaModuleRoute.shell(sessionID))
                         } label: {
@@ -1997,10 +3475,15 @@ struct TerminalPane: View {
                     .background(.ultraThinMaterial, in: Capsule())
                     .padding(8)
             } else if pane.exited {
-                Label(
-                    pane.exitStatus.map { "Session ended (status \($0))" } ?? "Session ended",
-                    systemImage: pane.exitStatus == 0 ? "checkmark.circle" : "stop.circle"
-                )
+                Label {
+                    if let status = pane.exitStatus {
+                        Text("Session ended (status \(status))")
+                    } else {
+                        Text("Session ended")
+                    }
+                } icon: {
+                    Image(systemName: pane.exitStatus == 0 ? "checkmark.circle" : "stop.circle")
+                }
                 .font(.caption)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 7)
@@ -2008,10 +3491,9 @@ struct TerminalPane: View {
                 .padding(8)
             }
         }
-        .onAppear {
-            pane.start()
-            pane.setRawDisplayEnabled(displayMode == .raw)
-        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
+        .onAppear { pane.start() }
         .task(id: sessionID) {
             // The embedded Live Pane is inserted after the attach request
             // completes. Give AppKit one run-loop turn to put the native
@@ -2020,16 +3502,10 @@ struct TerminalPane: View {
             // the inspector or sidebar that initiated the attach.
             await Task.yield()
             try? await Task.sleep(for: .milliseconds(120))
-            guard !Task.isCancelled, displayMode == .terminal else { return }
+            guard !Task.isCancelled else { return }
             pane.focus()
         }
-        .onDisappear {
-            pane.setRawDisplayEnabled(false)
-            pane.stop()
-        }
-        .onChange(of: displayMode) { mode in
-            pane.setRawDisplayEnabled(mode == .raw)
-        }
+        .onDisappear { pane.stop() }
         .onChange(of: pane.exited) { exited in
             if exited { onExit() }
         }

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="muxa" width="260" />
+<img src="assets/logo.svg" alt="Muxa logo" width="144" />
 
 **Work-oriented AI-agent observability & orchestration for tmux.**
 
@@ -97,6 +97,7 @@ exit.
 | `muxa stats` / `muxa report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
 | `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
 | `muxa activity` | Raw duration ledger query for debugging exactly what fed stats/report. |
+| `muxa automation` | Rules that act on agent state — the built-in one resumes a session after its usage cap resets. |
 | BarShelf widget (macOS) | Menu-bar popover summary of active, working, waiting, and error agents. |
 | Muxa for Mac | Native session browser and menu-bar app with a locally built libghostty terminal; native PTYs remain owned by `muxad`. |
 | Dashboard | Optional loopback HTTP UI with SSE live updates, timeline, and collaboration node-edge/sequence graphs. |
@@ -113,6 +114,13 @@ Homebrew (pre-built binaries, no Rust toolchain needed):
 ```bash
 brew install open330/tap/muxa
 muxa init
+```
+
+For the Mac app (notarized, updates through Homebrew since it has no
+built-in updater):
+
+```bash
+brew install --cask open330/tap/muxa-app
 ```
 
 Or the one-shot installer (builds from source, requires Rust 1.89+):
@@ -182,17 +190,16 @@ wake = "idle_only"
 wake_payload = "operator_full"
 ```
 
-Register the MCP server once for both agent hosts, then restart agents that
-were already running so they can read and reply to requests themselves.
+Install shared collaboration instructions, the symlinked skill, and MCP for
+detected Codex and Claude Code installations, then restart running agents.
+The standard preset includes this setup.
 
 ```bash
-claude mcp add --scope user muxa -- muxa mcp
-codex mcp add muxa -- muxa mcp
+muxa init --component agent-instructions,agent-skills,agent-mcp
 ```
 
-Codex only forwards explicitly allowed environment variables to stdio MCP
-servers. Add this line to the generated `[mcp_servers.muxa]` table in
-`~/.codex/config.toml` (especially when using a custom muxa/tmux socket):
+Init adds Codex's required pane environment forwarding to `[mcp_servers.muxa]`
+while preserving existing variables and other settings:
 
 ```toml
 env_vars = ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE", "MUXA_SOCKET"]
@@ -201,6 +208,9 @@ env_vars = ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE", "MUXA_SOCKET"]
 Muxa also recovers the pane from process ancestry across active pane backends
 for existing default-endpoint Codex registrations, so older setups fail safely
 rather than appearing paneless.
+
+See [Global agent integration](docs/AGENT_INTEGRATION.md) for canonical paths,
+updates, and removal; [MCP setup](docs/MCP.md) also covers manual registration.
 
 Connected agents are told that room peers can serve as read-only reviewers or
 narrowly scoped execution subagents. Requests and replies can also carry
@@ -277,7 +287,7 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa dashboard [--since today]` | Work-card TUI with Run capture, per-agent and Work-wide prompt/abort actions, ACT/WACT totals, and collaboration controls. |
 | `muxa attend [--cycle] [--list]` | Focus or list agents needing attention. |
 | `muxa status-line [--pane %N]` | tmux status-line output. |
-| `muxa peek [--plain]` | Per-pane overlay for the current tmux window; `--plain` prints it as text. |
+| `muxa peek [--plain]` | Per-pane overlay for the current tmux window; `--plain` prints it as text. The overlay is a tmux popup, so where nothing can draw one — a front-end that attaches no client (cmux), or a control-mode client (`tmux -CC` — amux, iTerm2) — peek prints the text report instead and says why on stderr. |
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
 | `muxa peers` / `muxa identity` / `muxa msg` | Discover and name same-window agents, then exchange durable request/reply messages. |
 | `muxa skill add/list/show/remove` | Manage reusable `/` prompt templates for watch/dashboard messages, watch ask, and MCP peer calls. |
@@ -292,7 +302,12 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
 | `muxa agent start --agent codex [--host auto\|native\|tmux]` | Start an allowlisted agent. `auto` uses tmux inside tmux and a muxa-owned PTY in a plain terminal. |
 | `muxa work init` | Describe a work pipeline in your own words; an agent writes the `[ticket]`/`[[route]]`/`[pipeline.*]` config, validated and shown before anything is written. |
-| `muxa work up cal-1234 --body "..."` | Resolve the ticket, route it to a workspace, and create whichever pipeline agent panes are missing — delivering the request to the ones already running. Re-running converges; also `muxa_start_work` over MCP. See [docs/PIPELINE.md](docs/PIPELINE.md). |
+| `muxa work compose "implementer in claude, reviewer in codex after it"` | Draft one pipeline from a description without writing anything: the reply is the same JSON `muxa work pipeline set --from-json` accepts, validated like it, so Muxa.app can show it for review first. |
+| `muxa ask providers` / `muxa ask provider add anthropic-work --engine anthropic` | List the Ask providers with what each needs, and compose the list: an instance names its engine (Claude Code, Codex, Gemini CLIs; Anthropic, OpenAI APIs), its model, and its own key variable, so several keys for one engine can coexist. |
+| `muxa automation list` / `muxa automation test resume-after-limit` | Inspect the rule engine and see what a rule would do right now without firing it. A rule reacts to an agent event (a session limit, a wait for input, an idle stretch) after a delay, with guards that a rule cannot opt out of. See [docs/AUTOMATION.md](docs/AUTOMATION.md). |
+| `muxa config show` / `muxa config set --from new.toml` | Read and replace the daemon's `config.toml` through muxad, which parses and validates before writing. Muxa.app's Settings › Advanced edits the same file the same way. |
+| `muxa work preset apply solo --route '.*'` | Write a built-in pipeline (`solo`, `pair`, `triad`) into `config.toml` without an agent turn; `muxa work options --json` prints the routes, pipelines, skills, and presets a launcher can offer. |
+| `muxa work up cal-1234 --body "..."` | Resolve the ticket, route it to a workspace, and create whichever pipeline agent panes are missing — delivering the request to the ones already running. Re-running converges; also `muxa_start_work` over MCP. See [docs/PIPELINE.md](docs/PIPELINE.md), and [docs/AIR.md](docs/AIR.md) for how a pipeline maps onto the AIR interchange format. |
 | `muxa work start muxa-onboarding --workspace muxa --agent codex ...` | Create/reuse workspace session `muxa`, create/reuse its work window, and add an agent pane. |
 | `muxa workspace list/show/view/close` | Inspect, give the current terminal an independent grouped view of, or explicitly close workspace/project sessions. |
 | `muxa window rename NAME` | Give a tmux window a stable normalized name, or restore process-based naming with `--auto`. |
@@ -300,6 +315,7 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa agent start --host tmux --workspace muxa --work muxa-onboarding ...` | Add an allowlisted agent pane to one managed tmux Work window; also exposed as MCP `muxa_start_agent`. |
 | `muxa agent control (--pane %N\|--session pty-N) --action interrupt` | Interrupt or explicitly terminate one managed tmux pane or muxa-owned PTY agent session. |
 | `muxa onboard [--tour live] [--lang auto\|en\|ko]` | Sixteen live steps on a throwaway muxa: real tmux, watch, attend, and mailbox. Refuses to nest inside an existing tmux session. `F2` switches language, `--no-quiz` offers `F12` immediately, and `--print` emits the written guide. |
+| `muxa automation list/test/log` | Rules that watch agent state and act on it — resume a session once its usage cap resets, nudge an idle agent, interrupt a stuck one. Ships enabled with no rules; `pause`, `cooldown`, per-rule hourly caps, a fire-time re-check, and a durable ledger keep it from running away. See [docs/AUTOMATION.md](docs/AUTOMATION.md). |
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |

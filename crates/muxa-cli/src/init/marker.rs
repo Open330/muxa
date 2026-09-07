@@ -30,6 +30,8 @@ pub enum Style {
     Hash,
     /// `//`-prefixed fences — JS/TS (e.g. the opencode plugin).
     Slash,
+    /// HTML comments in agent Markdown instructions.
+    Html,
 }
 
 impl Style {
@@ -38,6 +40,7 @@ impl Style {
         match self {
             Style::Hash => "#",
             Style::Slash => "//",
+            Style::Html => "<!--",
         }
     }
 
@@ -47,6 +50,14 @@ impl Style {
 
     fn close_prefix(self) -> String {
         format!("{} <<< muxa managed (", self.lead())
+    }
+
+    fn end(self) -> &'static str {
+        if self == Style::Html {
+            " -->"
+        } else {
+            ""
+        }
     }
 }
 
@@ -135,10 +146,15 @@ pub fn remove_styled(original: &str, id: &str, style: Style) -> (String, Outcome
 
 fn render(id: &str, body: &str, style: Style) -> String {
     let mut s = String::with_capacity(body.len() + 80);
-    let _ = writeln!(s, "{}{id}{OPEN_SUFFIX}", style.open_prefix());
+    let _ = writeln!(s, "{}{id}{OPEN_SUFFIX}{}", style.open_prefix(), style.end());
     s.push_str(body);
     s.push('\n');
-    let _ = writeln!(s, "{}{id}{CLOSE_SUFFIX}", style.close_prefix());
+    let _ = writeln!(
+        s,
+        "{}{id}{CLOSE_SUFFIX}{}",
+        style.close_prefix(),
+        style.end()
+    );
     s
 }
 
@@ -159,8 +175,8 @@ fn append_block(original: &str, rendered: &str) -> String {
 /// inclusive of the fence lines and trailing newline. Returns `None`
 /// when the block is absent or malformed (open without matching close).
 fn find_block(haystack: &str, id: &str, style: Style) -> Option<(usize, usize)> {
-    let open = format!("{}{id}{OPEN_SUFFIX}", style.open_prefix());
-    let close = format!("{}{id}{CLOSE_SUFFIX}", style.close_prefix());
+    let open = format!("{}{id}{OPEN_SUFFIX}{}", style.open_prefix(), style.end());
+    let close = format!("{}{id}{CLOSE_SUFFIX}{}", style.close_prefix(), style.end());
     let open_idx = line_start_of(haystack, &open)?;
     // Search for the matching close *after* the open fence, scoped to
     // the same id — this gracefully tolerates other components' blocks

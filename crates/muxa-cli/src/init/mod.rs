@@ -13,6 +13,7 @@ pub mod apply;
 pub mod components;
 pub mod detect;
 pub mod files;
+pub mod integration;
 pub mod marker;
 pub mod plan;
 pub mod ui;
@@ -85,7 +86,15 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
     ui::intro(mode);
 
     let detect = Detection::run();
-    if !preflight_ok(mode, &detect, args.uninstall) {
+    // Config-only wiring also works with prebuilt binaries, outside tmux.
+    let config_only = !args.component.is_empty()
+        && args.component.iter().all(|component| {
+            matches!(
+                component.as_str(),
+                "ask" | "agent-instructions" | "agent-skills" | "agent-mcp"
+            )
+        });
+    if !preflight_ok(mode, &detect, args.uninstall, config_only) {
         anyhow::bail!("pre-flight blockers");
     }
 
@@ -101,6 +110,7 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
         Direction::Install
     };
     let mut plan = plan::build(direction, &chosen, &detect, &socket)?;
+    integration::extend_plan(&mut plan, &detect, config_path.as_deref(), &socket)?;
     if matches!(direction, Direction::Install) && args.start_daemon && !manages_daemon(&chosen) {
         // Append last so disk edits + service enablement happen first;
         // by the time we try to start muxad the file/socket layout it
@@ -134,7 +144,14 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
     }
 
     if !plan.has_changes() {
-        ui::outro(mode, "Already in the desired state.");
+        ui::outro(
+            mode,
+            if plan.warnings.is_empty() {
+                "Already in the desired state."
+            } else {
+                "No managed changes to apply; see the warnings above."
+            },
+        );
         return Ok(());
     }
 
@@ -191,8 +208,17 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
 
 /// Render pre-flight, surface warnings, and signal whether we should
 /// proceed. `false` means a hard blocker fired (caller bails).
-fn preflight_ok(mode: Mode, detect: &Detection, uninstall: bool) -> bool {
-    let blockers = detect.blockers();
+fn preflight_ok(
+    mode: Mode,
+    detect: &Detection,
+    uninstall: bool,
+    skip_bootstrap_tools: bool,
+) -> bool {
+    let blockers = if skip_bootstrap_tools {
+        Vec::new()
+    } else {
+        detect.blockers()
+    };
     if !blockers.is_empty() && !uninstall {
         for b in &blockers {
             ui::error_line(mode, b);

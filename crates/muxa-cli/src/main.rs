@@ -3,13 +3,16 @@
 mod activity_query;
 mod agent_launch;
 mod attend;
+mod automation;
 mod collab_screen;
+mod config_cmd;
 mod daemon;
 mod dashboard_tui;
 mod doctor;
 mod fleet_cli;
 mod fleet_watch;
 mod init;
+mod interactive_child;
 mod logs;
 mod mcp;
 mod message_skill;
@@ -23,7 +26,10 @@ mod timeline;
 mod tmux_work;
 mod upgrade;
 mod watch;
+mod work_compose;
 mod work_init;
+mod work_options;
+mod work_pipeline;
 mod work_up;
 
 use anyhow::{Context, Result};
@@ -126,8 +132,42 @@ enum Cmd {
         #[command(subcommand)]
         action: MsgCmd,
     },
+    /// Ask a headless provider and print the durable reply. The five
+    /// built-ins are claude, codex, gemini, anthropic, and openai; add your
+    /// own with `muxa ask provider add`, and `muxa ask providers` lists
+    /// every one the daemon can drive.
+    #[command(args_conflicts_with_subcommands = true)]
+    Ask {
+        #[command(subcommand)]
+        action: Option<AskCmd>,
+        /// Question or task for the selected headless provider.
+        prompt: Option<String>,
+        /// Override the daemon's selected provider for this and later
+        /// asks. Any provider id from `muxa ask providers`.
+        #[arg(long, value_name = "ID")]
+        agent: Option<String>,
+        /// Read one API key from piped stdin and use it only for this turn.
+        /// The key is never stored in config, history, logs, or argv.
+        #[arg(long)]
+        api_key_stdin: bool,
+        /// Queue the Ask and return immediately instead of waiting for its answer.
+        #[arg(long)]
+        detach: bool,
+        /// Print the stored Ask entry as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Maximum time this CLI waits for the durable answer.
+        #[arg(long, default_value_t = 1800)]
+        timeout_secs: u64,
+    },
     /// Register reusable `/` templates for the interactive message composer.
     Skill(message_skill::Args),
+    /// Rules that watch agent state and act on it — resuming a session
+    /// after a usage cap resets, for one. See docs/AUTOMATION.md.
+    Automation(automation::Args),
+    /// Read and replace the daemon's config.toml, the same way Muxa.app's
+    /// Advanced settings does.
+    Config(config_cmd::Args),
     /// Manage local/SSH host inventory and Kubernetes-style metadata.
     Host(fleet_cli::HostArgs),
     /// Observe and control this node plus SSH-connected Muxa hosts.
@@ -283,7 +323,11 @@ enum Cmd {
     },
     /// Exact remote pane attach endpoint used by `muxa fleet attach`.
     #[command(hide = true)]
-    FleetRemoteAttach { token: String },
+    FleetRemoteAttach {
+        token: String,
+        #[arg(long)]
+        fit: bool,
+    },
     /// Jump to the agent that needs you — focus the pane of whichever
     /// agent has been blocked on input/choice/error longest. `--cycle`
     /// rotates through them (bind it to a tmux key); `--list` prints the
@@ -463,6 +507,120 @@ enum MsgCmd {
     },
 }
 
+/// The closed set of engines an instance can be built on. Adding a
+/// provider is config; adding an engine is code, which is why this is a
+/// `ValueEnum` and provider ids are free strings.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AskEngineArg {
+    Claude,
+    Codex,
+    Gemini,
+    Anthropic,
+    #[value(name = "openai")]
+    OpenAi,
+}
+
+impl AskEngineArg {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum AskCmd {
+    /// List every provider the daemon can ask: engine, kind, model,
+    /// credential status, and which one is selected.
+    Providers {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add, remove, or configure an `[ask.providers.<id>]` instance.
+    Provider {
+        #[command(subcommand)]
+        action: AskProviderCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AskProviderCmd {
+    /// Add a provider instance under an id of your choosing. Several
+    /// instances may share an engine, so a work and a personal account of
+    /// the same API can sit side by side, each with its own key.
+    Add {
+        /// New provider id. A TOML bare key: letters, digits, `-`, `_`.
+        id: String,
+        /// Engine that drives it.
+        #[arg(long, value_enum)]
+        engine: AskEngineArg,
+        /// Display name. Defaults to a humanized id.
+        #[arg(long)]
+        title: Option<String>,
+        /// Model name for this instance.
+        #[arg(long)]
+        model: Option<String>,
+        /// Name of an environment variable holding the API key. The key
+        /// itself is never written to config.
+        #[arg(long, value_name = "VAR")]
+        api_key_env: Option<String>,
+        /// Binary a CLI engine spawns for this instance.
+        #[arg(long, value_name = "PATH")]
+        executable: Option<String>,
+        /// Print the updated provider list as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a provider instance. A built-in id keeps its row and only
+    /// loses the settings you gave it.
+    Remove {
+        /// Provider id to remove.
+        id: String,
+        /// Print the updated provider list as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set or clear a provider's title, model, key variable, and binary.
+    /// Flags you omit leave that key unchanged. The engine is fixed at
+    /// `add` time; to change it, remove the instance and add it again.
+    Set {
+        /// Provider id from `muxa ask providers`.
+        id: String,
+        /// Display name for this provider.
+        #[arg(long, conflicts_with = "clear_title")]
+        title: Option<String>,
+        /// Model name for this provider.
+        #[arg(long, conflicts_with = "clear_model")]
+        model: Option<String>,
+        /// Name of an environment variable holding the API key. The key
+        /// itself is never written to config.
+        #[arg(long, value_name = "VAR", conflicts_with = "clear_api_key_env")]
+        api_key_env: Option<String>,
+        /// Binary a CLI engine spawns for this provider.
+        #[arg(long, value_name = "PATH", conflicts_with = "clear_executable")]
+        executable: Option<String>,
+        /// Remove `title` so the default name applies.
+        #[arg(long)]
+        clear_title: bool,
+        /// Remove `model` so the provider's default applies.
+        #[arg(long)]
+        clear_model: bool,
+        /// Remove `api_key_env`.
+        #[arg(long)]
+        clear_api_key_env: bool,
+        /// Remove `executable` so the engine's own binary applies.
+        #[arg(long)]
+        clear_executable: bool,
+        /// Print the updated provider list as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum AgentCmd {
     /// Start an allowlisted agent in tmux or a muxa-owned PTY session.
@@ -483,6 +641,9 @@ enum WorkCmd {
     /// the `[ticket]`/`[[route]]`/`[pipeline.*]` config for you. Validated
     /// and shown before anything is written.
     Init(work_init::InitArgs),
+    /// Draft one pipeline from a description as the JSON `work pipeline
+    /// set` reads, with a read-only agent turn. Prints it; writes nothing.
+    Compose(work_compose::ComposeArgs),
     /// Converge a Work's current Run to its pipeline: optionally link an
     /// external issue, route the Work, and create missing agent sessions.
     /// Re-running converges instead of duplicating.
@@ -503,6 +664,17 @@ enum WorkCmd {
     Close(tmux_work::WorkCloseArgs),
     /// Counterpart to `up`: close the work window and every agent in it.
     Down(tmux_work::WorkCloseArgs),
+    /// Print the routes, pipelines, message skills, and built-in presets a
+    /// Work launcher can offer, so a GUI never has to parse config.toml.
+    Options(work_options::OptionsArgs),
+    /// Built-in pipeline presets: list them, or write one into config.toml
+    /// as `[pipeline.<name>]` without spending an agent turn.
+    Preset(work_options::PresetArgs),
+    /// Write, replace, or remove a `[pipeline.<name>]` from the JSON shape
+    /// `work options` prints, so an editor never parses config.toml.
+    Pipeline(work_pipeline::PipelineArgs),
+    /// Add, update, or remove one `[[route]]` by its `match` regex.
+    Route(work_pipeline::RouteArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -686,6 +858,7 @@ async fn run_work_cmd(
 ) -> Result<()> {
     match action {
         WorkCmd::Init(args) => work_init::run(args, cfg, config_path).await,
+        WorkCmd::Compose(args) => work_compose::run(args, cfg).await,
         WorkCmd::Up(args) => work_up::run(args, cfg, config_path, Some(client)).await,
         WorkCmd::Start(args) => agent_launch::run_work_start(args, client.socket()),
         WorkCmd::List(args) => tmux_work::run_work_list(args, client).await,
@@ -693,6 +866,10 @@ async fn run_work_cmd(
         WorkCmd::Done(args) => tmux_work::run_work_done(args, client).await,
         WorkCmd::Reconcile(args) => work_up::run_reconcile(args, client).await,
         WorkCmd::Close(args) | WorkCmd::Down(args) => tmux_work::run_work_close(args),
+        WorkCmd::Options(args) => work_options::run_options(args, cfg, config_path),
+        WorkCmd::Preset(args) => work_options::run_preset(args, config_path),
+        WorkCmd::Pipeline(args) => work_pipeline::run_pipeline(args, config_path),
+        WorkCmd::Route(args) => work_pipeline::run_route(args, config_path),
     }
 }
 
@@ -711,6 +888,245 @@ fn collaboration_client_kind(command: &Cmd) -> CollaborationClientKind {
         Cmd::Mcp => CollaborationClientKind::Mcp,
         Cmd::Dashboard(_) => CollaborationClientKind::Dashboard,
         _ => CollaborationClientKind::Cli,
+    }
+}
+
+/// Refuse with a pointed message when the running daemon predates a
+/// request kind, instead of the generic "unknown kind" it would answer.
+async fn require_capability(client: &Client, capability: &str, what: &str) -> Result<()> {
+    let hello = client.hello(Duration::from_secs(2)).await?;
+    anyhow::ensure!(
+        hello.capabilities.iter().any(|value| value == capability),
+        "the running muxad is too old for {what}; restart it from this muxa version"
+    );
+    Ok(())
+}
+
+async fn cmd_ask_admin(client: &Client, action: AskCmd) -> Result<()> {
+    require_capability(client, "ask_providers_v1", "ask providers").await?;
+    match action {
+        AskCmd::Providers { json } => {
+            let providers = client.ask_providers().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&providers)?);
+            } else {
+                print!("{}", render_ask_providers(&providers));
+            }
+        }
+        AskCmd::Provider {
+            action:
+                AskProviderCmd::Set {
+                    id,
+                    title,
+                    model,
+                    api_key_env,
+                    executable,
+                    clear_title,
+                    clear_model,
+                    clear_api_key_env,
+                    clear_executable,
+                    json,
+                },
+        } => {
+            // Only the flags given travel: an omitted key stays as it is.
+            let key = |set: Option<String>, clear: bool| {
+                if clear {
+                    Some(None)
+                } else {
+                    set.map(Some)
+                }
+            };
+            let edit = muxa::ask::AskProviderEdit {
+                title: key(title, clear_title),
+                model: key(model, clear_model),
+                api_key_env: key(api_key_env, clear_api_key_env),
+                executable: key(executable, clear_executable),
+            };
+            let providers = client.ask_provider_configure(&id, &edit).await?;
+            report_provider_change(&providers, &id, json)?;
+        }
+        AskCmd::Provider {
+            action:
+                AskProviderCmd::Add {
+                    id,
+                    engine,
+                    title,
+                    model,
+                    api_key_env,
+                    executable,
+                    json,
+                },
+        } => {
+            let request = muxa::ask::AskProviderAdd {
+                id: id.clone(),
+                engine: engine.label().to_string(),
+                title,
+                model,
+                api_key_env,
+                executable,
+            };
+            let providers = client.ask_provider_add(&request).await?;
+            report_provider_change(&providers, &id, json)?;
+        }
+        AskCmd::Provider {
+            action: AskProviderCmd::Remove { id, json },
+        } => {
+            let providers = client.ask_provider_remove(&id).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&providers)?);
+            } else if providers.iter().any(|provider| provider.id == id) {
+                println!("{id}: settings cleared; the built-in provider stands again");
+            } else {
+                println!("{id}: removed");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One line describing the provider a write just touched, or the whole
+/// list as JSON.
+fn report_provider_change(
+    providers: &[muxa::ask::AskProviderInfo],
+    id: &str,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(providers)?);
+        return Ok(());
+    }
+    let changed = providers
+        .iter()
+        .find(|provider| provider.id == id)
+        .context("the daemon did not echo the provider back")?;
+    println!(
+        "{}: {} on {}, model {}, key from {}{}",
+        changed.id,
+        changed.title,
+        changed.engine,
+        changed.model.as_deref().unwrap_or("(provider default)"),
+        changed.credential_env,
+        if changed.credential_present {
+            " (present)"
+        } else {
+            ""
+        }
+    );
+    Ok(())
+}
+
+fn render_ask_providers(providers: &[muxa::ask::AskProviderInfo]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for provider in providers {
+        let via = match provider.kind {
+            muxa::ask::AskProviderKind::Cli => {
+                provider.executable.clone().unwrap_or_else(|| "cli".into())
+            }
+            muxa::ask::AskProviderKind::Api => "api".into(),
+        };
+        let credential = if provider.credential_present {
+            format!("{} present", provider.credential_env)
+        } else if provider.credential_required {
+            format!("{} missing", provider.credential_env)
+        } else {
+            format!("{} optional", provider.credential_env)
+        };
+        let _ = writeln!(
+            out,
+            "{} {:<16} {:<18} {:<10} {:<10} {:<18} {}",
+            if provider.selected { "*" } else { " " },
+            provider.id,
+            provider.title,
+            provider.engine,
+            via,
+            provider.model.as_deref().unwrap_or("-"),
+            credential
+        );
+    }
+    out
+}
+
+async fn cmd_ask(
+    client: &Client,
+    prompt: String,
+    agent: Option<String>,
+    api_key_stdin: bool,
+    detach: bool,
+    json: bool,
+    timeout_secs: u64,
+) -> Result<()> {
+    let selected = client.ask_agent(agent.as_deref()).await?;
+    let api_key = if api_key_stdin {
+        anyhow::ensure!(
+            !std::io::stdin().is_terminal(),
+            "--api-key-stdin requires a pipe; refusing to echo a secret in the terminal"
+        );
+        let mut value = String::new();
+        std::io::stdin().read_to_string(&mut value)?;
+        let value = value.trim().to_string();
+        anyhow::ensure!(!value.is_empty(), "stdin did not contain an API key");
+        let hello = client.hello(Duration::from_secs(2)).await?;
+        anyhow::ensure!(
+            hello
+                .capabilities
+                .iter()
+                .any(|value| value == "ask_one_turn_credential_v1"),
+            "the running muxad is too old for one-turn API keys; restart it from this muxa version"
+        );
+        Some(value)
+    } else {
+        None
+    };
+    let pending = client
+        .ask_send_with_credential(&prompt, Some(&selected), api_key.as_deref())
+        .await?;
+    if detach {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&pending)?);
+        } else {
+            println!("queued {} via {}", pending.id, pending.agent);
+        }
+        return Ok(());
+    }
+
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(timeout_secs.clamp(1, 24 * 60 * 60));
+    loop {
+        let entry = client
+            .ask_list()
+            .await?
+            .into_iter()
+            .find(|entry| entry.id == pending.id)
+            .context("the queued Ask disappeared from durable history")?;
+        match entry.status {
+            muxa::ask::AskStatus::Running => {
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for {}; the Ask remains queued in muxad history",
+                    entry.id
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            muxa::ask::AskStatus::Answered => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entry)?);
+                } else {
+                    println!("{}", entry.answer);
+                }
+                return Ok(());
+            }
+            muxa::ask::AskStatus::Failed => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entry)?);
+                    anyhow::bail!("Ask {} failed", entry.id);
+                }
+                anyhow::bail!(
+                    "{}",
+                    entry.error.as_deref().unwrap_or("headless provider failed")
+                );
+            }
+        }
     }
 }
 
@@ -765,7 +1181,36 @@ async fn main() -> Result<()> {
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Peers { json } => cmd_peers(&client, json).await,
         Cmd::Msg { action } => cmd_msg(&client, action).await,
+        Cmd::Ask {
+            action: Some(action),
+            ..
+        } => cmd_ask_admin(&client, action).await,
+        Cmd::Ask {
+            action: None,
+            prompt,
+            agent,
+            api_key_stdin,
+            detach,
+            json,
+            timeout_secs,
+        } => {
+            let prompt = prompt.context(
+                "give a question to ask, or a subcommand (`muxa ask providers`, `muxa ask provider set …`)",
+            )?;
+            cmd_ask(
+                &client,
+                prompt,
+                agent,
+                api_key_stdin,
+                detach,
+                json,
+                timeout_secs,
+            )
+            .await
+        }
         Cmd::Skill(a) => message_skill::run(a, &cfg.message, skill_path.as_deref()),
+        Cmd::Automation(a) => automation::run(a, &client).await,
+        Cmd::Config(a) => config_cmd::run(a, socket.clone()).await,
         Cmd::Host(a) => fleet_cli::run_host(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Fleet(a) => fleet_cli::run_fleet(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Agent { action } => run_agent_cmd(action, &client, &socket).await,
@@ -861,11 +1306,11 @@ async fn main() -> Result<()> {
             }
             relay::run(client).await
         }
-        Cmd::FleetRemoteAttach { token } => relay::remote_attach(&token),
+        Cmd::FleetRemoteAttach { token, fit } => relay::remote_attach(&token, fit),
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket, config_path).await,
-        Cmd::Doctor => doctor::run(socket).await,
+        Cmd::Doctor => doctor::run(socket, config_path.as_deref()).await,
         Cmd::Daemon { action } => {
             daemon::run(action, &client, &socket, config_path.as_deref()).await
         }
@@ -2274,18 +2719,17 @@ fn jump_to_pane_tmux_key(key: &muxa::PaneKey) {
     );
     run(&["select-window", "-t", &target]);
     run(&["select-pane", "-t", pane]);
-    match muxa::tmux::tmux_command_on(socket)
-        .args([
-            "attach-session",
-            "-t",
-            key.window.session.session_id.as_str(),
-        ])
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!(
+    // Wait through a hang-up of our own terminal: the client is told to
+    // detach and the caller's `--fit` restore guards still run afterwards.
+    match interactive_child::run_interactive(muxa::tmux::tmux_command_on(socket).args([
+        "attach-session",
+        "-t",
+        key.window.session.session_id.as_str(),
+    ])) {
+        Ok(exit) if exit.is_clean_detach() => {}
+        Ok(exit) => eprintln!(
             "muxa: tmux attach-session exited with {}",
-            status
+            exit.status
                 .code()
                 .map_or_else(|| "signal".into(), |code| code.to_string())
         ),
@@ -2436,18 +2880,17 @@ fn jump_to_pane_tmux(pane_id: &str) {
         // and real session sets collide (`callabo` against `callabo-set`).
         // `.status()` waits for tmux to exit; on detach the user is back at
         // this shell prompt, which is the least-surprising behaviour.
-        match muxa::tmux::tmux_command()
-            .args([
-                "attach-session",
-                "-t",
-                session_target(&info.session_id, &info.session),
-            ])
-            .status()
-        {
-            Ok(s) if s.success() => {}
-            Ok(s) => eprintln!(
+        match interactive_child::run_interactive(muxa::tmux::tmux_command().args([
+            "attach-session",
+            "-t",
+            session_target(&info.session_id, &info.session),
+        ])) {
+            Ok(exit) if exit.is_clean_detach() => {}
+            Ok(exit) => eprintln!(
                 "muxa: tmux attach-session exited with {}",
-                s.code().map_or_else(|| "signal".into(), |c| c.to_string())
+                exit.status
+                    .code()
+                    .map_or_else(|| "signal".into(), |c| c.to_string())
             ),
             Err(e) => eprintln!("muxa: failed to spawn tmux attach-session: {e}"),
         }
@@ -3295,6 +3738,263 @@ mod tests {
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
 
+    #[test]
+    fn ask_command_supports_headless_provider_and_stdin_key() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "ask",
+            "summarize this window",
+            "--agent",
+            "codex",
+            "--api-key-stdin",
+            "--detach",
+            "--json",
+        ])
+        .unwrap();
+        let Cmd::Ask {
+            action,
+            prompt,
+            agent,
+            api_key_stdin,
+            detach,
+            json,
+            ..
+        } = args.cmd
+        else {
+            panic!("expected ask command");
+        };
+        assert!(action.is_none());
+        assert_eq!(prompt.as_deref(), Some("summarize this window"));
+        assert_eq!(agent.as_deref(), Some("codex"));
+        assert!(api_key_stdin);
+        assert!(detach);
+        assert!(json);
+    }
+
+    #[test]
+    fn the_provider_table_names_the_engine_behind_each_instance() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "anthropic-work".to_string(),
+            muxa::config::AskProviderConfig {
+                engine: Some("anthropic".into()),
+                title: Some("Anthropic (work)".into()),
+                api_key_env: Some("WORK_ANTHROPIC_KEY".into()),
+                ..muxa::config::AskProviderConfig::default()
+            },
+        );
+        let env = |name: &str| (name == "WORK_ANTHROPIC_KEY").then(|| "k".to_string());
+        let rendered = render_ask_providers(&muxa::ask::provider_infos(
+            &providers,
+            "anthropic-work",
+            env,
+        ));
+        let mut lines = rendered.lines();
+        let work = lines.next().expect("the composed instance leads");
+        assert!(work.starts_with('*'), "{work}");
+        assert!(work.contains("anthropic-work"), "{work}");
+        assert!(work.contains("Anthropic (work)"), "{work}");
+        // The engine is its own column, so two instances of one engine are
+        // told apart by id while still showing what drives them.
+        assert!(work.contains("anthropic"), "{work}");
+        assert!(work.contains("ANTHROPIC_API_KEY present"), "{work}");
+        // Every built-in still follows it, unselected.
+        let rest: Vec<&str> = lines.collect();
+        assert_eq!(rest.len(), muxa::ask::supported_agents().len());
+        assert!(rest.iter().all(|line| line.starts_with(' ')), "{rest:?}");
+        let claude = rest.first().expect("claude leads the built-ins");
+        assert!(claude.contains("Claude Code"), "{claude}");
+        assert!(claude.contains("ANTHROPIC_API_KEY optional"), "{claude}");
+    }
+
+    #[allow(clippy::too_many_lines)] // one parse assertion per ask subcommand
+    #[test]
+    fn ask_accepts_every_provider_id_and_its_admin_subcommands() {
+        // Built-in ids and composed ones alike: `--agent` names a provider
+        // instance, so it cannot be a closed value set.
+        for id in muxa::ask::supported_agents()
+            .iter()
+            .chain(["anthropic-work", "openai_personal"].iter())
+        {
+            let args = Args::try_parse_from(["muxa", "ask", "--agent", id, "hello"]).unwrap();
+            let Cmd::Ask { agent, .. } = args.cmd else {
+                panic!("expected ask command");
+            };
+            assert_eq!(agent.as_deref(), Some(*id));
+        }
+
+        let args = Args::try_parse_from(["muxa", "ask", "providers", "--json"]).unwrap();
+        let Cmd::Ask {
+            action: Some(AskCmd::Providers { json }),
+            prompt: None,
+            ..
+        } = args.cmd
+        else {
+            panic!("expected ask providers");
+        };
+        assert!(json);
+
+        let args = Args::try_parse_from([
+            "muxa",
+            "ask",
+            "provider",
+            "set",
+            "anthropic",
+            "--model",
+            "claude-opus-5",
+            "--clear-api-key-env",
+        ])
+        .unwrap();
+        let Cmd::Ask {
+            action:
+                Some(AskCmd::Provider {
+                    action:
+                        AskProviderCmd::Set {
+                            id,
+                            model,
+                            api_key_env,
+                            clear_model,
+                            clear_api_key_env,
+                            ..
+                        },
+                }),
+            ..
+        } = args.cmd
+        else {
+            panic!("expected ask provider set");
+        };
+        assert_eq!(id, "anthropic");
+        assert_eq!(model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(api_key_env, None);
+        assert!(!clear_model);
+        assert!(clear_api_key_env);
+        // Setting and clearing the same key at once is a contradiction.
+        assert!(Args::try_parse_from([
+            "muxa",
+            "ask",
+            "provider",
+            "set",
+            "openai",
+            "--model",
+            "gpt-5",
+            "--clear-model"
+        ])
+        .is_err());
+        // Composing a provider: the id is free text, the engine is not.
+        let args = Args::try_parse_from([
+            "muxa",
+            "ask",
+            "provider",
+            "add",
+            "anthropic-work",
+            "--engine",
+            "anthropic",
+            "--title",
+            "Anthropic (work)",
+            "--api-key-env",
+            "WORK_ANTHROPIC_KEY",
+            "--executable",
+            "/opt/homebrew/bin/claude",
+        ])
+        .unwrap();
+        let Cmd::Ask {
+            action:
+                Some(AskCmd::Provider {
+                    action:
+                        AskProviderCmd::Add {
+                            id,
+                            engine,
+                            title,
+                            model,
+                            api_key_env,
+                            executable,
+                            json,
+                        },
+                }),
+            ..
+        } = args.cmd
+        else {
+            panic!("expected ask provider add");
+        };
+        assert_eq!(id, "anthropic-work");
+        assert_eq!(engine.label(), "anthropic");
+        assert_eq!(title.as_deref(), Some("Anthropic (work)"));
+        assert_eq!(model, None);
+        assert_eq!(api_key_env.as_deref(), Some("WORK_ANTHROPIC_KEY"));
+        assert_eq!(executable.as_deref(), Some("/opt/homebrew/bin/claude"));
+        assert!(!json);
+        // The engine is required, and only the five muxa ships are accepted.
+        assert!(Args::try_parse_from(["muxa", "ask", "provider", "add", "mine"]).is_err());
+        assert!(Args::try_parse_from([
+            "muxa", "ask", "provider", "add", "mine", "--engine", "bard"
+        ])
+        .is_err());
+
+        let args = Args::try_parse_from([
+            "muxa",
+            "ask",
+            "provider",
+            "remove",
+            "anthropic-work",
+            "--json",
+        ])
+        .unwrap();
+        let Cmd::Ask {
+            action:
+                Some(AskCmd::Provider {
+                    action: AskProviderCmd::Remove { id, json },
+                }),
+            ..
+        } = args.cmd
+        else {
+            panic!("expected ask provider remove");
+        };
+        assert_eq!(id, "anthropic-work");
+        assert!(json);
+
+        // A question that is not a subcommand name still asks.
+        let args = Args::try_parse_from(["muxa", "ask", "what providers exist?"]).unwrap();
+        let Cmd::Ask {
+            action: None,
+            prompt,
+            ..
+        } = args.cmd
+        else {
+            panic!("expected a plain ask");
+        };
+        assert_eq!(prompt.as_deref(), Some("what providers exist?"));
+    }
+
+    #[test]
+    fn work_compose_cli_takes_a_description_agent_and_current_draft() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "work",
+            "compose",
+            "implementer in claude, reviewer in codex after it",
+            "--agent",
+            "codex",
+            "--current",
+            "-",
+            "--json",
+        ])
+        .unwrap();
+        let Cmd::Work {
+            action: WorkCmd::Compose(compose),
+        } = args.cmd
+        else {
+            panic!("expected work compose");
+        };
+        assert_eq!(
+            compose.description,
+            "implementer in claude, reviewer in codex after it"
+        );
+        assert_eq!(compose.agent.as_deref(), Some("codex"));
+        assert_eq!(compose.current.as_deref(), Some(std::path::Path::new("-")));
+        assert!(compose.json);
+        assert!(Args::try_parse_from(["muxa", "work", "compose"]).is_err());
+    }
+
     fn started(kind: AgentKind, pane: Option<&str>) -> muxa::event::AgentEvent {
         muxa::event::AgentEvent::Started {
             id: muxa::event::AgentId {
@@ -3540,6 +4240,7 @@ mod tests {
             cwd: None,
             state,
             last_prompt: Some(prompt.into()),
+            last_prompt_at: None,
             last_response: None,
             recap: None,
             ai_title: None,
@@ -4125,6 +4826,22 @@ mod tests {
         assert_eq!(onboard.tour, onboarding::Tour::Live);
         assert!(Args::try_parse_from(["muxa", "onboard", "--tour", "live"]).is_ok());
         assert!(Args::try_parse_from(["muxa", "onboard", "--tour", "simulated"]).is_err());
+    }
+
+    #[test]
+    fn fleet_attach_accepts_app_fit_mode() {
+        assert!(Args::try_parse_from([
+            "muxa",
+            "fleet",
+            "attach",
+            "--fit",
+            "rtzr",
+            r#"{"window":{"session":{"host":"tmux","socket":"default","session_id":"$1"},"window_id":"@2"},"pane_id":"%3"}"#,
+        ])
+        .is_ok());
+        assert!(
+            Args::try_parse_from(["muxa", "fleet-remote-attach", "0123abcd", "--fit",]).is_ok()
+        );
     }
 
     #[test]

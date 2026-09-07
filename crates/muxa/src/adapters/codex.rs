@@ -22,6 +22,90 @@ use time::OffsetDateTime;
 
 pub struct CodexAdapter;
 
+const CONVERSATION_RECAP_HEADER: &str = "Conversation recap";
+const MAX_RECAP_BYTES: usize = 2_000;
+
+/// Extract Codex's user-visible `Conversation recap` from a captured pane.
+///
+/// The compacted rollout item is intentionally opaque, while the TUI renders a
+/// short plaintext recap between a box-rule header and the next composer. The
+/// screen detector uses this best-effort parser to persist that text in the
+/// same `Agent::recap` field Claude fills from its transcript. A strict chrome
+/// match prevents ordinary prompts that merely mention "Conversation recap"
+/// from being mistaken for a summary.
+#[must_use]
+pub fn conversation_recap_from_capture(raw: &str) -> Option<String> {
+    let prepared = crate::screen::prepare_capture(raw, usize::MAX);
+    let lines: Vec<&str> = prepared.lines().collect();
+    let header = lines
+        .iter()
+        .rposition(|line| is_conversation_recap_header(line))?;
+
+    let mut body: Vec<String> = Vec::new();
+    let mut started = false;
+    for line in &lines[header + 1..] {
+        let trimmed = line.trim();
+        if !started && trimmed.is_empty() {
+            continue;
+        }
+        if recap_boundary(line) {
+            break;
+        }
+        if trimmed.is_empty() {
+            if started && body.last().is_some_and(|line| !line.is_empty()) {
+                body.push(String::new());
+            }
+            continue;
+        }
+
+        started = true;
+        // Codex indents recap prose by two cells. Remove only that known
+        // chrome indent; additional indentation may be meaningful markdown.
+        body.push(
+            line.strip_prefix("  ")
+                .unwrap_or(line)
+                .trim_end()
+                .to_owned(),
+        );
+    }
+
+    while body.last().is_some_and(String::is_empty) {
+        body.pop();
+    }
+    let recap = body.join("\n").trim().to_owned();
+    (!recap.is_empty()).then(|| truncate(recap, MAX_RECAP_BYTES))
+}
+
+fn is_conversation_recap_header(line: &str) -> bool {
+    line.trim_matches(|c: char| c.is_whitespace() || matches!(c, '─' | '━'))
+        == CONVERSATION_RECAP_HEADER
+}
+
+/// TUI rows that can follow the recap but are not part of it. Column-zero
+/// markers begin the next turn; status/footer rows retain Codex's two-cell
+/// indent and therefore need their own narrow checks.
+fn recap_boundary(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let begins_at_column_zero = line.chars().next().is_some_and(|c| !c.is_whitespace());
+    if begins_at_column_zero
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| matches!(c, '›' | '>' | '•' | '─' | '━'))
+    {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    (lower.contains("background terminal") && lower.contains("running"))
+        || (lower.starts_with("gpt-") && trimmed.contains(" · "))
+        || lower.ends_with("for shortcuts")
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Input {
     pub session_id: String,
@@ -112,5 +196,59 @@ impl HookAdapter for CodexAdapter {
                 at,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_visible_conversation_recap_without_tui_chrome() {
+        let capture = "- finished prior output\n\
+─ Worked for 14m 27s ───\n\
+\n\
+─ Conversation recap ─────\n\
+\n\
+  CAL 일감 18건을 각각 검토하는 작업입니다. 검토 기준은 최신 코드와 Linear입니다.\n\
+  다음 단계는 각 일감의 상태와 근거를 확인하는 것입니다.\n\
+\n\
+  1 background terminal running · /ps to view · /stop to close\n\
+\n\
+› Ask Codex to do anything\n\
+\n\
+  gpt-5.6-sol xhigh · ~/project\n";
+
+        assert_eq!(
+            conversation_recap_from_capture(capture).as_deref(),
+            Some(
+                "CAL 일감 18건을 각각 검토하는 작업입니다. 검토 기준은 최신 코드와 Linear입니다.\n다음 단계는 각 일감의 상태와 근거를 확인하는 것입니다."
+            ),
+        );
+    }
+
+    #[test]
+    fn picks_latest_strict_header_and_strips_ansi() {
+        let capture = "─ Conversation recap ──\n\n  old recap\n\n\
+› next prompt\n\
+\x1b[0;1m─ Conversation recap\x1b[0;2m ───\n\n  latest recap\n";
+        assert_eq!(
+            conversation_recap_from_capture(capture).as_deref(),
+            Some("latest recap"),
+        );
+
+        let ordinary_text = "› Can you explain Conversation recap?\n\n• Yes.";
+        assert_eq!(conversation_recap_from_capture(ordinary_text), None);
+    }
+
+    #[test]
+    fn empty_or_chrome_only_recap_is_none() {
+        assert_eq!(
+            conversation_recap_from_capture(
+                "─ Conversation recap ──\n\n› Ask Codex to do anything\n"
+            ),
+            None,
+        );
+        assert_eq!(conversation_recap_from_capture("plain output"), None);
     }
 }

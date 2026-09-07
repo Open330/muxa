@@ -43,6 +43,12 @@ pub enum Component {
     Dashboard,
     /// Same-window agent mailbox: enable `[collaboration]` in config
     Collaboration,
+    /// Shared collaboration entry points in global agent instructions.
+    AgentInstructions,
+    /// Canonical collaboration skill and per-agent symlinks.
+    AgentSkills,
+    /// User-scoped muxa MCP registrations for installed agents.
+    AgentMcp,
     /// Headless questions from watch: enable `[ask]` in config
     Ask,
 }
@@ -64,6 +70,9 @@ impl Component {
         Component::MuxadShellrc,
         Component::Dashboard,
         Component::Collaboration,
+        Component::AgentInstructions,
+        Component::AgentSkills,
+        Component::AgentMcp,
         Component::Ask,
     ];
 
@@ -85,6 +94,9 @@ impl Component {
             Component::MuxadShellrc => "muxad-shellrc",
             Component::Dashboard => "dashboard",
             Component::Collaboration => "collaboration",
+            Component::AgentInstructions => "agent-instructions",
+            Component::AgentSkills => "agent-skills",
+            Component::AgentMcp => "agent-mcp",
             Component::Ask => "ask",
         }
     }
@@ -111,6 +123,9 @@ impl Component {
             Component::MuxadShellrc => "muxad: shellrc autostart hook (no service manager)",
             Component::Dashboard => "Web dashboard: generate token + enable",
             Component::Collaboration => "Collaboration: same-window agent request/reply mailbox",
+            Component::AgentInstructions => "Agents: global Muxa collaboration entry points",
+            Component::AgentSkills => "Agents: shared collaboration skill with symlinks",
+            Component::AgentMcp => "Agents: register Muxa MCP for Codex and Claude Code",
             Component::Ask => "Ask: headless questions to an agent from watch",
         }
     }
@@ -135,6 +150,11 @@ impl Component {
             Component::MuxadShellrc => "appends to ~/.zshrc or ~/.bashrc; cross-platform",
             Component::Dashboard => "loopback :7878 by default; token in config",
             Component::Collaboration => "lets a peer's request type a wake prompt into your pane",
+            Component::AgentInstructions => "adds a managed block to active AGENTS.md / CLAUDE.md",
+            Component::AgentSkills => {
+                "keeps the canonical skill beside muxa config; preserves existing skills"
+            }
+            Component::AgentMcp => "merges only the muxa server; forwards Codex pane environment",
             Component::Ask => "a/A in watch; muxad spawns an agent CLI that bills your account",
         }
     }
@@ -187,6 +207,9 @@ impl Component {
                 Component::AntigravityHooks,
                 Component::OpencodeHooks,
                 Component::Collaboration,
+                Component::AgentInstructions,
+                Component::AgentSkills,
+                Component::AgentMcp,
                 Component::Ask,
                 dm,
             ],
