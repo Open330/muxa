@@ -72,7 +72,7 @@ pub enum AskError {
     Disabled,
     #[error("ask prompt is empty")]
     EmptyPrompt,
-    #[error("this conversation is still answering; wait for the current reply before sending another message")]
+    #[error("this conversation is still answering; wait for the current reply or start a new conversation")]
     ConversationBusy,
     #[error("ask conversation {0:?} was not found")]
     ConversationNotFound(String),
@@ -624,21 +624,7 @@ impl AskStore {
     pub async fn reset_thread(&self) -> AskConversation {
         let _guard = self.write_lock.lock().await;
         let agent = self.agent.read().await.clone();
-        self.threads.write().await.remove(&agent);
-        let now = OffsetDateTime::now_utc();
-        let conversation = AskConversation {
-            id: format!("conversation_{:x}", next_id()),
-            title: "New conversation".into(),
-            agent: agent.clone(),
-            agent_session_id: None,
-            created_at: now,
-            updated_at: now,
-        };
-        self.conversations.write().await.push(conversation.clone());
-        self.active_conversations
-            .write()
-            .await
-            .insert(agent, conversation.id.clone());
+        let conversation = self.create_conversation(&agent).await;
         self.persist().await;
         self.publish_change();
         conversation
@@ -727,6 +713,28 @@ impl AskStore {
         prompt: &str,
         credential: Option<AskCredential>,
     ) -> Result<AskEntry, AskError> {
+        self.ask_with_credential_mode(prompt, credential, false)
+            .await
+    }
+
+    /// Queue the first turn of a fresh conversation as one mutation. Unlike
+    /// [`Self::reset_thread`] followed by [`Self::ask_with_credential`], a
+    /// rejected or abandoned prompt cannot leave an empty conversation.
+    pub async fn ask_in_new_conversation_with_credential(
+        self: &Arc<Self>,
+        prompt: &str,
+        credential: Option<AskCredential>,
+    ) -> Result<AskEntry, AskError> {
+        self.ask_with_credential_mode(prompt, credential, true)
+            .await
+    }
+
+    async fn ask_with_credential_mode(
+        self: &Arc<Self>,
+        prompt: &str,
+        credential: Option<AskCredential>,
+        new_conversation: bool,
+    ) -> Result<AskEntry, AskError> {
         if !self.opts.enabled {
             return Err(AskError::Disabled);
         }
@@ -742,7 +750,11 @@ impl AskStore {
         let credential_key = take_credential(&instances, &provider, credential)?;
 
         let write_guard = self.write_lock.lock().await;
-        let conversation = self.ensure_active_conversation(&provider.id).await;
+        let conversation = if new_conversation {
+            self.create_conversation(&provider.id).await
+        } else {
+            self.ensure_active_conversation(&provider.id).await
+        };
         let conversation_id = conversation.id.clone();
         if self.entries.read().await.iter().any(|entry| {
             entry.conversation_id.as_deref() == Some(conversation_id.as_str())
@@ -939,18 +951,27 @@ impl AskStore {
     }
 
     async fn ensure_active_conversation(&self, agent: &str) -> AskConversation {
-        if let Some(id) = self.active_conversations.read().await.get(agent).cloned() {
-            if let Some(conversation) = self
-                .conversations
-                .read()
-                .await
-                .iter()
-                .find(|conversation| conversation.id == id)
-                .cloned()
-            {
-                return conversation;
-            }
+        if let Some(conversation) = self.active_conversation_for(agent).await {
+            return conversation;
         }
+        self.create_conversation(agent).await
+    }
+
+    async fn active_conversation_for(&self, agent: &str) -> Option<AskConversation> {
+        let id = self.active_conversations.read().await.get(agent).cloned()?;
+        self.conversations
+            .read()
+            .await
+            .iter()
+            .find(|conversation| conversation.id == id)
+            .cloned()
+    }
+
+    /// Create and select a conversation while the caller holds `write_lock`.
+    /// Persistence and change publication stay with the outer mutation so a
+    /// create-and-send appears atomically to readers.
+    async fn create_conversation(&self, agent: &str) -> AskConversation {
+        self.threads.write().await.remove(agent);
         let now = OffsetDateTime::now_utc();
         let conversation = AskConversation {
             id: format!("conversation_{:x}", next_id()),
@@ -2953,6 +2974,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_new_conversation_can_start_while_the_previous_one_is_running() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "claude".into(),
+            AskProviderConfig {
+                executable: Some("/definitely/missing/muxa-test-agent".into()),
+                ..AskProviderConfig::default()
+            },
+        );
+        let store = AskStore::in_memory(AskOptions {
+            enabled: true,
+            providers,
+            ..AskOptions::default()
+        });
+        let first = store.reset_thread().await;
+        let now = OffsetDateTime::now_utc();
+        store.entries.write().await.push(AskEntry {
+            id: "still-running".into(),
+            conversation_id: Some(first.id.clone()),
+            prompt: "first".into(),
+            answer: String::new(),
+            status: AskStatus::Running,
+            agent: "claude".into(),
+            agent_session_id: None,
+            cwd: "/tmp".into(),
+            asked_at: now,
+            answered_at: None,
+            cost_usd: None,
+            error: None,
+        });
+
+        let second = store
+            .ask_in_new_conversation_with_credential("independent", None)
+            .await
+            .unwrap();
+
+        assert_ne!(second.conversation_id.as_deref(), Some(first.id.as_str()));
+        assert_eq!(store.list_conversations().await.len(), 2);
+        assert_eq!(store.list().await.len(), 2);
+    }
+
+    #[tokio::test]
     async fn every_provider_can_be_selected_and_listed() {
         let store = AskStore::in_memory(AskOptions::default());
         for id in supported_agents() {
@@ -3229,6 +3292,13 @@ mod tests {
                 .await,
             Err(AskError::EmptyPrompt)
         ));
+        assert!(matches!(
+            store
+                .ask_in_new_conversation_with_credential(" ", None)
+                .await,
+            Err(AskError::EmptyPrompt)
+        ));
+        assert!(store.list_conversations().await.is_empty());
     }
 
     #[test]

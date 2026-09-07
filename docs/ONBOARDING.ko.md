@@ -136,7 +136,7 @@ row는 tmux window를, 펼친 child row는 agent pane을 나타냅니다.
 - m: 선택한 agent에 collaboration 메시지 작성
 - M: mailbox 열기
 - a: headless ask
-- A: ask history
+- A: 선택한 Ask conversation
 - o 또는 Alt-P: pane preview
 - Alt-I: inspector
 - Alt-E: event inbox

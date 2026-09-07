@@ -372,6 +372,14 @@ enum RequestBody {
         #[serde(default)]
         credential: Option<AskCredential>,
     },
+    /// Queue the first turn of a fresh conversation atomically. This is a
+    /// distinct request kind so an older daemon rejects it instead of
+    /// silently ignoring a new flag and appending to the active conversation.
+    AskSendNew {
+        prompt: String,
+        #[serde(default)]
+        credential: Option<AskCredential>,
+    },
     AskSubscribe,
     /// Report whether the daemon accepted the explicit `[ask].enabled`
     /// grant at startup. This lets native clients present setup before a
@@ -692,6 +700,7 @@ const CAPABILITIES: &[&str] = &[
     "ask_one_turn_credential_v1",
     "ask_status_v1",
     "ask_conversations_v1",
+    "ask_send_new_v1",
     "ask_subscribe",
     "ask_providers_v1",
     "work_compose_v1",
@@ -3200,6 +3209,16 @@ async fn handle(
                         Err(error) => Response::err(error.to_string()),
                     }
                 }
+                RequestBody::AskSendNew { prompt, credential } => {
+                    kind = "ask_send_new";
+                    match ask
+                        .ask_in_new_conversation_with_credential(&prompt, credential)
+                        .await
+                    {
+                        Ok(entry) => Response::with_ask_entry(entry),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
                 RequestBody::AskSubscribe => {
                     let changes = ask.subscribe();
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
@@ -4728,6 +4747,19 @@ impl Client {
     /// Queue a headless question; the returned entry is `Running`.
     pub async fn ask_send(&self, prompt: &str) -> Result<AskEntry, RuntimeError> {
         self.ask_send_with_credential(prompt, None, None).await
+    }
+
+    /// Queue a question as the first turn of a new conversation. Creation and
+    /// send are one daemon mutation, so a cancelled composer never creates an
+    /// empty durable conversation.
+    pub async fn ask_send_new(&self, prompt: &str) -> Result<AskEntry, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_send_new",
+            "prompt": prompt,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_entry"].clone()).map_err(RuntimeError::Json)
     }
 
     /// Queue a headless question with an optional one-turn API key. The key
@@ -7043,6 +7075,7 @@ mod tests {
         assert!(caps.contains(&"ask_one_turn_credential_v1"));
         assert!(caps.contains(&"ask_status_v1"));
         assert!(caps.contains(&"ask_conversations_v1"));
+        assert!(caps.contains(&"ask_send_new_v1"));
         assert!(caps.contains(&"ask_providers_v1"));
         assert!(caps.contains(&"work_compose_v1"));
         assert!(!caps.contains(&RESTART_CAPABILITY));
@@ -7121,6 +7154,39 @@ mod tests {
         assert_eq!(selected.id, first.id);
         let (_, active) = client.ask_conversation_list().await.unwrap();
         assert_eq!(active.unwrap().id, first.id);
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_send_new_creates_the_conversation_with_its_first_turn() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-ask-send-new.sock");
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "claude".into(),
+            crate::config::AskProviderConfig {
+                executable: Some("/definitely/missing/muxa-test-agent".into()),
+                ..crate::config::AskProviderConfig::default()
+            },
+        );
+        let ask = crate::ask::AskStore::in_memory(crate::ask::AskOptions {
+            enabled: true,
+            providers,
+            ..crate::ask::AskOptions::default()
+        });
+        let server = Server::new(sock.clone(), Store::shared()).with_ask(ask);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        let client = Client::new(sock);
+        let entry = client.ask_send_new("independent question").await.unwrap();
+        let (conversations, active) = client.ask_conversation_list().await.unwrap();
+
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(entry.conversation_id, active.map(|item| item.id));
 
         tx.send(()).unwrap();
         handle.await.unwrap();

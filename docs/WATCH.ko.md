@@ -46,7 +46,7 @@ window였던 것처럼 보이지 않도록 전체 session → window → pane an
 | `w` | pipeline 실행: work id를 입력하면 `muxa work up`을 실행하는 window로 넘어갑니다. |
 | `R` / `:rename` | 선택한 tmux session/window 이름 또는 pane title 변경. |
 | `\|` | list/inspector 분할 순환: 50/50 → 70/30 → 30/70. |
-| `a` / `A` | 설정한 agent에게 headless 질의 / 답변 이력 보기. `Enter`로 선택한 답변 전문 읽기. |
+| `a` / `A` | 선택한 Ask 대화 이어쓰기 / 열기. 컴포저의 `Ctrl-E`와 패널의 `n`으로 새 대화 초안을 만듭니다. |
 | `m` / `M` | resolve된 agent에게 request 보내기 / 선택 topology scope 이력 열기. |
 | `b` | `M`의 이전 alias. mailbox 안에서 `i`는 claim, `e`는 reply. |
 | `v` | collaboration 화면에서 table / 시간순 sequence 전환. |
@@ -185,15 +185,23 @@ durable history는 table과 같습니다.
 ## Ask
 
 `a`는 컴포저 제목에 표시된 agent에게 보낼 headless 질의를 작성합니다. `Tab`으로
-claude ↔ codex를 바꾸고, `Ctrl-V`로 붙여넣으며, 초안 어느 위치에서든 `/`로 공용
-스킬 팔레트를 열어 현재 커서에 삽입하고, `Enter`로 보냅니다. muxad가 agent를
+provider를 바꾸고, `Ctrl-E`로 현재 대화를 이어갈지 새 대화로 보낼지를 전환합니다.
+제목의 `NEW`는 전송할 때 새 대화를 만든다는 뜻이고, `CONTINUE` 뒤에는 이어 쓸
+대화의 위치와 제목이 표시됩니다. `Ctrl-V`로 붙여넣고, 초안 어느 위치에서든
+`/`로 공용 스킬 팔레트를 열어 현재
+커서에 삽입하며, `Enter`로 보냅니다. 새 대화와 첫 질문은 함께 저장되므로 초안을
+취소해도 빈 대화가 남지 않습니다. 대화 하나에서는 한 번에 한 질문만 실행할 수
+있으며, 별개의 초안을 새 대화로 보내면 기존 질문과 동시에 실행할 수 있습니다.
+muxad가 agent를
 print 모드로 실행해 답변을 수집하므로 pane에 입력하지 않고 관리할 세션도 없습니다.
 `Esc`로 취소하며, 입력이 이미 비어 있을 때는 `Backspace`로도 닫을 수 있습니다.
 
-`A`는 이력을 엽니다. `j`/`k` 선택, `Enter` 선택한 답변 전문 열기, `|` 상세 영역
-확대, `Tab` agent 필터(all → claude → codex), `n` 새 대화. `n` 전까지는 하나의 대화라 질문마다 직전 대화를
-resume하며, 두 번째부터는 첫 질문이 지불한 캐시 컨텍스트를 재사용합니다. 대화는
-agent별로 분리돼 있어 되돌아오면 그 대화가 이어집니다.
+`A`는 선택된 대화를 transcript로 엽니다. `j`/`k`로 turn을 선택하고, `Enter`로
+선택한 답변 전문을 열며, `|`로 상세 영역을 확대합니다. `Tab`/`Shift-Tab`은 저장된
+대화 사이를 이동합니다. `a`는 화면의 대화를 이어서 묻고, `n`은 새 대화의 첫 질문을
+작성합니다. 같은 대화의 질문은 직전 대화를 resume하므로 두 번째부터는 첫 질문이
+지불한 캐시 컨텍스트를 재사용합니다. 대화를 선택하면 해당 provider도 함께
+복원됩니다.
 
 실행 주체는 daemon입니다. 팝업을 닫아도 답변이 이력에 도착하고, 이력은
 `$XDG_DATA_HOME/muxa/ask.json`에 남아 재시작 후에도 조회됩니다. `[ask] enabled =
@@ -206,9 +214,10 @@ true`가 필요합니다 — [CONFIGURATION.ko.md](CONFIGURATION.ko.md) 참고.
 `d`/`D`가 읽는 중인 답변을 지우지 않으며, 항목 자체를 따라가므로 열어 둔 상태에서
 도착한 답변도 다시 열 필요 없이 나타납니다.
 
-Ask 이력 안에서 `n`은 이력을 지우지 않고 새 대화를 시작합니다. `D`는 확인창을 연
-뒤 모든 agent filter의 완료 이력을 지웁니다. 소문자 `d`는 선택한 완료 이력 하나만
-확인 후 지웁니다. 두 동작 모두 실행 중인 ask와 conversation id를 보존합니다.
+Ask 패널의 `n`은 새 대화 초안만 열며, 초안을 실제로 보낼 때까지 대화를 만들지
+않습니다. `D`는 확인창을 연 뒤 완료 이력을 모두 지우고, 소문자 `d`는 선택한 완료
+이력 하나만 확인 후 지웁니다. 두 삭제 동작 모두 실행 중인 ask와 conversation id를
+보존합니다.
 
 Ask는 headless session이 승인 prompt에 응답할 수 없고 무인 skill 실행을 목적으로
 하므로 `[ask].permission_mode = "bypass"`가 기본값입니다. 파일 편집·명령 실행·배포가

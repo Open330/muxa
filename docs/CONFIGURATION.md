@@ -109,11 +109,11 @@ executable = "/opt/homebrew/bin/claude"  # optional; CLI engines only
 Opt-in headless questions from `muxa watch`: `a` composes one, `A` browses
 the answers. muxad runs the agent in print mode and captures the reply, so
 there is no session to manage and completion is an exit code rather than a
-guess. Each agent keeps its own conversation and every question after the
-first resumes it, reusing the cached context the first one paid for; `n` in
-the panel starts a fresh thread. `path` defaults to
-`$XDG_DATA_HOME/muxa/ask.json` and holds both the history and the per-agent
-thread ids. Off by default because enabling it lets the daemon spawn a CLI
+guess. Each provider can keep several resumable conversations; `Ctrl-E` in
+the composer marks a draft as new, while `n` in the panel opens a new draft.
+The conversation and its first turn are created together on send. `path` defaults to
+`$XDG_DATA_HOME/muxa/ask.json` and holds both the history and conversation
+ids. Off by default because enabling it lets the daemon spawn a CLI
 that bills your account. See [WATCH.md](WATCH.md).
 
 `permission_mode = "bypass"` is the default because the headless agent cannot
