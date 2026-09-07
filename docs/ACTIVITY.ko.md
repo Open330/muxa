@@ -17,6 +17,11 @@ muxa activity --since today --type human
 muxa activity --since today --type agent --format json
 ```
 
+`muxa stats`와 `muxa report`의 세션별 집계는 `callabo~view~123` 같은 view를
+`callabo`로 합칩니다. 과거 기록에도 적용되며, 합친 뒤 정렬과 행 수 제한을
+적용합니다. view 사이에 겹치는 사용자 체류 시간과 ACT/WACT는 중복 계산하지
+않으며, agent 작업 시간은 기존처럼 합산합니다.
+
 `--since` 는 다음 값을 받습니다:
 
 - `today`: 로컬 날짜 기준 오늘 00:00부터 현재까지.

@@ -914,7 +914,7 @@ fn build_rows(
 
     if group_by == GroupBy::Session && !session_foreground_ledger {
         for activity in &data.activities {
-            let key = activity.name.clone();
+            let key = stats_session_name(&activity.name).to_owned();
             let secs = activity.effective_total_secs(data.now);
             let acc = rows.entry(key).or_default();
             acc.foreground_secs += secs;
@@ -1657,6 +1657,18 @@ fn add_state_transition_row(
     }
 }
 
+/// Historical records outlive tmux's view sessions. Fold only generated
+/// numeric suffixes, leaving deliberate names such as `project~view~draft`.
+fn stats_session_name(mut name: &str) -> &str {
+    while let Some((base, suffix)) = name.rsplit_once("~view~") {
+        if base.is_empty() || suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        name = base;
+    }
+    name
+}
+
 fn prompt_group_key(data: &StatsData, prompt: &HistoryEntry, group_by: GroupBy) -> String {
     match group_by {
         GroupBy::Day => format_day(prompt.at),
@@ -1676,7 +1688,10 @@ fn prompt_group_key(data: &StatsData, prompt: &HistoryEntry, group_by: GroupBy) 
             .tmux_session
             .clone()
             .or_else(|| data.pane_sessions.get(&prompt.pane).cloned())
-            .unwrap_or_else(|| prompt.session_id.clone()),
+            .map_or_else(
+                || prompt.session_id.clone(),
+                |name| stats_session_name(&name).to_owned(),
+            ),
     }
 }
 
@@ -1691,8 +1706,10 @@ fn agent_group_key(data: &StatsData, agent: &Agent, group_by: GroupBy) -> String
             .pane
             .as_ref()
             .and_then(|pane| data.pane_sessions.get(pane))
-            .cloned()
-            .unwrap_or_else(|| agent.session_id.clone()),
+            .map_or_else(
+                || agent.session_id.clone(),
+                |name| stats_session_name(name).to_owned(),
+            ),
     }
 }
 
@@ -1731,7 +1748,10 @@ fn state_transition_group_key(
                     .and_then(|pane| data.pane_sessions.get(pane))
                     .cloned()
             })
-            .unwrap_or_else(|| entry.session_id.clone()),
+            .map_or_else(
+                || entry.session_id.clone(),
+                |name| stats_session_name(&name).to_owned(),
+            ),
     }
 }
 
@@ -1741,7 +1761,7 @@ fn session_foreground_group_key(
 ) -> Option<String> {
     match group_by {
         GroupBy::Day => Some(format_day(entry.ended_at)),
-        GroupBy::Session => Some(entry.session_name.clone()),
+        GroupBy::Session => Some(stats_session_name(&entry.session_name).to_owned()),
         GroupBy::Project | GroupBy::Agent => None,
     }
 }
@@ -1763,7 +1783,7 @@ fn add_open_session_foreground_rows(
         }
         let key = match group_by {
             GroupBy::Day => format_day(data.now),
-            GroupBy::Session => activity.name.clone(),
+            GroupBy::Session => stats_session_name(&activity.name).to_owned(),
             GroupBy::Project | GroupBy::Agent => unreachable!(),
         };
         rows.entry(key).or_default().foreground_secs += secs;
@@ -1908,7 +1928,8 @@ fn human_presence_group_key(
         GroupBy::Day => Some(format_day(interval.ended_at)),
         GroupBy::Session => interval
             .session_name
-            .clone()
+            .as_deref()
+            .map(|name| stats_session_name(name).to_owned())
             .or_else(|| interval.pane.clone())
             .or_else(|| Some("unknown".to_string())),
         GroupBy::Project => interval
@@ -2071,7 +2092,7 @@ fn clip_interval(
 
 fn scope_key(pane: Option<&str>, session_name: Option<&str>, fallback: &str) -> String {
     if let Some(session_name) = session_name {
-        return format!("session:{session_name}");
+        return format!("session:{}", stats_session_name(session_name));
     }
     if let Some(pane) = pane {
         return format!("pane:{pane}");
@@ -3145,6 +3166,53 @@ mod tests {
     };
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn generated_view_names_fold_without_merging_named_projects() {
+        assert_eq!(stats_session_name("callabo~view~123"), "callabo");
+        assert_eq!(stats_session_name("callabo-set~view~42"), "callabo-set");
+        assert_eq!(stats_session_name("base~view~1~view~2"), "base");
+        for name in ["callabo-set", "project~view~draft", "base~view~", "~view~1"] {
+            assert_eq!(stats_session_name(name), name);
+        }
+    }
+
+    #[test]
+    fn session_report_merges_historical_views_before_limit_and_unions_presence() {
+        let at = datetime!(2026-05-30 10:30:00 UTC);
+        let mut prompts = Vec::new();
+        let mut presence = Vec::new();
+        for (index, name) in ["callabo", "callabo~view~123", "callabo~view~456"]
+            .into_iter()
+            .enumerate()
+        {
+            let pane = format!("%{index}");
+            let mut p = prompt(AgentKind::Codex, "agent-main", &pane, None, "hello", at);
+            p.tmux_session = Some(name.into());
+            prompts.push(p);
+            presence.push(ActivityEntry::HumanInteraction(HumanInteractionEntry::new(
+                HumanInteractionInput {
+                    kind: HumanInteractionKind::TmuxAttach,
+                    pane: Some(pane),
+                    session_id: None,
+                    session_name: Some(name.into()),
+                    started_at: at,
+                    ended_at: at + time::Duration::minutes(10),
+                },
+            )));
+        }
+        let mut d = data(prompts);
+        d.activity_entries = presence;
+        let rows = build_rows(&d, GroupBy::Session, 1, SortKey::Active, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, "callabo");
+        assert_eq!(rows[0].prompts, 3);
+        assert_eq!(rows[0].human_secs, 600);
+        let totals = build_totals(&d);
+        assert_eq!(rows[0].active_secs, totals.active_secs);
+        assert_eq!(rows[0].work_active_secs, totals.work_active_secs);
+        assert_eq!(totals.human_secs, 600);
+    }
 
     fn prompt(
         kind: AgentKind,
