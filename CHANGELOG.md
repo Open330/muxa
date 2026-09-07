@@ -23,6 +23,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id (or refusal/error) per recipient. Delivered agents lose their marks, while
   refused and failed agents remain marked for a deliberate retry.
 
+- **`[agent.<program>]` configures the model and flags every muxa-started
+  agent launches with.** Which model an agent runs is not a property of the
+  surface it lands on, so it is keyed by provider rather than attached to one
+  launcher, and every path that starts an agent now resolves through the same
+  place: `muxa agent start`, `muxa work start`, a `muxa work up` pipeline,
+  `muxa_start_agent`, the automatic peer spawn behind `muxa_call_peer`, and the
+  native PTY host. Before this, four of those five filled the field with an
+  empty list and only `[mcp.guide].options` reached anything — which made a
+  model look configurable while applying to exactly one provider on one path.
+  Keying by provider is also the safety property: `--model` names different
+  things to different CLIs, so the guard that kept one CLI's model away from
+  another is now structural instead of repeated per launch site.
+
+  A pipeline agent takes its own `options`, because panes in one line-up are
+  not doing the same job — a reviewer reading a diff need not run what wrote
+  it — and `muxa agent start --option` / `muxa work start --option` pin one
+  launch. Anything named explicitly replaces the configured list rather than
+  extending it, so an override never puts `--model` on the command line twice.
+  `muxa work up --dry-run` prints each pane's resolved arguments, `muxa_guide`
+  advertises them per provider so an agent choosing a non-default CLI sees what
+  it will get, and an unrecognised key (`[agent.claud]`) fails the load instead
+  of sitting inert. `[mcp.guide].options` keeps working for the one provider
+  `[mcp.guide].agent` names.
+
 - `muxa init` now ships `agent-instructions`, `agent-skills`, and `agent-mcp`
   in standard/full presets for Codex and Claude Code. A canonical collaboration
   bundle lives beside muxa config, personal skills link to it, and managed global

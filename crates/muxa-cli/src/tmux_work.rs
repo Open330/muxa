@@ -1720,6 +1720,7 @@ mod work_list_view_tests {
                     role: None,
                     task: None,
                     prompt: None,
+                    options: Vec::new(),
                     direction: None,
                     after: Vec::new(),
                 })
@@ -1780,6 +1781,7 @@ mod work_list_view_tests {
                 role: None,
                 task: None,
                 prompt: None,
+                options: Vec::new(),
                 direction: None,
                 after,
             })

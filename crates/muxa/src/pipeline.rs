@@ -594,6 +594,17 @@ pub struct DesiredAgent {
     pub prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
+    /// Provider arguments this pane launches with.
+    ///
+    /// Rendering copies the pipeline agent's own list; the caller resolves
+    /// it against `[agent.<program>]` before launching (see
+    /// [`crate::config::Config::launch_options`]), so what a `--dry-run`
+    /// prints is what the pane will actually be started with.
+    ///
+    /// Additive on the wire — an older daemon reading a newer Run simply
+    /// sees no options rather than failing to parse it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
     /// Aliases that must report done before this one may start.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<String>,
@@ -714,6 +725,7 @@ fn render_agent(
         role: agent.role.as_deref().map(|role| vars.render(role)),
         task: agent.task.as_deref().map(|task| vars.render(task)),
         prompt,
+        options: agent.options.clone(),
         direction: agent.direction.clone(),
         after: agent
             .after
@@ -1288,6 +1300,7 @@ program = 'claude'
                 role: None,
                 task: None,
                 prompt: None,
+                options: Vec::new(),
                 direction: None,
                 after: Vec::new(),
             })
@@ -1326,6 +1339,7 @@ program = 'claude'
             role: None,
             task: None,
             prompt: None,
+            options: Vec::new(),
             direction: None,
             after: after.iter().map(|a| (*a).to_string()).collect(),
         }

@@ -104,6 +104,9 @@ pub enum ConfigError {
     InvalidMcp { path: String, message: String },
 
     #[error("{path}: {message}")]
+    InvalidAgent { path: String, message: String },
+
+    #[error("{path}: {message}")]
     InvalidAsk { path: String, message: String },
 
     #[error("automation: {0}")]
@@ -168,6 +171,10 @@ pub struct Config {
     pub route: Vec<RouteConfig>,
     /// Named agent line-ups, keyed by pipeline name.
     pub pipeline: BTreeMap<String, PipelineConfig>,
+    /// How each provider's CLI is launched, keyed by program name — the
+    /// model and flags every muxa-started agent of that kind gets. See
+    /// [`Config::launch_options`] for how a launch resolves them.
+    pub agent: BTreeMap<String, AgentLaunchConfig>,
 
     /// Top-level tables this build does not know. Carried so a round trip
     /// through `Config` never drops a newer muxa's section, and so the
@@ -181,6 +188,40 @@ impl Config {
     #[must_use]
     pub fn unknown_sections(&self) -> Vec<&str> {
         self.unknown.keys().map(String::as_str).collect()
+    }
+
+    /// The provider arguments one launch of `program` should carry.
+    ///
+    /// Every path that starts an agent — `muxa agent start`, a work
+    /// pipeline, `muxa_start_agent`, an automatic peer spawn — resolves
+    /// here, so a model configured once applies to all of them. Before
+    /// this existed each launch site filled the field itself and three of
+    /// the four passed an empty list, which made `[mcp.guide].options`
+    /// look configurable while only ever reaching one of them.
+    ///
+    /// `over` is what the caller named explicitly (a `--option` flag, an
+    /// MCP `options` argument, a pipeline agent's own list). It **replaces**
+    /// the configured defaults rather than extending them: appending would
+    /// put `--model` on the command line twice whenever someone overrides
+    /// the very setting they configured, and the winner of a repeated flag
+    /// is the provider's business, not ours.
+    ///
+    /// With nothing named, `[agent.<program>]` answers. The older
+    /// `[mcp.guide].options` remains the last fallback for the one provider
+    /// `[mcp.guide].agent` names, so configs written before this section
+    /// existed keep working unchanged.
+    #[must_use]
+    pub fn launch_options(&self, program: &str, over: Option<&[String]>) -> Vec<String> {
+        if let Some(explicit) = over {
+            return explicit.to_vec();
+        }
+        if let Some(configured) = self.agent.get(program) {
+            return configured.options.clone();
+        }
+        if self.mcp.guide.agent.as_deref() == Some(program) {
+            return self.mcp.guide.options.clone();
+        }
+        Vec::new()
     }
 
     /// Unknown top-level entries that are not sections. A feature always
@@ -611,6 +652,23 @@ pub struct WorktreeConfig {
     pub base: Option<String>,
 }
 
+/// One `[agent.<program>]` entry — how this provider's CLI is invoked.
+///
+/// Keyed by the provider muxa launches (`claude`, `codex`, `gemini`,
+/// `opencode`, `agy`) so a flag can never reach the wrong CLI. That is the
+/// whole reason this is not one flat list: `--model` is spelled per
+/// provider, and a single shared list either only ever fits one of them or
+/// has to be guarded at every launch site to keep `claude`'s model name
+/// away from `codex`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentLaunchConfig {
+    /// Arguments inserted after muxa's built-in launch profile
+    /// (`--yolo` / `--dangerously-skip-permissions` / …) and before the
+    /// initial prompt — where `--model <id>` goes.
+    pub options: Vec<String>,
+}
+
 /// One `[pipeline.<name>]` entry — the set of agents a work window should
 /// end up staffed with. This is a desired state, not a script: `muxa work
 /// up` compares it against the panes that already exist and creates only
@@ -647,6 +705,14 @@ pub struct PipelineAgentConfig {
     pub task: Option<String>,
     /// This agent's own instructions, appended to the pipeline prompt.
     pub prompt: Option<String>,
+    /// Launch arguments for this pane specifically, replacing whatever
+    /// `[agent.<program>]` says for this provider.
+    ///
+    /// The reason a pipeline needs its own is that panes in one line-up are
+    /// not doing the same job: a reviewer reading a diff does not need the
+    /// model its implementer is writing with, and pinning that per role is
+    /// the point of declaring the line-up at all.
+    pub options: Vec<String>,
     /// Split direction when this pane joins an existing window: `right`
     /// (default) or `down`.
     pub direction: Option<String>,
@@ -1414,6 +1480,7 @@ impl Config {
         }
         validate_fleet(&self.fleet)?;
         validate_mcp(&self.mcp)?;
+        validate_agents(&self.agent)?;
         validate_ask(&self.ask)?;
         // An automation types into a live agent, so a rule that does
         // not hold together fails the load rather than sitting in the
@@ -1516,6 +1583,43 @@ fn validate_mcp(cfg: &McpConfig) -> std::result::Result<(), ConfigError> {
             &format!("mcp.guide.options[{index}]"),
             "option must not contain a NUL byte".into(),
         ));
+    }
+    Ok(())
+}
+
+/// `[agent.<program>]` keys are provider names, so a typo is not a syntax
+/// error — `[agent.claud]` parses fine and then silently never applies.
+/// The map is the whole point of the section (a key that matches nothing
+/// configures nothing), so an unrecognised one fails the load the same way
+/// `mcp.guide.agent` does.
+fn validate_agents(
+    agents: &BTreeMap<String, AgentLaunchConfig>,
+) -> std::result::Result<(), ConfigError> {
+    for (program, launch) in agents {
+        let path = format!("agent.{program}");
+        let invalid = |message: String| ConfigError::InvalidAgent {
+            path: path.clone(),
+            message,
+        };
+        if !matches!(
+            program.as_str(),
+            "claude" | "codex" | "gemini" | "agy" | "opencode"
+        ) {
+            return Err(invalid(format!(
+                "unknown agent {program:?}; expected claude, codex, gemini, agy, or opencode"
+            )));
+        }
+        if let Some((index, _)) = launch
+            .options
+            .iter()
+            .enumerate()
+            .find(|(_, option)| option.contains('\0'))
+        {
+            return Err(ConfigError::InvalidAgent {
+                path: format!("agent.{program}.options[{index}]"),
+                message: "option must not contain a NUL byte".into(),
+            });
+        }
     }
     Ok(())
 }
@@ -2291,6 +2395,109 @@ fn parse_width_string(raw: &str) -> WidthSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_options_are_keyed_so_a_flag_cannot_reach_the_wrong_cli() {
+        let cfg: Config = toml::from_str(
+            r#"
+[agent.claude]
+options = ["--model", "claude-opus-5"]
+
+[agent.codex]
+options = ["--model", "gpt-5-codex"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.launch_options("claude", None),
+            ["--model", "claude-opus-5"]
+        );
+        assert_eq!(
+            cfg.launch_options("codex", None),
+            ["--model", "gpt-5-codex"]
+        );
+        // A provider nobody configured launches bare rather than borrowing
+        // another's model name.
+        assert!(cfg.launch_options("gemini", None).is_empty());
+    }
+
+    #[test]
+    fn a_misspelled_provider_section_fails_the_load() {
+        // The key is the only thing that binds these options to a CLI, so a
+        // typo is not a harmless no-op: it looks configured and never
+        // applies. Same treatment `mcp.guide.agent` already gets.
+        let cfg: Config = toml::from_str("[agent.claud]\noptions = []\n").unwrap();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidAgent { .. })
+        ));
+
+        let good: Config = toml::from_str("[agent.claude]\noptions = []\n").unwrap();
+        assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn an_explicit_list_replaces_the_configured_one() {
+        let cfg: Config = toml::from_str(
+            "[agent.codex]
+options = [\"--model\", \"a\"]\n",
+        )
+        .unwrap();
+        let over = vec!["--model".to_string(), "b".to_string()];
+        // Replaced, not appended: appending would put `--model` on the
+        // command line twice for the one caller who overrode it.
+        assert_eq!(cfg.launch_options("codex", Some(&over)), ["--model", "b"]);
+    }
+
+    #[test]
+    fn the_older_guide_options_still_answer_for_the_agent_they_named() {
+        let cfg: Config = toml::from_str(
+            r#"
+[mcp.guide]
+agent = "codex"
+options = ["--model", "legacy"]
+"#,
+        )
+        .unwrap();
+        // Configs written before `[agent.*]` existed keep working…
+        assert_eq!(cfg.launch_options("codex", None), ["--model", "legacy"]);
+        // …for exactly the one provider they named, as before.
+        assert!(cfg.launch_options("claude", None).is_empty());
+    }
+
+    #[test]
+    fn a_provider_section_wins_over_the_older_guide_list() {
+        let cfg: Config = toml::from_str(
+            r#"
+[mcp.guide]
+agent = "codex"
+options = ["--model", "legacy"]
+
+[agent.codex]
+options = ["--model", "current"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.launch_options("codex", None), ["--model", "current"]);
+    }
+
+    #[test]
+    fn an_empty_provider_section_means_no_arguments_not_fall_through() {
+        // Spelling out "launch this one bare" has to beat the legacy list,
+        // or an operator could never turn the old default off.
+        let cfg: Config = toml::from_str(
+            r#"
+[mcp.guide]
+agent = "codex"
+options = ["--model", "legacy"]
+
+[agent.codex]
+options = []
+"#,
+        )
+        .unwrap();
+        assert!(cfg.launch_options("codex", None).is_empty());
+    }
 
     #[test]
     fn parses_empty_toml() {

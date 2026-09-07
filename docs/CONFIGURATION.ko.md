@@ -66,13 +66,61 @@ pane, window, 별도 session 중 어디에 둘지 추측하지 않아도 됩니�
 `muxa_start_agent`에서 대응하는 인자를 생략하면 같은 값이 실제 기본값으로
 적용됩니다. `agent`를 설정하지 않은 경우에는 호출자가 agent를 직접 지정해야 합니다.
 
-`options`는 설정된 agent에 추가할 개별 CLI 인자입니다. Muxa의 내장 provider
-profile 뒤, 최초 prompt 앞에 들어가며 각 값은 독립적으로 shell quote됩니다.
-`muxa_start_agent`에서 `options`를 명시하면 설정 배열을 대체하고, 빈 배열을 넘기면
-설정된 추가 옵션을 사용하지 않습니다. 호출자가 다른 agent를 명시하면 이 옵션도
-적용되지 않습니다. Managed Work의 Workspace=session/Run=window/Agent=pane 구조와
+여기의 `options`는 [`[agent.<program>]`](#agent-실행-인자)가 provider별로 표현하는
+것의 예전 단일 provider 표기입니다. 계속 동작하지만 `mcp.guide.agent`가 지정한
+agent에만 적용됩니다. Managed Work의 Workspace=session/Run=window/Agent=pane 구조와
 collaboration peer의 현재 window 내 pane 배치는 그대로 유지됩니다. 이 설정은 MCP
 stdio process 시작 시 읽으므로 변경 후에는 MCP가 연결된 agent를 재시작하세요.
+
+## Agent 실행 인자
+
+```toml
+[agent.claude]
+options = ["--model", "claude-opus-5"]
+
+[agent.codex]
+options = ["--model", "gpt-5-codex", "--search"]
+```
+
+agent가 어떤 모델로 도는지는 그 agent가 놓이는 표면의 속성이 아니므로, 이 설정은
+특정 launcher에 붙지 않고 **provider를 키로** 갖습니다. agent를 시작하는 모든
+경로가 여기서 값을 읽습니다 — `muxa agent start`, `muxa work start`,
+`muxa work up` 파이프라인, `muxa_start_agent`, 그리고 `muxa_call_peer`의 자동 peer
+spawn. 한 번 설정하면 전부에 적용됩니다.
+
+provider를 키로 두는 것이 안전장치이기도 합니다. `--model`은 CLI마다 다른 것을
+가리키므로, 평평한 목록 하나로는 provider 하나에만 맞거나 모든 launch 지점에서
+"이 CLI의 모델명이 저 CLI로 새지 않도록" 가드를 걸어야 합니다. 알 수 없는
+키(`[agent.claud]`)는 조용히 무시되지 않고 로드를 실패시킵니다.
+
+인자는 Muxa 내장 provider profile 뒤(`codex`는 이미 `--yolo`, `claude`는
+`--dangerously-skip-permissions`를 받습니다), 최초 prompt 앞에 들어가며 각 값은
+독립적으로 shell quote됩니다.
+
+명시된 값은 설정을 **대체**하며 덧붙이지 않습니다. 덮어쓴 사람만 `--model`이 두 번
+들어가는 일을 막기 위해서입니다:
+
+| 명시 위치 | 우선함 |
+| --- | --- |
+| `muxa agent start --option`, `muxa work start --option` | `[agent.<program>]` |
+| MCP `options` 배열 | `[agent.<program>]` |
+| 파이프라인 agent의 `options` | `[agent.<program>]` |
+
+`options = []`는 "인자 없이 실행"이라는 뜻이며, 예전 `[mcp.guide].options`를 끄는
+방법입니다.
+
+파이프라인은 pane별로 인자를 고정할 수 있습니다. 한 line-up의 pane들이 같은 일을
+하는 게 아니기 때문입니다:
+
+```toml
+[[pipeline.triad.agent]]
+alias   = 'review'
+program = 'claude'
+role    = 'reviewer'
+options = ['--model', 'claude-sonnet-5']
+```
+
+`muxa work up --dry-run`은 pane별로 최종 인자를 출력하므로, 보이는 그대로 실행됩니다.
 
 ## Ask
 

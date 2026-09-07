@@ -38,6 +38,10 @@ pub struct AgentSpec {
     pub task: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Provider arguments for this pane, mirroring
+    /// [`PipelineAgentConfig::options`](crate::config::PipelineAgentConfig::options).
+    #[serde(default)]
+    pub options: Vec<String>,
     #[serde(default)]
     pub direction: Option<String>,
     #[serde(default)]
@@ -62,6 +66,7 @@ impl PipelineSpec {
                     role: agent.role.clone(),
                     task: agent.task.clone(),
                     prompt: agent.prompt.clone(),
+                    options: agent.options.clone(),
                     direction: agent.direction.clone(),
                     after: agent.after.clone(),
                 })
@@ -85,6 +90,7 @@ impl From<PipelineSpec> for PipelineConfig {
                     role: agent.role,
                     task: agent.task,
                     prompt: agent.prompt,
+                    options: agent.options,
                     direction: agent.direction,
                     after: agent.after,
                 })
@@ -204,6 +210,22 @@ mod tests {
 
     fn spec(value: Value) -> PipelineSpec {
         serde_json::from_value(value).unwrap()
+    }
+
+    /// `muxa work options --json` → edit → `muxa work pipeline set` is a
+    /// round trip through this shape, so a key it drops is a key the next
+    /// edit silently deletes from the operator's config.
+    #[test]
+    fn per_pane_options_survive_the_config_round_trip() {
+        let mut pipeline = PipelineConfig::default();
+        pipeline.agent.push(PipelineAgentConfig {
+            alias: "review".into(),
+            program: "claude".into(),
+            options: vec!["--model".into(), "cheap".into()],
+            ..PipelineAgentConfig::default()
+        });
+        let back: PipelineConfig = PipelineSpec::from_config("triad", &pipeline).into();
+        assert_eq!(back.agent[0].options, ["--model", "cheap"]);
     }
 
     fn pair() -> Value {
@@ -327,7 +349,7 @@ mod tests {
             json!({
                 "name": "solo", "description": null, "layout": null, "prompt": null,
                 "agents": [{"alias": "x", "program": "claude", "role": null, "task": null,
-                            "prompt": null, "direction": null, "after": []}]
+                            "prompt": null, "options": [], "direction": null, "after": []}]
             })
         );
     }

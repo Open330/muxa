@@ -6695,6 +6695,7 @@ mod tests {
             role: None,
             task: None,
             prompt: None,
+            options: Vec::new(),
             direction: None,
             after,
         };

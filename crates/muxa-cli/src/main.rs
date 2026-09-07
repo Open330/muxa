@@ -837,9 +837,14 @@ impl WatchSortArg {
     }
 }
 
-async fn run_agent_cmd(action: AgentCmd, client: &Client, socket_path: &Path) -> Result<()> {
+async fn run_agent_cmd(
+    action: AgentCmd,
+    client: &Client,
+    socket_path: &Path,
+    cfg: &Config,
+) -> Result<()> {
     match action {
-        AgentCmd::Start(args) => agent_launch::run(args, client, socket_path).await,
+        AgentCmd::Start(args) => agent_launch::run(args, client, socket_path, cfg).await,
         AgentCmd::Control(args) => tmux_work::run_agent_control(args, client).await,
     }
 }
@@ -860,7 +865,7 @@ async fn run_work_cmd(
         WorkCmd::Init(args) => work_init::run(args, cfg, config_path).await,
         WorkCmd::Compose(args) => work_compose::run(args, cfg).await,
         WorkCmd::Up(args) => work_up::run(args, cfg, config_path, Some(client)).await,
-        WorkCmd::Start(args) => agent_launch::run_work_start(args, client.socket()),
+        WorkCmd::Start(args) => agent_launch::run_work_start(args, client.socket(), cfg),
         WorkCmd::List(args) => tmux_work::run_work_list(args, client).await,
         WorkCmd::Show(args) => tmux_work::run_work_show(args),
         WorkCmd::Done(args) => tmux_work::run_work_done(args, client).await,
@@ -1213,7 +1218,7 @@ async fn main() -> Result<()> {
         Cmd::Config(a) => config_cmd::run(a, socket.clone()).await,
         Cmd::Host(a) => fleet_cli::run_host(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Fleet(a) => fleet_cli::run_fleet(a, &client, &cfg, config_path.as_deref()).await,
-        Cmd::Agent { action } => run_agent_cmd(action, &client, &socket).await,
+        Cmd::Agent { action } => run_agent_cmd(action, &client, &socket, &cfg).await,
         Cmd::Window { action } => run_window_cmd(action),
         Cmd::Work { action } => run_work_cmd(action, &cfg, config_path, &client).await,
         Cmd::Workspace { action } => run_workspace_cmd(action),

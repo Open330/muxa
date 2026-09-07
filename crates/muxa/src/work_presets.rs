@@ -160,6 +160,10 @@ fn agent(alias: &str, program: &str, role: &str, task: &str, prompt: &str) -> Pi
         role: Some(role.into()),
         task: Some(task.into()),
         prompt: Some(prompt.into()),
+        // Built-in line-ups stay on whatever `[agent.<program>]` configures
+        // for the provider; a preset that pinned a model would silently
+        // override the operator's own choice.
+        options: Vec::new(),
         direction: None,
         after: Vec::new(),
     }

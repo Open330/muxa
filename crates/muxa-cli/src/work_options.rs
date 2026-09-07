@@ -105,6 +105,9 @@ pub struct AgentOption {
     pub task: Option<String>,
     /// The raw agent `prompt` template, not rendered.
     pub prompt: Option<String>,
+    /// Provider arguments this pane pins for itself, empty when it takes
+    /// the `[agent.<program>]` default.
+    pub options: Vec<String>,
     pub direction: Option<String>,
     pub after: Vec<String>,
 }
@@ -242,6 +245,7 @@ fn agent_option(agent: &PipelineAgentConfig) -> AgentOption {
         role: agent.role.clone(),
         task: agent.task.clone(),
         prompt: agent.prompt.clone(),
+        options: agent.options.clone(),
         direction: agent.direction.clone(),
         after: agent.after.clone(),
     }
@@ -434,6 +438,13 @@ pub(crate) fn pipeline_table(pipeline: &PipelineConfig) -> toml_edit::Table {
         insert_opt(&mut entry, "role", agent.role.as_deref());
         insert_opt(&mut entry, "task", agent.task.as_deref());
         insert_opt(&mut entry, "prompt", agent.prompt.as_deref());
+        // Round-trip or lose it: this writer is how `muxa work options`
+        // and `muxa work preset` rewrite a pipeline, so a key it does not
+        // emit is a key the next edit silently deletes.
+        if !agent.options.is_empty() {
+            let options: toml_edit::Array = agent.options.iter().map(String::as_str).collect();
+            entry.insert("options", toml_edit::value(options));
+        }
         insert_opt(&mut entry, "direction", agent.direction.as_deref());
         if !agent.after.is_empty() {
             let after: toml_edit::Array = agent.after.iter().map(String::as_str).collect();
@@ -759,6 +770,7 @@ after = ['plan']
                 "role",
                 "task",
                 "prompt",
+                "options",
                 "direction",
                 "after"
             ])

@@ -72,15 +72,64 @@ pane, window, or separate session. `muxa_start_agent` also uses these values
 when the matching arguments are omitted. If `agent` is not configured, the
 tool still requires the caller to choose one.
 
-`options` are additional individual CLI arguments for the configured agent.
-They are inserted after Muxa's built-in provider profile and before an initial
-prompt, and every value is shell-quoted independently. An explicit `options`
-array in `muxa_start_agent` replaces the configured array; pass an empty array
-to suppress configured extras. Options are not applied when the caller selects
-a different agent. Managed Work still follows its fixed
-Workspace=session/Run=window/Agent=pane layout, and collaboration peer spawning
-still uses a pane in the current window. Restart an MCP-connected agent after
-changing this section because its stdio MCP process loads config at startup.
+`options` here is the older, single-provider spelling of what
+[`[agent.<program>]`](#agent-launch-arguments) now expresses per provider. It
+still applies, but only to the agent `mcp.guide.agent` names. Managed Work
+follows its fixed Workspace=session/Run=window/Agent=pane layout, and
+collaboration peer spawning still uses a pane in the current window. Restart an
+MCP-connected agent after changing this section because its stdio MCP process
+loads config at startup.
+
+## Agent launch arguments
+
+```toml
+[agent.claude]
+options = ["--model", "claude-opus-5"]
+
+[agent.codex]
+options = ["--model", "gpt-5-codex", "--search"]
+```
+
+Which model an agent runs is not a property of the surface it lands on, so this
+is keyed by the provider rather than attached to any one launcher. Every path
+that starts an agent resolves here — `muxa agent start`, `muxa work start`, a
+`muxa work up` pipeline, `muxa_start_agent`, and the automatic peer spawn behind
+`muxa_call_peer` — so a model configured once applies to all of them.
+
+Keying by provider is also what makes it safe: `--model` names different things
+to different CLIs, and a single shared list either fits one provider or has to
+be guarded at every launch site to keep one CLI's model name away from another.
+An unrecognised key (`[agent.claud]`) fails the load rather than sitting inert.
+
+Arguments land after Muxa's built-in provider profile — `codex` already gets
+`--yolo`, `claude` `--dangerously-skip-permissions` — and before any initial
+prompt. Each value is shell-quoted independently.
+
+Anything named explicitly **replaces** the configured list rather than adding to
+it, so an override never puts `--model` on the command line twice:
+
+| Named by | Wins over |
+| --- | --- |
+| `muxa agent start --option`, `muxa work start --option` | `[agent.<program>]` |
+| An MCP `options` array | `[agent.<program>]` |
+| A pipeline agent's own `options` | `[agent.<program>]` |
+
+`options = []` on a provider means "launch it bare", which is how an operator
+turns an inherited `[mcp.guide].options` off.
+
+A pipeline pins arguments per pane, because panes in one line-up are not doing
+the same job:
+
+```toml
+[[pipeline.triad.agent]]
+alias   = 'review'
+program = 'claude'
+role    = 'reviewer'
+options = ['--model', 'claude-sonnet-5']
+```
+
+`muxa work up --dry-run` prints the resolved list for every pane, so what it
+shows is what the launch will use.
 
 ## Ask
 

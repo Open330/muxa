@@ -73,8 +73,29 @@
 # placement = "pane"                # pane (default) | window | session
 # agent = "codex"                   # claude | codex | gemini | agy | opencode
 # options = ["--model", "preferred-model"]
+#                                   # superseded by [agent.<program>] below, which is
+#                                   # per provider and applies to every launch path.
+#                                   # Kept working for configs that predate it.
 # direction = "right"               # right (default) | down; pane splits only
 # instructions = "Keep one task per window and use a new session for unrelated projects."
+
+# How each agent CLI is launched. Keyed by provider so a flag can never reach
+# the wrong one: `--model` is spelled differently per CLI, and one shared list
+# would either fit a single provider or have to be guarded at every launch.
+#
+# These apply to EVERY path that starts an agent — `muxa agent start`, `muxa
+# work start`, a `muxa work up` pipeline, `muxa_start_agent`, and an automatic
+# `muxa_call_peer` spawn. Options land after Muxa's built-in provider profile
+# (codex already gets `--yolo`) and before the initial prompt.
+#
+# Anything named explicitly REPLACES these rather than adding to them —
+# `muxa agent start --option`, an MCP `options` array, or a pipeline agent's
+# own `options` — so an override never puts `--model` on the line twice.
+# An unknown provider key fails the load rather than sitting inert.
+# [agent.claude]
+# options = ["--model", "claude-opus-5"]
+# [agent.codex]
+# options = ["--model", "gpt-5-codex", "--search"]
 
 # Durable request/reply collaboration between top-level agents in the same
 # tmux window. Opt-in: idle_only delivery types only at a hook-authoritative
@@ -537,3 +558,8 @@
 # program = 'claude'
 # role    = 'reviewer'
 # prompt  = 'You own review. Critique the implementer; do not edit.'
+# options = ['--model', 'claude-sonnet-5']
+#                                 # optional: this pane's provider arguments,
+#                                 # replacing [agent.claude].options. Panes in one
+#                                 # line-up are not doing the same job — a reviewer
+#                                 # reading a diff need not run what wrote it.

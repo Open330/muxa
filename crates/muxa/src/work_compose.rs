@@ -70,6 +70,10 @@ program = 'codex'             # ONLY claude, codex, gemini, agy, or opencode
 role    = 'implementer'       # optional; peers address it as role:<role>
 task    = 'fix the reaper'    # optional; short label in `muxa work show`/`watch`
 prompt  = '...'               # optional; this agent's own instructions
+options = ['--model', 'x']    # optional; provider CLI arguments for this pane,
+                              # replacing [agent.<program>].options. Omit unless
+                              # the operator named a model — panes inherit the
+                              # provider default, and a model is their bill.
 direction = 'auto'            # optional: auto (default), right, or down
 after   = ['impl']            # optional: aliases that must report finishing
                               # before this one starts. Omit for work that is
@@ -109,6 +113,8 @@ emits and `muxa work pipeline set --from-json` reads:
       "role": "implementer",          // or null; peers address it as role:<role>
       "task": "fix the reaper",       // or null; short label in `muxa work show`/`watch`
       "prompt": "this agent's own instructions",   // or null
+      "options": [],                  // provider CLI arguments for this pane, replacing
+                                      // [agent.<program>].options; [] to inherit it
       "direction": "auto",            // "auto" (default), "right", "down", or null
       "after": ["plan"]               // aliases that must report finishing first; [] for parallel work
     }}

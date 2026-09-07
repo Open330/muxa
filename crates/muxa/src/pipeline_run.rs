@@ -986,6 +986,7 @@ mod tests {
             role: None,
             task: None,
             prompt: Some(format!("do {alias}")),
+            options: Vec::new(),
             direction: None,
             after: after.iter().map(|value| (*value).to_string()).collect(),
         }

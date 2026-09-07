@@ -711,7 +711,8 @@ pub(crate) async fn resolve(
     let spec = config.pipeline.get(&name).ok_or_else(|| {
         anyhow::Error::from(pipeline::PipelineError::UnknownPipeline(name.clone()))
     })?;
-    let desired = pipeline::desired_agents(&name, spec, &vars)?;
+    let mut desired = pipeline::desired_agents(&name, spec, &vars)?;
+    resolve_launch_options(&mut desired, config);
     let durable_run = match client {
         Some(client) => client.pipeline_runs().await.ok().and_then(|runs| {
             runs.into_iter()
@@ -1210,6 +1211,21 @@ fn ask_for_request(work: &str) -> Result<Option<String>> {
     Ok((!text.is_empty()).then_some(text))
 }
 
+/// Fill in each pane's provider arguments from `[agent.<program>]`, keeping
+/// whatever the pipeline pinned for that pane.
+///
+/// Done here, where the config is in hand, rather than at the launch itself:
+/// `--dry-run` then prints the arguments the pane will really be started
+/// with, and [`launch`] needs no config of its own deep in the apply path.
+fn resolve_launch_options(desired: &mut [DesiredAgent], config: &Config) {
+    for agent in desired {
+        agent.options = config.launch_options(
+            &agent.program,
+            (!agent.options.is_empty()).then_some(agent.options.as_slice()),
+        );
+    }
+}
+
 fn launch(
     agent: &DesiredAgent,
     resolved: &Resolved,
@@ -1223,7 +1239,8 @@ fn launch(
     let result = crate::agent_launch::start(StartRequest {
         socket: socket.to_path_buf(),
         agent: program,
-        options: Vec::new(),
+        // Already resolved against `[agent.<program>]` in `resolve`.
+        options: agent.options.clone(),
         placement: Placement::Pane,
         target: None,
         // Supplying a cwd asserts it against the work window's recorded one,

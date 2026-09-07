@@ -42,7 +42,8 @@ impl AgentProgram {
         }
     }
 
-    fn label(self) -> &'static str {
+    /// The provider's CLI name, and the `[agent.<program>]` config key.
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
@@ -254,6 +255,12 @@ pub struct StartArgs {
     /// an agent it already started from one it still has to.
     #[arg(long)]
     pub alias: Option<String>,
+    /// Provider argument for this launch, repeatable — for example
+    /// `--option --model --option gpt-5-codex`. Replaces whatever
+    /// `[agent.<program>]` configures for this provider rather than adding
+    /// to it, so a repeated flag never reaches the CLI twice.
+    #[arg(long = "option")]
+    pub options: Vec<String>,
     /// Split to the right (default) or below the target pane.
     #[arg(long, value_enum, default_value = "right")]
     pub direction: SplitDirection,
@@ -287,6 +294,10 @@ pub struct WorkStartArgs {
     /// Stable per-work name for this pane, used by `muxa work up`.
     #[arg(long)]
     pub alias: Option<String>,
+    /// Provider argument for this launch, repeatable. Same rule as
+    /// `muxa agent start --option`: it replaces the configured defaults.
+    #[arg(long = "option")]
+    pub options: Vec<String>,
     /// Split a reused work window to the right or below.
     #[arg(long, value_enum, default_value = "right")]
     pub direction: SplitDirection,
@@ -324,13 +335,25 @@ pub struct StartRequest {
     pub socket: PathBuf,
 }
 
+/// The caller's own `--option`/`options` list, or `None` when they named
+/// none. Empty and absent mean the same thing here — a caller cannot ask
+/// for "no arguments at all" while a provider default exists, which is
+/// what `[agent.<program>].options = []` is for.
+fn explicit_options(options: &[String]) -> Option<&[String]> {
+    (!options.is_empty()).then_some(options)
+}
+
 impl StartRequest {
     /// The request a `muxa agent start` invocation describes, against the
     /// daemon the CLI resolved.
-    pub fn from_args(args: &StartArgs, socket: &Path) -> Self {
+    ///
+    /// `cfg` supplies the provider's configured launch arguments when the
+    /// caller named none, so the CLI starts an agent the same way a
+    /// pipeline or an MCP call does.
+    pub fn from_args(args: &StartArgs, socket: &Path, cfg: &muxa::config::Config) -> Self {
         Self {
             agent: args.agent,
-            options: Vec::new(),
+            options: cfg.launch_options(args.agent.label(), explicit_options(&args.options)),
             placement: args.placement,
             target: args.target.clone(),
             cwd: args.cwd.clone(),
@@ -425,17 +448,22 @@ impl AgentStartOutput {
     }
 }
 
-pub async fn run(args: StartArgs, client: &Client, socket_path: &Path) -> Result<()> {
+pub async fn run(
+    args: StartArgs,
+    client: &Client,
+    socket_path: &Path,
+    cfg: &muxa::config::Config,
+) -> Result<()> {
     match args.host.resolve(muxa::backend::detect_host_env()) {
-        LaunchHost::Native => run_native(args, client, socket_path).await,
-        LaunchHost::Tmux => run_tmux(args, socket_path),
+        LaunchHost::Native => run_native(args, client, socket_path, cfg).await,
+        LaunchHost::Tmux => run_tmux(args, socket_path, cfg),
         LaunchHost::Auto => unreachable!("auto launch host is resolved above"),
     }
 }
 
-fn run_tmux(args: StartArgs, socket: &Path) -> Result<()> {
+fn run_tmux(args: StartArgs, socket: &Path, cfg: &muxa::config::Config) -> Result<()> {
     let json = args.json;
-    let result = start(StartRequest::from_args(&args, socket))?;
+    let result = start(StartRequest::from_args(&args, socket, cfg))?;
     if json {
         println!(
             "{}",
@@ -457,7 +485,12 @@ fn run_tmux(args: StartArgs, socket: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_native(args: StartArgs, client: &Client, socket_path: &Path) -> Result<()> {
+async fn run_native(
+    args: StartArgs,
+    client: &Client,
+    socket_path: &Path,
+    cfg: &muxa::config::Config,
+) -> Result<()> {
     if args.work.is_some() || args.workspace.is_some() {
         bail!(
             "managed --work/--workspace launch is not available on the native host yet; use --host tmux or `muxa run`"
@@ -487,7 +520,11 @@ async fn run_native(args: StartArgs, client: &Client, socket_path: &Path) -> Res
         .prompt
         .as_deref()
         .filter(|prompt| !prompt.trim().is_empty());
-    let launch = args.agent.native_launch(&[], prompt);
+    // The native host resolves the provider's arguments the same way the
+    // tmux one does: which surface a session lands on says nothing about
+    // which model it should run.
+    let options = cfg.launch_options(args.agent.label(), explicit_options(&args.options));
+    let launch = args.agent.native_launch(&options, prompt);
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     let session = client
         .spawn_session(muxa::SpawnSession {
@@ -543,12 +580,16 @@ async fn run_native(args: StartArgs, client: &Client, socket_path: &Path) -> Res
     Ok(())
 }
 
-pub fn run_work_start(args: WorkStartArgs, socket: &Path) -> Result<()> {
+pub fn run_work_start(
+    args: WorkStartArgs,
+    socket: &Path,
+    cfg: &muxa::config::Config,
+) -> Result<()> {
     let json = args.json;
     let result = start(StartRequest {
         socket: socket.to_path_buf(),
         agent: args.agent,
-        options: Vec::new(),
+        options: cfg.launch_options(args.agent.label(), explicit_options(&args.options)),
         placement: Placement::Pane,
         target: None,
         cwd: args.cwd,
@@ -1098,11 +1139,13 @@ mod tests {
             role: None,
             task: None,
             alias: Some("reviewer".into()),
+            options: Vec::new(),
             direction: SplitDirection::Right,
             json: false,
         };
         let socket = PathBuf::from("/tmp/somewhere-else.sock");
-        assert_eq!(StartRequest::from_args(&args, &socket).socket, socket);
+        let cfg = muxa::config::Config::default();
+        assert_eq!(StartRequest::from_args(&args, &socket, &cfg).socket, socket);
     }
 
     fn request(agent: AgentProgram, placement: Placement) -> StartRequest {
