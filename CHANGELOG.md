@@ -17,6 +17,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   updates, drift diagnostics in `muxa doctor`, and component-specific removal.
   Existing dotfile symlinks and locally modified integration files are preserved.
 
+### Fixed
+
+- **The live tour no longer presses Enter on the learner's behalf.** Step 8
+  asks them to press Enter, and it completed when the prompt log grew. Splitting
+  a pane starts a shell, and that shell draws a prompt of its own — so whether
+  the step waited for the learner or walked straight past them came down to
+  whether bash reached its first prompt before or after the tour noticed the
+  split. On a machine with a moment to spare it waited; on a loaded one it did
+  not, and the learner watched an instruction they were given disappear and the
+  agents arrive unbidden.
+
+  A shell's own first prompt is no longer logged. It stands for nothing the
+  learner did — `history 1` at that point is empty, which is why the line was
+  always blank — so every entry in the log is now a prompt they caused, and the
+  step waits for one. Reproduced by delaying the split pane's shell by 400ms,
+  which walked past step 8 in three runs out of three, and passes in three out
+  of three now.
+
+- **`scripts/live-tour-smoke.py` waits for the tour rather than betting on the
+  clock.** It failed twice in a week on unrelated pull requests and both times
+  re-ran green, which is the point at which a suite that gates every PR stops
+  being evidence. Two mechanisms, neither of them the tour being slow. A step
+  wait asked for the step number to be *exactly* its target, so a step the tour
+  passed through faster than the driver sampled had, as far as the driver was
+  concerned, never happened — it then waited out its whole timeout with the tour
+  several steps ahead. And the wait for the tour to exit was twelve fixed reads
+  of the pty rather than a deadline: a read returns the instant the pty reaches
+  end of file, and a process closes its descriptors *before* it becomes
+  reapable, so the nominal 24 seconds was measured here at 10–24 microseconds
+  once output stopped.
+
+  Every wait is now a condition with a generous deadline, and the pty is drained
+  on its own thread so no check can stall the tour by not reading it. Steps are
+  waited for as "reached, or past", which is what the escape hatch already
+  needed and what a counter that only goes up actually means. Failures carry the
+  step reached, the steps seen on the way, and the tail of the screen. Nothing
+  was relaxed to make it pass: it now also holds step 8 open to check the tour
+  is still asking for the Enter, and the check that a skipped split leaves the
+  agents a pane to move into — which the old cadence never actually reached —
+  now runs. A full run takes 12 seconds rather than 70.
+
 ## [0.8.44] - 2026-09-05
 
 ### Fixed
@@ -446,47 +487,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no-op that answers `press / to filter`; after it, every key — `q`, `j`, `C`,
   the whole reserved set — is an ordinary filter character, so no search term
   is out of reach. Esc and Ctrl-U still clear the filter and back out.
-
-### Fixed
-
-- **The live tour no longer presses Enter on the learner's behalf.** Step 8
-  asks them to press Enter, and it completed when the prompt log grew. Splitting
-  a pane starts a shell, and that shell draws a prompt of its own — so whether
-  the step waited for the learner or walked straight past them came down to
-  whether bash reached its first prompt before or after the tour noticed the
-  split. On a machine with a moment to spare it waited; on a loaded one it did
-  not, and the learner watched an instruction they were given disappear and the
-  agents arrive unbidden.
-
-  A shell's own first prompt is no longer logged. It stands for nothing the
-  learner did — `history 1` at that point is empty, which is why the line was
-  always blank — so every entry in the log is now a prompt they caused, and the
-  step waits for one. Reproduced by delaying the split pane's shell by 400ms,
-  which walked past step 8 in three runs out of three, and passes in three out
-  of three now.
-
-- **`scripts/live-tour-smoke.py` waits for the tour rather than betting on the
-  clock.** It failed twice in a week on unrelated pull requests and both times
-  re-ran green, which is the point at which a suite that gates every PR stops
-  being evidence. Two mechanisms, neither of them the tour being slow. A step
-  wait asked for the step number to be *exactly* its target, so a step the tour
-  passed through faster than the driver sampled had, as far as the driver was
-  concerned, never happened — it then waited out its whole timeout with the tour
-  several steps ahead. And the wait for the tour to exit was twelve fixed reads
-  of the pty rather than a deadline: a read returns the instant the pty reaches
-  end of file, and a process closes its descriptors *before* it becomes
-  reapable, so the nominal 24 seconds was measured here at 10–24 microseconds
-  once output stopped.
-
-  Every wait is now a condition with a generous deadline, and the pty is drained
-  on its own thread so no check can stall the tour by not reading it. Steps are
-  waited for as "reached, or past", which is what the escape hatch already
-  needed and what a counter that only goes up actually means. Failures carry the
-  step reached, the steps seen on the way, and the tail of the screen. Nothing
-  was relaxed to make it pass: it now also holds step 8 open to check the tour
-  is still asking for the Enter, and the check that a skipped split leaves the
-  agents a pane to move into — which the old cadence never actually reached —
-  now runs. A full run takes 12 seconds rather than 70.
 
 ## [0.8.40] - 2026-09-01
 
