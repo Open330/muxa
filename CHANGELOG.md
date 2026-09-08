@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`muxa doctor` reports a workspace whose mark and session name disagree.**
+  A workspace's identity is a tmux session option, and the session *name* is
+  the fallback used when nothing claims it. The mark outranks the name on
+  purpose — that is what lets an adopted or renamed session keep working — but
+  when a session carries the workspace's own name *and* another session claims
+  the workspace, a launch passes the named one by and says so only in its
+  result line, after the window is already open. doctor now names both
+  sessions, and separately reports a workspace claimed by more than one
+  session, where a lookup takes whichever tmux lists first. Nothing is refused
+  and nothing lands anywhere new: this is the disagreement said out loud.
+
 - **Marked broadcasts now cross physical hosts in `muxa fleet watch`.** A pane
   row's `Space` mark carries its host alias and complete pane identity, so a
   local `%1` and a remote `%1` are two exact recipients rather than one
@@ -56,6 +67,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Existing dotfile symlinks and locally modified integration files are preserved.
 
 ### Fixed
+
+- **Session marks are written to a session id, not a session name.** tmux
+  resolves a bare name by exact match, then as a pattern, then as a *unique
+  prefix*, and the last of those is silent: with no session named `callabo`
+  and `callabo-set` the only one starting with those letters,
+  `set-option -t callabo` succeeds against `callabo-set`. muxa picked its
+  session by exact match in Rust and then handed the name back to tmux, so
+  that guarantee was lost at the boundary — for the workspace marks and for
+  the `new-window` target that places work. Both now carry the session id
+  from the listing that matched, `adopt_workspace`/`mark_workspace` refuse
+  anything that is not one, and `WorkspaceInfo` exposes the id beside the
+  name it displays. The `=name` spelling is not the fix here: tmux 3.4
+  refuses it for `set-option`, though `kill-session` accepts it, which is why
+  `muxa workspace close` was already safe.
 
 - **The live tour no longer presses Enter on the learner's behalf.** Step 8
   asks them to press Enter, and it completed when the prompt log grew. Splitting

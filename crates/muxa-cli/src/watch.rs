@@ -1221,7 +1221,6 @@ pub(crate) trait Effects {
 pub(crate) struct RealEffects;
 
 struct SpawnWorkPlan {
-    session: String,
     created_workspace: bool,
     created_work: bool,
     args: Vec<String>,
@@ -1249,7 +1248,6 @@ fn plan_spawn_work(
             ));
         }
         return Ok(SpawnWorkPlan {
-            session: existing.session,
             created_workspace: false,
             created_work: false,
             args: vec![
@@ -1272,7 +1270,6 @@ fn plan_spawn_work(
         crate::tmux_work::window_name_for_work(work).map_err(|error| error.to_string())?;
     if let Some(existing) = existing_workspace {
         return Ok(SpawnWorkPlan {
-            session: existing.session.clone(),
             created_workspace: false,
             created_work: true,
             args: vec![
@@ -1282,7 +1279,7 @@ fn plan_spawn_work(
                 "-F".into(),
                 "#{pane_id}".into(),
                 "-t".into(),
-                existing.session,
+                existing.session_id,
                 "-n".into(),
                 window_name,
                 "-c".into(),
@@ -1295,7 +1292,6 @@ fn plan_spawn_work(
     let session = crate::tmux_work::session_name_for_workspace(workspace)
         .map_err(|error| error.to_string())?;
     Ok(SpawnWorkPlan {
-        session: session.clone(),
         created_workspace: true,
         created_work: true,
         args: vec![
@@ -1589,7 +1585,10 @@ impl Effects for RealEffects {
             crate::tmux_work::window_id_for_pane(&pane).map_err(|error| error.to_string())?;
         let marked = (|| {
             if plan.created_workspace {
-                crate::tmux_work::mark_workspace(&plan.session, &workspace, &cwd)?;
+                // From the pane, so the mark lands on the session the pane is
+                // actually in — a session *name* can resolve to a neighbour.
+                let session_id = crate::tmux_work::session_id_for_pane(&pane)?;
+                crate::tmux_work::mark_workspace(&session_id, &workspace, &cwd)?;
             }
             if plan.created_work {
                 crate::tmux_work::mark_work(&window, &workspace, &work, &cwd)?;

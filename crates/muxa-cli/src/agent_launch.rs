@@ -681,6 +681,14 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     let window = managed
         .then(|| crate::tmux_work::window_id_for_pane(&pane))
         .transpose()?;
+    // The name is what the result reports to a human; the id is what the
+    // marks are written against. They are read from the same pane, so they
+    // describe one session — but only the id still says so once it reaches
+    // tmux, which resolves a bare name by unique prefix as well as by
+    // exact match.
+    let session_id = managed
+        .then(|| crate::tmux_work::session_id_for_pane(&pane))
+        .transpose()?;
 
     let mark = (|| {
         if let (Some(session), Some(workspace)) = (&adopted_session, workspace.as_deref()) {
@@ -688,7 +696,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         }
         if created_workspace {
             crate::tmux_work::mark_workspace(
-                session
+                session_id
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("created workspace has no tmux session"))?,
                 workspace
@@ -753,8 +761,8 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
 
 struct PreparedLaunch {
     cwd: PathBuf,
-    /// Session muxa put this work into without having created it. It gets a
-    /// workspace identity, never the managed flag.
+    /// Session muxa put this work into without having created it, as a tmux
+    /// session id. It gets a workspace identity, never the managed flag.
     adopted_session: Option<String>,
     workspace: Option<String>,
     work: Option<String>,
@@ -842,7 +850,7 @@ fn prepare_launch(request: &mut StartRequest) -> Result<PreparedLaunch> {
         request.name = Some(existing.window_name.clone());
     } else if let Some(existing) = &existing_workspace {
         request.placement = Placement::Window;
-        request.target = Some(existing.session.clone());
+        request.target = Some(existing.session_id.clone());
         request.name = Some(crate::tmux_work::window_name_for_work(
             work.as_deref().expect("managed work has id"),
         )?);
