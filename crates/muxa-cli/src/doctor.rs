@@ -128,6 +128,11 @@ pub async fn run(socket: PathBuf, config: Option<&Path>) -> Result<()> {
     // path differs per OS and nothing else prints it.
     tally(check_config_file(), &mut issues);
 
+    // 5⅞. Workspace marks vs session names. Reported, never acted on:
+    // the mark legitimately outranks the name, so a disagreement is a thing
+    // to know about rather than a thing to refuse.
+    tally(check_workspace_marks(), &mut issues);
+
     // 6. Recent muxad errors. These are surfaced as warnings (not
     //    failures) — a stale ERROR line from yesterday shouldn't make
     //    the whole doctor run look red.
@@ -155,6 +160,33 @@ pub async fn run(socket: PathBuf, config: Option<&Path>) -> Result<()> {
     };
     let _ = cliclack::outro(summary);
     Ok(())
+}
+
+/// Workspace identity lives in a tmux session option, and the session name is
+/// the fallback muxa uses when nothing claims the workspace. When both exist
+/// and point different ways, a launch goes somewhere the operator did not
+/// name — visible in the result line, but only after the window has opened.
+/// Saying so here is the cheap half: no refusal, no change to where anything
+/// lands, just the one line that turns "why is my agent over there" into a
+/// fact somebody can act on.
+fn check_workspace_marks() -> CheckResult {
+    match crate::tmux_work::workspace_mark_anomalies() {
+        // No server, or a server with no marks, is the ordinary case.
+        Ok(anomalies) if anomalies.is_empty() => {
+            CheckResult::Ok("Workspace marks agree with session names".to_string())
+        }
+        Ok(anomalies) => CheckResult::Warn(format!(
+            "{}. Rebind with `muxa work start --workspace <id>` from the intended \
+             session, or clear the stale mark with `tmux set-option -u -t <session> \
+             @muxa_workspace_id`",
+            anomalies
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )),
+        Err(error) => CheckResult::Warn(format!("Could not read workspace marks: {error}")),
+    }
 }
 
 /// Internal status — every check folds into one of these so the

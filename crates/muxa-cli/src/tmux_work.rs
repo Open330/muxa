@@ -106,6 +106,17 @@ pub struct ExternalItemInfo {
 pub struct WorkspaceInfo {
     pub workspace: String,
     pub session: String,
+    /// The session's tmux id. Anything that acts on the session — placing a
+    /// window in it, writing its marks — uses this rather than `session`,
+    /// because tmux resolves a bare name by unique prefix as well as by
+    /// exact match, and picks the neighbour silently when the exact one is
+    /// gone. `session` is for display.
+    ///
+    /// Kept out of `--json`: this is plumbing for addressing the session
+    /// correctly, and putting a new key in a published payload is a decision
+    /// to make on its own rather than a side effect of fixing the addressing.
+    #[serde(skip)]
+    pub session_id: String,
     /// Whether muxa created this session, as opposed to adopting one the
     /// operator already had.
     ///
@@ -1339,6 +1350,104 @@ pub fn find_workspace(raw: &str) -> Result<Option<WorkspaceInfo>> {
         .find(|workspace| workspace.workspace == wanted))
 }
 
+/// A workspace mark that does not agree with the session names around it.
+///
+/// Neither shape is treated as an error. muxa resolves a workspace through
+/// its mark and falls back to the session name, and that order is right: the
+/// mark is the explicit identity, and it is what lets a renamed or adopted
+/// session keep working. These are the states where the two sources disagree
+/// and a human would want to know before wondering why a launch landed
+/// somewhere unexpected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkAnomaly {
+    /// The workspace is claimed by one session while a *different* session
+    /// carries the name the workspace would otherwise resolve to. The mark
+    /// wins, so `--workspace callabo` goes to the claiming session even
+    /// though a session named `callabo` is sitting right there.
+    Shadowed {
+        workspace: String,
+        claimed_by: String,
+        named: String,
+    },
+    /// Two or more sessions claim the same workspace. One session is one
+    /// workspace, so this is a state muxa should not be able to reach —
+    /// lookups take the first tmux happens to list.
+    Duplicated {
+        workspace: String,
+        sessions: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for MarkAnomaly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shadowed {
+                workspace,
+                claimed_by,
+                named,
+            } => write!(
+                f,
+                "workspace {workspace} is claimed by session {claimed_by}, \
+                 but a different session is named {named} — launches into \
+                 {workspace} go to {claimed_by}"
+            ),
+            Self::Duplicated {
+                workspace,
+                sessions,
+            } => write!(
+                f,
+                "workspace {workspace} is claimed by {} sessions ({}) — \
+                 lookups take whichever tmux lists first",
+                sessions.len(),
+                sessions.join(", ")
+            ),
+        }
+    }
+}
+
+/// Disagreements between the workspace marks and the session names, read from
+/// the live tmux server.
+pub fn workspace_mark_anomalies() -> Result<Vec<MarkAnomaly>> {
+    Ok(mark_anomalies(&list_workspaces()?, &all_session_names()?))
+}
+
+/// The pure half of [`workspace_mark_anomalies`], so the shapes can be tested
+/// without a tmux server.
+pub fn mark_anomalies(workspaces: &[WorkspaceInfo], session_names: &[String]) -> Vec<MarkAnomaly> {
+    let mut anomalies = Vec::new();
+    let mut claimants: Vec<(&str, Vec<&str>)> = Vec::new();
+    for workspace in workspaces {
+        match claimants
+            .iter_mut()
+            .find(|(id, _)| *id == workspace.workspace)
+        {
+            Some((_, sessions)) => sessions.push(&workspace.session),
+            None => claimants.push((&workspace.workspace, vec![&workspace.session])),
+        }
+    }
+    for (workspace, sessions) in &claimants {
+        if sessions.len() > 1 {
+            anomalies.push(MarkAnomaly::Duplicated {
+                workspace: (*workspace).to_string(),
+                sessions: sessions.iter().map(|s| (*s).to_string()).collect(),
+            });
+            continue;
+        }
+        // The name a workspace resolves to when nothing claims it, which is
+        // what `adoptable_session` matches on.
+        let named = sanitize_session_name(&workspace.to_ascii_lowercase());
+        let claimed_by = sessions[0];
+        if claimed_by != named && session_names.iter().any(|name| name == &named) {
+            anomalies.push(MarkAnomaly::Shadowed {
+                workspace: (*workspace).to_string(),
+                claimed_by: claimed_by.to_string(),
+                named,
+            });
+        }
+    }
+    anomalies
+}
+
 pub fn list_works() -> Result<Vec<WorkInfo>> {
     Ok(list_workspaces()?
         .into_iter()
@@ -1354,18 +1463,25 @@ pub fn list_workspaces() -> Result<Vec<WorkspaceInfo>> {
 }
 
 /// A session muxa may put this workspace's work windows into without
-/// having created it: one already named after the workspace.
+/// having created it: one already named after the workspace. Returns its
+/// tmux *session id*, not its name.
 ///
 /// Refusing to adopt splits a workspace across `callabo` and `callabo-2`,
 /// which contradicts the whole model — one session is one workspace. The
 /// safety that mattered was never "do not touch it"; it is that
 /// `close_workspace` refuses a session muxa did not create.
+///
+/// The id comes out of the same listing that matched the name, so nothing
+/// between here and the write has to look the session up again: see
+/// [`adopt_workspace`] for why a name handed back to tmux is not the same
+/// session it came from.
 pub fn adoptable_session(workspace: &str) -> Result<Option<String>> {
     let normalized = normalize_workspace_id(workspace)?;
     let wanted = sanitize_session_name(&normalized.to_ascii_lowercase());
-    Ok(all_session_names()?
+    Ok(all_sessions()?
         .into_iter()
-        .find(|name| name == &wanted))
+        .find(|(name, _)| name == &wanted)
+        .map(|(_, id)| id))
 }
 
 pub fn session_name_for_workspace(workspace: &str) -> Result<String> {
@@ -1496,29 +1612,48 @@ fn set_window_automatic_rename(window: &str, enabled: bool) -> Result<()> {
 /// Deliberately does not set `@muxa_managed_workspace`: that flag is what
 /// `close_workspace` reads, and muxa must not offer to kill a session full
 /// of windows somebody else opened.
-pub fn adopt_workspace(session: &str, workspace: &str) -> Result<()> {
+/// Takes a tmux session *id* (`$5`), never a name.
+///
+/// tmux resolves a bare name by exact match, then as a pattern, then as a
+/// unique prefix — and that last step is silent. So a name that named one
+/// session when muxa looked it up can name a *different* one by the time the
+/// write goes out: with `callabo` gone and `callabo-set` the only session
+/// left starting with those letters, `set-option -t callabo` succeeds against
+/// `callabo-set`, exit 0. The `=name` spelling does not close this, because
+/// tmux 3.4 refuses it for `set-option` (it accepts it for `kill-session`,
+/// which is why `close_workspace` is already safe). An id is the only
+/// spelling that means one session and nothing else.
+pub fn adopt_workspace(session_id: &str, workspace: &str) -> Result<()> {
+    validate_session_id(session_id)?;
     let workspace = normalize_workspace_id(workspace)?;
     set_option(
         OptionScope::Session,
-        session,
+        session_id,
         WORKSPACE_ID_OPTION,
         &workspace,
     )
 }
 
-pub fn mark_workspace(session: &str, workspace: &str, cwd: &Path) -> Result<()> {
+/// Takes a tmux session *id* — see [`adopt_workspace`].
+pub fn mark_workspace(session_id: &str, workspace: &str, cwd: &Path) -> Result<()> {
+    validate_session_id(session_id)?;
     let workspace = normalize_workspace_id(workspace)?;
     let cwd = cwd
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("workspace cwd is not valid UTF-8: {}", cwd.display()))?;
     set_option(
         OptionScope::Session,
-        session,
+        session_id,
         WORKSPACE_ID_OPTION,
         &workspace,
     )?;
-    set_option(OptionScope::Session, session, WORKSPACE_CWD_OPTION, cwd)?;
-    set_option(OptionScope::Session, session, MANAGED_WORKSPACE_OPTION, "1")?;
+    set_option(OptionScope::Session, session_id, WORKSPACE_CWD_OPTION, cwd)?;
+    set_option(
+        OptionScope::Session,
+        session_id,
+        MANAGED_WORKSPACE_OPTION,
+        "1",
+    )?;
     Ok(())
 }
 
@@ -1921,6 +2056,20 @@ pub fn window_id_for_pane(pane: &str) -> Result<String> {
     Ok(window.to_string())
 }
 
+/// The session id owning `pane`. A pane id is exact, so this resolves one
+/// session with no room for tmux's prefix matching — which is what makes it
+/// the right input to [`mark_workspace`].
+pub fn session_id_for_pane(pane: &str) -> Result<String> {
+    validate_pane_id(pane)?;
+    let session = tmux_output(&["display-message", "-p", "-t", pane, "#{session_id}"])?;
+    let session = session.trim();
+    if session.is_empty() {
+        bail!("pane {pane} resolved to an empty session id");
+    }
+    validate_session_id(session)?;
+    Ok(session.to_string())
+}
+
 pub fn session_name_for_pane(pane: &str) -> Result<String> {
     validate_pane_id(pane)?;
     let session = tmux_output(&["display-message", "-p", "-t", pane, "#{session_name}"])?;
@@ -2006,6 +2155,17 @@ fn ensure_managed_agent(pane: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_session_id(session: &str) -> Result<()> {
+    if session
+        .strip_prefix('$')
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        Ok(())
+    } else {
+        bail!("session must be an exact tmux session id such as $5, not {session:?}")
+    }
+}
+
 fn validate_pane_id(pane: &str) -> Result<()> {
     if pane
         .strip_prefix('%')
@@ -2060,6 +2220,7 @@ fn parse_workspaces(sessions: &str, windows: &str, panes: &str) -> Vec<Workspace
         let session = fields[0].to_string();
         let session_id = fields[1];
         let workspace = fields[2].trim().to_ascii_lowercase();
+        let session_id_owned = session_id.to_string();
         let mut works = windows
             .lines()
             .filter_map(|line| parse_work_window(line, session_id, &workspace, panes))
@@ -2068,6 +2229,7 @@ fn parse_workspaces(sessions: &str, windows: &str, panes: &str) -> Vec<Workspace
         workspaces.push(WorkspaceInfo {
             workspace,
             session,
+            session_id: session_id_owned,
             managed: fields[4] == "1",
             cwd: PathBuf::from(fields[3]),
             attached_clients: fields[5].parse().unwrap_or(0),
@@ -2167,6 +2329,20 @@ fn parse_agent_pane(
 
 fn option(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.to_string())
+}
+
+/// Every session's name paired with its id, read in one listing so a caller
+/// that matches on the name can act on the id.
+fn all_sessions() -> Result<Vec<(String, String)>> {
+    Ok(
+        tmux_output_allow_no_server(&["list-sessions", "-F", "#{session_name}\t#{session_id}"])?
+            .lines()
+            .filter_map(|line| {
+                let (name, id) = line.split_once('\t')?;
+                Some((name.to_string(), id.to_string()))
+            })
+            .collect(),
+    )
 }
 
 fn all_session_names() -> Result<Vec<String>> {
@@ -2480,6 +2656,78 @@ mod tests {
     #[test]
     fn parse_view_session_refuses_a_malformed_attached_count() {
         assert!(parse_view_session("$1\tbase\tnot-a-number\t\toff").is_err());
+    }
+
+    fn workspace_at(workspace: &str, session: &str, session_id: &str) -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace: workspace.to_string(),
+            session: session.to_string(),
+            session_id: session_id.to_string(),
+            managed: false,
+            cwd: PathBuf::new(),
+            attached_clients: 0,
+            windows: 1,
+            works: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_mark_on_a_differently_named_session_is_only_reported_when_the_name_is_taken() {
+        // Adoption and renames both leave a mark whose session is named
+        // something else. On its own that is the feature working.
+        let renamed = [workspace_at("callabo", "callabo-set", "$5")];
+        assert!(mark_anomalies(&renamed, &["callabo-set".to_string()]).is_empty());
+
+        // A session carrying the workspace's own name is what makes it
+        // ambiguous: `--workspace callabo` passes it by without a word.
+        let shadowed = mark_anomalies(
+            &renamed,
+            &["callabo-set".to_string(), "callabo".to_string()],
+        );
+        assert_eq!(
+            shadowed,
+            vec![MarkAnomaly::Shadowed {
+                workspace: "callabo".to_string(),
+                claimed_by: "callabo-set".to_string(),
+                named: "callabo".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn two_sessions_claiming_one_workspace_are_reported_together() {
+        let both = [
+            workspace_at("callabo", "callabo", "$2"),
+            workspace_at("callabo", "callabo-set", "$5"),
+        ];
+        // Reported as the duplicate, not as a shadow: which session a lookup
+        // returns is down to tmux's listing order, and naming one of them as
+        // the claimant would imply muxa had chosen.
+        assert_eq!(
+            mark_anomalies(&both, &["callabo".to_string(), "callabo-set".to_string()]),
+            vec![MarkAnomaly::Duplicated {
+                workspace: "callabo".to_string(),
+                sessions: vec!["callabo".to_string(), "callabo-set".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn the_mark_writers_refuse_a_session_name() {
+        // The whole point of the id: a name is what tmux may resolve to a
+        // neighbour, so it must not reach `set-option` at all.
+        let error = adopt_workspace("callabo", "callabo")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("session id"), "unexpected error: {error}");
+        let error = mark_workspace("callabo", "callabo", Path::new("/tmp"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("session id"), "unexpected error: {error}");
+        // And the spellings tmux itself uses are accepted.
+        assert!(validate_session_id("$5").is_ok());
+        assert!(validate_session_id("$").is_err());
+        assert!(validate_session_id("$x").is_err());
     }
 
     #[test]
