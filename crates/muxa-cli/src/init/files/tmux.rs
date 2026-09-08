@@ -54,6 +54,7 @@ bind-key D display-popup -E -w 95% -h 90% "muxa dashboard""#;
 /// the pane it describes.
 pub const PEEK_BODY: &str = r#"# prefix + q: display-panes, plus each pane's agent state, summary, and
 # latest prompt/response over its live content. A pane's digit jumps to it.
+# Inside peek: | opens a scrollable reader; Tab switches to terminal history.
 # Replaces tmux's stock display-panes; `muxa init --uninstall` puts it back.
 bind-key q display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa peek""#;
 

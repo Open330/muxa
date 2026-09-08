@@ -24,12 +24,12 @@ struct InboxAgentRequestCard: View {
     }
 
     /// The most specific text about what the agent is waiting on: its last
-    /// notification (the input request itself), then its recap, then the
-    /// reply it stopped at.
+    /// notification (the input request itself), then the reply it stopped at,
+    /// then its recap.
     private var waitingText: String? {
         nonEmpty(participant.agent.lastNotification)
-            ?? nonEmpty(participant.agent.recap)
             ?? nonEmpty(participant.agent.lastResponse)
+            ?? nonEmpty(participant.agent.recap)
     }
 
     private var paneLocation: String? {

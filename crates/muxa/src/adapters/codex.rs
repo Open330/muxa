@@ -116,6 +116,8 @@ pub struct Input {
     pub prompt: Option<String>,
     #[serde(default)]
     pub last_assistant_message: Option<String>,
+    #[serde(default)]
+    pub transcript_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -186,7 +188,16 @@ impl HookAdapter for CodexAdapter {
             },
             Event::Stop => AgentEvent::TurnStopped {
                 id,
-                response: None,
+                response: input
+                    .last_assistant_message
+                    .filter(|text| !text.trim().is_empty())
+                    .or_else(|| {
+                        input
+                            .transcript_path
+                            .as_deref()
+                            .and_then(super::codex_rollout::latest_final_response)
+                    })
+                    .map(|text| truncate(text, 4_000)),
                 recap: None,
                 ai_title: None,
                 // Real hook: never a synthetic idle observation. A response-less
@@ -202,6 +213,67 @@ impl HookAdapter for CodexAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stop(payload: serde_json::Value) -> AgentEvent {
+        CodexAdapter::normalize(Event::Stop, serde_json::from_value(payload).unwrap(), None)
+    }
+
+    #[test]
+    fn stop_preserves_final_response_and_bounds_its_size() {
+        for text in [
+            "All four reviews complete; CI remains blocked.".to_owned(),
+            "한".repeat(5_000),
+        ] {
+            let event = stop(serde_json::json!({
+                "session_id": "s", "last_assistant_message": text,
+                "transcript_path": "/missing/rollout.jsonl"
+            }));
+            let AgentEvent::TurnStopped {
+                response,
+                idle_confirmed,
+                ..
+            } = event
+            else {
+                panic!("expected stop")
+            };
+            assert_eq!(response, Some(truncate(text, 4_000)));
+            assert!(!idle_confirmed);
+        }
+    }
+
+    #[test]
+    fn stop_without_response_does_not_claim_completion() {
+        for text in [None, Some(" \n ")] {
+            let event =
+                stop(serde_json::json!({"session_id": "s", "last_assistant_message": text}));
+            assert!(matches!(
+                event,
+                AgentEvent::TurnStopped {
+                    response: None,
+                    idle_confirmed: false,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn stop_reads_current_final_response_from_transcript() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"event_msg", "payload":{
+                "type":"task_complete", "last_agent_message":"CI remains blocked"
+            }})
+        )
+        .unwrap();
+        let event = stop(serde_json::json!({"session_id":"s", "transcript_path":file.path()}));
+        assert!(
+            matches!(event, AgentEvent::TurnStopped { response: Some(text), .. } if text == "CI remains blocked")
+        );
+    }
 
     #[test]
     fn extracts_visible_conversation_recap_without_tui_chrome() {

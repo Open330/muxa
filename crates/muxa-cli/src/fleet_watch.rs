@@ -3835,9 +3835,7 @@ fn paneless_agent_inspector(
 fn agent_summary(agent: &muxa::Agent) -> String {
     safe_text(
         agent
-            .recap
-            .as_deref()
-            .or(agent.ai_title.as_deref())
+            .summary_text()
             .or(agent.last_prompt.as_deref())
             .or(agent.last_notification.as_deref())
             .unwrap_or("-"),

@@ -187,7 +187,7 @@ not match. The newest visible recap is capped at 2 KB and stored in
 `Agent::recap`; an identical observation is a no-op. The update does not advance
 `last_activity_at`, change state, create a synthetic row, or emit a transition.
 
-That single field already feeds the existing summary priority (`recap → title
+That single field already feeds the existing summary priority (`response → recap → title
 → prompt`) in `muxa watch`, `muxa status`, Fleet/macOS views, and `muxa
 peek`. Peek also parses the fresh backdrop capture locally, closing the interval
 between Codex rendering a recap and the daemon's next detection tick.

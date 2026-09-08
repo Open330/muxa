@@ -1675,7 +1675,8 @@ private struct InboxAgentRow: View {
     }
 
     private var summary: String {
-        presentText(participant.agent.recap)
+        presentText(participant.agent.lastResponse)
+            ?? presentText(participant.agent.recap)
             ?? presentText(participant.agent.lastNotification)
             ?? presentText(participant.agent.lastPrompt)
             ?? String(localized: "Waiting for input")
@@ -2139,7 +2140,8 @@ private struct WorkParticipantCard: View {
     }
 
     private var summary: String? {
-        participant.agent.recap
+        participant.agent.lastResponse
+            ?? participant.agent.recap
             ?? participant.agent.aiTitle
             ?? participant.agent.lastNotification
             ?? participant.agent.lastPrompt
@@ -2361,7 +2363,8 @@ private struct FleetAgentDetailView: View {
     private var client: MuxaIPCClient { model.client }
 
     private var summary: String? {
-        participant.agent.recap
+        participant.agent.lastResponse
+            ?? participant.agent.recap
             ?? participant.agent.lastNotification
             ?? participant.agent.aiTitle
             ?? participant.agent.lastPrompt
@@ -2927,14 +2930,14 @@ private struct WindowAgentReportCard: View {
     let open: () -> Void
 
     private var summary: String? {
-        presentText(pane.agent?.recap)
-            ?? presentText(pane.agent?.lastResponse)
+        presentText(pane.agent?.lastResponse)
+            ?? presentText(pane.agent?.recap)
             ?? presentText(pane.agent?.lastNotification)
             ?? presentText(pane.agent?.lastPrompt)
     }
 
     private var separateResponse: String? {
-        guard let response = presentText(pane.agent?.lastResponse), response != pane.agent?.recap else {
+        guard let response = presentText(pane.agent?.lastResponse), response != summary else {
             return nil
         }
         return response
@@ -3261,8 +3264,8 @@ private func fleetPaneDisplayTitle(_ pane: MuxaWatchPane) -> String {
 }
 
 private func fleetPaneSummary(_ pane: MuxaWatchPane) -> String? {
-    presentText(pane.agent?.recap)
-        ?? presentText(pane.agent?.lastResponse)
+    presentText(pane.agent?.lastResponse)
+        ?? presentText(pane.agent?.recap)
         ?? presentText(pane.agent?.lastNotification)
         ?? presentText(pane.agent?.lastPrompt)
         ?? presentText(pane.pane.currentPath)

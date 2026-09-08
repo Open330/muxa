@@ -218,7 +218,8 @@ enum Cmd {
     /// state, summary, latest prompt, and latest response — then jump to
     /// one by its `display-panes` digit.
     ///
-    /// Designed to be bound to `prefix + Q` via a borderless fullscreen
+    /// Press `|` for a scrollable reader, or start with `--expanded`.
+    /// Designed to be bound to `prefix + q` via a borderless fullscreen
     /// `display-popup` (see `muxa init --only tmux-peek`).
     Peek(peek::Args),
     /// Fullscreen nested session/window/pane topology of tracked agents.

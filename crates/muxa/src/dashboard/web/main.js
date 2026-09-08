@@ -599,7 +599,7 @@ function adaptWork(raw) {
     source: raw.source || "managed",
     managed: raw.source === "managed",
     metadata: raw.metadata || { stage: "auto" },
-    summary: latestAgent?.recap || latestAgent?.ai_title || latestAgent?.last_response ||
+    summary: latestAgent?.last_response || latestAgent?.recap || latestAgent?.ai_title ||
       latestAgent?.last_prompt || firstRun.window_name || "No recent work signal",
     host: firstRun.execution?.host || "",
     endpoint: firstRun.execution?.socket || "",

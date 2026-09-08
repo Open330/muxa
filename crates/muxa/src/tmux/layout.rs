@@ -302,8 +302,20 @@ pub fn window_panes_on(socket: Option<&str>, window_id: &str) -> (Vec<PaneGeomet
 /// Returns `None` when the pane is gone or tmux errors; the caller draws
 /// an empty backdrop rather than failing the frame.
 pub fn capture_pane_plain(pane_id: &str) -> Option<String> {
+    capture_plain(pane_id, false)
+}
+
+/// Capture all scrollback still retained by tmux, joining wrapped lines.
+pub fn capture_pane_history_plain(pane_id: &str) -> Option<String> {
+    capture_plain(pane_id, true)
+}
+
+fn capture_plain(pane_id: &str, history: bool) -> Option<String> {
     let mut cmd = tmux_command();
     cmd.args(["capture-pane", "-p", "-t", pane_id]);
+    if history {
+        cmd.args(["-S", "-", "-J"]);
+    }
     let out = command_output_with_timeout(
         cmd,
         TMUX_COMMAND_TIMEOUT,

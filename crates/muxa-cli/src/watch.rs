@@ -14912,8 +14912,7 @@ fn inspector_agent_summary(agent: &Agent) -> String {
     agent
         .last_notification
         .as_deref()
-        .or(agent.recap.as_deref())
-        .or(agent.ai_title.as_deref())
+        .or(agent.summary_text())
         .or(agent.last_prompt.as_deref())
         .unwrap_or("—")
         .replace('\n', " ")
@@ -16265,8 +16264,7 @@ fn topology_agent_summary(agent: &Agent, layout: WatchLayout) -> String {
         agent
             .last_notification
             .as_deref()
-            .or(agent.recap.as_deref())
-            .or(agent.ai_title.as_deref())
+            .or(agent.summary_text())
             .or(agent.last_prompt.as_deref())
             .map_or_else(|| agent.state.to_string(), str::to_string)
     };
@@ -16390,8 +16388,7 @@ fn swarm_topology_agent_summary(agent: &Agent) -> String {
     let activity = agent
         .last_notification
         .as_deref()
-        .or(agent.recap.as_deref())
-        .or(agent.ai_title.as_deref())
+        .or(agent.summary_text())
         .or(agent.last_prompt.as_deref())
         .unwrap_or("waiting")
         .replace('\n', " ");
@@ -17290,18 +17287,14 @@ fn resolve_var_chain(
 /// clipped to the column's practical width.
 ///
 /// Each mode names the highest tier it will show and then *degrades*: the
-/// default `Recap` falls through recap → session title → last prompt. That
+/// default `Recap` falls through response → recap → session title → last prompt. That
 /// matters because recaps are sparse (Claude Code writes one only when you
 /// return after being away; Codex prints one only after context compaction)
 /// and agents with no recap source, such as Gemini, would otherwise render an
 /// empty column.
 fn summary_line(a: &Agent, mode: WatchSummary) -> String {
     let picked = match mode {
-        WatchSummary::Recap => a
-            .recap
-            .as_deref()
-            .or(a.ai_title.as_deref())
-            .or(a.last_prompt.as_deref()),
+        WatchSummary::Recap => a.summary_text().or(a.last_prompt.as_deref()),
         WatchSummary::Title => a.ai_title.as_deref().or(a.last_prompt.as_deref()),
         WatchSummary::Prompt => a.last_prompt.as_deref(),
     };
@@ -22456,6 +22449,21 @@ mod tests {
         );
         assert_eq!(summary_line(&a, WatchSummary::Title), "infra cleanup");
 
+        // A completed response must displace the old compaction recap.
+        a.last_response = Some("Four reviews complete; CI blocked.\nDetails".into());
+        assert_eq!(
+            summary_line(&a, WatchSummary::Recap),
+            "Four reviews complete; CI blocked."
+        );
+        assert_eq!(summary_line(&a, WatchSummary::Title), "infra cleanup");
+        assert_eq!(summary_line(&a, WatchSummary::Prompt), "do the thing");
+        assert!(inspector_agent_summary(&a).starts_with("Four reviews complete"));
+        a.last_response = Some("  \n".into());
+        assert_eq!(
+            summary_line(&a, WatchSummary::Recap),
+            "Redis restored; MinIO left."
+        );
+
         // No recap or title source, and nothing typed yet — renders the
         // placeholder rather than an empty cell (the common Gemini shape).
         a.recap = None;
@@ -25873,19 +25881,19 @@ sort = ["state"]
         // `Borders::ALL` + a header row -> data rows start at y = 3 + 1
         // (top border) + 1 (header) = y=5.
         // Rows:
-        //   y=5  ALPHAprompt (row 0, not selected)
-        //   y=6  BETAprompt  (row 1, selected, 2-line)
+        //   y=5  ALPHAresp (row 0, not selected)
+        //   y=6  BETAresp  (row 1, selected, 2-line)
         //   y=7  ↳ BETAresp  (detail line — default template is `{last_response}`)
-        //   y=8  GAMMAprompt (row 2, not selected)
+        //   y=8  GAMMAresp (row 2, not selected)
         let r0 = row_text(buf, 5);
         let r1 = row_text(buf, 6);
         let r1_detail = row_text(buf, 7);
         let r2 = row_text(buf, 8);
 
-        assert!(r0.contains("ALPHAprompt"), "row 0 missing top text: {r0:?}");
+        assert!(r0.contains("ALPHAresp"), "row 0 missing top text: {r0:?}");
         assert!(!r0.contains("↳"), "row 0 must not carry detail: {r0:?}");
         assert!(
-            r1.contains("BETAprompt"),
+            r1.contains("BETAresp"),
             "selected row missing top text: {r1:?}"
         );
         assert!(
@@ -25896,7 +25904,7 @@ sort = ["state"]
             r1_detail.contains("↳") && r1_detail.contains("BETAresp"),
             "detail line not on the row directly below the selection: {r1_detail:?}"
         );
-        assert!(r2.contains("GAMMAprompt"), "row 2 missing top text: {r2:?}");
+        assert!(r2.contains("GAMMAresp"), "row 2 missing top text: {r2:?}");
         assert!(!r2.contains("↳"), "row 2 must not carry detail: {r2:?}");
     }
 
@@ -25915,9 +25923,9 @@ sort = ["state"]
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
         // y=5/6/7 should be the three packed rows.
-        assert!(row_text(buf, 5).contains("ALPHAprompt"));
-        assert!(row_text(buf, 6).contains("BETAprompt"));
-        assert!(row_text(buf, 7).contains("GAMMAprompt"));
+        assert!(row_text(buf, 5).contains("ALPHAresp"));
+        assert!(row_text(buf, 6).contains("BETAresp"));
+        assert!(row_text(buf, 7).contains("GAMMAresp"));
         // No detail anywhere.
         let dump: String = buf
             .content()

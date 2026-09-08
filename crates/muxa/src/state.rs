@@ -211,15 +211,13 @@ pub struct Agent {
     /// Last assistant response captured for this agent. Populated by the
     /// `TurnStopped` ingest path when the adapter could read the
     /// transcript; remains `None` for adapters that don't expose response
-    /// text (e.g., Codex/Gemini today). Optional so the field is purely
+    /// text. Optional so the field is purely
     /// additive on the wire and in the UI.
     pub last_response: Option<String>,
     /// Agent-authored session recap: Claude Code's `※ recap: …` read from
     /// its transcript, or Codex's `Conversation recap` observed in its TUI.
-    /// This is the richest "what is this agent actually doing" signal muxa
-    /// can get, but sparse, so it is never cleared when a later observation
-    /// carries none; the UI falls back to [`Self::ai_title`] then
-    /// [`Self::last_prompt`].
+    /// Sparse metadata retained across turns. Summaries prefer the latest
+    /// response over this recap, then fall back to title and prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recap: Option<String>,
     /// Claude Code's rolling short session title — the same string it puts
@@ -318,6 +316,19 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 impl Agent {
+    /// Prefer a captured response over sparse compaction/resume metadata.
+    /// Prompt fallback and notification priority belong to each view.
+    pub fn summary_text(&self) -> Option<&str> {
+        [
+            self.last_response.as_deref(),
+            self.recap.as_deref(),
+            self.ai_title.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|text| !text.trim().is_empty())
+    }
+
     fn new(
         kind: AgentKind,
         session_id: String,

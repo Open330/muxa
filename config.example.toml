@@ -264,13 +264,14 @@
 # What the summary ("prompt") column leads with. Each value names the highest
 # tier it will show and then degrades, so the column is never blank when a
 # last prompt exists.
-#   summary = "recap"   # recap → session title → last prompt (default)
+#   summary = "recap"   # response → recap → session title → last prompt (default)
 #   summary = "title"   # session title → last prompt; skips the sparse recap
 #   summary = "prompt"  # last prompt only (pre-recap behavior)
 # "recap" is the agent's own summary: Claude Code's `※ recap: …` is read
 # from its transcript, while Codex's `Conversation recap` is observed from a
 # capture-capable pane when context compaction renders it. Neither is in the
-# normal hook payload and both are sparse, so the title/prompt tiers keep the
+# normal hook payload and both are sparse. The latest captured response takes
+# precedence; the title/prompt tiers keep the
 # column useful between recaps. Gemini currently falls through to last prompt.
 # The header reads SUMMARY unless set to "prompt".
 # summary = "recap"

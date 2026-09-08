@@ -1998,7 +1998,7 @@ pub struct WatchConfig {
     pub sort: Vec<WatchSortKey>,
     /// What the summary column shows, and in what priority order.
     ///
-    /// Default `recap`: the agent's own session recap when it has one,
+    /// Default `recap`: the latest response, else the agent's session recap,
     /// else its rolling session title, else the last prompt. Claude Code
     /// writes a recap only when you come back after being away; Codex prints
     /// one when it compacts conversation context, which muxa observes from
@@ -2135,7 +2135,7 @@ pub enum WatchTreeExpansion {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchSummary {
-    /// recap → session title → last prompt. The default: prefer the agent's
+    /// response → recap → session title → last prompt. Prefer the agent's
     /// own summary of what it's doing, and degrade gracefully.
     #[default]
     Recap,

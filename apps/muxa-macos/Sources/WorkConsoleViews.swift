@@ -3728,8 +3728,8 @@ private struct FleetPaneInspector: View {
 
     private func overviewSummary(_ item: MuxaWatchPane) -> String? {
         guard let agent = item.agent else { return item.pane.currentPath.nonEmpty }
-        return agent.recap?.nonEmpty
-            ?? agent.lastResponse?.nonEmpty
+        return agent.lastResponse?.nonEmpty
+            ?? agent.recap?.nonEmpty
             ?? agent.lastNotification?.nonEmpty
             ?? agent.lastPrompt?.nonEmpty.map(humanReadablePrompt)
     }

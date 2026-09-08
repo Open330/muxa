@@ -90,7 +90,7 @@ exit.
 | Surface | What it does |
 | --- | --- |
 | `muxa status-line` | One-line tmux `status-right` summary for the active pane. |
-| `muxa peek` | `prefix + q` overlay: each pane's live screen dimmed under a box with its handle (`@claude`) and tmux pane id, its agent's state, summary, and latest prompt/response — including how long ago you last prompted it and which pane was prompted most recently; press a digit to jump. |
+| `muxa peek` | `prefix + q` overlay: each pane's live screen dimmed under a box with its handle (`@claude`) and tmux pane id, its agent's state, summary, and latest prompt/response — including how long ago you last prompted it and which pane was prompted most recently; press a digit to jump, or `|` for a scrollable reader (`Tab` toggles terminal history). |
 | `muxa watch` | Main TUI for agents, prompts, live previews, hierarchy-aware mailbox history, and table/sequence collaboration. |
 | `muxa dashboard` | Work-first TUI console; `P` prompts and `A` aborts every live agent in the selected Work. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |
@@ -287,7 +287,7 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa dashboard [--since today]` | Work-card TUI with Run capture, per-agent and Work-wide prompt/abort actions, ACT/WACT totals, and collaboration controls. |
 | `muxa attend [--cycle] [--list]` | Focus or list agents needing attention. |
 | `muxa status-line [--pane %N]` | tmux status-line output. |
-| `muxa peek [--plain]` | Per-pane overlay for the current tmux window; `--plain` prints it as text. The overlay is a tmux popup, so where nothing can draw one — a front-end that attaches no client (cmux), or a control-mode client (`tmux -CC` — amux, iTerm2) — peek prints the text report instead and says why on stderr. |
+| `muxa peek [--plain] [--expanded]` | Per-pane overlay for the current tmux window; `--plain` prints it as text. The overlay is a tmux popup, so where nothing can draw one — a front-end that attaches no client (cmux), or a control-mode client (`tmux -CC` — amux, iTerm2) — peek prints the text report instead and says why on stderr. |
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
 | `muxa peers` / `muxa identity` / `muxa msg` | Discover and name same-window agents, then exchange durable request/reply messages. |
 | `muxa skill add/list/show/remove` | Manage reusable `/` prompt templates for watch/dashboard messages, watch ask, and MCP peer calls. |
@@ -447,3 +447,13 @@ cargo fmt --all -- --check
 ## License
 
 MIT OR Apache-2.0.
+
+### Peek expanded reader
+
+Inside peek, press `|` to read the active pane in fullscreen. Use `j/k`, arrows, `PgUp/PgDn`, or `Home/End` to scroll; `n/p` changes panes, `r` refreshes the reading snapshot, `|`/`Esc` returns to the overlay, and `q` closes it. `Tab` switches between saved agent text and terminal history. Saved responses may be capped at ingestion; terminal history includes everything tmux still retains, but cannot recover discarded scrollback.
+
+`muxa peek --expanded` opens the reader directly. Existing tmux `prefix + |` split bindings are preserved. To assign that key to the reader instead:
+
+```tmux
+bind-key | display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa peek --expanded"
+```

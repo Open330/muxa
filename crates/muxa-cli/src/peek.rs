@@ -32,6 +32,7 @@
 //! Focus comes from tmux's `#{pane_active}` instead, carried on
 //! [`PaneGeometry::active`].
 
+use std::fmt::Write as _;
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
@@ -94,6 +95,9 @@ pub(crate) struct Args {
     /// a normal shell, where there's no popup to draw into.
     #[arg(long)]
     plain: bool,
+    /// Open the active pane in a fullscreen, scrollable reader.
+    #[arg(long)]
+    expanded: bool,
 }
 
 /// One pane's worth of overlay: where to draw, and what to say.
@@ -161,7 +165,17 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
     // including a panic mid-draw. Outside a popup (`muxa peek` run bare in
     // a shell) nothing else would put the terminal back.
     let mut guard = TerminalGuard::new(setup_terminal()?);
-    let outcome = drive(guard.terminal_mut(), client, cells, frame, zoomed, &target).await;
+    let detail = args.expanded.then(|| Detail::active(&cells)).flatten();
+    let outcome = drive(
+        guard.terminal_mut(),
+        client,
+        cells,
+        frame,
+        zoomed,
+        &target,
+        detail,
+    )
+    .await;
     drop(guard);
     // Jump only after the popup's screen is torn down: `select-pane`
     // repaints the window underneath, and doing it while we still own the
@@ -217,6 +231,210 @@ enum Outcome {
     Dismissed,
 }
 
+/// A stable reading snapshot; background refreshes must not move the text
+/// underneath the reader. `r` explicitly captures a newer snapshot.
+struct Detail {
+    cell: PeekCell,
+    history: String,
+    terminal: bool,
+    offset: usize,
+    page: usize,
+    width: u16,
+    lines: Vec<String>,
+}
+
+impl Detail {
+    fn active(cells: &[PeekCell]) -> Option<Self> {
+        cells
+            .iter()
+            .find(|cell| cell.geo.active)
+            .or(cells.first())
+            .cloned()
+            .map(Self::new)
+    }
+
+    fn new(cell: PeekCell) -> Self {
+        let history = muxa::tmux::layout::capture_pane_history_plain(&cell.geo.pane_id)
+            .unwrap_or_else(|| "Pane history unavailable (the pane may have closed).".into());
+        Self {
+            cell,
+            history,
+            terminal: false,
+            offset: 0,
+            page: 1,
+            width: 0,
+            lines: Vec::new(),
+        }
+    }
+
+    fn text(&self) -> String {
+        if self.terminal {
+            return self.history.clone();
+        }
+        let mut text = String::from(
+            "Saved agent text — Tab opens terminal history for the original output.\n",
+        );
+        if let Some(agent) = &self.cell.agent {
+            for (title, body) in [
+                ("Latest response", agent.last_response.as_deref()),
+                ("Latest prompt", agent.last_prompt.as_deref()),
+                ("Conversation recap", agent.recap.as_deref()),
+                ("Notification", agent.last_notification.as_deref()),
+            ] {
+                if let Some(body) = body.filter(|body| !body.trim().is_empty()) {
+                    let _ = write!(text, "\n{title}\n{body}\n");
+                }
+            }
+        } else {
+            text.push_str("\nNo tracked agent. Press Tab to read this pane's terminal history.");
+        }
+        text
+    }
+
+    fn toggle_source(&mut self) {
+        self.terminal = !self.terminal;
+        self.offset = if self.terminal { usize::MAX } else { 0 };
+        self.width = 0;
+    }
+
+    fn scroll(&mut self, key: KeyCode) {
+        let max = self.lines.len().saturating_sub(self.page);
+        self.offset = match key {
+            KeyCode::Up | KeyCode::Char('k') => self.offset.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.offset.saturating_add(1),
+            KeyCode::PageUp => self.offset.saturating_sub(self.page),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.offset.saturating_add(self.page),
+            KeyCode::Home | KeyCode::Char('g') => 0,
+            KeyCode::End | KeyCode::Char('G') => max,
+            _ => self.offset,
+        }
+        .min(max);
+    }
+
+    fn draw(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        let source = if self.terminal {
+            "Terminal history"
+        } else {
+            "Saved agent text"
+        };
+        let block = Block::bordered().title(format!(
+            " {} {} · {source} ",
+            self.cell.geo.pane_index, self.cell.geo.pane_id
+        ));
+        let inner = block.inner(area);
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
+        let body = Rect {
+            height: inner.height.saturating_sub(1),
+            ..inner
+        };
+        if self.width != body.width || self.lines.is_empty() {
+            self.lines = wrap_full(&self.text(), usize::from(body.width));
+            self.width = body.width;
+        }
+        self.page = usize::from(body.height).max(1);
+        self.offset = self.offset.min(self.lines.len().saturating_sub(self.page));
+        let visible: Vec<Line<'static>> = self
+            .lines
+            .iter()
+            .skip(self.offset)
+            .take(self.page)
+            .cloned()
+            .map(Line::raw)
+            .collect();
+        frame.render_widget(Paragraph::new(visible), body);
+        if inner.height > 0 {
+            let footer = format!(" {}/{} · j/k ↑↓ PgUp/Dn g/G · Tab source · n/p pane · r refresh · |/Esc back · Enter jump · q close",
+                self.offset + 1, self.lines.len().max(1));
+            frame.render_widget(
+                Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+                Rect {
+                    y: inner.bottom() - 1,
+                    height: 1,
+                    ..inner
+                },
+            );
+        }
+    }
+}
+
+/// Wrap without ellipsizing or collapsing line breaks/indentation. Unlike the
+/// glance cards, this reader must make every retained character reachable.
+fn wrap_full(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    for line in text.split('\n') {
+        let mut row = String::new();
+        let mut used = 0;
+        for ch in line.chars().filter(|ch| !ch.is_control() || *ch == '\t') {
+            let chars = if ch == '\t' {
+                "    ".to_owned()
+            } else {
+                ch.to_string()
+            };
+            for ch in chars.chars() {
+                let cells = ch.width().unwrap_or(0);
+                if used + cells > width && !row.is_empty() {
+                    result.push(std::mem::take(&mut row));
+                    used = 0;
+                }
+                row.push(ch);
+                used += cells;
+            }
+        }
+        result.push(row);
+    }
+    result
+}
+
+fn handle_detail_key(
+    detail: &mut Option<Detail>,
+    key: KeyEvent,
+    cells: &[PeekCell],
+) -> Option<Outcome> {
+    let reader = detail.as_mut().expect("detail is open");
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return Some(Outcome::Dismissed)
+        }
+        KeyCode::Char('q' | 'Q') => return Some(Outcome::Dismissed),
+        KeyCode::Esc | KeyCode::Char('|') => *detail = None,
+        KeyCode::Enter => return Some(Outcome::Jump(reader.cell.geo.pane_id.clone())),
+        KeyCode::Tab => reader.toggle_source(),
+        KeyCode::Char('r') => {
+            let cell = cells
+                .iter()
+                .find(|cell| cell.geo.pane_id == reader.cell.geo.pane_id)
+                .unwrap_or(&reader.cell)
+                .clone();
+            let terminal = reader.terminal;
+            let offset = reader.offset;
+            *reader = Detail::new(cell);
+            reader.terminal = terminal;
+            reader.offset = offset;
+        }
+        KeyCode::Char('n' | 'p') => {
+            let index = cells
+                .iter()
+                .position(|cell| cell.geo.pane_id == reader.cell.geo.pane_id)
+                .unwrap_or(0);
+            if !cells.is_empty() {
+                let next = if key.code == KeyCode::Char('n') {
+                    (index + 1) % cells.len()
+                } else {
+                    (index + cells.len() - 1) % cells.len()
+                };
+                *reader = Detail::new(cells[next].clone());
+            }
+        }
+        code => reader.scroll(code),
+    }
+    None
+}
+
 async fn drive(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     client: &Client,
@@ -224,6 +442,7 @@ async fn drive(
     frame: Option<WindowFrame>,
     mut zoomed: bool,
     target: &WindowTarget,
+    mut detail: Option<Detail>,
 ) -> Result<Outcome> {
     let placement = Placement::from(frame);
     let mut typed = String::new();
@@ -233,10 +452,21 @@ async fn drive(
     // the interval.
     let mut stale = false;
     loop {
-        terminal.draw(|f| draw(f, &cells, placement, zoomed, &typed))?;
+        terminal.draw(|f| {
+            if let Some(detail) = detail.as_mut() {
+                detail.draw(f);
+            } else {
+                draw(f, &cells, placement, zoomed, &typed);
+            }
+        })?;
 
         if event::poll(INPUT_POLL)? {
             match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press && detail.is_some() => {
+                    if let Some(outcome) = handle_detail_key(&mut detail, key, &cells) {
+                        return Ok(outcome);
+                    }
+                }
                 Event::Key(key) if key.kind == KeyEventKind::Press => match classify(key) {
                     Action::Dismiss => return Ok(Outcome::Dismissed),
                     Action::Refresh => {
@@ -258,6 +488,14 @@ async fn drive(
                         typed.clear();
                     }
                     Action::Ignore => {}
+                    Action::Expand => {
+                        detail = exact_match(&typed, &cells)
+                            .and_then(|id| cells.iter().find(|cell| cell.geo.pane_id == id))
+                            .cloned()
+                            .map(Detail::new)
+                            .or_else(|| Detail::active(&cells));
+                        typed.clear();
+                    }
                 },
                 // A resize invalidates every rectangle we hold; re-read
                 // geometry rather than repainting a stale layout.
@@ -295,6 +533,7 @@ async fn drive(
 }
 
 enum Action {
+    Expand,
     Digit(char),
     /// Commit whatever digits are pending, ambiguity be damned.
     Commit,
@@ -356,6 +595,7 @@ fn classify(key: KeyEvent) -> Action {
         // `Q` too: the key that opened the overlay should close it.
         KeyCode::Char('q' | 'Q') | KeyCode::Esc => Action::Dismiss,
         KeyCode::Char('r') => Action::Refresh,
+        KeyCode::Char('|') => Action::Expand,
         KeyCode::Enter => Action::Commit,
         KeyCode::Char(c) if c.is_ascii_digit() => Action::Digit(c),
         _ => Action::Ignore,
@@ -1059,12 +1299,12 @@ fn glyph_response() -> &'static str {
     }
 }
 
-/// Summary source, degrading the same way `muxa watch` does: recap →
+/// Summary source, degrading the same way `muxa watch` does: response → recap →
 /// session title → nothing. `last_prompt` is deliberately *not* in this
 /// chain — unlike watch's single summary column, peek renders the prompt
 /// on its own line, and falling back to it here would print it twice.
 fn summary_source(a: &Agent) -> Option<&str> {
-    a.recap.as_deref().or(a.ai_title.as_deref())
+    a.summary_text()
 }
 
 /// `opus · ctx 62% · 5h 41%` — the bottom strip, dropped entirely when
@@ -1119,7 +1359,7 @@ pub(crate) fn hint_line(cells: &[PeekCell], pending: &str) -> Line<'static> {
     }
     if pending.is_empty() {
         spans.push(Span::styled(
-            " 0-9 jump · r refresh · q/Esc close",
+            " 0-9 jump · | expand · r refresh · q/Esc close",
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
@@ -1373,6 +1613,85 @@ mod tests {
     use muxa::state::Agent;
     use muxa::AgentKind;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn expanded_wrap_preserves_indentation_newlines_and_unicode() {
+        let text = "  한글🙂abc\n\n    tail";
+        let rows = wrap_full(text, 8);
+        assert_eq!(rows, ["  한글🙂", "abc", "", "    tail"]);
+        assert!(rows.iter().all(|row| display_width(row) <= 8));
+        assert!(wrap_full(text, 0).is_empty());
+    }
+
+    #[test]
+    fn expanded_reader_reaches_response_tail_and_terminal_history() {
+        let mut a = agent("%0", AgentState::Idle);
+        a.last_response = Some(format!(
+            "{}\nFINAL RESPONSE LINE",
+            "long response\n".repeat(100)
+        ));
+        let cell = PeekCell {
+            geo: geo("0", 0, 0, 80, 24, true),
+            agent: Some(a),
+            extra: 0,
+            last_prompt_at: None,
+            capture: Vec::new(),
+        };
+        let mut reader = Detail {
+            cell,
+            history: "original output\nFULL HISTORY END".into(),
+            terminal: false,
+            offset: 0,
+            page: 1,
+            width: 0,
+            lines: Vec::new(),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|f| reader.draw(f)).unwrap();
+        assert!(reader.lines.len() > 100);
+        reader.scroll(KeyCode::End);
+        terminal.draw(|f| reader.draw(f)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("FINAL RESPONSE LINE"));
+        reader.scroll(KeyCode::Home);
+        assert_eq!(reader.offset, 0);
+        reader.scroll(KeyCode::PageDown);
+        assert_eq!(reader.offset, reader.page);
+        reader.toggle_source();
+        terminal.draw(|f| reader.draw(f)).unwrap();
+        assert!(reader.lines.iter().any(|line| line == "FULL HISTORY END"));
+        assert!(!reader
+            .lines
+            .iter()
+            .any(|line| line == "FINAL RESPONSE LINE"));
+        // Resizing to a tiny viewport must clamp offsets without panicking.
+        terminal.resize(Rect::new(0, 0, 2, 2)).unwrap();
+        terminal.draw(|f| reader.draw(f)).unwrap();
+        let mut detail = Some(reader);
+        assert!(
+            matches!(handle_detail_key(&mut detail, KeyEvent::from(KeyCode::Enter), &[]), Some(Outcome::Jump(id)) if id == "%0")
+        );
+        assert!(handle_detail_key(&mut detail, KeyEvent::from(KeyCode::Esc), &[]).is_none());
+        assert!(detail.is_none());
+    }
+
+    #[test]
+    fn pipe_opens_reader_without_changing_digit_jump() {
+        assert!(matches!(
+            classify(KeyEvent::from(KeyCode::Char('|'))),
+            Action::Expand
+        ));
+        assert!(matches!(
+            classify(KeyEvent::from(KeyCode::Char('2'))),
+            Action::Digit('2')
+        ));
+    }
 
     #[test]
     fn the_fallback_names_its_own_cause() {
@@ -1665,7 +1984,7 @@ mod tests {
         // One row: summary only — the question the overlay exists to answer.
         let one = body_text(&cell, 38, 1);
         assert_eq!(one.lines.len(), 1);
-        assert!(line_text(&one.lines[0]).contains("auth refactor"));
+        assert!(line_text(&one.lines[0]).contains("added a JWT expiry guard"));
 
         // Two rows: summary + prompt.
         let two = body_text(&cell, 38, 2);

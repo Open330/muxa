@@ -79,7 +79,7 @@ workflow까지 하나의 시나리오로 익히게 합니다. 기존 tmux server
 | Surface | 기능 |
 | --- | --- |
 | `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
-| `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 handle(`@claude`)·tmux pane id와 agent의 상태·요약·최근 프롬프트/응답과 마지막 프롬프트 시각을 얹으며, 가장 최근에 프롬프트를 보낸 pane은 따로 표시함. 숫자 키로 이동. |
+| `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 handle(`@claude`)·tmux pane id와 agent의 상태·요약·최근 프롬프트/응답과 마지막 프롬프트 시각을 얹으며, 가장 최근에 프롬프트를 보낸 pane은 따로 표시함. 숫자 키로 이동. `|`로 확대하고 `Tab`으로 저장된 텍스트/터미널 원문을 전환. |
 | `muxa watch` | agent/pane 관측, prompt, live preview, hierarchy-aware mailbox와 table/sequence 협업을 제공하는 기본 TUI. |
 | `muxa dashboard` | Work 중심 TUI. `P`는 선택 Work의 모든 live agent에 prompt를 보내고 `A`는 모두 중단. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
@@ -223,7 +223,7 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 | `muxa dashboard [--since today]` | Run capture와 agent별/Work 일괄 prompt·abort, ACT/WACT total을 보여주는 Work-card TUI. |
 | `muxa attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |
 | `muxa status-line [--pane %N]` | tmux status-line 출력. |
-| `muxa peek [--plain]` | 현재 tmux window의 pane별 오버레이. `--plain`은 텍스트로 출력. 오버레이는 tmux popup이므로 이를 그릴 수 없는 환경 — client를 붙이지 않는 프런트엔드(cmux), control mode 클라이언트(`tmux -CC` — amux, iTerm2) — 에서는 텍스트 리포트로 대체하고 이유를 stderr에 알림. |
+| `muxa peek [--plain] [--expanded]` | 현재 tmux window의 pane별 오버레이. `--plain`은 텍스트로 출력. 오버레이는 tmux popup이므로 이를 그릴 수 없는 환경 — client를 붙이지 않는 프런트엔드(cmux), control mode 클라이언트(`tmux -CC` — amux, iTerm2) — 에서는 텍스트 리포트로 대체하고 이유를 stderr에 알림. |
 | `muxa recap [--pane %N]` | 보관된 disk history에서 최근 prompt 조회. |
 | `muxa peers` / `muxa identity` / `muxa msg` | 같은 tmux window의 agent를 찾고 이름/역할을 지정해 durable request/reply 메시지를 주고받음. |
 | `muxa skill add/list/show/remove` | watch/dashboard 메시지, watch ask, MCP peer call에서 사용할 `/` prompt 템플릿 관리. |
@@ -359,3 +359,15 @@ cargo fmt --all -- --check
 ## 라이선스
 
 MIT OR Apache-2.0.
+
+### Peek 전문 보기
+
+`prefix + q`로 peek를 연 뒤 **`|`**를 누르면 현재 패널의 텍스트를 전체 화면으로 읽을 수 있습니다. `j/k` 또는 방향키로 스크롤하고, `PgUp/PgDn`, `Home/End`로 이동합니다. `n/p`는 다음/이전 패널, `r`은 새로고침, `|` 또는 `Esc`는 오버레이로 복귀, `q`는 종료입니다.
+
+`Tab`은 저장된 응답·요청·recap과 **터미널 원문**을 전환합니다. 저장된 응답에는 수집 시 길이 제한이 있을 수 있습니다. 터미널 원문은 tmux가 보관 중인 스크롤 기록 전체를 표시하며, 이미 삭제된 기록은 복원하지 못합니다. 읽는 동안 내용은 고정되고 `r`로 갱신됩니다.
+
+`muxa peek --expanded`는 확대 보기로 바로 시작합니다. 기존 `prefix + |` 분할 바인딩은 변경하지 않습니다. 해당 키를 전문 보기로 바꾸려면 tmux 설정에 다음을 사용할 수 있습니다.
+
+```tmux
+bind-key | display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa peek --expanded"
+```

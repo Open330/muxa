@@ -213,6 +213,50 @@ pub fn latest_rate_limits(path: &Path) -> Option<RateLimits> {
     latest
 }
 
+/// Read a final assistant response from the current turn only. Commentary,
+/// tool output, and a previous turn's answer must not turn a response-less
+/// Stop (for example at a permission prompt) into a successful completion.
+pub fn latest_final_response(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let start = file.metadata().ok()?.len().saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut latest = None;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let payload = &value["payload"];
+        match (value["type"].as_str(), payload["type"].as_str()) {
+            (Some("event_msg"), Some("task_started" | "user_message")) => latest = None,
+            (Some("response_item"), Some("message")) if payload["role"] == "user" => latest = None,
+            (Some("response_item"), Some("message"))
+                if payload["role"] == "assistant"
+                    && matches!(payload["phase"].as_str(), Some("final" | "final_answer")) =>
+            {
+                let text = payload["content"].as_array().map(|parts| {
+                    parts
+                        .iter()
+                        .filter(|part| part["type"] == "output_text")
+                        .filter_map(|part| part["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                });
+                latest = text.filter(|text| !text.trim().is_empty());
+            }
+            (Some("event_msg"), Some("task_complete")) => {
+                if let Some(text) = payload["last_agent_message"]
+                    .as_str()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    latest = Some(text.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    latest
+}
+
 /// Locate the rollout JSONL for `session_id` by scanning the
 /// date-partitioned `sessions_root` around `now`.
 ///
@@ -296,6 +340,47 @@ mod tests {
     use std::io::Write;
     use tempfile::{tempdir, TempDir};
     use time::macros::datetime;
+
+    #[test]
+    fn final_response_ignores_commentary_and_previous_turns() {
+        let dir = tempdir().unwrap();
+        let final_line = serde_json::json!({"type":"response_item", "payload":{
+            "type":"message", "role":"assistant", "phase":"final_answer",
+            "content":[{"type":"output_text","text":"Reviews complete"}]
+        }})
+        .to_string();
+        let commentary = serde_json::json!({"type":"response_item", "payload":{
+            "type":"message", "role":"assistant", "phase":"commentary",
+            "content":[{"type":"output_text","text":"Investigating"}]
+        }})
+        .to_string();
+        let path = write_rollout(
+            dir.path(),
+            "s",
+            &[
+                "invalid fragment".into(),
+                final_line.clone(),
+                commentary.clone(),
+            ],
+        );
+        assert_eq!(
+            latest_final_response(&path).as_deref(),
+            Some("Reviews complete")
+        );
+        for boundary in [
+            serde_json::json!({"type":"event_msg", "payload":{"type":"task_started"}}),
+            serde_json::json!({"type":"event_msg", "payload":{"type":"user_message"}}),
+            serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"user"}}),
+        ] {
+            let path = write_rollout(
+                dir.path(),
+                "s",
+                &[final_line.clone(), boundary.to_string(), commentary.clone()],
+            );
+            assert_eq!(latest_final_response(&path), None);
+        }
+        assert_eq!(latest_final_response(&dir.path().join("missing")), None);
+    }
 
     /// A real-shape `token_count` rollout line with the given window
     /// percentages and `rate_limit_reached_type`.
