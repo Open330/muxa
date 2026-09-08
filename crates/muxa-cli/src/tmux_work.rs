@@ -111,6 +111,11 @@ pub struct WorkspaceInfo {
     /// because tmux resolves a bare name by unique prefix as well as by
     /// exact match, and picks the neighbour silently when the exact one is
     /// gone. `session` is for display.
+    ///
+    /// Kept out of `--json`: this is plumbing for addressing the session
+    /// correctly, and putting a new key in a published payload is a decision
+    /// to make on its own rather than a side effect of fixing the addressing.
+    #[serde(skip)]
     pub session_id: String,
     /// Whether muxa created this session, as opposed to adopting one the
     /// operator already had.
