@@ -124,6 +124,17 @@ pub fn enable_service(plist_path: &std::path::Path) -> Result<()> {
     let target = format!("gui/{}", super::super::util::uid_string());
     let label_target = format!("{target}/{LABEL}");
 
+    // Clear any persistent disable override before touching the job.
+    // `launchctl disable` writes to
+    // `/var/db/com.apple.xpc.launchd/disabled.<uid>.plist`, survives reboots,
+    // and outranks the plist's own `RunAtLoad`: a disabled label bootstraps
+    // fine and then never runs, at this install and at every later login.
+    // Older muxa.app builds set exactly this when they replaced a running
+    // daemon, so installing has to be able to undo it.
+    let _ = Command::new("launchctl")
+        .args(["enable", &label_target])
+        .output();
+
     // `bootout` is best-effort: it returns "No such process" (errno 3) when
     // the agent isn't loaded, which is equivalent to the desired state.
     let _ = Command::new("launchctl")
@@ -154,6 +165,44 @@ pub fn enable_service(plist_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Read the label's entry out of `launchctl print-disabled gui/<uid>`,
+/// whose body is one `"<label>" => <state>` line per override.
+///
+/// Both spellings of the state are accepted on purpose. macOS 26 prints
+/// `enabled`/`disabled` while the `true`/`false` of the backing
+/// `/var/db/com.apple.xpc.launchd/disabled.<uid>.plist` is what older
+/// launchctl echoed, and either can turn up depending on the host.
+///
+/// `Some(true)` is the state that makes muxad look broken for no visible
+/// reason: the plist is present and correct, `RunAtLoad` is set, and launchd
+/// skips the job at every login anyway. `None` means launchd holds no opinion
+/// about this label, which is the ordinary case.
+pub fn parse_disabled(output: &str, label: &str) -> Option<bool> {
+    let needle = format!("\"{label}\"");
+    output.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix(&needle)?.trim_start();
+        match rest.strip_prefix("=>")?.trim() {
+            "true" | "disabled" => Some(true),
+            "false" | "enabled" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+/// Ask launchd whether `LABEL` carries a disable override. `None` when
+/// `launchctl` can't be run or says nothing about the label.
+pub fn service_disabled() -> Option<bool> {
+    let target = format!("gui/{}", super::super::util::uid_string());
+    let out = Command::new("launchctl")
+        .args(["print-disabled", &target])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_disabled(&String::from_utf8_lossy(&out.stdout), LABEL)
+}
+
 /// `launchctl bootout gui/<uid>/<label>`. Idempotent — non-zero exit
 /// when the agent isn't loaded is treated as success.
 pub fn disable_service() {
@@ -182,6 +231,39 @@ mod tests {
         // Closing tags + xml prologue
         assert!(body.starts_with("<?xml"));
         assert!(body.trim_end().ends_with("</plist>"));
+    }
+
+    #[test]
+    fn parse_disabled_reads_the_override_table() {
+        // Verbatim shape of `launchctl print-disabled gui/501` on macOS 26.
+        let out = "\
+disabled services = {
+\t\t\"com.apple.Siri.agent\" => disabled
+\t\t\"dev.open330.muxad\" => disabled
+\t\t\"homebrew.mxcl.muxa\" => enabled
+}
+";
+        assert_eq!(parse_disabled(out, LABEL), Some(true));
+        assert_eq!(parse_disabled(out, "homebrew.mxcl.muxa"), Some(false));
+        assert_eq!(parse_disabled(out, "dev.open330.absent"), None);
+    }
+
+    #[test]
+    fn parse_disabled_also_reads_the_boolean_spelling() {
+        // What the backing disabled.<uid>.plist stores, and what older
+        // launchctl builds echo back.
+        let out = "\t\t\"dev.open330.muxad\" => true\n";
+        assert_eq!(parse_disabled(out, LABEL), Some(true));
+        assert_eq!(
+            parse_disabled("\t\t\"dev.open330.muxad\" => false\n", LABEL),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn parse_disabled_ignores_a_label_that_is_only_a_suffix() {
+        let out = "\t\t\"legacy.dev.open330.muxad\" => true\n";
+        assert_eq!(parse_disabled(out, LABEL), None);
     }
 
     #[test]

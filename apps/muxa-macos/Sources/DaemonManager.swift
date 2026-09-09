@@ -105,16 +105,16 @@ struct DaemonSocketOwner: Equatable, Sendable {
 
     func stop() async throws {
         // A launchd-managed cargo install is just as persistent as a Homebrew
-        // one. Disable known legacy labels before stopping either executable,
+        // one. Unload known legacy labels before stopping either executable,
         // otherwise KeepAlive can win the socket race against the bundled
         // daemon and leave the app in a restart loop.
-        try await Self.disableLegacyLaunchAgents()
+        try await Self.bootOutLegacyLaunchAgents()
         if let brew = homebrewExecutable {
             try await Self.stopHomebrewService(brew: brew)
-        } else {
-            guard Darwin.kill(pid, SIGTERM) == 0 else {
-                throw MuxaIPCError.posix(operation: "kill", code: errno)
-            }
+        } else if Darwin.kill(pid, SIGTERM) != 0, errno != ESRCH {
+            // ESRCH means the bootout above already reaped the daemon, which
+            // is the state this call is asking for.
+            throw MuxaIPCError.posix(operation: "kill", code: errno)
         }
 
         for _ in 0..<100 {
@@ -145,21 +145,22 @@ struct DaemonSocketOwner: Equatable, Sendable {
         }.value
     }
 
-    private static func disableLegacyLaunchAgents() async throws {
+    /// Unload the legacy `LaunchAgent` for the rest of this login session, so
+    /// its `KeepAlive` cannot resurrect the old daemon while the app brings up
+    /// the bundled one.
+    ///
+    /// Deliberately `bootout` and never `launchctl disable`: `disable` writes a
+    /// persistent override into
+    /// `/var/db/com.apple.xpc.launchd/disabled.<uid>.plist` that survives the
+    /// reboot and outranks the plist's own `RunAtLoad`, so one "replace the
+    /// running daemon" would leave muxad silently absent at every later login
+    /// — and `muxa init` re-bootstraps a label launchd still refuses to run.
+    /// `bootout` is scoped to the current session, which is the only window
+    /// this race is fought in.
+    private static func bootOutLegacyLaunchAgents() async throws {
         try await Task.detached(priority: .userInitiated) {
             let domain = "gui/\(getuid())"
             for label in legacyLaunchAgentLabels {
-                let disable = Process()
-                disable.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-                disable.arguments = ["disable", "\(domain)/\(label)"]
-                disable.standardOutput = FileHandle.nullDevice
-                disable.standardError = FileHandle.nullDevice
-                try disable.run()
-                disable.waitUntilExit()
-                guard disable.terminationStatus == 0 else {
-                    throw MuxaIPCError.server("could not disable legacy service \(label)")
-                }
-
                 let bootout = Process()
                 bootout.executableURL = URL(fileURLWithPath: "/bin/launchctl")
                 bootout.arguments = ["bootout", "\(domain)/\(label)"]
@@ -167,8 +168,8 @@ struct DaemonSocketOwner: Equatable, Sendable {
                 bootout.standardError = FileHandle.nullDevice
                 try bootout.run()
                 bootout.waitUntilExit()
-                // bootout returns non-zero when the label was already unloaded;
-                // the preceding persistent disable is the authoritative action.
+                // A non-zero exit means the label was not loaded to begin
+                // with, which is already the state this call wants.
             }
         }.value
     }

@@ -337,6 +337,18 @@ fn check_service_manager() -> CheckResult {
 
 fn check_launchctl() -> CheckResult {
     let uid = uid_string();
+    // Report a disable override ahead of the load probe. `launchctl print`
+    // fails identically for "never installed" and "installed but disabled",
+    // and only the first of those is fixed by re-running the installer — a
+    // disabled label is skipped at every login no matter what the plist says.
+    // `muxa init` clears it now, so this is aimed at hosts that are still
+    // carrying the override an older muxa.app wrote.
+    if launchd::service_disabled() == Some(true) {
+        return CheckResult::Fail(format!(
+            "launchd: muxad agent is disabled and will not start at login — run \
+             `launchctl enable gui/{uid}/{LAUNCHD_LABEL}`, then `muxa init --component muxad-launchd`"
+        ));
+    }
     let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
     let out = Command::new("launchctl").args(["print", &target]).output();
     match out {
