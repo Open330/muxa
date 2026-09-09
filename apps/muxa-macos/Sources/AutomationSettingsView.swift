@@ -367,6 +367,11 @@ private struct AutomationRuleRow: View {
                     AutomationBadge(text: automationActionTitle(rule.action), symbol: "arrow.right.circle")
                 }
                 AutomationTargetSummary(rule: rule)
+                if let condition = rule.askCondition {
+                    Text(condition.observeOnly ? "Ask condition · Observe only (no action)" : "Ask condition · Fixed action on match")
+                        .font(.caption)
+                    Text(verbatim: condition.prompt).font(.caption).lineLimit(2)
+                }
                 AutomationGuardSummary(rule: rule)
                 AutomationActivitySummary(rule: rule)
             }
@@ -688,7 +693,7 @@ private struct AutomationTestSheet: View {
                         AutomationBadge(text: String(localized: "Rule off"), symbol: "moon.zzz")
                     }
                 }
-                Text("Nothing was fired and nothing was recorded.")
+                Text("Free deterministic check: no Ask turn, no action, and nothing recorded. Ask conditions require the separate billed test in the rule editor.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -782,6 +787,7 @@ struct AutomationRuleEditor: View {
     @State private var draft: MuxaAutomationRuleDraft
     @State private var wait: MuxaAutomationWaitDraft
     @State private var copiedTOML = false
+    @ObservedObject private var providers = AskProviderStore.shared
 
     init(
         draft: MuxaAutomationRuleDraft,
@@ -799,7 +805,19 @@ struct AutomationRuleEditor: View {
     }
 
     private var issues: [MuxaAutomationRuleIssue] {
-        draft.issues(existingNames: existingNames)
+        var issues = draft.issues(existingNames: existingNames)
+        if let condition = draft.askCondition {
+            if !store.isAskSupported {
+                issues.append(.invalidAskCondition(String(localized: "Update muxad for automation_ask_v1. This condition cannot be saved on an older daemon.")))
+            }
+            if !providers.providersFromDaemon || !providers.providers.contains(where: {
+                $0.id == condition.provider && $0.kind == .api
+                    && ["openai", "anthropic"].contains($0.engine)
+            }) {
+                issues.append(.invalidAskCondition(String(localized: "Choose an API Ask provider ID backed by OpenAI or Anthropic. Configure its API key in Ask providers; Claude/Codex CLI providers are not supported.")))
+            }
+        }
+        return issues
     }
 
     /// The Timing controls and `draft.wait` move together: every change
@@ -943,7 +961,29 @@ struct AutomationRuleEditor: View {
                     AutomationTimingPreview(draft: draft)
                 }
 
-                Section("Action") {
+                Section("Ask condition (optional)") {
+                    Toggle("Judge a natural-language condition", isOn: Binding(
+                        get: { draft.askCondition != nil },
+                        set: { draft.askCondition = $0 ? MuxaAutomationAskCondition() : nil }
+                    ))
+                    if draft.askCondition != nil {
+                        AutomationAskConditionPanel(
+                            condition: Binding(
+                                get: { draft.askCondition ?? MuxaAutomationAskCondition() },
+                                set: { draft.askCondition = $0 }
+                            ),
+                            rule: draft.rule,
+                            canTest: issues.isEmpty,
+                            model: model
+                        )
+                    }
+                }
+
+                Section("Fixed action") {
+                    if draft.askCondition != nil {
+                        Text("Ask only judges the condition; it cannot choose or run an action. Observe-only logs judgments without executing this fixed action.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Picker("Does", selection: $draft.action) {
                         ForEach(MuxaAutomationAction.pickable, id: \.self) { action in
                             Text(automationActionTitle(action)).tag(action)
@@ -1038,6 +1078,7 @@ struct AutomationRuleEditor: View {
             .padding(16)
         }
         .frame(width: 620, height: 660)
+        .task { await providers.reload(model: model) }
         .onChange(of: draft) { _ in copiedTOML = false }
         .onChange(of: draft.event) { _ in
             // Only a cap carries a reset time, so an event that has none
@@ -1046,6 +1087,83 @@ struct AutomationRuleEditor: View {
             wait.anchor = .event
             draft.wait = wait.text
         }
+    }
+}
+
+private struct AutomationAskConditionPanel: View {
+    @Binding var condition: MuxaAutomationAskCondition
+    let rule: MuxaAutomationRule
+    let canTest: Bool
+    @ObservedObject var model: AppModel
+    @State private var pane = ""
+    @State private var isTesting = false
+    @State private var confirmsTest = false
+    @State private var judgment: MuxaAutomationJudgment?
+    @State private var testError: String?
+    @State private var testID: UUID?
+
+    var body: some View {
+        TextField("API Ask provider ID", text: $condition.provider, prompt: Text(verbatim: "openai"))
+        Text("Default: openai. Requires API provider configuration and a key available to muxad; this request does not forward app-only Keychain keys. Only OpenAI, Anthropic, or named API instances backed by them are supported—not Claude/Codex CLI providers.")
+            .font(.caption).foregroundStyle(.secondary)
+        TextField("Natural-language condition", text: $condition.prompt, axis: .vertical)
+            .lineLimit(3...8)
+        Toggle("Observe only — log judgments, execute no action", isOn: $condition.observeOnly)
+        Stepper("Timeout: \(condition.timeoutSecs) seconds", value: $condition.timeoutSecs, in: 5...120)
+        Stepper("Maximum judgment calls per hour: \(condition.maxPerHour)", value: $condition.maxPerHour, in: 1...30)
+        Text("Each judgment is one read-only, tool-free Ask turn. Only bounded recent screen text, current state, and work/workspace IDs are sent—not full goal lookup. This context leaves your machine for the selected API provider and may be billed. Judgment call limits are separate from action firing limits.")
+            .font(.caption).foregroundStyle(.secondary)
+        TextField("Pane ID to try against", text: $pane, prompt: Text(verbatim: "%1"))
+        Button(isTesting ? "Judging…" : "Try condition — one billed API turn…") {
+            confirmsTest = true
+        }
+        .disabled(!canTest || isTesting || pane.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        .confirmationDialog("Send pane context for one billed Ask turn?", isPresented: $confirmsTest) {
+            Button("Send context and judge (billed)") {
+                let testedRule = rule
+                let testedPane = pane.trimmingCharacters(in: .whitespacesAndNewlines)
+                let requestID = UUID()
+                testID = requestID
+                isTesting = true
+                judgment = nil
+                testError = nil
+                Task {
+                    defer { isTesting = false }
+                    do {
+                        let result = try await model.client.automationJudgeTest(rule: testedRule, pane: testedPane)
+                        if testID == requestID {
+                            judgment = result
+                        }
+                    } catch {
+                        if testID == requestID { testError = error.localizedDescription }
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Bounded recent screen/current state and work/workspace IDs leave this machine for the selected API provider. This uses one potentially billed, read-only, tool-free turn and executes no action, even with observe-only off.")
+        }
+        if let judgment {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Judgment: \(judgment.decision.rawValue)").font(.headline)
+                Text(verbatim: judgment.reason)
+                ForEach(Array(judgment.evidence.enumerated()), id: \.offset) { _, evidence in
+                    Text(verbatim: "• " + evidence)
+                }
+                Text(verbatim: "Provider: \(judgment.provider) · Model: \(judgment.model ?? "—")")
+                Text(verbatim: "Context hash: \(judgment.contextHash)")
+            }
+            .font(.caption).textSelection(.enabled)
+        }
+        if let testError {
+            Text(verbatim: testError).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+        }
+        Text("Unknown is not a match and must not execute an action.")
+            .font(.caption).foregroundStyle(.secondary)
+            .onChange(of: rule) { _ in testID = nil; judgment = nil; testError = nil }
+            .onChange(of: pane) { _ in testID = nil; judgment = nil; testError = nil }
+            .onAppear { if pane.isEmpty { pane = rule.pane ?? "" } }
+            .onDisappear { testID = nil }
     }
 }
 
@@ -1290,6 +1408,9 @@ func automationOutcomeTitle(_ outcome: MuxaAutomationOutcome) -> String {
     case .fired: String(localized: "Fired")
     case .skipped: String(localized: "Skipped")
     case .failed: String(localized: "Failed")
+    case .other("judging"): String(localized: "Judging condition")
+    case .other("judged"): String(localized: "Condition judged")
+    case .other("judge_test"): String(localized: "Ask condition test")
     case .other(let raw): raw
     }
 }
@@ -1298,6 +1419,7 @@ func automationOutcomeTitle(_ outcome: MuxaAutomationOutcome) -> String {
 /// it arrived rather than hidden.
 func automationSkipReasonTitle(_ reason: String) -> String {
     switch reason {
+    case "ask_required": String(localized: "Ask judgment required (not run by this free test)")
     case "engine_disabled": String(localized: "Automations are switched off")
     case "paused": String(localized: "Automations are paused")
     case "rule_disabled": String(localized: "The rule is switched off")

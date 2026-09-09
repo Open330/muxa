@@ -49,6 +49,74 @@ private struct MuxaConfigEnvelope: Decodable {
     let config: MuxaDaemonConfigDocument?
 }
 
+struct MuxaLaunchProvider: Codable, Hashable, Sendable, Identifiable {
+    var program: String
+    var options: [String]?
+    var effectiveOptions: [String]
+    var id: String { program }
+    enum CodingKeys: String, CodingKey {
+        case program, options
+        case effectiveOptions = "effective_options"
+    }
+}
+
+struct MuxaLaunchPipelineAgent: Codable, Hashable, Sendable, Identifiable {
+    var pipeline: String
+    var index: Int
+    var name: String
+    var program: String
+    var options: [String]?
+    var effectiveOptions: [String]
+    var id: String { "\(pipeline.utf8.count):\(pipeline):\(index)" }
+    enum CodingKeys: String, CodingKey {
+        case pipeline, index, name, program, options
+        case effectiveOptions = "effective_options"
+    }
+}
+
+struct MuxaLaunchSettings: Codable, Hashable, Sendable {
+    struct LegacyGuide: Codable, Hashable, Sendable {
+        var program: String?
+        var options: [String]
+    }
+    var providers: [MuxaLaunchProvider]
+    var pipelines: [MuxaLaunchPipelineAgent]
+    var legacyGuide: LegacyGuide
+    enum CodingKeys: String, CodingKey {
+        case providers, pipelines
+        case legacyGuide = "legacy_guide"
+    }
+
+    func effectiveOptions(program: String, override: [String]?) -> [String] {
+        if let override { return override }
+        if let options = providers.first(where: { $0.program == program })?.options { return options }
+        return legacyGuide.program == program ? legacyGuide.options : []
+    }
+
+    func edits(against baseline: Self) -> [[String: Any]] {
+        var edits: [[String: Any]] = []
+        for provider in providers where provider.options != baseline.providers.first(where: { $0.id == provider.id })?.options {
+            edits.append(["target": "provider", "program": provider.program, "options": provider.options as Any? ?? NSNull()])
+        }
+        for agent in pipelines where agent.options != baseline.pipelines.first(where: { $0.id == agent.id })?.options {
+            edits.append(["target": "pipeline", "pipeline": agent.pipeline, "index": agent.index, "options": agent.options as Any? ?? NSNull()])
+        }
+        return edits
+    }
+}
+
+struct MuxaLaunchDocument: Decodable, Sendable {
+    let config: MuxaDaemonConfigDocument
+    let launch: MuxaLaunchSettings
+}
+
+private struct MuxaLaunchEnvelope: Decodable {
+    let ok: Bool?
+    let error: String?
+    let config: MuxaDaemonConfigDocument?
+    let launch: MuxaLaunchSettings?
+}
+
 /// The `config_read` / `config_write` pair, on its own connection for the
 /// same reason `MuxaAutomationClient` has one.
 final class MuxaConfigClient: Sendable {
@@ -96,6 +164,32 @@ final class MuxaConfigClient: Sendable {
         try await document(Self.writeRequest(text: text, expectedText: expectedText))
     }
 
+    func readLaunch() async throws -> MuxaLaunchDocument {
+        try await launchDocument(["protocol": MuxaIPCClient.protocolVersion, "kind": "config_launch_read"])
+    }
+
+    func writeLaunch(expectedText: String, settings: MuxaLaunchSettings, baseline: MuxaLaunchSettings) async throws -> MuxaLaunchDocument {
+        try await launchDocument([
+            "protocol": MuxaIPCClient.protocolVersion, "kind": "config_launch_write",
+            "expected_text": expectedText, "edits": settings.edits(against: baseline),
+        ])
+    }
+
+    private func launchDocument(_ object: [String: Any]) async throws -> MuxaLaunchDocument {
+        let payload = try JSONSerialization.data(withJSONObject: object)
+        let data = try await transport.request(path: socketPath, payload: payload, timeout: Self.requestTimeout)
+        let response = try JSONDecoder().decode(MuxaLaunchEnvelope.self, from: data)
+        if response.ok == false {
+            let message = response.error ?? "muxad rejected the request"
+            if let current = response.config { throw MuxaConfigConflict(message: message, current: current) }
+            throw MuxaIPCError.server(message)
+        }
+        guard let config = response.config, let launch = response.launch else {
+            throw MuxaIPCError.missingField("config / launch")
+        }
+        return MuxaLaunchDocument(config: config, launch: launch)
+    }
+
     private func document(_ object: [String: Any]) async throws -> MuxaDaemonConfigDocument {
         let payload = try JSONSerialization.data(withJSONObject: object)
         let data = try await transport.request(
@@ -123,6 +217,7 @@ final class MuxaConfigClient: Sendable {
 
 extension MuxaIPCClient {
     static let configEditCapability = "config_edit_v1"
+    static let configLaunchCapability = "config_launch_v1"
 
     nonisolated func makeConfigClient() -> MuxaConfigClient {
         MuxaConfigClient(socketPath: socketPath)

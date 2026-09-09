@@ -9,19 +9,34 @@ import SwiftUI
 struct AdvancedSettingsPane: View {
     @ObservedObject var model: AppModel
     @ObservedObject var store: MuxaConfigStore
+    @State private var showsLaunchOptions = true
+    @State private var confirmsReload = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
             if store.isSupported {
-                editor
+                VStack(spacing: 0) {
+                    Picker("Configuration editor", selection: $showsLaunchOptions) {
+                        Text("Launch options").tag(true)
+                        Text("Raw TOML").tag(false)
+                    }
+                    .pickerStyle(.segmented)
+                    .padding(12)
+                    editor
+                }
             } else {
                 unsupported
             }
         }
         .task(id: model.isConnected) {
             await store.load(model: model)
+        }
+        .confirmationDialog("Discard unsaved configuration changes and reload?", isPresented: $confirmsReload) {
+            Button("Discard and Reload", role: .destructive) {
+                Task { await store.load(model: model, force: true) }
+            }
         }
     }
 
@@ -75,7 +90,17 @@ struct AdvancedSettingsPane: View {
 
     private var editor: some View {
         VStack(alignment: .leading, spacing: 0) {
-            TextEditor(text: $store.draft)
+            if showsLaunchOptions {
+                launchOptions
+            } else {
+                if store.isLaunchDirty {
+                    Label("Save or discard launch option changes before editing Raw TOML.", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .padding(12)
+                }
+                TextEditor(text: $store.draft)
+                .disabled(store.isLoading || store.isSaving || store.isLaunchDirty)
                 .font(.system(size: 12, design: .monospaced))
                 .disableAutocorrection(true)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -84,6 +109,7 @@ struct AdvancedSettingsPane: View {
                         ProgressView()
                     }
                 }
+            }
 
             Divider()
 
@@ -95,7 +121,9 @@ struct AdvancedSettingsPane: View {
                         Label(conflict, systemImage: "arrow.triangle.branch")
                             .foregroundStyle(.orange)
                             .textSelection(.enabled)
-                        Text("The editor now holds your version and the file's latest text is the baseline. Save again to apply yours on top, or Reload to take the file's.")
+                        Text(showsLaunchOptions
+                             ? "Reload to review the current file before applying launch options again."
+                             : "Your raw text is preserved. Reload to take the file's version, or review it before saving again.")
                             .foregroundStyle(.secondary)
                     }
                     .font(.caption)
@@ -128,19 +156,101 @@ struct AdvancedSettingsPane: View {
                     Spacer(minLength: 8)
                     MuxaDaemonReloadButton(model: model)
                     Button("Reload") {
-                        Task { await store.load(model: model, force: true) }
+                        if store.isDirty || store.isLaunchDirty {
+                            confirmsReload = true
+                        } else {
+                            Task { await store.load(model: model, force: true) }
+                        }
                     }
                     .disabled(store.isLoading || store.isSaving)
                     Button("Save") {
-                        Task { await store.save(model: model) }
+                        Task {
+                            if showsLaunchOptions { await store.saveLaunch(model: model) }
+                            else { await store.save(model: model) }
+                        }
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!store.isDirty || store.isSaving)
+                    .disabled(store.isSaving || store.isLoading || (showsLaunchOptions
+                        ? !store.isLaunchDirty || store.isDirty || store.launchNeedsReload
+                        : !store.isDirty || store.isLaunchDirty))
                 }
                 .controlSize(.small)
             }
             .padding(16)
         }
+    }
+
+    private var launchOptions: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Each entry is one literal CLI argument, not a shell command. Options replace the entire inherited list; they are never appended. Changes affect future launches, not running agents.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                if store.isDirty {
+                    Label("Raw TOML has unsaved changes. Save or reload it first.", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                }
+                if store.launchNeedsReload {
+                    Label("Reload to refresh launch options from the configuration file.", systemImage: "arrow.clockwise")
+                        .foregroundStyle(.orange)
+                }
+                if let settings = store.launchDraft {
+                    if let program = settings.legacyGuide.program {
+                        GroupBox("Legacy guide options") {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("[mcp.guide].options still supplies \(program)'s fallback. Provider defaults override it, even when empty. These legacy settings are preserved; edit them in Raw TOML if needed.")
+                                Text(verbatim: String(describing: settings.legacyGuide.options))
+                                    .font(.caption.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    Text("Provider defaults").font(.headline)
+                    ForEach(settings.providers.indices, id: \.self) { index in
+                        let provider = settings.providers[index]
+                        MuxaLaunchOptionsRow(
+                            title: provider.program,
+                            detail: "[agent.\(provider.program)]",
+                            inheritLabel: "Inherit legacy guide options or no options",
+                            options: Binding(
+                                get: { store.launchDraft?.providers[index].options },
+                                set: { store.launchDraft?.providers[index].options = $0 }
+                            ),
+                            effective: settings.effectiveOptions(program: provider.program, override: nil)
+                        )
+                    }
+                    Text("Pipeline overrides").font(.headline)
+                    if settings.pipelines.isEmpty {
+                        Text("No pipeline agents configured. Add pipelines in Raw TOML.")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(settings.pipelines.indices, id: \.self) { index in
+                        let agent = settings.pipelines[index]
+                        MuxaLaunchOptionsRow(
+                            title: "\(agent.pipeline) / \(agent.name) · \(agent.program)",
+                            detail: "pipeline agent #\(agent.index + 1)",
+                            inheritLabel: "Inherit provider defaults",
+                            options: Binding(
+                                get: { store.launchDraft?.pipelines[index].options },
+                                set: { store.launchDraft?.pipelines[index].options = $0 }
+                            ),
+                            effective: settings.effectiveOptions(program: agent.program, override: agent.options)
+                        )
+                    }
+                    Button("Discard Launch Changes") { store.discardLaunch() }
+                        .disabled(!store.isLaunchDirty)
+                } else if !store.isLoading {
+                    Text(store.supportsLaunch
+                         ? "Launch options could not be read. Correct the configuration in Raw TOML and reload."
+                         : "This muxad does not support launch option forms. Update the daemon or use Raw TOML.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .disabled(store.isSaving || store.isLoading || store.isDirty || store.launchNeedsReload)
+            .padding(16)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: Capability fallback
@@ -174,6 +284,64 @@ struct AdvancedSettingsPane: View {
             NSWorkspace.shared.activateFileViewerSelecting([url])
         } else {
             NSWorkspace.shared.activateFileViewerSelecting([url.deletingLastPathComponent()])
+        }
+    }
+}
+
+private struct MuxaLaunchOptionsRow: View {
+    let title: String
+    let detail: String
+    let inheritLabel: LocalizedStringKey
+    @Binding var options: [String]?
+    let effective: [String]
+
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(verbatim: detail).font(.caption.monospaced()).foregroundStyle(.secondary)
+                Toggle("Override inherited options", isOn: Binding(
+                    get: { options != nil },
+                    set: { options = $0 ? effective : nil }
+                ))
+                if let arguments = options {
+                    ForEach(arguments.indices, id: \.self) { index in
+                        HStack {
+                            Text("\(index + 1)").foregroundStyle(.secondary)
+                            TextField("Argument (empty string allowed)", text: Binding(
+                                get: { options?[index] ?? "" },
+                                set: { options?[index] = $0 }
+                            ))
+                            .font(.system(.body, design: .monospaced))
+                            .textFieldStyle(.roundedBorder)
+                            Button { options?.swapAt(index, index - 1) } label: {
+                                Image(systemName: "arrow.up")
+                            }
+                            .disabled(index == 0)
+                            .accessibilityLabel("Move argument up")
+                            Button { options?.remove(at: index) } label: {
+                                Image(systemName: "minus.circle")
+                            }
+                            .accessibilityLabel("Remove argument")
+                        }
+                    }
+                    HStack {
+                        Button("Add Argument") { options?.append("") }
+                        Button("Use Empty List []") { options = [] }
+                    }
+                    if arguments.isEmpty {
+                        Text("Explicit []: no extra options, even if defaults exist.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text(inheritLabel).font(.caption).foregroundStyle(.secondary)
+                }
+                Text("Effective options: \(String(describing: effective))")
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } label: {
+            Text(verbatim: title).font(.headline)
         }
     }
 }

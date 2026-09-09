@@ -417,6 +417,11 @@ enum RequestBody {
     /// Hand out the daemon's `config.toml` as text, so a client can edit
     /// the sections that have no typed request of their own.
     ConfigRead {},
+    ConfigLaunchRead {},
+    ConfigLaunchWrite {
+        expected_text: String,
+        edits: Vec<crate::config_file::LaunchEdit>,
+    },
     /// Replace `config.toml` with `text`. Refused unless the document
     /// parses and validates, and unless `expected_text` (when given) still
     /// matches what is on disk, so two editors cannot clobber each other.
@@ -513,6 +518,10 @@ enum RequestBody {
     /// `automation_test`.
     AutomationTest {
         name: String,
+    },
+    AutomationJudgeTest {
+        rule: AutomationRule,
+        pane: String,
     },
     CollaborationInbox {
         origin: CollaborationOrigin,
@@ -708,6 +717,8 @@ const CAPABILITIES: &[&str] = &[
     "ask_providers_v1",
     "work_compose_v1",
     "automation_v1",
+    "automation_ask_v1",
+    "config_launch_v1",
     "config_edit_v1",
 ];
 
@@ -838,6 +849,10 @@ pub struct Response {
     /// `automation_v1`: what one rule would do right now.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub automation_test: Option<AutomationTestReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automation_judgment: Option<crate::automation_judge::AutomationJudgment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch: Option<crate::config_file::LaunchSettings>,
 }
 
 #[derive(Debug, Serialize)]
@@ -892,6 +907,8 @@ impl Response {
             automation_rules: None,
             automation_log: None,
             automation_test: None,
+            automation_judgment: None,
+            launch: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -2280,6 +2297,97 @@ impl CollaborationTopology {
 /// workspace/work stamped on its pane when a pane scan can supply them.
 /// The daemon's automation task builds subjects the same way, so
 /// `muxa automation test` and a real firing evaluate identical inputs.
+async fn automation_judge_test(
+    rule: &AutomationRule,
+    pane: &str,
+    store: &SharedStore,
+    backends: &[SharedBackend],
+    automation: &AutomationStore,
+    ask: &AskStore,
+) -> Result<crate::automation_judge::AutomationJudgment, String> {
+    use crate::automation::{AutomationLedgerEntry, AutomationOutcome};
+    use crate::automation_judge::{capture_context, evaluate, AutomationJudgment};
+    rule.validate()?;
+    let condition = rule
+        .ask_condition
+        .as_ref()
+        .ok_or("This rule has no Ask condition")?;
+    let _permit = automation.try_judgment_slot()?;
+    let agents = store.by_pane(pane).await;
+    unique_pane_endpoint(pane, &agents)?;
+    if agents.iter().any(|agent| agent.tmux_socket.is_none())
+        && agents.iter().any(|agent| agent.tmux_socket.is_some())
+    {
+        return Err(
+            "Ambiguous pane endpoint: both scoped and unscoped agents are registered".into(),
+        );
+    }
+    if agents.len() > 1 {
+        return Err("Ambiguous pane: multiple agent sessions are registered".into());
+    }
+    let agent = agents.first().ok_or("No live agent found for this pane")?;
+    let config = automation.config().await;
+    let saved = config.rule_named(&rule.name);
+    let max_per_hour = condition.max_per_hour.min(6).min(
+        saved
+            .and_then(|rule| rule.ask_condition.as_ref())
+            .map_or(6, |condition| condition.max_per_hour),
+    );
+    let cooldown = saved.map_or(time::Duration::seconds(10), |rule| {
+        rule.cooldown().max(time::Duration::seconds(10))
+    });
+    let ledger = automation.ledger();
+    let reservation = AutomationLedgerEntry {
+        rule: rule.name.clone(),
+        pane: pane.into(),
+        agent: agent.kind,
+        fired_at: time::OffsetDateTime::now_utc(),
+        action: rule.action,
+        outcome: AutomationOutcome::JudgeTest,
+        detail: Some("Explicit Ask condition test; no action will be executed".into()),
+        episode: None,
+    };
+    ledger
+        .reserve_judgment(reservation.clone(), max_per_hour, cooldown)
+        .await?;
+    let context = async {
+        let subjects =
+            tokio::time::timeout(Duration::from_secs(2), automation_subjects(store, backends))
+                .await
+                .map_err(|_| "Pane metadata capture timed out".to_string())?;
+        let subject = subjects
+            .iter()
+            .find(|subject| {
+                subject.agent_session_id == agent.session_id
+                    && subject.socket == agent.tmux_socket
+                    && subject.pane.as_deref() == Some(pane)
+            })
+            .ok_or("Agent changed before judgment capture".to_string())?;
+        capture_context(subject, backends).await
+    }
+    .await;
+    let judgment = match context {
+        Ok(context) => evaluate(ask, condition, &context).await,
+        Err(reason) => AutomationJudgment::unknown(condition, reason),
+    };
+    let detail = serde_json::json!({
+        "judgment": judgment,
+        "condition": condition.prompt,
+        "observe_only": true,
+        "execution": "test_only",
+    })
+    .to_string();
+    ledger
+        .append(AutomationLedgerEntry {
+            fired_at: time::OffsetDateTime::now_utc(),
+            outcome: AutomationOutcome::Judged,
+            detail: Some(detail),
+            ..reservation
+        })
+        .await;
+    Ok(judgment)
+}
+
 async fn automation_subjects(
     store: &SharedStore,
     backends: &[SharedBackend],
@@ -3311,6 +3419,50 @@ async fn handle(
                         None => Response::err(NO_CONFIG_PATH.to_string()),
                     }
                 }
+                RequestBody::ConfigLaunchRead {} => {
+                    kind = "config_launch_read";
+                    match config_path.as_deref() {
+                        Some(path) => match crate::config_file::read_launch(path) {
+                            Ok(document) => {
+                                let mut response = Response::with_config(document.config);
+                                response.launch = Some(document.launch);
+                                response
+                            }
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        None => Response::err(NO_CONFIG_PATH.to_string()),
+                    }
+                }
+                RequestBody::ConfigLaunchWrite {
+                    expected_text,
+                    edits,
+                } => {
+                    kind = "config_launch_write";
+                    match config_path.as_deref() {
+                        Some(path) => {
+                            match crate::config_file::write_launch(path, &expected_text, &edits) {
+                                Ok(document) => {
+                                    let mut response = Response::with_config(document.config);
+                                    response.launch = Some(document.launch);
+                                    response
+                                }
+                                Err(crate::config_file::ConfigFileError::Conflict { current }) => {
+                                    let mut response = Response::err(
+                                        "config.toml changed; reload before saving launch options",
+                                    );
+                                    response.config = Some(crate::config_file::ConfigDocument {
+                                        path: path.to_path_buf(),
+                                        exists: true,
+                                        text: current,
+                                    });
+                                    response
+                                }
+                                Err(error) => Response::err(error.to_string()),
+                            }
+                        }
+                        None => Response::err(NO_CONFIG_PATH.to_string()),
+                    }
+                }
                 RequestBody::ConfigWrite {
                     text,
                     expected_text,
@@ -3460,6 +3612,19 @@ async fn handle(
                         .await
                     {
                         Ok(report) => Response::with_automation_test(report),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                RequestBody::AutomationJudgeTest { rule, pane } => {
+                    kind = "automation_judge_test";
+                    match automation_judge_test(&rule, &pane, &store, &backends, &automation, &ask)
+                        .await
+                    {
+                        Ok(judgment) => {
+                            let mut response = Response::ok();
+                            response.automation_judgment = Some(judgment);
+                            response
+                        }
                         Err(error) => Response::err(error),
                     }
                 }
@@ -7651,6 +7816,126 @@ mod tests {
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn automation_judge_test_rejects_ambiguous_panes_before_charging() {
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%42", "first", AgentKind::ClaudeCode).await;
+        add_collaboration_agent(&store, "%42", "second", AgentKind::Codex).await;
+        let (backend, sends) = RecordingBackend::new(HostKind::Tmux, true);
+        let automation = AutomationStore::in_memory(crate::automation::AutomationConfig::default());
+        let ask = AskStore::in_memory(crate::ask::AskOptions::default());
+        let rule = serde_json::from_value(serde_json::json!({
+            "name":"judge", "on":"waiting_input", "action":"notify", "message":"ready",
+            "ask_condition":{"prompt":"Ready?", "provider":"openai"}
+        }))
+        .unwrap();
+        let error = automation_judge_test(
+            &rule,
+            "%42",
+            &store,
+            &[backend as SharedBackend],
+            &automation,
+            &ask,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_lowercase().contains("ambiguous"));
+        assert!(sends.lock().unwrap().is_empty());
+        assert!(automation.ledger().all().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn automation_judge_test_is_action_free_and_bounded() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("judge.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%42", "session", AgentKind::ClaudeCode).await;
+        let (backend, sends) = RecordingBackend::new(HostKind::Tmux, true);
+        let automation = AutomationStore::in_memory(crate::automation::AutomationConfig::default());
+        let ask = AskStore::in_memory(crate::ask::AskOptions {
+            enabled: false,
+            ..Default::default()
+        });
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend as SharedBackend])
+            .with_automation(automation.clone())
+            .with_ask(ask.clone());
+        let (shutdown, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(async move { server.run(receiver).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let request = serde_json::json!({
+            "protocol": PROTOCOL_VERSION, "kind":"automation_judge_test", "pane":"%42",
+            "rule": {"name":"judge", "on":"waiting_input", "action":"send_prompt", "text":"continue",
+                "ask_condition":{"prompt":"Ready?", "provider":"openai", "observe_only":false}}
+        });
+        let result = client.call(&request).await.unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["automation_judgment"]["decision"], "unknown");
+        assert_eq!(result["automation_judgment"]["reason"], "ask is disabled");
+        assert!(sends.lock().unwrap().is_empty());
+        assert!(ask.list().await.is_empty());
+        assert_eq!(client.call(&request).await.unwrap()["ok"], false);
+        assert_eq!(automation.ledger().all().await.len(), 2);
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_launch_requests_roundtrip_and_reject_stale_writes() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("launch.sock");
+        let path = directory.path().join("config.toml");
+        let initial = "# preserve\n[agent.codex]\noptions = ['--search']\n";
+        std::fs::write(&path, initial).unwrap();
+        let server =
+            Server::new(socket.clone(), Store::shared()).with_config_path(Some(path.clone()));
+        let (shutdown, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(async move { server.run(receiver).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let read = client
+            .call(&serde_json::json!({"protocol": PROTOCOL_VERSION, "kind": "config_launch_read"}))
+            .await
+            .unwrap();
+        assert_eq!(read["config"]["text"], initial);
+        assert!(read["launch"]["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|provider| provider["program"] == "codex"
+                && provider["options"] == serde_json::json!(["--search"])));
+        let request = serde_json::json!({
+            "protocol": PROTOCOL_VERSION, "kind": "config_launch_write", "expected_text": initial,
+            "edits": [{"target": "provider", "program": "codex", "options": []}],
+        });
+        let written = client.call(&request).await.unwrap();
+        assert!(written["config"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("# preserve"));
+        let stale = client.call(&request).await.unwrap();
+        assert_eq!(stale["ok"], false);
+        assert!(stale["error"].as_str().unwrap().contains("changed"));
+        assert_eq!(stale["config"]["text"], written["config"]["text"]);
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn automation_judge_wire_contract_is_additive_and_strict() {
+        let request: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "automation_judge_test", "pane": "%1", "rule": {
+                "name": "judge", "on": "waiting_input", "action": "notify", "message": "Ready",
+                "ask_condition": {"prompt":"Ready?", "provider":"openai"}
+            }
+        }))
+        .unwrap();
+        assert!(matches!(request, RequestBody::AutomationJudgeTest { pane, .. } if pane == "%1"));
+        assert!(CAPABILITIES.contains(&"automation_ask_v1"));
+        assert!(CAPABILITIES.contains(&"config_launch_v1"));
     }
 
     #[tokio::test]

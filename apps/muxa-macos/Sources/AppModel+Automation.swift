@@ -46,9 +46,12 @@ enum MuxaAutomationRuleIssue: Hashable, Sendable {
     case invalidWorkRegex
     case invalidHost
     case invalidMaxPerHour
+    case invalidAskCondition(String)
 
     var message: String {
         switch self {
+        case .invalidAskCondition(let message):
+            message
         case .missingName:
             String(localized: "Give this rule a name.")
         case .invalidName:
@@ -114,6 +117,7 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
     var cooldown = MuxaAutomationRule.defaultCooldown
     /// nil keeps the daemon's default: the condition that armed the rule.
     var onlyIfStill: MuxaAutomationCondition?
+    var askCondition: MuxaAutomationAskCondition?
 
     /// The agent kinds the picker offers, as muxad stores them. Shorthand
     /// (`claude`, `gemini`, `agy`) is accepted on the wire but normalised
@@ -151,6 +155,9 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
         }
 
         issues.append(contentsOf: actionIssues)
+        if let error = askCondition?.validationError {
+            issues.append(.invalidAskCondition(error))
+        }
 
         if event.requiresDuration {
             let value = idleFor.trimmingCharacters(in: .whitespaces)
@@ -309,7 +316,8 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
             cooldown: cooldown.trimmingCharacters(in: .whitespaces).isEmpty
                 ? MuxaAutomationRule.defaultCooldown
                 : cooldown.trimmingCharacters(in: .whitespaces),
-            onlyIfStill: onlyIfStill
+            onlyIfStill: onlyIfStill,
+            askCondition: askCondition
         )
     }
 
@@ -335,7 +343,8 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
             submit: rule.submit,
             maxPerHour: rule.maxPerHour,
             cooldown: rule.cooldown,
-            onlyIfStill: rule.onlyIfStill
+            onlyIfStill: rule.onlyIfStill,
+            askCondition: rule.askCondition
         )
     }
 
@@ -575,6 +584,7 @@ final class AutomationStore: ObservableObject {
     @Published private(set) var snapshot = MuxaAutomationSnapshot.empty
     @Published private(set) var log: [MuxaAutomationLogEntry] = []
     @Published private(set) var isSupported = false
+    @Published private(set) var isAskSupported = false
     @Published private(set) var hasLoaded = false
     @Published private(set) var isLoading = false
     @Published private(set) var isMutating = false
@@ -604,6 +614,7 @@ final class AutomationStore: ObservableObject {
 
     func reload(model: AppModel) async {
         isSupported = await model.client.supports(MuxaIPCClient.automationCapability)
+        isAskSupported = await model.client.supports(MuxaIPCClient.automationAskCapability)
         guard isSupported else {
             hasLoaded = true
             return
@@ -635,7 +646,12 @@ final class AutomationStore: ObservableObject {
 
     @discardableResult
     func save(_ rule: MuxaAutomationRule, model: AppModel) async -> Bool {
-        await mutate(model: model) { client in
+        let issues = MuxaAutomationRuleDraft.draft(editing: rule).issues(existingNames: existingNames)
+        guard issues.isEmpty else {
+            actionError = issues.map(\.message).joined(separator: "\n")
+            return false
+        }
+        return await mutate(model: model) { client in
             try await client.automationSetRule(rule)
         }
     }

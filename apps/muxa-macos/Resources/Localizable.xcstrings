@@ -1,6 +1,686 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Advanced has unsaved configuration changes. Save or reload it before changing this." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "고급 설정에 저장하지 않은 변경 사항이 있습니다. 이 항목을 변경하기 전에 저장하거나 다시 불러오세요."
+          }
+        }
+      }
+    },
+    "Ask conditions require an OpenAI or Anthropic API provider ID with API key/configuration. CLI providers are not supported." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 조건에는 API 키와 설정이 갖춰진 OpenAI 또는 Anthropic API 공급자 ID가 필요합니다. CLI 공급자는 지원하지 않습니다."
+          }
+        }
+      }
+    },
+    "Context hash: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "컨텍스트 해시: %@"
+          }
+        }
+      }
+    },
+    "muxad does not support Ask conditions; update muxa and restart muxad. The condition was not removed." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "muxad가 Ask 조건을 지원하지 않습니다. muxa를 업데이트한 뒤 muxad를 다시 시작하세요. 조건은 삭제되지 않았습니다."
+          }
+        }
+      }
+    },
+    "muxad rejected the judgment" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "muxad가 판단 요청을 거부했습니다."
+          }
+        }
+      }
+    },
+    "pipeline agent #%lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파이프라인 에이전트 #%lld"
+          }
+        }
+      }
+    },
+    "Provider: %@ · Model: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "공급자: %@ · 모델: %@"
+          }
+        }
+      }
+    },
+    "Save or discard launch option changes before editing Raw TOML." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TOML 원문을 편집하기 전에 실행 옵션 변경 사항을 저장하거나 버리세요."
+          }
+        }
+      }
+    },
+    "[mcp.guide].options still supplies %@'s fallback. Provider defaults override it, even when empty. These legacy settings are preserved; edit them in Raw TOML if needed." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "[mcp.guide].options는 여전히 %@의 대체 옵션으로 사용됩니다. 공급자 기본값이 있으면 빈 목록이어도 이를 대체합니다. 기존 설정은 유지되며, 필요하면 TOML 원문에서 수정할 수 있습니다."
+          }
+        }
+      }
+    },
+    "Add Argument" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "인수 추가"
+          }
+        }
+      }
+    },
+    "API Ask provider ID" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API Ask 공급자 ID"
+          }
+        }
+      }
+    },
+    "Argument (empty string allowed)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "인수(빈 문자열 허용)"
+          }
+        }
+      }
+    },
+    "Ask condition · Fixed action on match" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 조건 · 일치 시 지정된 동작 실행"
+          }
+        }
+      }
+    },
+    "Ask condition · Observe only (no action)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 조건 · 관찰만(동작 실행 안 함)"
+          }
+        }
+      }
+    },
+    "Ask condition (optional)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 조건(선택 사항)"
+          }
+        }
+      }
+    },
+    "Ask condition test" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 조건 테스트"
+          }
+        }
+      }
+    },
+    "Ask judgment calls per hour must be between 1 and 30." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "시간당 Ask 판단 호출 수는 1~30회여야 합니다."
+          }
+        }
+      }
+    },
+    "Ask judgment required (not run by this free test)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 판단 필요(이 무료 테스트에서는 실행하지 않음)"
+          }
+        }
+      }
+    },
+    "Ask only judges the condition; it cannot choose or run an action. Observe-only logs judgments without executing this fixed action." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask는 조건만 판단하며 동작을 선택하거나 실행할 수 없습니다. 관찰 전용 모드에서는 지정된 동작을 실행하지 않고 판단 결과만 기록합니다."
+          }
+        }
+      }
+    },
+    "Ask timeout must be between 5 and 120 seconds." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 제한 시간은 5~120초여야 합니다."
+          }
+        }
+      }
+    },
+    "Bounded recent screen/current state and work/workspace IDs leave this machine for the selected API provider. This uses one potentially billed, read-only, tool-free turn and executes no action, even with observe-only off." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "길이가 제한된 최근 화면/현재 상태와 작업/워크스페이스 ID가 기기 밖의 선택한 API 공급자로 전송됩니다. 도구를 사용하지 않는 읽기 전용 호출 1회이며 요금이 발생할 수 있습니다. 관찰 전용 모드를 꺼도 동작은 실행하지 않습니다."
+          }
+        }
+      }
+    },
+    "Choose an API Ask provider ID backed by OpenAI or Anthropic. Configure its API key in Ask providers; Claude/Codex CLI providers are not supported." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OpenAI 또는 Anthropic 기반의 API Ask 공급자 ID를 선택하세요. Ask 공급자 설정에서 API 키를 구성하세요. Claude/Codex CLI 공급자는 지원하지 않습니다."
+          }
+        }
+      }
+    },
+    "Choose an explicit configured Ask provider." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정된 Ask 공급자를 명시적으로 선택하세요."
+          }
+        }
+      }
+    },
+    "Condition judged" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "조건 판단 완료"
+          }
+        }
+      }
+    },
+    "Configuration editor" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정 편집기"
+          }
+        }
+      }
+    },
+    "Default: openai. Requires API provider configuration and a key available to muxad; this request does not forward app-only Keychain keys. Only OpenAI, Anthropic, or named API instances backed by them are supported—not Claude/Codex CLI providers." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본값: openai. API 공급자 설정과 muxad에서 사용할 수 있는 키가 필요합니다. 이 요청은 앱 전용 키체인 키를 전달하지 않습니다. OpenAI, Anthropic 또는 이를 기반으로 이름을 지정한 API 인스턴스만 지원하며, Claude/Codex CLI 공급자는 지원하지 않습니다."
+          }
+        }
+      }
+    },
+    "Describe the Ask condition in natural language." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 조건을 자연어로 입력하세요."
+          }
+        }
+      }
+    },
+    "Discard and Reload" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "변경 사항 버리고 다시 불러오기"
+          }
+        }
+      }
+    },
+    "Discard Launch Changes" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 옵션 변경 사항 버리기"
+          }
+        }
+      }
+    },
+    "Discard unsaved configuration changes and reload?" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장하지 않은 설정 변경 사항을 버리고 다시 불러올까요?"
+          }
+        }
+      }
+    },
+    "Each entry is one literal CLI argument, not a shell command. Options replace the entire inherited list; they are never appended. Changes affect future launches, not running agents." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "각 항목은 셸 명령이 아닌 하나의 CLI 인수입니다. 옵션은 상속된 목록 전체를 대체하며, 기존 목록에 추가되지 않습니다. 변경 사항은 이후 실행에만 적용되며 실행 중인 에이전트에는 영향을 주지 않습니다."
+          }
+        }
+      }
+    },
+    "Each judgment is one read-only, tool-free Ask turn. Only bounded recent screen text, current state, and work/workspace IDs are sent—not full goal lookup. This context leaves your machine for the selected API provider and may be billed. Judgment call limits are separate from action firing limits." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "각 판단은 도구를 사용하지 않는 읽기 전용 Ask 호출 1회입니다. 길이가 제한된 최근 화면 텍스트, 현재 상태, 작업/워크스페이스 ID만 전송하며 목표 전체를 조회하지 않습니다. 이 컨텍스트는 기기 밖의 선택한 API 공급자로 전송되며 요금이 발생할 수 있습니다. 판단 호출 제한과 동작 실행 제한은 별도로 적용됩니다."
+          }
+        }
+      }
+    },
+    "Effective options: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "적용될 옵션: %@"
+          }
+        }
+      }
+    },
+    "Explicit []: no extra options, even if defaults exist." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "명시적 빈 목록 []: 기본값이 있어도 추가 옵션을 사용하지 않습니다."
+          }
+        }
+      }
+    },
+    "Fixed action" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "지정된 동작"
+          }
+        }
+      }
+    },
+    "Free deterministic check: no Ask turn, no action, and nothing recorded. Ask conditions require the separate billed test in the rule editor." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "무료 규칙 검사: Ask를 호출하거나 동작을 실행하지 않으며, 기록도 남기지 않습니다. Ask 조건은 규칙 편집기에서 별도의 유료 테스트로 확인해야 합니다."
+          }
+        }
+      }
+    },
+    "Inherit legacy guide options or no options" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기존 가이드 옵션 상속, 없으면 옵션 없음"
+          }
+        }
+      }
+    },
+    "Inherit provider defaults" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "공급자 기본값 상속"
+          }
+        }
+      }
+    },
+    "Judge a natural-language condition" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자연어 조건 판단"
+          }
+        }
+      }
+    },
+    "Judging condition" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "조건 판단 중"
+          }
+        }
+      }
+    },
+    "Judging…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "판단 중…"
+          }
+        }
+      }
+    },
+    "Judgment: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "판단 결과: %@"
+          }
+        }
+      }
+    },
+    "Launch options" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 옵션"
+          }
+        }
+      }
+    },
+    "Launch options could not be read. Correct the configuration in Raw TOML and reload." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 옵션을 읽지 못했습니다. TOML 원문에서 설정을 수정한 뒤 다시 불러오세요."
+          }
+        }
+      }
+    },
+    "Legacy guide options" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기존 가이드 옵션"
+          }
+        }
+      }
+    },
+    "Maximum judgment calls per hour: %u" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "시간당 최대 판단 호출 수: %u"
+          }
+        }
+      }
+    },
+    "Move argument up" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "인수 위로 이동"
+          }
+        }
+      }
+    },
+    "Natural-language condition" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자연어 조건"
+          }
+        }
+      }
+    },
+    "No pipeline agents configured. Add pipelines in Raw TOML." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정된 파이프라인 에이전트가 없습니다. TOML 원문에서 파이프라인을 추가하세요."
+          }
+        }
+      }
+    },
+    "Observe only — log judgments, execute no action" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "관찰만 — 판단 결과만 기록하고 동작은 실행하지 않음"
+          }
+        }
+      }
+    },
+    "Override inherited options" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "상속된 옵션 재정의"
+          }
+        }
+      }
+    },
+    "Pane ID to try against" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "테스트할 페인 ID"
+          }
+        }
+      }
+    },
+    "Pipeline overrides" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파이프라인 재정의"
+          }
+        }
+      }
+    },
+    "Provider defaults" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "공급자 기본값"
+          }
+        }
+      }
+    },
+    "Raw TOML" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TOML 원문"
+          }
+        }
+      }
+    },
+    "Raw TOML has unsaved changes. Save or reload it first." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TOML 원문에 저장하지 않은 변경 사항이 있습니다. 먼저 저장하거나 다시 불러오세요."
+          }
+        }
+      }
+    },
+    "Reload to refresh launch options from the configuration file." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 불러오면 설정 파일의 최신 실행 옵션을 확인할 수 있습니다."
+          }
+        }
+      }
+    },
+    "Reload to review the current file before applying launch options again." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 옵션을 다시 적용하기 전에 파일을 다시 불러와 현재 내용을 확인하세요."
+          }
+        }
+      }
+    },
+    "Remove argument" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "인수 삭제"
+          }
+        }
+      }
+    },
+    "Send context and judge (billed)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "컨텍스트 전송 후 판단(유료)"
+          }
+        }
+      }
+    },
+    "Send pane context for one billed Ask turn?" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "페인 컨텍스트를 전송해 유료 Ask 호출을 1회 진행할까요?"
+          }
+        }
+      }
+    },
+    "This muxad does not support launch option forms. Update the daemon or use Raw TOML." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 muxad는 실행 옵션 폼을 지원하지 않습니다. 데몬을 업데이트하거나 TOML 원문을 사용하세요."
+          }
+        }
+      }
+    },
+    "Timeout: %llu seconds" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "제한 시간: %llu초"
+          }
+        }
+      }
+    },
+    "Try condition — one billed API turn…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "조건 테스트 — 유료 API 호출 1회…"
+          }
+        }
+      }
+    },
+    "Unknown is not a match and must not execute an action." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "판단 불가(unknown)는 조건 일치가 아니며 동작을 실행해서는 안 됩니다."
+          }
+        }
+      }
+    },
+    "Update muxad for automation_ask_v1. This condition cannot be saved on an older daemon." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "automation_ask_v1을 지원하도록 muxad를 업데이트하세요. 이전 데몬에서는 이 조건을 저장할 수 없습니다."
+          }
+        }
+      }
+    },
+    "Use Empty List []" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "빈 목록 [] 사용"
+          }
+        }
+      }
+    },
+    "Your raw text is preserved. Reload to take the file's version, or review it before saving again." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "편집한 원문은 유지됩니다. 다시 불러와 파일의 내용을 사용하거나, 다시 저장하기 전에 내용을 검토하세요."
+          }
+        }
+      }
+    },
     "#%@ · %lld panes" : {
       "localizations" : {
         "en" : {

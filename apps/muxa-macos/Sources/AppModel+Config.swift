@@ -458,6 +458,10 @@ final class MuxaConfigStore: ObservableObject {
     static let shared = MuxaConfigStore()
 
     @Published private(set) var document: MuxaDaemonConfigDocument?
+    @Published private(set) var launch: MuxaLaunchSettings?
+    @Published var launchDraft: MuxaLaunchSettings?
+    @Published private(set) var supportsLaunch = false
+    @Published private(set) var launchNeedsReload = false
     /// The Advanced editor's buffer. Diverges from `document.text` while
     /// the operator types; `expected_text` always carries `document.text`.
     @Published var draft = ""
@@ -475,12 +479,18 @@ final class MuxaConfigStore: ObservableObject {
     @Published private(set) var retryEdits: [MuxaTOMLEdit] = []
     @Published private(set) var status: String?
 
-    init() {}
+    init(document: MuxaDaemonConfigDocument? = nil, launch: MuxaLaunchSettings? = nil) {
+        self.document = document
+        self.launch = launch
+        self.launchDraft = launch
+        self.draft = document?.text ?? ""
+    }
 
     var loadedText: String { document?.text ?? "" }
     var hasLoaded: Bool { document != nil }
     var isDirty: Bool { hasLoaded && draft != loadedText }
     var path: String { document?.path ?? "" }
+    var isLaunchDirty: Bool { launchDraft != launch }
 
     var behaviour: MuxaBehaviourSettings {
         MuxaBehaviourSettings.read(from: loadedText)
@@ -489,19 +499,43 @@ final class MuxaConfigStore: ObservableObject {
     /// Reads the document once per connection; `force` re-reads and
     /// discards an unsaved draft.
     func load(model: AppModel, force: Bool = false) async {
+        guard !isLoading, !isSaving else { return }
+        isLoading = true
+        defer { isLoading = false }
         isSupported = await model.client.supports(MuxaIPCClient.configEditCapability)
         guard isSupported else {
             document = nil
+            launch = nil
+            launchDraft = nil
             return
         }
         guard force || document == nil else { return }
-        isLoading = true
-        defer { isLoading = false }
+        let startingDraft = draft
+        let startingLaunchDraft = launchDraft
         loadError = nil
         do {
-            let loaded = try await model.client.readDaemonConfig()
+            supportsLaunch = await model.client.supports(MuxaIPCClient.configLaunchCapability)
+            let loaded: MuxaDaemonConfigDocument
+            if supportsLaunch {
+                do {
+                    let response = try await model.client.makeConfigClient().readLaunch()
+                    loaded = response.config
+                    launch = response.launch
+                    if launchDraft == startingLaunchDraft { launchDraft = response.launch }
+                    launchNeedsReload = false
+                } catch {
+                    loaded = try await model.client.readDaemonConfig()
+                    launch = nil
+                    launchDraft = nil
+                    loadError = error.localizedDescription
+                }
+            } else {
+                loaded = try await model.client.readDaemonConfig()
+                launch = nil
+                launchDraft = nil
+            }
             document = loaded
-            draft = loaded.text
+            if draft == startingDraft { draft = loaded.text }
             saveError = nil
             conflictMessage = nil
             retryEdits = []
@@ -514,7 +548,16 @@ final class MuxaConfigStore: ObservableObject {
     /// Writes the Advanced editor's buffer.
     @discardableResult
     func save(model: AppModel) async -> Bool {
-        await write(text: draft, model: model, success: String(localized: "Saved."))
+        await save(client: model.client.makeConfigClient())
+    }
+
+    @discardableResult
+    func save(client: MuxaConfigClient) async -> Bool {
+        guard !isLaunchDirty else {
+            saveError = "Launch options have unsaved changes. Save or discard them first."
+            return false
+        }
+        return await write(text: draft, client: client, success: String(localized: "Saved."))
     }
 
     /// Writes `edits` against the last loaded text. Refuses while the
@@ -523,14 +566,14 @@ final class MuxaConfigStore: ObservableObject {
     @discardableResult
     func apply(_ edits: [MuxaTOMLEdit], model: AppModel) async -> Bool {
         guard !edits.isEmpty else { return true }
-        guard !isDirty else {
+        guard !isDirty, !isLaunchDirty else {
             saveError = String(
-                localized: "Advanced has unsaved changes. Save or reload it before changing this."
+                localized: "Advanced has unsaved configuration changes. Save or reload it before changing this."
             )
             return false
         }
         let patched = MuxaTOMLPatcher.apply(edits, to: loadedText)
-        let wrote = await write(text: patched, model: model, success: String(localized: "Saved."))
+        let wrote = await write(text: patched, client: model.client.makeConfigClient(), success: String(localized: "Saved."))
         // A conflict leaves `document` holding the file as it now stands, so
         // the same edits re-applied land on top of whatever changed.
         retryEdits = wrote || conflictMessage == nil ? [] : edits
@@ -547,8 +590,8 @@ final class MuxaConfigStore: ObservableObject {
         return await apply(edits, model: model)
     }
 
-    private func write(text: String, model: AppModel, success: String) async -> Bool {
-        guard !isSaving else { return false }
+    private func write(text: String, client: MuxaConfigClient, success: String) async -> Bool {
+        guard !isSaving, !isLoading else { return false }
         // Never write a document that was never read: `expected_text` would
         // be nil and an empty draft would replace the operator's file.
         guard let loaded = document else {
@@ -558,17 +601,18 @@ final class MuxaConfigStore: ObservableObject {
         isSaving = true
         defer { isSaving = false }
         let wasDirty = isDirty
+        let startingDraft = draft
         saveError = nil
         conflictMessage = nil
         status = nil
         do {
-            let saved = try await model.client.writeDaemonConfig(
+            let saved = try await client.write(
                 text: text,
-                // A file that does not exist yet has no text to match on.
-                expectedText: loaded.exists ? loaded.text : nil
+                expectedText: loaded.text
             )
             document = saved
-            draft = saved.text
+            if draft == startingDraft { draft = saved.text }
+            launchNeedsReload = true
             retryEdits = []
             status = success
             return true
@@ -578,7 +622,8 @@ final class MuxaConfigStore: ObservableObject {
             // is against the current file — and keep the operator's work:
             // an edited draft stays, an untouched one follows the file.
             document = conflict.current
-            if !wasDirty { draft = conflict.current.text }
+            if !wasDirty, draft == startingDraft { draft = conflict.current.text }
+            launchNeedsReload = true
             conflictMessage = conflict.message
             saveError = conflict.message
             return false
@@ -586,6 +631,43 @@ final class MuxaConfigStore: ObservableObject {
             saveError = error.localizedDescription
             return false
         }
+    }
+
+    func saveLaunch(model: AppModel) async -> Bool {
+        await saveLaunch(client: model.client.makeConfigClient())
+    }
+
+    func saveLaunch(client: MuxaConfigClient) async -> Bool {
+        guard !isSaving, !isLoading, !isDirty, !launchNeedsReload,
+              let document, let launch, let submitted = launchDraft else { return false }
+        isSaving = true
+        defer { isSaving = false }
+        saveError = nil
+        conflictMessage = nil
+        status = nil
+        let startingDraft = draft
+        do {
+            let response = try await client.writeLaunch(
+                expectedText: document.text, settings: submitted, baseline: launch
+            )
+            self.document = response.config
+            self.launch = response.launch
+            if launchDraft == submitted { launchDraft = response.launch }
+            if draft == startingDraft { draft = response.config.text }
+            status = String(localized: "Saved.")
+            return true
+        } catch let conflict as MuxaConfigConflict {
+            launchNeedsReload = true
+            conflictMessage = "The configuration changed. Reload before editing launch options; your options remain visible until then."
+            saveError = conflict.message
+        } catch {
+            saveError = error.localizedDescription
+        }
+        return false
+    }
+
+    func discardLaunch() {
+        launchDraft = launch
     }
 
     func revertDraft() {

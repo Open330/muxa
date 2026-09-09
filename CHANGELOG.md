@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`[automation.rule.ask_condition]` puts a natural-language check in front of
+  a rule's fixed action.** The condition runs *after* the deterministic event,
+  filters, timing, and guards have already selected a candidate, and it can
+  only ever withhold the action the rule already declares — it never chooses
+  one. A rule without the table behaves exactly as before.
+
+  It is a judgment, not an agent turn: only the `openai` and `anthropic` API
+  engines are accepted, the request carries no tools, and CLI providers are
+  refused because they cannot be held to that. Every failure mode is a
+  non-match — invalid JSON, a timeout, a missing key, unavailable context, a
+  provider error, and the judge's own `unknown` verdict. `observe_only` is the
+  default, so a new condition records what it would have done and acts on
+  nothing.
+
+  What bounds the spend is deliberately separate from what bounds the rule: a
+  judgment attempt is reserved in the persistent ledger *before* the call, at
+  most one per `(rule, pane, episode)` so a restarted daemon does not retry an
+  episode, under a non-configurable global ceiling of 30 attempts/hour and at
+  most two concurrent judgments — a slow provider must not stall the
+  deterministic scheduler. A match is re-checked against current context,
+  state, and configuration before the action fires, because a match is a
+  statement about the pane as it was.
+
+  The privacy boundary is the point to read before enabling this: each
+  judgment sends bounded recent pane text (at most 12,000 characters) to an
+  external API, which is disclosure and may be billed even in observe-only
+  mode. `muxa automation test` stays free and deterministic and reports
+  `ask_required` rather than guessing; the app's **Try condition** is the
+  explicitly billed one-turn test, and it never executes an action. Requires
+  daemon capability `automation_ask_v1`, so an older daemon refuses the rule
+  instead of silently dropping the condition. See
+  [Optional Ask condition](docs/AUTOMATION.md#optional-ask-condition).
+
+- **Settings → Advanced edits `[agent.<program>]` launch options as a form.**
+  The segmented Launch options / Raw TOML editor covers provider defaults and
+  existing pipeline agent panes; pipelines are still created and restructured
+  in Raw TOML.
+
+  The form exists to make one distinction visible that raw TOML hides: no
+  `options` key (inherit the next default), `options = []` (explicitly
+  suppress inherited arguments), and `options = [...]` (replace them) are
+  three different states, and the middle one is invisible in a text editor
+  until it surprises someone. One row is one literal argument with no shell
+  splitting, so `--model` and its value are separate rows and a value with
+  spaces needs no quoting.
+
+  Saves are optimistically concurrent — the request carries the configuration
+  text it was based on, and a file changed underneath is a conflict rather
+  than an overwrite. Only the requested option fields are rewritten;
+  unrelated TOML, comments, and legacy `[mcp.guide]` settings survive
+  verbatim, and unsaved raw and form edits do not overwrite each other.
+  Options apply to new launches, not to running agents. Requires daemon
+  capability `config_launch_v1`. See
+  [Advanced launch options form](docs/CONFIGURATION.md#advanced-launch-options-form).
+
 ### Fixed
 
 - **The macOS app no longer stops muxad from starting at login.** Replacing a

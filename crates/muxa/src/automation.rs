@@ -496,6 +496,8 @@ impl AutomationConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutomationRule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_condition: Option<crate::automation_judge::AskCondition>,
     /// Unique, TOML-safe identity. Used by `enable`/`disable`, by the
     /// ledger, and as part of the one-firing-per-episode key.
     pub name: String,
@@ -582,6 +584,7 @@ impl AutomationRule {
     pub fn new(name: impl Into<String>, on: AutomationEvent, action: AutomationAction) -> Self {
         Self {
             name: name.into(),
+            ask_condition: None,
             on,
             enabled: true,
             agent: Vec::new(),
@@ -658,7 +661,10 @@ impl AutomationRule {
     /// for a pane scan when at least one enabled rule says yes.
     #[must_use]
     pub fn needs_pane_metadata(&self) -> bool {
-        self.workspace.is_some() || self.work.is_some() || self.host.is_some()
+        self.workspace.is_some()
+            || self.work.is_some()
+            || self.host.is_some()
+            || self.ask_condition.is_some()
     }
 
     /// The compiled `work` regex, if the rule has one. Compilation is
@@ -673,6 +679,9 @@ impl AutomationRule {
     #[allow(clippy::too_many_lines)] // one branch per key; a table would hide which key failed
     pub fn validate(&self) -> Result<(), String> {
         let named = |message: String| format!("automation.rule {:?}: {message}", self.name);
+        if let Some(condition) = &self.ask_condition {
+            condition.validate().map_err(&named)?;
+        }
 
         if self.name.trim().is_empty() {
             return Err("automation.rule: name cannot be empty".into());
@@ -1377,6 +1386,9 @@ fn jitter_offset(jitter: time::Duration, ratio: f64) -> time::Duration {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum AutomationOutcome {
+    Judging,
+    Judged,
+    JudgeTest,
     /// The action reached the pane.
     Fired,
     /// A guard or the fire-time re-check stopped it.
@@ -1422,6 +1434,7 @@ pub struct AutomationLedger {
     /// Serializes each mutation with its snapshot write, so a reader never
     /// sees an entry the file does not have.
     write_lock: Mutex<()>,
+    recovery_failed: bool,
 }
 
 impl AutomationLedger {
@@ -1431,6 +1444,7 @@ impl AutomationLedger {
             path: None,
             entries: RwLock::new(Vec::new()),
             write_lock: Mutex::new(()),
+            recovery_failed: false,
         })
     }
 
@@ -1439,17 +1453,25 @@ impl AutomationLedger {
     /// direction of firing, so the global cap remains the backstop.
     #[must_use]
     pub fn load(path: Option<PathBuf>) -> Arc<Self> {
-        let mut entries = path
-            .as_ref()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|text| serde_json::from_str::<LedgerSnapshot>(&text).ok())
-            .unwrap_or_default()
-            .entries;
+        let loaded =
+            path.as_ref().map_or(
+                Ok(LedgerSnapshot::default()),
+                |path| match std::fs::read_to_string(path) {
+                    Ok(text) => serde_json::from_str::<LedgerSnapshot>(&text).map_err(|_| ()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(LedgerSnapshot::default())
+                    }
+                    Err(_) => Err(()),
+                },
+            );
+        let recovery_failed = loaded.is_err();
+        let mut entries = loaded.unwrap_or_default().entries;
         trim(&mut entries);
         Arc::new(Self {
             path,
             entries: RwLock::new(entries),
             write_lock: Mutex::new(()),
+            recovery_failed,
         })
     }
 
@@ -1461,6 +1483,70 @@ impl AutomationLedger {
             trim(&mut entries);
         }
         self.persist().await;
+    }
+
+    pub async fn reserve_judgment(
+        &self,
+        entry: AutomationLedgerEntry,
+        max_per_hour: u32,
+        cooldown: time::Duration,
+    ) -> Result<(), String> {
+        let _guard = self.write_lock.lock().await;
+        if self.recovery_failed {
+            return Err(
+                "Ask judgment ledger could not be recovered; repair it and restart muxad".into(),
+            );
+        }
+        {
+            let mut entries = self.entries.write().await;
+            let attempts: Vec<_> = entries
+                .iter()
+                .filter(|previous| {
+                    matches!(
+                        previous.outcome,
+                        AutomationOutcome::Judging | AutomationOutcome::JudgeTest
+                    ) && previous.fired_at > entry.fired_at - time::Duration::hours(1)
+                })
+                .collect();
+            if attempts.len() >= 30 {
+                return Err("Ask judgment global hourly limit reached".into());
+            }
+            let matches_budget = |previous: &&AutomationLedgerEntry| {
+                previous.pane == entry.pane
+                    && (previous.rule == entry.rule
+                        || entry.outcome == AutomationOutcome::JudgeTest)
+            };
+            let matching: Vec<_> = attempts.iter().copied().filter(matches_budget).collect();
+            if matching.len() >= max_per_hour as usize {
+                return Err("Ask judgment rule/pane hourly limit reached".into());
+            }
+            if entries
+                .iter()
+                .filter(|previous| {
+                    matches!(
+                        previous.outcome,
+                        AutomationOutcome::Judging | AutomationOutcome::JudgeTest
+                    )
+                })
+                .filter(matches_budget)
+                .any(|previous| entry.fired_at - previous.fired_at < cooldown)
+            {
+                return Err("Ask judgment cooldown is active".into());
+            }
+            if entry.episode.is_some()
+                && entries.iter().any(|previous| {
+                    previous.rule == entry.rule
+                        && previous.pane == entry.pane
+                        && previous.episode == entry.episode
+                        && previous.outcome != AutomationOutcome::Skipped
+                })
+            {
+                return Err("This episode has already been judged or handled".into());
+            }
+            entries.push(entry);
+            trim(&mut entries);
+        }
+        self.persist_checked().await
     }
 
     /// Newest first, capped at `limit`.
@@ -1543,28 +1629,63 @@ impl AutomationLedger {
     /// in-memory ledger rather than blocking the action the operator asked
     /// for. Write-then-rename so a reader never catches a half-written file.
     async fn persist(&self) {
+        if let Err(error) = self.persist_checked().await {
+            tracing::warn!(%error, "automation ledger could not be persisted");
+        }
+    }
+
+    async fn persist_checked(&self) -> Result<(), String> {
+        use std::io::Write;
+
+        if self.recovery_failed {
+            return Err("Automation ledger recovery failed; original file preserved".into());
+        }
         let Some(path) = self.path.as_ref() else {
-            return;
+            return Ok(());
         };
         let snapshot = LedgerSnapshot {
             entries: self.entries.read().await.clone(),
         };
-        let Ok(text) = serde_json::to_string_pretty(&snapshot) else {
-            return;
-        };
+        let text = serde_json::to_string_pretty(&snapshot).map_err(|error| error.to_string())?;
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
         let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        let mut file = options.open(&tmp).map_err(|error| error.to_string())?;
+        file.write_all(text.as_bytes())
+            .map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        std::fs::rename(&tmp, path).map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 }
 
 fn trim(entries: &mut Vec<AutomationLedgerEntry>) {
-    if entries.len() > MAX_LEDGER_ENTRIES {
-        entries.drain(..entries.len() - MAX_LEDGER_ENTRIES);
+    let hour_ago = OffsetDateTime::now_utc() - time::Duration::hours(24);
+    while entries.len() > MAX_LEDGER_ENTRIES {
+        let Some(index) = entries.iter().position(|entry| {
+            entry.fired_at <= hour_ago
+                || !matches!(
+                    entry.outcome,
+                    AutomationOutcome::Judging | AutomationOutcome::JudgeTest
+                )
+        }) else {
+            break;
+        };
+        entries.remove(index);
     }
 }
 
@@ -1583,6 +1704,8 @@ fn trim(entries: &mut Vec<AutomationLedgerEntry>) {
 /// duration grammar or the defaults.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutomationRuleView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_condition: Option<crate::automation_judge::AskCondition>,
     pub name: String,
     pub on: AutomationEvent,
     pub enabled: bool,
@@ -1705,6 +1828,7 @@ pub struct AutomationStore {
     ledger: Arc<AutomationLedger>,
     config_path: Option<PathBuf>,
     changes: watch::Sender<u64>,
+    judgment_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AutomationStore {
@@ -1720,6 +1844,7 @@ impl AutomationStore {
             ledger,
             config_path,
             changes,
+            judgment_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }
 
@@ -1735,6 +1860,15 @@ impl AutomationStore {
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changes.subscribe()
+    }
+
+    pub fn try_judgment_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        self.judgment_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                "Two Ask judgments are already running; try again after they finish".into()
+            })
     }
 
     fn publish_change(&self) {
@@ -1777,6 +1911,7 @@ impl AutomationStore {
                     .get(&rule.name)
                     .map_or((0, None), |(count, at)| (*count, Some(*at)));
                 AutomationRuleView {
+                    ask_condition: rule.ask_condition.clone(),
                     name: rule.name.clone(),
                     on: rule.on,
                     enabled: rule.enabled,
@@ -1925,9 +2060,15 @@ impl AutomationStore {
                 state: subject.state,
                 decision: decision
                     .skip_reason()
-                    .map_or_else(|| "fire".to_string(), |reason| reason.to_string()),
+                    .map_or_else(|| if rule.ask_condition.is_some() { "ask_required" } else { "fire" }.to_string(), |reason| reason.to_string()),
                 fire_at: decision.firing().map(|firing| firing.fire_at),
-                detail: decision.firing().and_then(|firing| firing.text.clone()),
+                detail: decision.firing().and_then(|firing| {
+                    if rule.ask_condition.is_some() {
+                        Some("Deterministic checks passed; Ask was not called. Use Test Ask condition to evaluate without executing.".into())
+                    } else {
+                        firing.text.clone()
+                    }
+                }),
             });
         }
         Ok(AutomationTestReport {
@@ -2043,6 +2184,9 @@ impl AutomationStore {
         let Some(path) = self.config_path.as_ref() else {
             return Ok(());
         };
+        let _guard = crate::config_file::CONFIG_WRITE_LOCK
+            .lock()
+            .map_err(|error| error.to_string())?;
         let mut document = load_document(path)?;
         edit(&mut document)?;
         let text = document.to_string();
@@ -3054,6 +3198,197 @@ waaait = "5m"
         assert_eq!(guards.fired_last_hour, 0);
     }
 
+    #[tokio::test]
+    async fn judgment_long_cooldown_is_not_limited_to_the_hourly_window() {
+        let ledger = AutomationLedger::in_memory();
+        let mut previous = entry(
+            "judge",
+            "%42",
+            NOW - time::Duration::minutes(61),
+            AutomationOutcome::JudgeTest,
+        );
+        previous.episode = None;
+        ledger
+            .reserve_judgment(previous, 6, time::Duration::ZERO)
+            .await
+            .unwrap();
+        let mut next = entry("judge", "%42", NOW, AutomationOutcome::JudgeTest);
+        next.episode = None;
+        assert!(ledger
+            .reserve_judgment(next, 6, time::Duration::hours(2))
+            .await
+            .unwrap_err()
+            .contains("cooldown"));
+    }
+
+    #[tokio::test]
+    async fn judgment_corrupt_recovery_fails_closed_and_preserves_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("judgments.json");
+        std::fs::write(&path, "not JSON").unwrap();
+        let ledger = AutomationLedger::load(Some(path.clone()));
+        assert!(ledger
+            .reserve_judgment(
+                entry("judge", "%42", NOW, AutomationOutcome::Judging),
+                6,
+                time::Duration::ZERO
+            )
+            .await
+            .is_err());
+        ledger
+            .append(entry("other", "%43", NOW, AutomationOutcome::Skipped))
+            .await;
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "not JSON");
+    }
+
+    #[test]
+    fn judgment_concurrency_slots_are_shared_and_released() {
+        let store = AutomationStore::in_memory(AutomationConfig::default());
+        let first = store.try_judgment_slot().unwrap();
+        let second = store.try_judgment_slot().unwrap();
+        assert!(store.try_judgment_slot().is_err());
+        drop(first);
+        assert!(store.try_judgment_slot().is_ok());
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn judgment_test_budget_survives_draft_renames() {
+        let ledger = AutomationLedger::in_memory();
+        let mut first = entry("first-draft", "%42", NOW, AutomationOutcome::JudgeTest);
+        first.episode = None;
+        ledger
+            .reserve_judgment(first, 1, time::Duration::ZERO)
+            .await
+            .unwrap();
+        let mut renamed = entry("renamed", "%42", NOW, AutomationOutcome::JudgeTest);
+        renamed.episode = None;
+        assert!(ledger
+            .reserve_judgment(renamed, 1, time::Duration::ZERO)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn judgment_reservations_survive_restart_and_consume_the_episode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("judgments.json");
+        let ledger = AutomationLedger::load(Some(path.clone()));
+        let attempt = entry("judge", "%42", NOW, AutomationOutcome::Judging);
+        ledger
+            .reserve_judgment(attempt.clone(), 6, time::Duration::ZERO)
+            .await
+            .unwrap();
+        let restored = AutomationLedger::load(Some(path));
+        assert!(
+            restored
+                .guard_state("judge", "%42", "Error@ep", NOW)
+                .await
+                .episode_handled
+        );
+        assert!(restored
+            .reserve_judgment(attempt, 6, time::Duration::ZERO)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn judgment_tests_share_budget_but_do_not_consume_episodes() {
+        let ledger = AutomationLedger::in_memory();
+        let mut attempt = entry("judge", "%42", NOW, AutomationOutcome::JudgeTest);
+        attempt.episode = None;
+        ledger
+            .reserve_judgment(attempt.clone(), 1, time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            !ledger
+                .guard_state("judge", "%42", "Error@ep", NOW)
+                .await
+                .episode_handled
+        );
+        assert!(ledger
+            .reserve_judgment(attempt, 1, time::Duration::ZERO)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn judgment_reservation_enforces_global_limit_and_cooldown() {
+        let ledger = AutomationLedger::in_memory();
+        for index in 0..30 {
+            let attempt = entry(
+                &format!("rule-{index}"),
+                "%42",
+                NOW,
+                AutomationOutcome::Judging,
+            );
+            ledger
+                .reserve_judgment(attempt, 30, time::Duration::ZERO)
+                .await
+                .unwrap();
+        }
+        assert!(ledger
+            .reserve_judgment(
+                entry("extra", "%43", NOW, AutomationOutcome::Judging),
+                30,
+                time::Duration::ZERO
+            )
+            .await
+            .is_err());
+        let ledger = AutomationLedger::in_memory();
+        let mut attempt = entry("judge", "%42", NOW, AutomationOutcome::JudgeTest);
+        attempt.episode = None;
+        ledger
+            .reserve_judgment(attempt.clone(), 6, time::Duration::seconds(10))
+            .await
+            .unwrap();
+        assert!(ledger
+            .reserve_judgment(attempt, 6, time::Duration::seconds(10))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn judgment_reservation_refuses_when_durable_write_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("not-a-directory");
+        std::fs::write(&path, "file").unwrap();
+        let ledger = AutomationLedger::load(Some(path.join("judgments.json")));
+        assert!(ledger
+            .reserve_judgment(
+                entry("judge", "%42", NOW, AutomationOutcome::Judging),
+                6,
+                time::Duration::ZERO
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn judgment_budget_survives_unrelated_skip_log_churn() {
+        let ledger = AutomationLedger::in_memory();
+        let now = OffsetDateTime::now_utc();
+        let attempt = entry("judge", "%42", now, AutomationOutcome::Judging);
+        ledger
+            .reserve_judgment(attempt, 1, time::Duration::ZERO)
+            .await
+            .unwrap();
+        for _ in 0..MAX_LEDGER_ENTRIES + 10 {
+            ledger
+                .append(entry("other", "%99", now, AutomationOutcome::Skipped))
+                .await;
+        }
+        assert!(ledger
+            .reserve_judgment(
+                entry("judge", "%42", now, AutomationOutcome::JudgeTest),
+                1,
+                time::Duration::ZERO
+            )
+            .await
+            .is_err());
+    }
+
     // --- store -------------------------------------------------------------
 
     fn store_with_rule() -> (tempfile::TempDir, Arc<AutomationStore>) {
@@ -3211,6 +3546,7 @@ waaait = "5m"
     #[test]
     fn views_and_reports_serialize_flat() {
         let view = AutomationRuleView {
+            ask_condition: None,
             name: "resume-after-limit".into(),
             on: AutomationEvent::RateLimited,
             enabled: true,

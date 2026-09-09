@@ -14,6 +14,233 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
+pub(crate) static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchProvider {
+    pub program: String,
+    pub options: Option<Vec<String>>,
+    pub effective_options: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchPipelineAgent {
+    pub pipeline: String,
+    pub index: usize,
+    pub name: String,
+    pub program: String,
+    pub options: Option<Vec<String>>,
+    pub effective_options: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchLegacyGuide {
+    pub program: Option<String>,
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchSettings {
+    pub providers: Vec<LaunchProvider>,
+    pub pipelines: Vec<LaunchPipelineAgent>,
+    pub legacy_guide: LaunchLegacyGuide,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchDocument {
+    pub config: ConfigDocument,
+    pub launch: LaunchSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LaunchEdit {
+    Provider {
+        program: String,
+        #[serde(deserialize_with = "deserialize_launch_options")]
+        options: Option<Vec<String>>,
+    },
+    Pipeline {
+        pipeline: String,
+        index: usize,
+        #[serde(deserialize_with = "deserialize_launch_options")]
+        options: Option<Vec<String>>,
+    },
+}
+
+fn deserialize_launch_options<'de, Decoder: serde::Deserializer<'de>>(
+    decoder: Decoder,
+) -> Result<Option<Vec<String>>, Decoder::Error> {
+    Option::<Vec<String>>::deserialize(decoder)
+}
+
+fn launch_settings(text: &str) -> Result<LaunchSettings, ConfigFileError> {
+    let config: Config =
+        toml::from_str(text).map_err(|error| ConfigFileError::Invalid(error.to_string()))?;
+    config
+        .validate()
+        .map_err(|error| ConfigFileError::Invalid(error.to_string()))?;
+    let raw: toml::Value =
+        toml::from_str(text).map_err(|error| ConfigFileError::Invalid(error.to_string()))?;
+    let providers = ["claude", "codex", "gemini", "opencode", "agy"]
+        .into_iter()
+        .map(|program| LaunchProvider {
+            program: program.to_owned(),
+            options: config.agent.get(program).map(|entry| entry.options.clone()),
+            effective_options: config.launch_options(program, None),
+        })
+        .collect();
+    let mut pipelines = Vec::new();
+    for (pipeline, entry) in &config.pipeline {
+        for (index, agent) in entry.agent.iter().enumerate() {
+            let options = raw
+                .get("pipeline")
+                .and_then(|value| value.get(pipeline))
+                .and_then(|value| value.get("agent"))
+                .and_then(|value| value.get(index))
+                .and_then(|value| value.get("options"))
+                .map(|value| value.clone().try_into::<Vec<String>>())
+                .transpose()
+                .map_err(|error| ConfigFileError::Invalid(error.to_string()))?;
+            pipelines.push(LaunchPipelineAgent {
+                pipeline: pipeline.clone(),
+                index,
+                name: agent.alias.clone(),
+                program: agent.program.clone(),
+                effective_options: config.launch_options(&agent.program, options.as_deref()),
+                options,
+            });
+        }
+    }
+    Ok(LaunchSettings {
+        providers,
+        pipelines,
+        legacy_guide: LaunchLegacyGuide {
+            program: config.mcp.guide.agent,
+            options: config.mcp.guide.options,
+        },
+    })
+}
+
+pub fn read_launch(path: &Path) -> Result<LaunchDocument, ConfigFileError> {
+    let config = read(path)?;
+    let launch = launch_settings(&config.text)?;
+    Ok(LaunchDocument { config, launch })
+}
+
+pub fn write_launch(
+    path: &Path,
+    expected_text: &str,
+    edits: &[LaunchEdit],
+) -> Result<LaunchDocument, ConfigFileError> {
+    let _guard = CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|error| ConfigFileError::Io(error.to_string()))?;
+    let current = read(path)?;
+    if current.text != expected_text {
+        return Err(ConfigFileError::Conflict {
+            current: current.text,
+        });
+    }
+    let mut document = current
+        .text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| ConfigFileError::Invalid(error.to_string()))?;
+    for edit in edits {
+        let options = match edit {
+            LaunchEdit::Provider { options, .. } | LaunchEdit::Pipeline { options, .. } => options,
+        };
+        if options
+            .as_ref()
+            .is_some_and(|options| options.iter().any(|option| option.contains('\0')))
+        {
+            return Err(ConfigFileError::Invalid(
+                "launch options must not contain a NUL byte".into(),
+            ));
+        }
+        match edit {
+            LaunchEdit::Provider { program, options } => {
+                if !["claude", "codex", "gemini", "opencode", "agy"].contains(&program.as_str()) {
+                    return Err(ConfigFileError::Invalid(format!(
+                        "unknown provider {program:?}"
+                    )));
+                }
+                if document.get("agent").is_none() && options.is_none() {
+                    continue;
+                }
+                let agents = launch_table(document.as_table_mut(), "agent")?;
+                if options.is_none() {
+                    agents.remove(program);
+                } else {
+                    let provider = launch_table(agents, program)?;
+                    set_launch_options(provider, options.as_deref());
+                }
+            }
+            LaunchEdit::Pipeline {
+                pipeline,
+                index,
+                options,
+            } => {
+                let agents = document
+                    .get_mut("pipeline")
+                    .and_then(|item| item.get_mut(pipeline))
+                    .and_then(|item| item.get_mut("agent"))
+                    .ok_or_else(|| {
+                        ConfigFileError::Invalid(format!("pipeline {pipeline:?} no longer exists"))
+                    })?;
+                let table: Option<&mut dyn toml_edit::TableLike> = match agents {
+                    toml_edit::Item::ArrayOfTables(tables) => tables
+                        .get_mut(*index)
+                        .map(|table| table as &mut dyn toml_edit::TableLike),
+                    toml_edit::Item::Value(toml_edit::Value::Array(array)) => array
+                        .get_mut(*index)
+                        .and_then(toml_edit::Value::as_inline_table_mut)
+                        .map(|table| table as &mut dyn toml_edit::TableLike),
+                    _ => None,
+                };
+                let table = table.ok_or_else(|| {
+                    ConfigFileError::Invalid(format!(
+                        "pipeline {pipeline:?} agent {index} no longer exists"
+                    ))
+                })?;
+                set_launch_options(table, options.as_deref());
+            }
+        }
+    }
+    let text = document.to_string();
+    let launch = launch_settings(&text)?;
+    let config = write_unlocked(path, &text, Some(expected_text))?;
+    Ok(LaunchDocument { config, launch })
+}
+
+fn launch_table<'table>(
+    parent: &'table mut dyn toml_edit::TableLike,
+    key: &str,
+) -> Result<&'table mut dyn toml_edit::TableLike, ConfigFileError> {
+    if !parent.contains_key(key) {
+        let mut table = toml_edit::Table::new();
+        table.set_implicit(true);
+        parent.insert(key, toml_edit::Item::Table(table));
+    }
+    parent
+        .get_mut(key)
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or_else(|| ConfigFileError::Invalid(format!("{key:?} is not a table")))
+}
+
+fn set_launch_options(table: &mut dyn toml_edit::TableLike, options: Option<&[String]>) {
+    if let Some(options) = options {
+        let array: toml_edit::Array = options.iter().map(String::as_str).collect();
+        let mut value = toml_edit::Value::Array(array);
+        if let Some(old) = table.get("options").and_then(toml_edit::Item::as_value) {
+            *value.decor_mut() = old.decor().clone();
+        }
+        table.insert("options", toml_edit::Item::Value(value));
+    } else {
+        table.remove("options");
+    }
+}
+
 /// The configuration file as a client sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigDocument {
@@ -81,6 +308,17 @@ pub fn read(path: &Path) -> Result<ConfigDocument, ConfigFileError> {
 /// parses as a [`Config`] and passes [`Config::validate`], so a daemon
 /// restart can never find a file it cannot load.
 pub fn write(
+    path: &Path,
+    text: &str,
+    expected: Option<&str>,
+) -> Result<ConfigDocument, ConfigFileError> {
+    let _guard = CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|error| ConfigFileError::Io(error.to_string()))?;
+    write_unlocked(path, text, expected)
+}
+
+fn write_unlocked(
     path: &Path,
     text: &str,
     expected: Option<&str>,
@@ -161,6 +399,262 @@ fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_reads_presence_and_replacement_precedence() {
+        let settings = launch_settings(
+            r#"
+[mcp.guide]
+agent = "codex"
+options = ["--model", "legacy"]
+[agent.claude]
+options = []
+[[pipeline."with.dot".agent]]
+alias = "inherits"
+program = "codex"
+[[pipeline."with.dot".agent]]
+alias = "empty"
+program = "codex"
+options = []
+[[pipeline."with.dot".agent]]
+alias = "overrides"
+program = "codex"
+options = ["--model", "other"]
+"#,
+        )
+        .unwrap();
+        let codex = settings
+            .providers
+            .iter()
+            .find(|entry| entry.program == "codex")
+            .unwrap();
+        assert_eq!(codex.options, None);
+        assert_eq!(codex.effective_options, ["--model", "legacy"]);
+        assert_eq!(settings.pipelines[0].options, None);
+        assert_eq!(
+            settings.pipelines[0].effective_options,
+            ["--model", "legacy"]
+        );
+        assert_eq!(settings.pipelines[1].options, Some(vec![]));
+        assert!(settings.pipelines[1].effective_options.is_empty());
+        assert_eq!(
+            settings.pipelines[2].effective_options,
+            ["--model", "other"]
+        );
+    }
+
+    #[test]
+    fn launch_wire_requires_explicit_options_and_rejects_unknown_fields() {
+        assert!(
+            serde_json::from_str::<LaunchEdit>(r#"{"target":"provider","program":"codex"}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<LaunchEdit>(
+            r#"{"target":"provider","program":"codex","options":null,"typo":true}"#
+        )
+        .is_err());
+        let inherited: LaunchEdit =
+            serde_json::from_str(r#"{"target":"provider","program":"codex","options":null}"#)
+                .unwrap();
+        assert_eq!(
+            inherited,
+            LaunchEdit::Provider {
+                program: "codex".into(),
+                options: None
+            }
+        );
+        let empty: LaunchEdit = serde_json::from_str(
+            r#"{"target":"pipeline","pipeline":"demo","index":0,"options":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            empty,
+            LaunchEdit::Pipeline {
+                pipeline: "demo".into(),
+                index: 0,
+                options: Some(vec![])
+            }
+        );
+    }
+
+    #[test]
+    fn launch_patch_preserves_legacy_comments_and_literal_arguments() {
+        let dir = temp_dir("launch-patch");
+        let path = dir.join("config.toml");
+        let source = "# keep header\n[mcp.guide]\nagent = 'codex'\noptions = ['legacy'] # keep legacy\n\n[[pipeline.'with.dot'.agent]]\nalias = 'review'\nprogram = 'codex'\nprompt = '''\noptions = ['not an option']\n'''\noptions = [\n  'old',\n] # keep suffix\n";
+        std::fs::write(&path, source).unwrap();
+        let arguments = vec![
+            "--model".into(),
+            "a b\"c\\d\n한글".into(),
+            String::new(),
+            "#[]".into(),
+        ];
+        let saved = write_launch(
+            &path,
+            source,
+            &[
+                LaunchEdit::Provider {
+                    program: "codex".into(),
+                    options: Some(vec![]),
+                },
+                LaunchEdit::Pipeline {
+                    pipeline: "with.dot".into(),
+                    index: 0,
+                    options: Some(arguments.clone()),
+                },
+            ],
+        )
+        .unwrap();
+        assert!(saved.config.text.contains("# keep header"));
+        assert!(saved
+            .config
+            .text
+            .contains("options = ['legacy'] # keep legacy"));
+        assert!(saved.config.text.contains("# keep suffix"));
+        assert!(saved.config.text.contains("options = ['not an option']"));
+        assert_eq!(saved.launch.pipelines[0].options, Some(arguments));
+        let inherited = write_launch(
+            &path,
+            &saved.config.text,
+            &[
+                LaunchEdit::Provider {
+                    program: "codex".into(),
+                    options: None,
+                },
+                LaunchEdit::Pipeline {
+                    pipeline: "with.dot".into(),
+                    index: 0,
+                    options: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(inherited.launch.pipelines[0].options, None);
+        assert_eq!(inherited.launch.pipelines[0].effective_options, ["legacy"]);
+        assert_eq!(inherited.launch.legacy_guide.options, ["legacy"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn launch_patch_handles_inline_and_dotted_tables() {
+        for source in [
+            "agent = { codex = { options = ['old'] } }\npipeline = { demo = { agent = [{alias='review',program='codex'}] } }\n",
+            "agent.codex.options = ['old']\npipeline.demo.agent = [{alias='review',program='codex'}]\n",
+        ] {
+            let dir = temp_dir("launch-inline");
+            let path = dir.join("config.toml");
+            std::fs::write(&path, source).unwrap();
+            let saved = write_launch(
+                &path,
+                source,
+                &[
+                    LaunchEdit::Provider {
+                        program: "codex".into(),
+                        options: Some(vec!["new".into()]),
+                    },
+                    LaunchEdit::Pipeline {
+                        pipeline: "demo".into(),
+                        index: 0,
+                        options: Some(vec![]),
+                    },
+                ],
+            )
+            .unwrap();
+            assert_eq!(saved.launch.pipelines[0].options, Some(vec![]));
+            assert_eq!(
+                saved
+                    .launch
+                    .providers
+                    .iter()
+                    .find(|entry| entry.program == "codex")
+                    .unwrap()
+                    .options,
+                Some(vec!["new".into()])
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn launch_invalid_batch_and_stale_indices_never_write() {
+        let dir = temp_dir("launch-refuse");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "# original\n").unwrap();
+        for edit in [
+            LaunchEdit::Provider {
+                program: "unknown".into(),
+                options: Some(vec![]),
+            },
+            LaunchEdit::Provider {
+                program: "codex".into(),
+                options: Some(vec!["\0".into()]),
+            },
+            LaunchEdit::Pipeline {
+                pipeline: "missing".into(),
+                index: 0,
+                options: None,
+            },
+        ] {
+            assert!(matches!(
+                write_launch(
+                    &path,
+                    "# original\n",
+                    &[
+                        LaunchEdit::Provider {
+                            program: "claude".into(),
+                            options: Some(vec![])
+                        },
+                        edit,
+                    ]
+                ),
+                Err(ConfigFileError::Invalid(_))
+            ));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "# original\n");
+        }
+        assert!(matches!(
+            write_launch(&path, "", &[]),
+            Err(ConfigFileError::Conflict { .. })
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn launch_concurrent_writers_have_only_one_winner() {
+        let dir = temp_dir("launch-race");
+        let path = dir.join("config.toml");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = ["codex", "claude"]
+            .into_iter()
+            .map(|program| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_launch(
+                        &path,
+                        "",
+                        &[LaunchEdit::Provider {
+                            program: program.into(),
+                            options: Some(vec![]),
+                        }],
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(ConfigFileError::Conflict { .. })))
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A directory of this test's own. Tests run on threads of one process,
     /// so a clock-based name can collide and one test's cleanup then deletes
