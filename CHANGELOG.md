@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.46] - 2026-09-09
+
+### Added
+
+- Native rmux discovery, namespaced pane identities, endpoint-aware capture
+  and input, and watch navigation. rmux's tmux compatibility environment no
+  longer makes its panes appear twice or routes commands to native tmux.
+
+### Fixed
+
+- Multiple terminals can view different windows of one rmux workspace.
+  Muxa creates private grouped views before selecting a window, reuses the
+  invoking client's view on subsequent jumps, and cleans temporary views up.
+  Bare-terminal attaches also avoid changing another terminal's selection.
+- Auto-view hooks use the event's `hook_client` identity, which rmux provides
+  even when `client_name` is empty. Group creation uses the resolved session
+  name because rmux 0.10 interprets a `$N` target as a new group name.
+- Window, session, and pane-title renames now use the selected backend and
+  endpoint. Grouped window ids are qualified with a session so rmux does not
+  reject them as ambiguous; CLI buffer-based window naming works as well.
+- Watch window creation, pane splitting, prompt submission, interrupt, close,
+  and window previews now support rmux. New windows are created detached
+  until the invoking client can select them independently.
+- Workspace/work and agent launches, pipeline input and layout changes,
+  `muxa peek`, and config reloads use the native rmux endpoint inside rmux.
+  Popup callers retain their rmux pane identity and initial selection.
+- rmux pane enumeration reads the socket after the complete metadata format,
+  preserving workspace marks and session groups instead of mistaking a
+  workspace id for a socket path.
+
+### Validation
+
+- Added a disposable rmux server regression with two PTY clients, grouped
+  view reuse and cleanup, rename, lifecycle controls, input and capture,
+  CLI buffer naming, peek, and the actual auto-view hook.
+- Isolated native tmux integration tests from inherited rmux environments
+  and compatibility shims.
+
 ## [0.8.45] - 2026-09-08
 
 ### Added
