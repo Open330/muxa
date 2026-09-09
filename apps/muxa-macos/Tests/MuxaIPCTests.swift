@@ -3,6 +3,155 @@ import Darwin
 import Testing
 @testable import Muxa
 
+@Test func automationAskConditionDefaultsAndRoundTrips() throws {
+    let data = Data(#"{"name":"judge","on":"error","action":"interrupt","ask_condition":{"prompt":"  Is the task done?\nQuote: \"yes\"  ","provider":"team-openai"}}"#.utf8)
+    let rule = try JSONDecoder().decode(MuxaAutomationRule.self, from: data)
+    let condition = try #require(rule.askCondition)
+    #expect(condition.observeOnly)
+    #expect(condition.timeoutSecs == 30)
+    #expect(condition.maxPerHour == 6)
+    #expect(MuxaAutomationAskCondition().provider == "openai")
+    let encoded = try JSONEncoder().encode(condition)
+    #expect(try JSONDecoder().decode(MuxaAutomationAskCondition.self, from: encoded) == condition)
+    let draft = MuxaAutomationRuleDraft.draft(editing: rule)
+    #expect(draft.askCondition == condition)
+    #expect(draft.rule.askCondition == condition)
+    let wire = try JSONSerialization.data(withJSONObject: draft.rule.wireObject)
+    #expect(try JSONDecoder().decode(MuxaAutomationRule.self, from: wire).askCondition == condition)
+    #expect(rule.tomlSnippet.contains("[automation.rule.ask_condition]\n"))
+    #expect(rule.tomlSnippet.contains("prompt = \(MuxaAutomationRule.tomlString(condition.prompt))"))
+    #expect(rule.tomlSnippet.contains("provider = \"team-openai\""))
+    #expect(rule.tomlSnippet.contains("observe_only = true\ntimeout_secs = 30\nmax_per_hour = 6"))
+    #expect(MuxaAutomationRule.tomlString("\u{00}\u{1B}\u{7F}") == "\"\\u0000\\u001B\\u007F\"")
+    #expect(MuxaAutomationRule.sessionLimitRecommendation.wireObject["ask_condition"] == nil)
+    #expect(!MuxaAutomationRule.sessionLimitRecommendation.tomlSnippet.contains("ask_condition"))
+}
+
+@Test func automationAskValidationAndFixedActionStayIndependent() throws {
+    var draft = MuxaAutomationRuleDraft.sessionLimitDraft
+    draft.askCondition = MuxaAutomationAskCondition(prompt: "Finished?", observeOnly: false, timeoutSecs: 120, maxPerHour: 30)
+    #expect(draft.issues(existingNames: []).isEmpty)
+    let condition = try #require(draft.askCondition)
+    for action in MuxaAutomationAction.pickable {
+        draft.action = action
+        #expect(draft.rule.askCondition == condition)
+    }
+    draft.action = .interrupt
+    for timeout: UInt64 in [0, 4, 121, UInt64.max] {
+        draft.askCondition?.timeoutSecs = timeout
+        #expect(!draft.isReady(existingNames: []))
+    }
+    draft.askCondition?.timeoutSecs = 5
+    for limit: UInt32 in [0, 31, UInt32.max] {
+        draft.askCondition?.maxPerHour = limit
+        #expect(!draft.isReady(existingNames: []))
+    }
+    draft.askCondition?.maxPerHour = 1
+    #expect(draft.isReady(existingNames: []))
+    draft.askCondition?.prompt = " \n"
+    #expect(!draft.isReady(existingNames: []))
+    draft.askCondition?.prompt = "Finished?"
+    draft.askCondition?.provider = " \n"
+    #expect(!draft.isReady(existingNames: []))
+    draft.askCondition = nil
+    #expect(draft.isReady(existingNames: []))
+}
+
+@Test func automationAskPaidTestWireAndDecisions() async throws {
+    var rule = MuxaAutomationRule.sessionLimitRecommendation
+    rule.askCondition = MuxaAutomationAskCondition(prompt: "Can this resume?", observeOnly: false)
+    let request = MuxaAutomationClient.judgeTestRequest(rule: rule, pane: "tmux:%1")
+    #expect(request["kind"] as? String == "automation_judge_test")
+    #expect(request["pane"] as? String == "tmux:%1")
+    let sentRule = try #require(request["rule"] as? [String: Any])
+    #expect(sentRule["text"] as? String == "continue")
+    #expect(sentRule["ask_condition"] != nil)
+    #expect(MuxaAutomationClient.judgmentRequestTimeout >= 130)
+    #expect(MuxaAutomationClient.testRequest(name: rule.name)["kind"] as? String == "automation_test")
+    for decision in ["match", "no_match", "unknown"] {
+        let client = MuxaAutomationClient(socketPath: "/tmp/automation-ask-test.sock") { _, payload in
+            let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+            #expect(object["kind"] as? String == "automation_judge_test")
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true, "automation_judgment": [
+                    "decision": decision, "reason": "Observed current screen", "evidence": ["Ready"],
+                    "provider": "openai", "context_hash": "abc123",
+                ],
+            ])
+        }
+        let result = try await client.judgeTest(rule: rule, pane: "tmux:%1")
+        #expect(result.decision.rawValue == decision)
+        #expect(result.reason == "Observed current screen")
+        #expect(result.evidence == ["Ready"])
+        #expect(result.model == nil)
+        #expect(result.contextHash == "abc123")
+    }
+}
+
+@Test func automationAskTestFailsClosed() async throws {
+    var rule = MuxaAutomationRule.sessionLimitRecommendation
+    rule.askCondition = MuxaAutomationAskCondition(prompt: "Finished?")
+    for response in [#"{"ok":true}"#, #"{"ok":false,"error":"provider unavailable"}"#] {
+        let client = MuxaAutomationClient(socketPath: "/tmp/automation-ask-refused.sock") { _, _ in Data(response.utf8) }
+        await #expect(throws: (any Error).self) { _ = try await client.judgeTest(rule: rule, pane: "tmux:%1") }
+    }
+    let client = MuxaAutomationClient(socketPath: "/tmp/automation-ask-invalid.sock") { _, _ in
+        Issue.record("Invalid judgments must not spend an API turn")
+        return Data()
+    }
+    await #expect(throws: (any Error).self) { _ = try await client.judgeTest(rule: rule, pane: " ") }
+    rule.askCondition = nil
+    await #expect(throws: (any Error).self) { _ = try await client.judgeTest(rule: rule, pane: "tmux:%1") }
+}
+
+@Test func automationAskCapabilityPreventsConditionLoss() async throws {
+    let client = MuxaIPCClient(socketPath: "/tmp/automation-without-ask.sock") { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        #expect(object["kind"] as? String == "hello")
+        return try settingsPaneHello(capabilities: ["automation_v1"])
+    }
+    try await client.hello()
+    var rule = MuxaAutomationRule.sessionLimitRecommendation
+    rule.askCondition = MuxaAutomationAskCondition(prompt: "Finished?")
+    await #expect(throws: (any Error).self) { _ = try await client.automationSetRule(rule) }
+    await #expect(throws: (any Error).self) { _ = try await client.automationJudgeTest(rule: rule, pane: "tmux:%1") }
+}
+
+@Test func automationAskLedgerAndFreeTestLabels() throws {
+    #expect(automationOutcomeTitle(.other("judging")) == "Judging condition")
+    #expect(automationOutcomeTitle(.other("judged")) == "Condition judged")
+    #expect(automationOutcomeTitle(.other("judge_test")) == "Ask condition test")
+    #expect(automationOutcomeTitle(.other("future_outcome")) == "future_outcome")
+    #expect(automationDecisionTitle("ask_required").contains("not run by this free test"))
+    let candidate = try JSONDecoder().decode(MuxaAutomationTestCandidate.self, from: Data(#"{"decision":"ask_required"}"#.utf8))
+    #expect(!candidate.wouldFire)
+}
+
+@Test func automationAskRejectsCLIAndUnknownProvidersBeforeSending() async throws {
+    let client = MuxaIPCClient(socketPath: "/tmp/automation-api-only.sock") { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        switch object["kind"] as? String {
+        case "hello":
+            return try settingsPaneHello(capabilities: ["automation_v1", "automation_ask_v1", "ask_providers_v1"])
+        case "ask_providers":
+            return try JSONSerialization.data(withJSONObject: ["ok": true, "ask_providers": [
+                ["id": "team-claude", "kind": "cli", "engine": "claude"],
+                ["id": "team-openai", "kind": "api", "engine": "openai"],
+            ]])
+        default:
+            Issue.record("Unsupported providers must not send save or paid judgment requests")
+            return Data()
+        }
+    }
+    try await client.hello()
+    for provider in ["team-claude", "missing", "codex"] {
+        var rule = MuxaAutomationRule.sessionLimitRecommendation
+        rule.askCondition = MuxaAutomationAskCondition(prompt: "Finished?", provider: provider)
+        await #expect(throws: (any Error).self) { _ = try await client.automationSetRule(rule) }
+        await #expect(throws: (any Error).self) { _ = try await client.automationJudgeTest(rule: rule, pane: "tmux:%1") }
+    }
+}
+
 @Test func readableMarkdownKeepsConversationStructure() {
     let document = ReadableMarkdownDocument(source: """
     # Result

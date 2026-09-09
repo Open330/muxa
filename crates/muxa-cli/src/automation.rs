@@ -427,6 +427,7 @@ mod tests {
 
     fn view() -> AutomationRuleView {
         AutomationRuleView {
+            ask_condition: None,
             name: "resume-after-limit".into(),
             on: AutomationEvent::RateLimited,
             enabled: true,

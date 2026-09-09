@@ -131,6 +131,51 @@ options = ['--model', 'claude-sonnet-5']
 `muxa work up --dry-run` prints the resolved list for every pane, so what it
 shows is what the launch will use.
 
+### Advanced launch options form
+
+In Muxa.app, **Settings → Advanced** has a segmented **Launch options / Raw
+TOML** editor. The form edits provider defaults under `[agent.<program>]`
+and options for **existing** pipeline agent panes. Create or restructure
+pipelines in Raw TOML; the form does not edit the CLI runtime `--option`
+flags or change running agents.
+
+Each provider or pane has three distinct states:
+
+| Form state | Saved configuration | Effect |
+| ---------- | ------------------- | ------ |
+| Inherit (override off) | No `options` key | Use the next applicable default. |
+| Override with empty list | `options = []` | Explicitly suppress inherited extra arguments. |
+| Override with argument rows | `options = ["--model", "preferred-model"]` | Replace the inherited list with these tokens in order. |
+
+One row is **one literal argument**. There is no shell splitting: enter
+`--model` and its value on separate rows, and enter a value containing spaces
+in a single row without adding shell quotes. An empty string row (`[""]`)
+passes one empty argument; it is not the same as an empty list (`[]`).
+An empty list suppresses extra options, not Muxa's built-in provider profile.
+
+Replacement precedence is **explicit CLI options → pipeline pane options →
+provider defaults → legacy `[mcp.guide].options` → no extra options**. Only
+applicable layers participate; the legacy fallback applies only to the
+program named by `[mcp.guide].agent`. An explicit MCP `options` array likewise
+overrides configured defaults. Lists replace, never append, even when empty.
+The form previews effective configured options; a later explicit launch
+override can still replace them.
+
+The form uses optimistic concurrency: a save includes the configuration text
+it was based on, and a changed file causes a conflict rather than an overwrite.
+Reload and review the current file before reapplying launch edits. Form saves
+change only the requested option fields and preserve unrelated TOML, comments,
+and legacy guide settings. Legacy settings remain visible as a fallback and
+can be edited in Raw TOML. Unsaved raw and form edits are kept from overwriting
+each other; reload asks before discarding unsaved changes.
+
+Saved options apply to **new launches**, not existing sessions. Launchers
+that read the file afresh see the new configuration; restart `muxad` for
+daemon-held launch defaults and reconnect/restart MCP processes that loaded
+their defaults at startup. Reloading the editor only refreshes its view of
+the file. The form requires daemon capability `config_launch_v1`; use Raw
+TOML or update the daemon if it is unavailable.
+
 ## Ask
 
 ```toml
@@ -180,6 +225,15 @@ mode (claude `--permission-mode plan`, codex `--sandbox read-only`, gemini
 `--approval-mode plan`); `muxa work compose` always drafts under it.
 
 ### Providers
+
+Automation's optional `[automation.rule.ask_condition]` is a separate,
+strictly tool-free API judgment path: it requires Ask enabled and a configured
+key available to the daemon, accepts only OpenAI/Anthropic API providers, and
+does **not** replay Ask conversation history. Observe-only is the default,
+but judgments still disclose bounded pane context externally and may be
+billed. Its timeout and attempt budget are separate from ordinary Ask turns
+and automation actions. See [Optional Ask condition](AUTOMATION.md#optional-ask-condition)
+for the schema, limits, privacy boundary, and free versus paid tests.
 
 An **engine** is the code that drives a provider: the argv a CLI takes, the
 JSON an API answers with, the environment variable its key lives in. There

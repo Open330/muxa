@@ -17,6 +17,7 @@ use muxa::automation::{
     AutomationRule, AutomationStore, AutomationSubject, Decision, PlannedFiring, Scheduler,
     SkipReason,
 };
+use muxa::automation_judge::{self, AutomationJudgment, JudgmentContext, JudgmentDecision};
 use muxa::collaboration::{
     CollaborationClientKind, CollaborationOptions, CollaborationOriginMatch, CollaborationRequest,
     CollaborationStore, WakeDeliveryState,
@@ -297,6 +298,7 @@ async fn main() -> Result<()> {
     // ownership of `store`.
     let automation_handle = spawn_automation_task(
         automation.clone(),
+        ask.clone(),
         store.clone(),
         backends.clone(),
         &shutdown_tx,
@@ -798,6 +800,7 @@ fn build_automation(cfg: &Config, config_path: Option<PathBuf>) -> Arc<Automatio
 /// engine with nothing to do costs one refcount bump per transition.
 fn spawn_automation_task(
     automation: Arc<AutomationStore>,
+    ask: Arc<AskStore>,
     store: muxa::SharedStore,
     backends: Vec<muxa::SharedBackend>,
     shutdown_tx: &broadcast::Sender<()>,
@@ -809,6 +812,7 @@ fn spawn_automation_task(
     let mut config_changes = automation.subscribe();
     tokio::spawn(async move {
         let mut engine = AutomationEngine::new(automation, store, backends);
+        engine.ask = Some(ask);
         engine.rescan().await;
         let mut reconcile =
             tokio::time::interval(std::time::Duration::from_secs(AUTOMATION_RECONCILE_SECONDS));
@@ -831,12 +835,22 @@ fn spawn_automation_task(
                     if changed.is_err() {
                         break;
                     }
+                    engine.pending.clear();
+                    engine.armed.clear();
+                    engine.queued_rules.clear();
                     // A rule was added, edited, enabled, or paused. Drop
                     // pending firings whose rule no longer exists and
                     // re-evaluate everything against the new set.
                     engine.rescan().await;
                 }
                 () = tokio::time::sleep(idle) => engine.fire_due().await,
+                completed = engine.judgments.join_next(), if !engine.judgments.is_empty() => {
+                    match completed {
+                        Some(Ok(completed)) => engine.finish_judgment(completed).await,
+                        Some(Err(error)) => tracing::warn!(%error, "automation judgment task failed; no action taken"),
+                        None => {}
+                    }
+                }
                 _ = reconcile.tick() => engine.rescan().await,
                 _ = shutdown_rx.recv() => break,
             }
@@ -857,8 +871,20 @@ struct AutomationEngine {
     /// own episode check this is what makes "never twice for one cap
     /// episode" hold both within a daemon run and across a restart.
     armed: HashSet<(String, String, String)>,
+    queued_rules: HashMap<(String, String, String), (AutomationRule, u64)>,
     panes: Vec<muxa::tmux::PaneInfo>,
     panes_read_at: Option<std::time::Instant>,
+    ask: Option<Arc<AskStore>>,
+    judgments: tokio::task::JoinSet<JudgedFiring>,
+}
+
+struct JudgedFiring {
+    firing: PlannedFiring,
+    rule: AutomationRule,
+    subject: AutomationSubject,
+    revision: u64,
+    context: Option<JudgmentContext>,
+    judgment: AutomationJudgment,
 }
 
 impl AutomationEngine {
@@ -873,8 +899,11 @@ impl AutomationEngine {
             backends,
             pending: BinaryHeap::new(),
             armed: HashSet::new(),
+            queued_rules: HashMap::new(),
             panes: Vec::new(),
             panes_read_at: None,
+            ask: None,
+            judgments: tokio::task::JoinSet::new(),
         }
     }
 
@@ -917,6 +946,8 @@ impl AutomationEngine {
             .retain(|firing| live.contains(firing.0.rule.as_str()));
         self.armed
             .retain(|(rule, _, _)| live.contains(rule.as_str()));
+        self.queued_rules
+            .retain(|(rule, _, _), _| live.contains(rule.as_str()));
         if !active || rules.is_empty() {
             return;
         }
@@ -936,9 +967,13 @@ impl AutomationEngine {
         subjects: &[AutomationSubject],
         now: time::OffsetDateTime,
     ) {
+        let revision = *self.automation.subscribe().borrow();
         let config = self.automation.config().await;
         let ledger = self.automation.ledger();
         for rule in rules {
+            if config.rule_named(&rule.name) != Some(rule) {
+                continue;
+            }
             for subject in subjects {
                 let Some(pane) = subject.pane.clone() else {
                     continue;
@@ -964,6 +999,8 @@ impl AutomationEngine {
                             fire_at = %firing.fire_at,
                             "automation armed",
                         );
+                        self.queued_rules
+                            .insert(key.clone(), (rule.clone(), revision));
                         self.armed.insert(key);
                         self.pending.push(std::cmp::Reverse(*firing));
                     }
@@ -1006,6 +1043,14 @@ impl AutomationEngine {
     }
 
     async fn fire(&mut self, firing: &PlannedFiring, now: time::OffsetDateTime) {
+        let key = (
+            firing.rule.clone(),
+            firing.pane.clone(),
+            firing.episode.clone(),
+        );
+        let Some((queued_rule, revision)) = self.queued_rules.remove(&key) else {
+            return;
+        };
         let config = self.automation.config().await;
         let Some(rule) = config.rule_named(&firing.rule).cloned() else {
             // The rule was removed while this firing waited.
@@ -1013,6 +1058,22 @@ impl AutomationEngine {
         };
         let subject = self.live_subject(&rule, &firing.agent_session_id).await;
         let ledger = self.automation.ledger();
+        if queued_rule != rule
+            || revision != *self.automation.subscribe().borrow()
+            || subject
+                .as_ref()
+                .is_some_and(|subject| subject.socket != firing.socket)
+        {
+            ledger
+                .append(ledger_entry(
+                    firing,
+                    now,
+                    AutomationOutcome::Skipped,
+                    Some("Queued rule or pane endpoint changed".into()),
+                ))
+                .await;
+            return;
+        }
         let guards = ledger
             .guard_state(&firing.rule, &firing.pane, &firing.episode, now)
             .await;
@@ -1034,6 +1095,13 @@ impl AutomationEngine {
                     .await;
             }
             Decision::Fire(confirmed) => {
+                if rule.ask_condition.is_some() {
+                    if let Some(subject) = subject {
+                        self.start_judgment(*confirmed, rule, subject, now, revision)
+                            .await;
+                    }
+                    return;
+                }
                 let delivered = self.perform(&confirmed).await;
                 let outcome = if delivered {
                     AutomationOutcome::Fired
@@ -1056,6 +1124,190 @@ impl AutomationEngine {
                     .append(ledger_entry(&confirmed, now, outcome, detail))
                     .await;
             }
+        }
+    }
+
+    async fn start_judgment(
+        &mut self,
+        firing: PlannedFiring,
+        rule: AutomationRule,
+        subject: AutomationSubject,
+        now: time::OffsetDateTime,
+        revision: u64,
+    ) {
+        let slot = self.automation.try_judgment_slot();
+        if self.judgments.len() >= 2 || slot.is_err() {
+            let mut deferred = firing;
+            deferred.fire_at = now + time::Duration::seconds(1);
+            self.queued_rules.insert(
+                (
+                    deferred.rule.clone(),
+                    deferred.pane.clone(),
+                    deferred.episode.clone(),
+                ),
+                (rule, revision),
+            );
+            self.armed.insert((
+                deferred.rule.clone(),
+                deferred.pane.clone(),
+                deferred.episode.clone(),
+            ));
+            self.pending.push(std::cmp::Reverse(deferred));
+            return;
+        }
+        let permit = slot.expect("judgment slot checked");
+        if revision != *self.automation.subscribe().borrow() {
+            return;
+        }
+        let condition = rule
+            .ask_condition
+            .as_ref()
+            .expect("Ask condition checked")
+            .clone();
+        let ledger = self.automation.ledger();
+        let reservation = ledger_entry(
+            &firing,
+            now,
+            AutomationOutcome::Judging,
+            Some(format!(
+                "Ask provider {}: judgment reserved",
+                condition.provider
+            )),
+        );
+        if let Err(reason) = ledger
+            .reserve_judgment(reservation, condition.max_per_hour, rule.cooldown())
+            .await
+        {
+            ledger
+                .append(ledger_entry(
+                    &firing,
+                    now,
+                    AutomationOutcome::Skipped,
+                    Some(reason),
+                ))
+                .await;
+            return;
+        }
+        let ask = self.ask.clone();
+        let backends = self.backends.clone();
+        self.judgments.spawn(async move {
+            let _permit = permit;
+            let context = automation_judge::capture_context(&subject, &backends).await;
+            let judgment = match (&ask, &context) {
+                (Some(ask), Ok(context)) => {
+                    automation_judge::evaluate(ask, &condition, context).await
+                }
+                (_, Err(_)) => {
+                    AutomationJudgment::unknown(&condition, "Current pane context is unavailable")
+                }
+                (None, _) => AutomationJudgment::unknown(&condition, "Ask is unavailable"),
+            };
+            JudgedFiring {
+                firing,
+                rule,
+                subject,
+                revision,
+                context: context.ok(),
+                judgment,
+            }
+        });
+    }
+
+    async fn finish_judgment(&mut self, completed: JudgedFiring) {
+        let condition = completed
+            .rule
+            .ask_condition
+            .as_ref()
+            .expect("judged rule has a condition");
+        let mut execution = "not_matched".to_string();
+        let mut outcome = AutomationOutcome::Judged;
+        if condition.observe_only {
+            execution = "observe_only".into();
+        } else if completed.judgment.decision == JudgmentDecision::Match {
+            match self.confirm_judgment(&completed).await {
+                Ok(()) => {
+                    if self.perform(&completed.firing).await {
+                        execution = "fired".into();
+                        outcome = AutomationOutcome::Fired;
+                    } else {
+                        execution = "action_failed".into();
+                        outcome = AutomationOutcome::Failed;
+                    }
+                }
+                Err(reason) => execution = reason,
+            }
+        }
+        let detail = serde_json::json!({
+            "judgment": completed.judgment,
+            "condition": condition.prompt,
+            "observe_only": condition.observe_only,
+            "execution": execution,
+        })
+        .to_string();
+        self.automation
+            .ledger()
+            .append(ledger_entry(
+                &completed.firing,
+                time::OffsetDateTime::now_utc(),
+                outcome,
+                Some(detail),
+            ))
+            .await;
+    }
+
+    async fn confirm_judgment(&mut self, completed: &JudgedFiring) -> Result<(), String> {
+        if *self.automation.subscribe().borrow() != completed.revision {
+            return Err("configuration_changed".into());
+        }
+        self.panes_read_at = None;
+        let subject = self
+            .live_subject(&completed.rule, &completed.firing.agent_session_id)
+            .await
+            .ok_or("pane_gone")?;
+        if subject != completed.subject {
+            return Err("agent_state_changed".into());
+        }
+        let fresh = automation_judge::capture_context(&subject, &self.backends)
+            .await
+            .map_err(|_| "context_unavailable")?;
+        if completed.context.as_ref() != Some(&fresh) {
+            return Err("context_changed".into());
+        }
+        let config = self.automation.config().await;
+        let Some(rule) = config.rule_named(&completed.firing.rule) else {
+            return Err("rule_removed".into());
+        };
+        if rule != &completed.rule || *self.automation.subscribe().borrow() != completed.revision {
+            return Err("configuration_changed".into());
+        }
+        let now = time::OffsetDateTime::now_utc();
+        let latest = self
+            .live_subject(rule, &completed.firing.agent_session_id)
+            .await;
+        if latest.as_ref() != Some(&completed.subject) {
+            return Err("agent_state_changed".into());
+        }
+        let mut guards = self
+            .automation
+            .ledger()
+            .guard_state(
+                &completed.firing.rule,
+                &completed.firing.pane,
+                &completed.firing.episode,
+                now,
+            )
+            .await;
+        guards.episode_handled = false;
+        match Scheduler::confirm(
+            &config,
+            rule,
+            &completed.firing,
+            latest.as_ref(),
+            guards,
+            now,
+        ) {
+            Decision::Fire(_) => Ok(()),
+            Decision::Skip(reason) => Err(reason.to_string()),
         }
     }
 
@@ -1137,14 +1389,17 @@ impl AutomationEngine {
             return;
         }
         let backends = self.backends.clone();
-        self.panes = tokio::task::spawn_blocking(move || {
+        let scan = tokio::task::spawn_blocking(move || {
             backends
                 .iter()
                 .flat_map(|backend| backend.list_panes())
                 .collect::<Vec<_>>()
-        })
-        .await
-        .unwrap_or_default();
+        });
+        self.panes = tokio::time::timeout(std::time::Duration::from_secs(3), scan)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
         self.panes_read_at = Some(std::time::Instant::now());
     }
 }
@@ -3970,6 +4225,176 @@ mod tests {
             sends: sends.clone(),
         });
         (vec![backend], sends)
+    }
+
+    struct JudgmentBackend {
+        inner: CollaborationWakeBackend,
+        screen: Arc<Mutex<String>>,
+    }
+
+    impl PaneBackend for JudgmentBackend {
+        fn kind(&self) -> HostKind {
+            HostKind::Tmux
+        }
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            self.inner.list_panes()
+        }
+        fn resolve_pane(&self, pane: &str) -> Option<PaneInfo> {
+            self.inner.resolve_pane(pane)
+        }
+        fn capture_pane(&self, _: &str) -> Option<String> {
+            Some(self.screen.lock().unwrap().clone())
+        }
+        fn pane_pid_map(&self) -> HashMap<u32, String> {
+            HashMap::new()
+        }
+        fn current_pane(&self) -> Option<String> {
+            None
+        }
+        fn focus_pane(&self, _: &str) -> bool {
+            false
+        }
+        fn send_text(&self, pane: &str, text: &str) -> bool {
+            self.inner.send_text(pane, text)
+        }
+        fn caps(&self) -> BackendCaps {
+            BackendCaps::default()
+        }
+    }
+
+    async fn judgment_fixture(
+        observe_only: bool,
+    ) -> (
+        AutomationEngine,
+        JudgedFiring,
+        RecordedSends,
+        Arc<Mutex<String>>,
+    ) {
+        let store = muxa::Store::shared();
+        add_capped_agent(&store, "%1", "capped").await;
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let screen = Arc::new(Mutex::new("Continue the agreed task?".to_string()));
+        let mut pane = collaboration_pane("%1", "0");
+        pane.workspace_id = Some("workspace".into());
+        pane.work_id = Some("work".into());
+        let backend: muxa::SharedBackend = Arc::new(JudgmentBackend {
+            inner: CollaborationWakeBackend {
+                panes: vec![pane],
+                sends: sends.clone(),
+            },
+            screen: screen.clone(),
+        });
+        let mut config = resume_rule_config();
+        config.rule[0].ask_condition = Some(serde_json::from_value(serde_json::json!({
+            "prompt": "Only continue the agreed task", "provider": "openai", "observe_only": observe_only,
+        })).unwrap());
+        let automation = AutomationStore::in_memory(config);
+        let mut engine = AutomationEngine::new(automation, store, vec![backend]);
+        engine.rescan().await;
+        engine.fire_due().await;
+        assert!(sends.lock().unwrap().is_empty());
+        let mut completed = engine.judgments.join_next().await.unwrap().unwrap();
+        assert_eq!(
+            completed.context.as_ref().unwrap().work.as_deref(),
+            Some("work")
+        );
+        assert_eq!(
+            completed.context.as_ref().unwrap().workspace.as_deref(),
+            Some("workspace")
+        );
+        completed.judgment.decision = JudgmentDecision::Match;
+        completed.judgment.reason = "Test judgment".into();
+        (engine, completed, sends, screen)
+    }
+
+    #[tokio::test]
+    async fn automation_queued_rule_change_is_refused_before_dispatch() {
+        let store = muxa::Store::shared();
+        add_capped_agent(&store, "%1", "capped").await;
+        let (backends, sends) = automation_backend(vec![collaboration_pane("%1", "0")]);
+        let automation = AutomationStore::in_memory(resume_rule_config());
+        let mut engine = AutomationEngine::new(automation.clone(), store, backends);
+        engine.rescan().await;
+        let mut edited = resume_rule_config().rule.remove(0);
+        edited.text = Some("different action".into());
+        automation.upsert_rule(edited).await.unwrap();
+        engine.fire_due().await;
+        assert!(sends.lock().unwrap().is_empty());
+        assert!(engine.judgments.is_empty());
+        assert!(automation.ledger().recent(1).await[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("Queued rule"));
+    }
+
+    #[tokio::test]
+    async fn automation_judgment_match_sends_only_the_fixed_action_once() {
+        let (mut engine, completed, sends, _) = judgment_fixture(false).await;
+        engine.finish_judgment(completed).await;
+        assert_eq!(
+            *sends.lock().unwrap(),
+            vec![("%1".into(), "continue".into()), ("%1".into(), "\r".into())]
+        );
+        engine.rescan().await;
+        engine.fire_due().await;
+        assert_eq!(sends.lock().unwrap().len(), 2);
+        assert!(engine.judgments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn automation_judgment_observation_never_sends() {
+        let (mut engine, completed, sends, _) = judgment_fixture(true).await;
+        engine.finish_judgment(completed).await;
+        assert!(sends.lock().unwrap().is_empty());
+        assert!(engine.automation.ledger().recent(1).await[0]
+            .detail
+            .as_ref()
+            .unwrap()
+            .contains("observe_only"));
+        engine.rescan().await;
+        assert!(engine.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn automation_judgment_changed_output_or_state_discards_match() {
+        let (mut engine, completed, sends, screen) = judgment_fixture(false).await;
+        *screen.lock().unwrap() = "Deploy to production?".into();
+        engine.finish_judgment(completed).await;
+        assert!(sends.lock().unwrap().is_empty());
+        assert!(engine.automation.ledger().recent(1).await[0]
+            .detail
+            .as_ref()
+            .unwrap()
+            .contains("context_changed"));
+        let (mut engine, completed, sends, _) = judgment_fixture(false).await;
+        add_agent(&engine.store, "%1", "capped", AgentKind::ClaudeCode).await;
+        engine.finish_judgment(completed).await;
+        assert!(sends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn automation_judgment_config_edit_discards_match() {
+        let (mut engine, completed, sends, _) = judgment_fixture(false).await;
+        engine
+            .automation
+            .set_paused_until(Some(OffsetDateTime::now_utc() + time::Duration::minutes(5)))
+            .await
+            .unwrap();
+        engine.finish_judgment(completed).await;
+        assert!(sends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn automation_judgment_unknown_and_no_match_never_send() {
+        for decision in [JudgmentDecision::Unknown, JudgmentDecision::NoMatch] {
+            let (mut engine, mut completed, sends, _) = judgment_fixture(false).await;
+            completed.judgment.decision = decision;
+            engine.finish_judgment(completed).await;
+            assert!(sends.lock().unwrap().is_empty());
+            engine.rescan().await;
+            assert!(engine.pending.is_empty());
+        }
     }
 
     #[tokio::test]

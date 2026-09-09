@@ -37,6 +37,7 @@ pub mod activity;
 pub mod adapters;
 pub mod ask;
 pub mod automation;
+pub mod automation_judge;
 pub mod backend;
 pub mod collaboration;
 pub mod collaboration_audit;

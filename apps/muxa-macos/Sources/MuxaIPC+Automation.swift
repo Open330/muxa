@@ -1,5 +1,79 @@
 import Foundation
 
+struct MuxaAutomationAskCondition: Codable, Hashable, Sendable {
+    var prompt: String
+    var provider: String
+    var observeOnly = true
+    var timeoutSecs: UInt64 = 30
+    var maxPerHour: UInt32 = 6
+
+    enum CodingKeys: String, CodingKey {
+        case prompt, provider
+        case observeOnly = "observe_only"
+        case timeoutSecs = "timeout_secs"
+        case maxPerHour = "max_per_hour"
+    }
+
+    init(prompt: String = "", provider: String = "openai", observeOnly: Bool = true,
+         timeoutSecs: UInt64 = 30, maxPerHour: UInt32 = 6) {
+        self.prompt = prompt
+        self.provider = provider
+        self.observeOnly = observeOnly
+        self.timeoutSecs = timeoutSecs
+        self.maxPerHour = maxPerHour
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        prompt = try values.decode(String.self, forKey: .prompt)
+        provider = try values.decode(String.self, forKey: .provider)
+        observeOnly = try values.decodeIfPresent(Bool.self, forKey: .observeOnly) ?? true
+        timeoutSecs = try values.decodeIfPresent(UInt64.self, forKey: .timeoutSecs) ?? 30
+        maxPerHour = try values.decodeIfPresent(UInt32.self, forKey: .maxPerHour) ?? 6
+    }
+
+    var wireObject: [String: Any] {
+        ["prompt": prompt, "provider": provider, "observe_only": observeOnly,
+         "timeout_secs": timeoutSecs, "max_per_hour": maxPerHour]
+    }
+
+    var validationError: String? {
+        if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return String(localized: "Describe the Ask condition in natural language.")
+        }
+        if provider.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return String(localized: "Choose an explicit configured Ask provider.")
+        }
+        if !(5...120).contains(timeoutSecs) {
+            return String(localized: "Ask timeout must be between 5 and 120 seconds.")
+        }
+        if !(1...30).contains(maxPerHour) {
+            return String(localized: "Ask judgment calls per hour must be between 1 and 30.")
+        }
+        return nil
+    }
+}
+
+struct MuxaAutomationJudgment: Decodable, Hashable, Sendable {
+    enum Decision: String, Decodable, Sendable {
+        case match
+        case noMatch = "no_match"
+        case unknown
+    }
+
+    let decision: Decision
+    let reason: String
+    let evidence: [String]
+    let provider: String
+    let model: String?
+    let contextHash: String
+
+    enum CodingKeys: String, CodingKey {
+        case decision, reason, evidence, provider, model
+        case contextHash = "context_hash"
+    }
+}
+
 // MARK: - Wire model
 
 /// The agent condition an automation rule listens for.
@@ -207,6 +281,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
     var maxPerHour: Int
     var cooldown: String
     var onlyIfStill: MuxaAutomationCondition?
+    var askCondition: MuxaAutomationAskCondition?
 
     // Derived, read-only: present on a row from the daemon, never sent back.
     /// One-line filter summary the daemon renders, or `any`.
@@ -247,7 +322,8 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         submit: Bool = true,
         maxPerHour: Int = MuxaAutomationRule.defaultMaxPerHour,
         cooldown: String = MuxaAutomationRule.defaultCooldown,
-        onlyIfStill: MuxaAutomationCondition? = nil
+        onlyIfStill: MuxaAutomationCondition? = nil,
+        askCondition: MuxaAutomationAskCondition? = nil
     ) {
         self.name = name
         self.on = on
@@ -269,6 +345,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         self.maxPerHour = maxPerHour
         self.cooldown = cooldown
         self.onlyIfStill = onlyIfStill
+        self.askCondition = askCondition
         filters = nil
         firedLastHour = nil
         lastFiredAt = nil
@@ -282,6 +359,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         case idleFor = "for"
         case maxPerHour = "max_per_hour"
         case onlyIfStill = "only_if_still"
+        case askCondition = "ask_condition"
         case firedLastHour = "fired_last_hour"
         case lastFiredAt = "last_fired_at"
     }
@@ -308,6 +386,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         maxPerHour = try values.decodeIfPresent(Int.self, forKey: .maxPerHour) ?? Self.defaultMaxPerHour
         cooldown = try values.decodeIfPresent(String.self, forKey: .cooldown) ?? Self.defaultCooldown
         onlyIfStill = try values.decodeIfPresent(MuxaAutomationCondition.self, forKey: .onlyIfStill)
+        askCondition = try values.decodeIfPresent(MuxaAutomationAskCondition.self, forKey: .askCondition)
         filters = try values.decodeIfPresent(String.self, forKey: .filters)
         firedLastHour = try values.decodeIfPresent(Int.self, forKey: .firedLastHour)
         lastFiredAt = try values.decodeIfPresent(String.self, forKey: .lastFiredAt)
@@ -342,6 +421,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         }
         if action.needsMessage { Self.put(message, key: "message", in: &object) }
         if let onlyIfStill { object["only_if_still"] = onlyIfStill.rawValue }
+        if let askCondition { object["ask_condition"] = askCondition.wireObject }
         return object
     }
 
@@ -390,6 +470,14 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         if let onlyIfStill {
             lines.append("only_if_still = \(Self.tomlString(onlyIfStill.rawValue))")
         }
+        if let condition = askCondition {
+            lines.append("[automation.rule.ask_condition]")
+            lines.append("prompt = \(Self.tomlString(condition.prompt))")
+            lines.append("provider = \(Self.tomlString(condition.provider))")
+            lines.append("observe_only = \(condition.observeOnly)")
+            lines.append("timeout_secs = \(condition.timeoutSecs)")
+            lines.append("max_per_hour = \(condition.maxPerHour)")
+        }
         return lines.joined(separator: "\n") + "\n"
     }
 
@@ -424,14 +512,19 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
     /// short identifiers and prompts, never binary.
     static func tomlString(_ value: String) -> String {
         var escaped = ""
-        for character in value {
-            switch character {
+        for scalar in value.unicodeScalars {
+            switch scalar {
             case "\\": escaped += "\\\\"
             case "\"": escaped += "\\\""
             case "\n": escaped += "\\n"
             case "\r": escaped += "\\r"
             case "\t": escaped += "\\t"
-            default: escaped.append(character)
+            default:
+                if scalar.value < 0x20 || scalar.value == 0x7f {
+                    escaped += String(format: "\\u%04X", scalar.value)
+                } else {
+                    escaped.unicodeScalars.append(scalar)
+                }
             }
         }
         return "\"\(escaped)\""
@@ -760,12 +853,14 @@ private struct MuxaAutomationEnvelope: Decodable {
     let automationRules: MuxaAutomationSnapshot?
     let automationLog: [MuxaAutomationLogEntry]?
     let automationTest: MuxaAutomationTestReport?
+    let automationJudgment: MuxaAutomationJudgment?
 
     enum CodingKeys: String, CodingKey {
         case ok, error
         case automationRules = "automation_rules"
         case automationLog = "automation_log"
         case automationTest = "automation_test"
+        case automationJudgment = "automation_judgment"
     }
 }
 
@@ -777,12 +872,20 @@ private struct MuxaAutomationEnvelope: Decodable {
 /// queueing behind a terminal read.
 final class MuxaAutomationClient: Sendable {
     static let requestTimeout: TimeInterval = 5
+    static let judgmentRequestTimeout: TimeInterval = 130
+    private static let sharedJudgmentTransport = SerializedIPCTransport(
+        label: "dev.muxa.mac.ipc-automation-judgment"
+    ) { path, payload in
+        try UnixSocket.request(path: path, payload: payload, timeout: judgmentRequestTimeout)
+    }
 
     let socketPath: String
     private let transport: SerializedIPCTransport
+    private let judgmentTransport: SerializedIPCTransport
 
     init(socketPath: String) {
         self.socketPath = socketPath
+        judgmentTransport = Self.sharedJudgmentTransport
         transport = SerializedIPCTransport(label: "dev.muxa.mac.ipc-automation") { path, payload in
             try UnixSocket.request(path: path, payload: payload, timeout: Self.requestTimeout)
         }
@@ -791,6 +894,7 @@ final class MuxaAutomationClient: Sendable {
     /// Test seam: exchanges go through `request` instead of the socket.
     init(socketPath: String, request: @escaping MuxaIPCRequestHandler) {
         self.socketPath = socketPath
+        judgmentTransport = SerializedIPCTransport(label: "dev.muxa.mac.ipc-automation-judgment-test", handler: request)
         transport = SerializedIPCTransport(label: "dev.muxa.mac.ipc-automation-test", handler: request)
     }
 
@@ -852,6 +956,33 @@ final class MuxaAutomationClient: Sendable {
 
     // MARK: Calls
 
+    static func judgeTestRequest(rule: MuxaAutomationRule, pane: String) -> [String: Any] {
+        ["protocol": MuxaIPCClient.protocolVersion, "kind": "automation_judge_test",
+         "rule": rule.wireObject, "pane": pane]
+    }
+
+    func judgeTest(rule: MuxaAutomationRule, pane: String) async throws -> MuxaAutomationJudgment {
+        guard let condition = rule.askCondition else {
+            throw MuxaIPCError.missingField("ask_condition")
+        }
+        if let error = condition.validationError { throw MuxaIPCError.server(error) }
+        guard !pane.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw MuxaIPCError.missingField("pane")
+        }
+        let payload = try JSONSerialization.data(withJSONObject: Self.judgeTestRequest(rule: rule, pane: pane))
+        let data = try await judgmentTransport.request(
+            path: socketPath, payload: payload, timeout: Self.judgmentRequestTimeout
+        )
+        let response = try JSONDecoder().decode(MuxaAutomationEnvelope.self, from: data)
+        if response.ok == false {
+            throw MuxaIPCError.server(response.error ?? "muxad rejected the judgment")
+        }
+        guard let judgment = response.automationJudgment else {
+            throw MuxaIPCError.missingField("automation_judgment")
+        }
+        return judgment
+    }
+
     func list() async throws -> MuxaAutomationSnapshot {
         try await snapshot(Self.listRequest())
     }
@@ -912,6 +1043,30 @@ final class MuxaAutomationClient: Sendable {
 
 extension MuxaIPCClient {
     static let automationCapability = "automation_v1"
+    static let automationAskCapability = "automation_ask_v1"
+
+    private func requireAutomationAsk() throws {
+        guard supports(Self.automationAskCapability) else {
+            throw MuxaIPCError.server("muxad does not support Ask conditions; update muxa and restart muxad. The condition was not removed.")
+        }
+    }
+
+    func automationJudgeTest(rule: MuxaAutomationRule, pane: String) async throws -> MuxaAutomationJudgment {
+        try requireAutomationAsk()
+        if let condition = rule.askCondition {
+            try await validateAutomationAPIProvider(condition.provider)
+        }
+        return try await requireAutomation().judgeTest(rule: rule, pane: pane)
+    }
+
+    private func validateAutomationAPIProvider(_ id: String) async throws {
+        let providers = try await listAskProviders()
+        guard providers.contains(where: {
+            $0.id == id && $0.kind == .api && ["openai", "anthropic"].contains($0.engine)
+        }) else {
+            throw MuxaIPCError.server("Ask conditions require an OpenAI or Anthropic API provider ID with API key/configuration. CLI providers are not supported.")
+        }
+    }
 
     nonisolated func makeAutomationClient() -> MuxaAutomationClient {
         MuxaAutomationClient(socketPath: socketPath)
@@ -945,7 +1100,12 @@ extension MuxaIPCClient {
     }
 
     func automationSetRule(_ rule: MuxaAutomationRule) async throws -> MuxaAutomationSnapshot {
-        try await requireAutomation().setRule(rule)
+        if let condition = rule.askCondition {
+            try requireAutomationAsk()
+            if let error = condition.validationError { throw MuxaIPCError.server(error) }
+            try await validateAutomationAPIProvider(condition.provider)
+        }
+        return try await requireAutomation().setRule(rule)
     }
 
     func automationRemoveRule(name: String) async throws -> MuxaAutomationSnapshot {

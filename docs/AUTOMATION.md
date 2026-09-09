@@ -164,6 +164,94 @@ pane muxa did not launch. `host = "local"` matches every pane this daemon
 governs — it only ever sees its own node — while a backend name (`tmux`,
 `herdr`, …) narrows to one pane-id namespace.
 
+## Optional Ask condition
+
+An Ask condition adds a natural-language check **after** the deterministic
+event, filters, timing, and guards. It does not let an AI choose an action:
+the rule still declares one fixed `send_prompt`, `notify`, or `interrupt`.
+Rules without this optional table keep their deterministic behavior.
+
+Add the table immediately after the rule it belongs to:
+
+```toml
+[[automation.rule]]
+name = "observe-ready-to-continue"
+on = "waiting_input"
+action = "send_prompt"
+text = "continue"
+
+[automation.rule.ask_condition]
+prompt = "Is the agent asking only for permission to continue the current task?"
+provider = "openai"
+observe_only = true
+timeout_secs = 30
+max_per_hour = 6
+```
+
+| Field | Meaning |
+| ----- | ------- |
+| `prompt` | Required, nonblank natural-language condition. |
+| `provider` | Required explicit Ask provider ID. The app initially offers `openai`. |
+| `observe_only` | Default `true`: record judgments without executing the fixed action. |
+| `timeout_secs` | Judgment timeout in seconds; default 30, inclusive range 5–120. |
+| `max_per_hour` | Judgment attempts per rule per pane per hour; default 6, inclusive range 1–30. Separate from the rule's action limit. |
+
+### Provider and privacy boundary
+
+Requires `[ask] enabled = true` and a configured API key available to
+`muxad`. Only the `openai` and `anthropic` API engines are allowed, including
+named API instances backed by either engine. CLI providers (including Claude
+and Codex) are not supported because the judge requires a strict no-tools
+turn, not a general-purpose agent session. The app's test request does not
+forward app-only Keychain keys. See [Ask configuration](CONFIGURATION.md#ask).
+
+Each judgment sends the condition plus bounded recent pane screen text
+(at most **12,000 characters**), current state, and work/workspace IDs to the
+selected **external API provider**. This leaves your machine and may incur
+API charges, even in observe-only mode. It does not send chat history, full
+files, or a full goal lookup, and it cannot use tools. Treat visible terminal
+content as data that will be disclosed; do not enable it on sensitive panes
+unless that disclosure is acceptable.
+
+The response must be strict JSON with a decision of `match`, `no_match`, or
+`unknown`, plus a reason and evidence. Only `match` can permit the fixed
+action, and only when observe-only is off. Invalid responses, timeouts,
+missing keys, unavailable context, and provider failures fail closed: they
+never become permission to act. `unknown` is not a match.
+
+### Judgment guards and testing
+
+- An automatic attempt is reserved in the persistent ledger before judging.
+  Only one attempt is allowed per `(rule, pane, episode)`, including failures
+  and observe-only results; restarting the daemon does not retry the episode.
+  Reservations are synchronized before admission. Corrupt or unreadable
+  ledgers disable Ask judgments until repaired and the daemon restarted.
+- Judgment cooldown and hourly accounting are separate from action firing
+  accounting. Automatic judgments use the rule's `cooldown` duration against
+  judgment attempts, while `ask_condition.max_per_hour` caps those attempts.
+  The outer rule's `max_per_hour` still caps actions.
+- A separate, non-configurable global budget allows at most **30 judgment
+  attempts/hour** across rules and panes. Manual tests share this budget and
+  a per-pane ceiling of **6 tests/hour**, and any tighter draft/saved-rule
+  maximum. Renaming a draft does not reset its test budget. Tests have a
+  cooldown of at least **10 seconds**, or the saved rule's longer cooldown.
+- At most **two judgments**, including manual tests, run concurrently, so a slow
+  provider does not block the deterministic scheduler.
+- Before any fixed action after a match, the engine checks the current
+  context, state, and configuration again, along with the action guards.
+  A stale match is not authorization to act on a changed pane or rule.
+
+In the app's rule editor, **Try condition — one billed API turn…** asks for
+confirmation before sending the selected pane's context. This is an explicit,
+potentially paid, read-only test that records a judgment but **never executes
+an action**, even with observe-only off. It can test the editor's draft; it
+does not save that draft as a rule.
+
+The ordinary `muxa automation test` and app rule test remain **free,
+deterministic dry runs**: no Ask call, no action, and no ledger entry. An
+otherwise eligible candidate with an Ask condition reports `ask_required`,
+not an inferred match.
+
 ## What stops a runaway
 
 An automation types into a live agent. Every firing has to pass all of
@@ -228,7 +316,8 @@ testable to the second — see `crates/muxa/src/automation.rs`.
 
 ## IPC
 
-Capability tag: `automation_v1`.
+Capability tag: `automation_v1`. Ask conditions additionally require
+`automation_ask_v1`; an older daemon must not silently drop the condition.
 
 | Request | Answers in |
 | ------- | ---------- |
@@ -239,6 +328,7 @@ Capability tag: `automation_v1`.
 | `{"kind":"automation_set_rule","rule":{…}}` | `automation_rules` |
 | `{"kind":"automation_remove_rule","name":"…"}` | `automation_rules` |
 | `{"kind":"automation_test","name":"…"}` | `automation_test` |
+| `{"kind":"automation_judge_test","rule":{…},"pane":"tmux:%1"}` | `automation_judgment` (explicit potentially billed test; no action) |
 
 `automation_set_rule` takes one rule in the same shape as a
 `[[automation.rule]]` table, with `name` required. It replaces the rule
@@ -307,7 +397,10 @@ may have been written with.
 }
 ```
 
-`outcome` is `fired`, `skipped`, or `failed`; for a skip, `detail` is the
+`outcome` is `fired`, `skipped`, or `failed` for deterministic actions. Ask
+also records `judging` (reserved attempt), `judged`, and `judge_test`; completed
+judgments carry decision, reason, evidence, provider/model, and context hash
+in their details. For a skip, `detail` is the
 reason (`condition_cleared`, `pane_gone`, `cooldown`, `hourly_cap`,
 `global_cap`, `episode_already_handled`, `paused`, `engine_disabled`,
 `rule_disabled`).
@@ -334,7 +427,9 @@ reason (`condition_cleared`, `pane_gone`, `cooldown`, `hourly_cap`,
 }
 ```
 
-`decision` is `fire` or the skip reason. `fire_at` is the earliest the
+`decision` is `fire`, `ask_required`, or the skip reason. `ask_required` means
+the deterministic checks passed but the Ask condition was not evaluated.
+`fire_at` is the earliest the
 rule could act — a real firing adds up to `jitter` on top. Nothing is
 fired and nothing is recorded.
 
