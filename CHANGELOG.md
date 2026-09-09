@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The workbench is fully drivable from the keyboard, with `⌘P` and `⌘⇧P` in
+  front.** `⌘P` opens Quick Open over sessions, windows, panes, native shells,
+  work and agents; `⌘⇧P` opens the command palette for navigating, creating
+  work and shells, refreshing, and managing editor tabs. While either is open
+  the two keys switch between destinations and commands without closing the
+  search field. The **Navigate** and **Editor** menus list every shortcut, so
+  the keyboard surface is discoverable rather than folklore.
+
+  Ranking is defined rather than fuzzy-by-default: exact title, then title
+  prefix and substring, then context substring, then fuzzy — with recency only
+  breaking ties, and an empty query showing recent destinations. An exact pane
+  title outranks a same-named window. Editing the query selects the best
+  *enabled* result while a background refresh preserves whatever the user
+  selected, so a list that updates underneath does not move the target.
+  Identical names on different hosts or tmux sockets stay separate
+  destinations. Opening a result pins its editor — it never sends terminal
+  input or starts a session.
+
+  IME composition keeps its native key handling, including Korean candidate
+  selection and the Enter that confirms a composition, and plain Tab outside
+  the palette still traverses focus normally.
+
+  Editor navigation covers `⌘1`–`⌘9`, `Ctrl-Tab`, editor groups (`⌘⌥←`/`⌘⌥→`),
+  split (`⌘\`), pin (`⌘⌥Enter`) and close (`⌘W`, which never terminates the
+  session). Closing an editor in a background group no longer moves focus out
+  of the group the user is in, and dismissing an exited shell synchronizes to
+  the surviving editor once rather than leaving the model pointing at a
+  removed group.
+
+  Pane and work send results now occupy a fixed-size status area beside Send,
+  so neither a success nor a long error reflows the composer, and a draft
+  edited while a send is in flight survives that send completing. See
+  [Keyboard navigation](docs/MACOS.md#keyboard-navigation).
+
 - **`[automation.rule.ask_condition]` puts a natural-language check in front of
   a rule's fixed action.** The condition runs *after* the deterministic event,
   filters, timing, and guards have already selected a candidate, and it can

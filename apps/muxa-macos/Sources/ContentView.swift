@@ -4,7 +4,10 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
     @StateObject private var tabs = MuxaWorkbenchTabs()
-    @State private var isCommandPalettePresented = false
+    @State private var paletteMode: MuxaPaletteMode?
+    @State private var pendingPaletteAction: MuxaPaletteAction?
+    @State private var sidebarFocusRequest = UUID()
+    @FocusState private var focusedEditorGroup: UUID?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -19,7 +22,8 @@ struct ContentView: View {
                         model.selectWatchPane(id)
                         tabs.openPinned(.pane(id))
                     },
-                    closeShell: dismissExitedShell
+                    closeShell: dismissExitedShell,
+                    focusRequest: sidebarFocusRequest
                 )
                     .frame(minWidth: 260, idealWidth: 300, maxWidth: 380)
                 editorRegion
@@ -49,11 +53,10 @@ struct ContentView: View {
                     .disabled(!model.isConnected)
 
                     Button {
-                        isCommandPalettePresented = true
+                        paletteMode = .commands
                     } label: {
                         Label("Commands", systemImage: "command")
                     }
-                    .keyboardShortcut("p", modifiers: [.command, .shift])
 
                     Button(role: .destructive) {
                         model.terminateSelectedSession()
@@ -84,8 +87,18 @@ struct ContentView: View {
                 "This stops the muxad currently using the socket, disables older background services that could reclaim it, and starts the version bundled with Muxa. Native PTY sessions owned by the old daemon will end; tmux sessions will not be terminated."
             )
         }
-        .sheet(isPresented: $isCommandPalettePresented) {
-            CommandPaletteView(model: model, isPresented: $isCommandPalettePresented)
+        .sheet(item: $paletteMode, onDismiss: performPendingPaletteAction) { mode in
+            CommandPaletteView(
+                model: model,
+                mode: mode,
+                recent: tabs.groups.sorted { $0.id == tabs.focusedGroupID && $1.id != tabs.focusedGroupID }
+                    .flatMap { $0.history.reversed() },
+                onChoose: { action in
+                    pendingPaletteAction = action
+                    paletteMode = nil
+                },
+                onCancel: { paletteMode = nil }
+            )
         }
         .sheet(isPresented: $model.isPresentingWorkStart) {
             WorkStartView(model: model, isPresented: $model.isPresentingWorkStart)
@@ -109,6 +122,11 @@ struct ContentView: View {
             if model.sidebarSelection != tabs.focusedSelection {
                 model.activateEditor(tabs.focusedSelection)
             }
+        }
+        .onChange(of: focusedEditorGroup) { groupID in
+            guard let groupID else { return }
+            tabs.focus(groupID)
+            model.activateEditor(tabs.focusedSelection)
         }
         .background(WorkbenchWindowPresenter())
         .focusedSceneValue(\.muxaEditorCommands, editorCommands)
@@ -134,6 +152,8 @@ struct ContentView: View {
                     maxHeight: .infinity,
                     alignment: .topLeading
                 )
+                .focusable()
+                .focused($focusedEditorGroup, equals: group.id)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -226,12 +246,7 @@ struct ContentView: View {
     /// sidebar hides the row itself.
     private func dismissExitedShell(id: String) {
         let selection = MuxaSidebarSelection.shell(id)
-        for group in tabs.groups where group.tabs.contains(selection) {
-            let focused = tabs.close(selection, groupID: group.id)
-            if tabs.focusedGroupID == group.id {
-                model.activateEditor(focused)
-            }
-        }
+        model.activateEditor(tabs.closeEverywhere(selection))
         Task { await model.refresh() }
     }
 
@@ -262,8 +277,64 @@ struct ContentView: View {
             pin: {
                 guard let selection = tabs.focusedSelection else { return }
                 tabs.pin(selection, groupID: tabs.focusedGroupID)
-            }
+            },
+            quickOpen: { paletteMode = .navigation },
+            commandPalette: { paletteMode = .commands },
+            activateAt: { index in
+                if let selection = tabs.activateAt(index) { model.activateEditor(selection) }
+            },
+            activateLast: {
+                if let selection = tabs.activateLast() { model.activateEditor(selection) }
+            },
+            focusRelativeGroup: { offset in
+                model.activateEditor(tabs.focusRelativeGroup(offset))
+                focusedEditorGroup = tabs.focusedGroupID
+            },
+            openWorkCommandCenter: { openEditor(.workBoard) },
+            openAsk: { openEditor(.ask) },
+            openInbox: { openEditor(.inbox) },
+            selectSidebar: { model.show($0) },
+            focusSidebar: { sidebarFocusRequest = UUID() },
+            isEnabled: paletteMode == nil && !model.isPresentingWorkStart
+                && !model.isPresentingHostRegistration && model.pipelineEditorTarget == nil
+                && !model.isConfirmingDaemonReplacement
         )
+    }
+
+    private func openEditor(_ selection: MuxaSidebarSelection) {
+        guard model.isSelectionAvailable(selection) else { return }
+        tabs.openPinned(selection)
+        model.select(selection)
+        model.activateEditor(selection)
+    }
+
+    private func performPendingPaletteAction() {
+        guard let action = pendingPaletteAction else { return }
+        pendingPaletteAction = nil
+        switch action {
+        case .navigate(let selection):
+            openEditor(selection)
+        case .command(let command):
+            guard command.disabledReason(model: model) == nil else { return }
+            switch command {
+            case .startWork: model.presentWorkStart()
+            case .workCommandCenter: openEditor(.workBoard)
+            case .liveWatch: openEditor(.watch)
+            case .ask: openEditor(.ask)
+            case .newShell: model.createShell()
+            case .showWork: model.show(.work)
+            case .showWatch: model.show(.watch)
+            case .showInbox: model.show(.inbox)
+            case .showShells: model.show(.shells)
+            case .refresh: Task { await model.refresh() }
+            case .closeEditor: editorCommands.close?()
+            case .previousEditor: editorCommands.previous?()
+            case .nextEditor: editorCommands.next?()
+            case .splitEditor: editorCommands.splitRight?()
+            case .pinEditor: editorCommands.pin?()
+            case .focusSidebar: sidebarFocusRequest = UUID()
+            }
+        }
     }
 }
 
@@ -557,117 +628,6 @@ private struct EditorTab: View {
     @Environment(\.colorScheme) private var colorScheme
 }
 
-private struct CommandPaletteView: View {
-    private enum PaletteCommand: CaseIterable, Identifiable {
-        case startWork
-        case workCommandCenter
-        case liveWatch
-        case ask
-        case newShell
-        case showWork
-        case showShells
-        case refresh
-
-        var id: Self { self }
-
-        var title: String {
-            switch self {
-            case .startWork: String(localized: "Start configured Work")
-            case .workCommandCenter: String(localized: "Open Work Command Center")
-            case .liveWatch: String(localized: "Open native Live Watch")
-            case .ask: String(localized: "Open global Ask")
-            case .newShell: String(localized: "New native shell")
-            case .showWork: String(localized: "Show managed work")
-            case .showShells: String(localized: "Show native shells")
-            case .refresh: String(localized: "Refresh workspace")
-            }
-        }
-
-        var systemImage: String {
-            switch self {
-            case .startWork: "play.square.stack"
-            case .workCommandCenter: "rectangle.3.group"
-            case .liveWatch: "waveform.path.ecg.rectangle"
-            case .ask: "sparkles"
-            case .newShell: "plus.rectangle.on.rectangle"
-            case .showWork: "square.stack.3d.up"
-            case .showShells: "terminal"
-            case .refresh: "arrow.clockwise"
-            }
-        }
-    }
-
-    @ObservedObject var model: AppModel
-    @Binding var isPresented: Bool
-    @State private var query = ""
-    @FocusState private var searchFocused: Bool
-
-    private var commands: [PaletteCommand] {
-        guard !query.isEmpty else { return PaletteCommand.allCases }
-        return PaletteCommand.allCases.filter {
-            $0.title.localizedCaseInsensitiveContains(query)
-        }
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "command")
-                    .foregroundStyle(.secondary)
-                TextField("Type a command", text: $query)
-                    .textFieldStyle(.plain)
-                    .focused($searchFocused)
-                    .onSubmit {
-                        if let first = commands.first { run(first) }
-                    }
-            }
-            .font(.title3)
-            .padding(14)
-
-            Divider()
-
-            List(commands) { command in
-                Button {
-                    run(command)
-                } label: {
-                    Label(command.title, systemImage: command.systemImage)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(
-                    (command == .newShell && (!model.isConnected || model.isCreatingSession))
-                        || (command == .startWork && (!model.isConnected || model.isStartingWork))
-                )
-            }
-            .listStyle(.inset)
-        }
-        .frame(width: 520, height: 360)
-        .onAppear { searchFocused = true }
-    }
-
-    private func run(_ command: PaletteCommand) {
-        switch command {
-        case .startWork:
-            model.presentWorkStart()
-        case .workCommandCenter:
-            model.select(.workBoard)
-        case .liveWatch:
-            model.select(.watch)
-        case .ask:
-            model.select(.ask)
-        case .newShell:
-            model.createShell()
-        case .showWork:
-            model.show(.work)
-        case .showShells:
-            model.show(.shells)
-        case .refresh:
-            Task { await model.refresh() }
-        }
-        isPresented = false
-    }
-}
 
 private struct MuxaSidebar: View {
     private enum StatusScope: CaseIterable, Identifiable {
@@ -783,6 +743,8 @@ private struct MuxaSidebar: View {
     let openPinnedSession: (MuxaWatchSessionIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
     let closeShell: (String) -> Void
+    let focusRequest: UUID
+    @FocusState private var filterFocused: Bool
     @Environment(\.colorScheme) private var colorScheme
     @State private var filterText = ""
     @State private var statusScope: StatusScope = .all
@@ -876,6 +838,8 @@ private struct MuxaSidebar: View {
                             .foregroundStyle(.secondary)
                         TextField(model.sidebarMode.filterPrompt, text: $filterText)
                             .textFieldStyle(.plain)
+                            .focused($filterFocused)
+                            .onChange(of: focusRequest) { _ in filterFocused = true }
                         Menu {
                             Picker("Status", selection: $statusScope) {
                                 ForEach(StatusScope.allCases) { scope in

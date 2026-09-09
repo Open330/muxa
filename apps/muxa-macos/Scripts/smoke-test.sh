@@ -23,16 +23,38 @@ SMOKE_DIR=$(mktemp -d)
 SOCKET_PATH="$SMOKE_DIR/muxad.sock"
 APP_LOG="$SMOKE_DIR/muxa.log"
 APP_PID=
+DAEMON_PIDS=
+mkdir -p "$SMOKE_DIR/home" "$SMOKE_DIR/config" "$SMOKE_DIR/data"
+cat >"$SMOKE_DIR/config.toml" <<'TOML'
+[automation]
+enabled = false
+[ask]
+enabled = false
+[discovery]
+enabled = false
+TOML
 
 cleanup() {
     if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
         kill "$APP_PID" 2>/dev/null || true
         wait "$APP_PID" 2>/dev/null || true
     fi
-    if [ -S "$SOCKET_PATH" ]; then
-        while IFS= read -r daemon_pid; do
-            [ -n "$daemon_pid" ] && kill "$daemon_pid" 2>/dev/null || true
-        done < <(lsof -t "$SOCKET_PATH" 2>/dev/null || true)
+    for daemon_pid in $DAEMON_PIDS; do
+        [ "$daemon_pid" = "$APP_PID" ] || kill "$daemon_pid" 2>/dev/null || true
+    done
+    for attempt in $(seq 1 100); do
+        running=0
+        for daemon_pid in $DAEMON_PIDS; do
+            if [ "$daemon_pid" != "$APP_PID" ] && kill -0 "$daemon_pid" 2>/dev/null; then
+                running=1
+            fi
+        done
+        [ "$running" -eq 0 ] && break
+        sleep 0.1
+    done
+    if [ "$running" -ne 0 ]; then
+        echo "Smoke daemon is still stopping; retained $SMOKE_DIR" >&2
+        return 1
     fi
     rm -rf "$SMOKE_DIR"
 }
@@ -63,7 +85,9 @@ print(json.dumps(response, separators=(",", ":")))
 PY
 }
 
-MUXA_SOCKET="$SOCKET_PATH" "$APP_EXECUTABLE" >"$APP_LOG" 2>&1 &
+HOME="$SMOKE_DIR/home" XDG_CONFIG_HOME="$SMOKE_DIR/config" XDG_DATA_HOME="$SMOKE_DIR/data" \
+    MUXA_CONFIG="$SMOKE_DIR/config.toml" MUXA_HOSTS=herdr MUXA_SOCKET="$SOCKET_PATH" \
+    "$APP_EXECUTABLE" >"$APP_LOG" 2>&1 &
 APP_PID=$!
 
 for _ in $(seq 1 50); do
@@ -75,6 +99,7 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 test -S "$SOCKET_PATH"
+DAEMON_PIDS=$(lsof -t "$SOCKET_PATH" 2>/dev/null | sort -u || true)
 
 hello=$(ipc '{"protocol":6,"kind":"hello","client":"muxa-macos-smoke"}')
 python3 - "$hello" <<'PY'
@@ -89,6 +114,8 @@ required = {
     "ask_status_v1",
     "ask_one_turn_credential_v1",
     "ask_conversations_v1",
+    "automation_ask_v1",
+    "config_launch_v1",
 }
 missing = required.difference(response.get("capabilities", []))
 if missing:
@@ -109,4 +136,6 @@ sleep 3
 kill -0 "$APP_PID"
 ipc "{\"protocol\":6,\"kind\":\"terminate_session\",\"session_id\":\"$session_id\"}" >/dev/null
 
+cleanup
+trap - EXIT
 echo "Muxa.app smoke test passed"

@@ -30,9 +30,23 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Look for the enabled modules' tools once, here. Settings › Modules
+        // used to be the only thing that probed, so until it had been opened
+        // every action needing a tool sat disabled saying it was still
+        // looking — for a module the operator had already pointed at a
+        // working install. A module that is switched off is not probed, so
+        // an operator who uses none still pays nothing.
+        Task { await MuxaModuleRegistry.shared.probeEnabled() }
         if UserDefaults.standard.bool(forKey: MuxaPreferences.showWorkbenchOnLaunchKey) {
             presentWorkbench(remainingAttempts: 50)
         }
+    }
+
+    /// A module may be holding a process of its own — AIR Workbench serves a
+    /// loopback page until it is stopped — and quitting must not leave it
+    /// running.
+    func applicationWillTerminate(_ notification: Notification) {
+        MuxaModuleRegistry.shared.shutdown()
     }
 
     func applicationShouldHandleReopen(
@@ -119,6 +133,7 @@ struct MuxaApp: App {
         }
         .defaultSize(width: 1120, height: 760)
         .commands {
+            CommandGroup(replacing: .printItem) {}
             MuxaEditorMenuCommands()
             OnboardingMenuCommands()
             CommandGroup(after: .newItem) {
@@ -147,26 +162,84 @@ struct MuxaApp: App {
 }
 
 private struct MuxaEditorMenuCommands: Commands {
-    @FocusedValue(\.muxaEditorCommands) private var actions
+    @FocusedValue(\.muxaEditorCommands) private var focusedActions
+
+    private var actions: MuxaEditorCommandActions? {
+        guard let focusedActions, focusedActions.isEnabled else { return nil }
+        return focusedActions
+    }
+
+    private var dispatchActions: MuxaEditorCommandActions? {
+        guard NSApp.modalWindow == nil,
+              let window = NSApp.keyWindow,
+              window.attachedSheet == nil,
+              window.sheetParent == nil else { return nil }
+        return actions
+    }
 
     var body: some Commands {
         CommandMenu("Editor") {
-            Button("Close Editor") { actions?.close() }
+            Button("Close Editor") { dispatchActions?.close?() }
                 .keyboardShortcut("w", modifiers: .command)
-                .disabled(actions == nil)
+                .disabled(actions?.close == nil)
             Divider()
-            Button("Previous Editor") { actions?.previous() }
+            Button("Previous Editor") { dispatchActions?.previous?() }
                 .keyboardShortcut(.tab, modifiers: [.control, .shift])
-                .disabled(actions == nil)
-            Button("Next Editor") { actions?.next() }
+                .disabled(actions?.previous == nil)
+            Button("Next Editor") { dispatchActions?.next?() }
                 .keyboardShortcut(.tab, modifiers: .control)
-                .disabled(actions == nil)
+                .disabled(actions?.next == nil)
+            ForEach(1...8, id: \.self) { number in
+                Button("Editor \(number)") { dispatchActions?.activateAt?(number - 1) }
+                    .keyboardShortcut(KeyEquivalent(Character(String(number))), modifiers: .command)
+                    .disabled(actions?.activateAt == nil)
+            }
+            Button("Last Editor") { dispatchActions?.activateLast?() }
+                .keyboardShortcut("9", modifiers: .command)
+                .disabled(actions?.activateLast == nil)
             Divider()
-            Button("Keep Editor Open") { actions?.pin() }
-                .disabled(actions == nil)
-            Button("Split Editor Right") { actions?.splitRight() }
+            Button("Focus Previous Editor Group") { dispatchActions?.focusRelativeGroup?(-1) }
+                .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
+                .disabled(actions?.focusRelativeGroup == nil)
+            Button("Focus Next Editor Group") { dispatchActions?.focusRelativeGroup?(1) }
+                .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
+                .disabled(actions?.focusRelativeGroup == nil)
+            Divider()
+            Button("Keep Editor Open") { dispatchActions?.pin?() }
+                .keyboardShortcut(.return, modifiers: [.command, .option])
+                .disabled(actions?.pin == nil)
+            Button("Split Editor Right") { dispatchActions?.splitRight?() }
                 .keyboardShortcut("\\", modifiers: .command)
-                .disabled(actions == nil)
+                .disabled(actions?.splitRight == nil)
+        }
+        CommandMenu("Navigate") {
+            Button("Quick Open…") { dispatchActions?.quickOpen?() }
+                .keyboardShortcut("p", modifiers: .command)
+                .disabled(actions?.quickOpen == nil)
+            Button("Command Palette…") { dispatchActions?.commandPalette?() }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+                .disabled(actions?.commandPalette == nil)
+            Divider()
+            Button("Open Work Command Center") { dispatchActions?.openWorkCommandCenter?() }
+                .keyboardShortcut("1", modifiers: [.command, .shift])
+                .disabled(actions?.openWorkCommandCenter == nil)
+            Button("Open Ask") { dispatchActions?.openAsk?() }
+                .keyboardShortcut("2", modifiers: [.command, .shift])
+                .disabled(actions?.openAsk == nil)
+            Button("Open Inbox") { dispatchActions?.openInbox?() }
+                .keyboardShortcut("3", modifiers: [.command, .shift])
+                .disabled(actions?.openInbox == nil)
+            Divider()
+            Menu("Sidebar") {
+                ForEach(MuxaSidebarMode.allCases) { mode in
+                    Button(mode.title) { dispatchActions?.selectSidebar?(mode) }
+                        .disabled(actions?.selectSidebar == nil)
+                }
+            }
+            .disabled(actions?.selectSidebar == nil)
+            Button("Focus Sidebar Filter") { dispatchActions?.focusSidebar?() }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+                .disabled(actions?.focusSidebar == nil)
         }
     }
 }

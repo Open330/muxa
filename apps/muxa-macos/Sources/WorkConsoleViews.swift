@@ -3847,11 +3847,112 @@ struct FleetPaneModuleView: View {
     }
 }
 
-/// The outcome line under a prompt composer: the wording and whether the
-/// send succeeded, so the colour never depends on the wording's language.
 struct PromptFeedback: Equatable {
     let message: String
     let succeeded: Bool
+}
+
+enum PromptComposerRules {
+    static func canSend(prompt: String, sending: Bool, hosts: [MuxaFleetHostIdentity]) -> Bool {
+        !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !sending && !hosts.isEmpty
+            && hosts.allSatisfy { $0.local || $0.mode == "control" }
+    }
+
+    static func shouldClearDraft(current: String, submitted: String, revision: UUID, submittedRevision: UUID) -> Bool {
+        current == submitted && revision == submittedRevision
+    }
+
+    static func handlesSendKey(keyCode: UInt16, modifiers: NSEvent.ModifierFlags, focused: Bool, markedText: Bool) -> Bool {
+        focused && !markedText && keyCode == 36
+            && modifiers.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad]) == .command
+    }
+}
+
+struct PromptComposerStatus: View {
+    let feedback: PromptFeedback?
+    @State private var showsDetails = false
+
+    var body: some View {
+        Color.clear
+            .frame(width: 132, height: 24)
+            .overlay(alignment: .trailing) {
+                if let feedback {
+                    Button {
+                        showsDetails.toggle()
+                    } label: {
+                        Label(feedback.message, systemImage: feedback.succeeded ? "checkmark.circle" : "exclamationmark.circle")
+                            .font(.caption2)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .foregroundStyle(feedback.succeeded ? Color.green : Color.red)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                    }
+                    .buttonStyle(.plain)
+                    .help(Text(verbatim: feedback.message))
+                    .accessibilityLabel(Text(verbatim: feedback.message))
+                    .accessibilityHint("Show prompt status details")
+                    .popover(isPresented: $showsDetails) {
+                        ScrollView {
+                            Text(verbatim: feedback.message)
+                                .font(.callout)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(12)
+                        }
+                        .frame(width: 360, height: 180)
+                    }
+                }
+            }
+            .onChange(of: feedback) { _ in showsDetails = false }
+    }
+}
+
+private struct PromptComposerSendKey: NSViewRepresentable {
+    let focused: Bool
+    let send: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        context.coordinator.update(view: view, focused: focused, send: send)
+        context.coordinator.monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak coordinator = context.coordinator] event in
+            guard let coordinator,
+                  let window = coordinator.view?.window,
+                  window.isKeyWindow, event.window === window,
+                  let editor = window.firstResponder as? NSTextView,
+                  PromptComposerRules.handlesSendKey(
+                    keyCode: event.keyCode, modifiers: event.modifierFlags,
+                    focused: coordinator.focused, markedText: editor.hasMarkedText()
+                  ) else { return event }
+            coordinator.send()
+            return nil
+        }
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        context.coordinator.update(view: view, focused: focused, send: send)
+    }
+
+    static func dismantleNSView(_ view: NSView, coordinator: Coordinator) {
+        if let monitor = coordinator.monitor { NSEvent.removeMonitor(monitor) }
+        coordinator.monitor = nil
+    }
+
+    final class Coordinator {
+        weak var view: NSView?
+        var focused = false
+        var send: () -> Void = {}
+        var monitor: Any?
+
+        func update(view: NSView, focused: Bool, send: @escaping () -> Void) {
+            self.view = view
+            self.focused = focused
+            self.send = send
+        }
+    }
 }
 
 private struct PanePromptComposer: View {
@@ -3861,54 +3962,68 @@ private struct PanePromptComposer: View {
     @Binding var prompt: String
     @Binding var sending: Bool
     @Binding var feedback: PromptFeedback?
+    @State private var draftRevision = UUID()
+    @FocusState private var promptFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 8) {
                     promptField
-                    sendButton.fixedSize()
+                    sendControls.fixedSize()
                 }
                 VStack(alignment: .trailing, spacing: 8) {
                     promptField
-                    sendButton
+                    sendControls
                 }
             }
             if !host.local && host.mode != "control" {
                 Text("This host is registered in observe mode. Change it to control to send prompts.")
                     .font(.caption2)
                     .foregroundStyle(.orange)
-            } else if let feedback {
-                Text(feedback.message)
-                    .font(.caption2)
-                    .foregroundStyle(feedback.succeeded ? .green : .red)
             }
         }
+        .background(PromptComposerSendKey(focused: promptFocused, send: send))
     }
 
     private var promptField: some View {
-        TextField("Send a prompt to this agent/pane", text: $prompt, axis: .vertical)
+        TextField("Send a prompt to this agent/pane", text: Binding(
+            get: { prompt },
+            set: { prompt = $0; draftRevision = UUID() }
+        ), axis: .vertical)
             .textFieldStyle(.roundedBorder)
             .lineLimit(1...4)
+            .focused($promptFocused)
             .onSubmit(send)
+    }
+
+    private var sendControls: some View {
+        HStack(spacing: 8) {
+            PromptComposerStatus(feedback: feedback)
+            sendButton
+        }
     }
 
     private var sendButton: some View {
         Button("Send", action: send)
             .buttonStyle(.borderedProminent)
-            .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sending || (!host.local && host.mode != "control"))
+            .disabled(!PromptComposerRules.canSend(prompt: prompt, sending: sending, hosts: [host]))
     }
 
     private func send() {
-        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !sending else { return }
+        guard PromptComposerRules.canSend(prompt: prompt, sending: sending, hosts: [host]) else { return }
+        let submitted = prompt
+        let submittedRevision = draftRevision
+        let text = submitted.trimmingCharacters(in: .whitespacesAndNewlines)
         sending = true
         feedback = nil
         Task {
             defer { sending = false }
             do {
                 try await client.sendFleetPrompt(host: host, pane: pane, text: text)
-                prompt = ""
+                if PromptComposerRules.shouldClearDraft(current: prompt, submitted: submitted, revision: draftRevision, submittedRevision: submittedRevision) {
+                    prompt = ""
+                }
                 feedback = PromptFeedback(message: String(localized: "Sent and submitted"), succeeded: true)
             } catch {
                 feedback = PromptFeedback(message: error.localizedDescription, succeeded: false)
@@ -3923,6 +4038,12 @@ struct WorkPromptComposer: View {
     @State private var prompt = ""
     @State private var sending = false
     @State private var feedback: PromptFeedback?
+    @State private var draftRevision = UUID()
+    @FocusState private var promptFocused: Bool
+
+    private var promptHosts: [MuxaFleetHostIdentity] {
+        work.participants.filter { $0.pane != nil }.map(\.host)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -3931,46 +4052,62 @@ struct WorkPromptComposer: View {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 8) {
                     workPromptField
-                    workSendButton.fixedSize()
+                    sendControls.fixedSize()
                 }
                 VStack(alignment: .trailing, spacing: 8) {
                     workPromptField
-                    workSendButton
+                    sendControls
                 }
             }
-            if let feedback {
-                Text(feedback.message)
-                    .font(.caption)
-                    .foregroundStyle(feedback.succeeded ? .green : .red)
+            if promptHosts.contains(where: { !$0.local && $0.mode != "control" }) {
+                Text("This host is registered in observe mode. Change it to control to send prompts.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
             }
         }
+        .background(PromptComposerSendKey(focused: promptFocused, send: send))
         .padding(14)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var workPromptField: some View {
-        TextField("Send the next instruction to every live collaborator", text: $prompt, axis: .vertical)
+        TextField("Send the next instruction to every live collaborator", text: Binding(
+            get: { prompt },
+            set: { prompt = $0; draftRevision = UUID() }
+        ), axis: .vertical)
             .textFieldStyle(.roundedBorder)
             .lineLimit(1...4)
+            .focused($promptFocused)
             .onSubmit(send)
+    }
+
+    private var sendControls: some View {
+        HStack(spacing: 8) {
+            PromptComposerStatus(feedback: feedback)
+            workSendButton
+        }
     }
 
     private var workSendButton: some View {
         Button("Send to \(work.participants.count)", action: send)
             .buttonStyle(.borderedProminent)
-            .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sending || work.participants.isEmpty)
+            .disabled(!PromptComposerRules.canSend(prompt: prompt, sending: sending, hosts: promptHosts))
     }
 
     private func send() {
-        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !sending else { return }
+        guard PromptComposerRules.canSend(prompt: prompt, sending: sending, hosts: promptHosts) else { return }
+        let submitted = prompt
+        let submittedRevision = draftRevision
+        let text = submitted.trimmingCharacters(in: .whitespacesAndNewlines)
         sending = true
         feedback = nil
         Task {
             defer { sending = false }
             do {
                 let count = try await model.prompt(work: work, text: text)
-                prompt = ""
+                if PromptComposerRules.shouldClearDraft(current: prompt, submitted: submitted, revision: draftRevision, submittedRevision: submittedRevision) {
+                    prompt = ""
+                }
                 feedback = PromptFeedback(
                     message: String(localized: "Sent to \(count) collaborators"),
                     succeeded: true

@@ -389,6 +389,46 @@ focus an arbitrary application. Because any process running as the same user
 can reach this QA bridge, quit the helper when UI automation is finished; it is
 intended for local development, not distribution.
 
+## Keyboard navigation
+
+The workbench's **Navigate** and **Editor** menus list the available shortcuts:
+
+| Shortcut | Action |
+| --- | --- |
+| `⌘P` | Quick Open: search sessions, windows, panes, native shells, work, and agents |
+| `⌘⇧P` | Command palette: navigate, create work/shells, refresh, or manage editor tabs |
+| `↑` / `↓`, `Tab` / `Shift-Tab` | Select the previous/next enabled palette result |
+| `Enter` / `Esc` | Open the selected result / dismiss the palette |
+| `⌘1` … `⌘8`, `⌘9` | Activate an editor by position / activate the last editor |
+| `Ctrl-Tab` / `Ctrl-Shift-Tab` | Next / previous editor |
+| `⌘⌥←` / `⌘⌥→` | Focus the previous / next editor group |
+| `⌘\` | Split the active editor to the right |
+| `⌘⌥Enter` | Keep the preview editor open (pin) |
+| `⌘W` | Close the editor, without terminating its session |
+| `⌘⇧1` / `⌘⇧2` / `⌘⇧3` | Open Work Command Center / Ask / Inbox |
+| `⌘⇧F` | Focus the sidebar filter |
+| `⌘Enter` | Send from the focused pane/work prompt composer |
+
+Quick Open searches names and host/socket context with multiword fuzzy matching.
+While the palette is open, `⌘P` and `⌘⇧P` switch between destinations and commands
+without closing the search field; typing is focused automatically.
+Recent destinations rank first when the query is empty. Nonempty searches rank
+by exact title, title prefix/substring, context substring,
+then fuzzy match, with recent history only breaking ties. Exact pane titles take
+precedence over same-named windows. Editing the query selects the best enabled
+result; background refreshes preserve the user's selection. Identical names on
+different hosts or tmux sockets remain separate destinations. Opening a result
+pins its editor; it does not send terminal input or start another session.
+Unavailable commands are shown disabled and skipped by keyboard selection.
+IME composition keeps its native key handling, including Korean candidate
+selection and composition-confirming Enter. Plain Tab outside the palette keeps
+normal focus traversal; macOS Keyboard Navigation controls tabbing to all controls.
+
+Pane/work send results occupy a fixed-size status area immediately left of Send,
+so success or a long error never adds a row or shifts the layout. Hover or open
+the status to read the complete details. A draft edited during an in-flight send
+is preserved when the earlier send completes.
+
 ## Reproducible libghostty supply chain
 
 [`apps/muxa-macos/Dependencies.lock`](../apps/muxa-macos/Dependencies.lock)
