@@ -22,7 +22,7 @@ fn muxa() -> PathBuf {
 }
 
 fn tmux_installed() -> bool {
-    Command::new("tmux")
+    muxa::tmux::tmux_command()
         .arg("-V")
         .output()
         .is_ok_and(|out| out.status.success())
@@ -93,7 +93,7 @@ impl Server {
     }
 
     fn tmux(&self, args: &[&str]) -> Result<String, String> {
-        let out = Command::new("tmux")
+        let out = muxa::tmux::tmux_command()
             .arg("-f")
             .arg("/dev/null")
             .arg("-S")
@@ -125,7 +125,11 @@ fn stub_agent_dir(root: &Path) -> PathBuf {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).expect("create stub bin dir");
     let claude = bin.join("claude");
-    std::fs::write(&claude, "#!/bin/sh\nexec sleep 600\n").expect("write stub claude");
+    std::fs::write(
+        &claude,
+        "#!/bin/sh\nprintf '__MUXA_STUB_AGENT__\\n'\nexec sleep 600\n",
+    )
+    .expect("write stub claude");
     std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755))
         .expect("chmod stub claude");
     bin
@@ -147,6 +151,15 @@ fn launch_and_assert(server: &Server, launch: &Launch<'_>, target: &str, owner: 
         launch.stub_bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    server
+        .tmux(&["set-option", "-g", "default-shell", "/bin/sh"])
+        .expect("use a shell without operator startup files");
+    server
+        .tmux(&["set-environment", "-g", "PATH", &path])
+        .expect("isolate the launched agent PATH");
+    server
+        .tmux(&["set-environment", "-t", owner, "PATH", &path])
+        .expect("set the destination session PATH");
     let out = Command::new(muxa())
         .args([
             "agent",
@@ -165,6 +178,8 @@ fn launch_and_assert(server: &Server, launch: &Launch<'_>, target: &str, owner: 
         ])
         .env("PATH", path)
         .env("MUXA_TMUX_SOCKET", &server.socket)
+        .env_remove("RMUX")
+        .env_remove("RMUX_PANE")
         .env("TMUX", launch.tmux_env)
         .env("TMUX_PANE", launch.caller_pane)
         .output()
@@ -200,29 +215,25 @@ fn launch_and_assert(server: &Server, launch: &Launch<'_>, target: &str, owner: 
     assert_ne!(index, 0, "index 0 belongs to the session's first window");
     // The stub is what ran, so a machine with a real `claude` on PATH cannot
     // make this test pass for the wrong reason.
-    let command = wait_for_pane_command(server, &format!("{owner}:{index}"));
-    assert_eq!(command, "sleep", "the stub agent should own the new pane");
+    let output = wait_for_stub(server, &format!("{owner}:{index}"));
+    assert!(
+        output.contains("__MUXA_STUB_AGENT__"),
+        "the stub agent should own the new pane: {output}"
+    );
 }
 
-/// tmux runs the launch through `sh -c`, which then execs the stub, so the
-/// foreground command reported the instant the window appears may still be the
-/// shell. Poll briefly rather than race it.
-fn wait_for_pane_command(server: &Server, window: &str) -> String {
-    let mut command = String::new();
+/// Verify the stub itself executed; foreground process names can report the
+/// waiting `sh -c` parent on Linux even after its child execs sleep.
+fn wait_for_stub(server: &Server, window: &str) -> String {
+    let mut output = String::new();
     for _ in 0..50 {
-        command = server.query(&[
-            "display-message",
-            "-p",
-            "-t",
-            window,
-            "#{pane_current_command}",
-        ]);
-        if command == "sleep" {
+        output = server.query(&["capture-pane", "-p", "-t", window]);
+        if output.contains("__MUXA_STUB_AGENT__") {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(40));
     }
-    command
+    output
 }
 
 #[test]

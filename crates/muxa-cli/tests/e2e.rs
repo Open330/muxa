@@ -114,6 +114,8 @@ enabled = false
             .arg("--config")
             .arg(&cfg_path)
             .env("RUST_LOG", "muxa=warn")
+            .env_remove("RMUX")
+            .env_remove("RMUX_PANE")
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
             .env("TMUX_TMPDIR", &tmux_tmpdir)
@@ -139,7 +141,9 @@ enabled = false
         // the daemon reads the temporary config while the CLI can pick up an
         // operator's real ~/.config/muxa/config.toml.
         c.env("MUXA_CONFIG", &self.config);
-        c.env_remove("TMUX");
+        c.env_remove("RMUX")
+            .env_remove("RMUX_PANE")
+            .env_remove("TMUX");
         c.env_remove("TMUX_PANE");
         c.env("TMUX_TMPDIR", &self.tmux_tmpdir);
         c
@@ -649,6 +653,8 @@ path = "{}"
         .arg("--dashboard-bind")
         .arg("127.0.0.1:0")
         .env("RUST_LOG", "muxa=info")
+        .env_remove("RMUX")
+        .env_remove("RMUX_PANE")
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .env("TMUX_TMPDIR", &tmux_tmpdir)

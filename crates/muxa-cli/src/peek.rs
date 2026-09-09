@@ -150,7 +150,11 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
         .snapshot_with_timeout(PEEK_IPC_TIMEOUT)
         .await
         .unwrap_or_default();
-    let mut cells = build_cells(panes, &agents);
+    let mut cells = build_cells_on(
+        panes,
+        &agents,
+        muxa::backend::rmux::endpoint_from_env().as_deref(),
+    );
     attach_prompt_times(client, &mut cells).await;
 
     if plain {
@@ -181,7 +185,7 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
     // repaints the window underneath, and doing it while we still own the
     // alternate screen leaves the user looking at our leftovers.
     if let Outcome::Jump(pane_id) = outcome? {
-        muxa::tmux::tmux_command()
+        crate::mux_control::ambient_command()
             .args(["select-pane", "-t", &pane_id])
             .status()
             .ok();
@@ -511,7 +515,11 @@ async fn drive(
                     .snapshot_with_timeout(PEEK_IPC_TIMEOUT)
                     .await
                     .unwrap_or_default();
-                let mut next = build_cells(panes, &agents);
+                let mut next = build_cells_on(
+                    panes,
+                    &agents,
+                    muxa::backend::rmux::endpoint_from_env().as_deref(),
+                );
                 attach_prompt_times(client, &mut next).await;
                 // Agent state is cheap to re-read and worth keeping live.
                 // Backdrops are neither: one `capture-pane` per pane per
@@ -608,14 +616,28 @@ fn classify(key: KeyEvent) -> Action {
 /// currently covering: the attention count in the footer must still see
 /// them, and `--plain` lists them. Hiding the covered ones is a *drawing*
 /// concern, handled in [`draw`].
-pub(crate) fn build_cells(panes: Vec<PaneGeometry>, agents: &[Agent]) -> Vec<PeekCell> {
-    let here = muxa::tmux::layout::current_socket_name();
+#[cfg(test)]
+fn build_cells(panes: Vec<PaneGeometry>, agents: &[Agent]) -> Vec<PeekCell> {
+    build_cells_on(panes, agents, None)
+}
+
+fn build_cells_on(panes: Vec<PaneGeometry>, agents: &[Agent], rmux: Option<&str>) -> Vec<PeekCell> {
+    let here = rmux
+        .map(str::to_string)
+        .or_else(muxa::tmux::layout::current_socket_name);
     panes
         .into_iter()
         .map(|geo| {
             let mut mine: Vec<&Agent> = agents
                 .iter()
-                .filter(|a| a.pane.as_deref() == Some(geo.pane_id.as_str()))
+                .filter(|a| {
+                    let id = if rmux.is_some() {
+                        format!("rmux:{}", geo.pane_id)
+                    } else {
+                        geo.pane_id.clone()
+                    };
+                    a.pane.as_deref() == Some(id.as_str())
+                })
                 .filter(|a| on_this_server(a, here.as_deref()))
                 .collect();
             // Most interesting first: a pane holding both a live agent and

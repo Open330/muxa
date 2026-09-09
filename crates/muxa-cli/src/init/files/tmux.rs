@@ -81,7 +81,9 @@ bind-key q display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa peek""#;
 /// into it. `muxa workspace view` is a no-op for a sole client, so a single
 /// terminal never grows a second session.
 ///
-/// Only `#{client_name}` is interpolated, and deliberately: the hook body is
+/// `#{hook_client}` identifies the client that caused the hook on both hosts;
+/// rmux does not populate `#{client_name}` in this context. Only that client
+/// identity is interpolated, deliberately: the hook body is
 /// already three quoting levels deep (`set-hook "…"` → `if -F '…'` →
 /// `run-shell \"…\"`), and a fourth pair around each value terminates the
 /// enclosing one — it broke exactly that way in testing, with tmux reporting
@@ -99,8 +101,8 @@ pub const AUTO_VIEW_BODY: &str = r#"# Each terminal on a workspace gets its own 
 # group. Both hooks are needed: attach covers `tmux attach`, session-changed
 # covers `switch-client` — which is what `muxa watch`'s Enter does.
 # Mirror two terminals instead: tmux set-option -t <session> @no_auto_view 1
-set-hook -g 'client-attached[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'"
-set-hook -g 'client-session-changed[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'""#;
+set-hook -g 'client-attached[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{hook_client}\"'"
+set-hook -g 'client-session-changed[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{hook_client}\"'""#;
 
 /// The body that goes inside the `tmux-window-names` marker block.
 ///

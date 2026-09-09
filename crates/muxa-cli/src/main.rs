@@ -16,6 +16,7 @@ mod interactive_child;
 mod logs;
 mod mcp;
 mod message_skill;
+mod mux_control;
 mod onboarding;
 mod peek;
 mod relay;
@@ -2948,25 +2949,73 @@ fn jump_to_pane_rmux_key(key: &muxa::PaneKey) {
     );
 }
 
+fn rmux_client_from_context(listing: &str, context: &str) -> Option<String> {
+    let clients: Vec<_> = listing
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .collect();
+    if clients.len() == 1 {
+        return Some(clients[0].0.to_string());
+    }
+    let session = context.split(',').nth(2)?.trim_start_matches('$');
+    let mut matches = clients
+        .iter()
+        .filter(|(_, id)| id.trim_start_matches('$') == session);
+    let (client, _) = matches.next()?;
+    matches.next().is_none().then(|| client.to_string())
+}
+
 fn jump_to_pane_rmux_target(socket: &str, session: &str, window: &str, pane: &str) {
     let backend = muxa::RmuxBackend::with_endpoint(socket);
     let pane = pane.strip_prefix("rmux:").unwrap_or(pane);
-    let target = format!("{session}:{window}.{pane}");
     let current = muxa::backend::rmux::endpoint_from_env();
+    let control = mux_control::Control::Endpoint(muxa::BackendEndpoint {
+        host: muxa::HostKind::Rmux,
+        socket: socket.to_string(),
+    });
+    let mut attach_view = None;
+    let mut selected_session = session.to_string();
     if current.as_deref() == Some(socket) {
-        let mut args = vec!["switch-client"];
-        if let Some(client) = CALLER_CLIENT.get() {
-            args.extend(["-c", client]);
-        }
-        args.extend(["-t", &target]);
-        if let Err(error) = backend.run_control(&args) {
-            eprintln!("muxa: rmux switch-client failed: {error}");
+        let result = (|| -> Result<()> {
+            let client = if let Some(client) = CALLER_CLIENT.get() {
+                client.clone()
+            } else {
+                let listing = backend
+                    .capture_control(&["list-clients", "-F", "#{client_name}\t#{session_id}"])
+                    .map_err(anyhow::Error::msg)?;
+                let context = std::env::var("RMUX").unwrap_or_default();
+                rmux_client_from_context(&listing, &context).context(
+                    "multiple rmux clients share this session: open watch using the popup binding or pass --caller-client"
+                )?
+            };
+            selected_session = tmux_work::private_jump_session(&control, &client, session, window)?;
+            // Switch only the client here. Window selection happens below,
+            // after it has its own view and with that view's session id.
+            backend
+                .run_control(&["switch-client", "-c", &client, "-t", &selected_session])
+                .map_err(anyhow::Error::msg)
+        })();
+        if let Err(error) = result {
+            eprintln!("muxa: rmux jump failed: {error}");
             return;
         }
     } else if current.is_some() {
         eprintln!("muxa: cannot switch an rmux client across servers; attach to {socket} from a separate terminal");
         return;
     }
+    if current.is_none() {
+        match tmux_work::prepare_attach_view(&control, session) {
+            Ok(view) => {
+                selected_session.clone_from(&view.id);
+                attach_view = Some(view);
+            }
+            Err(error) => {
+                eprintln!("muxa: rmux attach view failed: {error}");
+                return;
+            }
+        }
+    }
+    let target = format!("{selected_session}:{window}.{pane}");
     for args in [
         ["select-window", "-t", target.as_str()],
         ["select-pane", "-t", target.as_str()],
@@ -2980,13 +3029,14 @@ fn jump_to_pane_rmux_target(socket: &str, session: &str, window: &str, pane: &st
         match interactive_child::run_interactive(backend.command(None).args([
             "attach-session",
             "-t",
-            session,
+            &selected_session,
         ])) {
             Ok(exit) if exit.is_clean_detach() => {}
             Ok(exit) => eprintln!("muxa: rmux attach-session exited: {}", exit.status),
             Err(error) => eprintln!("muxa: rmux attach-session failed: {error}"),
         }
     }
+    drop(attach_view);
 }
 
 /// Jump on herdr: `pane.focus` over the herdr socket is the whole story,
@@ -3800,6 +3850,20 @@ mod tests {
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
 
+    #[test]
+    fn rmux_client_resolution_uses_the_invoking_session_without_guessing() {
+        let listing = "/dev/pts/1\t$1\n/dev/pts/2\t$2\n";
+        assert_eq!(
+            rmux_client_from_context(listing, "/tmp/socket,10,2").as_deref(),
+            Some("/dev/pts/2")
+        );
+        assert_eq!(rmux_client_from_context(listing, "/tmp/socket,10,3"), None);
+        assert_eq!(
+            rmux_client_from_context("a\t$1\nb\t$1", "/tmp/socket,10,1"),
+            None
+        );
+    }
+
     /// The harness supplies a disposable server with an attached client and
     /// a target pane in a different session/window. No user server is touched.
     #[test]
@@ -3818,38 +3882,78 @@ mod tests {
         let pane = backend.resolve_pane(&pane_id).unwrap();
         let key = muxa::PaneKey::from_pane(muxa::HostKind::Rmux, &pane);
         jump_to_topology_pane(&key);
-        // rmux 0.10's display-message -c still formats the inherited session;
-        // inspect client membership separately from the session's active pane.
-        let clients = backend
-            .command(None)
-            .args(["list-clients", "-F", "#{client_name}\t#{session_id}"])
-            .output()
-            .unwrap();
-        assert!(clients.status.success());
-        assert!(String::from_utf8(clients.stdout)
-            .unwrap()
-            .lines()
-            .any(|line| line == format!("{client}\t{}", pane.session_id)));
+        let clients = || {
+            backend
+                .capture_control(&["list-clients", "-F", "#{client_name}\t#{session_id}"])
+                .unwrap()
+        };
+        let session_for = |name: &str| {
+            clients()
+                .lines()
+                .find_map(|line| {
+                    let (client, session) = line.split_once('\t')?;
+                    (client == name).then(|| session.to_string())
+                })
+                .unwrap()
+        };
+        let view = session_for(&client);
+        let control = mux_control::Control::Endpoint(key.window.session.endpoint.clone());
+        {
+            let attach_view = tmux_work::prepare_attach_view(&control, &pane.session_id).unwrap();
+            assert_ne!(attach_view.id, pane.session_id);
+            let linked = backend
+                .capture_control(&["list-windows", "-t", &attach_view.id, "-F", "#{window_id}"])
+                .unwrap();
+            assert!(linked.lines().any(|window| window == pane.window_id));
+        }
+        if let Ok(other) = std::env::var("MUXA_RMUX_TEST_OTHER_CLIENT") {
+            assert_ne!(view, pane.session_id, "a busy session needs a private view");
+            assert_eq!(session_for(&other), pane.session_id);
+            let original = backend
+                .capture_control(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &pane.session_id,
+                    "#{window_id}",
+                ])
+                .unwrap();
+            assert_ne!(
+                original.trim(),
+                pane.window_id,
+                "another terminal's selected window changed"
+            );
+        }
         let output = backend
-            .command(None)
-            .args([
+            .capture_control(&[
                 "display-message",
                 "-p",
                 "-t",
-                &pane.session_id,
-                "#{session_id}:#{window_id}.#{pane_id}",
+                &view,
+                "#{window_id}.#{pane_id}",
             ])
-            .output()
             .unwrap();
-        assert!(output.status.success(), "{output:?}");
         assert_eq!(
-            String::from_utf8(output.stdout).unwrap().trim(),
+            output.trim(),
             format!(
-                "{}:{}.{}",
-                pane.session_id,
+                "{}.{}",
                 pane.window_id,
                 pane_id.strip_prefix("rmux:").unwrap_or(&pane_id)
             )
+        );
+        // Repeated jumps reuse this terminal's view even though topology
+        // reports the canonical source session for the shared window.
+        jump_to_topology_pane(&key);
+        assert_eq!(session_for(&client), view);
+        let sessions = backend
+            .capture_control(&["list-sessions", "-F", "#{session_name}"])
+            .unwrap();
+        assert_eq!(
+            sessions
+                .lines()
+                .filter(|name| name.contains("~view~"))
+                .count(),
+            usize::from(view != pane.session_id)
         );
     }
 

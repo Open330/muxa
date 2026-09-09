@@ -1,6 +1,6 @@
 # rmux backend
 
-Status: **initial CLI backend implemented.** Muxa can discover rmux panes,
+Status: **CLI backend and terminal controls implemented.** Muxa can discover rmux panes,
 correlate agent hooks, capture screens, focus panes, and send targeted literal
 input through rmux's public command-line surface.
 
@@ -37,7 +37,11 @@ prefixes. This also covers systemd/launchd environments with a restricted
 | Pane/session enumeration | `rmux list-panes -a -F ...` |
 | Current command, cwd, tty, pid | rmux format fields |
 | Capture | `rmux capture-pane -ep -t ...` |
-| Focus | `rmux select-pane -t ...` |
+| Focus | Client-scoped session/window/pane jump with private grouped views |
+| Rename | Session, window, and pane title; CLI buffer-based window naming |
+| Lifecycle | Workspace/work and agent launch, window creation, pane splitting, close |
+| Interaction | Prompt submission, interrupt, capture, window inspector, `muxa peek` |
+| Auto view | `muxa workspace view` attach/session-change hooks; view reuse and cleanup |
 | Targeted input | literal `send-keys`; bracketed paste for multiline text |
 | Hook identity | `RMUX_PANE` → `rmux:%N` |
 | Session activity duration | Not yet sampled |
@@ -57,9 +61,13 @@ events and fewer process launches without changing callers.
 - Session/client activity sampling is absent, so rmux rows report no DUR/ACT
   time instead of borrowing tmux's same-shaped `$N` session ids.
 - `muxa watch` switches the invoking rmux client to the selected session,
-  window, and pane. Popup callers preserve `--caller-client`; topology rows
+  window, and pane. Busy sessions get a grouped view per terminal, and jumps
+  preserve an existing view. Window creation is detached until the invoking
+  client jumps, so it does not move another terminal's selected window.
+  Popup callers preserve `--caller-client`; topology rows
   preserve the target server endpoint. From a bare terminal, the command uses
-  `rmux attach-session`. Switching an existing rmux client across different
+  `rmux attach-session` with a temporary grouped view when the source is busy.
+  Switching an existing rmux client across different
   servers is rejected with an explicit message.
 - The implementation follows the public CLI/format contract verified against
   rmux 0.10.x.
@@ -117,3 +125,33 @@ PTY client, then checks the client's session and the selected window/pane:
 ```sh
 python3 scripts/rmux-jump-check.py
 ```
+
+## Compatibility details
+
+The CLI lifecycle and layout helpers prefer the native `$RMUX` endpoint over
+rmux's `$TMUX` compatibility variables. Watch actions use the selected row's
+host and socket instead of the invoking terminal's backend. Pane ids retain
+`rmux:` internally and lose that prefix only at the native command boundary.
+
+rmux 0.10 interprets `new-session -t` as a session/group **name**. Passing `$N`
+can silently create an unrelated group, so view creation uses the resolved
+session name on rmux. Client membership and pid are read from `list-clients`;
+`display-message` client context is insufficient to identify a popup caller.
+
+The scanner appends `socket_path` after the entire shared pane format. Its
+column index must track that format: column 12 contains workspace metadata,
+not the endpoint. Full rows retain session groups for topology folding.
+
+Run `python3 scripts/rmux-jump-check.py` to test two PTY clients, isolated
+window selection and view reuse, rename, creation/splitting, prompt submission,
+interrupt/close, capture, CLI buffer naming, and peek against a disposable server.
+
+Grouped windows also need session-qualified targets for commands such as
+`set-option`: a bare `@N` can be ambiguous even though every link represents
+the same window. Muxa resolves those ids within the selected endpoint before
+sending control commands. Window rename reads link identities from enumeration
+to avoid empty `display-message` context fields on rmux 0.10.
+
+Auto-view hooks use `#{hook_client}`, which names the client that triggered
+the event on both tmux and rmux. rmux can leave `#{client_name}` empty in that
+hook context; popup key bindings continue to use `#{client_name}` at keypress.

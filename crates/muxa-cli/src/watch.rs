@@ -1321,6 +1321,7 @@ fn plan_spawn_work(
 fn plan_new_window(session_id: &str, cwd: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "new-window".to_string(),
+        "-d".into(),
         "-P".into(),
         "-F".into(),
         "#{window_id} #{pane_id}".into(),
@@ -1355,7 +1356,11 @@ fn parse_new_window_target(
                     session: session.clone(),
                     window_id: window_id.to_string(),
                 },
-                pane_id: pane_id.to_string(),
+                pane_id: if session.endpoint.host == muxa::HostKind::Rmux {
+                    format!("rmux:{pane_id}")
+                } else {
+                    pane_id.to_string()
+                },
             })
         }
         _ => Err(format!("tmux reported no new window ({reported:?})")),
@@ -1364,14 +1369,14 @@ fn parse_new_window_target(
 
 /// Run the `c` binding and hand back the pane to attach to.
 fn create_window(session: &SessionKey, cwd: Option<&str>) -> std::result::Result<PaneKey, String> {
-    if session.endpoint.host != muxa::HostKind::Tmux {
+    if !crate::mux_control::supported(session.endpoint.host) {
         return Err(format!(
             "{} window creation is not supported",
             session.endpoint.host
         ));
     }
     let args = plan_new_window(&session.session_id, cwd);
-    let output = muxa::tmux::tmux_command_on(Some(&session.endpoint.socket))
+    let output = crate::mux_control::command(&session.endpoint)?
         .args(&args)
         .output()
         .map_err(|error| format!("tmux: {error}"))?;
@@ -1401,7 +1406,7 @@ impl Effects for RealEffects {
             TopologyNodeKey::Window(window) => &window.session.endpoint,
             TopologyNodeKey::Pane(pane) => &pane.window.session.endpoint,
         };
-        if endpoint.host != muxa::HostKind::Tmux {
+        if !crate::mux_control::supported(endpoint.host) {
             return Err(format!("{} topology spawn is not supported", endpoint.host));
         }
         let cwd = std::fs::canonicalize(dir).map_err(|error| format!("resolve {dir}: {error}"))?;
@@ -1434,7 +1439,7 @@ impl Effects for RealEffects {
                 "-F".into(),
                 "#{pane_id}".into(),
                 "-t".into(),
-                window.window_id.clone(),
+                format!("{}:{}", window.session.session_id, window.window_id),
                 "-c".into(),
                 cwd,
                 launch.to_string(),
@@ -1447,13 +1452,16 @@ impl Effects for RealEffects {
                 "-F".into(),
                 "#{pane_id}".into(),
                 "-t".into(),
-                pane.window.window_id.clone(),
+                format!(
+                    "{}:{}",
+                    pane.window.session.session_id, pane.window.window_id
+                ),
                 "-c".into(),
                 cwd,
                 launch.to_string(),
             ],
         };
-        let output = muxa::tmux::tmux_command_on(Some(&endpoint.socket))
+        let output = crate::mux_control::command(endpoint)?
             .args(&args)
             .output()
             .map_err(|error| format!("tmux: {error}"))?;
@@ -1466,13 +1474,13 @@ impl Effects for RealEffects {
             .find(|line| line.starts_with('%'))
             .ok_or_else(|| "tmux returned no pane id".to_string())?
             .to_string();
-        muxa::tmux::run_control_on(
-            Some(&endpoint.socket),
+        crate::mux_control::run(
+            endpoint,
             &["set-option", "-p", "-t", &pane, "@muxa_agent", agent_label],
         )
         .and_then(|()| {
-            muxa::tmux::run_control_on(
-                Some(&endpoint.socket),
+            crate::mux_control::run(
+                endpoint,
                 &["set-option", "-p", "-t", &pane, "@muxa_managed_agent", "1"],
             )
         })
@@ -1498,26 +1506,36 @@ impl Effects for RealEffects {
                 pane.pane_id.as_str(),
             ),
         };
-        if endpoint.host != muxa::HostKind::Tmux {
+        if !crate::mux_control::supported(endpoint.host) {
             return Err(format!(
                 "{} hierarchy close is not supported",
                 endpoint.host
             ));
         }
-        muxa::tmux::run_control_on(Some(&endpoint.socket), &[command, "-t", target])
-            .map_err(|error| error.to_string())
+        crate::mux_control::run(
+            endpoint,
+            &[
+                command,
+                "-t",
+                target.strip_prefix("rmux:").unwrap_or(target),
+            ],
+        )
     }
 
     fn interrupt_pane(&mut self, key: &PaneKey) -> std::result::Result<(), String> {
         let endpoint = &key.window.session.endpoint;
-        if endpoint.host != muxa::HostKind::Tmux {
+        if !crate::mux_control::supported(endpoint.host) {
             return Err(format!("{} pane interrupt is not supported", endpoint.host));
         }
-        muxa::tmux::run_control_on(
-            Some(&endpoint.socket),
-            &["send-keys", "-t", &key.pane_id, "C-c"],
+        crate::mux_control::run(
+            endpoint,
+            &[
+                "send-keys",
+                "-t",
+                key.pane_id.strip_prefix("rmux:").unwrap_or(&key.pane_id),
+                "C-c",
+            ],
         )
-        .map_err(|error| error.to_string())
     }
 
     fn kill_pane(&mut self, pane_id: &str) -> std::result::Result<(), String> {
@@ -1540,17 +1558,14 @@ impl Effects for RealEffects {
 
     fn send_prompt_to(&mut self, pane: &PaneKey, text: &str) -> std::result::Result<(), String> {
         let endpoint = &pane.window.session.endpoint;
-        if endpoint.host != muxa::HostKind::Tmux {
+        if !crate::mux_control::supported(endpoint.host) {
             return Err(format!("{} pane prompt is not supported", endpoint.host));
         }
         send_prompt_to_tmux(
-            &pane.pane_id,
+            pane.pane_id.strip_prefix("rmux:").unwrap_or(&pane.pane_id),
             text,
             PROMPT_SUBMIT_GRACE,
-            |args| {
-                muxa::tmux::run_control_on(Some(&endpoint.socket), args)
-                    .map_err(|error| error.to_string())
-            },
+            |args| crate::mux_control::run(endpoint, args),
             std::thread::sleep,
         )
     }
@@ -1567,8 +1582,8 @@ impl Effects for RealEffects {
         let workspace =
             crate::tmux_work::workspace_id_for_cwd(&cwd).map_err(|error| error.to_string())?;
         let plan = plan_spawn_work(&cwd, &workspace, &work, launch)?;
-        let output = muxa::tmux::tmux_command_scoped()
-            .args(&plan.args)
+        let output = crate::mux_control::ambient_command_with_args(&plan.args)
+            .map_err(|error| error.to_string())?
             .output()
             .map_err(|error| format!("tmux: {error}"))?;
         if !output.status.success() {
@@ -1758,7 +1773,14 @@ fn pipe_to_command(bin: &str, args: &[&str], text: &str) -> std::result::Result<
 }
 
 fn run_status(bin: &str, args: &[&str]) -> std::result::Result<(), String> {
-    match Command::new(bin).args(args).status() {
+    let mut command = if bin == "tmux" {
+        crate::mux_control::ambient_command_with_args(args).map_err(|error| error.to_string())?
+    } else {
+        let mut command = Command::new(bin);
+        command.args(args);
+        command
+    };
+    match command.status() {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => Err(format!(
             "{bin} {} exited with {}",
@@ -3305,8 +3327,23 @@ fn capture_tmux_window(key: WindowKey) -> CapturedWindow {
     use ansi_to_tui::IntoText;
 
     let socket = key.session.endpoint.socket.clone();
-    let (geometries, zoomed) = muxa::tmux::layout::window_panes_on(Some(&socket), &key.window_id);
-    let backend = crate::backend_for_kind(muxa::HostKind::Tmux);
+    let (geometries, zoomed) = if key.session.endpoint.host == muxa::HostKind::Rmux {
+        crate::mux_control::capture(
+            &key.session.endpoint,
+            &[
+                "list-panes",
+                "-t",
+                &key.window_id,
+                "-F",
+                muxa::tmux::layout::PANE_GEOMETRY_FMT,
+            ],
+        )
+        .map(|raw| muxa::tmux::layout::parse_pane_geometry_lines(&raw))
+        .unwrap_or_default()
+    } else {
+        muxa::tmux::layout::window_panes_on(Some(&socket), &key.window_id)
+    };
+    let backend = crate::backend_for_kind(key.session.endpoint.host);
 
     // A slow or wedged pane must not make N panes cost N timeout windows.
     // Each capture is independent, so run them concurrently inside the one
@@ -4148,8 +4185,8 @@ impl App {
             }
             TopologyNodeRef::Pane(pane) => (pane.node_key(), RenameLevel::Pane, pane.title.clone()),
         };
-        if key.endpoint().host != muxa::HostKind::Tmux {
-            self.set_hint("rename is tmux-only for now", HintLevel::Warn);
+        if !crate::mux_control::supported(key.endpoint().host) {
+            self.set_hint("rename is unavailable for this backend", HintLevel::Warn);
             return;
         }
         let cursor = original.chars().count();
@@ -7534,7 +7571,16 @@ pub async fn run(
     // resolved by tmux at the keypress, in the pressing client's context,
     // which no query made from inside a popup can reproduce.
     let (initial_pane, initial_host) = if let Some(pane) = caller_pane {
-        (Some(pane), Some(muxa::HostKind::Tmux))
+        if muxa::backend::rmux::endpoint_from_env().is_some() {
+            let pane = if pane.starts_with("rmux:") {
+                pane
+            } else {
+                format!("rmux:{pane}")
+            };
+            (Some(pane), Some(muxa::HostKind::Rmux))
+        } else {
+            (Some(pane), Some(muxa::HostKind::Tmux))
+        }
     } else {
         backends
             .iter()
@@ -10364,7 +10410,7 @@ fn open_work_up_window(raw: &str, in_tmux: bool) -> std::result::Result<String, 
         .display()
         .to_string();
     let args = work_up_window_args(&exe, &work);
-    let output = muxa::tmux::tmux_command_scoped()
+    let output = crate::mux_control::ambient_command()
         .args(&args)
         .output()
         .map_err(|error| format!("tmux: {error}"))?;
@@ -10443,7 +10489,7 @@ fn rename_label(raw: &str, level: RenameLevel) -> std::result::Result<String, St
 /// sets the pane *title* — the string watch already displays for a pane, and the
 /// only per-pane label tmux persists.
 fn apply_rename(rename: &RenameComposer) -> std::result::Result<String, String> {
-    let socket = Some(rename.key.endpoint().socket.as_str());
+    let endpoint = rename.key.endpoint();
     let name = match rename.level {
         RenameLevel::Window => {
             crate::tmux_work::normalize_window_name(&rename.input).map_err(|e| e.to_string())?
@@ -10451,7 +10497,7 @@ fn apply_rename(rename: &RenameComposer) -> std::result::Result<String, String> 
         RenameLevel::Session | RenameLevel::Pane => rename_label(&rename.input, rename.level)?,
     };
     let run = |args: &[&str]| -> std::result::Result<(), String> {
-        muxa::tmux::run_control_on(socket, args).map_err(|e| e.to_string())
+        crate::mux_control::run(endpoint, args)
     };
     match (&rename.key, rename.level) {
         (TopologyNodeKey::Session(session), _) => {
@@ -10461,8 +10507,8 @@ fn apply_rename(rename: &RenameComposer) -> std::result::Result<String, String> 
             // Session-scoped uniqueness, for the reason tmux targets make it
             // matter: `session:window` matches names by prefix, so a duplicate
             // silently addresses the wrong window.
-            let listing = muxa::tmux::capture_control_on(
-                socket,
+            let listing = crate::mux_control::capture(
+                endpoint,
                 &[
                     "list-windows",
                     "-t",
@@ -10470,8 +10516,7 @@ fn apply_rename(rename: &RenameComposer) -> std::result::Result<String, String> 
                     "-F",
                     "#{window_id}\t#{window_name}",
                 ],
-            )
-            .map_err(|e| e.to_string())?;
+            )?;
             if window_name_taken(&listing, &window.window_id, &name) {
                 return Err(format!(
                     "window name {name:?} is already used in this session"
@@ -10489,7 +10534,13 @@ fn apply_rename(rename: &RenameComposer) -> std::result::Result<String, String> 
             run(&["rename-window", "-t", &window.window_id, &name])?;
         }
         (TopologyNodeKey::Pane(pane), _) => {
-            run(&["select-pane", "-t", &pane.pane_id, "-T", &name])?;
+            run(&[
+                "select-pane",
+                "-t",
+                pane.pane_id.strip_prefix("rmux:").unwrap_or(&pane.pane_id),
+                "-T",
+                &name,
+            ])?;
         }
     }
     Ok(format!("renamed {} to {name:?}", rename.level.label()))
@@ -14719,7 +14770,7 @@ fn render_body(f: &mut Frame, area: Rect, app: &mut App, tree_targets: Option<&[
         selected_tree_target_from(app, tree_targets.unwrap_or_default()).and_then(|target| {
             match &target.key {
                 TopologyNodeKey::Window(key)
-                    if key.session.endpoint.host == muxa::HostKind::Tmux =>
+                    if crate::mux_control::supported(key.session.endpoint.host) =>
                 {
                     Some(key.clone())
                 }
@@ -18042,6 +18093,153 @@ mod tests {
     use time::OffsetDateTime;
 
     #[test]
+    #[ignore = "requires the isolated scripts/rmux-jump-check.py server"]
+    #[allow(clippy::too_many_lines)] // one disposable lifecycle verifies the native command contract
+    fn live_rmux_topology_controls() {
+        let endpoint = muxa::BackendEndpoint {
+            host: muxa::HostKind::Rmux,
+            socket: std::env::var("MUXA_RMUX_TEST_ENDPOINT").unwrap(),
+        };
+        let run = |args: &[&str]| crate::mux_control::capture(&endpoint, args).unwrap();
+        let id = run(&[
+            "new-session",
+            "-dP",
+            "-F",
+            "#{session_id}",
+            "-s",
+            "controls",
+            "/bin/sh",
+        ]);
+        let session = SessionKey {
+            endpoint: endpoint.clone(),
+            session_id: id.trim().into(),
+        };
+        let pane = create_window(&session, None).unwrap();
+        assert!(pane.pane_id.starts_with("rmux:%"));
+        let rename = |key, level, name: &str| {
+            apply_rename(&RenameComposer {
+                key,
+                level,
+                original: String::new(),
+                input: name.into(),
+                cursor: name.len(),
+            })
+            .unwrap()
+        };
+        rename(
+            TopologyNodeKey::Window(pane.window.clone()),
+            RenameLevel::Window,
+            "review work",
+        );
+        assert_eq!(
+            run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &pane.window.window_id,
+                "#{window_name}"
+            ])
+            .trim(),
+            "review-work"
+        );
+        rename(
+            TopologyNodeKey::Pane(pane.clone()),
+            RenameLevel::Pane,
+            "Reviewer",
+        );
+        assert_eq!(
+            run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &pane.window.window_id,
+                "#{pane_title}"
+            ])
+            .trim(),
+            "Reviewer"
+        );
+        rename(
+            TopologyNodeKey::Session(session.clone()),
+            RenameLevel::Session,
+            "controls-renamed",
+        );
+        assert_eq!(
+            run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &session.session_id,
+                "#{session_name}"
+            ])
+            .trim(),
+            "controls-renamed"
+        );
+        let mut effects = RealEffects;
+        effects
+            .spawn_at(
+                &TopologyNodeKey::Window(pane.window.clone()),
+                "/tmp",
+                "",
+                "test",
+                "/bin/sh",
+            )
+            .unwrap();
+        assert_eq!(
+            run(&[
+                "list-panes",
+                "-t",
+                &pane.window.window_id,
+                "-F",
+                "#{pane_id}"
+            ])
+            .lines()
+            .count(),
+            2
+        );
+        let captured = capture_tmux_window(pane.window.clone());
+        assert_eq!(captured.panes.len(), 2);
+        assert!(captured.panes.iter().all(|pane| pane.text.is_some()));
+        effects
+            .send_prompt_to(&pane, "printf '__RMUX_%s__\\n' CONTROL")
+            .unwrap();
+        let backend = muxa::RmuxBackend::with_endpoint(&endpoint.socket);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let output = muxa::PaneBackend::capture_pane(&backend, &pane.pane_id).unwrap();
+            if output.contains("__RMUX_CONTROL__") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prompt never executed: {output}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        effects.interrupt_pane(&pane).unwrap();
+        effects
+            .terminate_node(&TopologyNodeKey::Pane(pane.clone()))
+            .unwrap();
+        assert_eq!(
+            run(&[
+                "list-panes",
+                "-t",
+                &pane.window.window_id,
+                "-F",
+                "#{pane_id}"
+            ])
+            .lines()
+            .count(),
+            1
+        );
+        effects
+            .terminate_node(&TopologyNodeKey::Window(pane.window))
+            .unwrap();
+        effects
+            .terminate_node(&TopologyNodeKey::Session(session))
+            .unwrap();
+    }
+
+    #[test]
     fn state_markers_are_single_cell() {
         let theme = watch_theme(WatchTheme::Classic);
         for state in [
@@ -18519,10 +18717,10 @@ mod tests {
 
     #[test]
     fn new_window_plan_is_prefix_c_on_the_selected_session() {
-        // No `-d`: tmux's own binding leaves the new window current, and the
-        // caller attaches to it immediately afterwards.
+        // Create detached so another terminal's current window never moves;
+        // the invoking client jumps after obtaining its private view.
         let args = plan_new_window("$1", None);
-        assert!(!args.iter().any(|arg| arg == "-d"), "{args:?}");
+        assert!(args.iter().any(|arg| arg == "-d"), "{args:?}");
         assert_eq!(args[0], "new-window");
         assert!(args.windows(2).any(|pair| pair == ["-t", "$1"]), "{args:?}");
         assert!(!args.iter().any(|arg| arg == "-c"), "{args:?}");

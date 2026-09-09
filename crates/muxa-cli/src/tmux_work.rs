@@ -8,6 +8,8 @@
 //! Identity is stored in tmux user options so it survives muxad and MCP
 //! process restarts without adding another database.
 
+use crate::mux_control::Control;
+
 use crate::theme::TableTone;
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
@@ -429,20 +431,29 @@ fn parse_view_session(line: &str) -> Result<ViewSession> {
     })
 }
 
-fn list_view_sessions() -> Result<Vec<ViewSession>> {
-    tmux_output(&["list-sessions", "-F", VIEW_SESSION_FORMAT])?
+fn list_view_sessions(control: &Control) -> Result<Vec<ViewSession>> {
+    control
+        .output(&["list-sessions", "-F", VIEW_SESSION_FORMAT])?
         .lines()
         .filter(|line| !line.is_empty())
         .map(parse_view_session)
         .collect()
 }
 
-fn resolve_view_session(target: &str) -> Result<ViewSession> {
-    parse_view_session(&tmux_output(&[
+fn resolve_view_session(control: &Control, target: &str) -> Result<ViewSession> {
+    let clients = control.output(&["list-clients", "-F", "#{client_name}\t#{session_id}"])?;
+    let session = clients
+        .lines()
+        .find_map(|line| {
+            let (name, id) = line.split_once('\t')?;
+            (name == target).then_some(id)
+        })
+        .unwrap_or(target);
+    parse_view_session(&control.output(&[
         "display-message",
         "-p",
         "-t",
-        target,
+        session,
         VIEW_SESSION_FORMAT,
     ])?)
 }
@@ -519,13 +530,14 @@ struct PreparedView {
 }
 
 fn prepare_view(
+    control: &Control,
     client: &str,
     source: &ViewSession,
     suffix: &str,
     sessions: &[ViewSession],
 ) -> Result<PreparedView> {
     let base_name = view_session_name(view_name_base(source), suffix);
-    let current_id = resolve_view_session(client)?.id;
+    let current_id = resolve_view_session(control, client)?.id;
     let existing = reusable_view(sessions, &base_name, source, &current_id);
     let mut name = base_name;
     if existing.is_none() && sessions.iter().any(|session| session.name == name) {
@@ -541,13 +553,19 @@ fn prepare_view(
         });
     }
 
-    let create = tmux_output(&[
+    let create = control.output(&[
         "new-session",
         "-dP",
         "-F",
         "#{session_id}",
         "-t",
-        &source.id,
+        // rmux 0.10 treats -t as a group/session NAME, not a target
+        // expression: passing $N silently creates an unrelated group.
+        if control.is_rmux() {
+            &source.name
+        } else {
+            &source.id
+        },
         "-s",
         &name,
     ]);
@@ -561,8 +579,8 @@ fn prepare_view(
             // Another hook invocation may have won the create between our
             // listing and `new-session`. Reuse only its unattached view or the
             // session this same client already entered.
-            let refreshed = list_view_sessions()?;
-            let refreshed_client_id = resolve_view_session(client)?.id;
+            let refreshed = list_view_sessions(control)?;
+            let refreshed_client_id = resolve_view_session(control, client)?.id;
             let Some(existing) = reusable_view(&refreshed, &name, source, &refreshed_client_id)
             else {
                 return Err(create_error);
@@ -576,23 +594,28 @@ fn prepare_view(
     }
 }
 
-fn activate_view(client: &str, original_session_id: &str, view: &PreparedView) -> Result<()> {
+fn activate_view(
+    control: &Control,
+    client: &str,
+    original_session_id: &str,
+    view: &PreparedView,
+) -> Result<()> {
     // Move the client in BEFORE `destroy-unattached`. Setting that option on a
     // session that still has no client makes tmux reap it on the spot.
-    if let Err(error) = tmux_status(&["switch-client", "-c", client, "-t", &view.id]) {
+    if let Err(error) = control.run(&["switch-client", "-c", client, "-t", &view.id]) {
         if view.created {
-            let _ = tmux_status(&["kill-session", "-t", &view.id]);
+            let _ = control.run(&["kill-session", "-t", &view.id]);
         }
         return Err(error);
     }
-    if let Err(error) = tmux_status(&["set-option", "-t", &view.id, "destroy-unattached", "on"]) {
+    if let Err(error) = control.run(&["set-option", "-t", &view.id, "destroy-unattached", "on"]) {
         if let Err(rollback) =
-            tmux_status(&["switch-client", "-c", client, "-t", original_session_id])
+            control.run(&["switch-client", "-c", client, "-t", original_session_id])
         {
             bail!("{error}; could not return client to {original_session_id}: {rollback}");
         }
         if view.created {
-            let _ = tmux_status(&["kill-session", "-t", &view.id]);
+            let _ = control.run(&["kill-session", "-t", &view.id]);
         }
         return Err(error);
     }
@@ -611,23 +634,27 @@ fn activate_view(client: &str, original_session_id: &str, view: &PreparedView) -
 /// no view, and creating one anyway would leave a second session in every
 /// listing for nothing.
 pub fn run_workspace_view(args: WorkspaceViewArgs) -> Result<()> {
+    let control = &Control::Ambient;
     let client = match args.client.clone() {
         Some(client) => client,
-        None => tmux_output(&["display-message", "-p", "#{client_name}"])?
+        None => control
+            .output(&["display-message", "-p", "#{client_name}"])?
             .trim()
             .to_string(),
     };
     if client.is_empty() {
         bail!("no tmux client to move; pass --client");
     }
-    let client_session = resolve_view_session(&client)
+    let client_session = resolve_view_session(control, &client)
         .with_context(|| format!("resolve the current session for client {client:?}"))?;
     let target = match args.session.as_deref() {
-        Some(session) => resolve_view_session(session)
+        Some(session) => resolve_view_session(control, session)
             .with_context(|| format!("resolve requested session {session:?}"))?,
         None => client_session.clone(),
     };
-    let other_clients = client_session.attached.saturating_sub(1);
+    let other_clients = target
+        .attached
+        .saturating_sub(u32::from(target.id == client_session.id));
     if other_clients == 0 {
         if args.json {
             println!(
@@ -645,19 +672,23 @@ pub fn run_workspace_view(args: WorkspaceViewArgs) -> Result<()> {
 
     let suffix = match args.client_pid.clone() {
         Some(suffix) => suffix,
-        None => tmux_output(&["display-message", "-p", "-t", &client, "#{client_pid}"])?
-            .trim()
-            .to_string(),
+        None => client_suffix(control, &client)?,
     };
     let suffix = if suffix.is_empty() {
         std::process::id().to_string()
     } else {
         suffix
     };
-    let sessions = list_view_sessions()?;
+    let sessions = list_view_sessions(control)?;
     let source = canonical_view_source(&target, &sessions);
-    let view = prepare_view(&client, &source, &suffix, &sessions)?;
-    activate_view(&client, &client_session.id, &view)?;
+    let window = control.output(&["display-message", "-p", "-t", &target.id, "#{window_id}"])?;
+    let view = prepare_view(control, &client, &source, &suffix, &sessions)?;
+    activate_view(control, &client, &client_session.id, &view)?;
+    control.run(&[
+        "select-window",
+        "-t",
+        &format!("{}:{}", view.id, window.trim()),
+    ])?;
 
     if args.json {
         println!(
@@ -673,6 +704,111 @@ pub fn run_workspace_view(args: WorkspaceViewArgs) -> Result<()> {
         println!("client {client} now views {} as {}", source.name, view.name);
     }
     Ok(())
+}
+
+fn client_suffix(control: &Control, client: &str) -> Result<String> {
+    let listing = control.output(&["list-clients", "-F", "#{client_name}\t#{client_pid}"])?;
+    listing
+        .lines()
+        .find_map(|line| {
+            let (name, pid) = line.split_once('\t')?;
+            (name == client && !pid.is_empty()).then(|| pid.to_string())
+        })
+        .ok_or_else(|| anyhow::anyhow!("client {client:?} is no longer attached"))
+}
+
+/// Choose a private destination before changing the selected window. This
+/// avoids even a transient window switch in another terminal's session.
+pub(crate) fn private_jump_session(
+    control: &Control,
+    client: &str,
+    session: &str,
+    window: &str,
+) -> Result<String> {
+    let current = resolve_view_session(control, client)?;
+    let linked = control.output(&["list-windows", "-t", &current.id, "-F", "#{window_id}"])?;
+    let target = if linked.lines().any(|id| id == window) {
+        current.clone()
+    } else {
+        resolve_view_session(control, session)?
+    };
+    let others = target
+        .attached
+        .saturating_sub(u32::from(current.id == target.id));
+    if others == 0 {
+        return Ok(target.id);
+    }
+    let opted_out = control
+        .output(&["show-options", "-v", "-t", &target.id, "@no_auto_view"])
+        .unwrap_or_default();
+    if !opted_out.trim().is_empty() {
+        return Ok(target.id);
+    }
+    let sessions = list_view_sessions(control)?;
+    let source = canonical_view_source(&target, &sessions);
+    let suffix = client_suffix(control, client)?;
+    let view = prepare_view(control, client, &source, &suffix, &sessions)?;
+    activate_view(control, client, &current.id, &view)?;
+    Ok(view.id)
+}
+
+/// Keep a bare-terminal attach private as well. The owner is retained until
+/// attach exits; unlike destroy-unattached, this cannot reap a view before
+/// the interactive client has connected.
+pub(crate) struct AttachView {
+    pub id: String,
+    control: Control,
+    created: bool,
+}
+
+impl Drop for AttachView {
+    fn drop(&mut self) {
+        if self.created
+            && resolve_view_session(&self.control, &self.id)
+                .is_ok_and(|session| session.attached == 0)
+        {
+            let _ = self.control.run(&["kill-session", "-t", &self.id]);
+        }
+    }
+}
+
+pub(crate) fn prepare_attach_view(control: &Control, target: &str) -> Result<AttachView> {
+    let session = resolve_view_session(control, target)?;
+    let opted_out = control
+        .output(&["show-options", "-v", "-t", &session.id, "@no_auto_view"])
+        .unwrap_or_default();
+    if session.attached == 0 || !opted_out.trim().is_empty() {
+        return Ok(AttachView {
+            id: session.id,
+            control: control.clone(),
+            created: false,
+        });
+    }
+    let sessions = list_view_sessions(control)?;
+    let source = canonical_view_source(&session, &sessions);
+    let name = unique_name(
+        view_session_name(view_name_base(&source), &std::process::id().to_string()),
+        |name| sessions.iter().any(|session| session.name == name),
+    );
+    let id = control.output(&[
+        "new-session",
+        "-dP",
+        "-F",
+        "#{session_id}",
+        "-t",
+        if control.is_rmux() {
+            &source.name
+        } else {
+            &source.id
+        },
+        "-s",
+        &name,
+    ])?;
+    Ok(AttachView {
+        id: id.trim().to_string(),
+        control: control.clone(),
+        created: true,
+    })
 }
 
 pub async fn run_agent_control(args: AgentControlArgs, client: &Client) -> Result<()> {
@@ -1545,6 +1681,35 @@ fn resolve_window_identity(target: Option<&str>) -> Result<WindowIdentity> {
         .ok_or_else(|| {
             anyhow::anyhow!("window target is required outside tmux; pass --window @N")
         })?;
+    if muxa::backend::rmux::endpoint_from_env().is_some() {
+        // A grouped @window may be linked into a different session from the
+        // caller. rmux 0.10's display-message can then report empty identity
+        // fields; enumeration gives each link its explicit session context.
+        let native = target.strip_prefix("rmux:").unwrap_or(&target);
+        let rows = if native.starts_with('@') {
+            tmux_output(&["list-windows", "-a", "-F", WINDOW_IDENTITY_FORMAT])?
+        } else if native.starts_with('%') {
+            let format = format!("#{{pane_id}}\t{WINDOW_IDENTITY_FORMAT}");
+            tmux_output(&["list-panes", "-a", "-F", &format])?
+                .lines()
+                .filter_map(|line| line.split_once('\t'))
+                .filter(|(pane, _)| *pane == native)
+                .map(|(_, identity)| identity.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
+        let mut matches: Vec<_> = rows
+            .lines()
+            .filter_map(parse_window_identity)
+            .filter(|identity| !native.starts_with('@') || identity.window_id == native)
+            .collect();
+        matches.sort_by(|a, b| tmux_session_id_cmp(&a.session_id, &b.session_id));
+        if let Some(identity) = matches.into_iter().next() {
+            return Ok(identity);
+        }
+    }
     let output = tmux_output(&[
         "display-message",
         "-p",
@@ -1552,7 +1717,7 @@ fn resolve_window_identity(target: Option<&str>) -> Result<WindowIdentity> {
         &target,
         WINDOW_IDENTITY_FORMAT,
     ])?;
-    parse_window_identity(output.trim()).ok_or_else(|| {
+    parse_window_identity(output.trim_end_matches(['\r', '\n'])).ok_or_else(|| {
         anyhow::anyhow!("tmux target {target:?} did not resolve to a complete window identity")
     })
 }
@@ -2082,9 +2247,7 @@ pub fn session_name_for_pane(pane: &str) -> Result<String> {
 
 pub fn cleanup_pane(pane: &str) {
     if validate_pane_id(pane).is_ok() {
-        let _ = muxa::tmux::tmux_command_scoped()
-            .args(["kill-pane", "-t", pane])
-            .status();
+        let _ = tmux_status(&["kill-pane", "-t", pane]);
     }
 }
 
@@ -2438,43 +2601,11 @@ fn set_option(scope: OptionScope, target: &str, key: &str, value: &str) -> Resul
 }
 
 fn tmux_status(args: &[&str]) -> Result<()> {
-    let output = muxa::tmux::tmux_command_scoped()
-        .args(args)
-        .output()
-        .with_context(|| format!("run tmux {}", args.first().unwrap_or(&"command")))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    bail!(
-        "tmux {} failed{}",
-        args.first().unwrap_or(&"command"),
-        if stderr.is_empty() {
-            String::new()
-        } else {
-            format!(": {stderr}")
-        }
-    )
+    Control::Ambient.run(args)
 }
 
 fn tmux_output(args: &[&str]) -> Result<String> {
-    let output = muxa::tmux::tmux_command_scoped()
-        .args(args)
-        .output()
-        .with_context(|| format!("run tmux {}", args.first().unwrap_or(&"command")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        bail!(
-            "tmux {} failed{}",
-            args.first().unwrap_or(&"command"),
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Control::Ambient.output(args)
 }
 
 fn tmux_output_allow_no_server(args: &[&str]) -> Result<String> {

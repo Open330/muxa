@@ -38,11 +38,21 @@
 //! attached at all — cannot, and neither case leaves the user anything to
 //! read. See that type.
 
-use super::{command_output_with_timeout, tmux_command, TMUX_COMMAND_TIMEOUT};
+use super::{command_output_with_timeout, TMUX_COMMAND_TIMEOUT};
+
+// These helpers describe the invoking terminal. Explicit tmux endpoint
+// queries below continue to use the native tmux transport.
+fn tmux_command() -> std::process::Command {
+    if let Some(socket) = crate::backend::rmux::endpoint_from_env() {
+        crate::RmuxBackend::with_endpoint(socket).command(None)
+    } else {
+        super::tmux_command_scoped()
+    }
+}
 
 /// `tmux -F` columns behind [`current_window_panes`]. Tab-separated,
 /// parsed by [`parse_pane_geometry_lines`].
-const PANE_GEOMETRY_FMT: &str = "#{pane_id}\t#{pane_index}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{window_zoomed_flag}\t#{pane_current_command}\t#{@muxa_agent_alias}";
+pub const PANE_GEOMETRY_FMT: &str = "#{pane_id}\t#{pane_index}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{window_zoomed_flag}\t#{pane_current_command}\t#{@muxa_agent_alias}";
 
 /// `tmux -F` columns behind [`current_window_frame`].
 const FRAME_FMT: &str =
@@ -210,7 +220,8 @@ impl WindowTarget {
     /// or on a malformed env, where queries go unscoped — no worse than
     /// having never pinned anything.
     pub fn resolve() -> Self {
-        let session = std::env::var("TMUX")
+        let session = std::env::var("RMUX")
+            .or_else(|_| std::env::var("TMUX"))
             .ok()
             .and_then(|raw| super::parse_tmux_session_target(&raw));
         let window = session.as_deref().and_then(window_id_for);

@@ -296,14 +296,14 @@ fn apply_source_tmux(path: &Path, dry_run: bool, report: &mut ApplyReport) -> Re
     }
     // Only attempt if there's a tmux server running; otherwise
     // `tmux source-file` errors with "no server running".
-    let server_up = muxa::tmux::tmux_command()
+    let server_up = crate::mux_control::ambient_command()
         .arg("info")
         .output()
         .is_ok_and(|o| o.status.success());
     if !server_up {
         return Ok(());
     }
-    let status = muxa::tmux::tmux_command()
+    let status = crate::mux_control::ambient_command()
         .arg("source-file")
         .arg(path)
         .status()

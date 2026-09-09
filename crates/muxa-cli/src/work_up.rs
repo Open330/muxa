@@ -1478,16 +1478,21 @@ fn state_label(state: AgentState) -> &'static str {
 }
 
 fn send_prompt(pane: &str, text: &str) -> Result<()> {
-    if !muxa::tmux::send_text(pane, text) {
+    let sent = if muxa::backend::rmux::endpoint_from_env().is_some() {
+        muxa::PaneBackend::send_text(&muxa::RmuxBackend::new(), pane, text)
+    } else {
+        muxa::tmux::send_text(pane, text)
+    };
+    if !sent {
         bail!("tmux refused the prompt; the pane may be gone");
     }
     // The agent CLIs treat text and submit as separate events; typing into
     // a TUI that is still redrawing swallows the newline.
     std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
-    let output = muxa::tmux::tmux_command_scoped()
-        .args(["send-keys", "-t", pane, "Enter"])
-        .output()
-        .context("submit prompt")?;
+    let output =
+        crate::mux_control::ambient_command_with_args(&["send-keys", "-t", pane, "Enter"])?
+            .output()
+            .context("submit prompt")?;
     if !output.status.success() {
         bail!("tmux could not submit the prompt to {pane}");
     }
@@ -1495,10 +1500,10 @@ fn send_prompt(pane: &str, text: &str) -> Result<()> {
 }
 
 fn apply_layout(window: &str, layout: &str) -> Result<()> {
-    let output = muxa::tmux::tmux_command_scoped()
-        .args(["select-layout", "-t", window, layout])
-        .output()
-        .context("apply pipeline layout")?;
+    let output =
+        crate::mux_control::ambient_command_with_args(&["select-layout", "-t", window, layout])?
+            .output()
+            .context("apply pipeline layout")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         bail!("tmux select-layout {layout} failed: {stderr}");

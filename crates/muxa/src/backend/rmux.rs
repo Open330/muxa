@@ -71,10 +71,61 @@ impl RmuxBackend {
         rmux_command(endpoint.or(self.endpoint.as_deref()))
     }
 
-    /// Execute a bounded control command, preserving the server error.
-    pub fn run_control(&self, args: &[&str]) -> Result<(), String> {
+    /// Qualify native ids with a session before passing them to rmux. Linked
+    /// windows repeat in a session group, and rmux 0.10 rejects their bare
+    /// @N targets as ambiguous for several mutation commands.
+    pub fn control_command(&self, args: &[&str]) -> Result<Command, String> {
+        let mut args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        if let Some(index) = args.iter().position(|arg| arg == "-t") {
+            if let Some(raw) = args.get(index + 1) {
+                let target = strip_prefix(raw);
+                let pane_target = target.starts_with('%');
+                if pane_target || target.starts_with('@') {
+                    let mut query = self.command(None);
+                    query.args([
+                        if pane_target {
+                            "list-panes"
+                        } else {
+                            "list-windows"
+                        },
+                        "-a",
+                        "-F",
+                        "#{session_id}\t#{window_id}\t#{pane_id}",
+                    ]);
+                    let output = successful_stdout(query).ok_or("cannot resolve rmux target")?;
+                    let mut matches: Vec<_> = output
+                        .lines()
+                        .filter_map(|line| {
+                            let fields: Vec<_> = line.split('\t').collect();
+                            if fields.len() != 3
+                                || fields[if pane_target { 2 } else { 1 }] != target
+                            {
+                                return None;
+                            }
+                            let sequence = fields[0].trim_start_matches('$').parse::<u64>().ok()?;
+                            let qualified = if pane_target {
+                                format!("{}:{}.{}", fields[0], fields[1], fields[2])
+                            } else {
+                                format!("{}:{}", fields[0], fields[1])
+                            };
+                            Some((sequence, qualified))
+                        })
+                        .collect();
+                    matches.sort_by_key(|(sequence, _)| *sequence);
+                    if let Some((_, qualified)) = matches.into_iter().next() {
+                        args[index + 1] = qualified;
+                    }
+                }
+            }
+        }
         let mut command = self.command(None);
         command.args(args);
+        Ok(command)
+    }
+
+    /// Execute a bounded control command, preserving the server error.
+    pub fn run_control(&self, args: &[&str]) -> Result<(), String> {
+        let command = self.control_command(args)?;
         let output = command_output(command, None).map_err(|error| error.to_string())?;
         if output.status.success() {
             Ok(())
@@ -83,19 +134,28 @@ impl RmuxBackend {
         }
     }
 
-    fn scan_panes(&self, target: Option<&str>) -> PaneObservation {
-        let mut command = self.command(None);
-        command.arg("list-panes");
-        if let Some(target) = target {
-            command.args(["-t", strip_prefix(target)]);
-        } else {
-            command.arg("-a");
+    /// Read a bounded control response from this exact rmux endpoint.
+    pub fn capture_control(&self, args: &[&str]) -> Result<String, String> {
+        let command = self.control_command(args)?;
+        let output = command_output(command, None).map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
         }
-        // `RmuxBackend::new()` is endpoint-less in a long-running daemon.
-        // Ask rmux to stamp its resolved socket on every row so the resulting
-        // pane identity still routes later control calls to the right server.
+        String::from_utf8(output.stdout).map_err(|error| error.to_string())
+    }
+
+    fn scan_panes(&self, target: Option<&str>) -> PaneObservation {
         let format = format!("{PANE_FMT}\t#{{socket_path}}");
-        command.args(["-F", &format]);
+        let mut args = vec!["list-panes"];
+        if let Some(target) = target {
+            args.extend(["-t", strip_prefix(target)]);
+        } else {
+            args.push("-a");
+        }
+        args.extend(["-F", &format]);
+        let Ok(command) = self.control_command(&args) else {
+            return PaneObservation::incomplete(Vec::new());
+        };
 
         let output = match command_output(command, None) {
             Ok(output) => output,
@@ -128,8 +188,14 @@ impl RmuxBackend {
     }
 
     fn capture_on(&self, endpoint: Option<&str>, pane_id: &str) -> Option<String> {
-        let mut command = self.command(endpoint);
-        command.args(["capture-pane", "-ep", "-t", strip_prefix(pane_id)]);
+        let scoped = Self {
+            endpoint: endpoint
+                .map(str::to_string)
+                .or_else(|| self.endpoint.clone()),
+        };
+        let command = scoped
+            .control_command(&["capture-pane", "-ep", "-t", strip_prefix(pane_id)])
+            .ok()?;
         successful_stdout(command)
     }
 
@@ -146,15 +212,24 @@ impl RmuxBackend {
             return false;
         }
 
-        let mut paste = self.command(endpoint);
-        paste.args([
+        let scoped = Self {
+            endpoint: endpoint
+                .map(str::to_string)
+                .or_else(|| self.endpoint.clone()),
+        };
+        let Ok(paste) = scoped.control_command(&[
             "paste-buffer",
             "-p",
             "-b",
             &buffer,
             "-t",
             strip_prefix(pane_id),
-        ]);
+        ]) else {
+            let mut delete = self.command(endpoint);
+            delete.args(["delete-buffer", "-b", &buffer]);
+            let _ = command_output(delete, None);
+            return false;
+        };
         let pasted = command_output(paste, None).is_ok_and(|o| o.status.success());
 
         let mut delete = self.command(endpoint);
@@ -210,9 +285,8 @@ impl PaneBackend for RmuxBackend {
     }
 
     fn focus_pane(&self, pane_id: &str) -> bool {
-        let mut command = self.command(None);
-        command.args(["select-pane", "-t", strip_prefix(pane_id)]);
-        command_output(command, None).is_ok_and(|o| o.status.success())
+        self.run_control(&["select-pane", "-t", strip_prefix(pane_id)])
+            .is_ok()
     }
 
     fn send_text(&self, pane_id: &str, text: &str) -> bool {
@@ -223,9 +297,14 @@ impl PaneBackend for RmuxBackend {
         if text.contains('\n') || text.ends_with(';') {
             return self.paste_text_on(endpoint, pane_id, text);
         }
-        let mut command = self.command(endpoint);
-        command.args(["send-keys", "-t", strip_prefix(pane_id), "-l", "--", text]);
-        command_output(command, None).is_ok_and(|o| o.status.success())
+        let scoped = Self {
+            endpoint: endpoint
+                .map(str::to_string)
+                .or_else(|| self.endpoint.clone()),
+        };
+        scoped
+            .run_control(&["send-keys", "-t", strip_prefix(pane_id), "-l", "--", text])
+            .is_ok()
     }
 
     fn capture_pane_on(&self, endpoint: Option<&str>, pane_id: &str) -> Option<String> {
@@ -275,13 +354,13 @@ fn parse_pane_observation(stdout: &str, endpoint: Option<&str>) -> PaneObservati
     let complete = stdout
         .lines()
         .filter(|line| !line.is_empty())
-        .all(|line| line.split('\t').count() >= 13);
+        .all(|line| line.split('\t').count() > PANE_FMT.split('\t').count());
     let mut panes = Vec::new();
     for line in stdout.lines().filter(|line| !line.is_empty()) {
         let columns = line.split('\t').collect::<Vec<_>>();
         let row_endpoint = endpoint.or_else(|| {
             columns
-                .get(12)
+                .get(PANE_FMT.split('\t').count())
                 .copied()
                 .filter(|value| !value.trim().is_empty())
         });
@@ -301,6 +380,11 @@ fn rmux_command(endpoint: Option<&str>) -> Command {
     let mut command = Command::new(rmux_binary());
     command.env("LC_ALL", "en_US.UTF-8");
     if let Some(endpoint) = endpoint.filter(|endpoint| !endpoint.trim().is_empty()) {
+        // rmux 0.10 can let an inherited pane override an explicit grouped
+        // window target in display-message, returning empty identity fields.
+        // Commands on a recorded endpoint use their own targets; retain RMUX
+        // for session context, but never borrow the calling pane's identity.
+        command.env_remove("RMUX_PANE").env_remove("TMUX_PANE");
         command.arg("-S").arg(endpoint);
     }
     command
@@ -413,6 +497,28 @@ mod tests {
     use super::*;
     use crate::backend::ObservationCompleteness;
 
+    fn full_row(socket: &str) -> String {
+        let mut cols = vec![""; PANE_FMT.split('\t').count()];
+        cols[..12].copy_from_slice(&[
+            "%7",
+            "alpha",
+            "2",
+            "1",
+            "/dev/pts/3",
+            "codex",
+            "work",
+            "4242",
+            "/tmp/project",
+            "$3",
+            "@9",
+            "editor",
+        ]);
+        cols[12] = "workspace-is-not-a-socket";
+        cols[32] = "alpha-group";
+        cols.push(socket);
+        cols.join("\t")
+    }
+
     #[test]
     fn endpoint_parser_reads_native_rmux_tuple() {
         assert_eq!(
@@ -424,14 +530,15 @@ mod tests {
 
     #[test]
     fn parser_namespaces_ids_and_retains_endpoint() {
-        let input = "%7\talpha\t2\t1\t/dev/pts/3\tcodex\twork\t4242\t/tmp/project\t$3\t@9\teditor\t/tmp/row.sock\n";
-        let observed = parse_pane_observation(input, Some("/tmp/rmux.sock"));
+        let input = full_row("/tmp/row.sock");
+        let observed = parse_pane_observation(&input, Some("/tmp/rmux.sock"));
         assert_eq!(observed.completeness, ObservationCompleteness::Complete);
         assert_eq!(observed.panes.len(), 1);
         let pane = &observed.panes[0];
         assert_eq!(pane.pane_id, "rmux:%7");
         assert_eq!(pane.session_id, "$3");
         assert_eq!(pane.window_id, "@9");
+        assert_eq!(pane.session_group.as_deref(), Some("alpha-group"));
         assert_eq!(pane.current_path, "/tmp/project");
         assert_eq!(pane.pane_pid, 4242);
         assert_eq!(pane.socket.as_deref(), Some("/tmp/rmux.sock"));
@@ -439,8 +546,8 @@ mod tests {
 
     #[test]
     fn parser_uses_formatted_socket_when_backend_is_endpointless() {
-        let input = "%7\talpha\t2\t1\t/dev/pts/3\tcodex\twork\t4242\t/tmp/project\t$3\t@9\teditor\t/tmp/resolved.sock\n";
-        let observed = parse_pane_observation(input, None);
+        let input = full_row("/tmp/resolved.sock");
+        let observed = parse_pane_observation(&input, None);
         assert_eq!(observed.completeness, ObservationCompleteness::Complete);
         assert_eq!(
             observed.panes[0].socket.as_deref(),

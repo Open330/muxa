@@ -21,7 +21,7 @@ fn muxa() -> PathBuf {
 }
 
 fn tmux_installed() -> bool {
-    Command::new("tmux")
+    muxa::tmux::tmux_command()
         .arg("-V")
         .output()
         .is_ok_and(|out| out.status.success())
@@ -58,7 +58,7 @@ impl Server {
     }
 
     fn tmux(&self, args: &[&str]) -> Result<String, String> {
-        let out = Command::new("tmux")
+        let out = muxa::tmux::tmux_command()
             .arg("-f")
             .arg("/dev/null")
             .arg("-S")
@@ -115,9 +115,13 @@ fn run_muxa(server: &Server, stub_bin: &Path, args: &[&str]) -> std::process::Ou
         .args(args)
         .env("PATH", path)
         .env("MUXA_TMUX_SOCKET", &server.socket)
+        .env_remove("RMUX")
+        .env_remove("RMUX_PANE")
         // A socket no daemon answers: these paths mark tmux and report, and
         // must not reach the operator's running muxad.
         .env("MUXA_SOCKET", server.dir.path().join("muxad.sock"))
+        .env_remove("RMUX")
+        .env_remove("RMUX_PANE")
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .output()

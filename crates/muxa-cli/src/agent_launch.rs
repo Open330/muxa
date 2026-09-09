@@ -643,8 +643,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         .filter(|prompt| !prompt.trim().is_empty());
     let command = request.agent.launch_command(&request.options, prompt);
     let args = tmux_args(&request, &cwd, &command)?;
-    let output = muxa::tmux::tmux_command_scoped()
-        .args(&args)
+    let output = crate::mux_control::ambient_command_with_args(&args)?
         .output()
         .context("run tmux agent launcher")?;
     if !output.status.success() {
@@ -959,10 +958,15 @@ fn resolve_window_session(target: &str) -> Result<String> {
 /// refused with. The outer `Result` is reserved for not being able to run tmux
 /// at all, which is not something another spelling can recover from.
 fn session_id_of(target: &str) -> Result<std::result::Result<String, String>> {
-    let output = muxa::tmux::tmux_command_scoped()
-        .args(["display-message", "-p", "-t", target, "#{session_id}"])
-        .output()
-        .context("resolve tmux window target")?;
+    let output = crate::mux_control::ambient_command_with_args(&[
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "#{session_id}",
+    ])?
+    .output()
+    .context("resolve tmux window target")?;
     if !output.status.success() {
         return Ok(Err(String::from_utf8_lossy(&output.stderr)
             .trim()
@@ -1099,7 +1103,7 @@ fn sanitize_session_name(name: &str) -> String {
 }
 
 fn existing_session_names() -> Vec<String> {
-    muxa::tmux::tmux_command_scoped()
+    crate::mux_control::ambient_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
         .map(|output| {
