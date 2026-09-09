@@ -86,11 +86,13 @@ use crate::message_skill::{
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Slower fallback cadence when streaming `Subscribe` is wired. Push
-/// updates land in ~milliseconds, so the polling tick only exists
-/// to catch up after broadcast `Lagged` drops or transient
-/// connection blips. 5 s gives plenty of headroom while keeping
-/// idle CPU effectively zero.
+/// state updates land in ~milliseconds; this tick refreshes topology and
+/// catches up after dropped transitions. Same-state activity has its own
+/// cheaper, faster snapshot cadence below.
 const STREAMING_FALLBACK_INTERVAL: Duration = Duration::from_secs(5);
+/// Same-state activity is absent from the transition stream. Refresh agent
+/// records independently of the more expensive multiplexer topology scan.
+const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// Max time to wait for a single keystroke when the input buffer is
 /// empty. ~60 Hz so a press feels immediate without burning CPU on an
 /// idle terminal. Held keys / fast typing are absorbed by the
@@ -986,6 +988,7 @@ impl WatchRow {
 /// error is the "daemon not reachable" variant so the renderer can drop the
 /// `daemon error: ` prefix — otherwise the message reads
 /// "daemon error: daemon not reachable at …" which is awkward.
+#[derive(Clone)]
 pub(crate) struct DaemonError {
     pub message: String,
     pub self_describing: bool,
@@ -3843,6 +3846,10 @@ impl App {
 
     fn resort_rows_preserving_selection(&mut self) {
         let selected = self.selection_identity_for_rebuild();
+        self.resort_rows_restoring_selection(selected);
+    }
+
+    fn resort_rows_restoring_selection(&mut self, selected: Option<RowIdentity>) {
         if self.uses_tree() {
             self.restore_selection(selected);
             return;
@@ -6953,6 +6960,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 pub(crate) enum RefreshOutcome {
     Full(FullRefresh),
     SingleAgent(Agent),
+    Agents(Vec<Agent>),
 }
 
 pub(crate) struct FullRefresh {
@@ -7010,7 +7018,21 @@ pub(crate) fn apply_outcome(app: &mut App, outcome: RefreshOutcome) {
 fn apply_outcome_inner(app: &mut App, outcome: RefreshOutcome) {
     match outcome {
         RefreshOutcome::Full(full) => apply_full(app, full),
+        RefreshOutcome::Agents(agents) => {
+            apply_full(
+                app,
+                FullRefresh {
+                    agents,
+                    panes: app.panes.clone(),
+                    sessions: app.sessions.clone(),
+                    session_activity: app.session_activity.clone(),
+                    pipeline_runs: app.pipeline_runs.clone(),
+                    error: app.last_error.clone(),
+                },
+            );
+        }
         RefreshOutcome::SingleAgent(agent) => {
+            let selected = app.selection_identity_for_rebuild();
             apply_single_agent(app, agent);
             app.topology = build_watch_topology(
                 &app.current_agents(),
@@ -7029,7 +7051,7 @@ fn apply_outcome_inner(app: &mut App, outcome: RefreshOutcome) {
             // "all rows jumped" jitter that the original per-push full-snapshot
             // refresh caused. Selection is pinned by `pane_id`, so the cursor
             // stays on the same agent.
-            app.resort_rows_preserving_selection();
+            app.resort_rows_restoring_selection(selected);
         }
     }
 }
@@ -7392,8 +7414,9 @@ async fn compute_refresh(
 ///
 /// Generic over the fetcher so unit tests can swap in a closure that
 /// returns a canned `RefreshOutcome` without touching tmux or the daemon.
-async fn refresh_task<F, Fut, S>(
+async fn refresh_task<F, Fut, S, A, AFut>(
     mut fetch: F,
+    mut fetch_activity: A,
     mut wake: mpsc::Receiver<()>,
     out: mpsc::Sender<RefreshOutcome>,
     sub_init: S,
@@ -7401,6 +7424,8 @@ async fn refresh_task<F, Fut, S>(
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = RefreshOutcome> + Send,
     S: Future<Output = Option<muxa::ipc::TransitionStream>> + Send + 'static,
+    A: FnMut() -> AFut + Send + 'static,
+    AFut: Future<Output = Option<Vec<Agent>>> + Send,
 {
     // Acquire the streaming subscription as the first thing the
     // background task does — `run` doesn't await it any more, so the
@@ -7425,6 +7450,9 @@ async fn refresh_task<F, Fut, S>(
     // The first `tick()` fires immediately. We don't want a duplicate
     // refresh right after the priming snapshot in `run`, so consume it.
     tick.tick().await;
+    let mut activity_tick = tokio::time::interval(ACTIVITY_REFRESH_INTERVAL);
+    activity_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    activity_tick.tick().await;
 
     loop {
         // Reduce subscribe-arm noise: the `if sub.is_some()` guard
@@ -7433,6 +7461,13 @@ async fn refresh_task<F, Fut, S>(
         // never resolve but tokio still polls it once per loop, which
         // would burn a tiny bit of CPU and obscure traces.
         tokio::select! {
+            _ = activity_tick.tick(), if sub.is_some() => {
+                if let Some(agents) = fetch_activity().await {
+                    if out.send(RefreshOutcome::Agents(agents)).await.is_err() {
+                        return;
+                    }
+                }
+            }
             _ = tick.tick() => {
                 // Periodic full sync — catches up after lagged drops
                 // or any state we missed via the push stream.
@@ -7646,12 +7681,17 @@ pub async fn run(
         }
     };
 
+    let activity_client = client.clone();
     let bg = tokio::spawn(refresh_task(
         move || {
             let client = bg_client.clone();
             let backends = bg_backends.clone();
             let session_activity_path = bg_session_activity_path.clone();
             async move { compute_refresh(&client, &backends, session_activity_path).await }
+        },
+        move || {
+            let client = activity_client.clone();
+            async move { client.snapshot().await.ok() }
         },
         wake_rx,
         outcome_tx,
@@ -19322,6 +19362,72 @@ mod tests {
     }
 
     #[test]
+    fn latest_updates_reorder_windows_without_changing_selected_target() {
+        for (view, snapshot) in [
+            (WatchView::Window, false),
+            (WatchView::Pane, false),
+            (WatchView::Window, true),
+            (WatchView::Pane, true),
+        ] {
+            let panes = vec![
+                fake_topology_pane("default", "$1", "alpha", "@1", "AUTH", 0, "%1", 0),
+                fake_topology_pane("default", "$1", "alpha", "@2", "DOCS", 1, "%2", 0),
+            ];
+            let auth = topology_agent("auth", "%1", "default", AgentState::Working, "auth", 1);
+            let docs = topology_agent("docs", "%2", "default", AgentState::Working, "docs", 2);
+            let mut app = topology_watch(view, vec![auth.clone(), docs], panes);
+            app.apply_sort_preset(WatchSortPreset::Latest);
+            let selected = app
+                .tree_targets()
+                .into_iter()
+                .find(|target| match &target.key {
+                    TopologyNodeKey::Window(key) => {
+                        view == WatchView::Window && key.window_id == "@2"
+                    }
+                    TopologyNodeKey::Pane(key) => view == WatchView::Pane && key.pane_id == "%2",
+                    TopologyNodeKey::Session(_) => false,
+                })
+                .unwrap()
+                .key;
+            let index = app
+                .tree_targets()
+                .iter()
+                .position(|target| target.key == selected)
+                .unwrap();
+            app.table_state.select(Some(index));
+            let mut updated = auth;
+            updated.last_activity_at += time::Duration::minutes(10);
+            let outcome = if snapshot {
+                let agents = app
+                    .current_agents()
+                    .into_iter()
+                    .map(|agent| {
+                        if agent.session_id == updated.session_id {
+                            updated.clone()
+                        } else {
+                            agent
+                        }
+                    })
+                    .collect();
+                RefreshOutcome::Agents(agents)
+            } else {
+                RefreshOutcome::SingleAgent(updated)
+            };
+            apply_outcome(&mut app, outcome);
+            let windows = app.sorted_windows(app.topology.sessions[0].windows.iter());
+            assert_eq!(
+                windows[0].key.window_id, "@1",
+                "latest activity should move AUTH first"
+            );
+            assert_eq!(
+                app.selected_node_key(),
+                Some(selected),
+                "push must preserve the selected target in {view:?}"
+            );
+        }
+    }
+
+    #[test]
     fn initial_pane_selects_nearest_visible_ancestor_after_empty_first_frame() {
         let panes = vec![
             fake_topology_pane("default", "$1", "alpha", "@1", "AUTH", 0, "%1", 0),
@@ -24694,6 +24800,7 @@ sort = ["state"]
                 let n = calls_for_fetch.fetch_add(1, Ordering::SeqCst);
                 async move { outcome_with_marker(&format!("call-{n}")) }
             },
+            || async { None },
             wake_rx,
             out_tx,
             async { None },
@@ -24733,6 +24840,7 @@ sort = ["state"]
                 calls_for_fetch.fetch_add(1, Ordering::SeqCst);
                 async { outcome_with_marker("tick") }
             },
+            || async { None },
             wake_rx,
             out_tx,
             async { None },
@@ -24751,6 +24859,64 @@ sort = ["state"]
 
         drop(wake_tx);
         task.await.expect("refresh_task joins on shutdown");
+    }
+
+    #[tokio::test]
+    async fn streaming_activity_refresh_does_not_wait_for_full_topology_poll() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("subscribe.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            for expected in ["hello", "subscribe"] {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["kind"], expected);
+                writer.write_all(b"{\"ok\":true}\n").await.unwrap();
+            }
+            std::future::pending::<()>().await;
+        });
+        let stream = Client::new(socket).subscribe().await.unwrap();
+        let full_calls = Arc::new(AtomicUsize::new(0));
+        let count = full_calls.clone();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let task = tokio::spawn(refresh_task(
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async { outcome_with_marker("full") }
+            },
+            || async {
+                Some(vec![fake_agent_at(
+                    "activity",
+                    "%1",
+                    OffsetDateTime::now_utc(),
+                )])
+            },
+            wake_rx,
+            out_tx,
+            async move { Some(stream) },
+        ));
+        let outcome = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let RefreshOutcome::Agents(agents) = outcome else {
+            panic!("expected lightweight activity refresh")
+        };
+        assert_eq!(agents[0].session_id, "activity");
+        assert_eq!(full_calls.load(Ordering::SeqCst), 0);
+        drop(wake_tx);
+        task.await.unwrap();
+        server.abort();
     }
 
     // ---- detail row -------------------------------------------------------

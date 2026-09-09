@@ -468,6 +468,11 @@ override입니다. 기본값은 attention state를 먼저 띄운 뒤 workspace�
 각 group 안에서 가장 최근 activity가 있는 work를 위로 올립니다. `activity`와
 `act`는 `latest` alias로 계속 동작합니다.
 
+`latest`는 창 방문 순서가 아니라 에이전트의 최근 활동 순서입니다. 상태 전환은
+즉시 반영하고, 같은 상태에서 이어지는 활동은 멀티플렉서의 창 목록을 다시 조회하지
+않고 1초 주기로 갱신합니다. 같은 세션의 다른 창이 앞으로 이동해도 선택한
+세션·창·pane은 고유 식별자를 기준으로 유지합니다.
+
 ## Detail Row
 
 ```toml

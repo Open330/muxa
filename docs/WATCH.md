@@ -535,6 +535,12 @@ you press a runtime sort key. The default floats attention states first,
 then groups by workspace and floats the most recently active work in each
 group. `activity` and `act` remain accepted aliases for `latest`.
 
+`latest` follows agent activity, not the order in which you visit windows.
+State transitions update immediately; activity within the same state is
+refreshed every second without rescanning multiplexer topology. A refresh or
+re-sort keeps the selected session, window, or pane selected by its stable key,
+even when another window in the same session moves ahead of it.
+
 ## Detail Row
 
 ```toml
