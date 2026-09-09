@@ -19,7 +19,7 @@ pub const ENV_BLOCK_ID: &str = "tmux-env";
 
 /// The body that goes inside the `tmux-popup` marker block.
 ///
-/// `muxa watch` gets the borderless full-client treatment (`-B`, `100%`,
+/// `muxa watch` gets the borderless full-client treatment (`-B`, full width,
 /// origin `0,0`) rather than an inset box, because its own wide-screen
 /// inspector needs 120 columns of *inner* width. An inset popup spends
 /// that budget twice over — `-w 90%` of a 134-column terminal is 120,
@@ -27,7 +27,7 @@ pub const ENV_BLOCK_ID: &str = "tmux-env";
 /// unreachable on any terminal under ~136 columns, which is most of
 /// them. The dashboard has no such threshold and stays inset.
 pub const POPUP_BODY: &str = r#"# Muxa popups: local watch, Fleet watch, and dashboard.
-# `muxa watch` is borderless and full-client so its wide-screen inspector
+# `muxa watch` is borderless and full-width so its wide-screen inspector
 # (120-column minimum, Alt-I) has the room to open. The run-shell wrapper
 # is what expands #{client_name}/#{pane_id} — display-popup itself passes
 # its command string through verbatim (measured on tmux 3.4), and an
@@ -36,8 +36,10 @@ pub const POPUP_BODY: &str = r#"# Muxa popups: local watch, Fleet watch, and das
 # at the keypress, in the pressing client's context — the only moment
 # that identity is unambiguous; from inside the popup every unpinned
 # tmux query can answer for another terminal.
-bind-key s run-shell -b "tmux display-popup -c '#{client_name}' -B -E -w 100% -h 100% -x 0 -y 0 \"muxa watch --caller-client '#{client_name}' --caller-pane '#{pane_id}'\""
-bind-key S run-shell -b "tmux display-popup -c '#{client_name}' -B -E -w 100% -h 100% -x 0 -y 0 \"muxa watch --fleet --caller-client '#{client_name}' --caller-pane '#{pane_id}'\""
+# Reserve the bottom row for the host status bar: rmux 0.10 refreshes it
+# even while a popup is open, overwriting a full-height watch footer.
+bind-key s run-shell -b "tmux display-popup -c '#{client_name}' -B -E -w 100% -h 99% -x 0 -y 0 \"muxa watch --caller-client '#{client_name}' --caller-pane '#{pane_id}'\""
+bind-key S run-shell -b "tmux display-popup -c '#{client_name}' -B -E -w 100% -h 99% -x 0 -y 0 \"muxa watch --fleet --caller-client '#{client_name}' --caller-pane '#{pane_id}'\""
 bind-key D display-popup -E -w 95% -h 90% "muxa dashboard""#;
 
 /// The body that goes inside the `tmux-peek` marker block.

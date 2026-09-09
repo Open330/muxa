@@ -37,11 +37,10 @@ const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 /// each tick, wiping `last_prompt` on every row.
 ///
 /// Resolution order:
-/// 1. `$PATH` lookup via `tmux -V`. Cheap (~5 ms once) and the steady-state
-///    path everywhere except launchd.
-/// 2. Known Homebrew install prefixes — Apple Silicon then Intel.
-/// 3. Bare `tmux` as a last-resort sentinel so the eventual error message
-///    matches the prior behavior.
+/// 1. Inspect `$PATH` candidates via `-V`, accepting only native `tmux` output.
+///    rmux puts a compatibility executable named `tmux` first on its PATH.
+/// 2. Known Homebrew and system install prefixes.
+/// 3. A missing absolute path so failure cannot execute a compatibility shim.
 ///
 /// Build a `Command` for shelling out to tmux with the resolved binary
 /// path and a UTF-8 locale pre-applied.
@@ -60,24 +59,56 @@ const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 pub fn tmux_command() -> Command {
     let mut cmd = Command::new(tmux_binary());
     cmd.env("LC_ALL", "en_US.UTF-8");
+    // RMUX exports TMUX for compatibility; native tmux must not connect to it.
+    let rmux_endpoint = crate::backend::rmux::endpoint_from_env();
+    let tmux_endpoint = std::env::var("TMUX")
+        .ok()
+        .and_then(|value| crate::backend::rmux::endpoint_from_value(&value));
+    if rmux_endpoint.is_some() && rmux_endpoint == tmux_endpoint {
+        cmd.env_remove("TMUX").env_remove("TMUX_PANE");
+    }
     cmd
 }
 
 pub fn tmux_binary() -> &'static Path {
     static RESOLVED: OnceLock<PathBuf> = OnceLock::new();
     RESOLVED.get_or_init(|| {
-        if Command::new("tmux")
-            .arg("-V")
-            .output()
-            .is_ok_and(|o| o.status.success())
-        {
-            return PathBuf::from("tmux");
-        }
-        ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"]
-            .iter()
-            .find(|p| Path::new(p).exists())
-            .map_or_else(|| PathBuf::from("tmux"), PathBuf::from)
+        let candidates = std::env::var_os("PATH")
+            .map(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|p| p.join("tmux"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        resolve_tmux_binary(candidates)
     })
+}
+
+fn resolve_tmux_binary(candidates: Vec<PathBuf>) -> PathBuf {
+    candidates
+        .into_iter()
+        .chain(
+            [
+                "/opt/homebrew/bin/tmux",
+                "/usr/local/bin/tmux",
+                "/usr/bin/tmux",
+                "/bin/tmux",
+            ]
+            .map(PathBuf::from),
+        )
+        .find_map(|path| {
+            // rmux even reports "tmux 3.4" when invoked through its `tmux`
+            // symlink. Probe the resolved executable under its native name.
+            let native = path.canonicalize().ok()?;
+            (native.is_file()
+                && Command::new(&native)
+                    .arg("-V")
+                    .output()
+                    .is_ok_and(|o| o.status.success() && o.stdout.starts_with(b"tmux ")))
+            .then_some(native)
+        })
+        // Fail closed instead of executing an rmux compatibility shim.
+        .unwrap_or_else(|| PathBuf::from("/nonexistent/muxa-native-tmux"))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1173,6 +1204,36 @@ pub(crate) fn parse_pane_pid_map(stdout: &str) -> std::collections::HashMap<u32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn native_tmux_resolution_skips_rmux_shim() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("tmux");
+        let rmux = dir.path().join("rmux");
+        let native = dir.path().join("native");
+        std::fs::write(
+            &rmux,
+            "#!/bin/sh\ncase \"$0\" in */tmux) echo 'tmux 3.4';; *) echo 'rmux 0.10.0';; esac\n",
+        )
+        .unwrap();
+        std::fs::write(&native, "#!/bin/sh\necho 'tmux 3.4'\n").unwrap();
+        for path in [&rmux, &native] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::os::unix::fs::symlink(&rmux, &shim).unwrap();
+        assert!(Command::new(&shim)
+            .arg("-V")
+            .output()
+            .unwrap()
+            .stdout
+            .starts_with(b"tmux "));
+        assert_eq!(
+            resolve_tmux_binary(vec![shim, native.clone()]),
+            native.canonicalize().unwrap()
+        );
+    }
 
     #[test]
     fn pane_and_session_parsers_read_the_session_group_column() {

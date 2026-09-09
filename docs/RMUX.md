@@ -16,7 +16,9 @@ Muxa therefore:
 - detects `RMUX` / `RMUX_PANE` before the compatibility `TMUX` variables;
 - stores rmux pane ids as `rmux:%N` internally;
 - stores the full native socket path from the first field of `$RMUX`;
-- strips `rmux:` and passes `-S <socket>` when issuing rmux control commands.
+- strips `rmux:` and passes `-S <socket>` when issuing rmux control commands;
+- skips rmux compatibility shims when resolving the native tmux executable,
+  so the same rmux panes do not appear a second time as tmux panes.
 
 `MUXA_HOST=rmux` forces a single rmux backend. `MUXA_HOSTS=rmux,tmux` observes
 both explicitly. With the rmux CLI installed, a login-launched daemon keeps an
@@ -39,7 +41,7 @@ prefixes. This also covers systemd/launchd environments with a restricted
 | Targeted input | literal `send-keys`; bracketed paste for multiline text |
 | Hook identity | `RMUX_PANE` → `rmux:%N` |
 | Session activity duration | Not yet sampled |
-| Bare-terminal attach from Muxa | Not yet implemented |
+| Watch jump / bare-terminal attach | Switch the invoking client to the target session/window/pane; attach from a bare terminal |
 
 The CLI transport is intentional for the first slice because it matches
 Muxa's synchronous `PaneBackend` contract and keeps rmux out of the dependency
@@ -54,10 +56,30 @@ events and fewer process launches without changing callers.
   endpoint for capture and input and are not reaped by another endpoint's scan.
 - Session/client activity sampling is absent, so rmux rows report no DUR/ACT
   time instead of borrowing tmux's same-shaped `$N` session ids.
-- `muxa watch` can focus a pane when invoked in rmux. Handing a bare terminal
-  over to `rmux attach-session` is a follow-up.
+- `muxa watch` switches the invoking rmux client to the selected session,
+  window, and pane. Popup callers preserve `--caller-client`; topology rows
+  preserve the target server endpoint. From a bare terminal, the command uses
+  `rmux attach-session`. Switching an existing rmux client across different
+  servers is rejected with an explicit message.
 - The implementation follows the public CLI/format contract verified against
   rmux 0.10.x.
+
+## Popup rendering on rmux 0.10.0
+
+The generated watch/Fleet bindings use full width, 99% height, and top-left
+placement. This leaves at least one bottom row for the host status bar:
+rmux continues writing that bar while a popup is open, so a 100%-height
+popup and its footer otherwise share the same terminal row. Existing users
+can re-run the popup component of `muxa init`, or change only the watch
+bindings from `-h 100%` to `-h 99%` while keeping `-x 0 -y 0`.
+
+This mitigates the bottom-row collision, **not all popup flicker**. In an
+isolated 120x30 client, six idle seconds of watch produced about 58 KB and
+180 full-width blank rows both with the status bar enabled and disabled.
+A static `sleep` popup produced status updates with the bar enabled and no
+output with it disabled. The rmux popup renderer fills the entire popup
+before drawing its contents; running `muxa watch` directly in a pane avoids
+that popup redraw path. Fixing that renderer requires a change in rmux.
 
 ## Validation
 
@@ -87,4 +109,11 @@ MUXA_RMUX_TEST_PANE="$muxa_rmux_smoke_pane" \
   cargo test -p muxa \
     backend::rmux::tests::live_backend_smoke_against_explicit_endpoint \
     -- --ignored --exact
+```
+
+The client/session/window jump regression uses a disposable rmux server and a
+PTY client, then checks the client's session and the selected window/pane:
+
+```sh
+python3 scripts/rmux-jump-check.py
 ```

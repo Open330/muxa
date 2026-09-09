@@ -2569,8 +2569,7 @@ fn jump_to_pane(pane_id: &str) {
             jump_to_pane_cmux(backend.as_ref(), pane_id);
         }
         muxa::HostKind::Rmux => {
-            let backend = backend_for_dispatch(kind, &fallback);
-            jump_to_pane_rmux(backend.as_ref(), pane_id);
+            jump_to_pane_rmux(pane_id);
         }
         muxa::HostKind::Zellij => {
             let backend = backend_for_dispatch(kind, &fallback);
@@ -2592,7 +2591,8 @@ fn jump_to_topology_pane(key: &muxa::PaneKey) {
             );
             jump_to_pane_cmux(&backend, &key.pane_id);
         }
-        muxa::HostKind::Rmux | muxa::HostKind::Zellij | muxa::HostKind::Herdr => {
+        muxa::HostKind::Rmux => jump_to_pane_rmux_key(key),
+        muxa::HostKind::Zellij | muxa::HostKind::Herdr => {
             jump_to_pane(&key.pane_id);
         }
     }
@@ -2924,12 +2924,68 @@ fn jump_to_pane_cmux(backend: &dyn muxa::PaneBackend, pane_id: &str) {
     }
 }
 
-/// Jump within the rmux client associated with the native `$RMUX` endpoint.
-/// Full bare-terminal attach is intentionally outside the initial backend
-/// slice; focus still covers watch/dashboard usage launched from rmux itself.
-fn jump_to_pane_rmux(backend: &dyn muxa::PaneBackend, pane_id: &str) {
-    if !backend.focus_pane(pane_id) {
-        eprintln!("muxa: rmux select-pane {pane_id} failed — pane may have closed");
+/// Resolve legacy pane-only actions before using the same endpoint-aware jump.
+fn jump_to_pane_rmux(pane_id: &str) {
+    use muxa::PaneBackend;
+    let backend = muxa::RmuxBackend::new();
+    let Some(pane) = backend.resolve_pane(pane_id) else {
+        eprintln!("muxa: rmux pane {pane_id} is unavailable");
+        return;
+    };
+    let Some(socket) = pane.socket else {
+        eprintln!("muxa: rmux pane {pane_id} has no server endpoint");
+        return;
+    };
+    jump_to_pane_rmux_target(&socket, &pane.session_id, &pane.window_id, pane_id);
+}
+
+fn jump_to_pane_rmux_key(key: &muxa::PaneKey) {
+    jump_to_pane_rmux_target(
+        &key.window.session.endpoint.socket,
+        &key.window.session.session_id,
+        &key.window.window_id,
+        &key.pane_id,
+    );
+}
+
+fn jump_to_pane_rmux_target(socket: &str, session: &str, window: &str, pane: &str) {
+    let backend = muxa::RmuxBackend::with_endpoint(socket);
+    let pane = pane.strip_prefix("rmux:").unwrap_or(pane);
+    let target = format!("{session}:{window}.{pane}");
+    let current = muxa::backend::rmux::endpoint_from_env();
+    if current.as_deref() == Some(socket) {
+        let mut args = vec!["switch-client"];
+        if let Some(client) = CALLER_CLIENT.get() {
+            args.extend(["-c", client]);
+        }
+        args.extend(["-t", &target]);
+        if let Err(error) = backend.run_control(&args) {
+            eprintln!("muxa: rmux switch-client failed: {error}");
+            return;
+        }
+    } else if current.is_some() {
+        eprintln!("muxa: cannot switch an rmux client across servers; attach to {socket} from a separate terminal");
+        return;
+    }
+    for args in [
+        ["select-window", "-t", target.as_str()],
+        ["select-pane", "-t", target.as_str()],
+    ] {
+        if let Err(error) = backend.run_control(&args) {
+            eprintln!("muxa: rmux {} failed: {error}", args[0]);
+            return;
+        }
+    }
+    if current.is_none() {
+        match interactive_child::run_interactive(backend.command(None).args([
+            "attach-session",
+            "-t",
+            session,
+        ])) {
+            Ok(exit) if exit.is_clean_detach() => {}
+            Ok(exit) => eprintln!("muxa: rmux attach-session exited: {}", exit.status),
+            Err(error) => eprintln!("muxa: rmux attach-session failed: {error}"),
+        }
     }
 }
 
@@ -3743,6 +3799,59 @@ mod tests {
     use muxa::AgentKind;
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
+
+    /// The harness supplies a disposable server with an attached client and
+    /// a target pane in a different session/window. No user server is touched.
+    #[test]
+    #[ignore = "requires an isolated rmux server and attached client"]
+    fn live_rmux_jump_switches_client_session_and_window() {
+        use muxa::PaneBackend;
+        let socket = std::env::var("MUXA_RMUX_TEST_ENDPOINT").unwrap();
+        let pane_id = std::env::var("MUXA_RMUX_TEST_PANE").unwrap();
+        let client = std::env::var("MUXA_RMUX_TEST_CLIENT").unwrap();
+        assert_eq!(
+            muxa::backend::rmux::endpoint_from_env().as_deref(),
+            Some(socket.as_str())
+        );
+        CALLER_CLIENT.set(client.clone()).unwrap();
+        let backend = muxa::RmuxBackend::with_endpoint(&socket);
+        let pane = backend.resolve_pane(&pane_id).unwrap();
+        let key = muxa::PaneKey::from_pane(muxa::HostKind::Rmux, &pane);
+        jump_to_topology_pane(&key);
+        // rmux 0.10's display-message -c still formats the inherited session;
+        // inspect client membership separately from the session's active pane.
+        let clients = backend
+            .command(None)
+            .args(["list-clients", "-F", "#{client_name}\t#{session_id}"])
+            .output()
+            .unwrap();
+        assert!(clients.status.success());
+        assert!(String::from_utf8(clients.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| line == format!("{client}\t{}", pane.session_id)));
+        let output = backend
+            .command(None)
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &pane.session_id,
+                "#{session_id}:#{window_id}.#{pane_id}",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!(
+                "{}:{}.{}",
+                pane.session_id,
+                pane.window_id,
+                pane_id.strip_prefix("rmux:").unwrap_or(&pane_id)
+            )
+        );
+    }
 
     #[test]
     fn ask_command_supports_headless_provider_and_stdin_key() {

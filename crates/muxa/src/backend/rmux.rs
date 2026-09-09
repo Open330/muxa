@@ -66,8 +66,21 @@ impl RmuxBackend {
         }
     }
 
-    fn command(&self, endpoint: Option<&str>) -> Command {
+    /// Build a native command pinned to this backend or an explicit endpoint.
+    pub fn command(&self, endpoint: Option<&str>) -> Command {
         rmux_command(endpoint.or(self.endpoint.as_deref()))
+    }
+
+    /// Execute a bounded control command, preserving the server error.
+    pub fn run_control(&self, args: &[&str]) -> Result<(), String> {
+        let mut command = self.command(None);
+        command.args(args);
+        let output = command_output(command, None).map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        }
     }
 
     fn scan_panes(&self, target: Option<&str>) -> PaneObservation {
