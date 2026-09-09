@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The macOS app no longer stops muxad from starting at login.** Replacing a
+  running daemon ran `launchctl disable` on the legacy `dev.open330.muxad`
+  label before unloading it. `disable` is not scoped to the session: it writes
+  a persistent override into
+  `/var/db/com.apple.xpc.launchd/disabled.<uid>.plist` that survives the reboot
+  and outranks the plist's own `RunAtLoad`, so a single replace left the agent
+  silently skipped at every later login — a correct plist on disk, muxad absent
+  until the app was opened by hand. The app now only boots the label out, which
+  is scoped to the session the socket race is actually fought in, and tolerates
+  the daemon having already been reaped by that bootout.
+
+  Installing clears the override rather than tripping over it: `muxa init`
+  runs `launchctl enable` before bootstrapping, since a disabled label
+  bootstraps cleanly and then never runs, which made a reinstall look like it
+  had worked. `muxa doctor` reports the override by name ahead of its load
+  check — `launchctl print` fails the same way for "never installed" and
+  "installed but disabled", and only one of those is the installer's to fix.
+
 ## [0.8.46] - 2026-09-09
 
 ### Added
