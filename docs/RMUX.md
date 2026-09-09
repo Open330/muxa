@@ -166,3 +166,7 @@ The popup reuses the current muxa executable and preserves watch arguments.
 Run `python3 scripts/rmux-popup-check.py` after building the CLI to drive
 prefix+s and prefix+S through a real PTY, with native tmux first in PATH.
 The check reproduces the old binding failure before verifying both new bindings.
+
+Init checks server availability with `list-sessions`, not `info`: rmux's
+`info` alias needs an unambiguous client and otherwise skips configuration
+reloads. Both reload and `MUXA_SOCKET` propagation use the current native host.

@@ -171,13 +171,13 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
     // heals the runtime env if the tmux server was restarted since the
     // last init. The conf-file persistence added by `tmux-env` handles
     // fresh server boots; this live injection handles existing servers.
-    let server_up = muxa::tmux::tmux_command()
-        .arg("info")
+    let server_up = crate::mux_control::ambient_command()
+        .arg("list-sessions")
         .output()
         .is_ok_and(|o| o.status.success());
     if server_up {
         if let Some(s) = socket.to_str() {
-            let _ = muxa::tmux::tmux_command()
+            let _ = crate::mux_control::ambient_command()
                 .args(["set-environment", "-g", "MUXA_SOCKET", s])
                 .status();
         }

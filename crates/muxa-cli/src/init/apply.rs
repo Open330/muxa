@@ -294,10 +294,11 @@ fn apply_source_tmux(path: &Path, dry_run: bool, report: &mut ApplyReport) -> Re
     if dry_run {
         return Ok(());
     }
-    // Only attempt if there's a tmux server running; otherwise
-    // `tmux source-file` errors with "no server running".
+    // list-sessions works without an attached-client context on both hosts.
+    // rmux maps info to show-messages, which fails when several clients are
+    // attached and would silently skip the reload.
     let server_up = crate::mux_control::ambient_command()
-        .arg("info")
+        .arg("list-sessions")
         .output()
         .is_ok_and(|o| o.status.success());
     if !server_up {
