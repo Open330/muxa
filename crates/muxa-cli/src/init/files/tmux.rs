@@ -27,19 +27,12 @@ pub const ENV_BLOCK_ID: &str = "tmux-env";
 /// unreachable on any terminal under ~136 columns, which is most of
 /// them. The dashboard has no such threshold and stays inset.
 pub const POPUP_BODY: &str = r#"# Muxa popups: local watch, Fleet watch, and dashboard.
-# `muxa watch` is borderless and full-width so its wide-screen inspector
-# (120-column minimum, Alt-I) has the room to open. The run-shell wrapper
-# is what expands #{client_name}/#{pane_id} — display-popup itself passes
-# its command string through verbatim (measured on tmux 3.4), and an
-# unexpanded '#{client_name}' reaching muxa means every switch-client
-# quietly fails against a client that does not exist. run-shell expands
-# at the keypress, in the pressing client's context — the only moment
-# that identity is unambiguous; from inside the popup every unpinned
-# tmux query can answer for another terminal.
-# Reserve the bottom row for the host status bar: rmux 0.10 refreshes it
-# even while a popup is open, overwriting a full-height watch footer.
-bind-key s run-shell -b "tmux display-popup -c '#{client_name}' -B -E -w 100% -h 99% -x 0 -y 0 \"muxa watch --caller-client '#{client_name}' --caller-pane '#{pane_id}'\""
-bind-key S run-shell -b "tmux display-popup -c '#{client_name}' -B -E -w 100% -h 99% -x 0 -y 0 \"muxa watch --fleet --caller-client '#{client_name}' --caller-pane '#{pane_id}'\""
+# Expand the pressing client's identity before opening the popup.
+# muxa resolves the host/socket directly: run-shell's PATH may resolve
+# tmux to native tmux even inside rmux (without its compatibility shim).
+# Reserve the bottom row for rmux's status bar.
+bind-key s run-shell -b "muxa watch --popup --caller-client '#{client_name}' --caller-pane '#{pane_id}'"
+bind-key S run-shell -b "muxa watch --popup --fleet --caller-client '#{client_name}' --caller-pane '#{pane_id}'"
 bind-key D display-popup -E -w 95% -h 90% "muxa dashboard""#;
 
 /// The body that goes inside the `tmux-peek` marker block.
@@ -222,7 +215,7 @@ mod tests {
         assert!(after.contains("display-popup"));
         assert!(after.contains("muxa watch"));
         assert!(after.contains("bind-key S"));
-        assert!(after.contains("muxa watch --fleet"));
+        assert!(after.contains("muxa watch --popup --fleet"));
         assert!(after.contains("bind-key D"));
         assert!(after.contains("muxa dashboard"));
 

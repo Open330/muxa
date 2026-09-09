@@ -155,3 +155,14 @@ to avoid empty `display-message` context fields on rmux 0.10.
 Auto-view hooks use `#{hook_client}`, which names the client that triggered
 the event on both tmux and rmux. rmux can leave `#{client_name}` empty in that
 hook context; popup key bindings continue to use `#{client_name}` at keypress.
+
+Watch popup bindings use `muxa watch --popup` to select the native host and
+socket directly. A long-running rmux server can have a `run-shell` PATH where
+`tmux` resolves to `/usr/bin/tmux`, so invoking `tmux display-popup` from that
+shell sends the request to the wrong host. Re-run
+`muxa init --component tmux-popup --yes --start-daemon=false` after upgrading.
+The popup reuses the current muxa executable and preserves watch arguments.
+
+Run `python3 scripts/rmux-popup-check.py` after building the CLI to drive
+prefix+s and prefix+S through a real PTY, with native tmux first in PATH.
+The check reproduces the old binding failure before verifying both new bindings.

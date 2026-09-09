@@ -225,6 +225,9 @@ enum Cmd {
     Peek(peek::Args),
     /// Fullscreen nested session/window/pane topology of tracked agents.
     Watch {
+        /// Open watch in a popup on the current tmux or rmux server.
+        #[arg(long)]
+        popup: bool,
         /// Show the SSH fleet host/session/window/pane hierarchy instead of
         /// the local topology.
         #[arg(long)]
@@ -1149,6 +1152,14 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    if let Cmd::Watch {
+        popup: true,
+        caller_client,
+        ..
+    } = &args.cmd
+    {
+        return mux_control::watch_popup(caller_client.as_deref());
+    }
     // Onboarding must remain available even when config.toml is malformed;
     // it is a recovery/learning surface and does not need daemon state.
     if let Cmd::Onboard(onboard_args) = &args.cmd {
@@ -1234,6 +1245,7 @@ async fn main() -> Result<()> {
         Cmd::Panes => cmd_panes(),
         Cmd::Peek(peek_args) => peek::run(&client, peek_args).await,
         Cmd::Watch {
+            popup: _,
             fleet,
             selector,
             include_paneless,

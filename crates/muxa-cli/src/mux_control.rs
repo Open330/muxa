@@ -48,6 +48,39 @@ pub fn run(endpoint: &BackendEndpoint, args: &[&str]) -> Result<(), String> {
     capture(endpoint, args).map(|_| ())
 }
 
+/// Resolve the host and socket ourselves: an existing rmux server's run-shell
+/// PATH can point `tmux` at native tmux rather than the rmux shim.
+pub fn watch_popup(client: Option<&str>) -> anyhow::Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut words = vec![executable.into_os_string()];
+    words.extend(std::env::args_os().skip(1).filter(|arg| arg != "--popup"));
+    let shell_command = popup_shell_command(&words)?;
+    let mut command = ambient_command();
+    command.arg("display-popup");
+    if let Some(client) = client.filter(|c| !c.is_empty() && !c.contains("#{")) {
+        command.args(["-c", client]);
+    }
+    let status = command
+        .args(["-B", "-E", "-w", "100%", "-h", "99%", "-x", "0", "-y", "0"])
+        .arg(shell_command)
+        .status()?;
+    anyhow::ensure!(status.success(), "could not open watch popup: {status}");
+    Ok(())
+}
+
+fn popup_shell_command(words: &[std::ffi::OsString]) -> anyhow::Result<String> {
+    words
+        .iter()
+        .map(|word| {
+            let word = word
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("popup argument is not UTF-8"))?;
+            Ok(format!("'{}'", word.replace('\'', "'\"'\"'")))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(|words| words.join(" "))
+}
+
 #[derive(Clone)]
 pub enum Control {
     Ambient,
@@ -90,6 +123,21 @@ impl Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_arguments_survive_shell_metacharacters() {
+        let words: Vec<std::ffi::OsString> = ["a path/muxa", "it's $HOME; $(false)", ""]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let quoted = popup_shell_command(&words).unwrap();
+        let output = Command::new("/bin/sh")
+            .args(["-c", &format!("printf '%s\\0' {quoted}")])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"a path/muxa\0it's $HOME; $(false)\0\0");
+    }
 
     #[test]
     fn explicit_endpoints_route_independently_of_the_invoking_terminal() {
