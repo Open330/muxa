@@ -85,14 +85,10 @@ use crate::message_skill::{
 /// variant or the subscription drops mid-session.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Slower fallback cadence when streaming `Subscribe` is wired. Push
-/// state updates land in ~milliseconds; this tick refreshes topology and
-/// catches up after dropped transitions. Same-state activity has its own
-/// cheaper, faster snapshot cadence below.
+/// Topology catch-up cadence while registry updates arrive through the
+/// coalesced invalidation stream. Old daemons use `POLL_INTERVAL` instead.
 const STREAMING_FALLBACK_INTERVAL: Duration = Duration::from_secs(5);
-/// Same-state activity is absent from the transition stream. Refresh agent
-/// records independently of the more expensive multiplexer topology scan.
-const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Max time to wait for a single keystroke when the input buffer is
 /// empty. ~60 Hz so a press feels immediate without burning CPU on an
 /// idle terminal. Held keys / fast typing are absorbed by the
@@ -6959,6 +6955,8 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum RefreshOutcome {
     Full(FullRefresh),
+    // Retained for incremental-update regression coverage.
+    #[allow(dead_code)]
     SingleAgent(Agent),
     Agents(Vec<Agent>),
 }
@@ -7434,8 +7432,8 @@ async fn refresh_task<F, Fut, S, A, AFut>(
     let mut sub = sub_init.await;
 
     // When we have a streaming subscription, push updates handle the
-    // common case in milliseconds — the polling tick only exists for
-    // catch-up after `Lagged` drops or reconnect. Without the
+    // common case with a bounded 100 ms coalescing delay. The polling
+    // tick reconciles topology and any missed updates. Without the
     // subscription we fall back to the historical 500 ms cadence so
     // the watch still updates against an old daemon.
     let interval_dur = if sub.is_some() {
@@ -7450,9 +7448,6 @@ async fn refresh_task<F, Fut, S, A, AFut>(
     // The first `tick()` fires immediately. We don't want a duplicate
     // refresh right after the priming snapshot in `run`, so consume it.
     tick.tick().await;
-    let mut activity_tick = tokio::time::interval(ACTIVITY_REFRESH_INTERVAL);
-    activity_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    activity_tick.tick().await;
 
     loop {
         // Reduce subscribe-arm noise: the `if sub.is_some()` guard
@@ -7461,13 +7456,6 @@ async fn refresh_task<F, Fut, S, A, AFut>(
         // never resolve but tokio still polls it once per loop, which
         // would burn a tiny bit of CPU and obscure traces.
         tokio::select! {
-            _ = activity_tick.tick(), if sub.is_some() => {
-                if let Some(agents) = fetch_activity().await {
-                    if out.send(RefreshOutcome::Agents(agents)).await.is_err() {
-                        return;
-                    }
-                }
-            }
             _ = tick.tick() => {
                 // Periodic full sync — catches up after lagged drops
                 // or any state we missed via the push stream.
@@ -7488,19 +7476,12 @@ async fn refresh_task<F, Fut, S, A, AFut>(
                     return;
                 }
             }
-            res = recv_transition(&mut sub), if sub.is_some() => {
-                if let Some(agent) = res {
-                    // Push-driven update: ship just the changed
-                    // row to the main loop. Avoids the "every tick
-                    // redraws every row" jitter where the full
-                    // snapshot would replace LAST PROMPT / STATE /
-                    // etc. for every agent on every transition.
-                    if out
-                        .send(RefreshOutcome::SingleAgent(agent))
-                        .await
-                        .is_err()
-                    {
-                        return;
+            res = recv_agent_change(&mut sub), if sub.is_some() => {
+                if res.is_some() {
+                    if let Some(agents) = fetch_activity().await {
+                        if out.send(RefreshOutcome::Agents(agents)).await.is_err() {
+                            return;
+                        }
                     }
                 } else {
                     // Daemon closed the stream OR parse/IO error.
@@ -7517,22 +7498,9 @@ async fn refresh_task<F, Fut, S, A, AFut>(
     }
 }
 
-/// Helper for the select arm: await the next transition. Returns
-/// `Some(agent)` when a push lands (the post-transition payload from
-/// the daemon), and `None` when the stream is dead — caller falls
-/// back to polling on `None`.
-async fn recv_transition(sub: &mut Option<muxa::ipc::TransitionStream>) -> Option<Agent> {
-    let stream = sub.as_mut()?;
-    match stream.recv().await {
-        // The wire payload deserializes as `Arc<Agent>` (the producer
-        // wraps once to make the broadcast fanout O(refcount) instead
-        // of O(sizeof(Agent))). On the client side the strong count is
-        // always 1 — this is a fresh `Arc` built by `serde` — so
-        // `Arc::try_unwrap` is guaranteed to succeed and avoids a
-        // pointless `Agent` clone here.
-        Ok(Some(t)) => Some(std::sync::Arc::try_unwrap(t.agent).unwrap_or_else(|a| (*a).clone())),
-        Ok(None) | Err(_) => None,
-    }
+/// Await a compact invalidation; a closed/failed stream enables fallback polling.
+async fn recv_agent_change(sub: &mut Option<muxa::ipc::TransitionStream>) -> Option<()> {
+    sub.as_mut()?.recv_change().await.ok().flatten()
 }
 
 /// Resolve the server identity that owns the invoking pane. This is kept as a
@@ -7672,7 +7640,7 @@ pub async fn run(
     // block the first paint. Falls back to polling on any error
     // (older daemon, socket unreachable, connection refused).
     let subscription_init = async move {
-        match sub_client.subscribe().await {
+        match sub_client.subscribe_agent_changes().await {
             Ok(s) => Some(s),
             Err(e) => {
                 tracing::debug!(error = %e, "subscribe unavailable; falling back to polling");
@@ -24862,7 +24830,7 @@ sort = ["state"]
     }
 
     #[tokio::test]
-    async fn streaming_activity_refresh_does_not_wait_for_full_topology_poll() {
+    async fn streaming_activity_refresh_is_event_driven() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -24875,16 +24843,21 @@ sort = ["state"]
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, mut writer) = stream.into_split();
             let mut reader = BufReader::new(reader);
-            for expected in ["hello", "subscribe"] {
+            for expected in ["hello", "subscribe_agent_changes"] {
                 let mut line = String::new();
                 reader.read_line(&mut line).await.unwrap();
                 let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                 assert_eq!(request["kind"], expected);
                 writer.write_all(b"{\"ok\":true}\n").await.unwrap();
             }
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            writer
+                .write_all(b"{\"event\":\"agents_changed\"}\n")
+                .await
+                .unwrap();
             std::future::pending::<()>().await;
         });
-        let stream = Client::new(socket).subscribe().await.unwrap();
+        let stream = Client::new(socket).subscribe_agent_changes().await.unwrap();
         let full_calls = Arc::new(AtomicUsize::new(0));
         let count = full_calls.clone();
         let (wake_tx, wake_rx) = mpsc::channel(1);
@@ -24905,6 +24878,12 @@ sort = ["state"]
             out_tx,
             async move { Some(stream) },
         ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1100), out_rx.recv())
+                .await
+                .is_err(),
+            "idle stream must not poll activity"
+        );
         let outcome = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
             .await
             .unwrap()

@@ -306,6 +306,9 @@ enum RequestBody {
         #[serde(default)]
         client: Option<String>,
     },
+    /// Coalesced registry invalidations, including same-state activity.
+    SubscribeAgentChanges,
+
     /// Long-lived streaming subscribe. Server replies with a one-shot
     /// `ok` ack, then writes one JSON-encoded `Transition` per
     /// state change (newline-delimited) until the client closes the
@@ -1985,6 +1988,32 @@ async fn stream_transitions(
                 if writer.flush().await.is_err() {
                     return Ok(());
                 }
+            }
+        }
+    }
+}
+
+/// Bound update traffic to ten invalidations per second per watcher. A watch
+/// channel retains only a pending bit; sustained activity cannot grow a queue
+/// or postpone delivery indefinitely. Idle streams only send keepalives.
+async fn stream_agent_changes(
+    mut writer: OwnedWriteHalf,
+    mut changes: watch::Receiver<()>,
+    protocol: u32,
+) -> Result<(), RuntimeError> {
+    let mut keepalive = tokio::time::interval(STREAM_KEEPALIVE_INTERVAL);
+    keepalive.tick().await;
+    loop {
+        tokio::select! {
+            result = changes.changed() => {
+                if result.is_err() { return Ok(()); }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                changes.borrow_and_update();
+                let bytes = encode_line(&serde_json::json!({"event": "agents_changed"}), protocol)?;
+                if !write_line_or_closed(&mut writer, &bytes).await? { return Ok(()); }
+            }
+            _ = keepalive.tick() => {
+                if !write_line_or_closed(&mut writer, b"\n").await? { return Ok(()); }
             }
         }
     }
@@ -3828,6 +3857,15 @@ async fn handle(
                         Err(e) => Response::err(e.to_string()),
                     }
                 }
+                RequestBody::SubscribeAgentChanges => {
+                    let protocol = negotiated.unwrap_or(PROTOCOL_VERSION);
+                    let changes = store.subscribe_changes();
+                    let ack = encode_line(&Response::ok(), protocol)?;
+                    if !write_line_or_closed(&mut writer, &ack).await? {
+                        return Ok(());
+                    }
+                    return stream_agent_changes(writer, changes, protocol).await;
+                }
                 RequestBody::Subscribe { lagged_markers } => {
                     kind = "subscribe";
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
@@ -4197,6 +4235,26 @@ fn decode_agents(resp: &serde_json::Value) -> Result<Vec<Agent>, RuntimeError> {
 }
 
 impl TransitionStream {
+    /// Receive an invalidation from `subscribe_agent_changes`, skipping keepalives.
+    pub async fn recv_change(&mut self) -> Result<Option<()>, RuntimeError> {
+        loop {
+            self.line.clear();
+            if read_limited_line(&mut self.reader, &mut self.line).await? == 0 {
+                return Ok(None);
+            }
+            if self.line.trim().is_empty() {
+                continue;
+            }
+            let frame: serde_json::Value = serde_json::from_str(self.line.trim())?;
+            if frame["event"] != "agents_changed" {
+                return Err(RuntimeError::Json(serde::de::Error::custom(
+                    "unexpected agent change frame",
+                )));
+            }
+            return Ok(Some(()));
+        }
+    }
+
     /// Wait for and return the next streamed `Transition`.
     ///
     /// Blank lines are the daemon's keepalive frames (a bare newline it emits
@@ -5498,12 +5556,22 @@ impl Client {
     pub async fn subscribe(&self) -> Result<TransitionStream, RuntimeError> {
         // Only the handshake is bounded — the returned stream is long-lived by
         // design. A wedged daemon must not block watch's background setup here.
-        tokio::time::timeout(CLIENT_CALL_TIMEOUT, self.subscribe_inner())
+        tokio::time::timeout(CLIENT_CALL_TIMEOUT, self.subscribe_inner("subscribe"))
             .await
             .map_err(|_| RuntimeError::Timeout(CLIENT_CALL_TIMEOUT))?
     }
 
-    async fn subscribe_inner(&self) -> Result<TransitionStream, RuntimeError> {
+    /// Subscribe to bounded, coalesced registry invalidations for watch.
+    pub async fn subscribe_agent_changes(&self) -> Result<TransitionStream, RuntimeError> {
+        tokio::time::timeout(
+            CLIENT_CALL_TIMEOUT,
+            self.subscribe_inner("subscribe_agent_changes"),
+        )
+        .await
+        .map_err(|_| RuntimeError::Timeout(CLIENT_CALL_TIMEOUT))?
+    }
+
+    async fn subscribe_inner(&self, kind: &str) -> Result<TransitionStream, RuntimeError> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .map_err(|e| match e.kind() {
@@ -5519,7 +5587,7 @@ impl Client {
 
         let mut req = serde_json::to_vec(&serde_json::json!({
             "protocol": PROTOCOL_VERSION,
-            "kind": "subscribe",
+            "kind": kind,
             // muxa's `TransitionStream::recv` understands the lagged marker
             // frame, so opt in — `muxa watch` and `muxa mcp`'s
             // `muxa_wait_for_change` both consume the stream through this
@@ -8933,6 +9001,58 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(v["event"], "lagged");
         assert_eq!(v["dropped"], 7);
+    }
+
+    #[tokio::test]
+    async fn agent_change_stream_coalesces_bursts_and_keeps_subscribers_independent() {
+        use tokio::io::AsyncBufReadExt;
+        let store = crate::state::Store::shared();
+        let mut other = store.subscribe_changes();
+        let (client, server) = UnixStream::pair().unwrap();
+        let (_, writer) = server.into_split();
+        let pump = tokio::spawn(stream_agent_changes(
+            writer,
+            store.subscribe_changes(),
+            PROTOCOL_VERSION,
+        ));
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        for _ in 0..100 {
+            store
+                .apply(&crate::event::AgentEvent::Started {
+                    id: crate::event::AgentId {
+                        session_id: "burst".into(),
+                        kind: crate::event::AgentKind::ClaudeCode,
+                        pane: None,
+                        surface: None,
+                        cwd: None,
+                        tmux_socket: None,
+                    },
+                    at: time::OffsetDateTime::now_utc(),
+                })
+                .await;
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["event"],
+            "agents_changed"
+        );
+        assert!(other.has_changed().unwrap());
+        other.borrow_and_update();
+        line.clear();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            reader.read_line(&mut line)
+        )
+        .await
+        .is_err());
+        pump.abort();
     }
 
     /// Fix 7 — muxa's own client opts in: the `subscribe` request it sends

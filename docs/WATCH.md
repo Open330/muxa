@@ -536,8 +536,10 @@ then groups by workspace and floats the most recently active work in each
 group. `activity` and `act` remain accepted aliases for `latest`.
 
 `latest` follows agent activity, not the order in which you visit windows.
-State transitions update immediately; activity within the same state is
-refreshed every second without rescanning multiplexer topology. A refresh or
+State transitions and same-state activity trigger daemon invalidations,
+coalesced over 100 ms before fetching agent records. Idle streams do not poll
+activity, and these updates do not rescan multiplexer topology. A five-second
+full refresh still reconciles topology; older daemons use polling. A refresh or
 re-sort keeps the selected session, window, or pane selected by its stable key,
 even when another window in the same session moves ahead of it.
 

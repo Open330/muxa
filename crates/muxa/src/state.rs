@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
-use tokio::sync::{broadcast, Notify, RwLock};
+use tokio::sync::{broadcast, watch, Notify, RwLock};
 
 /// Prefix used by `muxa sync` / startup discovery for the `session_id` of a
 /// synthesized `Started` event. The store recognizes this prefix to keep
@@ -442,6 +442,8 @@ pub struct Store {
     /// what keeps lock hold time in the microsecond range to begin with.
     agents: RwLock<HashMap<String, Agent>>,
     transitions: broadcast::Sender<Transition>,
+    /// Coalescing invalidation signal; independent of semantic transitions.
+    changes: watch::Sender<()>,
     prompts: broadcast::Sender<PromptRecord>,
     /// Disk-backed audit log of every prompt. Lives separately from
     /// `agents` so reaping/GC of the live registry doesn't take prompt
@@ -487,6 +489,7 @@ impl Store {
         Self {
             agents: RwLock::default(),
             transitions: tx,
+            changes: watch::channel(()).0,
             prompts: prompts_tx,
             history,
             dirty: Arc::new(Notify::new()),
@@ -549,6 +552,7 @@ impl Store {
         if inserted > 0 {
             drop(agents);
             self.dirty.notify_one();
+            self.changes.send_replace(());
         }
         inserted
     }
@@ -639,6 +643,7 @@ impl Store {
         agents.insert(key.clone(), agent);
         drop(agents);
         self.dirty.notify_one();
+        self.changes.send_replace(());
         Ok(key)
     }
 
@@ -653,6 +658,33 @@ impl Store {
 }
 
 pub type SharedStore = Arc<Store>;
+
+/// Heartbeat liveness alone is not a UI invalidation. Changed statusline
+/// metrics still refresh promptly without cloning the whole agent on each hook.
+fn heartbeat_changes_metrics(agent: &Agent, ev: &AgentEvent) -> bool {
+    let AgentEvent::Heartbeat {
+        model,
+        context_used_pct,
+        cost_usd,
+        rate_limit_5h_pct,
+        rate_limit_5h_resets_at,
+        rate_limit_7d_pct,
+        rate_limit_7d_resets_at,
+        ..
+    } = ev
+    else {
+        return false;
+    };
+    (model.is_some() && model != &agent.model)
+        || (context_used_pct.is_some() && context_used_pct != &agent.context_used_pct)
+        || (cost_usd.is_some() && cost_usd != &agent.cost_usd)
+        || (rate_limit_5h_pct.is_some() && rate_limit_5h_pct != &agent.rate_limit_5h_pct)
+        || (rate_limit_5h_resets_at.is_some()
+            && rate_limit_5h_resets_at != &agent.rate_limit_5h_resets_at)
+        || (rate_limit_7d_pct.is_some() && rate_limit_7d_pct != &agent.rate_limit_7d_pct)
+        || (rate_limit_7d_resets_at.is_some()
+            && rate_limit_7d_resets_at != &agent.rate_limit_7d_resets_at)
+}
 
 fn event_touches_activity(agent: &Agent, ev: &AgentEvent) -> bool {
     match ev {
@@ -1163,6 +1195,11 @@ impl Store {
         self.transitions.subscribe()
     }
 
+    /// Subscribe to registry invalidations. Bursts occupy one pending slot.
+    pub fn subscribe_changes(&self) -> watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+
     /// Subscribe to in-process prompt events.
     ///
     /// One [`PromptRecord`] is broadcast per `PromptSubmitted` event the
@@ -1237,6 +1274,7 @@ impl Store {
             }
         }
 
+        let new_agent = !agents.contains_key(&id.session_id);
         let agent = agents.entry(id.session_id.clone()).or_insert_with(|| {
             Agent::new(
                 id.kind,
@@ -1266,12 +1304,15 @@ impl Store {
         if agent.cwd.is_none() {
             agent.cwd.clone_from(&id.cwd);
         }
+        let metrics_changed = heartbeat_changes_metrics(agent, ev);
         let prev_state = agent.state;
         let (prompt_record, history_entry, touches_activity) = mutate_for_event(agent, ev, id, at);
         if touches_activity {
             agent.last_activity_at = at;
         }
 
+        let visible_change =
+            new_agent || metrics_changed || touches_activity || agent.state != prev_state;
         if agent.state != prev_state {
             // Wrap the post-transition snapshot in an `Arc` exactly once
             // here; the broadcast channel then bumps the refcount per
@@ -1307,6 +1348,9 @@ impl Store {
         // debounce window. Saturates to 1 pending wakeup so a burst of
         // events coalesces into one disk write.
         self.dirty.notify_one();
+        if visible_change {
+            self.changes.send_replace(());
+        }
 
         // Emit a structured per-apply timing line. `debug!` is filtered
         // out by the default subscriber level (`info`), so this costs
@@ -1370,6 +1414,7 @@ impl Store {
         agent.recap = Some(recap);
         drop(agents);
         self.dirty.notify_one();
+        self.changes.send_replace(());
         true
     }
 
@@ -1402,6 +1447,7 @@ impl Store {
         };
         if removed > 0 {
             self.dirty.notify_one();
+            self.changes.send_replace(());
         }
         removed
     }
@@ -1431,6 +1477,7 @@ impl Store {
         };
         if removed > 0 {
             self.dirty.notify_one();
+            self.changes.send_replace(());
         }
         removed
     }
@@ -1498,6 +1545,7 @@ impl Store {
         if flipped > 0 {
             drop(agents);
             self.dirty.notify_one();
+            self.changes.send_replace(());
         }
         flipped
     }
@@ -1538,6 +1586,7 @@ impl Store {
         if flipped > 0 {
             drop(agents);
             self.dirty.notify_one();
+            self.changes.send_replace(());
         }
         flipped
     }
@@ -1610,6 +1659,7 @@ impl Store {
         if flipped > 0 {
             drop(agents);
             self.dirty.notify_one();
+            self.changes.send_replace(());
         }
         flipped
     }
@@ -1703,6 +1753,7 @@ impl Store {
         if flipped > 0 {
             drop(agents);
             self.dirty.notify_one();
+            self.changes.send_replace(());
         }
         flipped
     }
@@ -1756,6 +1807,7 @@ impl Store {
         if changed > 0 {
             drop(agents);
             self.dirty.notify_one();
+            self.changes.send_replace(());
         }
         changed
     }
@@ -1989,6 +2041,7 @@ impl Store {
         if adopted > 0 {
             drop(agents);
             self.dirty.notify_one();
+            self.changes.send_replace(());
         }
         adopted
     }
@@ -2130,6 +2183,7 @@ impl Store {
         }
         if !report.is_noop() {
             self.dirty.notify_one();
+            self.changes.send_replace(());
         }
 
         report
@@ -2227,6 +2281,64 @@ mod tests {
             last_activity_at: at,
             state_entered_at: at,
         }
+    }
+
+    #[tokio::test]
+    async fn same_state_activity_invalidates_without_synthetic_transitions() {
+        let store = Store::shared();
+        let now = OffsetDateTime::now_utc();
+        store
+            .apply(&AgentEvent::Started {
+                id: id("updates"),
+                at: now,
+            })
+            .await;
+        let event = AgentEvent::PromptSubmitted {
+            id: id("updates"),
+            at: now,
+            prompt: "first".into(),
+        };
+        store.apply(&event).await;
+        let mut changes = store.subscribe_changes();
+        let mut transitions = store.subscribe();
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("updates"),
+                at: now + time::Duration::seconds(1),
+                prompt: "second".into(),
+            })
+            .await;
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        assert!(matches!(
+            transitions.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            store.by_session("updates").await.unwrap().last_activity_at,
+            now + time::Duration::seconds(1)
+        );
+        let heartbeat: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "heartbeat", "id": id("updates"), "at": "2026-09-09T00:00:00Z"
+        }))
+        .unwrap();
+        store.apply(&heartbeat).await;
+        assert!(
+            !changes.has_changed().unwrap(),
+            "liveness-only heartbeat must not trigger activity refresh"
+        );
+        let metrics: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "heartbeat", "id": id("updates"), "at": "2026-09-09T00:00:01Z", "cost_usd": 1.5
+        }))
+        .unwrap();
+        store.apply(&metrics).await;
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        store.apply(&metrics).await;
+        assert!(
+            !changes.has_changed().unwrap(),
+            "unchanged metrics must not invalidate"
+        );
     }
 
     #[tokio::test]
