@@ -66,6 +66,12 @@ final class MuxaModuleRegistry: ObservableObject {
         probeGeneration &+= 1
     }
 
+    /// The app is quitting: every enabled module lets go of what it holds
+    /// open. A module that holds nothing does nothing.
+    func shutdown() {
+        for module in enabledModules { module.shutdown() }
+    }
+
     /// Everything the enabled modules offer for this object. A module whose
     /// tool is missing contributes nothing unless it says its actions work
     /// without one — a converter does not need the editor installed.

@@ -282,6 +282,13 @@ final class AirModule: MuxaModule, ObservableObject {
         workbenchURL = nil
     }
 
+    /// Workbench serves until it is stopped, so quitting the app has to stop
+    /// it — otherwise the server outlives the app that started it, still
+    /// holding a loopback port for an artifact nobody can reach.
+    func shutdown() {
+        stopWorkbench()
+    }
+
     // MARK: AIR → pipeline
 
     func importWorkflow(into model: AppModel) {

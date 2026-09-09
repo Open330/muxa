@@ -37,12 +37,18 @@ protocol MuxaModule: AnyObject, Identifiable {
     /// importing a file should not wait on a runtime the import never uses.
     /// Default false: most modules are a face on a tool.
     var worksWithoutTool: Bool { get }
+
+    /// Let go of anything held open — a served page, a running helper —
+    /// because the app is quitting. Default: nothing to let go of.
+    func shutdown()
 }
 
 extension MuxaModule {
     nonisolated var id: String { Self.identity.id }
     var identity: MuxaModuleIdentity { Self.identity }
     var worksWithoutTool: Bool { false }
+
+    func shutdown() {}
 
     func actions(for context: MuxaModuleContext, model: AppModel) -> [MuxaModuleAction] {
         _ = (context, model)

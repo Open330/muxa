@@ -1,6 +1,436 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "A shell is being created": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "셸을 생성하고 있습니다"
+          }
+        }
+      }
+    },
+    "Ambiguous agent destination; open its pane instead": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "에이전트 대상을 구분할 수 없습니다. 해당 패널을 여세요"
+          }
+        }
+      }
+    },
+    "Ask: Open global Ask": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ask: 전역 Ask 열기"
+          }
+        }
+      }
+    },
+    "Daemon is not connected": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "데몬에 연결되어 있지 않습니다"
+          }
+        }
+      }
+    },
+    "Editor: Close active editor": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "편집기: 활성 편집기 닫기"
+          }
+        }
+      }
+    },
+    "Editor: Keep open (pin)": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "편집기: 열린 상태로 고정"
+          }
+        }
+      }
+    },
+    "Editor: Next editor": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "편집기: 다음 편집기"
+          }
+        }
+      }
+    },
+    "Editor: Previous editor": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "편집기: 이전 편집기"
+          }
+        }
+      }
+    },
+    "Editor: Split right": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "편집기: 오른쪽으로 분할"
+          }
+        }
+      }
+    },
+    "Native shell": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "네이티브 셸"
+          }
+        }
+      }
+    },
+    "No active editor": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "활성 편집기가 없습니다"
+          }
+        }
+      }
+    },
+    "Search sessions, windows, panes, shells, work, agents": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "세션, 윈도우, 패널, 셸, 작업, 에이전트 검색"
+          }
+        }
+      }
+    },
+    "Selected": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "선택됨"
+          }
+        }
+      }
+    },
+    "Shell: New native shell": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "셸: 새 네이티브 셸"
+          }
+        }
+      }
+    },
+    "View: Focus sidebar": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "보기: 사이드바에 포커스"
+          }
+        }
+      }
+    },
+    "View: Show Explore": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "보기: 탐색 표시"
+          }
+        }
+      }
+    },
+    "View: Show Inbox": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "보기: 받은 편지함 표시"
+          }
+        }
+      }
+    },
+    "View: Show Shells": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "보기: 셸 표시"
+          }
+        }
+      }
+    },
+    "View: Show Work": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "보기: 작업 표시"
+          }
+        }
+      }
+    },
+    "Watch: Open native Live Watch": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Watch: 네이티브 Live Watch 열기"
+          }
+        }
+      }
+    },
+    "Work is starting": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "작업을 시작하고 있습니다"
+          }
+        }
+      }
+    },
+    "Work: Open Command Center": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "작업: 명령 센터 열기"
+          }
+        }
+      }
+    },
+    "Work: Start configured Work": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "작업: 설정된 작업 시작"
+          }
+        }
+      }
+    },
+    "Workspace: Refresh": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "워크스페이스: 새로 고침"
+          }
+        }
+      }
+    },
+    "esc  dismiss": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "esc  닫기"
+          }
+        }
+      }
+    },
+    "↑↓ / ⇧⇥ ⇥  select": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "↑↓ / ⇧⇥ ⇥  선택"
+          }
+        }
+      }
+    },
+    "↵  open": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "↵  열기"
+          }
+        }
+      }
+    },
+    "Command Palette…": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "명령 팔레트…"
+          }
+        }
+      }
+    },
+    "Focus Next Editor Group": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "다음 편집기 그룹에 포커스"
+          }
+        }
+      }
+    },
+    "Focus Previous Editor Group": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이전 편집기 그룹에 포커스"
+          }
+        }
+      }
+    },
+    "Focus Sidebar Filter": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "사이드바 필터에 포커스"
+          }
+        }
+      }
+    },
+    "Last Editor": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "마지막 편집기"
+          }
+        }
+      }
+    },
+    "Open Ask": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ask 열기"
+          }
+        }
+      }
+    },
+    "Open Inbox": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "받은 편지함 열기"
+          }
+        }
+      }
+    },
+    "Quick Open…": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "빠른 이동…"
+          }
+        }
+      }
+    },
+    "Show prompt status details": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "프롬프트 전송 상태 자세히 보기"
+          }
+        }
+      }
+    },
+    "No destinations available": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이동할 대상이 없습니다"
+          }
+        }
+      }
+    },
+    "No matching results": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "검색 결과가 없습니다"
+          }
+        }
+      }
+    },
+    "Sessions and work appear here when available.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "사용 가능한 세션과 작업이 여기에 표시됩니다."
+          }
+        }
+      }
+    },
+    "Try a name, host, socket, or a shorter query.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이름, 호스트, 소켓 또는 더 짧은 검색어로 검색하세요."
+          }
+        }
+      }
+    },
+    "Editor %lld": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "편집기 %lld"
+          }
+        }
+      }
+    },
+    "%lld results": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "결과 %lld개"
+          }
+        }
+      }
+    },
+    "Navigate": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이동"
+          }
+        }
+      }
+    },
     "Advanced has unsaved configuration changes. Save or reload it before changing this." : {
       "localizations" : {
         "ko" : {

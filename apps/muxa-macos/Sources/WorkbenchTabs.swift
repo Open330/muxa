@@ -82,6 +82,31 @@ final class MuxaWorkbenchTabs: ObservableObject {
     }
 
     @discardableResult
+    func activateAt(_ index: Int) -> MuxaSidebarSelection? {
+        guard let group = group(id: focusedGroupID),
+              group.tabs.indices.contains(index) else { return nil }
+        let selection = group.tabs[index]
+        activate(selection, groupID: group.id)
+        return selection
+    }
+
+    @discardableResult
+    func activateLast() -> MuxaSidebarSelection? {
+        guard let group = group(id: focusedGroupID) else { return nil }
+        return activateAt(group.tabs.count - 1)
+    }
+
+    @discardableResult
+    func focusRelativeGroup(_ offset: Int) -> MuxaSidebarSelection? {
+        guard !groups.isEmpty,
+              let current = groups.firstIndex(where: { $0.id == focusedGroupID }) else { return nil }
+        let count = groups.count
+        let nextIndex = (current + offset % count + count) % count
+        focus(groups[nextIndex].id)
+        return focusedSelection
+    }
+
+    @discardableResult
     func activateRelative(_ offset: Int) -> MuxaSidebarSelection? {
         guard let group = group(id: focusedGroupID), !group.tabs.isEmpty else { return nil }
         let current = group.active.flatMap { group.tabs.firstIndex(of: $0) } ?? 0
@@ -125,10 +150,18 @@ final class MuxaWorkbenchTabs: ObservableObject {
 
         if groups[groupIndex].tabs.isEmpty, groups.count > 1 {
             groups.remove(at: groupIndex)
-            let fallbackIndex = min(groupIndex, groups.count - 1)
-            focusedGroupID = groups[fallbackIndex].id
-        } else {
-            focusedGroupID = groupID
+            if focusedGroupID == groupID {
+                let fallbackIndex = min(groupIndex, groups.count - 1)
+                focusedGroupID = groups[fallbackIndex].id
+            }
+        }
+        return focusedSelection
+    }
+
+    @discardableResult
+    func closeEverywhere(_ selection: MuxaSidebarSelection) -> MuxaSidebarSelection? {
+        for group in groups where group.tabs.contains(selection) {
+            close(selection, groupID: group.id)
         }
         return focusedSelection
     }
@@ -293,11 +326,22 @@ private extension Array {
 }
 
 struct MuxaEditorCommandActions {
-    let close: () -> Void
-    let next: () -> Void
-    let previous: () -> Void
-    let splitRight: () -> Void
-    let pin: () -> Void
+    var close: (() -> Void)? = nil
+    var next: (() -> Void)? = nil
+    var previous: (() -> Void)? = nil
+    var splitRight: (() -> Void)? = nil
+    var pin: (() -> Void)? = nil
+    var quickOpen: (() -> Void)? = nil
+    var commandPalette: (() -> Void)? = nil
+    var activateAt: ((Int) -> Void)? = nil
+    var activateLast: (() -> Void)? = nil
+    var focusRelativeGroup: ((Int) -> Void)? = nil
+    var openWorkCommandCenter: (() -> Void)? = nil
+    var openAsk: (() -> Void)? = nil
+    var openInbox: (() -> Void)? = nil
+    var selectSidebar: ((MuxaSidebarMode) -> Void)? = nil
+    var focusSidebar: (() -> Void)? = nil
+    var isEnabled: Bool = true
 }
 
 private struct MuxaEditorCommandActionsKey: FocusedValueKey {
