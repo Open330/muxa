@@ -22,7 +22,21 @@ pub fn default_socket() -> PathBuf {
     if let Some(dir) = dirs::runtime_dir() {
         return dir.join(SOCKET_FILENAME);
     }
-    PathBuf::from(format!("/tmp/muxa-{}.sock", posix_uid()))
+    #[cfg(unix)]
+    {
+        PathBuf::from(format!("/tmp/muxa-{}.sock", posix_uid()))
+    }
+    // No `$XDG_RUNTIME_DIR` and no `/tmp` worth writing to: fall back to the
+    // per-user local data directory. On Windows the path is not bound to a
+    // filesystem object anyway — the transport derives a pipe name from it —
+    // but it is still what `create_dir_all` runs against, and creating a
+    // `	mp` at the drive root would be a surprising thing for a daemon to do.
+    #[cfg(not(unix))]
+    {
+        dirs::data_local_dir()
+            .map(|d| d.join(CONFIG_DIRNAME).join(SOCKET_FILENAME))
+            .unwrap_or_else(|| PathBuf::from(SOCKET_FILENAME))
+    }
 }
 
 /// Default config file path: `$XDG_CONFIG_HOME/muxa/config.toml`, falling
@@ -95,6 +109,7 @@ pub fn default_pipeline_run_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(PIPELINE_RUN_FILENAME))
 }
 
+#[cfg(unix)]
 fn posix_uid() -> u32 {
     std::process::Command::new("id")
         .arg("-u")

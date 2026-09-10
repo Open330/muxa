@@ -39,7 +39,7 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
 /// for the MCP ancestry recovery; hook reconciliation already takes a shared
 /// one-shot process snapshot on macOS/BSD. A failed or unavailable `ps`
 /// degrades cleanly to no ancestry match.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn parent_pid(pid: u32) -> Option<u32> {
     let output = std::process::Command::new("ps")
         .args(["-o", "ppid=", "-p", &pid.to_string()])
@@ -49,6 +49,17 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
         return None;
     }
     String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
+/// No ancestry source on non-Unix hosts.
+///
+/// Spelled out rather than left to `not(target_os = "linux")`, which would
+/// otherwise select the `ps` arm above and fail at runtime. Returning `None`
+/// degrades exactly like an unavailable `ps`: the caller falls back to the
+/// pane env var and gives up quietly. See `docs/WINDOWS.md`.
+#[cfg(not(unix))]
+pub fn parent_pid(_pid: u32) -> Option<u32> {
+    None
 }
 
 /// Parse the `PPid:` field out of `/proc/<pid>/status` content.

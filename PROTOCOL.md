@@ -20,16 +20,41 @@ Post-1.0: the protocol is stable within a major version; breaking changes bump
 
 ## Transport
 
+- A local, owner-private, full-duplex byte stream addressed by a path that
+  both ends derive independently. `crates/muxa/src/transport.rs` owns the
+  platform-specific half; nothing above it names a socket type.
+- Encoding: **line-delimited JSON** (one UTF-8 JSON object per line, `\n`
+  terminated). `serde_json` does not emit raw newlines inside values, so
+  embedded newlines in string fields are escaped per RFC 8259. The encoding
+  is transport-independent — Fleet carries the same shape over SSH stdio.
+
+Each connection is full-duplex: a client may issue multiple
+request/response pairs over the same stream.
+
+On Unix, the supported host:
+
 - Unix-domain stream socket.
 - Default path: `$XDG_RUNTIME_DIR/muxa.sock`, falling back to
   `/tmp/muxa-<uid>.sock`.
 - Permissions: `0600` (owner-only). The daemon `chmod`s after bind.
-- Encoding: **line-delimited JSON** (one UTF-8 JSON object per line, `\n`
-  terminated). `serde_json` does not emit raw newlines inside values, so
-  embedded newlines in string fields are escaped per RFC 8259.
+- Peer credentials via `SO_PEERCRED`; collaboration provenance records them
+  as `caller_pid` / `caller_uid` / `caller_gid`.
 
-Each connection is full-duplex: a client may issue multiple
-request/response pairs over the same stream.
+On Windows — **not** a supported host (see `docs/WINDOWS.md`), but no longer
+blocked by the transport — the same protocol runs over a named pipe. The
+differences are not cosmetic:
+
+- Address: `\\.\pipe\muxa-<stem>-<digest>`, derived from the same path.
+  `$XDG_RUNTIME_DIR` being unset, that path defaults under `%LOCALAPPDATA%`.
+- Exclusivity comes from `first_pipe_instance`, not from a bind failing on an
+  existing file. `reject_remote_clients` keeps the pipe off SMB.
+- Protection is the creating token's default DACL, which is **weaker than
+  `0600`**: an administrator can connect. A pipe's DACL is fixed at creation,
+  and setting a custom one needs an unsafe call the workspace forbids.
+- No peer credentials, so provenance records `None` for all three fields.
+- A pipe instance serves one client, and the daemon creates its successor only
+  once a client has claimed the pending one. Clients retry `ERROR_PIPE_BUSY`
+  briefly to cover that window, which a socket's backlog would hide.
 
 Physical-host Fleet uses a second, versioned JSON-lines protocol over an
 OpenSSH stdio channel. It is intentionally not a network service. The remote
@@ -407,11 +432,12 @@ They back muxa's control plane — the `muxa mcp` MCP server exposes each as a
 tool so a coding agent can orchestrate the others (see `docs/MCP.md`).
 
 **Safety.** `send_prompt` injects keystrokes into another agent's pane — a
-control action, not a read. The IPC socket is already owner-only (`0600`,
-chmod'd after bind — see [Transport](#transport)), so only the daemon's own
-user can invoke it; there is no network exposure and no additional
-authentication layer. Treat socket access as equivalent to shell access for
-that user.
+control action, not a read. The IPC endpoint is already owner-only on Unix
+(`0600`, chmod'd after bind — see [Transport](#transport)), so only the
+daemon's own user can invoke it; there is no network exposure and no
+additional authentication layer. Treat endpoint access as equivalent to shell
+access for that user. The Windows named pipe is additionally reachable by
+administrators, which is one of the reasons Windows is not a supported host.
 
 **Pre-1.0 evolution.** These methods are additive (they do not bump
 `PROTOCOL_VERSION`). Like the rest of the pre-1.0 surface they may change

@@ -1,0 +1,20 @@
+# Line endings are pinned rather than left to each contributor's
+# `core.autocrlf`, because two of this repo's own checks break on CRLF and
+# neither failure names its cause:
+#
+#   * `scripts/install.sh` is documented as `curl … | sh`, and `sh` is dash on
+#     Debian/Ubuntu. dash rejects a CRLF script outright — "Syntax error: word
+#     unexpected" on the first `case`, pointing at a line that is fine.
+#   * `rustfmt.toml` sets `newline_style = "Unix"`, so `cargo fmt --all --
+#     --check` reports "Incorrect newline style" for every file in the tree.
+#
+# A Windows checkout with the default `core.autocrlf=true` produces exactly
+# that, so a contributor there cannot run the CI checks locally until they
+# reconfigure git. Pinning costs nothing: git already stores LF in both cases.
+
+* text=auto eol=lf
+
+# Fixtures and captures whose bytes are the point.
+*.gif binary
+*.png binary
+*.tape text eol=lf

@@ -56,6 +56,7 @@ pub mod cmux;
 pub mod herdr;
 pub mod rmux;
 pub mod tmux;
+pub(crate) mod unix_socket;
 pub mod zellij;
 
 use std::collections::HashMap;

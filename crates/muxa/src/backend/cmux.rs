@@ -6,9 +6,9 @@
 //! JSON fixture; until then observations are deliberately partial so the
 //! reconciler never treats an absent cmux row as proof that an agent exited.
 
+use super::unix_socket::UnixStream;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use serde_json::json;
@@ -269,6 +269,7 @@ mod tests {
         assert!(caps.send_text);
     }
 
+    #[cfg(unix)]
     #[test]
     fn send_text_uses_the_exact_surface_and_socket_endpoint() {
         let dir = tempfile::tempdir().unwrap();
@@ -294,6 +295,7 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn oversized_socket_response_is_rejected() {
         let dir = tempfile::tempdir().unwrap();

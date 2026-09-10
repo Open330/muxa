@@ -2908,6 +2908,7 @@ mod tests {
     /// not the (empty-on-herdr) tmux scanner. We stand up a minimal herdr
     /// mock socket, point a real `HerdrBackend` at it, and assert the pane
     /// surfaces with the herdr synthetic socket identity.
+    #[cfg(unix)]
     #[tokio::test]
     async fn panes_endpoint_sources_from_herdr_backend_when_host_is_herdr() {
         use std::io::{BufRead, BufReader, Write};
