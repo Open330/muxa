@@ -169,13 +169,14 @@ mod imp {
 
         /// A connected pair, for tests that drive a handler without a daemon.
         ///
-        /// Nothing here needs to await; it is async only so the signature
-        /// matches the Windows counterpart, which has a handshake to finish.
+        /// A socketpair is connected the moment it exists, so there is nothing
+        /// to await — but the signature has to match the Windows counterpart,
+        /// which has a handshake to finish. Returning a ready future says that
+        /// honestly, where an `async fn` with no `.await` only looks like an
+        /// oversight.
         #[cfg(test)]
-        #[allow(clippy::unused_async)] // parity with the Windows counterpart
-        pub async fn pair() -> io::Result<(Self, Self)> {
-            let (a, b) = tokio::net::UnixStream::pair()?;
-            Ok((Self(a), Self(b)))
+        pub fn pair() -> impl std::future::Future<Output = io::Result<(Self, Self)>> {
+            std::future::ready(tokio::net::UnixStream::pair().map(|(a, b)| (Self(a), Self(b))))
         }
 
         /// Lock-free owned halves, exactly as before this module existed.
