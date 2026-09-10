@@ -256,6 +256,7 @@ fn socket_is_live(_path: &Path) -> bool {
     false
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn classify_socket_connect(result: std::io::Result<()>) -> bool {
     use std::io::ErrorKind;
     match result {

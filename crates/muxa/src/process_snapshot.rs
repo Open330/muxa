@@ -30,7 +30,7 @@ pub(crate) struct ProcessTable {
     children_by_parent: HashMap<u32, Vec<u32>>,
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(any(target_os = "linux", not(unix)), allow(dead_code))]
 impl ProcessTable {
     pub(crate) fn from_processes(processes: impl IntoIterator<Item = ProcessInfo>) -> Self {
         let mut table = Self::default();

@@ -69,6 +69,7 @@ pub mod state;
 pub mod timeline;
 pub mod tmux;
 pub mod topology;
+pub mod transport;
 pub mod work;
 pub mod work_compose;
 #[doc(hidden)]

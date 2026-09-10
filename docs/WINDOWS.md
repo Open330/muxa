@@ -26,6 +26,8 @@ The 9p mount that backs `/mnt` makes cargo builds several times slower.
 ## Why not native
 
 Four independent reasons, in increasing order of how hard they are to remove.
+The second has since been removed — it is kept here, marked, because what it
+cost and what it could not recover are the useful part of the record.
 
 ### 1. No host to observe
 
@@ -41,20 +43,41 @@ CLI baseline is modelled — but `list_panes` has no capability flag because
 every host must answer it. A Windows backend could not.
 
 This is the blocker. The three below are ordinary work; this one has no known
-solution, so the other three should not be started on its account.
+solution, so the other three should not be started on its account — and
+finishing one of them, as the next section did, changes nothing here.
 
-### 2. IPC is a Unix-domain socket
+### 2. IPC was a Unix-domain socket — resolved
 
-`crates/muxa/src/ipc.rs` binds a `UnixListener`, `chmod`s it to `0600`, and
-threads `tokio::net::unix::OwnedWriteHalf` through handler signatures. See
-[PROTOCOL.md](../PROTOCOL.md#transport).
+`ipc.rs` used to bind a `UnixListener` and thread
+`tokio::net::unix::OwnedWriteHalf` through handler signatures. It now goes
+through `crates/muxa/src/transport.rs`, which resolves to a Unix socket or a
+Windows named pipe. See [PROTOCOL.md](../PROTOCOL.md#transport).
 
-The encoding itself is transport-agnostic — line-delimited JSON — and Fleet
-already runs the same shape of protocol over an SSH stdio byte stream
-(`crates/muxa-cli/src/relay.rs`), so there is precedent for carrying it on
-something other than a Unix socket. The security model is the part that does
-not port directly: `0600` on a socket file has no exact named-pipe equivalent,
-and a pipe's protection comes from creation-time flags and its DACL instead.
+The encoding was never the coupled part — line-delimited JSON, which Fleet
+already carries over an SSH stdio byte stream (`crates/muxa-cli/src/relay.rs`).
+The types were. Rather than make the dispatch table generic, the module exposes
+one `Stream`/`ReadHalf`/`WriteHalf` family whose definition is platform-chosen,
+so `ipc.rs` gained no type parameters.
+
+What did **not** port cleanly, and is why this is a compile story rather than a
+support story:
+
+- **Protection is weaker.** `0600` on a socket file has no named-pipe
+  equivalent. A pipe's DACL is fixed at creation and setting a custom one needs
+  an unsafe raw call `unsafe_code = "forbid"` rules out, so the pipe inherits
+  the creating token's default DACL — an administrator can connect.
+  `first_pipe_instance` and `reject_remote_clients` cover name squatting and
+  SMB reachability, which are the other two exposures.
+- **No peer credentials.** `SO_PEERCRED` has no safe counterpart, so
+  collaboration provenance records `None` for pid/uid/gid on Windows.
+- **No synchronous client.** `blocking_call` needs a bounded read, and a pipe
+  opened as a file cannot set one without `SetCommTimeouts`. It returns
+  `Unsupported` rather than risk hanging the caller — which lands on the
+  "daemon unavailable" path the function already documents.
+- **Accept has a gap a socket does not have.** One pipe instance serves one
+  client, and the successor is created only once the pending instance is
+  claimed. A client connecting in that window gets `ERROR_PIPE_BUSY`, so
+  clients retry it briefly; a socket's backlog hides the same burst.
 
 ### 3. No process source
 
@@ -90,28 +113,46 @@ compile time. Service installation shells out to `launchctl` and `systemctl`,
 and roughly twenty other call sites invoke `sh`, `bash`, `id`, `kill`, `ps`,
 or `nohup`.
 
-## What compiles today
+## What builds and runs today
 
-`cargo check -p muxa --target x86_64-pc-windows-msvc`.
+The `muxa` library crate compiles clean for `x86_64-pc-windows-msvc`, warnings
+included, and its test suite runs:
 
-The whole dependency tree builds on Windows, including `rusqlite` (bundled
-SQLite, so a C toolchain is exercised), `portable-pty` (ConPTY), `axum`,
-`reqwest`, `tokio`, and `notify-rust` (which pulls `tauri-winrt-notification`
-for toasts). The dependencies are not the obstacle; muxa's own code is.
+```
+cargo check -p muxa --all-targets     # clean
+cargo test  -p muxa --lib             # 995 passed, 8 failed
+```
 
-Remaining errors are confined to `ipc.rs`.
+The whole dependency tree builds, including `rusqlite` (bundled SQLite, so a C
+toolchain is exercised), `portable-pty` (ConPTY), `axum`, `reqwest`, `tokio`,
+and `notify-rust` (which pulls `tauri-winrt-notification` for toasts). The
+dependencies were never the obstacle.
 
-A caution for anyone reading that error count as an estimate: they are `E0432`
-/ `E0433` name-resolution failures, and rustc stops before type-checking. The
-9,921 lines of `ipc.rs` have not been checked at all. Stubbing the imports
-reveals a considerably larger second wave.
+The eight failures are all pre-existing Unix assumptions in test fixtures, none
+in transport or IPC:
+
+| Test | Assumption |
+| --- | --- |
+| `ipc::work_command_tests` (4) | fixture cwd `/tmp/...`, which `Path::is_absolute` rejects without a drive prefix |
+| `work_control::tests::native_work_request_...` | same |
+| `adapters::antigravity::tests` (2) | transcript path shape |
+| `state::tests::reap_dead_pids_...` | Unix process liveness |
+
+They are left alone deliberately. Making them pass means teaching fixtures a
+second path grammar, which is only worth doing for a host muxa intends to
+support.
+
+`muxa-cli` still does not build — `nix` fails at dependency resolution. `muxad`
+has no such dependency and is the natural next crate, if anyone wants one.
 
 ## If the blocker ever lifts
 
-Sequence the work as 1 → 2 → 3 → 4, not the reverse. Reasons 2 through 4 are
-tractable and individually reviewable, but they buy nothing on their own: a
-daemon that starts on Windows and observes no panes is not a product. Settle
-what a Windows `PaneBackend` would talk to first.
+Sequence the remaining work as 1 → 3 → 4, and settle 1 first. Reasons 3 and 4
+are tractable and individually reviewable, but they buy nothing on their own: a
+daemon that starts on Windows and observes no panes is not a product. Reason 2
+was worth doing early only because it was the load-bearing one for *compiling*
+at all, and because writing the transport down forced the security differences
+above into one reviewable place.
 
 [`PaneBackend`]: ../crates/muxa/src/backend/mod.rs
 [`BackendCaps`]: ../crates/muxa/src/backend/mod.rs

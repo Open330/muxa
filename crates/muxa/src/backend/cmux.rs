@@ -269,6 +269,7 @@ mod tests {
         assert!(caps.send_text);
     }
 
+    #[cfg(unix)]
     #[test]
     fn send_text_uses_the_exact_surface_and_socket_endpoint() {
         let dir = tempfile::tempdir().unwrap();
@@ -294,6 +295,7 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn oversized_socket_response_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
