@@ -247,6 +247,25 @@ mutation은 자동 retry하지 않습니다. 결과는 text delivery와 Enter su
 결과의 정확한 `pane_key`와 `request_id`를 wait 도구에 그대로 넘기면 됩니다. 요청과
 구조화된 reply는 선택한 physical node에 남으므로 terminal capture polling이 필요 없습니다.
 
+Fleet 응답 대기는 controller에서 `(host, pane_key, request_id)`별로 공유합니다.
+`mailbox_watch` 지원 호스트는 최초 조회 후 mailbox 변경·연결 복구 때만 다시 읽으며,
+상태 변화 없는 5분 대기는 조회 1회로 끝납니다. 같은 호스트의 다른 요청 변경은
+조회가 발생할 수 있지만, 다른 호스트 이벤트와 일반 topology refresh는 무시합니다.
+대기자별 timeout은 독립적이고 마지막 대기 연결이 종료되면 구독도 정리합니다.
+구형 호스트/controller에만 1→2→4→8→16→30초 간격의 backoff를 적용합니다.
+
+진행 중 보완 지시는 `muxa_fleet_update_request(host, pane_key, request_id, body)`,
+수임자의 진행보고는 `muxa_update_request(request_id, body)`로 기존 요청에 남깁니다.
+`muxa_fleet_wait_reply`에 `after_update: 0`을 주면 완료 전 새 update에도 반환하고,
+이후 `next_after_update`로 이어서 기다릴 수 있습니다. `initiator`는 원래 조율자의
+식별 정보이며 권한을 추가하지 않습니다. `console`을 수신 pane으로 사용하지 않습니다.
+
+update는 작업 완료·새 작업 생성·터미널 입력을 하지 않습니다. 에이전트는 합의한
+검토 시점에 `muxa_list_messages`로 변경사항을 읽고 마지막에 `muxa_reply`를 한 번
+제출합니다. 지시를 검증한 뒤 묶어서 전달하고, 큰 근거는 파일 경로로 연결합니다.
+update당 8 KiB, 요청당 최근 32개/본문 합계 32 KiB를 보관합니다. 원격 update는
+`collaboration_update` capability와 control mode가 필요합니다.
+
 web dashboard를 켜면 read API에 `GET /api/fleet?selector=...`가 추가됩니다.
 `POST /api/fleet/{host}/command`는 serialized `FleetOperation`을 받아 PAT를 요구합니다.
 dashboard `auth = "none"`에서는 기존 정책대로 모든 write가 비활성화됩니다.

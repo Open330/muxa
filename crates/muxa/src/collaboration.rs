@@ -531,11 +531,28 @@ pub struct CollaborationReply {
     pub at: OffsetDateTime,
 }
 
+/// A progress report or guidance update, separate from the one terminal reply.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CollaborationUpdate {
+    pub sequence: u64,
+    pub author: Participant,
+    pub body: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CollaborationRequest {
     pub id: String,
     pub from: Participant,
     pub to: Participant,
+    /// Advisory identity of the agent initiating a Fleet console request;
+    /// never used for authorization or participant matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<Box<Participant>>,
+    /// Bounded nonterminal conversation on this exact request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub updates: Vec<CollaborationUpdate>,
     /// How the request entered muxad. `from` remains the represented agent;
     /// this field identifies the local caller that exercised that authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -654,6 +671,8 @@ pub struct RoomContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<Box<Participant>>,
     pub kind: RequestKind,
     pub body: String,
     pub expects_reply: bool,
@@ -680,6 +699,7 @@ pub struct NewRequest {
 impl Default for NewRequest {
     fn default() -> Self {
         Self {
+            initiator: None,
             kind: RequestKind::Question,
             body: String::new(),
             expects_reply: true,
@@ -1896,6 +1916,8 @@ impl CollaborationStore {
             id,
             from,
             to,
+            initiator: input.initiator,
+            updates: Vec::new(),
             provenance,
             kind: input.kind,
             body,
@@ -2051,6 +2073,68 @@ impl CollaborationStore {
             result?;
         }
         Ok(())
+    }
+
+    /// Append bounded guidance/progress without claiming or completing work.
+    pub async fn update_request(
+        &self,
+        caller: &Participant,
+        request_id: &str,
+        body: String,
+    ) -> Result<CollaborationRequest, CollaborationError> {
+        self.ensure_enabled()?;
+        let body = body.trim().to_string();
+        if body.is_empty() {
+            return Err(CollaborationError::EmptyMessage);
+        }
+        let limit = self.opts.max_message_bytes.min(8192);
+        if body.len() > limit {
+            return Err(CollaborationError::MessageTooLarge(limit));
+        }
+        let _transaction = self.transaction_lock.lock().await;
+        let mut updated = self
+            .requests
+            .read()
+            .await
+            .get(request_id)
+            .cloned()
+            .ok_or_else(|| CollaborationError::NotFound(request_id.into()))?;
+        if !addresses(&updated.from, caller) && !addresses(&updated.to, caller) {
+            return Err(CollaborationError::NotParticipant(request_id.into()));
+        }
+        if updated.status.is_terminal() {
+            return Err(CollaborationError::AlreadyTerminal(request_id.into()));
+        }
+        // Retried identical updates from the same participant are idempotent.
+        if updated
+            .updates
+            .last()
+            .is_some_and(|last| addresses(&last.author, caller) && last.body == body)
+        {
+            return Ok(updated);
+        }
+        let sequence = updated
+            .updates
+            .last()
+            .map_or(1, |last| last.sequence.saturating_add(1));
+        updated.updates.push(CollaborationUpdate {
+            sequence,
+            author: caller.clone(),
+            body,
+            at: OffsetDateTime::now_utc(),
+        });
+        while updated.updates.len() > 32
+            || updated.updates.iter().map(|u| u.body.len()).sum::<usize>() > 32768
+        {
+            updated.updates.remove(0);
+        }
+        self.persist_requests(std::slice::from_ref(&updated))?;
+        self.requests
+            .write()
+            .await
+            .insert(request_id.into(), updated.clone());
+        self.publish_change();
+        Ok(updated)
     }
 
     pub async fn reply(
@@ -3193,6 +3277,93 @@ fn valid_identity_token(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::CollaborationScope;
+
+    #[tokio::test]
+    async fn request_updates_are_durable_bounded_and_do_not_complete_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CollaborationOptions {
+            path: Some(dir.path().join("mailbox.json")),
+            ..CollaborationOptions::default()
+        };
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let initiator = participant("%9", "coordinator");
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "bounded task".into(),
+                    initiator: Some(Box::new(initiator.clone())),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut changes = mailbox.subscribe();
+        mailbox
+            .update_request(&recipient, &request.id, "progress".into())
+            .await
+            .unwrap();
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        let retried = mailbox
+            .update_request(&recipient, &request.id, "progress".into())
+            .await
+            .unwrap();
+        assert_eq!(retried.updates.len(), 1);
+        assert!(!changes.has_changed().unwrap());
+        // Advisory initiator metadata does not grant participant authority.
+        assert!(matches!(
+            mailbox
+                .update_request(&initiator, &request.id, "spoof".into())
+                .await,
+            Err(CollaborationError::NotParticipant(_))
+        ));
+        assert!(matches!(
+            mailbox
+                .update_request(&sender, &request.id, " ".into())
+                .await,
+            Err(CollaborationError::EmptyMessage)
+        ));
+        assert!(matches!(
+            mailbox
+                .update_request(&sender, &request.id, "x".repeat(8193))
+                .await,
+            Err(CollaborationError::MessageTooLarge(_))
+        ));
+        for i in 0..40 {
+            mailbox
+                .update_request(&sender, &request.id, format!("guidance {i}"))
+                .await
+                .unwrap();
+        }
+        let reloaded = CollaborationStore::load(options).await.unwrap();
+        let restored = reloaded.get_for(&recipient, &request.id).await.unwrap();
+        assert_eq!(restored.initiator, Some(Box::new(initiator)));
+        assert_eq!(restored.updates.len(), 32);
+        assert_eq!(restored.updates.last().unwrap().sequence, 41);
+        assert_eq!(restored.status, RequestStatus::Queued);
+        assert!(restored.reply.is_none());
+        reloaded
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "done".into(),
+                vec![],
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reloaded
+                .update_request(&sender, &request.id, "late".into())
+                .await,
+            Err(CollaborationError::AlreadyTerminal(_))
+        ));
+    }
 
     fn participant(pane: &str, session: &str) -> Participant {
         Participant {

@@ -1706,6 +1706,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     &origin,
                     &target,
                     &NewRequest {
+                        initiator: None,
                         kind,
                         body,
                         expects_reply: !no_reply && kind != RequestKind::Notice,
@@ -4272,6 +4273,8 @@ mod tests {
         status: RequestStatus,
     ) -> CollaborationRequest {
         CollaborationRequest {
+            initiator: None,
+            updates: Vec::new(),
             id: id.into(),
             from: collaboration_participant("%1", window),
             to: collaboration_participant("%2", window),

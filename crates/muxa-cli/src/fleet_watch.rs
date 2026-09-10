@@ -1365,6 +1365,7 @@ fn handle_key(
                             )
                         };
                         let request = NewRequest {
+                            initiator: None,
                             kind: app.message_kind,
                             body: text,
                             expects_reply: app.message_kind != RequestKind::Notice,
@@ -2144,7 +2145,7 @@ fn spawn_collaboration_broadcast(
                             &target.recipient.host_alias,
                             &FleetOperation::CollaborationSend {
                                 pane: target.recipient.pane,
-                                request,
+                                request: Box::new(request),
                             },
                         )
                         .await
@@ -2179,7 +2180,13 @@ fn spawn_collaboration_send(
     let sender = background.clone();
     tokio::spawn(async move {
         let result = client
-            .fleet_execute(&host, &FleetOperation::CollaborationSend { pane, request })
+            .fleet_execute(
+                &host,
+                &FleetOperation::CollaborationSend {
+                    pane,
+                    request: Box::new(request),
+                },
+            )
             .await
             .map_err(|error| error.to_string());
         let _ = sender.send(BackgroundResult::CollaborationSent(result));
@@ -4821,6 +4828,7 @@ mod tests {
 
     fn broadcast_request() -> NewRequest {
         NewRequest {
+            initiator: None,
             kind: RequestKind::Question,
             body: "coordinate this change".into(),
             expects_reply: true,

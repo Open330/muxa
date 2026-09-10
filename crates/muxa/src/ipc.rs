@@ -268,6 +268,14 @@ enum RequestBody {
         host: String,
         operation: FleetOperation,
     },
+    FleetWaitReply {
+        #[serde(default)]
+        after_update: Option<u64>,
+        host: String,
+        pane: crate::topology::PaneKey,
+        request_id: String,
+        timeout_secs: u64,
+    },
     ByPane {
         pane: String,
     },
@@ -555,6 +563,11 @@ enum RequestBody {
         origin: CollaborationOrigin,
         request_id: String,
     },
+    CollaborationUpdate {
+        origin: CollaborationOrigin,
+        request_id: String,
+        body: String,
+    },
     /// Block on the mailbox's durable revision signal until this exact
     /// participant-visible request becomes terminal, or return its latest
     /// state at the bounded deadline. Unlike `collaboration_get` loops, one
@@ -701,6 +714,8 @@ const CAPABILITIES: &[&str] = &[
     "fleet_v1",
     "fleet_raw_capture_v1",
     "fleet_subscribe",
+    "fleet_wait_reply",
+    "collaboration_update",
     "pipeline_runs_v1",
     "pipeline_subscribe",
     "work_control_v1",
@@ -1647,6 +1662,9 @@ impl Server {
         tracing::info!(socket = %self.socket_path.display(), "listening");
 
         let mut handlers: JoinSet<()> = JoinSet::new();
+        // Sticky signal: a handler entering push mode after shutdown still
+        // observes it. Request mutations themselves are never cancelled by it.
+        let (stopping_tx, stopping_rx) = watch::channel(false);
         // Fixed budget of concurrent handlers. A permit is held for the
         // lifetime of each handler and released when it ends, so live fds
         // from handlers can never exceed `MAX_INFLIGHT_HANDLERS` — keeping
@@ -1722,6 +1740,7 @@ impl Server {
                     let pipeline_runs = self.pipeline_runs.clone();
                     let work_up = self.work_up.clone();
                     let config_path = self.config_path.clone();
+                    let stopping = stopping_rx.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
@@ -1741,6 +1760,7 @@ impl Server {
                                 pipeline_runs,
                                 work_up,
                                 config_path,
+                                stopping,
                             ))
                             .await
                         {
@@ -1757,6 +1777,8 @@ impl Server {
                 }
             }
         }
+
+        stopping_tx.send_replace(true);
 
         // Drain in-flight handlers with a bounded timeout. Closes the
         // lost-update window where a handler could call `Store::apply`
@@ -1911,6 +1933,19 @@ where
     *line = String::from_utf8(bytes)
         .map_err(|e| RuntimeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
     Ok(line.len())
+}
+
+/// Only use at cancellation-safe boundaries: waiting for a new request or
+/// streaming read-only updates. In-flight mutations retain the bounded drain.
+async fn until_server_shutdown<T>(
+    stopping: &mut watch::Receiver<bool>,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = stopping.wait_for(|value| *value) => None,
+        result = future => Some(result),
+    }
 }
 
 /// Encode the `{"event":"lagged","dropped":N}` overflow control frame — but
@@ -2702,6 +2737,7 @@ async fn handle(
     pipeline_runs: Arc<PipelineRunStore>,
     work_up: Arc<WorkUpManager>,
     config_path: Option<PathBuf>,
+    mut stopping: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError> {
     let mut collaboration_actor = observe_collaboration_actor(&stream);
     let (reader, mut writer) = stream.into_split();
@@ -2723,9 +2759,27 @@ async fn handle(
         // persistent client simply reconnects; a half-open one can't leak.
         // (A `Subscribe` connection never reaches a second iteration: it hands
         // off to `stream_transitions` and returns, so streams are unaffected.)
+        let deadline = tokio::time::Instant::now() + IDLE_CONN_TIMEOUT;
+        // fill_buf is cancellation-safe. Once any bytes of a request arrive,
+        // finish reading/processing it under the normal drain budget instead
+        // of dropping a partially received ingest on shutdown.
+        let Some(ready) = until_server_shutdown(
+            &mut stopping,
+            tokio::time::timeout_at(deadline, async {
+                reader.fill_buf().await.map(|bytes| !bytes.is_empty())
+            }),
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        match ready {
+            Ok(Ok(true)) => {}
+            Ok(Err(error)) if !is_client_disconnect(&error) => return Err(error.into()),
+            _ => return Ok(()),
+        }
         let Ok(read_result) =
-            tokio::time::timeout(IDLE_CONN_TIMEOUT, read_limited_line(&mut reader, &mut line))
-                .await
+            tokio::time::timeout_at(deadline, read_limited_line(&mut reader, &mut line)).await
         else {
             tracing::debug!("idle connection timed out; closing");
             return Ok(());
@@ -2872,7 +2926,12 @@ async fn handle(
                     if !write_line_or_closed(&mut writer, &ack_bytes).await? {
                         return Ok(());
                     }
-                    return stream_revision_updates(writer, changes, stream_proto).await;
+                    return until_server_shutdown(
+                        &mut stopping,
+                        stream_revision_updates(writer, changes, stream_proto),
+                    )
+                    .await
+                    .unwrap_or(Ok(()));
                 }
                 RequestBody::WorkUp { request } => {
                     kind = "work_up";
@@ -3061,15 +3120,19 @@ async fn handle(
                         kind,
                         "ipc.handle (fleet stream takeover)",
                     );
-                    return stream_fleet_updates(
-                        writer,
-                        fleet.store.clone(),
-                        updates,
-                        stream_proto,
-                        selector,
-                        visible_hosts,
+                    return until_server_shutdown(
+                        &mut stopping,
+                        stream_fleet_updates(
+                            writer,
+                            fleet.store.clone(),
+                            updates,
+                            stream_proto,
+                            selector,
+                            visible_hosts,
+                        ),
                     )
-                    .await;
+                    .await
+                    .unwrap_or(Ok(()));
                 }
                 RequestBody::FleetCommand { host, operation } => {
                     kind = "fleet_command";
@@ -3082,6 +3145,42 @@ async fn handle(
                             Err(error) => Response::err(error),
                         },
                         None => Response::err("fleet is not enabled in muxad"),
+                    }
+                }
+                RequestBody::FleetWaitReply {
+                    host,
+                    pane,
+                    request_id,
+                    timeout_secs,
+                    after_update,
+                } => {
+                    kind = "fleet_wait_reply";
+                    let response = async {
+                        match &fleet {
+                            Some(fleet) => match fleet
+                                .wait_for_reply(
+                                    host,
+                                    pane,
+                                    request_id,
+                                    Duration::from_secs(
+                                        timeout_secs.clamp(1, MAX_COLLABORATION_WAIT_SECS),
+                                    ),
+                                    after_update,
+                                )
+                                .await
+                            {
+                                Ok(Some(request)) => Response::with_collaboration_request(request),
+                                Ok(None) => Response::ok(),
+                                Err(error) => Response::err(error),
+                            },
+                            None => Response::err("fleet is not enabled in muxad"),
+                        }
+                    };
+                    // A disconnected waiter must release its shared subscription promptly.
+                    tokio::select! {
+                        response = response => response,
+                        _ = reader.fill_buf() => return Ok(()),
+                        _ = stopping.wait_for(|value| *value) => return Ok(()),
                     }
                 }
                 RequestBody::ByPane { pane } => {
@@ -3363,7 +3462,12 @@ async fn handle(
                     if !write_line_or_closed(&mut writer, &ack_bytes).await? {
                         return Ok(());
                     }
-                    return stream_revision_updates(writer, changes, stream_proto).await;
+                    return until_server_shutdown(
+                        &mut stopping,
+                        stream_revision_updates(writer, changes, stream_proto),
+                    )
+                    .await
+                    .unwrap_or(Ok(()));
                 }
                 RequestBody::AskStatus {} => {
                     kind = "ask_status";
@@ -3719,7 +3823,12 @@ async fn handle(
                         kind,
                         "ipc.handle (collaboration stream takeover)",
                     );
-                    return stream_revision_updates(writer, changes, stream_proto).await;
+                    return until_server_shutdown(
+                        &mut stopping,
+                        stream_revision_updates(writer, changes, stream_proto),
+                    )
+                    .await
+                    .unwrap_or(Ok(()));
                 }
                 RequestBody::CollaborationList {
                     origin,
@@ -3745,6 +3854,40 @@ async fn handle(
                             Ok(requests) => {
                                 Response::with_scoped_collaboration_requests(requests, scope)
                             }
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
+                }
+                RequestBody::CollaborationUpdate {
+                    origin,
+                    request_id,
+                    body,
+                } => {
+                    kind = "collaboration_update";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::Update,
+                        origin.clone(),
+                    );
+                    audit_context.request_id = Some(request_id.clone());
+                    audit_context.message_bytes = Some(body.len());
+                    let topology =
+                        collaboration_participants(&store, &backends, &collaboration).await;
+                    let response = match topology.resolve_origin(&origin) {
+                        Ok(current) => match collaboration
+                            .update_request(&current, &request_id, body)
+                            .await
+                        {
+                            Ok(request) => Response::with_collaboration_request(request),
                             Err(error) => Response::err(error.to_string()),
                         },
                         Err(error) => Response::err(error.to_string()),
@@ -4029,7 +4172,12 @@ async fn handle(
                     if !write_line_or_closed(&mut writer, &ack).await? {
                         return Ok(());
                     }
-                    return stream_agent_changes(writer, changes, protocol).await;
+                    return until_server_shutdown(
+                        &mut stopping,
+                        stream_agent_changes(writer, changes, protocol),
+                    )
+                    .await
+                    .unwrap_or(Ok(()));
                 }
                 RequestBody::Subscribe { lagged_markers } => {
                     kind = "subscribe";
@@ -4053,8 +4201,12 @@ async fn handle(
                         kind,
                         "ipc.handle (stream takeover)",
                     );
-                    return stream_transitions(writer, transitions, stream_proto, lagged_markers)
-                        .await;
+                    return until_server_shutdown(
+                        &mut stopping,
+                        stream_transitions(writer, transitions, stream_proto, lagged_markers),
+                    )
+                    .await
+                    .unwrap_or(Ok(()));
                 }
             },
             Err(e) => {
@@ -4695,6 +4847,22 @@ impl Client {
 
     /// Execute an exact operation on one configured host. Mutations are
     /// authorized again by the manager's per-host access mode.
+    pub async fn collaboration_update(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+        body: &str,
+    ) -> Result<CollaborationRequest, RuntimeError> {
+        let response = self
+            .call_checked(&serde_json::json!({
+                "protocol": PROTOCOL_VERSION, "kind": "collaboration_update",
+                "origin": origin, "request_id": request_id, "body": body,
+            }))
+            .await?;
+        serde_json::from_value(response["collaboration_request"].clone())
+            .map_err(RuntimeError::Json)
+    }
+
     pub async fn fleet_execute(
         &self,
         host: &str,
@@ -4718,6 +4886,38 @@ impl Client {
             )));
         }
         serde_json::from_value(response["fleet_result"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Wait through the controller's shared event subscription, without pinning a relay command.
+    pub async fn fleet_wait_reply(
+        &self,
+        host: &str,
+        pane: &crate::topology::PaneKey,
+        request_id: &str,
+        timeout_secs: u64,
+        after_update: Option<u64>,
+    ) -> Result<Option<CollaborationRequest>, RuntimeError> {
+        let timeout_secs = timeout_secs.clamp(1, MAX_COLLABORATION_WAIT_SECS);
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION, "kind": "fleet_wait_reply",
+            "host": host, "pane": pane, "request_id": request_id, "timeout_secs": timeout_secs, "after_update":after_update,
+        });
+        let response = self
+            .call_with_timeout(
+                &req,
+                Duration::from_secs(timeout_secs).saturating_add(CLIENT_CALL_TIMEOUT),
+            )
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("fleet reply wait failed")
+                    .to_string(),
+            )));
+        }
+        serde_json::from_value(response["collaboration_request"].clone())
+            .map_err(RuntimeError::Json)
     }
 
     /// Run one allowlisted `muxa work …` argv through the daemon, on its own
@@ -6405,6 +6605,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_updates_round_trip_between_fleet_console_and_recipient() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("request-updates.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "recipient", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "unrelated", AgentKind::ClaudeCode).await;
+        let backend: SharedBackend = Arc::new(CollaborationTestBackend {
+            panes: vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+            ],
+        });
+        let audit = CollaborationAuditLog::in_memory();
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(CollaborationStore::in_memory(
+                CollaborationOptions::default(),
+            ))
+            .with_collaboration_audit(audit.clone());
+        let (shutdown, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let origin = |pane: &str, console| CollaborationOrigin {
+            pane: pane.into(),
+            socket: Some("default".into()),
+            console,
+        };
+        let request = client
+            .collaboration_send(
+                &origin("%1", true),
+                "pane:%1",
+                &NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(request.from.console);
+        client
+            .collaboration_inbox(&origin("%1", false))
+            .await
+            .unwrap();
+        let progress = client
+            .collaboration_update(&origin("%1", false), &request.id, "Tests running")
+            .await
+            .unwrap();
+        assert_eq!(progress.status, RequestStatus::Claimed);
+        assert!(progress.reply.is_none());
+        let guidance = client
+            .collaboration_update(&origin("%1", true), &request.id, "Include the retry path")
+            .await
+            .unwrap();
+        assert_eq!(guidance.updates.len(), 2);
+        assert!(client
+            .collaboration_update(&origin("%2", false), &request.id, "unrelated")
+            .await
+            .is_err());
+        let completed = client
+            .collaboration_reply(
+                &origin("%1", false),
+                &request.id,
+                RequestStatus::Completed,
+                "verified",
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.updates[0].body, "Tests running");
+        assert_eq!(completed.updates[1].author.pane, "console");
+        assert!(client
+            .collaboration_update(&origin("%1", true), &request.id, "late")
+            .await
+            .is_err());
+        let entries = audit.entries().await;
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.operation == CollaborationAuditOperation::Update && e.ok)
+                .count(),
+            2
+        );
+        shutdown.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn widening_a_listing_over_ipc_is_console_only() {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("muxa-collaboration-scope.sock");
@@ -6451,6 +6740,7 @@ mod tests {
                         &from,
                         to,
                         &NewRequest {
+                            initiator: None,
                             kind: collaboration::RequestKind::Question,
                             body: body.into(),
                             expects_reply: true,
@@ -6590,6 +6880,7 @@ mod tests {
                 &sender,
                 "role:review",
                 &NewRequest {
+                    initiator: None,
                     kind: collaboration::RequestKind::Question,
                     body: "ambiguous".into(),
                     expects_reply: true,
@@ -6613,6 +6904,7 @@ mod tests {
                 &sender,
                 "@reviewer",
                 &NewRequest {
+                    initiator: None,
                     kind: collaboration::RequestKind::Review,
                     body: "review this".into(),
                     expects_reply: true,
@@ -6701,6 +6993,7 @@ mod tests {
                 &sender,
                 "role:rust",
                 &NewRequest {
+                    initiator: None,
                     kind: collaboration::RequestKind::Question,
                     body: "obsolete question".into(),
                     expects_reply: true,
@@ -6747,6 +7040,7 @@ mod tests {
                 },
                 "pane:%1",
                 &NewRequest {
+                    initiator: None,
                     kind: collaboration::RequestKind::Task,
                     body: "dispatch to launch pane".into(),
                     expects_reply: true,
@@ -7080,10 +7374,9 @@ mod tests {
         // still blocked on its read.
         tx.send(()).unwrap();
 
-        // Now finish the request (newline) so the handler can complete,
-        // then close the stream so the handler's read loop sees EOF and
-        // returns. Without the close, `handle()` would happily wait for
-        // a follow-up request and the drain timeout would fire.
+        // Finish the admitted request after shutdown. The handler must apply
+        // it and close the connection itself rather than waiting for a new
+        // request; the client deliberately remains open while reading EOF.
         stream.write_all(b"\n").await.unwrap();
         stream.flush().await.unwrap();
         // Read the single response so we know the apply landed before
@@ -7119,6 +7412,7 @@ mod tests {
     async fn client_disconnect_before_response_is_clean_handler_exit() {
         let (server_stream, mut client_stream) = tokio::net::UnixStream::pair().unwrap();
         let store = Store::shared();
+        let (_stopping_tx, stopping_rx) = watch::channel(false);
         let handle = tokio::spawn(handle(
             server_stream,
             store,
@@ -7134,6 +7428,7 @@ mod tests {
             PipelineRunStore::in_memory(),
             WorkUpManager::new(PathBuf::from("/tmp/muxa-disconnect-test.sock")),
             None,
+            stopping_rx,
         ));
 
         let req = serde_json::json!({
@@ -7151,6 +7446,62 @@ mod tests {
             .expect("handler should exit promptly")
             .expect("handler task panicked");
         outcome.expect("client disconnect should not be treated as a handler failure");
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_idle_connections_and_all_local_subscriptions_promptly() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("shutdown-streams.sock");
+        let server = Server::new(socket.clone(), Store::shared());
+        let (stop, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(server.run(receiver));
+        wait_for_socket(&socket).await;
+        let mut connections = Vec::new();
+        for kind in [
+            "subscribe",
+            "subscribe_agent_changes",
+            "pipeline_subscribe",
+            "ask_subscribe",
+            "collaboration_subscribe",
+        ] {
+            let stream = UnixStream::connect(&socket).await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut bytes = serde_json::to_vec(
+                &serde_json::json!({"protocol": PROTOCOL_VERSION, "kind": kind}),
+            )
+            .unwrap();
+            bytes.push(b'\n');
+            reader.get_mut().write_all(&bytes).await.unwrap();
+            let mut ack = String::new();
+            reader.read_line(&mut ack).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&ack).unwrap()["ok"],
+                true,
+                "{kind}"
+            );
+            connections.push(reader);
+        }
+        // A persistent client has completed its request and is now idle.
+        let mut idle = BufReader::new(UnixStream::connect(&socket).await.unwrap());
+        idle.get_mut()
+            .write_all(
+                format!("{{\"protocol\":{PROTOCOL_VERSION},\"kind\":\"snapshot\"}}\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut ack = String::new();
+        idle.read_line(&mut ack).await.unwrap();
+        connections.push(idle);
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("subscriptions must close without waiting for the five-second drain timeout")
+            .unwrap()
+            .unwrap();
+        for mut reader in connections {
+            let mut line = String::new();
+            assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
+        }
     }
 
     #[tokio::test]

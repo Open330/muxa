@@ -52,6 +52,7 @@ pub const FLEET_MAX_CAPTURE_BYTES: usize = 256 * 1024;
 /// with its own binary. A controller falls back to a one-shot OpenSSH
 /// command for a relay that does not advertise it.
 pub const FLEET_WORK_COMMAND_CAPABILITY: &str = "work_command";
+pub const FLEET_MAILBOX_WATCH_CAPABILITY: &str = "mailbox_watch";
 pub const FLEET_CAPABILITIES: &[&str] = &[
     "snapshot_watch",
     "capture",
@@ -59,6 +60,8 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     "send_prompt",
     "collaboration",
     "collaboration_get",
+    "collaboration_update",
+    FLEET_MAILBOX_WATCH_CAPABILITY,
     "exact_pane_ref",
     "labels_v1",
     "raw_capture_base64",
@@ -498,7 +501,7 @@ pub enum RelayRequest {
     CollaborationSend {
         request_id: String,
         pane: PaneKey,
-        request: NewRequest,
+        request: Box<NewRequest>,
     },
     CollaborationMailbox {
         request_id: String,
@@ -512,6 +515,12 @@ pub enum RelayRequest {
     CollaborationClaim {
         request_id: String,
         pane: PaneKey,
+    },
+    CollaborationUpdate {
+        request_id: String,
+        pane: PaneKey,
+        collaboration_request_id: String,
+        body: String,
     },
     CollaborationReply {
         request_id: String,
@@ -542,6 +551,7 @@ impl RelayRequest {
             | Self::CollaborationSend { request_id, .. }
             | Self::CollaborationMailbox { request_id, .. }
             | Self::CollaborationGet { request_id, .. }
+            | Self::CollaborationUpdate { request_id, .. }
             | Self::CollaborationClaim { request_id, .. }
             | Self::CollaborationReply { request_id, .. }
             | Self::WorkCommand { request_id, .. } => request_id,
@@ -606,7 +616,7 @@ pub enum FleetOperation {
     },
     CollaborationSend {
         pane: PaneKey,
-        request: NewRequest,
+        request: Box<NewRequest>,
     },
     CollaborationMailbox {
         pane: PaneKey,
@@ -617,6 +627,11 @@ pub enum FleetOperation {
     },
     CollaborationClaim {
         pane: PaneKey,
+    },
+    CollaborationUpdate {
+        pane: PaneKey,
+        request_id: String,
+        body: String,
     },
     CollaborationReply {
         pane: PaneKey,
@@ -910,6 +925,27 @@ impl FleetStore {
         self.updates.subscribe()
     }
 
+    /// Reply waits need connection metadata, never a cloned topology/agent snapshot.
+    pub(crate) async fn reply_wait_host(
+        &self,
+        alias: &str,
+    ) -> Option<crate::fleet_wait::ReplyHost> {
+        self.hosts
+            .read()
+            .await
+            .get(alias)
+            .map(|host| crate::fleet_wait::ReplyHost {
+                local: host.local,
+                mode: host.mode,
+                state: host.state,
+                generation: host.daemon_generation,
+                event_driven: host
+                    .capabilities
+                    .iter()
+                    .any(|c| c == FLEET_MAILBOX_WATCH_CAPABILITY),
+            })
+    }
+
     /// Return whether the current cached host matches `selector`. A missing
     /// host never matches. Fleet streams use this after receiving an update
     /// so selector-scoped watchers are not woken by unrelated hosts.
@@ -1029,13 +1065,21 @@ struct FleetDispatch {
 pub struct FleetRuntime {
     pub store: Arc<FleetStore>,
     commands: mpsc::Sender<FleetDispatch>,
+    pub(crate) reply_waits: Arc<crate::fleet_wait::ReplyWaits>,
 }
 
 impl FleetRuntime {
     #[must_use]
     pub fn new(store: Arc<FleetStore>) -> (Self, FleetCommandReceiver) {
         let (commands, receiver) = mpsc::channel(128);
-        (Self { store, commands }, FleetCommandReceiver(receiver))
+        (
+            Self {
+                store,
+                commands,
+                reply_waits: Arc::default(),
+            },
+            FleetCommandReceiver(receiver),
+        )
     }
 
     pub async fn execute(
@@ -1426,7 +1470,8 @@ mod tests {
         let request = RelayRequest::CollaborationSend {
             request_id: "relay-1".into(),
             pane: pane.clone(),
-            request: NewRequest {
+            request: Box::new(NewRequest {
+                initiator: None,
                 kind: crate::collaboration::RequestKind::Review,
                 body: "review this change".into(),
                 expects_reply: true,
@@ -1440,7 +1485,7 @@ mod tests {
                 artifacts: Vec::new(),
                 links: Vec::new(),
                 air_artifacts: Vec::new(),
-            },
+            }),
         };
         let encoded = serde_json::to_string(&request).unwrap();
         let decoded: RelayRequest = serde_json::from_str(&encoded).unwrap();

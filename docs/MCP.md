@@ -86,7 +86,7 @@ muxa_fleet_status      { "selector": "environment=production" }
 muxa_fleet_capture     { "host": "local", "pane": "%12" }
 muxa_fleet_capture     { "host": "dev", "pane": "%12" }
 muxa_fleet_send_prompt { "host": "dev", "pane": "%12",
-                         "text": "Summarize the result", "submit": true }
+                         "text": "Start the interactive session", "submit": true }
 muxa_fleet_call_peer   { "host": "dev", "pane": "%12",
                          "intent": "review", "body": "Review the current change" }
 muxa_fleet_wait_reply  { "host": "dev", "pane_key": { "window": { ... },
@@ -102,6 +102,43 @@ times out, pass the returned exact `pane_key` and `request_id` to
 `muxa_fleet_wait_reply`. Fleet calls use muxad's cache/control plane; the MCP
 subprocess never opens SSH itself. The remote `muxa` must advertise both
 `collaboration` and `collaboration_get`. See [FLEET.md](FLEET.md).
+
+Reply waits are shared in the controller by `(host, exact pane_key, request_id)`.
+The controller subscribes before its first read, then reconciles mailbox changes,
+stream gaps and host reconnections. An unchanged five-minute wait performs one
+request read; topology refreshes do not cause mailbox reads. The subscription is
+released when its last waiter disconnects or expires, and each waiter has its own
+deadline. Hosts advertising `mailbox_watch` use this event path; older hosts use
+1/2/4/8/16/30-second capped backoff. Older controllers also use capped backoff.
+Mailbox invalidations are host-scoped, so changes to other requests on that host
+can still trigger reads; updates from other hosts are ignored.
+
+For ongoing work, keep guidance and progress on the existing durable request:
+
+```text
+muxa_fleet_update_request { "host": "dev", "pane_key": <returned pane_key>,
+                           "request_id": "req_...", "body": "Verified guidance within the agreed scope" }
+muxa_update_request      { "request_id": "req_...", "body": "Implementation done; running tests" }
+muxa_fleet_wait_reply    { "host": "dev", "pane_key": <returned pane_key>,
+                           "request_id": "req_...", "after_update": 0 }
+```
+
+`after_update` returns `reason: "updated"` for a newer sequence without marking the
+request completed. Resume using `next_after_update`, or omit `after_update` to wait
+only for a terminal reply. Updates do not claim work, widen its execution/path
+scope, or inject terminal prompts. Recipients check their request updates through
+`muxa_list_messages` at agreed checkpoints; urgent interruption remains an explicit
+separate action. Finish with exactly one `muxa_reply`.
+
+Each update is limited to 8 KiB of UTF-8 text; a request retains at most 32 updates
+and 32 KiB of update bodies, with monotonic sequence numbers even after trimming.
+Link larger artifacts. Consecutive identical updates by the same participant are
+idempotent. Only the existing sender/recipient may update a nonterminal request.
+The optional `initiator` records the originating agent when its context resolves;
+it is advisory metadata, not additional authorization or a routable console pane.
+Fleet calls return explicit progress/guidance routes on the original request.
+Remote updates require the `collaboration_update` capability and control mode;
+there is no terminal-text fallback when that capability is absent.
 
 ## Implementation
 
@@ -155,7 +192,9 @@ it:
 | `muxa_fleet_capture` | `host`, `pane` | Capture one exact pane on a named Fleet host. |
 | `muxa_fleet_send_prompt` | `host`, `pane`, `text`, `submit?` | Inject literal text into one exact Fleet pane on a control-authorized host. |
 | `muxa_fleet_call_peer` | `host`, `pane`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?` | Send durable structured work to one explicitly selected Fleet agent and optionally wait for its reply. |
-| `muxa_fleet_wait_reply` | `host`, `pane_key`, `request_id`, `timeout_secs?` | Continue an exact remote durable reply wait, including after the target pane exits. |
+| `muxa_update_request` | `request_id`, `body` | Add nonterminal progress/guidance as an existing participant. |
+| `muxa_fleet_update_request` | `host`, `pane_key`, `request_id`, `body` | Add guidance to the original Fleet request without prompt injection. |
+| `muxa_fleet_wait_reply` | `host`, `pane_key`, `request_id`, `timeout_secs?`, `after_update?` | Continue an exact remote durable reply wait, including after the target pane exits. |
 | `muxa_wait_for_change` | `timeout_secs?`, `pane?`, `until?`, `include_capture?` | Wait for any change or a focused settled/idle/blocked/stopped state, optionally returning the screen. |
 | `muxa_collaboration_guide` | — | Show the recommended reviewer, question, delegated-subagent, incoming-work, and AIR handoff contracts. |
 | `muxa_room_context` | — | Identify self, list same-window peers, and report unread request/reply counts. |

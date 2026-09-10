@@ -89,6 +89,15 @@ pub(crate) async fn run(client: Client) -> Result<()> {
                 muxa_version: env!("CARGO_PKG_VERSION").into(),
                 capabilities: FLEET_CAPABILITIES
                     .iter()
+                    .filter(|capability| {
+                        (**capability != muxa::fleet::FLEET_MAILBOX_WATCH_CAPABILITY
+                            || mailbox_updates.is_some())
+                            && (**capability != "collaboration_update"
+                                || daemon
+                                    .capabilities
+                                    .iter()
+                                    .any(|c| c == "collaboration_update"))
+                    })
                     .map(|capability| (*capability).to_string())
                     .collect(),
                 daemon_generation: daemon.generation,
@@ -141,8 +150,25 @@ pub(crate) async fn run(client: Client) -> Result<()> {
     let mailbox_task = mailbox_updates.take().map(|mut mailbox_updates| {
         let mailbox_tx = output_tx.clone();
         let mailbox_topology_revision = Arc::clone(&revision);
+        let mailbox_client = client.clone();
         tokio::spawn(async move {
-            while let Ok(Some(mailbox_revision)) = mailbox_updates.recv().await {
+            loop {
+                let mailbox_revision = if let Ok(Some(revision)) = mailbox_updates.recv().await {
+                    revision
+                } else {
+                    loop {
+                        tokio::select! {
+                            () = mailbox_tx.closed() => return,
+                            () = tokio::time::sleep(Duration::from_secs(2)) => {},
+                        }
+                        if let Ok(stream) = mailbox_client.collaboration_subscribe().await {
+                            mailbox_updates = stream;
+                            break;
+                        }
+                    }
+                    // A fresh subscription alone cannot replay changes lost during disconnection.
+                    0
+                };
                 if mailbox_tx
                     .send(RelayFrame::Keepalive {
                         revision: mailbox_topology_revision.load(Ordering::SeqCst),
@@ -461,6 +487,24 @@ async fn handle_request(
             Ok(RelayFrame::Result {
                 request_id,
                 result: FleetCommandResult::collaboration_mailbox(incoming, Vec::new()),
+            })
+        }
+        RelayRequest::CollaborationUpdate {
+            request_id,
+            pane,
+            collaboration_request_id,
+            body,
+        } => {
+            let request = client
+                .collaboration_update(
+                    &collaboration_origin(&pane, true),
+                    &collaboration_request_id,
+                    &body,
+                )
+                .await?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: FleetCommandResult::collaboration_request(request),
             })
         }
         RelayRequest::CollaborationReply {
