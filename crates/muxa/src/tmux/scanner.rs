@@ -25,6 +25,8 @@
 use crate::backend::HostKind;
 use crate::tmux::{PaneInfo, PANE_FMT};
 use serde::Serialize;
+// Only the Unix socket-directory walk dedupes by canonical path.
+#[cfg(unix)]
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -240,8 +242,18 @@ fn enumerate_sockets_with(scoped: Option<PathBuf>, dirs: &[PathBuf]) -> Vec<Path
 /// error (e.g. permission denied) keeps the socket so we never hide one we
 /// merely failed to probe — the worst case there is the old per-socket cost
 /// for that single file.
+#[cfg(unix)]
 fn socket_is_live(path: &Path) -> bool {
     classify_socket_connect(std::os::unix::net::UnixStream::connect(path).map(|_| ()))
+}
+
+/// No tmux server sockets exist on a non-Unix host, so nothing can be live.
+///
+/// `classify_socket_connect` stays shared and unit-tested on every platform;
+/// only the syscall that feeds it is Unix-only.
+#[cfg(not(unix))]
+fn socket_is_live(_path: &Path) -> bool {
+    false
 }
 
 fn classify_socket_connect(result: std::io::Result<()>) -> bool {
@@ -268,6 +280,7 @@ fn default_socket_dirs() -> Vec<PathBuf> {
 
 /// Inner enumerator with the search dirs injected — the unit tests use
 /// this to point at a temp fixture instead of the real `/tmp`.
+#[cfg(unix)]
 fn enumerate_sockets_in(dirs: &[PathBuf]) -> Vec<PathBuf> {
     use std::os::unix::fs::FileTypeExt;
     let mut out = Vec::new();
@@ -291,6 +304,18 @@ fn enumerate_sockets_in(dirs: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// tmux does not run natively on Windows, so there is no socket directory to
+/// walk and no `SOCK_STREAM` file type to test for.
+///
+/// Returning empty makes [`scan`] yield an empty [`ScanResult`] rather than
+/// failing — the honest answer for a host with no tmux server. A Windows user
+/// runs muxa inside WSL, where this is the Unix arm above. See
+/// `docs/WINDOWS.md`.
+#[cfg(not(unix))]
+fn enumerate_sockets_in(_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    Vec::new()
 }
 
 /// Get the current user's UID. Cached for the process lifetime — stable
@@ -609,6 +634,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_sockets_in_filters_to_socket_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -625,6 +651,7 @@ mod tests {
         assert_eq!(found[0], sock_path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_sockets_with_scopes_to_a_single_socket() {
         let dir = tempfile::tempdir().unwrap();
@@ -652,6 +679,7 @@ mod tests {
         assert!(event_in_scope_with(None, None));
     }
 
+    #[cfg(unix)]
     #[test]
     fn event_in_scope_drops_foreign_socket_but_keeps_scoped_and_paneless() {
         let dir = tempfile::tempdir().unwrap();
@@ -683,6 +711,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_sockets_in_dedupes_canonical_paths() {
         // /tmp and /private/tmp resolve to the same dir on macOS — the
@@ -697,6 +726,7 @@ mod tests {
         assert_eq!(found.len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_sockets_in_skips_missing_dirs() {
         // Non-existent dirs should not panic or short-circuit later
@@ -713,6 +743,7 @@ mod tests {
         assert_eq!(found, vec![sock]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_is_live_distinguishes_listening_from_orphan() {
         let dir = tempfile::tempdir().unwrap();

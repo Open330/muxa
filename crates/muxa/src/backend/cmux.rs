@@ -6,9 +6,9 @@
 //! JSON fixture; until then observations are deliberately partial so the
 //! reconciler never treats an absent cmux row as proof that an agent exited.
 
+use super::unix_socket::UnixStream;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use serde_json::json;

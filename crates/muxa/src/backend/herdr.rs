@@ -32,9 +32,9 @@
 //!
 //! See `docs/HERDR.md` for the full design.
 
+use super::unix_socket::UnixStream;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
