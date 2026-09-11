@@ -3000,17 +3000,18 @@ fn jump_to_pane_rmux_target(socket: &str, session: &str, window: &str, pane: &st
                     "multiple rmux clients share this session: open watch using the popup binding or pass --caller-client"
                 )?
             };
-            selected_session = tmux_work::private_jump_session(&control, &client, session, window)?;
-            // Switch only the client here. Window selection happens below,
-            // after it has its own view and with that view's session id.
+            let view = tmux_work::prepare_jump_view(&control, &client, session, window)?;
+            let target = format!("{}:{window}.{pane}", view.id);
+            // A cross-session switch closes the invoking rmux popup. The
+            // destination must include the window and pane in this last call.
             backend
-                .run_control(&["switch-client", "-c", &client, "-t", &selected_session])
+                .run_control(&["switch-client", "-c", &client, "-t", &target])
                 .map_err(anyhow::Error::msg)
         })();
         if let Err(error) = result {
             eprintln!("muxa: rmux jump failed: {error}");
-            return;
         }
+        return;
     } else if current.is_some() {
         eprintln!("muxa: cannot switch an rmux client across servers; attach to {socket} from a separate terminal");
         return;
@@ -3874,6 +3875,22 @@ mod tests {
             rmux_client_from_context("a\t$1\nb\t$1", "/tmp/socket,10,1"),
             None
         );
+    }
+
+    /// The popup may terminate us during the switch. The external harness
+    /// asserts the final client, window, pane and cleanup state on the server.
+    #[test]
+    #[ignore = "requires scripts/rmux-popup-jump-check.py"]
+    fn popup_rmux_jump() {
+        use muxa::PaneBackend;
+        let socket = std::env::var("MUXA_RMUX_TEST_ENDPOINT").unwrap();
+        let pane = std::env::var("MUXA_RMUX_TEST_PANE").unwrap();
+        CALLER_CLIENT
+            .set(std::env::var("MUXA_RMUX_TEST_CLIENT").unwrap())
+            .unwrap();
+        let backend = muxa::RmuxBackend::with_endpoint(&socket);
+        let pane = backend.resolve_pane(&pane).unwrap();
+        jump_to_topology_pane(&muxa::PaneKey::from_pane(muxa::HostKind::Rmux, &pane));
     }
 
     /// The harness supplies a disposable server with an attached client and

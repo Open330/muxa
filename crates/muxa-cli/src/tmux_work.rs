@@ -719,12 +719,12 @@ fn client_suffix(control: &Control, client: &str) -> Result<String> {
 
 /// Choose a private destination before changing the selected window. This
 /// avoids even a transient window switch in another terminal's session.
-pub(crate) fn private_jump_session(
+pub(crate) fn prepare_jump_view(
     control: &Control,
     client: &str,
     session: &str,
     window: &str,
-) -> Result<String> {
+) -> Result<AttachView> {
     let current = resolve_view_session(control, client)?;
     let linked = control.output(&["list-windows", "-t", &current.id, "-F", "#{window_id}"])?;
     let target = if linked.lines().any(|id| id == window) {
@@ -736,20 +736,43 @@ pub(crate) fn private_jump_session(
         .attached
         .saturating_sub(u32::from(current.id == target.id));
     if others == 0 {
-        return Ok(target.id);
+        return Ok(AttachView {
+            id: target.id,
+            control: control.clone(),
+            created: false,
+        });
     }
     let opted_out = control
         .output(&["show-options", "-v", "-t", &target.id, "@no_auto_view"])
         .unwrap_or_default();
     if !opted_out.trim().is_empty() {
-        return Ok(target.id);
+        return Ok(AttachView {
+            id: target.id,
+            control: control.clone(),
+            created: false,
+        });
     }
     let sessions = list_view_sessions(control)?;
     let source = canonical_view_source(&target, &sessions);
     let suffix = client_suffix(control, client)?;
     let view = prepare_view(control, client, &source, &suffix, &sessions)?;
-    activate_view(control, client, &current.id, &view)?;
-    Ok(view.id)
+    let view = AttachView {
+        id: view.id,
+        control: control.clone(),
+        created: view.created,
+    };
+    // Switching sessions can terminate the popup that invoked us. Prepare
+    // cleanup on the server before the caller's one exact switch command.
+    for event in ["client-attached[9001]", "client-session-changed[9001]"] {
+        control.run(&[
+            "set-hook",
+            "-t",
+            &view.id,
+            event,
+            &format!("set-option -t '{}' destroy-unattached on", view.id),
+        ])?;
+    }
+    Ok(view)
 }
 
 /// Keep a bare-terminal attach private as well. The owner is retained until
