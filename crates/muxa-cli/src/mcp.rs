@@ -76,12 +76,12 @@ const MCP_SERVER_INSTRUCTIONS: &str = "Use muxa_guide for launch preferences, mu
     Use one muxa_wait_for_change(until=settled, include_capture). Resume yielded Codex cells with \
     host wait yield_time_ms=60000; never duplicate waits. Prefer muxa_call_peer(wait=false); \
     read the wake with muxa_wait_reply. Incoming: muxa_inbox, then one terminal muxa_reply. \
-    /name selects a message skill. Fleet tools address physical hosts: name host/pane and respect observe mode. \
+    /name selects a message skill. muxa_fleet_call_peer/muxa_fleet_wait_reply address hosts: name host/pane and respect observe mode. \
     Batch progress via muxa_update_request/muxa_fleet_update_request; read at checkpoints, wait with after_update. \
     Human decisions: muxa_send_message(target=human, kind=question, expects_reply=true, \
     human_action=approval|choice|information). Read the guide for threading and options. \
     Keep the request ID and parent open; muxa_wait_reply, then read the answer. \
-    Timeout/completion is not consent. Never impersonate the console or escalate routine peer traffic.";
+    Timeout/completion is not consent; never impersonate the console or escalate routine peer traffic.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
