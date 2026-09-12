@@ -311,3 +311,14 @@ into keystrokes.
 
 See [CONFIGURATION.md](CONFIGURATION.md) for every setting and
 [MULTI_HOST.md](MULTI_HOST.md) for local multi-backend observation.
+
+### Event-driven replies and progress
+
+Fleet reply waits share a controller-side subscription per exact host/pane/request.
+`mailbox_watch` hosts reconcile on mailbox changes and reconnection rather than
+polling every 500 ms; older hosts use capped exponential backoff. Independent
+waiters retain their deadlines and release the worker when none remain.
+Use `muxa_fleet_update_request` for consolidated guidance and `muxa_update_request`
+for progress on that same durable request. `muxa_fleet_wait_reply(after_update=0)`
+can return progress before terminal completion. See [MCP.md](MCP.md) for sequence,
+retention, authority and compatibility contracts.

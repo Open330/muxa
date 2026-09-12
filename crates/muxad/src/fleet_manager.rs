@@ -304,6 +304,10 @@ impl LocalTask {
                 _ = refresh.tick() => self.refresh().await,
                 _ = mailbox_retry.tick(), if mailbox_updates.is_none() => {
                     mailbox_updates = self.client.collaboration_subscribe().await.ok();
+                    if mailbox_updates.is_some() {
+                        // Reconcile replies completed while the upstream stream was down.
+                        self.store.notify_mailbox(LOCAL_HOST_ALIAS, 0).await;
+                    }
                 }
                 mailbox = next_mailbox_update(&mut mailbox_updates), if mailbox_updates.is_some() => {
                     match mailbox {
@@ -473,6 +477,22 @@ impl LocalTask {
                     .collaboration_inbox(&fleet_collaboration_origin(&pane, false))
                     .await
                     .map(|incoming| FleetCommandResult::collaboration_mailbox(incoming, Vec::new()))
+                    .map_err(|error| error.to_string())
+            }
+            FleetOperation::CollaborationUpdate {
+                pane,
+                request_id,
+                body,
+            } => {
+                audit_operation(LOCAL_HOST_ALIAS, "collaboration_update", body.len());
+                self.client
+                    .collaboration_update(
+                        &fleet_collaboration_origin(&pane, true),
+                        &request_id,
+                        &body,
+                    )
+                    .await
+                    .map(FleetCommandResult::collaboration_request)
                     .map_err(|error| error.to_string())
             }
             FleetOperation::CollaborationReply {
@@ -1219,6 +1239,7 @@ impl HostTask {
                             | FleetOperation::CollaborationGet { .. }
                             | FleetOperation::CollaborationClaim { .. }
                             | FleetOperation::CollaborationReply { .. }
+                            | FleetOperation::CollaborationUpdate { .. }
                     )
                         && self.config.mode != HostAccessMode::Control
                     {
@@ -1235,12 +1256,18 @@ impl HostTask {
                             | FleetOperation::CollaborationGet { .. }
                             | FleetOperation::CollaborationClaim { .. }
                             | FleetOperation::CollaborationReply { .. }
+                            | FleetOperation::CollaborationUpdate { .. }
                     ) && !connected.hello.capabilities.iter().any(|capability| capability == "collaboration")
                     {
                         let _ = command.reply.send(Err(format!(
                             "host '{}' does not support Fleet collaboration; upgrade muxa on that host",
                             self.alias
                         )));
+                        continue;
+                    }
+                    if matches!(command.operation, FleetOperation::CollaborationUpdate { .. })
+                        && !connected.hello.capabilities.iter().any(|c| c == "collaboration_update") {
+                        let _ = command.reply.send(Err(format!("host '{}' does not support request updates; upgrade muxa", self.alias)));
                         continue;
                     }
                     if matches!(command.operation, FleetOperation::CollaborationGet { .. })
@@ -1341,6 +1368,11 @@ impl HostTask {
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
                             RelayRequest::CollaborationClaim { request_id: id, pane }
+                        }
+                        FleetOperation::CollaborationUpdate { pane, request_id, body } => {
+                            audit_operation(&self.alias, "collaboration_update", body.len());
+                            pending.insert(id.clone(), PendingRequest::new(PendingReply::Command(command.reply), command_timeout));
+                            RelayRequest::CollaborationUpdate { request_id: id, pane, collaboration_request_id: request_id, body }
                         }
                         FleetOperation::CollaborationReply { pane, request_id, status, body } => {
                             audit_operation(&self.alias, "collaboration_reply", body.len());

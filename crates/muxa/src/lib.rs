@@ -48,6 +48,7 @@ pub mod discovery;
 pub mod error;
 pub mod event;
 pub mod fleet;
+mod fleet_wait;
 pub mod history;
 pub mod ipc;
 pub mod metrics;

@@ -3245,6 +3245,7 @@ mod tests {
                 sender,
                 recipient,
                 NewRequest {
+                    initiator: None,
                     kind: RequestKind::Question,
                     body: "wake from revision".into(),
                     expects_reply: true,
@@ -3387,6 +3388,7 @@ mod tests {
                 sender,
                 pending,
                 NewRequest {
+                    initiator: None,
                     kind: RequestKind::Review,
                     body: "review the pending diff".into(),
                     expects_reply: true,
@@ -3463,6 +3465,7 @@ mod tests {
                 sender.clone(),
                 recipient.clone(),
                 NewRequest {
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "change only the authorized file".into(),
                     expects_reply: true,
@@ -3515,6 +3518,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "unsafe\u{1b}[201~\rsubmit".into(),
                     expects_reply: true,
@@ -3575,6 +3579,7 @@ mod tests {
                 console,
                 recipient.clone(),
                 NewRequest {
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "operator request body".into(),
                     expects_reply: true,
@@ -3656,6 +3661,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "agent delegated body".into(),
                     expects_reply: true,
@@ -3725,6 +3731,7 @@ mod tests {
                     sender.clone(),
                     recipient.clone(),
                     NewRequest {
+                        initiator: None,
                         kind: RequestKind::Task,
                         body: body.into(),
                         expects_reply: true,
@@ -3811,6 +3818,7 @@ mod tests {
                 sender.clone(),
                 recipient.clone(),
                 NewRequest {
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "do not inject this twice".into(),
                     expects_reply: true,
@@ -3860,6 +3868,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "the prompt text is already buffered".into(),
                     expects_reply: true,
@@ -3918,6 +3927,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    initiator: None,
                     kind: RequestKind::Review,
                     body: "secret request body".into(),
                     expects_reply: true,
@@ -4035,6 +4045,7 @@ mod tests {
                 console.clone(),
                 recipient.clone(),
                 NewRequest {
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "dispatched by a human".into(),
                     expects_reply: true,

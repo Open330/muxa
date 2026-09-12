@@ -61,16 +61,14 @@ const DEFAULT_SPAWN_GRACE_SECS: u64 = 10;
 /// Hard ceiling on `muxa_wait_for_change` so a caller can't pin the stdio
 /// loop forever on a typo'd huge timeout.
 const MAX_WAIT_SECS: u64 = 600;
-/// Fleet commands have their own short IPC/relay deadlines, so remote reply
-/// waits poll exact durable request state instead of pinning one relay frame.
-const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Compatibility polling is used only with controllers lacking shared reply waits.
+const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
-const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team control plane. \
-    Use muxa_guide for the user's surface/agent launch preferences, muxa_room_context \
-    for identity/peers, and muxa_collaboration_guide only when detailed collaboration \
-    guidance is needed. Reserved @peer/@muxa-peer requests for new \
+const MCP_SERVER_INSTRUCTIONS: &str = "muxa coordinates same-window peers. \
+    Use muxa_guide for launch preferences, muxa_room_context for identity/peers, \
+    and muxa_collaboration_guide for details. Reserved @peer/@muxa-peer requests for new \
     work use muxa_call_peer; requests for an existing report use muxa_peer_report. \
     Never substitute a GitHub/PR workflow without an explicit PR number or URL. Peer \
     calls default to review + read_only. Never set execute=true or \
@@ -87,7 +85,8 @@ const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team c
     then read it with muxa_wait_reply. Incoming notifications require muxa_inbox and \
     exactly one terminal muxa_reply. A /name selects a registered message skill. \
     muxa_fleet_call_peer/muxa_fleet_wait_reply are a separate physical-host plane: \
-    name host/pane explicitly and respect observe mode.";
+    name host/pane explicitly and respect observe mode. Use muxa_fleet_update_request/muxa_update_request \
+    for batched guidance/progress; read updates at checkpoints and wait with after_update.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -643,7 +642,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_fleet_send_prompt",
-            "description": "Send literal text to one exact pane on a named Fleet host. Local is always control-capable; remote hosts must use control mode. The daemon never retries this mutation.",
+            "description": "Send literal text to one exact pane on a named Fleet host. Local is always control-capable; remote hosts must use control mode. The daemon never retries this mutation. For ongoing agent work use muxa_fleet_update_request; this tool has no request lifecycle or completion acknowledgement.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -691,6 +690,21 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "muxa_update_request",
+            "description": "Append verified guidance or a progress report to an existing nonterminal request without completing it. Use this instead of sending a new message to pane:console or injecting a prompt. Only existing participants may update; scope and execution authority stay unchanged. Read updates through muxa_list_messages and finish with one muxa_reply.",
+            "inputSchema": {"type":"object", "properties": {
+                "request_id":{"type":"string"}, "body":{"type":"string","description":"One consolidated update, at most 8192 UTF-8 bytes. Link larger artifacts."}
+            }, "required":["request_id","body"], "additionalProperties":false}
+        }),
+        json!({
+            "name": "muxa_fleet_update_request",
+            "description": "Append consolidated guidance to an existing Fleet request using its exact returned host/pane_key/request_id. Does not send another task or inject terminal text. Existing authorized scope is unchanged. The recipient reads updates on the same request; terminal completion still uses muxa_reply.",
+            "inputSchema": {"type":"object", "properties": {
+                "host":{"type":"string"}, "pane_key":{"type":"object"},
+                "request_id":{"type":"string"}, "body":{"type":"string","description":"Verified guidance within the original scope, at most 8192 UTF-8 bytes."}
+            }, "required":["host","pane_key","request_id","body"], "additionalProperties":false}
+        }),
+        json!({
             "name": "muxa_fleet_wait_reply",
             "description": "Continue waiting for the structured reply to a prior muxa_fleet_call_peer request. Pass the exact host, pane_key, and request_id returned by that call. The durable remote request remains readable even if the target pane has since exited. Remote hosts must remain explicitly configured mode='control'.",
             "inputSchema": {
@@ -702,6 +716,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                         "description": "Exact collision-free PaneKey object returned by muxa_fleet_call_peer; do not reconstruct it from a pane id."
                     },
                     "request_id": { "type": "string", "description": "Exact collaboration request id returned by muxa_fleet_call_peer." },
+                    "after_update": {"type":"integer", "minimum":0, "description":"Optionally return when a progress/guidance sequence newer than this value is available, without waiting for terminal completion. Start at 0; resume with next_after_update."},
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." }
                 },
                 "required": ["host", "pane_key", "request_id"],
@@ -1336,6 +1351,57 @@ async fn call_tool(
                 Err(error) => error_result(&format!("list_messages failed: {error}")),
             })
         }
+        "muxa_update_request" | "muxa_fleet_update_request" => {
+            let Some(request_id) = args.get("request_id").and_then(Value::as_str) else {
+                return Ok(error_result("request_id is required"));
+            };
+            let Some(body) = args.get("body").and_then(Value::as_str) else {
+                return Ok(error_result("body is required"));
+            };
+            if body.trim().is_empty() || body.len() > 8192 {
+                return Ok(error_result("body must contain 1..8192 UTF-8 bytes"));
+            }
+            if name == "muxa_fleet_update_request" {
+                let Some(host) = args.get("host").and_then(Value::as_str) else {
+                    return Ok(error_result("host is required"));
+                };
+                let pane = match serde_json::from_value::<muxa::PaneKey>(
+                    args.get("pane_key").cloned().unwrap_or(Value::Null),
+                ) {
+                    Ok(pane) => pane,
+                    Err(error) => return Ok(error_result(&format!("invalid pane_key: {error}"))),
+                };
+                return Ok(
+                    match client
+                        .fleet_execute(
+                            host,
+                            &muxa::FleetOperation::CollaborationUpdate {
+                                pane,
+                                request_id: request_id.into(),
+                                body: body.into(),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(result) => match result.collaboration_request {
+                            Some(request) => json_result(&request_update_ack(&request)),
+                            None => error_result("update returned no request"),
+                        },
+                        Err(error) => error_result(&error.to_string()),
+                    },
+                );
+            }
+            let origin = match current_collaboration_origin() {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(
+                match client.collaboration_update(&origin, request_id, body).await {
+                    Ok(request) => json_result(&request_update_ack(&request)),
+                    Err(error) => error_result(&error.to_string()),
+                },
+            )
+        }
         "muxa_reply" => {
             let Some(request_id) = args.get("request_id").and_then(Value::as_str) else {
                 return Ok(error_result("reply requires a `request_id` argument"));
@@ -1578,6 +1644,14 @@ fn collaboration_guide(room: RoomContext, config: &muxa::config::Config) -> Valu
                     "Pass artifact_id, exact AIR 1 profile, and optional display-only locator in air_artifacts.",
                     "Use the same artifact identity in review requests and structured replies so watch/dashboard can visualize the handoff.",
                     "Open the source-bearing artifact in AIR Workbench for graph inspection or editing; muxa transports references and does not validate or execute AIR."
+                ]
+            },
+            "ongoing_fleet_work": {
+                "steps": [
+                    "Consolidate verified guidance with muxa_fleet_update_request on the returned host/pane_key/request_id; do not inject repeated task prompts.",
+                    "Report nonterminal progress with muxa_update_request on the same request, never by addressing pane:console.",
+                    "At agreed checkpoints read muxa_list_messages; updates do not interrupt terminal input or widen execution authority.",
+                    "Wait with after_update=0 for progress, then resume with next_after_update; finish with exactly one terminal reply."
                 ]
             },
             "incoming_request": {
@@ -1892,12 +1966,17 @@ async fn fleet_call_peer(
         Err(error) => return error_result(&error),
     };
     let paths = string_array(args, "paths");
-    let request =
+    let mut request =
         match new_request_from_args(args, kind, body, true, work_mode, paths, air_artifacts) {
             Ok(request) => request,
             Err(error) => return error_result(&error),
         };
 
+    if let Ok(origin) = current_collaboration_origin() {
+        if let Ok(room) = client.collaboration_context(&origin).await {
+            request.initiator = Some(Box::new(room.current));
+        }
+    }
     if let Err(error) = ensure_fleet_collaboration_ready(client, host).await {
         return error_result(&format!("fleet_call_peer refused: {error}"));
     }
@@ -1910,7 +1989,7 @@ async fn fleet_call_peer(
             host,
             &muxa::FleetOperation::CollaborationSend {
                 pane: pane_key.clone(),
-                request,
+                request: Box::new(request),
             },
         )
         .await
@@ -1926,6 +2005,9 @@ async fn fleet_call_peer(
         "host": host,
         "pane_key": pane_key,
         "selected_peer": sent.to,
+        "initiator": sent.initiator,
+        "progress_route": {"tool":"muxa_update_request", "request_id":sent.id},
+        "guidance_route": {"tool":"muxa_fleet_update_request", "host":host, "pane_key":pane_key, "request_id":sent.id},
         "expanded_skill": expanded_skill,
         "request_id": sent.id,
         "thread_id": sent.thread_id,
@@ -1948,7 +2030,9 @@ async fn fleet_call_peer(
         .and_then(Value::as_u64)
         .unwrap_or(300)
         .clamp(1, MAX_WAIT_SECS);
-    match await_fleet_collaboration_reply(client, host, &pane_key, &sent.id, timeout_secs).await {
+    match await_fleet_collaboration_reply(client, host, &pane_key, &sent.id, timeout_secs, None)
+        .await
+    {
         Ok(Some(request)) if request.status.is_terminal() => {
             let mut payload = common;
             payload["completed"] = json!(true);
@@ -2035,7 +2119,16 @@ async fn fleet_wait_reply(client: &Client, args: &Value) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(300)
         .clamp(1, MAX_WAIT_SECS);
-    match await_fleet_collaboration_reply(client, host, &pane_key, request_id, timeout_secs).await {
+    match await_fleet_collaboration_reply(
+        client,
+        host,
+        &pane_key,
+        request_id,
+        timeout_secs,
+        args.get("after_update").and_then(Value::as_u64),
+    )
+    .await
+    {
         Ok(Some(request)) if request.status.is_terminal() => json_result(&json!({
             "completed": true,
             "host": host,
@@ -2043,7 +2136,21 @@ async fn fleet_wait_reply(client: &Client, args: &Value) -> Value {
             "request_id": request.id,
             "status": request.status,
             "reply": request.reply,
+            "updates": request.updates.iter().filter(|u| args.get("after_update").and_then(Value::as_u64).is_none_or(|seen| u.sequence > seen)).collect::<Vec<_>>(),
         })),
+        Ok(Some(request))
+            if args
+                .get("after_update")
+                .and_then(Value::as_u64)
+                .is_some_and(|seen| request.updates.last().is_some_and(|u| u.sequence > seen)) =>
+        {
+            json_result(&json!({
+                "completed":false, "reason":"updated", "host":host, "pane_key":pane_key,
+                "request_id":request.id, "status":request.status, "updates":request.updates.iter().filter(|u| args.get("after_update").and_then(Value::as_u64).is_none_or(|seen| u.sequence > seen)).collect::<Vec<_>>(),
+                "first_retained_sequence":request.updates.first().map(|u| u.sequence),
+                "next_after_update":request.updates.last().map(|u| u.sequence),
+            }))
+        }
         Ok(current) => json_result(&json!({
             "completed": false,
             "reason": "timeout",
@@ -2100,7 +2207,19 @@ async fn await_fleet_collaboration_reply(
     pane: &muxa::PaneKey,
     request_id: &str,
     timeout_secs: u64,
+    after_update: Option<u64>,
 ) -> std::result::Result<Option<CollaborationRequest>, String> {
+    let hello = client
+        .hello(Duration::from_secs(3))
+        .await
+        .map_err(|e| e.to_string())?;
+    if hello.capabilities.iter().any(|c| c == "fleet_wait_reply") {
+        return client
+            .fleet_wait_reply(host, pane, request_id, timeout_secs, after_update)
+            .await
+            .map_err(|e| e.to_string());
+    }
+    let mut poll_interval = FLEET_REPLY_POLL_INTERVAL;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut current = None;
     loop {
@@ -2119,14 +2238,20 @@ async fn await_fleet_collaboration_reply(
             .ok_or_else(|| "Fleet collaboration get returned no request".to_string())?;
         let terminal = request.status.is_terminal();
         current = Some(request);
-        if terminal || tokio::time::Instant::now() >= deadline {
+        let updated = after_update.is_some_and(|seen| {
+            current
+                .as_ref()
+                .is_some_and(|r| r.updates.last().is_some_and(|u| u.sequence > seen))
+        });
+        if terminal || updated || tokio::time::Instant::now() >= deadline {
             return Ok(current);
         }
         tokio::time::sleep_until(std::cmp::min(
             deadline,
-            tokio::time::Instant::now() + FLEET_REPLY_POLL_INTERVAL,
+            tokio::time::Instant::now() + poll_interval,
         ))
         .await;
+        poll_interval = (poll_interval * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -2816,6 +2941,7 @@ fn new_request_from_args(
     air_artifacts: Vec<AirArtifactReference>,
 ) -> std::result::Result<NewRequest, String> {
     Ok(NewRequest {
+        initiator: None,
         kind,
         body,
         expects_reply,
@@ -3372,6 +3498,11 @@ fn text_result(text: &str) -> Value {
 /// A compact acknowledgement for mutations. The caller already supplied the
 /// request body and attachments, so echoing the full durable record only
 /// consumes context; retain the correlation and routing fields it needs next.
+fn request_update_ack(request: &CollaborationRequest) -> Value {
+    json!({"request_id":request.id, "status":request.status,
+        "next_after_update":request.updates.last().map(|u| u.sequence)})
+}
+
 fn request_ack(request: &CollaborationRequest) -> Value {
     json!({
         "request_id": request.id,
@@ -3689,6 +3820,8 @@ mod tests {
                 "muxa_fleet_capture",
                 "muxa_fleet_send_prompt",
                 "muxa_fleet_call_peer",
+                "muxa_update_request",
+                "muxa_fleet_update_request",
                 "muxa_fleet_wait_reply",
                 "muxa_wait_for_change",
                 "muxa_collaboration_guide",
