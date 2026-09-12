@@ -66,33 +66,22 @@ const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
-const MCP_SERVER_INSTRUCTIONS: &str = "muxa coordinates same-window peers. \
-    Use muxa_guide for launch preferences, muxa_room_context for identity/peers, \
-    and muxa_collaboration_guide for details. Reserved @peer/@muxa-peer requests for new \
-    work use muxa_call_peer; requests for an existing report use muxa_peer_report. \
-    Never substitute a GitHub/PR workflow without an explicit PR number or URL. Peer \
-    calls default to review + read_only. Never set execute=true or \
-    spawn_if_missing=true without explicit user authorization. Prior authorization within \
-    scope counts; do not ask again. Keep primary ownership \
-    and verify replies. Use muxa_start_work for a configured Work pipeline, \
-    muxa_start_agent for one agent, and muxa_manage_tmux for lifecycle; never invent \
-    raw tmux commands. Prefer pane-scoped muxa_status; no-argument status is compact \
-    unless full=true. For pane work, use one muxa_wait_for_change with until=settled \
-    and include_capture instead of polling status/capture. On Codex, if a long call \
-    yields a background cell, resume that same cell with the host wait function using \
-    yield_time_ms=60000; never start a second Muxa wait. For durable peer work prefer \
-    muxa_call_peer with wait=false: muxa wakes the idle sender when the reply is ready, \
-    then read it with muxa_wait_reply. Incoming notifications require muxa_inbox and \
-    exactly one terminal muxa_reply. A /name selects a registered message skill. \
-    muxa_fleet_call_peer/muxa_fleet_wait_reply are a separate physical-host plane: \
-    name host/pane explicitly and respect observe mode. Use muxa_fleet_update_request/muxa_update_request \
-    for batched guidance/progress; read updates at checkpoints and wait with after_update. \
-    Human decisions use muxa_send_message(target=human, kind=question, expects_reply=true, \
-    human_action=approval|choice|information), with parent_request_id when following an actual request. \
-    Explain the decision, options and recommendation. Keep the returned ID and use muxa_wait_reply; \
-    timeout is not consent and completed is not necessarily approval: read the answer. \
-    Peer traffic/progress must not trigger human requests. Reuse existing authorization, \
-    never impersonate the console, and keep the parent open while awaiting a human answer.";
+const MCP_SERVER_INSTRUCTIONS: &str = "Use muxa_guide for launch preferences, muxa_room_context for identity, \
+    muxa_collaboration_guide for protocols. @peer/@muxa-peer: new work uses muxa_call_peer; \
+    existing reports use muxa_peer_report. No GitHub/PR substitution without an explicit PR number or URL. \
+    Defaults: review + read_only. execute=true/spawn_if_missing=true require explicit user authorization; \
+    existing authorization counts. Retain ownership and verify replies. \
+    Use muxa_start_work for Work, muxa_start_agent for agents, muxa_manage_tmux for lifecycle; \
+    never invent raw tmux commands. Prefer pane-scoped muxa_status. \
+    Use one muxa_wait_for_change(until=settled, include_capture). Resume yielded Codex cells with \
+    host wait yield_time_ms=60000; never duplicate waits. Prefer muxa_call_peer(wait=false); \
+    read the wake with muxa_wait_reply. Incoming: muxa_inbox, then one terminal muxa_reply. \
+    /name selects a message skill. Fleet tools address physical hosts: name host/pane and respect observe mode. \
+    Batch progress via muxa_update_request/muxa_fleet_update_request; read at checkpoints, wait with after_update. \
+    Human decisions: muxa_send_message(target=human, kind=question, expects_reply=true, \
+    human_action=approval|choice|information). Read the guide for threading and options. \
+    Keep the request ID and parent open; muxa_wait_reply, then read the answer. \
+    Timeout/completion is not consent. Never impersonate the console or escalate routine peer traffic.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
