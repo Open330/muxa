@@ -34,9 +34,10 @@ schemas and returned IDs describe the currently installed capabilities.
 3. Prefer `wait=false` while independent local work remains. Keep the returned
    `request_id`; retrieve the structured reply with `muxa_wait_reply`. For an
    existing report or feedback request, use `muxa_peer_report` before sending work.
-4. A timeout or `peer_pending` means the request may still be active. Continue
-   waiting on the same request rather than dispatching duplicate work. When a
-   host yields a running tool cell, resume that cell with the host's wait tool.
+4. A timeout or `peer_pending` is not proof that the peer can still work.
+   Wait in slices of at most 60 seconds, then follow **Peer interruption recovery**
+   before repeating the same request. Never dispatch duplicate work. Resume a
+   yielded tool cell with the host's wait tool instead of starting another wait.
 5. Inspect replies against the actual files and relevant checks. Apply valid
    findings, explain rejected findings when material, and integrate the result.
 
@@ -45,6 +46,61 @@ kind/work_mode/paths, and finish with one terminal `muxa_reply` (`completed`,
 `blocked`, `declined`, or `failed`). Include useful artifacts and verification.
 Do not treat idle status or terminal text as a durable completion report. Use
 `muxa_wait_for_change` for process state waits and mailbox tools for peer results.
+
+## Peer interruption recovery
+
+The coordinator owns recovery: a usage-limited agent may be unable to send any
+final reply. Before dispatch, retain the exact recipient identity and agree on
+an overall wait budget/checkpoint. Prefer `wait=false` and independent work;
+when awaiting results use `timeout_secs=60` or less, locally and in Fleet.
+A bounded call does not bound an unlimited sequence of repeated calls.
+
+After a timeout, or on an error/stopped notification, read the durable request
+first: a terminal reply wins. For an open request check fresh `muxa_status` for
+the recipient pane, matching its original agent kind/session and socket; use
+`muxa_fleet_status` for the exact returned host/pane_key on Fleet. The request's
+`to.state` is a dispatch-time snapshot, not a live health check. A reused pane
+is not the original recipient. Missing/offline observations mean unknown
+availability, not proof of a provider cap or that the remote process stopped.
+
+Use recorded `rate_limit_scope`, `rate_limit_source`, `rate_limited_until`, state
+and attention/error evidence. A utilization percentage alone is not proof that
+execution stopped. Do not classify every `error` as quota exhaustion or invent
+a reset time. `waiting_input`/`waiting_choice` may require an action; idle alone
+is neither completion nor proof of interruption. Known caps, errors, stopped
+sessions, repeated unavailability, or reaching the overall wait budget stop
+blind reply waits and require a recovery decision.
+
+Record one consolidated update on the original request with observed evidence,
+last progress/artifacts, reset time if known, and the next action. Do not send
+repeated prompts to the capped agent. If already authorized, continue independent
+work, arrange one bounded recheck near a known reset, or use a healthy peer.
+A reset timestamp is a recheck hint, not evidence of recovery: verify fresh state
+and actual progress before resuming. Do not leave a long blocking tool cell open
+until reset or claim to have scheduled a recheck without a real scheduler.
+
+Prevent duplicate execution before reassignment. Cancel a still-queued local
+request with `muxa_cancel_message` and verify success. Claimed requests cannot be
+cancelled by that tool; error/cap/offline status does not prevent later resumption.
+Use supported, authorized stop/handoff controls and verify the old worker cannot
+resume overlapping writes, or isolate the replacement in a separate worktree.
+Keep the old/new request IDs and artifacts linked in the thread. Never fabricate
+a reply as the unavailable peer or treat its failure as a successful review.
+
+If recovery needs a real user decision (wait, change provider, restart, or adjust
+scope/cost), send one `target="human"` request using the Human feedback protocol,
+with the original `parent_request_id` when supported. Include evidence, impact,
+options and recommendation. Reuse its ID while unresolved; do not create an alert
+for every timeout. Existing authorization counts; do not require another approval
+for an already-authorized recovery. On Fleet preserve the remote endpoint and use
+its supported transport; do not pass a remote request ID to local tools.
+
+If the coordinator is itself a recipient and can no longer complete its own work,
+reply `blocked` on that incoming request with the unavailable dependency and
+handoff evidence. Only do this when ending that attempt; keep it open during an
+active human decision. Never submit a terminal reply for someone else's work.
+If the coordinator is also capped, these instructions cannot execute; daemon
+notification/escalation is required for unattended recovery.
 
 ## Human feedback protocol
 

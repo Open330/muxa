@@ -9,3 +9,6 @@ read_only/execute contract; it does not grant authority beyond the user's task.
 For human decisions, follow the skill's Human feedback protocol: send to human
 with human_action, retain the returned request ID, and wait for the actual answer.
 Peer traffic and progress are not human alerts; never impersonate the console.
+For peer timeouts or usage-limit/error/stopped states, follow Peer interruption
+recovery in the skill: bounded waits, fresh recipient health, one recovery decision.
+Never keep retrying an unavailable peer indefinitely or duplicate its work.

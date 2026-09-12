@@ -70,7 +70,7 @@ const MCP_SERVER_INSTRUCTIONS: &str = "Use muxa_guide for launch preferences, mu
     muxa_collaboration_guide for protocols. @peer/@muxa-peer: new work uses muxa_call_peer; \
     existing reports use muxa_peer_report. No GitHub/PR substitution without an explicit PR number or URL. \
     Defaults: review + read_only. execute=true/spawn_if_missing=true require explicit user authorization; \
-    existing authorization counts. Retain ownership and verify replies. \
+    existing authorization counts. Cap/error recovery: read the guide; peer waits <=60s. \
     Use muxa_start_work for Work, muxa_start_agent for agents, muxa_manage_tmux for lifecycle; \
     never invent raw tmux commands. Prefer pane-scoped muxa_status. \
     Use one muxa_wait_for_change(until=settled, include_capture). Resume yielded Codex cells with \
@@ -701,7 +701,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_fleet_wait_reply",
-            "description": "Continue waiting for the structured reply to a prior muxa_fleet_call_peer request. Pass the exact host, pane_key, and request_id returned by that call. The durable remote request remains readable even if the target pane has since exited. Remote hosts must remain explicitly configured mode='control'.",
+            "description": "Continue waiting for the structured reply to a prior muxa_fleet_call_peer request. Pass the exact host, pane_key, and request_id returned by that call. The durable remote request remains readable even if the target pane has since exited. Remote hosts must remain explicitly configured mode='control'. Use <=60-second waits and check fresh recipient/host health after timeout; follow peer_interruption in muxa_collaboration_guide.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -877,7 +877,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_wait_reply",
-            "description": "Wait until a peer reviewer/subagent request reaches a terminal status and return its structured reply. Verify findings or edits before integrating them. Default 30 seconds, max 600.",
+            "description": "Wait until a peer reviewer/subagent request reaches a terminal status and return its structured reply. Verify findings or edits before integrating them. Default 30 seconds, max 600. Prefer <=60 seconds; after timeout check fresh recipient health and follow peer_interruption in muxa_collaboration_guide. Never repeat waits indefinitely.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1601,6 +1601,18 @@ fn collaboration_guide(room: RoomContext, config: &muxa::config::Config) -> Valu
         "user_launch_preferences": launch_guide_value(config),
         "next_step": next_step,
         "workflows": {
+            "peer_interruption": {
+                "wait_slice_secs": 60,
+                "owner": "The coordinator owns recovery; a capped peer may never send a reply. Set an overall wait budget; never renew timed-out waits blindly.",
+                "health": "Read the durable reply first, then fresh muxa_status for the exact recipient agent/session/socket or muxa_fleet_status for the returned host/pane_key. Request to.state is stale. Missing/offline is unknown availability, not proof of a cap or process exit.",
+                "evidence": ["state", "rate_limit_scope", "rate_limit_source", "rate_limited_until", "last_notification"],
+                "trigger": "Known cap/error/stopped, repeated unavailability, or exhausted overall budget requires a recovery decision. Utilization alone is insufficient; reset time is only a recheck hint.",
+                "recovery": "Record one update with evidence/artifacts. Use authorized independent work, one bounded reset recheck, or a healthy peer. Verify current health and progress; do not repeatedly prompt the capped agent.",
+                "handoff": "Cancel queued local requests with muxa_cancel_message and verify success. Claimed requests need supported authorized stop/handoff or isolated replacement work; a cap/offline state does not prevent resumption. Preserve request/thread identities and never impersonate the peer.",
+                "human": "Only if a real choice/approval/information is needed, follow human_feedback with one linked request; reuse its ID and existing authorization. Preserve remote endpoint identity.",
+                "completion": "Do not fabricate the peer reply. If ending your own incoming attempt, reply blocked with dependency/handoff evidence; keep it open during an active human decision.",
+                "limitation": "Waits currently observe durable replies, not live health. Instructions require a running coordinator; if it is capped too, unattended recovery needs daemon escalation."
+            },
             "human_feedback": {
                 "when": "Only when an actual operator approval, choice, or missing information is required; never for routine peer traffic or already-authorized work.",
                 "tool": "muxa_send_message",
@@ -4007,6 +4019,21 @@ mod tests {
         .unwrap();
 
         let guide = collaboration_guide(room, &muxa::config::Config::default());
+        let recovery = &guide["workflows"]["peer_interruption"];
+        assert_eq!(recovery["wait_slice_secs"], 60);
+        assert!(recovery["health"]
+            .as_str()
+            .unwrap()
+            .contains("to.state is stale"));
+        assert!(recovery["handoff"]
+            .as_str()
+            .unwrap()
+            .contains("Claimed requests"));
+        assert!(recovery["human"].as_str().unwrap().contains("reuse its ID"));
+        assert!(recovery["limitation"]
+            .as_str()
+            .unwrap()
+            .contains("running coordinator"));
         let human = &guide["workflows"]["human_feedback"];
         assert_eq!(human["tool"], "muxa_send_message");
         assert_eq!(human["request"]["target"], "human");

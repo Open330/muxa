@@ -51,3 +51,25 @@ is safe to suppress.
 
 Linux builds validate the Rust and dashboard changes. SwiftUI rendering must
 be built and visually verified on macOS before publishing a Muxa.app bundle.
+
+## Interrupted peers and usage caps
+
+The shared skill's **Peer interruption recovery** section and the MCP guide's
+`workflows.peer_interruption` define coordinator recovery. A peer's quota/error
+state and a durable reply are distinct: reply waits currently do not wake on
+health changes. Use waits of at most 60 seconds plus a chosen overall budget,
+then check fresh identity-matched recipient state. Do not use the request's
+snapshot of `to.state` or usage percentage alone to declare failure.
+
+Record the observed blocker once and use authorized recovery. Ask the operator
+only when a real decision is needed, preserving a single linked human request.
+Prevent overlapping execution before reassignment: claimed work may resume after
+a reset and cannot be cancelled through the queued-request cancellation tool.
+Do not impersonate the unavailable recipient or fabricate its terminal reply.
+A coordinator ending its own incoming attempt returns `blocked` with evidence.
+
+This is an agent policy, not automatic server-side cancellation or escalation.
+If the coordinator is also capped, a daemon mechanism is still needed to create
+a durable operator action request. Existing error notifications alone do not
+implement this recovery protocol. Installed guides must be reread by running
+agents; reconnect MCP to refresh server instructions.

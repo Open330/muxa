@@ -67,6 +67,18 @@ If a missing prerequisite ends this work attempt, return `blocked` and name it.
 While awaiting a human decision within an active attempt, keep the request open
 and use the Human decision protocol above instead of a terminal `blocked` reply.
 If asked to summarize "the peer's report", retrieve `muxa_peer_report`; do not
-ask the peer to repeat work. Long waits keep the same durable request ID even if
-the target pane disappears. Remote Fleet requests require an explicit host and
+ask the peer to repeat work. Keep the same durable request ID, but if the
+target disappears, follow Peer interruption recovery instead of blindly waiting. Remote Fleet requests require an explicit host and
 pane and obey the host's observe/control mode.
+
+## Interrupted peer example
+
+After `muxa_wait_reply(request_id=R, timeout_secs=60)` times out, check the durable
+record and fresh state for R's exact recipient. If it is capped, record the
+observed scope/reset and last artifacts with `muxa_update_request`. A reset time
+may be unknown. Use an already-authorized recovery when possible. Otherwise send
+one human choice request explaining "wait for reset / use a healthy provider",
+with `parent_request_id=R`, and retain its returned ID. Keep R open during that
+decision; a claimed R still requires verified stop/handoff or isolated work before
+reassignment. Resume only after checking fresh state and the operator's answer.
+For Fleet use its returned host/pane_key and the remote message endpoint.
