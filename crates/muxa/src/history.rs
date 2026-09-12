@@ -526,6 +526,14 @@ async fn run_writer(
             }
         }
     }
+    // Tokio's write_all can return while the blocking filesystem write is
+    // still pending. Joining this task must also wait for that write before
+    // callers reopen the history file during restart (flush is not fsync).
+    if let Some(file) = appender.as_mut() {
+        if let Err(error) = file.flush().await {
+            warn!(%error, "history writer shutdown flush failed");
+        }
+    }
 }
 
 /// File mode applied to `prompts.ndjson` — and the tempfile that
@@ -794,7 +802,13 @@ mod tests {
         // Quiesce: shut down the writer so the appended record is durable
         // before we reopen the file.
         let _ = tx.send(());
-        let _ = writer.await;
+        writer.await.unwrap();
+
+        // A synchronous read cannot accidentally wait behind the pending
+        // Tokio write on its blocking pool and hide an incomplete shutdown.
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        let record: HistoryEntry = serde_json::from_str(persisted.trim()).unwrap();
+        assert_eq!(record.prompt, "persisted");
 
         // Re-open: a fresh PromptHistory must hydrate from disk.
         let (tx2, _) = broadcast::channel::<()>(1);
