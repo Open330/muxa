@@ -81,6 +81,11 @@ as its link on the original request. Restarts do not duplicate it. Existing link
 human questions are reused. The service is explicitly identified as Muxa recovery;
 it does not impersonate a peer. Human answers are copied to interruption.decision
 for the coordinator; they do not execute any action or complete the original work.
+Original participants have read/wait access to the daemon action ID, so they can
+await the human answer without spinning on the interrupted parent. Only the human
+can reply; unrelated agents cannot read that action. The service consumes its
+reply notification when it delivers the decision to the parent. Archived action
+metadata follows the parent recovery state.
 Healthy working/idle state or an actual terminal reply clears the interruption and
 withdraws an unanswered daemon-generated action. A reset time alone never clears it.
 

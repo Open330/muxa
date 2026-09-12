@@ -2255,11 +2255,26 @@ impl CollaborationStore {
         let mut changed = false;
         let request = {
             let mut requests = self.requests.write().await;
+            // Participants may await the daemon's linked human decision, but
+            // this grants no authority to answer/cancel the service request.
+            let recovery_observer = requests
+                .get(request_id)
+                .filter(|r| r.to.console && r.from.agent_session_id == "muxa:peer-recovery")
+                .and_then(|r| r.interruption.as_ref())
+                .filter(|i| i.action_request_id.as_deref() == Some(request_id))
+                .and_then(|i| requests.get(&i.request_id))
+                .is_some_and(|parent| {
+                    parent
+                        .interruption
+                        .as_ref()
+                        .is_some_and(|i| i.action_request_id.as_deref() == Some(request_id))
+                        && (addresses(&parent.from, caller) || addresses(&parent.to, caller))
+                });
             let request = requests
                 .get_mut(request_id)
                 .ok_or_else(|| CollaborationError::NotFound(request_id.to_string()))?;
             let is_sender = request.from.same_endpoint(caller);
-            if !is_sender && !addresses(&request.to, caller) {
+            if !is_sender && !addresses(&request.to, caller) && !recovery_observer {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
             if is_sender && request.reply.is_some() && request.reply_read_at.is_none() {

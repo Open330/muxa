@@ -101,8 +101,11 @@ handoff evidence. Only do this when ending that attempt; keep it open during an
 active human decision. Never submit a terminal reply for someone else's work.
 On upgraded daemons, `reason="peer_interrupted"` releases local/Fleet waits while
 keeping the work open. Read `interruption.action_request_id` and reuse that human
-request instead of creating another; `interruption.decision` carries the recorded
-answer, including refusals. The daemon escalates once if the coordinator is also
+request instead of creating another. Original participants may read/wait for that
+action using `muxa_wait_reply` (or the matching Fleet endpoint), but may not answer
+it. Its completed reply is the human decision, not completion of the parent work.
+`interruption.decision` on the parent also carries the recorded answer, including
+refusals. The daemon escalates once if the coordinator is also
 unavailable or has not acknowledged with an update within two minutes. Recovery
 clears the interruption and withdraws unanswered daemon actions. Unknown/missing
 identities are not classified as caps; older hosts still need bounded checks.

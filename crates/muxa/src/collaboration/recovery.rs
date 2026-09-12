@@ -165,13 +165,21 @@ impl CollaborationStore {
                     .and_then(|id| snapshot.get(id))
                 {
                     info.decision.clone_from(&action.reply);
-                    if !info.active
-                        && !action.status.is_terminal()
-                        && action.from.agent_session_id == "muxa:peer-recovery"
-                    {
-                        let mut obsolete = action.clone();
-                        obsolete.status = RequestStatus::Cancelled;
-                        changed.push(obsolete);
+                    if action.from.agent_session_id == "muxa:peer-recovery" {
+                        let mut refreshed = action.clone();
+                        refreshed.interruption = Some(info.clone());
+                        if !info.active && !action.status.is_terminal() {
+                            refreshed.status = RequestStatus::Cancelled;
+                        }
+                        if action.reply.is_some() {
+                            // The daemon has delivered its own request's answer
+                            // to the parent; there is no service pane to wake.
+                            refreshed.reply_read_at.get_or_insert(now);
+                            refreshed.reply_notified_at.get_or_insert(now);
+                        }
+                        if refreshed != *action {
+                            changed.push(refreshed);
+                        }
                     }
                 }
             }
@@ -224,6 +232,8 @@ mod tests {
         (participant, agent)
     }
 
+    // Keep the restart, authorization and recovery assertions on one episode.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn interrupted_wait_durable_action_decision_and_recovery() {
         let dir = tempfile::tempdir().unwrap();
@@ -273,6 +283,9 @@ mod tests {
             Some(request.id.as_str())
         );
         assert_eq!(action.thread_id, request.thread_id);
+        assert!(mailbox.get_for(&sender, &action.id).await.is_ok());
+        let (unrelated, _) = actor("%9", "unrelated").await;
+        assert!(mailbox.get_for(&unrelated, &action.id).await.is_err());
         assert!(!action.peer_interrupted());
         let restored = CollaborationStore::load(options).await.unwrap();
         restored
@@ -302,6 +315,11 @@ mod tests {
             )
             .await
             .unwrap();
+        let answer = restored
+            .wait_for_terminal(&sender, &action.id, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(answer.reply.as_ref().unwrap().body, "Wait; do not reassign");
         restored
             .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
             .await
@@ -322,6 +340,10 @@ mod tests {
             .await
             .unwrap()
             .peer_interrupted());
+        let archived_action = restored.get_for(&action.to, &action.id).await.unwrap();
+        assert!(!archived_action.interruption.unwrap().active);
+        assert!(archived_action.reply_read_at.is_some());
+        assert!(restored.pending_reply_unnotified().await.is_empty());
         assert!(restored.pending_human_notifications().await.is_empty());
     }
 
