@@ -457,3 +457,6 @@ Inside peek, press `|` to read the active pane in fullscreen. Use `j/k`, arrows,
 ```tmux
 bind-key | display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa peek --expanded"
 ```
+
+---
+<p align="center"><sub>Part of <a href="https://github.com/Open330">Open330</a> · open source tools for AI-agent workflows · <a href="https://open330.github.io">open330.github.io</a></sub></p>
