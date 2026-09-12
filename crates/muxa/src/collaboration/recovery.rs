@@ -130,7 +130,7 @@ impl CollaborationStore {
                     .map(|t| t.to_string());
                 // A healthy coordinator gets an immediate wait result first. If it
                 // cannot act, or has not acknowledged within two minutes, escalate.
-                let coordinator_unavailable = parent.from.console
+                let coordinator_unavailable = (parent.from.console && parent.initiator.is_none())
                     || exact_agent(&parent.from, agents).is_some_and(|a| reason(a).is_some());
                 let acknowledged = parent
                     .updates
@@ -323,6 +323,57 @@ mod tests {
             .unwrap()
             .peer_interrupted());
         assert!(restored.pending_human_notifications().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fleet_initiator_gets_recovery_grace_without_gaining_authority() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (initiator, _) = actor("%1", "controller-agent").await;
+        let (recipient, mut peer) = actor("%2", "peer").await;
+        let console = Participant::console(recipient.room.clone());
+        let request = mailbox
+            .create(
+                console.clone(),
+                recipient,
+                NewRequest {
+                    initiator: Some(Box::new(initiator.clone())),
+                    body: "remote review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        peer.state = AgentState::Error;
+        mailbox
+            .reconcile_peer_interruptions(&[peer.clone()])
+            .await
+            .unwrap();
+        assert!(mailbox
+            .get_for(&console, &request.id)
+            .await
+            .unwrap()
+            .peer_interrupted());
+        assert!(mailbox.pending_human_notifications().await.is_empty());
+        assert!(mailbox
+            .update_request(&initiator, &request.id, "spoof".into())
+            .await
+            .is_err());
+        mailbox
+            .requests
+            .write()
+            .await
+            .get_mut(&request.id)
+            .unwrap()
+            .interruption
+            .as_mut()
+            .unwrap()
+            .observed_at -= time::Duration::minutes(3);
+        mailbox
+            .update_request(&console, &request.id, "Controller handling recovery".into())
+            .await
+            .unwrap();
+        mailbox.reconcile_peer_interruptions(&[peer]).await.unwrap();
+        assert!(mailbox.pending_human_notifications().await.is_empty());
     }
 
     #[tokio::test]
