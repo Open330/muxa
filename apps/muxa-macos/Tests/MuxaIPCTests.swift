@@ -5643,3 +5643,20 @@ private func airPipelineFixture() -> MuxaPipelineDefinition {
     #expect(url?.absoluteString == "http://127.0.0.1:60995/?token=abc&initial=explicit")
     #expect(AirWorkbenchProcess.loopbackURL(in: "no address here") == nil)
 }
+
+struct MuxaPeerRecoveryTests {
+    @Test func interruptionAndDecisionDecodeWithoutCompletingWork() throws {
+        var object = inboxSentRequest(id: "original", createdAt: "2026-09-12T12:00:00Z", status: "claimed")
+        object["interruption"] = [
+            "request_id": "original", "active": true, "reason": "rate_limited",
+            "observed_at": "2026-09-12T12:01:00Z", "action_request_id": "human-action",
+            "decision": ["status": "completed", "body": "Wait; do not reassign", "at": "2026-09-12T12:02:00Z"],
+        ] as [String: Any]
+        let request = try decodeInboxRequest(object)
+        #expect(request.interruption?.actionRequestID == "human-action")
+        #expect(request.interruption?.decision?.body == "Wait; do not reassign")
+        #expect(request.status == "claimed")
+        #expect(request.reply == nil)
+        #expect(request.interruption?.resetAt == nil)
+    }
+}

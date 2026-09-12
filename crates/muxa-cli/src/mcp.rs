@@ -66,27 +66,22 @@ const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
-const MCP_SERVER_INSTRUCTIONS: &str = "muxa coordinates same-window peers. \
-    Use muxa_guide for launch preferences, muxa_room_context for identity/peers, \
-    and muxa_collaboration_guide for details. Reserved @peer/@muxa-peer requests for new \
-    work use muxa_call_peer; requests for an existing report use muxa_peer_report. \
-    Never substitute a GitHub/PR workflow without an explicit PR number or URL. Peer \
-    calls default to review + read_only. Never set execute=true or \
-    spawn_if_missing=true without explicit user authorization. Prior authorization within \
-    scope counts; do not ask again. Keep primary ownership \
-    and verify replies. Use muxa_start_work for a configured Work pipeline, \
-    muxa_start_agent for one agent, and muxa_manage_tmux for lifecycle; never invent \
-    raw tmux commands. Prefer pane-scoped muxa_status; no-argument status is compact \
-    unless full=true. For pane work, use one muxa_wait_for_change with until=settled \
-    and include_capture instead of polling status/capture. On Codex, if a long call \
-    yields a background cell, resume that same cell with the host wait function using \
-    yield_time_ms=60000; never start a second Muxa wait. For durable peer work prefer \
-    muxa_call_peer with wait=false: muxa wakes the idle sender when the reply is ready, \
-    then read it with muxa_wait_reply. Incoming notifications require muxa_inbox and \
-    exactly one terminal muxa_reply. A /name selects a registered message skill. \
-    muxa_fleet_call_peer/muxa_fleet_wait_reply are a separate physical-host plane: \
-    name host/pane explicitly and respect observe mode. Use muxa_fleet_update_request/muxa_update_request \
-    for batched guidance/progress; read updates at checkpoints and wait with after_update.";
+const MCP_SERVER_INSTRUCTIONS: &str = "Use muxa_guide for launch preferences, muxa_room_context for identity, \
+    muxa_collaboration_guide for protocols. @peer/@muxa-peer: new work uses muxa_call_peer; \
+    existing reports use muxa_peer_report. No GitHub/PR substitution without an explicit PR number or URL. \
+    Defaults: review + read_only. execute=true/spawn_if_missing=true require explicit user authorization; \
+    existing authorization counts. Cap/error recovery: read the guide; peer waits <=60s. \
+    Use muxa_start_work for Work, muxa_start_agent for agents, muxa_manage_tmux for lifecycle; \
+    never invent raw tmux commands. Prefer pane-scoped muxa_status. \
+    Use one muxa_wait_for_change(until=settled, include_capture). Resume yielded Codex cells with \
+    host wait yield_time_ms=60000; never duplicate waits. Prefer muxa_call_peer(wait=false); \
+    read the wake with muxa_wait_reply. Incoming: muxa_inbox, then one terminal muxa_reply. \
+    /name selects a message skill. muxa_fleet_call_peer/muxa_fleet_wait_reply address hosts: name host/pane and respect observe mode. \
+    Batch progress via muxa_update_request/muxa_fleet_update_request; read at checkpoints, wait with after_update. \
+    Human decisions: muxa_send_message(target=human, kind=question, expects_reply=true, \
+    human_action=approval|choice|information). Read the guide for threading and options. \
+    Keep the request ID and parent open; muxa_wait_reply, then read the answer. \
+    Timeout/completion is not consent; never impersonate the console or escalate routine peer traffic.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -706,7 +701,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_fleet_wait_reply",
-            "description": "Continue waiting for the structured reply to a prior muxa_fleet_call_peer request. Pass the exact host, pane_key, and request_id returned by that call. The durable remote request remains readable even if the target pane has since exited. Remote hosts must remain explicitly configured mode='control'.",
+            "description": "Continue waiting for the structured reply to a prior muxa_fleet_call_peer request. Pass the exact host, pane_key, and request_id returned by that call. The durable remote request remains readable even if the target pane has since exited. Remote hosts must remain explicitly configured mode='control'. Use <=60-second waits and check fresh recipient/host health after timeout; follow peer_interruption in muxa_collaboration_guide.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -818,10 +813,11 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "peer, pane:%N, %N, @alias, or role:<name>" },
+                    "target": { "type": "string", "description": "peer, pane:%N, %N, @alias, role:<name>, or human for an operator decision" },
                     "kind": { "type": "string", "enum": ["question", "review", "task", "notice"] },
                     "body": { "type": "string" },
                     "expects_reply": { "type": "boolean", "description": "Default true except notice." },
+                    "human_action": { "type": "string", "enum": ["approval", "choice", "information"], "description": "Use target human only when an operator decision is required. Explain the question, choices and recommendation in body. Internal agent requests must omit this." },
                     "work_mode": { "type": "string", "enum": ["read_only", "execute"], "description": "Default read_only." },
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope for execute work." },
                     "thread_id": { "type": "string", "description": "Stable id shared by one causal conversation. Omit for a root request; muxa assigns its request id. When parent_request_id is set, this must match the parent's canonical thread." },
@@ -881,7 +877,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_wait_reply",
-            "description": "Wait until a peer reviewer/subagent request reaches a terminal status and return its structured reply. Verify findings or edits before integrating them. Default 30 seconds, max 600.",
+            "description": "Wait until a peer reviewer/subagent request reaches a terminal status and return its structured reply. Verify findings or edits before integrating them. Default 30 seconds, max 600. Prefer <=60 seconds; after timeout check fresh recipient health and follow peer_interruption in muxa_collaboration_guide. Never repeat waits indefinitely.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1605,6 +1601,29 @@ fn collaboration_guide(room: RoomContext, config: &muxa::config::Config) -> Valu
         "user_launch_preferences": launch_guide_value(config),
         "next_step": next_step,
         "workflows": {
+            "peer_interruption": {
+                "wait_slice_secs": 60,
+                "owner": "The coordinator owns recovery; a capped peer may never send a reply. Set an overall wait budget; never renew timed-out waits blindly.",
+                "health": "Read the durable reply first, then fresh muxa_status for the exact recipient agent/session/socket or muxa_fleet_status for the returned host/pane_key. Request to.state is stale. Missing/offline is unknown availability, not proof of a cap or process exit.",
+                "evidence": ["state", "rate_limit_scope", "rate_limit_source", "rate_limited_until", "last_notification"],
+                "trigger": "Known cap/error/stopped, repeated unavailability, or exhausted overall budget requires a recovery decision. Utilization alone is insufficient; reset time is only a recheck hint.",
+                "recovery": "Record one update with evidence/artifacts. Use authorized independent work, one bounded reset recheck, or a healthy peer. Verify current health and progress; do not repeatedly prompt the capped agent.",
+                "handoff": "Cancel queued local requests with muxa_cancel_message and verify success. Claimed requests need supported authorized stop/handoff or isolated replacement work; a cap/offline state does not prevent resumption. Preserve request/thread identities and never impersonate the peer.",
+                "human": "Only if a real choice/approval/information is needed, follow human_feedback with one linked request; reuse its ID and existing authorization. Preserve remote endpoint identity.",
+                "completion": "Do not fabricate the peer reply. If ending your own incoming attempt, reply blocked with dependency/handoff evidence; keep it open during an active human decision.",
+                "limitation": "Upgraded daemons return peer_interrupted without completing work. A running coordinator handles recovery first; if unavailable or unacknowledged for two minutes the daemon creates one durable human action. Reuse interruption.action_request_id; inspect interruption.decision without interpreting completion as consent. Older hosts still need bounded health checks."
+            },
+            "human_feedback": {
+                "when": "Only when an actual operator approval, choice, or missing information is required; never for routine peer traffic or already-authorized work.",
+                "tool": "muxa_send_message",
+                "request": { "target": "human", "kind": "question", "expects_reply": true, "human_action": "choice" },
+                "actions": ["approval", "choice", "information"],
+                "context": "Include the exact decision, why required, options and recommendation. Include parent_request_id only for an existing request you participate in; inherit its thread and preserve known work identity.",
+                "wait": "Retain the returned request_id and use muxa_wait_reply. Continue independent work; never treat a timeout as consent or create duplicate questions. Keep the original peer request open while waiting.",
+                "answer": "The human answers in Need you (watch: e). Read status and body; completed is not necessarily approval. Honor refusal/cancellation and complete the original peer request after authorized work.",
+                "identity": "Never use console=true or claim/answer the operator inbox as an agent.",
+                "fallback": "If the installed schema lacks human_action, ask in the existing user conversation. Do not silently drop the question or redirect it to a peer."
+            },
             "reviewer": {
                 "when": "After implementation, self-review, and relevant tests; before declaring important work complete.",
                 "request": {
@@ -1903,7 +1922,13 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
     match await_collaboration_reply(client, &origin, &sent.id, timeout_secs).await {
         Ok(Some(request)) => {
             let mut payload = common;
-            payload["completed"] = json!(true);
+            payload["completed"] = json!(request.status.is_terminal());
+            payload["interruption"] = json!(request.interruption);
+            payload["reason"] = json!(if request.peer_interrupted() {
+                "peer_interrupted"
+            } else {
+                "terminal"
+            });
             payload["status"] = json!(request.status);
             payload["reply"] = json!(request.reply);
             json_result(&payload)
@@ -2033,9 +2058,21 @@ async fn fleet_call_peer(
     match await_fleet_collaboration_reply(client, host, &pane_key, &sent.id, timeout_secs, None)
         .await
     {
+        Ok(Some(request)) if request.peer_interrupted() && !request.status.is_terminal() => {
+            let mut payload = request_outcome(&request);
+            payload["host"] = json!(host);
+            payload["pane_key"] = json!(pane_key);
+            json_result(&payload)
+        }
         Ok(Some(request)) if request.status.is_terminal() => {
             let mut payload = common;
-            payload["completed"] = json!(true);
+            payload["completed"] = json!(request.status.is_terminal());
+            payload["interruption"] = json!(request.interruption);
+            payload["reason"] = json!(if request.peer_interrupted() {
+                "peer_interrupted"
+            } else {
+                "terminal"
+            });
             payload["status"] = json!(request.status);
             payload["reply"] = json!(request.reply);
             json_result(&payload)
@@ -2129,6 +2166,12 @@ async fn fleet_wait_reply(client: &Client, args: &Value) -> Value {
     )
     .await
     {
+        Ok(Some(request)) if request.peer_interrupted() && !request.status.is_terminal() => {
+            let mut payload = request_outcome(&request);
+            payload["host"] = json!(host);
+            payload["pane_key"] = json!(pane_key);
+            json_result(&payload)
+        }
         Ok(Some(request)) if request.status.is_terminal() => json_result(&json!({
             "completed": true,
             "host": host,
@@ -2236,7 +2279,7 @@ async fn await_fleet_collaboration_reply(
         let request = *result
             .collaboration_request
             .ok_or_else(|| "Fleet collaboration get returned no request".to_string())?;
-        let terminal = request.status.is_terminal();
+        let terminal = request.status.is_terminal() || request.peer_interrupted();
         current = Some(request);
         let updated = after_update.is_some_and(|seen| {
             current
@@ -2811,7 +2854,7 @@ async fn await_collaboration_reply(
         .collaboration_wait(origin, request_id, timeout_secs)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(request.status.is_terminal().then_some(request))
+    Ok((request.status.is_terminal() || request.peer_interrupted()).then_some(request))
 }
 
 fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
@@ -2941,6 +2984,13 @@ fn new_request_from_args(
     air_artifacts: Vec<AirArtifactReference>,
 ) -> std::result::Result<NewRequest, String> {
     Ok(NewRequest {
+        human_action: args
+            .get("human_action")
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid human_action: {error}"))
+            })
+            .transpose()?,
         initiator: None,
         kind,
         body,
@@ -2993,7 +3043,9 @@ async fn wait_for_reply(client: &Client, args: &Value) -> Value {
         .collaboration_wait(&origin, request_id, timeout_secs)
         .await
     {
-        Ok(request) if request.status.is_terminal() => json_result(&request_outcome(&request)),
+        Ok(request) if request.status.is_terminal() || request.peer_interrupted() => {
+            json_result(&request_outcome(&request))
+        }
         Ok(_) => json_result(&json!({
             "completed": false,
             "reason": "timeout",
@@ -3520,7 +3572,12 @@ fn request_ack(request: &CollaborationRequest) -> Value {
 /// provenance, and timestamps. The structured reply is the new information.
 fn request_outcome(request: &CollaborationRequest) -> Value {
     let mut value = request_ack(request);
-    value["completed"] = json!(true);
+    value["completed"] = json!(request.status.is_terminal());
+    if request.peer_interrupted() {
+        value["reason"] = json!("peer_interrupted");
+        value["interruption"] = json!(request.interruption);
+        value["next_step"] = json!("Stop blind waits. Read the existing human action/decision if present; otherwise follow peer_interruption recovery and acknowledge via muxa_update_request. Do not duplicate work or impersonate the peer.");
+    }
     value["reply"] = json!(request.reply);
     value
 }
@@ -3993,6 +4050,41 @@ mod tests {
         .unwrap();
 
         let guide = collaboration_guide(room, &muxa::config::Config::default());
+        let recovery = &guide["workflows"]["peer_interruption"];
+        assert_eq!(recovery["wait_slice_secs"], 60);
+        assert!(recovery["health"]
+            .as_str()
+            .unwrap()
+            .contains("to.state is stale"));
+        assert!(recovery["handoff"]
+            .as_str()
+            .unwrap()
+            .contains("Claimed requests"));
+        assert!(recovery["human"].as_str().unwrap().contains("reuse its ID"));
+        assert!(recovery["limitation"]
+            .as_str()
+            .unwrap()
+            .contains("running coordinator"));
+        let human = &guide["workflows"]["human_feedback"];
+        assert_eq!(human["tool"], "muxa_send_message");
+        assert_eq!(human["request"]["target"], "human");
+        assert_eq!(human["request"]["expects_reply"], true);
+        let input = new_request_from_args(
+            &human["request"],
+            RequestKind::Question,
+            "Choose A or B".into(),
+            true,
+            WorkMode::ReadOnly,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            input.human_action,
+            Some(muxa::collaboration::HumanAction::Choice)
+        );
+        assert!(human["wait"].as_str().unwrap().contains("muxa_wait_reply"));
+        assert!(MCP_SERVER_INSTRUCTIONS.contains("never impersonate the console"));
         assert_eq!(guide["room"]["peers"][0]["pane"], "%2");
         assert_eq!(guide["workflows"]["reviewer"]["request"]["kind"], "review");
         assert_eq!(

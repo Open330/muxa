@@ -453,13 +453,16 @@ impl LocalTask {
                 audit_operation(LOCAL_HOST_ALIAS, "collaboration_mailbox", 0);
                 let agent = fleet_collaboration_origin(&pane, false);
                 let console = fleet_collaboration_origin(&pane, true);
-                let (incoming, sent) = tokio::try_join!(
+                let (mut incoming, sent, human) = tokio::try_join!(
                     self.client
                         .collaboration_list(&agent, RequestMailbox::Incoming),
                     self.client
                         .collaboration_list(&console, RequestMailbox::Sent),
+                    self.client
+                        .collaboration_list(&console, RequestMailbox::Incoming),
                 )
                 .map_err(|error| error.to_string())?;
+                incoming.extend(human);
                 Ok(FleetCommandResult::collaboration_mailbox(incoming, sent))
             }
             FleetOperation::CollaborationGet { pane, request_id } => {
@@ -503,9 +506,14 @@ impl LocalTask {
             } => {
                 exact_local_backend(&self.backends, &pane).await?;
                 audit_operation(LOCAL_HOST_ALIAS, "collaboration_reply", body.len());
+                let request = self
+                    .client
+                    .collaboration_get(&fleet_collaboration_origin(&pane, true), &request_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 self.client
                     .collaboration_reply(
-                        &fleet_collaboration_origin(&pane, false),
+                        &fleet_collaboration_origin(&pane, request.to.console),
                         &request_id,
                         status,
                         &body,

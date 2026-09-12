@@ -955,6 +955,14 @@ fn redact_collaboration_details(request: &mut serde_json::Value) {
     ] {
         request.remove(field);
     }
+    if let Some(info) = request
+        .get_mut("interruption")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        info.remove("decision");
+    }
+    // Progress bodies are also private message content.
+    request.remove("updates");
     if let Some(reply) = request
         .get_mut("reply")
         .and_then(serde_json::Value::as_object_mut)
@@ -2425,6 +2433,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_decisions_and_progress_are_redacted() {
+        let mut value = serde_json::json!({"interruption":{"reason":"error","decision":{"body":"private choice"}},"updates":[{"body":"private progress"}]});
+        super::redact_collaboration_details(&mut value);
+        assert!(value["interruption"].get("decision").is_none());
+        assert!(value.get("updates").is_none());
+        assert_eq!(value["interruption"]["reason"], "error");
+    }
+
     use super::*;
     use crate::backend::{BackendCaps, PaneBackend};
     use crate::event::{AgentEvent, AgentId, AgentKind};
@@ -2627,6 +2644,7 @@ mod tests {
                         from.clone(),
                         to.clone(),
                         NewRequest {
+                            human_action: None,
                             initiator: None,
                             kind: RequestKind::Review,
                             body: body.to_string(),
@@ -2653,6 +2671,7 @@ mod tests {
                     from,
                     to,
                     NewRequest {
+                        human_action: None,
                         initiator: None,
                         kind: RequestKind::Notice,
                         body: "finalize".to_string(),

@@ -2367,6 +2367,7 @@ private struct MuxaCollaborationView: View {
     }
 
     private enum MailboxTab: CaseIterable, Identifiable {
+        case human
         case incoming
         case sent
         var id: Self { self }
@@ -2390,7 +2391,7 @@ private struct MuxaCollaborationView: View {
     let mailboxRevision: UInt64?
     @State private var mailbox = MuxaCollaborationMailbox(incoming: [], sent: [])
     @State private var module: ModuleTab = .activity
-    @State private var tab: MailboxTab = .sent
+    @State private var tab: MailboxTab = .human
     @State private var displayMode: DisplayMode = .compact
     @State private var kind = "question"
     @State private var workMode = "read_only"
@@ -2401,7 +2402,11 @@ private struct MuxaCollaborationView: View {
     @State private var replyingTo: MuxaCollaborationRequest?
 
     private var requests: [MuxaCollaborationRequest] {
-        tab == .incoming ? mailbox.incoming : mailbox.sent
+        switch tab {
+        case .human: mailbox.incoming.filter { $0.needsHumanResponse }
+        case .incoming: mailbox.incoming.filter { $0.to.console != true }
+        case .sent: mailbox.sent
+        }
     }
 
     var body: some View {
@@ -2431,12 +2436,13 @@ private struct MuxaCollaborationView: View {
             case .activity:
                 HStack(spacing: 10) {
                     Picker("Mailbox", selection: $tab) {
-                        Text("Incoming \(mailbox.incoming.count)").tag(MailboxTab.incoming)
+                        Text("Need you \(mailbox.incoming.filter { $0.needsHumanResponse }.count)").tag(MailboxTab.human)
+                        Text("Agent inbox").tag(MailboxTab.incoming)
                         Text("Sent \(mailbox.sent.count)").tag(MailboxTab.sent)
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
-                    .frame(width: 220)
+                    .frame(width: 310)
                     Spacer()
                     Picker("Density", selection: $displayMode) {
                         ForEach(DisplayMode.allCases) { item in Text(item.title).tag(item) }
@@ -2453,15 +2459,30 @@ private struct MuxaCollaborationView: View {
 
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: displayMode == .compact ? 4 : 9) {
+                        CollaborationFlowGraph(requests: mailbox.incoming + mailbox.sent)
                         if requests.isEmpty {
-                            Text(tab == .incoming ? "No incoming requests for this agent." : "No requests sent from the operator in this room.")
+                            Text(tab == .human ? "No requests need your response." : "No messages in this mailbox.")
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, minHeight: 90, alignment: .center)
                         } else {
                             ForEach(requests) { request in
+                                HStack {
+                                    Text(request.from.label)
+                                    Image(systemName: "arrow.right")
+                                    Text(request.to.label)
+                                    if request.reply != nil {
+                                        Image(systemName: "arrow.turn.down.left")
+                                        Text("Reply to \(request.from.label)")
+                                    }
+                                    if request.needsHumanResponse {
+                                        Label(request.humanAction ?? "information", systemImage: "person.crop.circle.badge.exclamationmark")
+                                            .foregroundStyle(.orange)
+                                    }
+                                }
+                                .font(.caption)
                                 CollaborationRequestCard(
                                     request: request,
-                                    incoming: tab == .incoming,
+                                    incoming: tab != .sent,
                                     compact: displayMode == .compact,
                                     claim: { Task { await claim() } },
                                     reply: { replyingTo = request }
@@ -2569,6 +2590,75 @@ private struct MuxaCollaborationView: View {
     }
 }
 
+/// A chronological participant graph. Request and reply arrows stay paired;
+/// human attention is a live property, not an interpretation of message text.
+private struct CollaborationFlowGraph: View {
+    let requests: [MuxaCollaborationRequest]
+
+    private var uniqueRequests: [MuxaCollaborationRequest] {
+        var seen = Set<String>()
+        return requests.sorted { $0.createdAt < $1.createdAt }
+            .filter { seen.insert($0.id).inserted }
+            .suffix(20).map { $0 }
+    }
+
+    var body: some View {
+        let rows = uniqueRequests
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Conversation flow · latest 20 requests")
+                .font(.caption).foregroundStyle(.secondary)
+            ScrollView(.horizontal) {
+            Canvas { context, size in
+                let participants = rows.flatMap { [$0.from, $0.to] }
+                var seen = Set<String>()
+                let nodes = participants.filter { seen.insert(identity($0)).inserted }
+                let step = size.width / CGFloat(max(nodes.count, 1))
+                for (index, node) in nodes.enumerated() {
+                    let x = step * (CGFloat(index) + 0.5)
+                    context.draw(Text(node.label).font(.caption2), at: CGPoint(x: x, y: 12))
+                    var lane = Path()
+                    lane.move(to: CGPoint(x: x, y: 25))
+                    lane.addLine(to: CGPoint(x: x, y: size.height))
+                    context.stroke(lane, with: .color(.gray.opacity(0.3)), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                }
+                for (index, request) in rows.enumerated() {
+                    guard let from = nodes.firstIndex(where: { identity($0) == identity(request.from) }),
+                          let to = nodes.firstIndex(where: { identity($0) == identity(request.to) }) else { continue }
+                    let start = step * (CGFloat(from) + 0.5)
+                    let end = step * (CGFloat(to) + 0.5)
+                    let y = CGFloat(index) * 48 + 42
+                    let color: Color = (request.needsHumanResponse || request.peerInterrupted) ? .orange : .blue
+                    context.stroke(arrow(from: start, to: end, y: y), with: .color(color), lineWidth: 1.5)
+                    let label = request.needsHumanResponse ? "Need you: \(request.humanAction ?? "information")" : (request.peerInterrupted ? "Interrupted: \(request.interruption?.reason ?? "unknown")" : request.kind)
+                    context.draw(Text(label).font(.caption2).foregroundColor(color), at: CGPoint(x: (start + end) / 2, y: y - 9))
+                    if request.reply != nil {
+                        context.stroke(arrow(from: end, to: start, y: y + 18), with: .color(.green), style: StrokeStyle(lineWidth: 1, dash: [4, 2]))
+                    }
+                }
+            }
+            .frame(width: CGFloat(max(Set(rows.flatMap { [identity($0.from), identity($0.to)] }).count, 2)) * 140, height: CGFloat(rows.count) * 48 + 30)
+            .accessibilityLabel("Request arrows point to recipients; dashed replies return to senders. Orange requests need your response.")
+            }
+        }
+    }
+
+    private func identity(_ participant: MuxaCollaborationParticipant) -> String {
+        if participant.console == true { return "operator" }
+        return "\(participant.room.host)|\(participant.socket ?? participant.room.socket ?? "default")|\(participant.agentSessionID)"
+    }
+
+    private func arrow(from: CGFloat, to: CGFloat, y: CGFloat) -> Path {
+        let direction: CGFloat = to >= from ? 1 : -1
+        var path = Path()
+        path.move(to: CGPoint(x: from, y: y))
+        path.addLine(to: CGPoint(x: to, y: y))
+        path.move(to: CGPoint(x: to - direction * 6, y: y - 4))
+        path.addLine(to: CGPoint(x: to, y: y))
+        path.addLine(to: CGPoint(x: to - direction * 6, y: y + 4))
+        return path
+    }
+}
+
 private struct CollaborationRequestCard: View {
     let request: MuxaCollaborationRequest
     let incoming: Bool
@@ -2593,6 +2683,20 @@ private struct CollaborationRequestCard: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+            if let recovery = request.interruption {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(recovery.active ? "Peer interrupted: \(recovery.reason)" : "Peer interruption cleared", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(recovery.active ? .orange : .secondary)
+                    Text("Original request: \(recovery.requestID)").textSelection(.enabled)
+                    Text("Reset: \(recovery.resetAt ?? "unknown")")
+                    if let action = recovery.actionRequestID {
+                        Text("Recovery decision: \(action)").textSelection(.enabled)
+                    }
+                    if let decision = recovery.decision { Text("Decision (\(decision.status)): \(decision.body)") }
+                    Text("A decision does not automatically restart or reassign work.")
+                        .foregroundStyle(.secondary)
+                }.font(.caption)
+            }
             MarkdownContent(source: request.body, lineLimit: compact ? 2 : nil)
             if let response = request.reply {
                 if !compact {
@@ -2606,10 +2710,10 @@ private struct CollaborationRequestCard: View {
             if incoming, request.reply == nil {
                 HStack {
                     Spacer()
-                    if request.status == "queued" {
+                    if request.status == "queued" && !request.needsHumanResponse {
                         Button("Claim", action: claim)
                     }
-                    if request.status == "claimed" {
+                    if request.status == "claimed" || request.needsHumanResponse {
                         Button("Reply…", action: reply)
                             .buttonStyle(.borderedProminent)
                     }
@@ -2643,6 +2747,14 @@ private struct CollaborationReplyView: View {
             MarkdownContent(source: request.body)
                 .padding(10)
                 .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
+            if request.needsHumanResponse && request.interruption != nil {
+                HStack {
+                    Button("Wait and recheck") { replyText = "Wait and recheck the original peer. Verify fresh health and progress before resuming." }
+                    Button("Safe handoff") { replyText = "Arrange a safe handoff within the existing scope. Verify no overlapping execution before reassignment." }
+                    Button("Stop attempt") { replyText = "Stop this work attempt using authorized controls and preserve existing artifacts." }
+                }
+                Text("Choose a draft, edit it, then Reply. This records your decision only.").font(.caption)
+            }
             Picker("Outcome", selection: $status) {
                 Text("Completed").tag("completed")
                 Text("Blocked").tag("blocked")

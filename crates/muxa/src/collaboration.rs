@@ -543,6 +543,11 @@ pub struct CollaborationUpdate {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CollaborationRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption: Option<PeerInterruption>,
+    /// Explicit operator decision. Never inferred from prose or the sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_action: Option<HumanAction>,
     pub id: String,
     pub from: Participant,
     pub to: Participant,
@@ -628,6 +633,23 @@ pub struct CollaborationRequest {
     pub reply: Option<CollaborationReply>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanAction {
+    Approval,
+    Choice,
+    Information,
+}
+
+impl CollaborationRequest {
+    pub fn needs_human_response(&self) -> bool {
+        self.to.console
+            && self.expects_reply
+            && self.kind != RequestKind::Notice
+            && matches!(self.status, RequestStatus::Queued | RequestStatus::Claimed)
+    }
+}
+
 /// A handle the daemon has promised to one pane, pending the scan that will
 /// show the pane holding it.
 #[derive(Debug, Clone)]
@@ -672,6 +694,8 @@ pub struct RoomContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_action: Option<HumanAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiator: Option<Box<Participant>>,
     pub kind: RequestKind,
     pub body: String,
@@ -699,6 +723,7 @@ pub struct NewRequest {
 impl Default for NewRequest {
     fn default() -> Self {
         Self {
+            human_action: None,
             initiator: None,
             kind: RequestKind::Question,
             body: String::new(),
@@ -1870,6 +1895,13 @@ impl CollaborationStore {
     ) -> Result<CollaborationRequest, CollaborationError> {
         self.ensure_enabled()?;
         let body = input.body.trim().to_string();
+        if input.human_action.is_some()
+            && (!to.console || !input.expects_reply || input.kind == RequestKind::Notice)
+        {
+            return Err(CollaborationError::UnknownTarget(
+                "human_action requires target human and a reply-bearing request".into(),
+            ));
+        }
         if body.is_empty() {
             return Err(CollaborationError::EmptyMessage);
         }
@@ -1890,7 +1922,10 @@ impl CollaborationStore {
             let parent = requests
                 .get(parent_request_id)
                 .ok_or_else(|| CollaborationError::ParentNotFound(parent_request_id.to_string()))?;
-            if !same_participant_pair(parent, &from, &to) {
+            let human_escalation = to.console
+                && input.human_action.is_some()
+                && (addresses(&parent.from, &from) || addresses(&parent.to, &from));
+            if !same_participant_pair(parent, &from, &to) && !human_escalation {
                 return Err(CollaborationError::InvalidParentScope(
                     parent_request_id.to_string(),
                 ));
@@ -1913,6 +1948,8 @@ impl CollaborationStore {
             Some(supplied_thread_id.unwrap_or_else(|| id.clone()))
         };
         let request = CollaborationRequest {
+            interruption: None,
+            human_action: input.human_action,
             id,
             from,
             to,
@@ -2218,11 +2255,26 @@ impl CollaborationStore {
         let mut changed = false;
         let request = {
             let mut requests = self.requests.write().await;
+            // Participants may await the daemon's linked human decision, but
+            // this grants no authority to answer/cancel the service request.
+            let recovery_observer = requests
+                .get(request_id)
+                .filter(|r| r.to.console && r.from.agent_session_id == "muxa:peer-recovery")
+                .and_then(|r| r.interruption.as_ref())
+                .filter(|i| i.action_request_id.as_deref() == Some(request_id))
+                .and_then(|i| requests.get(&i.request_id))
+                .is_some_and(|parent| {
+                    parent
+                        .interruption
+                        .as_ref()
+                        .is_some_and(|i| i.action_request_id.as_deref() == Some(request_id))
+                        && (addresses(&parent.from, caller) || addresses(&parent.to, caller))
+                });
             let request = requests
                 .get_mut(request_id)
                 .ok_or_else(|| CollaborationError::NotFound(request_id.to_string()))?;
             let is_sender = request.from.same_endpoint(caller);
-            if !is_sender && !addresses(&request.to, caller) {
+            if !is_sender && !addresses(&request.to, caller) && !recovery_observer {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
             if is_sender && request.reply.is_some() && request.reply_read_at.is_none() {
@@ -2259,7 +2311,7 @@ impl CollaborationStore {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let request = self.get_for(caller, request_id).await?;
-            if request.status.is_terminal() {
+            if request.status.is_terminal() || request.peer_interrupted() {
                 return Ok(request);
             }
             match tokio::time::timeout_at(deadline, changes.changed()).await {
@@ -2456,13 +2508,26 @@ impl CollaborationStore {
             .await
             .values()
             .filter(|request| {
-                request.notified_at.is_none()
+                !request.to.console
+                    && request.notified_at.is_none()
                     && (request.status == RequestStatus::Queued || request.wake_delivery.is_some())
             })
             .cloned()
             .collect();
         requests.sort_by_key(|request| request.created_at);
         requests
+    }
+
+    /// Human attention has its own delivery queue; never wake a pane for it.
+    pub async fn pending_human_notifications(&self) -> Vec<CollaborationRequest> {
+        let _transaction = self.transaction_lock.lock().await;
+        self.requests
+            .read()
+            .await
+            .values()
+            .filter(|request| request.needs_human_response() && request.notified_at.is_none())
+            .cloned()
+            .collect()
     }
 
     /// Replies still owed a wake to their sender.
@@ -2496,7 +2561,9 @@ impl CollaborationStore {
             let mut requests = self.requests.write().await;
             requests.get_mut(request_id).and_then(|request| {
                 if request.notified_at.is_none()
-                    && (request.status == RequestStatus::Queued || request.wake_delivery.is_some())
+                    && (request.status == RequestStatus::Queued
+                        || request.wake_delivery.is_some()
+                        || request.needs_human_response())
                 {
                     request.notified_at = Some(OffsetDateTime::now_utc());
                     request.wake_delivery = None;
@@ -2828,6 +2895,9 @@ pub fn resolve_target(
     // alias is only unique among live peers of one room, and matching it
     // host-wide would deliver to whichever unrelated agent happens to share
     // the name.
+    if selector == "human" {
+        return Ok(Participant::console(sender.room.clone()));
+    }
     if scope == crate::config::CollaborationScope::Host {
         let pane = selector.strip_prefix("pane:").unwrap_or(selector);
         if pane.starts_with('%') {
@@ -3277,6 +3347,86 @@ fn valid_identity_token(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::CollaborationScope;
+
+    #[tokio::test]
+    async fn human_escalation_is_separate_durable_and_resolved_by_operator() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CollaborationOptions {
+            path: Some(dir.path().join("human.json")),
+            ..CollaborationOptions::default()
+        };
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        let sender = participant("%1", "sender");
+        let peer = participant("%2", "peer");
+        let human = resolve_target(&peer, "human", &[], CollaborationScope::Window).unwrap();
+        let parent = mailbox
+            .create(
+                sender.clone(),
+                peer.clone(),
+                NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!parent.needs_human_response());
+        let request = mailbox
+            .create(
+                peer.clone(),
+                human.clone(),
+                NewRequest {
+                    body: "Choose A or B; recommend A because it preserves compatibility".into(),
+                    human_action: Some(HumanAction::Choice),
+                    parent_request_id: Some(parent.id.clone()),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(request.thread_id, parent.thread_id);
+        assert!(request.needs_human_response());
+        assert_eq!(mailbox.pending_human_notifications().await.len(), 1);
+        assert!(mailbox
+            .pending_unnotified()
+            .await
+            .iter()
+            .all(|r| r.id != request.id));
+        // Reading/claiming is not an answer and must not cause repeat alerts.
+        let claimed = mailbox.claim_for(&human).await.unwrap();
+        assert!(claimed[0].needs_human_response());
+        mailbox.mark_notified(&request.id).await.unwrap();
+        let reloaded = CollaborationStore::load(options).await.unwrap();
+        assert!(reloaded.pending_human_notifications().await.is_empty());
+        assert!(reloaded
+            .reply(
+                &sender,
+                &request.id,
+                RequestStatus::Completed,
+                "spoof".into(),
+                vec![],
+                vec![]
+            )
+            .await
+            .is_err());
+        let resolved = reloaded
+            .reply(
+                &human,
+                &request.id,
+                RequestStatus::Completed,
+                "A".into(),
+                vec![],
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(!resolved.needs_human_response());
+        assert_eq!(reloaded.pending_reply_unnotified().await.len(), 1);
+        let legacy = serde_json::to_value(&parent).unwrap();
+        assert!(!serde_json::from_value::<CollaborationRequest>(legacy)
+            .unwrap()
+            .needs_human_response());
+    }
 
     #[tokio::test]
     async fn request_updates_are_durable_bounded_and_do_not_complete_work() {
@@ -6002,3 +6152,6 @@ mod tests {
         );
     }
 }
+
+mod recovery;
+pub use recovery::PeerInterruption;

@@ -587,6 +587,8 @@ mod tests {
 
     fn request(id: &str, from: Participant, to: Participant, body: &str) -> CollaborationRequest {
         CollaborationRequest {
+            interruption: None,
+            human_action: None,
             initiator: None,
             updates: Vec::new(),
             id: id.into(),

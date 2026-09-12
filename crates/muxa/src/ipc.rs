@@ -716,6 +716,7 @@ const CAPABILITIES: &[&str] = &[
     "fleet_subscribe",
     "fleet_wait_reply",
     "collaboration_update",
+    "collaboration_peer_recovery",
     "pipeline_runs_v1",
     "pipeline_subscribe",
     "work_control_v1",
@@ -6740,6 +6741,7 @@ mod tests {
                         &from,
                         to,
                         &NewRequest {
+                            human_action: None,
                             initiator: None,
                             kind: collaboration::RequestKind::Question,
                             body: body.into(),
@@ -6880,6 +6882,7 @@ mod tests {
                 &sender,
                 "role:review",
                 &NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: collaboration::RequestKind::Question,
                     body: "ambiguous".into(),
@@ -6904,6 +6907,7 @@ mod tests {
                 &sender,
                 "@reviewer",
                 &NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: collaboration::RequestKind::Review,
                     body: "review this".into(),
@@ -6993,6 +6997,7 @@ mod tests {
                 &sender,
                 "role:rust",
                 &NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: collaboration::RequestKind::Question,
                     body: "obsolete question".into(),
@@ -7040,6 +7045,7 @@ mod tests {
                 },
                 "pane:%1",
                 &NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: collaboration::RequestKind::Task,
                     body: "dispatch to launch pane".into(),

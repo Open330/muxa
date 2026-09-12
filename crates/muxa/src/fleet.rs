@@ -1471,6 +1471,7 @@ mod tests {
             request_id: "relay-1".into(),
             pane: pane.clone(),
             request: Box::new(NewRequest {
+                human_action: None,
                 initiator: None,
                 kind: crate::collaboration::RequestKind::Review,
                 body: "review this change".into(),

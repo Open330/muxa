@@ -61,6 +61,36 @@ pub struct Notifier {
 }
 
 impl Notifier {
+    /// Persist the receipt so redraws, progress updates and daemon re-execs
+    /// do not repeatedly notify the operator about the same decision.
+    pub async fn run_human_requests(
+        self,
+        collaboration: std::sync::Arc<crate::collaboration::CollaborationStore>,
+    ) {
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            for request in collaboration.pending_human_notifications().await {
+                let title = format!("muxa: your response needed ({})", request.from.label());
+                // Notification bodies can support markup; escape untrusted text.
+                let body = request
+                    .body
+                    .chars()
+                    .take(240)
+                    .collect::<String>()
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;");
+                if post(&self.app_name, &title, &body, false).is_ok() {
+                    if let Err(error) = collaboration.mark_notified(&request.id).await {
+                        tracing::warn!(%error, "could not persist human notification receipt");
+                    }
+                }
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             app_name: "muxa".into(),

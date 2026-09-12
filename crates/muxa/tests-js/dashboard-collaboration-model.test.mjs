@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   collaborationSequence,
+  needsHumanResponse,
   edgeIdentity,
   normalizeCollaborationPayload,
   participantIdentity,
@@ -33,6 +34,23 @@ const request = (id, createdAt, extra = {}) => ({
   thread_id: "CAL-7345/review",
   work_id: "CAL-7345",
   ...extra,
+});
+
+test("human attention follows recipient and lifecycle, never initiator or blocked prose", () => {
+  const human = { console: true };
+  const waiting = request("h", "2026-09-12", { to: human, status: "queued", expects_reply: true });
+  assert.equal(needsHumanResponse(waiting), true);
+  assert.equal(needsHumanResponse({ ...waiting, status: "claimed" }), true);
+  for (const status of ["completed", "cancelled", "expired", "blocked", "failed", "declined"]) {
+    assert.equal(needsHumanResponse({ ...waiting, status }), false);
+  }
+  assert.equal(needsHumanResponse({ ...waiting, kind: "notice" }), false);
+  assert.equal(needsHumanResponse({ ...waiting, expects_reply: false }), false);
+  assert.equal(needsHumanResponse({ ...waiting, from: human, to: reviewer }), false);
+  const graph = projectCollaboration([waiting, { ...waiting, id: "done", status: "completed", reply: { status: "completed" } }]);
+  assert.equal(graph.humanCount, 1);
+  assert.equal(graph.edges[0].humanCount, 1);
+  assert.equal(graph.edges[0].replyCount, 1);
 });
 
 test("accepts both the paged API envelope and a legacy bare array", () => {

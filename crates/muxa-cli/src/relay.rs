@@ -452,11 +452,13 @@ async fn handle_request(
             exact_backend(&backends, &pane).await?;
             let agent = collaboration_origin(&pane, false);
             let console = collaboration_origin(&pane, true);
-            let (incoming, sent) = tokio::try_join!(
+            let (mut incoming, sent, human) = tokio::try_join!(
                 client.collaboration_list(&agent, RequestMailbox::Incoming),
                 client.collaboration_list(&console, RequestMailbox::Sent),
+                client.collaboration_list(&console, RequestMailbox::Incoming),
             )
             .context("reading collaboration mailbox")?;
+            incoming.extend(human);
             Ok(RelayFrame::Result {
                 request_id,
                 result: FleetCommandResult::collaboration_mailbox(incoming, sent),
@@ -516,6 +518,17 @@ async fn handle_request(
         } => {
             exact_backend(&backends, &pane).await?;
             let agent = collaboration_origin(&pane, false);
+            let stored = client
+                .collaboration_get(
+                    &collaboration_origin(&pane, true),
+                    &collaboration_request_id,
+                )
+                .await?;
+            let agent = if stored.to.console {
+                collaboration_origin(&pane, true)
+            } else {
+                agent
+            };
             let request = client
                 .collaboration_reply(&agent, &collaboration_request_id, status, &body, &[], &[])
                 .await

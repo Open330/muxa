@@ -2909,6 +2909,7 @@ async fn collaboration_send(
     work_id: Option<String>,
 ) -> ActionOutcome {
     let request = NewRequest {
+        human_action: None,
         initiator: None,
         kind,
         body,
@@ -5288,6 +5289,8 @@ mod tests {
         now: OffsetDateTime,
     ) -> CollaborationRequest {
         CollaborationRequest {
+            interruption: None,
+            human_action: None,
             initiator: None,
             updates: Vec::new(),
             id: id.into(),

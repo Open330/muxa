@@ -1,5 +1,35 @@
 # Workflow examples
 
+## Human decision during peer work
+
+While handling `req_review`, a reviewer discovers two mutually exclusive product
+requirements that the authorized task does not resolve. Send:
+
+```json
+{
+  "target": "human",
+  "kind": "question",
+  "expects_reply": true,
+  "human_action": "choice",
+  "parent_request_id": "req_review",
+  "body": "Choose A (preserve compatibility) or B (remove the legacy API). This changes the public contract, so I need your choice. Recommend A for this release."
+}
+```
+
+Use `muxa_send_message`, retain its returned ID (for example `req_decision`),
+then call `muxa_wait_reply(request_id="req_decision")`. Keep the original review
+open; continue independent checks. On timeout, wait on `req_decision` again.
+When the operator answers, inspect both status and body, implement only what
+the answer authorizes, then complete `req_review` with the verified result.
+These IDs are illustrative: always use actual returned IDs.
+
+Do not use `muxa_call_peer(target="human")`, `pane:console`, or `console=true`
+to create or answer an operator decision. A failed review, missing peer, or
+routine permission already granted by the user does not justify this flow.
+`approval` and `information` use the same protocol with their corresponding
+`human_action`. The dashboard/app shows the linked request and return reply;
+orange/Need you identifies an unresolved human request, not agent activity.
+
 ## Independent review
 
 For "@peer review the current changes", retrieve room context, then call
@@ -33,8 +63,22 @@ read-only review returns findings without changing files. An execute task edits
 only within its delegated scope and reports the checks run. Use `muxa_reply`
 once with the original request ID, terminal status, result, and artifacts.
 
-If prerequisites are missing, return `blocked` with the missing prerequisite.
+If a missing prerequisite ends this work attempt, return `blocked` and name it.
+While awaiting a human decision within an active attempt, keep the request open
+and use the Human decision protocol above instead of a terminal `blocked` reply.
 If asked to summarize "the peer's report", retrieve `muxa_peer_report`; do not
-ask the peer to repeat work. Long waits keep the same durable request ID even if
-the target pane disappears. Remote Fleet requests require an explicit host and
+ask the peer to repeat work. Keep the same durable request ID, but if the
+target disappears, follow Peer interruption recovery instead of blindly waiting. Remote Fleet requests require an explicit host and
 pane and obey the host's observe/control mode.
+
+## Interrupted peer example
+
+After `muxa_wait_reply(request_id=R, timeout_secs=60)` times out, check the durable
+record and fresh state for R's exact recipient. If it is capped, record the
+observed scope/reset and last artifacts with `muxa_update_request`. A reset time
+may be unknown. Use an already-authorized recovery when possible. Otherwise send
+one human choice request explaining "wait for reset / use a healthy provider",
+with `parent_request_id=R`, and retain its returned ID. Keep R open during that
+decision; a claimed R still requires verified stop/handoff or isolated work before
+reassignment. Resume only after checking fresh state and the operator's answer.
+For Fleet use its returned host/pane_key and the remote message endpoint.
