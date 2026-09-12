@@ -4280,6 +4280,7 @@ mod tests {
         status: RequestStatus,
     ) -> CollaborationRequest {
         CollaborationRequest {
+            interruption: None,
             human_action: None,
             initiator: None,
             updates: Vec::new(),

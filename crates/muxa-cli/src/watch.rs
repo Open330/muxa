@@ -20298,6 +20298,7 @@ mod tests {
     ) -> CollaborationRequest {
         let now = OffsetDateTime::now_utc();
         CollaborationRequest {
+            interruption: None,
             human_action: None,
             initiator: None,
             updates: Vec::new(),
@@ -27532,6 +27533,7 @@ sort = ["state"]
 
     fn collab_request(to_pane: &str) -> CollaborationRequest {
         CollaborationRequest {
+            interruption: None,
             human_action: None,
             initiator: None,
             updates: Vec::new(),

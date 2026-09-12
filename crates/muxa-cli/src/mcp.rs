@@ -1611,7 +1611,7 @@ fn collaboration_guide(room: RoomContext, config: &muxa::config::Config) -> Valu
                 "handoff": "Cancel queued local requests with muxa_cancel_message and verify success. Claimed requests need supported authorized stop/handoff or isolated replacement work; a cap/offline state does not prevent resumption. Preserve request/thread identities and never impersonate the peer.",
                 "human": "Only if a real choice/approval/information is needed, follow human_feedback with one linked request; reuse its ID and existing authorization. Preserve remote endpoint identity.",
                 "completion": "Do not fabricate the peer reply. If ending your own incoming attempt, reply blocked with dependency/handoff evidence; keep it open during an active human decision.",
-                "limitation": "Waits currently observe durable replies, not live health. Instructions require a running coordinator; if it is capped too, unattended recovery needs daemon escalation."
+                "limitation": "Upgraded daemons return peer_interrupted without completing work. A running coordinator handles recovery first; if unavailable or unacknowledged for two minutes the daemon creates one durable human action. Reuse interruption.action_request_id; inspect interruption.decision without interpreting completion as consent. Older hosts still need bounded health checks."
             },
             "human_feedback": {
                 "when": "Only when an actual operator approval, choice, or missing information is required; never for routine peer traffic or already-authorized work.",
@@ -1922,7 +1922,13 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
     match await_collaboration_reply(client, &origin, &sent.id, timeout_secs).await {
         Ok(Some(request)) => {
             let mut payload = common;
-            payload["completed"] = json!(true);
+            payload["completed"] = json!(request.status.is_terminal());
+            payload["interruption"] = json!(request.interruption);
+            payload["reason"] = json!(if request.peer_interrupted() {
+                "peer_interrupted"
+            } else {
+                "terminal"
+            });
             payload["status"] = json!(request.status);
             payload["reply"] = json!(request.reply);
             json_result(&payload)
@@ -2052,9 +2058,21 @@ async fn fleet_call_peer(
     match await_fleet_collaboration_reply(client, host, &pane_key, &sent.id, timeout_secs, None)
         .await
     {
+        Ok(Some(request)) if request.peer_interrupted() && !request.status.is_terminal() => {
+            let mut payload = request_outcome(&request);
+            payload["host"] = json!(host);
+            payload["pane_key"] = json!(pane_key);
+            json_result(&payload)
+        }
         Ok(Some(request)) if request.status.is_terminal() => {
             let mut payload = common;
-            payload["completed"] = json!(true);
+            payload["completed"] = json!(request.status.is_terminal());
+            payload["interruption"] = json!(request.interruption);
+            payload["reason"] = json!(if request.peer_interrupted() {
+                "peer_interrupted"
+            } else {
+                "terminal"
+            });
             payload["status"] = json!(request.status);
             payload["reply"] = json!(request.reply);
             json_result(&payload)
@@ -2148,6 +2166,12 @@ async fn fleet_wait_reply(client: &Client, args: &Value) -> Value {
     )
     .await
     {
+        Ok(Some(request)) if request.peer_interrupted() && !request.status.is_terminal() => {
+            let mut payload = request_outcome(&request);
+            payload["host"] = json!(host);
+            payload["pane_key"] = json!(pane_key);
+            json_result(&payload)
+        }
         Ok(Some(request)) if request.status.is_terminal() => json_result(&json!({
             "completed": true,
             "host": host,
@@ -2255,7 +2279,7 @@ async fn await_fleet_collaboration_reply(
         let request = *result
             .collaboration_request
             .ok_or_else(|| "Fleet collaboration get returned no request".to_string())?;
-        let terminal = request.status.is_terminal();
+        let terminal = request.status.is_terminal() || request.peer_interrupted();
         current = Some(request);
         let updated = after_update.is_some_and(|seen| {
             current
@@ -2830,7 +2854,7 @@ async fn await_collaboration_reply(
         .collaboration_wait(origin, request_id, timeout_secs)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(request.status.is_terminal().then_some(request))
+    Ok((request.status.is_terminal() || request.peer_interrupted()).then_some(request))
 }
 
 fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
@@ -3019,7 +3043,9 @@ async fn wait_for_reply(client: &Client, args: &Value) -> Value {
         .collaboration_wait(&origin, request_id, timeout_secs)
         .await
     {
-        Ok(request) if request.status.is_terminal() => json_result(&request_outcome(&request)),
+        Ok(request) if request.status.is_terminal() || request.peer_interrupted() => {
+            json_result(&request_outcome(&request))
+        }
         Ok(_) => json_result(&json!({
             "completed": false,
             "reason": "timeout",
@@ -3546,7 +3572,12 @@ fn request_ack(request: &CollaborationRequest) -> Value {
 /// provenance, and timestamps. The structured reply is the new information.
 fn request_outcome(request: &CollaborationRequest) -> Value {
     let mut value = request_ack(request);
-    value["completed"] = json!(true);
+    value["completed"] = json!(request.status.is_terminal());
+    if request.peer_interrupted() {
+        value["reason"] = json!("peer_interrupted");
+        value["interruption"] = json!(request.interruption);
+        value["next_step"] = json!("Stop blind waits. Read the existing human action/decision if present; otherwise follow peer_interruption recovery and acknowledge via muxa_update_request. Do not duplicate work or impersonate the peer.");
+    }
     value["reply"] = json!(request.reply);
     value
 }

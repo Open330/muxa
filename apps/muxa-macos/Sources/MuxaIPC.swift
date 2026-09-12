@@ -803,7 +803,28 @@ struct MuxaCollaborationReply: Decodable, Hashable, Sendable {
     let at: String
 }
 
+struct MuxaPeerInterruption: Decodable, Hashable, Sendable {
+    let requestID: String
+    let reason: String
+    let active: Bool
+    let observedAt: String
+    let resetAt: String?
+    let actionRequestID: String?
+    let decision: MuxaCollaborationReply?
+    enum CodingKeys: String, CodingKey {
+        case reason, active, decision
+        case requestID = "request_id"
+        case observedAt = "observed_at"
+        case resetAt = "reset_at"
+        case actionRequestID = "action_request_id"
+    }
+}
+
 struct MuxaCollaborationRequest: Decodable, Identifiable, Hashable, Sendable {
+    var interruption: MuxaPeerInterruption? = nil
+    var peerInterrupted: Bool {
+        interruption?.active == true && interruption?.requestID == id && ["queued", "claimed"].contains(status)
+    }
     var humanAction: String? = nil
     var needsHumanResponse: Bool {
         to.console == true && expectsReply && kind != "notice" && ["queued", "claimed"].contains(status)
@@ -828,6 +849,7 @@ struct MuxaCollaborationRequest: Decodable, Identifiable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, from, to, kind, body, status, reply
+        case interruption
         case humanAction = "human_action"
         case expectsReply = "expects_reply"
         case workMode = "work_mode"

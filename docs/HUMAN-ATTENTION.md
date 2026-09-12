@@ -56,8 +56,8 @@ be built and visually verified on macOS before publishing a Muxa.app bundle.
 
 The shared skill's **Peer interruption recovery** section and the MCP guide's
 `workflows.peer_interruption` define coordinator recovery. A peer's quota/error
-state and a durable reply are distinct: reply waits currently do not wake on
-health changes. Use waits of at most 60 seconds plus a chosen overall budget,
+state and a durable reply are distinct: upgraded daemons return `peer_interrupted`
+on known error/stopped recipients without fabricating a terminal reply. Use waits of at most 60 seconds plus a chosen overall budget,
 then check fresh identity-matched recipient state. Do not use the request's
 snapshot of `to.state` or usage percentage alone to declare failure.
 
@@ -68,8 +68,24 @@ a reset and cannot be cancelled through the queued-request cancellation tool.
 Do not impersonate the unavailable recipient or fabricate its terminal reply.
 A coordinator ending its own incoming attempt returns `blocked` with evidence.
 
-This is an agent policy, not automatic server-side cancellation or escalation.
-If the coordinator is also capped, a daemon mechanism is still needed to create
-a durable operator action request. Existing error notifications alone do not
-implement this recovery protocol. Installed guides must be reread by running
-agents; reconnect MCP to refresh server instructions.
+The daemon reconciles exact agent kind/session/pane/socket identity on mailbox
+changes, agent transitions and a 30-second safety scan, including startup and
+when terminal wake injection is disabled. It records an interruption on the
+original request; local and Fleet waits return promptly with that metadata.
+Unknown/missing identities are not assumed stopped. Remote hosts need the
+updated daemon; old hosts continue to use bounded policy checks.
+
+If the coordinator is unavailable, or does not acknowledge via a request update
+within two minutes, one human choice request is persisted in the same transaction
+as its link on the original request. Restarts do not duplicate it. Existing linked
+human questions are reused. The service is explicitly identified as Muxa recovery;
+it does not impersonate a peer. Human answers are copied to interruption.decision
+for the coordinator; they do not execute any action or complete the original work.
+Healthy working/idle state or an actual terminal reply clears the interruption and
+withdraws an unanswered daemon-generated action. A reset time alone never clears it.
+
+muxa.app shows reason/reset/original request/action identity and decision, with
+editable reply drafts for wait/recheck, safe handoff and stopping an attempt. Its
+Reply button records only the decision. Dashboard detail shows the same structured
+recovery metadata; decision and progress bodies stay redacted without detail auth.
+Installed agents should reread the skill or reconnect MCP for the updated contract.

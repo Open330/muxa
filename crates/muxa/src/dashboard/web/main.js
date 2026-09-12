@@ -3012,6 +3012,7 @@ function renderCollaborationDetail(request) {
     </div>
     <dl class="collaboration-detail-meta">
       <dt>response needed</dt><dd>${needsHumanResponse(request) ? `you · ${esc(request.human_action || "information")}` : ["queued", "claimed"].includes(request.status) && request.expects_reply ? "agent" : "none"}</dd>
+      ${request.interruption ? `<dt>peer recovery</dt><dd>${esc(request.interruption.reason)} · ${request.interruption.active ? "active" : "cleared"}</dd><dt>original request</dt><dd>${esc(request.interruption.request_id)}</dd><dt>reset</dt><dd>${esc(request.interruption.reset_at || "unknown")}</dd><dt>action request</dt><dd>${esc(request.interruption.action_request_id || "coordinator notified")}</dd>` : ""}
       <dt>id</dt><dd>${esc(request.id)}</dd>
       <dt>room</dt><dd>${esc(roomLabel(request))}</dd>
       ${work ? `<dt>work</dt><dd>${esc(work)}</dd>` : ""}

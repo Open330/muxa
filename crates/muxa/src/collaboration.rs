@@ -543,6 +543,8 @@ pub struct CollaborationUpdate {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CollaborationRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption: Option<PeerInterruption>,
     /// Explicit operator decision. Never inferred from prose or the sender.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_action: Option<HumanAction>,
@@ -1946,6 +1948,7 @@ impl CollaborationStore {
             Some(supplied_thread_id.unwrap_or_else(|| id.clone()))
         };
         let request = CollaborationRequest {
+            interruption: None,
             human_action: input.human_action,
             id,
             from,
@@ -2293,7 +2296,7 @@ impl CollaborationStore {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let request = self.get_for(caller, request_id).await?;
-            if request.status.is_terminal() {
+            if request.status.is_terminal() || request.peer_interrupted() {
                 return Ok(request);
             }
             match tokio::time::timeout_at(deadline, changes.changed()).await {
@@ -6134,3 +6137,6 @@ mod tests {
         );
     }
 }
+
+mod recovery;
+pub use recovery::PeerInterruption;

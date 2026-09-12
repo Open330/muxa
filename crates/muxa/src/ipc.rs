@@ -716,6 +716,7 @@ const CAPABILITIES: &[&str] = &[
     "fleet_subscribe",
     "fleet_wait_reply",
     "collaboration_update",
+    "collaboration_peer_recovery",
     "pipeline_runs_v1",
     "pipeline_subscribe",
     "work_control_v1",

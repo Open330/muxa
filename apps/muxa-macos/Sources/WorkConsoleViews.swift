@@ -2627,9 +2627,9 @@ private struct CollaborationFlowGraph: View {
                     let start = step * (CGFloat(from) + 0.5)
                     let end = step * (CGFloat(to) + 0.5)
                     let y = CGFloat(index) * 48 + 42
-                    let color: Color = request.needsHumanResponse ? .orange : .blue
+                    let color: Color = (request.needsHumanResponse || request.peerInterrupted) ? .orange : .blue
                     context.stroke(arrow(from: start, to: end, y: y), with: .color(color), lineWidth: 1.5)
-                    let label = request.needsHumanResponse ? "Need you: \(request.humanAction ?? "information")" : request.kind
+                    let label = request.needsHumanResponse ? "Need you: \(request.humanAction ?? "information")" : (request.peerInterrupted ? "Interrupted: \(request.interruption?.reason ?? "unknown")" : request.kind)
                     context.draw(Text(label).font(.caption2).foregroundColor(color), at: CGPoint(x: (start + end) / 2, y: y - 9))
                     if request.reply != nil {
                         context.stroke(arrow(from: end, to: start, y: y + 18), with: .color(.green), style: StrokeStyle(lineWidth: 1, dash: [4, 2]))
@@ -2683,6 +2683,20 @@ private struct CollaborationRequestCard: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+            if let recovery = request.interruption {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(recovery.active ? "Peer interrupted: \(recovery.reason)" : "Peer interruption cleared", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(recovery.active ? .orange : .secondary)
+                    Text("Original request: \(recovery.requestID)").textSelection(.enabled)
+                    Text("Reset: \(recovery.resetAt ?? "unknown")")
+                    if let action = recovery.actionRequestID {
+                        Text("Recovery decision: \(action)").textSelection(.enabled)
+                    }
+                    if let decision = recovery.decision { Text("Decision (\(decision.status)): \(decision.body)") }
+                    Text("A decision does not automatically restart or reassign work.")
+                        .foregroundStyle(.secondary)
+                }.font(.caption)
+            }
             MarkdownContent(source: request.body, lineLimit: compact ? 2 : nil)
             if let response = request.reply {
                 if !compact {
@@ -2733,6 +2747,14 @@ private struct CollaborationReplyView: View {
             MarkdownContent(source: request.body)
                 .padding(10)
                 .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
+            if request.needsHumanResponse && request.interruption != nil {
+                HStack {
+                    Button("Wait and recheck") { replyText = "Wait and recheck the original peer. Verify fresh health and progress before resuming." }
+                    Button("Safe handoff") { replyText = "Arrange a safe handoff within the existing scope. Verify no overlapping execution before reassignment." }
+                    Button("Stop attempt") { replyText = "Stop this work attempt using authorized controls and preserve existing artifacts." }
+                }
+                Text("Choose a draft, edit it, then Reply. This records your decision only.").font(.caption)
+            }
             Picker("Outcome", selection: $status) {
                 Text("Completed").tag("completed")
                 Text("Blocked").tag("blocked")
