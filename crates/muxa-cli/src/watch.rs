@@ -2529,6 +2529,7 @@ fn persist_watch_collab_layout(
 
 #[derive(Debug, Clone, Default)]
 struct WatchCollaboration {
+    human: Vec<CollaborationRequest>,
     origin: Option<CollaborationOrigin>,
     room: Option<RoomContext>,
     /// The agent whose inbox `incoming` holds — the row under the cursor when
@@ -2630,6 +2631,7 @@ impl WatchCollaboration {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum CollaborationMailboxTab {
     #[default]
+    Human,
     Incoming,
     Sent,
 }
@@ -7680,6 +7682,7 @@ pub async fn run(
     // forces the first in-loop frame; `Instant::now()` seeds the cadence.
     let mut needs_render = true;
     let mut last_render = std::time::Instant::now();
+    let mut last_mailbox_refresh = std::time::Instant::now();
 
     loop {
         // Animate on a fast cadence only while there's something to move:
@@ -8417,6 +8420,14 @@ pub async fn run(
             }
         }
 
+        if app.collaboration_mailbox.open
+            && last_mailbox_refresh.elapsed() >= Duration::from_secs(2)
+        {
+            refresh_watch_collaboration(client, &mut app).await;
+            last_mailbox_refresh = std::time::Instant::now();
+            needs_render = true;
+        }
+
         if quit {
             break;
         }
@@ -8606,6 +8617,10 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
                 | None => None,
             };
             app.collaboration = WatchCollaboration {
+                human: requests
+                    .into_iter()
+                    .filter(CollaborationRequest::needs_human_response)
+                    .collect(),
                 origin: Some(origin),
                 room: Some(room),
                 history_scope,
@@ -8614,7 +8629,7 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
                 sent,
                 unavailable: None,
             };
-            if aggregate {
+            if aggregate && app.collaboration_mailbox.tab != CollaborationMailboxTab::Human {
                 app.collaboration_mailbox.tab = CollaborationMailboxTab::Incoming;
             }
         }
@@ -9264,6 +9279,7 @@ async fn run_watch_collaboration_broadcast(
     for (pane, label) in recipients {
         let pane = pane.clone();
         let request = NewRequest {
+            human_action: None,
             initiator: None,
             kind,
             body: body.clone(),
@@ -9324,6 +9340,7 @@ async fn run_watch_collaboration_single(
                 }
             };
             let request = NewRequest {
+                human_action: None,
                 initiator: None,
                 kind,
                 body: composer.input,
@@ -9376,6 +9393,7 @@ async fn run_watch_collaboration_single(
 
 fn collaboration_requests(app: &App) -> &[CollaborationRequest] {
     match app.collaboration_mailbox.tab {
+        CollaborationMailboxTab::Human => &app.collaboration.human,
         CollaborationMailboxTab::Incoming => &app.collaboration.incoming,
         CollaborationMailboxTab::Sent => &app.collaboration.sent,
     }
@@ -9409,8 +9427,9 @@ fn move_collaboration_mailbox(app: &mut App, delta: isize) {
 
 fn toggle_collaboration_mailbox(app: &mut App) {
     app.collaboration_mailbox.tab = match app.collaboration_mailbox.tab {
+        CollaborationMailboxTab::Human => CollaborationMailboxTab::Incoming,
         CollaborationMailboxTab::Incoming => CollaborationMailboxTab::Sent,
-        CollaborationMailboxTab::Sent => CollaborationMailboxTab::Incoming,
+        CollaborationMailboxTab::Sent => CollaborationMailboxTab::Human,
     };
     app.collaboration_mailbox.selected = 0;
 }
@@ -11629,10 +11648,13 @@ fn handle_collaboration_mailbox_event(code: KeyCode, app: &mut App) -> Action {
         }
         KeyCode::Char('m') => Action::OpenCollaborationMessage,
         KeyCode::Tab | KeyCode::BackTab if aggregate => {
-            app.set_hint(
-                "aggregate history already includes both directions",
-                HintLevel::Ok,
-            );
+            app.collaboration_mailbox.tab =
+                if app.collaboration_mailbox.tab == CollaborationMailboxTab::Human {
+                    CollaborationMailboxTab::Incoming
+                } else {
+                    CollaborationMailboxTab::Human
+                };
+            app.collaboration_mailbox.selected = 0;
             Action::None
         }
         KeyCode::Tab | KeyCode::BackTab => {
@@ -11654,10 +11676,19 @@ fn handle_collaboration_mailbox_event(code: KeyCode, app: &mut App) -> Action {
             app.set_hint(format!("mailbox detail: {label}"), HintLevel::Ok);
             Action::None
         }
-        KeyCode::Char('i' | 'e') if aggregate => {
+        KeyCode::Char('i' | 'e')
+            if aggregate && app.collaboration_mailbox.tab != CollaborationMailboxTab::Human =>
+        {
             app.set_hint(
                 "session/window history is read-only; select an exact recipient pane",
                 HintLevel::Warn,
+            );
+            Action::None
+        }
+        KeyCode::Char('i') if app.collaboration_mailbox.tab == CollaborationMailboxTab::Human => {
+            app.set_hint(
+                "press e to answer the selected human request",
+                HintLevel::Ok,
             );
             Action::None
         }
@@ -11672,6 +11703,25 @@ fn handle_collaboration_mailbox_event(code: KeyCode, app: &mut App) -> Action {
 }
 
 fn open_watch_collaboration_reply_composer(app: &mut App) {
+    if app.collaboration_mailbox.tab == CollaborationMailboxTab::Human {
+        if let (Some(request), Some(origin)) = (
+            selected_collaboration_request(app),
+            app.collaboration.origin.clone(),
+        ) {
+            app.collaboration_composer = Some(CollaborationComposer::new(
+                CollaborationComposeTarget::Reply {
+                    origin: CollaborationOrigin {
+                        console: true,
+                        ..origin
+                    },
+                    request_id: request.id.clone(),
+                    status: RequestStatus::Completed,
+                },
+                format!("reply to {}", request.from.label()),
+            ));
+        }
+        return;
+    }
     if app.collaboration_mailbox.tab != CollaborationMailboxTab::Incoming {
         app.set_hint("switch to incoming requests to reply", HintLevel::Err);
         return;
@@ -13488,6 +13538,15 @@ fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &App) {
 
 fn collaboration_mailbox_title(app: &App, theme: WatchThemeSpec) -> Line<'static> {
     let tab = app.collaboration_mailbox.tab;
+    if tab == CollaborationMailboxTab::Human {
+        return Line::from(vec![
+            Span::styled(
+                format!(" need your response {} ", app.collaboration.human.len()),
+                theme.action_badge(),
+            ),
+            Span::raw(" Tab: agent traffic · e: reply "),
+        ]);
+    }
     let owner = app
         .collaboration
         .history_scope
@@ -13500,6 +13559,17 @@ fn collaboration_mailbox_title(app: &App, theme: WatchThemeSpec) -> Line<'static
         .is_some_and(MailboxHistoryScope::aggregate);
     let mut spans = vec![
         Span::styled(" messages ", theme.accent_badge()),
+        Span::styled(
+            format!(
+                " need you {} · Tab to switch ",
+                app.collaboration.human.len()
+            ),
+            if tab == CollaborationMailboxTab::Human {
+                theme.action_badge()
+            } else {
+                theme.dim_style()
+            },
+        ),
         Span::raw(" "),
     ];
     if read_only {
@@ -13606,6 +13676,7 @@ fn collaboration_mailbox_request_lines(
     if painted.is_empty() {
         return vec![Line::from(Span::styled(
             match tab {
+                CollaborationMailboxTab::Human => "no requests need your response",
                 CollaborationMailboxTab::Incoming => "no incoming requests",
                 CollaborationMailboxTab::Sent => "no sent requests",
             },
@@ -13699,7 +13770,9 @@ fn collaboration_mailbox_request_lines_for_request(
         format!("{} → {}", request.from.label(), request.to.label())
     } else {
         match tab {
-            CollaborationMailboxTab::Incoming => request.from.label(),
+            CollaborationMailboxTab::Human | CollaborationMailboxTab::Incoming => {
+                request.from.label()
+            }
             CollaborationMailboxTab::Sent => request.to.label(),
         }
     };
@@ -17863,6 +17936,15 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
     }
 
     if app.collaboration_mailbox.open {
+        if app.collaboration_mailbox.tab == CollaborationMailboxTab::Human {
+            f.render_widget(
+                Paragraph::new(
+                    "j/k select · e reply as operator · Tab agent traffic · r refresh · M close",
+                ),
+                area,
+            );
+            return true;
+        }
         let aggregate = app
             .collaboration
             .history_scope
@@ -20216,6 +20298,7 @@ mod tests {
     ) -> CollaborationRequest {
         let now = OffsetDateTime::now_utc();
         CollaborationRequest {
+            human_action: None,
             initiator: None,
             updates: Vec::new(),
             id: id.into(),
@@ -20363,6 +20446,7 @@ mod tests {
     #[test]
     fn session_mailbox_leads_with_human_window_names_and_message_summaries() {
         let mut app = collaboration_watch_app();
+        app.collaboration_mailbox.tab = CollaborationMailboxTab::Incoming;
         app.collaboration.history_scope = Some(MailboxHistoryScope::Session {
             key: SessionKey {
                 endpoint: BackendEndpoint {
@@ -22298,8 +22382,36 @@ mod tests {
     }
 
     #[test]
+    fn human_mailbox_defaults_to_operator_and_replies_without_agent_claim() {
+        let mut app = collaboration_watch_app();
+        assert_eq!(
+            app.collaboration_mailbox.tab,
+            CollaborationMailboxTab::Human
+        );
+        let room = app.collaboration.room.as_ref().unwrap();
+        let mut request = fake_watch_collaboration_request(
+            "human_question",
+            room.peers[0].clone(),
+            Participant::console(room.current.room.clone()),
+            RequestStatus::Queued,
+        );
+        request.expects_reply = true;
+        app.collaboration.human.push(request);
+        open_watch_collaboration_reply_composer(&mut app);
+        assert!(
+            matches!(app.collaboration_composer.as_ref().map(|c| &c.target), Some(CollaborationComposeTarget::Reply { origin, request_id, .. }) if origin.console && request_id == "human_question")
+        );
+        toggle_collaboration_mailbox(&mut app);
+        assert_eq!(
+            app.collaboration_mailbox.tab,
+            CollaborationMailboxTab::Incoming
+        );
+    }
+
+    #[test]
     fn watch_mailbox_opens_reply_for_claimed_incoming_request() {
         let mut app = collaboration_watch_app();
+        app.collaboration_mailbox.tab = CollaborationMailboxTab::Incoming;
         let room = app.collaboration.room.as_ref().unwrap();
         app.collaboration
             .incoming
@@ -22338,6 +22450,7 @@ mod tests {
     #[test]
     fn watch_mailbox_render_contains_request_and_peer() {
         let mut app = collaboration_watch_app();
+        app.collaboration_mailbox.tab = CollaborationMailboxTab::Incoming;
         let room = app.collaboration.room.as_ref().unwrap();
         let mut request = fake_watch_collaboration_request(
             "req_watch_render_123456",
@@ -27419,6 +27532,7 @@ sort = ["state"]
 
     fn collab_request(to_pane: &str) -> CollaborationRequest {
         CollaborationRequest {
+            human_action: None,
             initiator: None,
             updates: Vec::new(),
             id: "req_1".into(),

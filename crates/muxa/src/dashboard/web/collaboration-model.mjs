@@ -4,6 +4,12 @@
 
 const SEP = "\u001f";
 
+// Recipient and live request state determine attention, never sender/prose.
+export function needsHumanResponse(request) {
+  return request?.to?.console === true && request.expects_reply === true
+    && request.kind !== "notice" && ["queued", "claimed"].includes(request.status);
+}
+
 export function normalizeCollaborationPayload(payload) {
   if (Array.isArray(payload)) {
     return {
@@ -125,6 +131,7 @@ export function projectCollaboration(requests) {
         to: to.id,
         count: 0,
         replyCount: 0,
+        humanCount: 0,
         replyStatuses: {},
         kinds: {},
         statuses: {},
@@ -134,6 +141,7 @@ export function projectCollaboration(requests) {
     }
     const edge = edges.get(key);
     edge.count += 1;
+    if (needsHumanResponse(request)) edge.humanCount += 1;
     increment(edge.kinds, request.kind || "unknown");
     increment(edge.statuses, request.status || "unknown");
     if (request.reply) {
@@ -167,6 +175,7 @@ export function projectCollaboration(requests) {
 
   return {
     nodes: [...nodes.values()].sort((left, right) => left.label.localeCompare(right.label)),
+    humanCount: (requests || []).filter(needsHumanResponse).length,
     edges: [...edges.values()].sort((left, right) => right.count - left.count || left.key.localeCompare(right.key)),
     rooms: [...rooms.values()].sort((left, right) => right.count - left.count || left.label.localeCompare(right.label)),
     works: [...works].sort(),

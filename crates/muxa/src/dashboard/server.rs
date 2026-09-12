@@ -2627,6 +2627,7 @@ mod tests {
                         from.clone(),
                         to.clone(),
                         NewRequest {
+                            human_action: None,
                             initiator: None,
                             kind: RequestKind::Review,
                             body: body.to_string(),
@@ -2653,6 +2654,7 @@ mod tests {
                     from,
                     to,
                     NewRequest {
+                        human_action: None,
                         initiator: None,
                         kind: RequestKind::Notice,
                         body: "finalize".to_string(),

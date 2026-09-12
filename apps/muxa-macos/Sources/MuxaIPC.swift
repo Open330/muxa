@@ -804,6 +804,10 @@ struct MuxaCollaborationReply: Decodable, Hashable, Sendable {
 }
 
 struct MuxaCollaborationRequest: Decodable, Identifiable, Hashable, Sendable {
+    var humanAction: String? = nil
+    var needsHumanResponse: Bool {
+        to.console == true && expectsReply && kind != "notice" && ["queued", "claimed"].contains(status)
+    }
     let id: String
     let from: MuxaCollaborationParticipant
     let to: MuxaCollaborationParticipant
@@ -824,6 +828,7 @@ struct MuxaCollaborationRequest: Decodable, Identifiable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, from, to, kind, body, status, reply
+        case humanAction = "human_action"
         case expectsReply = "expects_reply"
         case workMode = "work_mode"
         case createdAt = "created_at"

@@ -316,6 +316,7 @@ async fn main() -> Result<()> {
     // Desktop notifier: spawned only when opted in. We subscribe BEFORE
     // the server starts accepting events so no early transition is lost.
     if cfg.notifier.enabled && matches!(cfg.notifier.backend, NotifierBackend::Libnotify) {
+        tokio::spawn(Notifier::new().run_human_requests(collaboration.clone()));
         let rx = store.subscribe();
         tokio::spawn(async move {
             if let Err(e) = Notifier::new().run(rx).await {
@@ -3245,6 +3246,7 @@ mod tests {
                 sender,
                 recipient,
                 NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Question,
                     body: "wake from revision".into(),
@@ -3388,6 +3390,7 @@ mod tests {
                 sender,
                 pending,
                 NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Review,
                     body: "review the pending diff".into(),
@@ -3465,6 +3468,7 @@ mod tests {
                 sender.clone(),
                 recipient.clone(),
                 NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "change only the authorized file".into(),
@@ -3518,6 +3522,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "unsafe\u{1b}[201~\rsubmit".into(),
@@ -3579,6 +3584,7 @@ mod tests {
                 console,
                 recipient.clone(),
                 NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "operator request body".into(),
@@ -3661,6 +3667,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "agent delegated body".into(),
@@ -3731,6 +3738,7 @@ mod tests {
                     sender.clone(),
                     recipient.clone(),
                     NewRequest {
+                        human_action: None,
                         initiator: None,
                         kind: RequestKind::Task,
                         body: body.into(),
@@ -3796,6 +3804,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Full crash-recovery scenario, including request metadata.
     async fn full_wake_recovers_without_reinjecting_the_request_body() {
         let store = muxa::Store::shared();
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
@@ -3818,6 +3827,7 @@ mod tests {
                 sender.clone(),
                 recipient.clone(),
                 NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "do not inject this twice".into(),
@@ -3868,6 +3878,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "the prompt text is already buffered".into(),
@@ -3927,6 +3938,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Review,
                     body: "secret request body".into(),
@@ -4045,6 +4057,7 @@ mod tests {
                 console.clone(),
                 recipient.clone(),
                 NewRequest {
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "dispatched by a human".into(),

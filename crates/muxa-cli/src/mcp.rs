@@ -86,7 +86,13 @@ const MCP_SERVER_INSTRUCTIONS: &str = "muxa coordinates same-window peers. \
     exactly one terminal muxa_reply. A /name selects a registered message skill. \
     muxa_fleet_call_peer/muxa_fleet_wait_reply are a separate physical-host plane: \
     name host/pane explicitly and respect observe mode. Use muxa_fleet_update_request/muxa_update_request \
-    for batched guidance/progress; read updates at checkpoints and wait with after_update.";
+    for batched guidance/progress; read updates at checkpoints and wait with after_update. \
+    Human decisions use muxa_send_message(target=human, kind=question, expects_reply=true, \
+    human_action=approval|choice|information), with parent_request_id when following an actual request. \
+    Explain the decision, options and recommendation. Keep the returned ID and use muxa_wait_reply; \
+    timeout is not consent and completed is not necessarily approval: read the answer. \
+    Peer traffic/progress must not trigger human requests. Reuse existing authorization, \
+    never impersonate the console, and keep the parent open while awaiting a human answer.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -818,10 +824,11 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "peer, pane:%N, %N, @alias, or role:<name>" },
+                    "target": { "type": "string", "description": "peer, pane:%N, %N, @alias, role:<name>, or human for an operator decision" },
                     "kind": { "type": "string", "enum": ["question", "review", "task", "notice"] },
                     "body": { "type": "string" },
                     "expects_reply": { "type": "boolean", "description": "Default true except notice." },
+                    "human_action": { "type": "string", "enum": ["approval", "choice", "information"], "description": "Use target human only when an operator decision is required. Explain the question, choices and recommendation in body. Internal agent requests must omit this." },
                     "work_mode": { "type": "string", "enum": ["read_only", "execute"], "description": "Default read_only." },
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope for execute work." },
                     "thread_id": { "type": "string", "description": "Stable id shared by one causal conversation. Omit for a root request; muxa assigns its request id. When parent_request_id is set, this must match the parent's canonical thread." },
@@ -1605,6 +1612,17 @@ fn collaboration_guide(room: RoomContext, config: &muxa::config::Config) -> Valu
         "user_launch_preferences": launch_guide_value(config),
         "next_step": next_step,
         "workflows": {
+            "human_feedback": {
+                "when": "Only when an actual operator approval, choice, or missing information is required; never for routine peer traffic or already-authorized work.",
+                "tool": "muxa_send_message",
+                "request": { "target": "human", "kind": "question", "expects_reply": true, "human_action": "choice" },
+                "actions": ["approval", "choice", "information"],
+                "context": "Include the exact decision, why required, options and recommendation. Include parent_request_id only for an existing request you participate in; inherit its thread and preserve known work identity.",
+                "wait": "Retain the returned request_id and use muxa_wait_reply. Continue independent work; never treat a timeout as consent or create duplicate questions. Keep the original peer request open while waiting.",
+                "answer": "The human answers in Need you (watch: e). Read status and body; completed is not necessarily approval. Honor refusal/cancellation and complete the original peer request after authorized work.",
+                "identity": "Never use console=true or claim/answer the operator inbox as an agent.",
+                "fallback": "If the installed schema lacks human_action, ask in the existing user conversation. Do not silently drop the question or redirect it to a peer."
+            },
             "reviewer": {
                 "when": "After implementation, self-review, and relevant tests; before declaring important work complete.",
                 "request": {
@@ -2941,6 +2959,13 @@ fn new_request_from_args(
     air_artifacts: Vec<AirArtifactReference>,
 ) -> std::result::Result<NewRequest, String> {
     Ok(NewRequest {
+        human_action: args
+            .get("human_action")
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid human_action: {error}"))
+            })
+            .transpose()?,
         initiator: None,
         kind,
         body,
@@ -3993,6 +4018,26 @@ mod tests {
         .unwrap();
 
         let guide = collaboration_guide(room, &muxa::config::Config::default());
+        let human = &guide["workflows"]["human_feedback"];
+        assert_eq!(human["tool"], "muxa_send_message");
+        assert_eq!(human["request"]["target"], "human");
+        assert_eq!(human["request"]["expects_reply"], true);
+        let input = new_request_from_args(
+            &human["request"],
+            RequestKind::Question,
+            "Choose A or B".into(),
+            true,
+            WorkMode::ReadOnly,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            input.human_action,
+            Some(muxa::collaboration::HumanAction::Choice)
+        );
+        assert!(human["wait"].as_str().unwrap().contains("muxa_wait_reply"));
+        assert!(MCP_SERVER_INSTRUCTIONS.contains("never impersonate the console"));
         assert_eq!(guide["room"]["peers"][0]["pane"], "%2");
         assert_eq!(guide["workflows"]["reviewer"]["request"]["kind"], "review");
         assert_eq!(

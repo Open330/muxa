@@ -144,12 +144,14 @@ enum InputMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum MailboxTab {
     #[default]
+    Human,
     Incoming,
     Sent,
 }
 
 #[derive(Debug, Clone, Default)]
 struct MailboxState {
+    human: Vec<CollaborationRequest>,
     open: bool,
     loading: bool,
     host: Option<String>,
@@ -872,6 +874,7 @@ impl App {
 
     fn mailbox_requests(&self) -> &[CollaborationRequest] {
         match self.mailbox.tab {
+            MailboxTab::Human => &self.mailbox.human,
             MailboxTab::Incoming => &self.mailbox.incoming,
             MailboxTab::Sent => &self.mailbox.sent,
         }
@@ -1172,6 +1175,12 @@ pub(crate) async fn run(
                     app.mailbox.loading = false;
                     match result {
                         Ok(result) => {
+                            app.mailbox.human = result
+                                .collaboration_incoming
+                                .iter()
+                                .filter(|request| request.needs_human_response())
+                                .cloned()
+                                .collect();
                             app.mailbox.incoming = result.collaboration_incoming;
                             app.mailbox.sent = result.collaboration_sent;
                             app.clamp_mailbox();
@@ -1365,6 +1374,7 @@ fn handle_key(
                             )
                         };
                         let request = NewRequest {
+                            human_action: None,
                             initiator: None,
                             kind: app.message_kind,
                             body: text,
@@ -1583,8 +1593,9 @@ fn handle_key(
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 app.mailbox.tab = match app.mailbox.tab {
+                    MailboxTab::Human => MailboxTab::Incoming,
                     MailboxTab::Incoming => MailboxTab::Sent,
-                    MailboxTab::Sent => MailboxTab::Incoming,
+                    MailboxTab::Sent => MailboxTab::Human,
                 };
                 app.mailbox.selected = 0;
             }
@@ -2261,7 +2272,7 @@ fn claim_mailbox(
 }
 
 fn open_reply_composer(app: &mut App) {
-    if app.mailbox.tab != MailboxTab::Incoming {
+    if app.mailbox.tab == MailboxTab::Sent {
         app.status("switch to incoming requests to reply");
         return;
     }
@@ -2269,7 +2280,7 @@ fn open_reply_composer(app: &mut App) {
         app.status("no incoming request selected");
         return;
     };
-    if request.status == RequestStatus::Queued {
+    if request.status == RequestStatus::Queued && !request.needs_human_response() {
         app.status("press i to claim the request before replying");
         return;
     }
@@ -4027,6 +4038,14 @@ fn render_mailbox(frame: &mut Frame, area: Rect, app: &App) {
         .title(Line::from(vec![
             Span::styled(" mailbox ", theme.accent_badge()),
             Span::styled(
+                format!(" need you {} ", app.mailbox.human.len()),
+                if app.mailbox.tab == MailboxTab::Human {
+                    theme.action_badge()
+                } else {
+                    theme.dim_style()
+                },
+            ),
+            Span::styled(
                 format!(" incoming {} ", app.mailbox.incoming.len()),
                 if app.mailbox.tab == MailboxTab::Incoming {
                     theme.action_badge()
@@ -4045,7 +4064,9 @@ fn render_mailbox(frame: &mut Frame, area: Rect, app: &App) {
             ),
             Span::styled(format!(" · {target} "), theme.table_header_style()),
         ]))
-        .title_bottom(" Tab inbox/sent · j/k move · i claim · e reply · r refresh · M/Esc close ")
+        .title_bottom(
+            " Tab need you/agent inbox/sent · j/k move · e reply · r refresh · M/Esc close ",
+        )
         .borders(Borders::ALL)
         .border_type(theme.border_type)
         .border_style(theme.border_style());
@@ -4081,7 +4102,7 @@ fn render_mailbox(frame: &mut Frame, area: Rect, app: &App) {
                 "  "
             };
             let peer = match app.mailbox.tab {
-                MailboxTab::Incoming => request.from.label(),
+                MailboxTab::Human | MailboxTab::Incoming => request.from.label(),
                 MailboxTab::Sent => request.to.label(),
             };
             Row::new(vec![
@@ -4828,6 +4849,7 @@ mod tests {
 
     fn broadcast_request() -> NewRequest {
         NewRequest {
+            human_action: None,
             initiator: None,
             kind: RequestKind::Question,
             body: "coordinate this change".into(),

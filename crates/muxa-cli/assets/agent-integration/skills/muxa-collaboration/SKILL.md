@@ -46,6 +46,43 @@ kind/work_mode/paths, and finish with one terminal `muxa_reply` (`completed`,
 Do not treat idle status or terminal text as a durable completion report. Use
 `muxa_wait_for_change` for process state waits and mailbox tools for peer results.
 
+## Human feedback protocol
+
+Separate agent communication from operator decisions. A pending peer request,
+review, retry, progress update, or a human-initiated task is not by itself a
+reason to notify the human. Use `muxa_update_request` for progress on the same
+request and the existing peer tools for agent work.
+
+When progress actually requires a human's approval, choice, or missing
+information, use `muxa_send_message` with `target="human"`, `kind="question"`,
+`expects_reply=true`, and `human_action="approval"`, `"choice"`, or
+`"information"`. Explain the exact decision, why it is required, available
+options, and your recommendation. Reuse existing authorization; never create
+an approval request for work the user already authorized.
+
+If this follows a collaboration request you participate in, include its exact
+`parent_request_id`; muxa inherits the thread. Otherwise omit the parent.
+Preserve work/workspace/run identity when known. Do not invent IDs. Keep the
+returned human `request_id` and wait with `muxa_wait_reply`; a timeout is not
+an answer, consent, or permission to send a duplicate question. Continue
+independent authorized work while waiting, but not work dependent on the answer.
+
+The operator answers in mailbox **Need you** (`e` in watch). Read the structured
+reply and its body: `completed` means an answer was submitted, not necessarily
+approval. Honor a refusal or cancellation. Resume only the work the answer
+permits and eventually reply on the original peer request. Do not mark that
+parent `blocked` merely to represent a temporary human wait: blocked is terminal.
+Agents must not impersonate the operator console, claim its inbox, or answer
+their own human request. Never use terminal input to simulate a human reply.
+
+Check installed tool schemas for `human_action`/`target="human"` support. If
+unavailable, ask through the user's existing conversation and report the missing
+capability; do not redirect the question to an agent or silently drop it.
+The CLI equivalent is `muxa msg send human "decision and context" --human-action
+choice --parent REQUEST_ID --json` (omit `--parent` when there is none).
+For a remote host, use the installed host's supported message transport and keep
+its endpoint with the request ID; do not assume a local ID resolves remotely.
+
 ## Authority and unavailable capabilities
 
 Existing explicit user authorization remains valid within the same scope; do not
