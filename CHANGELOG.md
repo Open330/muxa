@@ -100,6 +100,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A muxad restart no longer reports itself to the macOS app as a failure.**
+  Every restart burned the full five-second handler drain before re-exec, and
+  the app gave up on its own three-second socket timeout first — so adding a
+  Fleet host, which asks muxad to reload, disconnected the app with the errno
+  text `read failed: Resource temporarily unavailable` instead of registering
+  the host.
+
+  The drain never ended early because `read_session_wait` — the event-driven
+  terminal read the app holds open per live pane — parks a `spawn_blocking`
+  thread for as long as the client asked for, up to 30 seconds. Blocking tasks
+  cannot be cancelled and `JoinSet::abort_all` only drops the join handle, so
+  the handler sat in the drain until that wait expired on its own, while every
+  other streaming handler had already returned. The wait is read-only and
+  performs no mutation, so shutdown now abandons it the way it already
+  abandoned subscriptions, and the daemon re-execs immediately.
+
+  The app reads the situation correctly on both sides of that: a read that
+  hits its receive timeout, and a connection muxad closed before answering,
+  now say muxad may be restarting rather than handing over an errno. Neither
+  is retried automatically — a read failure cannot prove muxad did not already
+  apply the request, and replaying a mutation would double-apply it — so
+  recovery stays with the reconciliation poll, which now backs off from 750ms
+  instead of waiting out its fifteen-second period.
+
 - **The macOS app no longer stops muxad from starting at login.** Replacing a
   running daemon ran `launchctl disable` on the legacy `dev.open330.muxad`
   label before unloading it. `disable` is not scoped to the session: it writes

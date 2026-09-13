@@ -414,14 +414,33 @@ final class AppModel: ObservableObject {
     }
 
     private func runReconciliation(ifGeneration generation: UInt64) async {
+        // A read failure is never replayed by the IPC layer, so a muxad
+        // restart always lands as `.failed` and this loop is what clears it.
+        // muxad re-execs in well under a second, so poll quickly at first —
+        // then back off to the steady-state period, because a daemon that is
+        // genuinely down should not be probed eighty times a minute.
+        var pollsWhileDisconnected = 0
         while !Task.isCancelled, connectionGeneration == generation {
+            let delay: Duration
+            if isDisconnected {
+                delay = .milliseconds(min(15_000, 750 << min(pollsWhileDisconnected, 5)))
+                pollsWhileDisconnected += 1
+            } else {
+                delay = .seconds(15)
+                pollsWhileDisconnected = 0
+            }
             do {
-                try await Task.sleep(for: .seconds(15))
+                try await Task.sleep(for: delay)
             } catch {
                 return
             }
             await refresh(ifGeneration: generation)
         }
+    }
+
+    private var isDisconnected: Bool {
+        if case .failed = connectionState { return true }
+        return false
     }
 
     private func runAskSubscription(ifGeneration generation: UInt64) async {

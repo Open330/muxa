@@ -16,6 +16,12 @@ enum MuxaIPCError: LocalizedError {
 
     /// True while the request provably never reached muxad: the connect or
     /// the write failed on a socket muxad had already dropped.
+    ///
+    /// Deliberately excludes read failures — a timeout (EAGAIN) or a reset
+    /// partway through a reply proves nothing about whether muxad applied the
+    /// request, and replaying a mutation would double-apply it. Those are
+    /// reported, not retried; `AppModel` re-polls instead, which is safe
+    /// because a snapshot refresh mutates nothing.
     var isReconnectable: Bool {
         switch self {
         case .posix(let operation, let code):
@@ -40,9 +46,13 @@ enum MuxaIPCError: LocalizedError {
         case .posix(let operation, let code):
             // A dropped connection almost always means muxad restarted (its
             // own binary watch re-execs it, and an app update replaces it),
-            // so say that rather than handing over an errno.
+            // so say that rather than handing over an errno. A read that hits
+            // SO_RCVTIMEO reports EAGAIN, which is that same restart seen from
+            // a connection muxad accepted and then stopped answering on as it
+            // shut down; left unclassified it reached the connection banner as
+            // "read failed: Resource temporarily unavailable".
             switch code {
-            case EPIPE, ECONNRESET, ECONNREFUSED, ENOENT:
+            case EPIPE, ECONNRESET, ECONNREFUSED, ENOENT, EAGAIN, ETIMEDOUT:
                 "muxad is not answering — it may be restarting. Try again in a moment."
             default:
                 "\(operation) failed: \(String(cString: strerror(code)))"
@@ -50,7 +60,10 @@ enum MuxaIPCError: LocalizedError {
         case .responseTooLarge:
             "muxad returned an oversized IPC response"
         case .emptyResponse:
-            "muxad closed the IPC connection without a response"
+            // End of file before a response: muxad closed the connection,
+            // which is what its shutdown now does to an idle or read-only
+            // handler instead of holding the client for the drain timeout.
+            "muxad closed the connection without responding — it may be restarting. Try again in a moment."
         case .server(let message):
             message
         case .incompatibleProtocol(let minimum, let maximum):

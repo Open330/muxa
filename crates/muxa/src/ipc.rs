@@ -4106,11 +4106,23 @@ async fn handle(
                     kind = "read_session_wait";
                     let sessions = Arc::clone(&sessions);
                     let timeout = Duration::from_millis(timeout_ms.clamp(1, 30_000));
-                    match tokio::task::spawn_blocking(move || {
+                    let wait = tokio::task::spawn_blocking(move || {
                         sessions.read_output_wait(&session_id, offset, timeout)
-                    })
-                    .await
-                    {
+                    });
+                    // A read-only long poll, so shutdown may abandon it. It
+                    // has to be abandoned explicitly: `spawn_blocking` cannot
+                    // be cancelled, and `JoinSet::abort_all` only drops the
+                    // join handle, so a handler that kept awaiting this would
+                    // sit in the drain until the client's own timeout expired
+                    // — up to 30s, which made every restart burn the whole
+                    // `HANDLER_DRAIN_TIMEOUT` before re-exec. Stop awaiting
+                    // instead: the blocking thread expires on its own (and is
+                    // replaced outright by the re-exec), and no mutation is
+                    // lost because this request performs none.
+                    let Some(joined) = until_server_shutdown(&mut stopping, wait).await else {
+                        return Ok(());
+                    };
+                    match joined {
                         Ok(Ok(output)) => Response::with_output(output),
                         Ok(Err(e)) => Response::err(e.to_string()),
                         Err(e) => Response::err(format!("session wait task failed: {e}")),
@@ -7502,6 +7514,68 @@ mod tests {
             let mut line = String::new();
             assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_abandons_an_in_flight_session_wait() {
+        // `read_session_wait` parks a `spawn_blocking` thread for as long as
+        // the client asked for — up to 30s. `spawn_blocking` cannot be
+        // cancelled and `JoinSet::abort_all` only drops the join handle, so a
+        // handler that kept awaiting it held the drain for the full
+        // `HANDLER_DRAIN_TIMEOUT` on the way out. The macOS app keeps one of
+        // these open per live terminal, which turned every muxad restart into
+        // a five-second blackout: long enough that the app's own three-second
+        // socket timeout fired first and reported the restart as a failure.
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("shutdown-session-wait.sock");
+        let sessions = PtySessionBackend::shared();
+        // Silent and long-lived, so the wait can only end by being abandoned.
+        let session = sessions
+            .spawn_session(SpawnSession {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                env: Vec::new(),
+                cwd: None,
+                name: None,
+                cols: Some(80),
+                rows: Some(24),
+            })
+            .unwrap();
+        let server = Server::new(socket.clone(), Store::shared()).with_sessions(sessions.clone());
+        let (stop, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(server.run(receiver));
+        wait_for_socket(&socket).await;
+
+        let mut waiting = BufReader::new(UnixStream::connect(&socket).await.unwrap());
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "read_session_wait",
+            "session_id": session.id,
+            "offset": 0,
+            "timeout_ms": 20_000,
+        }))
+        .unwrap();
+        bytes.push(b'\n');
+        waiting.get_mut().write_all(&bytes).await.unwrap();
+        // Let the handler reach the blocking wait before the signal lands.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("a session wait must not hold the drain for its client's timeout")
+            .unwrap()
+            .unwrap();
+        let mut line = String::new();
+        assert_eq!(
+            waiting.read_line(&mut line).await.unwrap(),
+            0,
+            "the abandoned wait must close the connection, not answer it"
+        );
+        let _ = sessions.terminate(&session.id);
     }
 
     #[tokio::test]
