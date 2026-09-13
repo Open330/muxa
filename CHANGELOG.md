@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.47] - 2026-09-13
+
 ### Added
 
 - **The workbench is fully drivable from the keyboard, with `⌘P` and `⌘⇧P` in
@@ -3519,7 +3521,9 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.45...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.47...HEAD
+[0.8.47]: https://github.com/Open330/muxa/compare/v0.8.46...v0.8.47
+[0.8.46]: https://github.com/Open330/muxa/compare/v0.8.45...v0.8.46
 [0.8.45]: https://github.com/Open330/muxa/compare/v0.8.44...v0.8.45
 [0.8.44]: https://github.com/Open330/muxa/compare/v0.8.43...v0.8.44
 [0.8.43]: https://github.com/Open330/muxa/compare/v0.8.42...v0.8.43
