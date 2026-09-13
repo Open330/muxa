@@ -5643,3 +5643,29 @@ private func airPipelineFixture() -> MuxaPipelineDefinition {
     #expect(url?.absoluteString == "http://127.0.0.1:60995/?token=abc&initial=explicit")
     #expect(AirWorkbenchProcess.loopbackURL(in: "no address here") == nil)
 }
+
+@Test func aStalledDaemonReadsAsARestartRatherThanAnErrno() {
+    // muxad closes its listener and then holds in-flight handlers for a
+    // bounded drain, so a request already on the socket gets no reply until
+    // the re-exec lands. The app's SO_RCVTIMEO fires first and `read()`
+    // reports EAGAIN, which used to reach the connection banner verbatim as
+    // "read failed: Resource temporarily unavailable" — an errno the reader
+    // cannot act on, for the one situation that resolves by itself.
+    let timedOut = MuxaIPCError.posix(operation: "read", code: EAGAIN)
+    #expect(timedOut.errorDescription?.contains("restarting") == true)
+    #expect(timedOut.errorDescription?.contains("Resource temporarily") == false)
+    // Shutdown now closes a read-only handler instead of stalling it, so the
+    // same event arrives as end-of-file and must read the same way.
+    #expect(MuxaIPCError.emptyResponse.errorDescription?.contains("restarting") == true)
+
+    // An errno that is not a daemon that went away still reports itself.
+    #expect(
+        MuxaIPCError.posix(operation: "write", code: EINVAL).errorDescription
+            == "write failed: Invalid argument"
+    )
+
+    // Classification is presentation only: a read is still never replayed,
+    // because muxad may already have applied the request.
+    #expect(!timedOut.isReconnectable)
+    #expect(MuxaIPCError.posix(operation: "connect", code: ECONNREFUSED).isReconnectable)
+}
