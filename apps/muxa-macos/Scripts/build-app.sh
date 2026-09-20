@@ -7,6 +7,20 @@ APP_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 DERIVED_DATA="$APP_DIR/.build/DerivedData"
 CONFIGURATION=${CONFIGURATION:-Debug}
 
+# xcodebuild needs a full Xcode. A Mac whose `xcode-select` still points at
+# the Command Line Tools has one installed all the same, and repointing it
+# takes sudo — so use the installed Xcode for this build rather than failing
+# on a setting the build does not need changed.
+if [ -z "${DEVELOPER_DIR:-}" ] && ! xcodebuild -version >/dev/null 2>&1; then
+    for xcode in /Applications/Xcode.app /Applications/Xcode-beta.app; do
+        if [ -x "$xcode/Contents/Developer/usr/bin/xcodebuild" ]; then
+            export DEVELOPER_DIR="$xcode/Contents/Developer"
+            echo "Using $xcode (xcode-select points at the Command Line Tools)"
+            break
+        fi
+    done
+fi
+
 "$SCRIPT_DIR/build-libghostty.sh"
 
 (
