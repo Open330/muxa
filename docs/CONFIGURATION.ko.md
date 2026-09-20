@@ -195,7 +195,18 @@ muxad는 헬퍼를 자기 실행 파일 옆, `/Applications/Muxa.app`, `PATH` �
 `executable`로 다른 사본을 지정할 수 있습니다. API처럼 세션이 없으므로 대화를
 다시 넣어 보내는데, on-device 컨텍스트에 맞게 6k자로 자르고, 그래도 모델이
 초과를 보고하면 헬퍼가 더 줄입니다. 이 모델들은 질문에 답할 뿐 파일을 건드리지
-않으므로 `cwd`·`additional_dirs`·`permission_mode`는 적용되지 않습니다. 내장
+않으므로 `cwd`·`additional_dirs`·`permission_mode`는 적용되지 않습니다.
+
+agent CLI는 shell이 있어서 workspace를 직접 볼 수 있지만, 모델만으로는 볼 수
+없어서 "다른 애플리케이션에 접근할 수 없다"고 답하게 됩니다. 그래서 Global Ask
+턴에서는 헬퍼가 모델에 읽기 전용 도구 두 개를 줍니다. 질문이 온 바로 그 daemon에
+`muxa status --json`과 `muxa recap`을 실행해 답하는 `list_agent_sessions`(추적
+중인 모든 agent의 pane, 상태, 제목, 디렉터리, 최근 prompt와 응답)와
+`read_agent_session`(pane 하나의 상세)입니다. 읽기만 가능하며 agent에 입력을
+보내거나 무엇을 바꿀 수는 없습니다. 도구를 부를지는 모델이 정하므로 agent와
+무관한 질문에는 아무것도 읽지 않습니다. `on-device`에서는 읽은 내용이 Mac 밖으로
+나가지 않고, `private-cloud`에서는 질문과 함께 Apple의 Private Cloud Compute로
+전송됩니다. `muxa work init` 같은 one-shot 턴에는 도구를 주지 않습니다. 내장
 `apple` provider는 macOS에서만 목록에 나오지만 engine 자체는 어디서나
 파싱되므로, config.toml 하나를 Mac과 Linux host가 함께 쓸 수 있습니다.
 

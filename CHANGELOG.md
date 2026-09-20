@@ -41,6 +41,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when the model still reports an overflow the helper drops the older half
   of the replay and tries again, down to the bare prompt, before giving up.
 
+  The agent CLIs can look at the workspace because they have a shell; a bare
+  model cannot, and asked "can you read my muxa agent sessions?" it answered,
+  truthfully, that it has no access to other applications. So on a Global Ask
+  turn muxad hands the helper its own socket, and the helper gives the model
+  two read-only tools backed by `muxa status --json` and `muxa recap`:
+  `list_agent_sessions` and `read_agent_session`. The model decides when to
+  call them, the lists are cut to fit the on-device window, and it can only
+  read — never send input to an agent. `on-device` keeps what it reads on the
+  Mac; `private-cloud` sends it to Apple's Private Cloud Compute with the
+  question. One-shot turns (`muxa work init`) get no tools.
+
   Being installed is never the interesting question for this provider, so
   Settings › Providers asks the helper (`muxa-afm --probe`) instead and shows
   the system's own answer — Apple Intelligence turned off, the model still

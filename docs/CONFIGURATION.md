@@ -263,7 +263,19 @@ its own executable, then in `/Applications/Muxa.app`, then on `PATH`;
 conversation is replayed — cut to 6k characters to fit the on-device
 window, and cut further by the helper if the model still reports an
 overflow. `cwd`, `additional_dirs`, and `permission_mode` do not apply:
-these models answer questions and touch no files. The built-in `apple`
+these models answer questions and touch no files.
+
+The agent CLIs can look at your workspace because they have a shell; a bare
+model cannot, and would answer that it has no access to other applications.
+So on a Global Ask turn the helper gives the model two read-only tools,
+answered by `muxa status --json` and `muxa recap` against the daemon the
+question came from: `list_agent_sessions` (every tracked agent — pane, state,
+title, directory, latest prompt and reply) and `read_agent_session` (one pane
+in detail). It can read; it cannot send input to an agent or change anything.
+The model decides when to call them, so nothing is read for a question that
+is not about your agents. With `on-device` what it reads never leaves the
+Mac; with `private-cloud` it is sent to Apple's Private Cloud Compute along
+with the question. One-shot turns such as `muxa work init` get no tools. The built-in `apple`
 provider is listed only on macOS; elsewhere the engine still parses, so one
 config.toml can serve a Mac and a Linux host.
 

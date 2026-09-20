@@ -130,6 +130,11 @@ pub struct AskOptions {
     /// The `config.toml` the daemon read `[ask]` from, so provider settings
     /// can be written back where they came from.
     pub config_path: Option<PathBuf>,
+    /// The daemon's own IPC socket. An engine with no shell of its own —
+    /// `apple` — is handed it so its helper can read the workspace back
+    /// (which agents are running, what they were last asked) the way the
+    /// agent CLIs can by running `muxa status` themselves.
+    pub socket: Option<PathBuf>,
 }
 
 /// One-turn provider credential. It is accepted only over the owner-only IPC
@@ -165,6 +170,7 @@ impl Default for AskOptions {
             keep: DEFAULT_KEEP,
             providers: BTreeMap::new(),
             config_path: None,
+            socket: None,
         }
     }
 }
@@ -843,6 +849,10 @@ impl AskStore {
                     model: provider.model(),
                     executable: provider.executable(),
                     api_key: api_key.as_deref(),
+                    workspace: store.opts.socket.as_deref().map(|socket| Workspace {
+                        socket,
+                        config: store.opts.config_path.as_deref(),
+                    }),
                 })
                 .await;
             store.finish(&id, outcome).await;
@@ -891,6 +901,7 @@ impl AskStore {
                 model: provider.model(),
                 executable: provider.executable(),
                 api_key: api_key.as_deref(),
+                workspace: None,
             })
             .await
             .map_err(AskError::Io)
@@ -934,6 +945,7 @@ impl AskStore {
                     model: instance.model(),
                     executable: None,
                     api_key: api_key.as_deref(),
+                    workspace: None,
                 },
                 Some(instruction),
             )
@@ -1499,6 +1511,7 @@ pub async fn one_shot_configured(
             model: instance.model(),
             executable: instance.executable(),
             api_key: api_key.as_deref(),
+            workspace: None,
         })
         .await
         .map_err(AskError::Io)
@@ -2023,11 +2036,21 @@ fn apple_request(turn: &Turn<'_>) -> serde_json::Value {
         .into_iter()
         .map(|exchange| serde_json::json!({"prompt": exchange.prompt, "answer": exchange.answer}))
         .collect();
-    serde_json::json!({
+    let mut request = serde_json::json!({
         "prompt": turn.prompt,
         "history": history,
         "model": turn.model,
-    })
+    });
+    // With this the helper offers the model read-only tools over the
+    // operator's agent sessions. Without it the model can only say, rightly,
+    // that it cannot see any other application.
+    if let Some(workspace) = turn.workspace {
+        request["muxa"] = serde_json::json!({
+            "socket": workspace.socket,
+            "config": workspace.config,
+        });
+    }
+    request
 }
 
 /// One turn through `muxa-afm`: the request on stdin, one JSON object on
@@ -2100,6 +2123,17 @@ struct Turn<'a> {
     /// Binary a CLI engine spawns, when the instance overrides it.
     executable: Option<&'a str>,
     api_key: Option<&'a str>,
+    /// Read access to the workspace for an engine that cannot get it on its
+    /// own. Only a Global Ask turn carries it: a one-shot drafting turn is
+    /// about the text it was given, not about the operator's agents.
+    workspace: Option<Workspace<'a>>,
+}
+
+/// Where the daemon answering this turn listens, and the config it loaded.
+#[derive(Debug, Clone, Copy)]
+struct Workspace<'a> {
+    socket: &'a Path,
+    config: Option<&'a Path>,
 }
 
 fn timeout_message(what: &str, timeout: Duration) -> String {
@@ -3185,6 +3219,7 @@ mod tests {
             model,
             executable: None,
             api_key: Some(api_key),
+            workspace: None,
         };
         let answer = AskEngine::Anthropic
             .call_api(
@@ -3252,6 +3287,7 @@ mod tests {
                         model: Some("test-model"),
                         executable: None,
                         api_key: Some("test-key"),
+                        workspace: None,
                     },
                     Some("trusted policy"),
                 )
@@ -4213,6 +4249,7 @@ mod tests {
             model: Some("private-cloud"),
             executable: None,
             api_key: None,
+            workspace: None,
         });
         assert_eq!(request["prompt"], "now");
         assert_eq!(request["model"], "private-cloud");
@@ -4224,6 +4261,35 @@ mod tests {
             .collect();
         assert_eq!(replayed, ["middle", "newest"], "oldest first, whole turns");
         assert_eq!(request["history"][1]["answer"], filler.as_str());
+        // A one-shot turn is about its own text: no way back into muxa.
+        assert!(request.get("muxa").is_none());
+    }
+
+    #[test]
+    fn a_global_ask_turn_hands_the_apple_helper_the_way_back_to_muxad() {
+        let request = apple_request(&Turn {
+            prompt: "which of my agents is waiting on me?",
+            resume: None,
+            history: &[],
+            cwd: Path::new("."),
+            permission_mode: AskPermissionMode::Default,
+            additional_dirs: &[],
+            timeout: Duration::from_secs(5),
+            model: None,
+            executable: None,
+            api_key: None,
+            workspace: Some(Workspace {
+                socket: Path::new("/tmp/muxa-501.sock"),
+                config: Some(Path::new("/etc/muxa/config.toml")),
+            }),
+        });
+        assert_eq!(
+            request["muxa"],
+            serde_json::json!({
+                "socket": "/tmp/muxa-501.sock",
+                "config": "/etc/muxa/config.toml",
+            })
+        );
     }
 
     #[test]
@@ -4267,6 +4333,7 @@ mod tests {
             enabled: true,
             agent: "apple".into(),
             cwd: directory.path().to_path_buf(),
+            socket: Some(PathBuf::from("/tmp/muxa-test.sock")),
             providers: BTreeMap::from([(
                 "apple".to_string(),
                 AskProviderConfig {
@@ -4306,6 +4373,8 @@ mod tests {
         assert_eq!(request(0)["prompt"], "first question");
         assert_eq!(request(0)["history"], serde_json::json!([]));
         assert_eq!(request(0)["model"], "on-device");
+        // A conversation turn can read the workspace back through muxad.
+        assert_eq!(request(0)["muxa"]["socket"], "/tmp/muxa-test.sock");
         // The store is the thread: the first exchange rides along.
         assert_eq!(request(1)["prompt"], "second question");
         assert_eq!(
