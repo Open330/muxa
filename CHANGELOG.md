@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.49] - 2026-09-20
+
 ### Changed
 
 - **Global Ask has its own place in the sidebar.** It used to be a row inside
@@ -3665,7 +3667,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.48...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.49...HEAD
+[0.8.49]: https://github.com/Open330/muxa/compare/v0.8.48...v0.8.49
 [0.8.48]: https://github.com/Open330/muxa/compare/v0.8.47...v0.8.48
 [0.8.47]: https://github.com/Open330/muxa/compare/v0.8.46...v0.8.47
 [0.8.46]: https://github.com/Open330/muxa/compare/v0.8.45...v0.8.46
