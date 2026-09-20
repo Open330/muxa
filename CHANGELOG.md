@@ -28,7 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on `PATH`; `[ask.providers.<id>] executable` names another copy. The
   helper keeps the app's macOS 13 floor — the framework is weak-linked and
   every use sits behind `#available` — so on an older Mac it runs and says
-  what is missing rather than failing to launch.
+  what is missing rather than failing to launch. The helper also compiles
+  without the macOS 26 SDK, which is a trap for whoever builds the app: it
+  would ship a provider that can never answer. So its build step looks for
+  an installed Xcode whose SDK has Foundation Models and compiles the helper
+  with that one, whichever Xcode builds the app, and a Release build that
+  finds none fails instead of shipping it.
 
   Like the API engines it has no session to resume, so the store is its
   thread: muxad replays the conversation on every turn, cut to 6,000
