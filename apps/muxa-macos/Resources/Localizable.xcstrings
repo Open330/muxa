@@ -3498,6 +3498,16 @@
         }
       }
     },
+    "Ask any configured provider from the Ask tab without starting a pipeline." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파이프라인을 시작하지 않고 Ask 탭에서 설정된 프로바이더에게 바로 물어볼 수 있습니다."
+          }
+        }
+      }
+    },
     "Ask any configured provider from the Inbox without starting a pipeline." : {
       "localizations" : {
         "ko" : {
@@ -5411,6 +5421,16 @@
         }
       }
     },
+    "Filter conversations" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "대화 필터"
+          }
+        }
+      }
+    },
     "Filter inbox" : {
       "localizations" : {
         "ko" : {
@@ -7187,6 +7207,16 @@
         }
       }
     },
+    "No conversations yet" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 대화가 없습니다"
+          }
+        }
+      }
+    },
     "No execution binding" : {
       "localizations" : {
         "ko" : {
@@ -7273,6 +7303,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "일치하는 명령 없음"
+          }
+        }
+      }
+    },
+    "No matching conversations" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "일치하는 대화 없음"
           }
         }
       }
