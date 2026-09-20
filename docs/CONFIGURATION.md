@@ -255,7 +255,13 @@ characters — ahead of each question; `cwd`, `additional_dirs`, and
 and sends nothing to a vendor account. `model` picks between the two system
 models: `on-device`, the default, which never leaves the Mac and has an
 8,192-token context; and `private-cloud`, Apple's Private Cloud Compute
-(macOS 27 or later, 32,768 tokens, subject to Apple's usage quota). The
+(macOS 27 or later, 32,768 tokens, subject to Apple's usage quota). As of
+this writing `private-cloud` does not work: it needs a helper built with the
+macOS 27 SDK, which no GitHub runner image offers yet, and even such a build,
+signed with a Developer ID, was refused by the system with
+`ModelManagerError 1046` — whatever Private Cloud Compute requires of a
+process, a command-line helper does not have it. The option stays so a
+future build can pick it up; a turn on it says why it cannot answer. The
 framework is Swift-only, so muxad reaches it through `muxa-afm`, a small
 helper that ships in `Muxa.app/Contents/Helpers`. muxad looks for it beside
 its own executable, then in `/Applications/Muxa.app`, then on `PATH`;
