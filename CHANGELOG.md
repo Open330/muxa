@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **"Reload muxad" no longer fails with "the existing muxad did not stop within
+  five seconds" when the daemon is a Homebrew binary that was started by
+  hand.** The app stopped a `/opt/homebrew` muxad only through
+  `brew services stop`, which exits 0 with a "not started" warning when the
+  process was launched from a shell rather than as the service — so nothing
+  ever signalled it and the wait always timed out. The app now sends SIGTERM
+  to the socket owner after the service stop as well.
+- **The Welcome guide's "Open Settings…" buttons open the tab that fixes the
+  row.** The Global Ask row lands on Providers, the muxad connection row on
+  Runtime and the work folder row on General, instead of whichever tab
+  Settings showed last.
 - **Muxa.app builds on a Mac that has only Xcode 26.4-or-later SDKs.**
   `Scripts/build-app.sh` failed in the libghostty step with every libc symbol
   undefined: those SDKs' `libSystem.tbd` offers arm64e but no longer plain
