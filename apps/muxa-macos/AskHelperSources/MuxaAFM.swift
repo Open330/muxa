@@ -183,6 +183,36 @@ let workspaceInstructions = """
     change anything. Answer in the language the user writes in.
     """
 
+/// Whether an earlier answer is the model's own boilerplate for "I cannot
+/// see other applications" — true when it was given, before the workspace
+/// tools existed, and poison once replayed: a small model keeps the story it
+/// told three turns ago sooner than reach for a tool it has since been
+/// handed, and no wording of the instructions overrides three of them in a
+/// row. Such a turn is dropped from the replay. Only a short answer that is
+/// nothing but the refusal qualifies; a long answer that mentions the phrase
+/// is an answer, and stays.
+func isStaleRefusal(_ answer: String) -> Bool {
+    let text = answer.lowercased()
+    guard text.count <= 400 else { return false }
+    let refusals = [
+        "cannot access external applications",
+        "cannot directly access external applications",
+        "cannot access other applications",
+        "can only work with the information provided in this conversation",
+        "unable to access external applications",
+        "do not have access to external applications",
+    ]
+    return refusals.contains { text.contains($0) }
+}
+
+/// The history a turn replays when the workspace can be read: the same
+/// exchanges, minus the stale refusals. Without tools every turn stays —
+/// the model's earlier answer was as true as it will be now.
+func replayableHistory(_ history: [TurnRequest.Exchange], hasTools: Bool) -> [TurnRequest.Exchange] {
+    guard hasTools else { return history }
+    return history.filter { !isStaleRefusal($0.answer) }
+}
+
 /// One tracked agent, flattened out of `muxa status --json`.
 struct AgentSession {
     let pane: String
@@ -518,8 +548,8 @@ func isContextOverflow(_ error: any Error) -> Bool {
 /// bare prompt, before giving up.
 @available(macOS 26.0, *)
 func respond(to request: TurnRequest, choice: ModelChoice, log: ToolLog) async throws -> String {
-    var history = ArraySlice(request.history ?? [])
     let tools = request.muxa.map { workspaceTools(for: $0, log: log) } ?? []
+    var history = ArraySlice(replayableHistory(request.history ?? [], hasTools: !tools.isEmpty))
     // The caller's instructions win; the workspace ones are only a default
     // for a turn that can actually use the tools they describe.
     let instructions = request.instructions ?? (tools.isEmpty ? nil : workspaceInstructions)
