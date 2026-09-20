@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Apple Intelligence provider reads your agent sessions even in a
+  conversation where it once said it could not.** The workspace tools arrived
+  after 0.8.47, so a conversation started before them holds an earlier turn
+  in which the model said, truthfully then, that it cannot access other
+  applications — and the on-device model repeated that answer rather than
+  reach for the tools it now has. The helper's instructions now say outright
+  that such an earlier answer is out of date and that a question about the
+  user's agents means calling `list_agent_sessions`, not answering from
+  memory. Checked against the real conversation that showed the problem:
+  the model called the tool on every run instead of never.
 - **A session's exit is no longer reported before its last output can be
   read.** The PTY reader and the process watcher are separate threads, so a
   child that printed and exited could be reaped, and `exited` published,
