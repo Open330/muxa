@@ -791,6 +791,17 @@ private struct MuxaSidebar: View {
                             .buttonStyle(.borderless)
                             .help("Register SSH Host")
                         }
+                        if model.sidebarMode == .ask {
+                            Button {
+                                Task { await model.resetAskConversation() }
+                                model.select(.ask)
+                            } label: {
+                                Image(systemName: "plus.bubble")
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(!model.isConnected)
+                            .help("New Conversation")
+                        }
                         if model.sidebarMode == .shells {
                             Button {
                                 model.createShell()
@@ -948,6 +959,7 @@ private struct MuxaSidebar: View {
         case .work: model.workGroups.count
         case .watch: model.executionSnapshot.watchHosts.reduce(0) { $0 + $1.paneCount }
         case .inbox: inboxBadgeCount
+        case .ask: askConversations.count
         case .shells: model.sessions.lazy.filter { !$0.exited }.count
         }
     }
@@ -957,8 +969,21 @@ private struct MuxaSidebar: View {
         case .work: filteredWorkGroups.count
         case .watch: filteredWatchHosts.reduce(0) { $0 + $1.paneCount }
         case .inbox: inboxBadgeCount
+        case .ask: filteredAskConversations.count
         case .shells: filteredSessions.count
         }
+    }
+
+    /// The selected provider's conversations, newest activity first — the
+    /// same list the Ask editor's menu offers, as sidebar rows.
+    private var askConversations: [MuxaAskConversation] {
+        model.askConversations
+            .filter { $0.agent == model.askAgent }
+            .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private var filteredAskConversations: [MuxaAskConversation] {
+        askConversations.filter { matchesFilter([$0.title]) }
     }
 
     private var sidebarCountLabel: String {
@@ -1023,8 +1048,7 @@ private struct MuxaSidebar: View {
         let commandAttention = model.operatorMessages.lazy.filter {
             $0.needsReply || $0.hasUnreadReply
         }.count
-        let runningAsk = model.askEntries.lazy.filter { $0.status == "running" }.count
-        return commandAttention + runningAsk + attentionAgents.count
+        return commandAttention + attentionAgents.count
     }
 
     private var filteredWatchHosts: [MuxaWatchHost] {
@@ -1266,17 +1290,6 @@ private struct MuxaSidebar: View {
                     )
                 }
                 .buttonStyle(.plain)
-                Button {
-                    model.select(.ask)
-                } label: {
-                    GlobalAskRow(
-                        conversationCount: model.askConversations.lazy.filter {
-                            $0.agent == model.askAgent
-                        }.count,
-                        agent: model.askAgent
-                    )
-                }
-                .buttonStyle(.plain)
             }
             Section("Needs attention") {
                 if attentionAgents.isEmpty {
@@ -1318,6 +1331,39 @@ private struct MuxaSidebar: View {
                             }
                             .disabled(participant.pane == nil)
                         }
+                    }
+                }
+            }
+        case .ask:
+            Section("Global Ask") {
+                Button {
+                    model.select(.ask)
+                } label: {
+                    GlobalAskRow(conversationCount: askConversations.count, agent: model.askAgent)
+                }
+                .buttonStyle(.plain)
+                .listRowBackground(
+                    model.sidebarSelection == .ask
+                        ? Color.accentColor.opacity(0.14) : Color.clear
+                )
+            }
+            Section("Conversations") {
+                if askConversations.isEmpty {
+                    SidebarEmptyRow(title: "No conversations yet", systemImage: "bubble.left.and.bubble.right")
+                } else if filteredAskConversations.isEmpty {
+                    SidebarEmptyRow(title: "No matching conversations", systemImage: "line.3.horizontal.decrease.circle")
+                } else {
+                    ForEach(filteredAskConversations) { conversation in
+                        Button {
+                            Task { await model.selectAskConversation(conversation.id) }
+                            model.select(.ask)
+                        } label: {
+                            AskConversationRow(
+                                conversation: conversation,
+                                isActive: conversation.id == model.activeAskConversationID
+                            )
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
             }
@@ -1529,8 +1575,10 @@ private struct SidebarActivityRail: View {
             let commandAttention = model.operatorMessages.lazy.filter {
                 $0.needsReply || $0.hasUnreadReply
             }.count
-            let askAttention = model.askEntries.lazy.filter { $0.status == "running" }.count
-            return agentAttention + commandAttention + askAttention
+            return agentAttention + commandAttention
+        case .ask:
+            // A question still being answered is the one thing worth a dot.
+            return model.askEntries.lazy.filter { $0.status == "running" }.count
         case .shells:
             return 0
         }
@@ -1597,6 +1645,39 @@ private struct GlobalAskRow: View {
         }
         .padding(.horizontal, 4)
         .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+}
+
+/// One Global Ask conversation in the Ask container's sidebar.
+private struct AskConversationRow: View {
+    let conversation: MuxaAskConversation
+    let isActive: Bool
+
+    private var updated: Date? {
+        (try? Date(conversation.updatedAt, strategy: .iso8601))
+            ?? ISO8601DateFormatter().date(from: conversation.updatedAt)
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: isActive ? "bubble.left.and.bubble.right.fill" : "bubble.left.and.bubble.right")
+                .foregroundStyle(isActive ? Color.accentColor : Color.secondary)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(conversation.title)
+                    .fontWeight(isActive ? .semibold : .regular)
+                    .lineLimit(1)
+                if let updated {
+                    Text(updated, style: .relative)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 4)
+        }
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
         .contentShape(Rectangle())
     }
 }

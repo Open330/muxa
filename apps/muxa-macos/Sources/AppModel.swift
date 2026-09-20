@@ -18,6 +18,9 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
     case work
     case watch
     case inbox
+    /// Global Ask and its conversations. Its own container: a question to a
+    /// provider is not a request from an agent, which is what Inbox holds.
+    case ask
     case shells
 
     var id: Self { self }
@@ -27,6 +30,7 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
         case .work: String(localized: "Work")
         case .watch: String(localized: "Explore")
         case .inbox: String(localized: "Inbox")
+        case .ask: String(localized: "Ask")
         case .shells: String(localized: "Shells")
         }
     }
@@ -37,6 +41,7 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
         case .work: String(localized: "Filter work")
         case .watch: String(localized: "Filter Explore")
         case .inbox: String(localized: "Filter inbox")
+        case .ask: String(localized: "Filter conversations")
         case .shells: String(localized: "Filter shells")
         }
     }
@@ -46,6 +51,7 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
         case .work: "square.stack.3d.up"
         case .watch: "sidebar.left"
         case .inbox: "tray.full"
+        case .ask: "sparkles"
         case .shells: "terminal"
         }
     }
@@ -1703,7 +1709,7 @@ final class AppModel: ObservableObject {
         case .workBoard: sidebarMode = .work
         case .watch: sidebarMode = .watch
         case .inbox: sidebarMode = .inbox
-        case .ask: sidebarMode = .inbox
+        case .ask: sidebarMode = .ask
         case .work: sidebarMode = .work
         case .agent: sidebarMode = .inbox
         case .host: sidebarMode = .watch
@@ -1728,8 +1734,10 @@ final class AppModel: ObservableObject {
             sidebarMode = .watch
         case .watch, .fleetSession, .fleetWindow:
             sidebarMode = .watch
-        case .inbox, .ask, .agent:
+        case .inbox, .agent:
             sidebarMode = .inbox
+        case .ask:
+            sidebarMode = .ask
         default:
             break
         }

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Global Ask has its own place in the sidebar.** It used to be a row inside
+  the Inbox container, next to the Operator Inbox, with its history as an
+  "Ask" scope of the Inbox view — but a question to a provider is not a
+  request from an agent. The activity bar now reads Work · Explore · Inbox ·
+  Ask · Shells. The Ask container lists the selected provider's
+  conversations, newest activity first, with a filter and a New Conversation
+  button; picking one opens it in the editor. The Inbox keeps to agent mail
+  and loses its Ask scope, and its badge no longer counts a question still
+  being answered — the Ask container's does.
+
 ### Fixed
 
 - **A session's exit is no longer reported before its last output can be

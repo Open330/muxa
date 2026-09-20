@@ -1682,125 +1682,6 @@ private struct AskTurnExportMenu: View {
     }
 }
 
-private struct AskHistoryCard: View {
-    let entry: MuxaAskEntry
-
-    private var providerTitle: String {
-        AskProviderStore.shared.title(for: entry.agent)
-    }
-
-    private var providerIcon: String {
-        AskProviderStore.shared.symbolName(for: entry.agent)
-    }
-
-    private var statusColor: Color {
-        switch entry.status {
-        case "failed": .red
-        case "running": .blue
-        default: .green
-        }
-    }
-
-    private var statusLabel: String {
-        askStatusLabel(entry.status)
-    }
-
-    private var askedDate: Date? {
-        (try? Date(entry.askedAt, strategy: .iso8601))
-            ?? ISO8601DateFormatter().date(from: entry.askedAt)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: providerIcon)
-                    .foregroundStyle(.tint)
-                Text(providerTitle)
-                    .font(.subheadline.weight(.semibold))
-                Label(statusLabel, systemImage: entry.status == "failed" ? "exclamationmark.circle.fill" : "circle.fill")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(statusColor)
-                    .labelStyle(.titleAndIcon)
-                if entry.status == "running" {
-                    ProgressView()
-                        .controlSize(.mini)
-                }
-                Spacer()
-                if let cost = entry.costUSD, cost > 0 {
-                    Text(cost, format: .currency(code: "USD"))
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-                if let askedDate {
-                    Text(askedDate, style: .relative)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .help(askedDate.formatted(date: .abbreviated, time: .standard))
-                }
-                AskTurnExportMenu(entry: entry)
-            }
-            .padding(.horizontal, 14)
-            .frame(height: 38)
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 12) {
-                AskMessageBlock(
-                    role: String(localized: "You"),
-                    icon: "person.fill",
-                    source: entry.prompt,
-                    tint: .accentColor,
-                    compact: true
-                )
-
-                if entry.status == "running", entry.answer.isEmpty {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Waiting for \(providerTitle)…")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.horizontal, 4)
-                }
-
-            if !entry.answer.isEmpty {
-                    AskMessageBlock(
-                        role: providerTitle,
-                        icon: providerIcon,
-                        source: entry.answer,
-                        tint: .primary,
-                        compact: false
-                    )
-            }
-
-            if let error = entry.error, !error.isEmpty {
-                    Label {
-                        Text(error)
-                            .textSelection(.enabled)
-                    } icon: {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
-                }
-            }
-            .padding(12)
-        }
-        .frame(maxWidth: 980, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.76), in: RoundedRectangle(cornerRadius: 10))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.primary.opacity(0.09), lineWidth: 1)
-        }
-        .frame(maxWidth: .infinity, alignment: .center)
-        .contextMenu { AskTurnExportItems(entry: entry) }
-    }
-}
-
 /// Display wording for a Global Ask entry `status` as muxad reports it.
 private func askStatusLabel(_ status: String) -> String {
     switch status {
@@ -1844,7 +1725,6 @@ struct MuxaOperatorInboxView: View {
         case replies
         case waiting
         case action
-        case ask
         var id: Self { self }
 
         var title: LocalizedStringKey {
@@ -1853,7 +1733,6 @@ struct MuxaOperatorInboxView: View {
             case .replies: "Replies"
             case .waiting: "Waiting"
             case .action: "Needs Action"
-            case .ask: "Ask"
             }
         }
     }
@@ -1875,7 +1754,6 @@ struct MuxaOperatorInboxView: View {
             case .replies: message.request.reply != nil
             case .waiting: message.isAwaitingAgentReply
             case .action: message.needsHumanDecision
-            case .ask: false
             }
             guard scopeMatches else { return false }
             guard !search.isEmpty else { return true }
@@ -1900,16 +1778,6 @@ struct MuxaOperatorInboxView: View {
         return filtered.sorted(by: MuxaOperatorMessage.needsActionOrder)
     }
 
-    private var visibleAsk: [MuxaAskEntry] {
-        guard scope == .ask else { return [] }
-        return model.askEntries
-            .filter { entry in
-                search.isEmpty
-                    || entry.prompt.localizedCaseInsensitiveContains(search)
-                    || entry.answer.localizedCaseInsensitiveContains(search)
-            }
-            .sorted { $0.askedAt > $1.askedAt }
-    }
 
     private var unreadReplies: Int {
         model.operatorMessages.lazy.filter(\.hasUnreadReply).count
@@ -1973,11 +1841,7 @@ struct MuxaOperatorInboxView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if scope == .ask {
-                askHistory
-            } else {
-                operatorMasterDetail
-            }
+            operatorMasterDetail
         }
         .task {
             await model.refreshOperatorInbox(force: true)
@@ -2043,30 +1907,6 @@ struct MuxaOperatorInboxView: View {
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background((value > 0 ? color : Color.secondary).opacity(0.1), in: Capsule())
-    }
-
-    private var askHistory: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Global Ask").font(.title3.weight(.semibold))
-                    Text("Headless Claude Code and Codex questions owned by muxad")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                if visibleAsk.isEmpty {
-                    Text("No matching Ask history")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .padding(.vertical, 18)
-                } else {
-                    ForEach(visibleAsk) { entry in AskHistoryCard(entry: entry) }
-                }
-            }
-            .padding(14)
-            .frame(maxWidth: 1000, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-        }
     }
 
     private var operatorMasterDetail: some View {

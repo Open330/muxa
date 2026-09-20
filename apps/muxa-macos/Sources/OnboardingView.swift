@@ -569,7 +569,7 @@ private struct OnboardingChecklistPage: View {
         } detail: {
             switch model.askEnabled {
             case .some(true):
-                Text("Ask any configured provider from the Inbox without starting a pipeline.")
+                Text("Ask any configured provider from the Ask tab without starting a pipeline.")
             case .some(false):
                 Text("Global Ask is disabled in the muxa configuration. Enable it under Settings › Providers.")
             case .none:

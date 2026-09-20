@@ -1649,7 +1649,7 @@ struct MuxaIPCTests {
     @Test @MainActor
     func activityBarSeparatesOutcomesTopologyInboxAndShells() {
         let model = AppModel()
-        #expect(MuxaSidebarMode.allCases == [.work, .watch, .inbox, .shells])
+        #expect(MuxaSidebarMode.allCases == [.work, .watch, .inbox, .ask, .shells])
 
         model.select(.host("rtzr"))
 
@@ -1679,8 +1679,9 @@ struct MuxaIPCTests {
 
         model.select(.ask)
 
+        // Its own container: a question to a provider is not agent mail.
         #expect(model.sidebarSelection == .ask)
-        #expect(model.sidebarMode == .inbox)
+        #expect(model.sidebarMode == .ask)
     }
 
     @Test @MainActor
