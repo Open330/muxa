@@ -275,9 +275,10 @@ in detail). It can read; it cannot send input to an agent or change anything.
 The model decides when to call them, so nothing is read for a question that
 is not about your agents. With `on-device` what it reads never leaves the
 Mac; with `private-cloud` it is sent to Apple's Private Cloud Compute along
-with the question. One-shot turns such as `muxa work init` get no tools. The built-in `apple`
-provider is listed only on macOS; elsewhere the engine still parses, so one
-config.toml can serve a Mac and a Linux host.
+with the question. One-shot turns such as `muxa work init` get no tools. The
+built-in `apple` provider is listed on every host, so one config.toml can
+serve a Mac and a Linux box; a turn on a host that cannot run it fails with a
+plain "runs only on macOS".
 
 A **provider** is an `[ask.providers.<id>]` table you compose. The id is
 yours to pick (a TOML bare key: letters, digits, `-`, `_`), and `engine`

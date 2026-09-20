@@ -207,8 +207,9 @@ agent CLI는 shell이 있어서 workspace를 직접 볼 수 있지만, 모델만
 무관한 질문에는 아무것도 읽지 않습니다. `on-device`에서는 읽은 내용이 Mac 밖으로
 나가지 않고, `private-cloud`에서는 질문과 함께 Apple의 Private Cloud Compute로
 전송됩니다. `muxa work init` 같은 one-shot 턴에는 도구를 주지 않습니다. 내장
-`apple` provider는 macOS에서만 목록에 나오지만 engine 자체는 어디서나
-파싱되므로, config.toml 하나를 Mac과 Linux host가 함께 쓸 수 있습니다.
+`apple` provider는 모든 host에서 목록에 나오므로 config.toml 하나를 Mac과 Linux
+host가 함께 쓸 수 있고, 실행할 수 없는 host에서 턴을 보내면 "macOS에서만
+실행됩니다"라는 명확한 오류로 실패합니다.
 
 **provider**는 직접 구성하는 `[ask.providers.<id>]` 테이블입니다. id는 원하는
 대로 정하고(TOML bare key: 영숫자, `-`, `_`), `engine`이 여섯 중 무엇으로

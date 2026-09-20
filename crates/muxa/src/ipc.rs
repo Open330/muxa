@@ -8617,10 +8617,7 @@ mod tests {
             "anthropic",
             "openai",
         ];
-        // The apple built-in is only listed where it could answer.
-        if crate::ask::AskEngine::Apple.runs_on_this_host() {
-            expected.push("apple");
-        }
+        expected.push("apple");
         assert_eq!(
             ids, expected,
             "composed instances lead, then the built-ins they do not cover"

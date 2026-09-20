@@ -425,13 +425,9 @@ program = 'claude'
     fn only_providers_that_could_actually_run_are_offered() {
         let none = BTreeMap::new();
         // Every CLI installed, no key anywhere: the three agent CLIs, in
-        // order — and on a Mac the keyless apple helper after them.
+        // order, then the keyless apple helper.
         let all = available_agents(&none, &|_| true, &|_| None);
-        let mut clis = vec!["claude", "codex", "gemini"];
-        if muxa::ask::AskEngine::Apple.runs_on_this_host() {
-            clis.push("apple");
-        }
-        assert_eq!(all, clis);
+        assert_eq!(all, ["claude", "codex", "gemini", "apple"]);
         // The launcher knows agy/opencode; the headless bridge does not, so
         // they must never appear here however installed.
         assert!(!all.iter().any(|name| name == "agy"), "{all:?}");

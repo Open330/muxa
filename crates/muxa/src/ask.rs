@@ -1413,11 +1413,6 @@ pub fn provider_instances(
         if instances.iter().any(|instance| instance.id == engine.id()) {
             continue;
         }
-        // A configured `apple` was listed above wherever it was written;
-        // the built-in row is only offered where it could answer.
-        if !engine.runs_on_this_host() {
-            continue;
-        }
         instances.push(AskProviderInstance {
             id: engine.id().to_string(),
             title: engine.title().to_string(),
@@ -1690,9 +1685,11 @@ impl AskEngine {
         }
     }
 
-    /// Whether this host can ever run the engine. `apple` stays parseable
-    /// everywhere — one `config.toml` may serve a Mac and a Linux box — but
-    /// it is only listed as a built-in where it could work.
+    /// Whether this host can run the engine. The built-in list is the same
+    /// everywhere — one `config.toml` may serve a Mac and a Linux box, and
+    /// clients rely on every id in [`supported_agents`] being listed — so
+    /// `apple` is offered on Linux too, and a turn there fails with a plain
+    /// "runs only on macOS" rather than the row quietly missing.
     #[must_use]
     pub fn runs_on_this_host(self) -> bool {
         match self {
@@ -2702,14 +2699,10 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// `ids`, then the `apple` built-in where this host lists one. The row
-    /// only exists on a Mac, so an expected list has to ask the same
-    /// question `provider_instances` does.
+    /// `ids`, then the `apple` built-in, which closes every built-in list.
     fn with_host_builtins(ids: &[&'static str]) -> Vec<&'static str> {
         let mut ids = ids.to_vec();
-        if AskEngine::Apple.runs_on_this_host() {
-            ids.push("apple");
-        }
+        ids.push("apple");
         ids
     }
 
@@ -4178,8 +4171,7 @@ mod tests {
         assert_eq!(cloud.engine, apple);
         assert_eq!(cloud.model(), Some("private-cloud"));
         assert_eq!(cloud.title, "Apple Cloud");
-        // A configured instance is listed wherever it was written, even on
-        // a host that does not offer the built-in row.
+        // A configured instance leads the list, as any configured one does.
         let providers = BTreeMap::from([(
             "apple-cloud".to_string(),
             AskProviderConfig {

@@ -62,8 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the system's own answer — Apple Intelligence turned off, the model still
   downloading, a Mac that is not eligible — and offers neither an API key
   field nor a sign-in, because there is no key. The built-in row is listed
-  only on macOS; the engine still parses everywhere, so one `config.toml`
-  can serve a Mac and a Linux host.
+  on every host, so one `config.toml` can serve a Mac and a Linux box; a
+  turn on a host that cannot run it fails with a plain "runs only on macOS".
 - **Global Ask answers can leave the app.** Until now the only way to take an
   answer anywhere was to select text by hand (or the Copy button on a code
   block). Every exchange — in the Ask tab and in the Inbox's Ask scope — now
