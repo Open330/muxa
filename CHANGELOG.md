@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Muxa.app builds on a Mac that has only Xcode 26.4-or-later SDKs.**
+  `Scripts/build-app.sh` failed in the libghostty step with every libc symbol
+  undefined: those SDKs' `libSystem.tbd` offers arm64e but no longer plain
+  arm64, which is what Zig 0.15.2 links its build runner as. The script's
+  compatibility check searched the whole file for `arm64-macos`, and the
+  macOS 27 SDK names it in a few re-exported sub-libraries while libSystem
+  itself does not — so the SDK read as compatible and then failed to link.
+  The check now reads libSystem's own target list, installed SDKs are tried
+  oldest first (Zig's libc++ does not compile against the macOS 27 headers
+  either), and when none qualifies the oldest is wrapped in a generated
+  `.build/zig-macos-sdk`: symlinks into the real SDK, plus a copy of
+  `libSystem.tbd` with arm64 listed beside arm64e. Only Zig's host link reads
+  it; Xcode still links the app against the real SDK. A macos-15 release
+  runner has an SDK that qualifies as it is, so nothing changes there.
+- **`Scripts/build-app.sh` no longer needs `xcode-select` repointed.** When the
+  active developer directory is the Command Line Tools — changing it takes
+  sudo — the script uses the installed Xcode for that build.
+
 ## [0.8.47] - 2026-09-13
 
 ### Added

@@ -95,21 +95,102 @@ install_zig() {
     printf '%s\n' "$zig_dir"
 }
 
-compatible_zig_macos_sdk() {
-    local candidate libsystem
-    for candidate in \
-        /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk \
-        /Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk \
+# The target a Zig host binary links libSystem as on this machine.
+zig_host_target() {
+    case "$(uname -m)" in
+        arm64) printf 'arm64-macos\n' ;;
+        *) printf 'x86_64-macos\n' ;;
+    esac
+}
+
+# Whether Zig can link a host binary against this SDK: the first document of
+# libSystem.tbd — libSystem.B itself — has to list the host target.
+#
+# Searching the whole file is not enough. The documents after the first
+# describe the sub-libraries libSystem re-exports, and the macOS 27 SDK names
+# arm64-macos in a few of those while libSystem.B offers only arm64e. That
+# reads as compatible and then fails to link with every libc symbol undefined.
+sdk_links_with_zig() {
+    local libsystem="$1/usr/lib/libSystem.tbd"
+    [ -f "$libsystem" ] || return 1
+    awk '/^targets:/ { found = 1 } found { print } found && /\]/ { exit }' "$libsystem" |
+        grep -q "$(zig_host_target)"
+}
+
+# Every macOS SDK installed here, oldest first, as "<version> <real path>".
+# The name is no guide: MacOSX.sdk is whatever the newest one happens to be.
+installed_macos_sdks() {
+    local sdk
+    for sdk in \
+        /Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk \
         "$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"; do
-        [ -d "$candidate" ] || continue
-        libsystem="$candidate/usr/lib/libSystem.tbd"
-        if [ -f "$libsystem" ] && grep -q 'arm64-macos' "$libsystem"; then
-            printf '%s\n' "$candidate"
+        [ -d "$sdk" ] || continue
+        sdk=$(cd "$sdk" && pwd -P)
+        printf '%s %s\n' \
+            "$(/usr/libexec/PlistBuddy -c 'Print :Version' "$sdk/SDKSettings.plist" 2>/dev/null || echo 9999)" \
+            "$sdk"
+    done | sort -u | sort -V
+}
+
+# A stand-in SDK for Zig: every entry is a symlink into `base` except
+# libSystem.tbd, which is copied with plain arm64 added wherever arm64e is
+# offered. arm64 and arm64e processes load the same libSystem, so the symbols
+# named are exactly the ones the link will find; the SDK merely stopped
+# advertising them to arm64. Only Zig's host link reads this — the app itself
+# is linked by Xcode against the real SDK.
+make_zig_sdk_shim() {
+    local base=$1 shim=$2 entry
+    case "$shim" in
+        "$BUILD_DIR"/*) rm -rf "$shim" ;;
+        *) echo "refusing to replace unexpected path: $shim" >&2; exit 1 ;;
+    esac
+    mkdir -p "$shim/usr/lib"
+    for entry in "$base"/*; do
+        [ "$(basename "$entry")" = usr ] || ln -s "$entry" "$shim/"
+    done
+    for entry in "$base"/usr/*; do
+        [ "$(basename "$entry")" = lib ] || ln -s "$entry" "$shim/usr/"
+    done
+    for entry in "$base"/usr/lib/*; do
+        [ "$(basename "$entry")" = libSystem.tbd ] || ln -s "$entry" "$shim/usr/lib/"
+    done
+    perl -0777 -pe '
+        s{(targets:\s*\[)([^\]]*)(\])}{
+            my ($open, $list, $close) = ($1, $2, $3);
+            my @added = grep {
+                index($list, $_->[0]) >= 0 && index($list, $_->[1]) < 0
+            } (["arm64e-macos", "arm64-macos"], ["arm64e-maccatalyst", "arm64-maccatalyst"]);
+            @added ? "$open " . join(", ", map { $_->[1] } @added) . ",$list$close" : "$open$list$close";
+        }ge
+    ' "$base/usr/lib/libSystem.tbd" > "$shim/usr/lib/libSystem.tbd"
+}
+
+# The SDK Zig's build runner links against. An installed SDK that still lists
+# the host target is used as it is, oldest first — Zig $ZIG_VERSION predates
+# the newest headers too, and its libc++ does not compile against the macOS 27
+# SDK's. Xcode 26.4 and later dropped plain arm64 from libSystem.tbd, so on a
+# Mac that has only those the oldest one is wrapped in a shim instead.
+compatible_zig_macos_sdk() {
+    local version sdk oldest=""
+    while read -r version sdk; do
+        [ -n "$oldest" ] || oldest=$sdk
+        if sdk_links_with_zig "$sdk"; then
+            printf '%s\n' "$sdk"
             return
         fi
-    done
-    echo "no macOS SDK compatible with Zig $ZIG_VERSION was found" >&2
-    exit 1
+    done < <(installed_macos_sdks)
+    if [ -z "$oldest" ]; then
+        echo "no macOS SDK was found; install Xcode or the Command Line Tools" >&2
+        exit 1
+    fi
+    sdk="$BUILD_DIR/zig-macos-sdk"
+    make_zig_sdk_shim "$oldest" "$sdk"
+    if ! sdk_links_with_zig "$sdk"; then
+        echo "could not make $oldest linkable for Zig $ZIG_VERSION" >&2
+        exit 1
+    fi
+    echo "libghostty: wrapped $oldest for Zig (its libSystem.tbd lists no $(zig_host_target))" >&2
+    printf '%s\n' "$sdk"
 }
 
 mkdir -p "$DEPS_DIR"
