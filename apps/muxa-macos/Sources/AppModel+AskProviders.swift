@@ -233,6 +233,15 @@ final class AskProviderStore: ObservableObject {
         provider(id: id)?.title ?? MuxaAskProvider.fallbackTitle(for: id)
     }
 
+    /// Display titles for the providers these entries name, resolved once so
+    /// an export formatter can run off the main actor's state.
+    func titles(for entries: [MuxaAskEntry]) -> [String: String] {
+        Dictionary(
+            entries.map { ($0.agent, title(for: $0.agent)) },
+            uniquingKeysWith: { first, _ in first }
+        )
+    }
+
     func symbolName(for id: String) -> String {
         provider(id: id)?.symbolName ?? MuxaAskProvider(rawValue: id)?.symbolName ?? "sparkles"
     }
