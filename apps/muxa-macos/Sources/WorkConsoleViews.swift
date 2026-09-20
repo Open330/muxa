@@ -1169,6 +1169,8 @@ struct MuxaAskView: View {
     @ObservedObject private var providers = AskProviderStore.shared
     @State private var prompt = ""
     @State private var agent = "claude"
+    /// "Copied" or "Saved …", shown in the header for a moment after an export.
+    @State private var exportNotice: String?
 
     private var activeConversation: MuxaAskConversation? {
         model.askConversations.first { $0.id == model.activeAskConversationID }
@@ -1205,10 +1207,22 @@ struct MuxaAskView: View {
                         .lineLimit(1)
                 }
                 Spacer()
-                Text("Conversations resume where the provider left off")
+                if let exportNotice {
+                    Label {
+                        Text(verbatim: exportNotice)
+                    } icon: {
+                        Image(systemName: "checkmark.circle.fill")
+                    }
                     .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
+                } else {
+                    Text("Conversations resume where the provider left off")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+                conversationExportMenu
             }
             .padding(.horizontal, 14)
             .frame(height: 40)
@@ -1398,6 +1412,62 @@ struct MuxaAskView: View {
         .menuStyle(.borderlessButton)
     }
 
+    /// The whole conversation, out of the app: as Markdown for notes, as a
+    /// prompt for handing the thread to another agent, or as a file.
+    private var conversationExportMenu: some View {
+        Menu {
+            Button {
+                copyConversation { AskExport.markdown($0, title: activeConversation?.title, providerTitle: $1) }
+            } label: {
+                Label("Copy Conversation as Markdown", systemImage: "doc.on.doc")
+            }
+            Button {
+                copyConversation { AskExport.prompt($0, providerTitle: $1) }
+            } label: {
+                Label("Copy Conversation as Prompt", systemImage: "arrow.turn.down.right")
+            }
+            Divider()
+            Button(action: saveConversation) {
+                Label("Save as Markdown…", systemImage: "square.and.arrow.down")
+            }
+        } label: {
+            Label("Export", systemImage: "square.and.arrow.up")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .disabled(conversationEntries.isEmpty)
+        .help("Copy or save this conversation")
+    }
+
+    private func copyConversation(_ format: ([MuxaAskEntry], (String) -> String) -> String) {
+        let entries = conversationEntries
+        let titles = AskProviderStore.shared.titles(for: entries)
+        AskExport.copy(format(entries) { titles[$0] ?? $0 })
+        flash(String(localized: "Copied"))
+    }
+
+    private func saveConversation() {
+        let entries = conversationEntries
+        let titles = AskProviderStore.shared.titles(for: entries)
+        let markdown = AskExport.markdown(entries, title: activeConversation?.title) { titles[$0] ?? $0 }
+        do {
+            let name = AskExport.fileName(title: activeConversation?.title)
+            if let url = try AskExport.save(markdown, suggestedName: name) {
+                flash(String(localized: "Saved \(url.lastPathComponent)"))
+            }
+        } catch {
+            flash(error.localizedDescription)
+        }
+    }
+
+    private func flash(_ notice: String) {
+        exportNotice = notice
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            if exportNotice == notice { exportNotice = nil }
+        }
+    }
+
     @ViewBuilder
     private var askSendStatus: some View {
         if let error = model.askError {
@@ -1511,6 +1581,7 @@ private struct AskConversationTurn: View {
                     .font(.caption.weight(.medium))
                     .foregroundStyle(statusColor)
                 if entry.status == "running" { ProgressView().controlSize(.mini) }
+                AskTurnExportMenu(entry: entry)
             }
 
             AskMessageBlock(
@@ -1556,6 +1627,58 @@ private struct AskConversationTurn: View {
         }
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .contextMenu { AskTurnExportItems(entry: entry) }
+    }
+}
+
+/// The ways one exchange leaves the app. Shared by the turn's menu button and
+/// its context menu, so the two never drift apart.
+private struct AskTurnExportItems: View {
+    let entry: MuxaAskEntry
+
+    var body: some View {
+        Button {
+            AskExport.copy(entry.answer)
+        } label: {
+            Label("Copy Answer", systemImage: "doc.on.doc")
+        }
+        .disabled(entry.answer.isEmpty)
+        Button {
+            AskExport.copy(entry.prompt)
+        } label: {
+            Label("Copy Question", systemImage: "person")
+        }
+        Divider()
+        Button {
+            let titles = AskProviderStore.shared.titles(for: [entry])
+            AskExport.copy(AskExport.markdown([entry]) { titles[$0] ?? $0 })
+        } label: {
+            Label("Copy as Markdown", systemImage: "doc.plaintext")
+        }
+        Button {
+            let titles = AskProviderStore.shared.titles(for: [entry])
+            AskExport.copy(AskExport.prompt([entry]) { titles[$0] ?? $0 })
+        } label: {
+            Label("Copy as Prompt", systemImage: "arrow.turn.down.right")
+        }
+    }
+}
+
+private struct AskTurnExportMenu: View {
+    let entry: MuxaAskEntry
+
+    var body: some View {
+        Menu {
+            AskTurnExportItems(entry: entry)
+        } label: {
+            Image(systemName: "square.and.arrow.up")
+                .font(.caption)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Copy this exchange")
     }
 }
 
@@ -1614,6 +1737,7 @@ private struct AskHistoryCard: View {
                         .foregroundStyle(.secondary)
                         .help(askedDate.formatted(date: .abbreviated, time: .standard))
                 }
+                AskTurnExportMenu(entry: entry)
             }
             .padding(.horizontal, 14)
             .frame(height: 38)
@@ -1673,6 +1797,7 @@ private struct AskHistoryCard: View {
                 .stroke(Color.primary.opacity(0.09), lineWidth: 1)
         }
         .frame(maxWidth: .infinity, alignment: .center)
+        .contextMenu { AskTurnExportItems(entry: entry) }
     }
 }
 

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Global Ask answers can leave the app.** Until now the only way to take an
+  answer anywhere was to select text by hand (or the Copy button on a code
+  block). Every exchange — in the Ask tab and in the Inbox's Ask scope — now
+  has a share menu, also on right-click: **Copy Answer**, **Copy Question**,
+  **Copy as Markdown**, and **Copy as Prompt**. The conversation header gains
+  **Export**: copy the whole conversation as Markdown or as a prompt, or
+  **Save as Markdown…** to a file named after the conversation.
+
+  *Copy as Prompt* is for handing a thread to another agent: the exchange
+  wrapped in `<conversation>` / `<user>` / `<assistant name="…">` tags under a
+  line saying where it came from, ending on a blank line for the instruction
+  that is yours to type. Markdown export leads a conversation with its title
+  and a `Global Ask · provider · date` line, and a single turn is just the two
+  messages. A turn with no answer says why — failed, with the error, or not
+  answered yet — instead of exporting an empty section.
+
 ## [0.8.47] - 2026-09-13
 
 ### Added

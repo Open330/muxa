@@ -1,6 +1,116 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Copy Answer": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "답변 복사"
+          }
+        }
+      }
+    },
+    "Copy Question": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "질문 복사"
+          }
+        }
+      }
+    },
+    "Copy as Markdown": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Markdown으로 복사"
+          }
+        }
+      }
+    },
+    "Copy as Prompt": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "프롬프트로 복사"
+          }
+        }
+      }
+    },
+    "Copy Conversation as Markdown": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "대화를 Markdown으로 복사"
+          }
+        }
+      }
+    },
+    "Copy Conversation as Prompt": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "대화를 프롬프트로 복사"
+          }
+        }
+      }
+    },
+    "Save as Markdown…": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Markdown으로 저장…"
+          }
+        }
+      }
+    },
+    "Export Global Ask conversation": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Global Ask 대화 내보내기"
+          }
+        }
+      }
+    },
+    "Copy or save this conversation": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 대화를 복사하거나 저장합니다"
+          }
+        }
+      }
+    },
+    "Copy this exchange": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 질문과 답변 복사"
+          }
+        }
+      }
+    },
+    "Saved %@": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ 저장됨"
+          }
+        }
+      }
+    },
     "A shell is being created": {
       "localizations": {
         "ko": {
