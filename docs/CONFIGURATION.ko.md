@@ -144,6 +144,10 @@ title = "Anthropic (work)"          # 선택. 기본값은 id를 사람이 읽�
 model = "claude-opus-5"             # 선택
 api_key_env = "WORK_ANTHROPIC_KEY"  # 선택. 이 provider 전용 키
 executable = "/opt/homebrew/bin/claude"  # 선택. CLI engine에만 적용
+
+[ask.providers.apple-cloud]         # Apple 모델 (macOS 26+): 키가 아예 없음
+engine = "apple"
+model = "private-cloud"             # on-device(기본값) | private-cloud(macOS 27+)
 ```
 
 `muxa watch`에서 보내는 headless 질의입니다. `a`로 묻고 `A`로 이력을 봅니다.
@@ -172,23 +176,38 @@ plan`). `muxa work compose`는 항상 이 모드로 초안을 만듭니다.
 ### Provider
 
 **engine**은 provider를 구동하는 코드입니다. CLI가 받는 argv, API가 돌려주는
-JSON, 키가 담긴 환경 변수가 여기에 있습니다. 다섯 개로 고정되어 있습니다.
+JSON, 키가 담긴 환경 변수가 여기에 있습니다. 여섯 개로 고정되어 있습니다.
 `claude`, `codex`, `gemini`는 agent CLI를 print 모드(`claude -p`, `codex exec
 --json`, `gemini -p --output-format json`)로 실행하고 질문 사이에 자체 세션을
 resume합니다. `anthropic`과 `openai`는 Messages API와 Chat Completions API를
-HTTPS로 직접 호출합니다. API engine은 resume할 세션이 없으므로 muxad가 자기
-이력에서 그 대화의 이전 턴(최근 40턴 또는 60k자)을 질문 앞에 다시 넣어 보내며,
+HTTPS로 직접 호출합니다. `apple`은 Mac 자체의 Foundation Models를 실행합니다.
+API engine은 resume할 세션이 없으므로 muxad가 자기 이력에서 그 대화의 이전
+턴(최근 40턴 또는 60k자)을 질문 앞에 다시 넣어 보내며,
 `cwd`·`additional_dirs`·`permission_mode`는 적용되지 않습니다.
 
+`apple`(macOS 26 이상, Apple Intelligence가 켜져 있어야 함)은 키가 필요 없고
+외부 계정으로 아무것도 보내지 않습니다. `model`로 두 시스템 모델 중 하나를
+고릅니다. 기본값 `on-device`는 Mac 밖으로 나가지 않으며 컨텍스트가 8,192
+토큰이고, `private-cloud`는 Apple의 Private Cloud Compute입니다(macOS 27 이상,
+32,768 토큰, Apple의 사용량 quota 적용). 이 프레임워크는 Swift 전용이라 muxad는
+`Muxa.app/Contents/Helpers`에 포함된 작은 헬퍼 `muxa-afm`을 통해 호출합니다.
+muxad는 헬퍼를 자기 실행 파일 옆, `/Applications/Muxa.app`, `PATH` 순서로 찾고,
+`executable`로 다른 사본을 지정할 수 있습니다. API처럼 세션이 없으므로 대화를
+다시 넣어 보내는데, on-device 컨텍스트에 맞게 6k자로 자르고, 그래도 모델이
+초과를 보고하면 헬퍼가 더 줄입니다. 이 모델들은 질문에 답할 뿐 파일을 건드리지
+않으므로 `cwd`·`additional_dirs`·`permission_mode`는 적용되지 않습니다. 내장
+`apple` provider는 macOS에서만 목록에 나오지만 engine 자체는 어디서나
+파싱되므로, config.toml 하나를 Mac과 Linux host가 함께 쓸 수 있습니다.
+
 **provider**는 직접 구성하는 `[ask.providers.<id>]` 테이블입니다. id는 원하는
-대로 정하고(TOML bare key: 영숫자, `-`, `_`), `engine`이 다섯 중 무엇으로
+대로 정하고(TOML bare key: 영숫자, `-`, `_`), `engine`이 여섯 중 무엇으로
 구동할지 정합니다. 여러 provider가 같은 engine을 공유할 수 있어 업무용과 개인용
 OpenAI 계정, Anthropic 키 두 개, 두 번째 `claude` 바이너리를 나란히 둘 수
 있습니다. 각각 자기 대화를 따로 유지하므로 provider를 바꿔도 새로 시작하지 않고
 이어집니다. `[ask] agent`와 `muxa ask --agent`는 engine이 아니라 provider id를
 가리킵니다.
 
-다섯 engine id는 그 자체로도 provider라서 `[ask.providers]`가 아예 없어도 새로
+engine id는 그 자체로도 provider라서 `[ask.providers]`가 아예 없어도 새로
 설치한 muxa가 그대로 동작합니다. `muxa ask providers`는 직접 구성한 provider를
 먼저, 그다음 아직 가려지지 않은 내장 provider를 보여줍니다. 내장 id로 만든
 테이블에 `engine`이 없으면 그 내장 provider를 조정하는 뜻입니다. 예전에 쓴

@@ -61,7 +61,10 @@ struct AskProvidersSettingsPane: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                     Button {
-                        Task { await store.detectInstalledTools(force: true) }
+                        Task {
+                            await store.detectInstalledTools(force: true)
+                            await store.probeAppleModels(force: true)
+                        }
                     } label: {
                         Label("Re-check CLIs", systemImage: "arrow.clockwise")
                     }
@@ -351,6 +354,8 @@ struct AskProviderDetectedRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        } else if provider.isApple {
+            AskAppleAvailabilityLine(provider: provider, store: store)
         } else {
             switch store.detection(for: provider) {
             case .probing:
@@ -369,6 +374,56 @@ struct AskProviderDetectedRow: View {
                     .foregroundStyle(.orange)
             }
         }
+    }
+}
+
+/// Where an `apple` provider stands: the helper, then the system's verdict on
+/// the model it names. Installation is never the interesting answer for this
+/// engine — the helper ships with the app — so this replaces the PATH line.
+struct AskAppleAvailabilityLine: View {
+    let provider: MuxaAskProvider
+    @ObservedObject var store: AskProviderStore
+
+    var body: some View {
+        switch store.detection(for: provider) {
+        case .probing:
+            Text("Looking for the \(provider.executable) helper…")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .notInstalled:
+            Text("The \(provider.executable) helper is missing. It ships inside Muxa.app; a development build may need it built first.")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        case .installed:
+            switch store.usability(provider) {
+            case .unavailable(let message):
+                Text(verbatim: message)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            case .usable, .probing, .notInstalled, .missingKey:
+                Text(readyLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// "Runs on this Mac · on-device · 8,192-token context", with whatever
+    /// the probe knows; just the first part before it has answered.
+    private var readyLine: String {
+        let model = AskAppleModel(configured: provider.model) ?? .onDevice
+        var parts = [
+            model == .onDevice
+                ? String(localized: "Runs on this Mac, no key needed")
+                : String(localized: "Runs on Apple's Private Cloud Compute, no key needed"),
+        ]
+        if let contextSize = store.appleProbe?.status(of: model)?.contextSize {
+            parts.append(String(localized: "\(contextSize)-token context"))
+        }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -424,11 +479,15 @@ struct AskProviderCard: View {
         VStack(alignment: .leading, spacing: 10) {
             header
 
-            if provider.kind == .cli {
+            if provider.isApple {
+                AskAppleAvailabilityLine(provider: provider, store: store)
+            } else if provider.kind == .cli {
                 detectionLine
             }
 
-            credentialRow
+            if provider.takesCredential {
+                credentialRow
+            }
 
             if isConfigured {
                 detailsEditor
@@ -463,7 +522,7 @@ struct AskProviderCard: View {
                     .foregroundStyle(.tint)
             }
             Spacer()
-            if provider.kind == .cli {
+            if provider.kind == .cli, provider.takesCredential {
                 Button("Log In…") {
                     Task { await model.openProviderCLI(provider) }
                 }
@@ -497,6 +556,10 @@ struct AskProviderCard: View {
                 .foregroundStyle(.red)
         case .missingKey:
             Label("API key required", systemImage: "key")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.orange)
+        case .unavailable:
+            Label("Unavailable", systemImage: "exclamationmark.triangle")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.orange)
         }
@@ -597,6 +660,11 @@ struct AskProviderCard: View {
                 TextField("Executable", text: $executablePath, prompt: executablePrompt)
                     .textFieldStyle(.roundedBorder)
                     .font(.body.monospaced())
+            }
+            if provider.isApple {
+                Text("Model: on-device, or private-cloud for Private Cloud Compute (macOS 27 or later).")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
             HStack(spacing: 8) {
                 Text("Stored under this provider's id in muxa's config. Empty fields fall back to the engine's defaults.")
@@ -771,6 +839,11 @@ struct AskProviderAddSheet: View {
     private var footnote: some View {
         if draft.engine.kind == .api {
             Text("The key is stored in your login Keychain under this provider's id and sent to muxad only for each Ask.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if draft.engine == .apple {
+            Text("Runs on this Mac's own models, with no key. Leave the model empty for on-device, or enter private-cloud for Private Cloud Compute (macOS 27 or later). The helper ships inside Muxa, so the executable can stay empty.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

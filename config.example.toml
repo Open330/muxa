@@ -107,7 +107,9 @@
 # your account.
 # [ask]
 # enabled = true
-# agent = "claude"          # claude | codex; ←/→ switches at runtime
+# agent = "claude"          # claude | codex | gemini | anthropic | openai | apple
+#                           # (apple: the Mac's own models, macOS 26+, no key);
+#                           # ←/→ switches at runtime
 # cwd = "~"                 # where the headless process runs; defaults to $HOME
 # timeout_secs = 180
 # keep = 200                # answers retained before the oldest are dropped

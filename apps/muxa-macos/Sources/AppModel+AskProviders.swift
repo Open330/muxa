@@ -10,6 +10,10 @@ enum AskProviderUsability: Equatable, Sendable {
     case probing
     case notInstalled
     case missingKey
+    /// Installed, but the system says it cannot answer right now — Apple
+    /// Intelligence turned off, the model still downloading. Carries the
+    /// explanation to show beside the provider.
+    case unavailable(String)
 
     var isUsable: Bool {
         self == .usable || self == .probing
@@ -21,6 +25,7 @@ enum AskProviderUsability: Equatable, Sendable {
         case .usable, .probing: nil
         case .notInstalled: String(localized: "not installed")
         case .missingKey: String(localized: "no API key")
+        case .unavailable: String(localized: "unavailable")
         }
     }
 }
@@ -123,7 +128,11 @@ final class AskProviderStore: ObservableObject {
     /// Executable name → detection; executables missing from the map have
     /// not been probed yet.
     @Published private(set) var detections: [String: AskProviderDetection] = [:]
+    /// What `muxa-afm --probe` last said about Apple's system models; nil
+    /// until it has answered, and again if it could not be run.
+    @Published private(set) var appleProbe: AskAppleProbe?
     private var detectionTask: Task<Void, Never>?
+    private var appleProbeHelper: String?
 
     init() {}
 
@@ -155,6 +164,28 @@ final class AskProviderStore: ObservableObject {
         }
         refreshKeyPresence()
         await detectInstalledTools()
+        await probeAppleModels()
+    }
+
+    /// Asks the `muxa-afm` helper whether Apple's models can answer on this
+    /// Mac. Being installed is not the question for this engine — the helper
+    /// ships with the app — so the pane shows this instead. Runs once per
+    /// helper; `force` asks again, after Apple Intelligence was turned on.
+    func probeAppleModels(force: Bool = false) async {
+        guard let helper = providers.lazy
+            .filter(\.isApple)
+            .compactMap({ self.detection(for: $0).tool?.path })
+            .first
+        else {
+            appleProbe = nil
+            appleProbeHelper = nil
+            return
+        }
+        guard force || appleProbeHelper != helper else { return }
+        appleProbeHelper = helper
+        let output = await InstalledTools.runCapturing(helper, ["--probe"], timeout: 5)
+        guard appleProbeHelper == helper else { return }
+        appleProbe = output.flatMap(AskAppleProbe.decode)
     }
 
     /// Probes every CLI provider's executable once per launch; `force`
@@ -243,21 +274,40 @@ final class AskProviderStore: ObservableObject {
 
     func detection(for provider: MuxaAskProvider) -> AskProviderDetection {
         guard provider.kind == .cli, let executable = provider.cliExecutable else { return .notInstalled }
-        if let direct = Self.pathDetection(for: executable, isExecutable: {
-            FileManager.default.isExecutableFile(atPath: $0)
-        }) {
+        let isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }
+        if let direct = Self.pathDetection(for: executable, isExecutable: isExecutable) {
             return direct
+        }
+        if provider.isApple,
+           let bundled = Self.bundledHelperDetection(
+               for: executable,
+               helpersDirectory: Self.bundledHelpersDirectory,
+               isExecutable: isExecutable
+           ) {
+            return bundled
         }
         return detections[executable] ?? .probing
     }
 
     func usability(_ provider: MuxaAskProvider) -> AskProviderUsability {
-        Self.usability(
+        let detection = detection(for: provider)
+        if provider.isApple, case .installed = detection {
+            return Self.appleUsability(model: provider.model, probe: appleProbe)
+        }
+        return Self.usability(
             kind: provider.kind,
-            detection: detection(for: provider),
+            detection: detection,
             hasKey: hasKey(provider),
             credentialPresent: provider.credentialPresent
         )
+    }
+
+    /// `Contents/Helpers` of the running app, where `muxa-afm` ships.
+    private static var bundledHelpersDirectory: String {
+        Bundle.main.bundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Helpers", isDirectory: true)
+            .path
     }
 
     func isUsable(_ provider: MuxaAskProvider) -> Bool {
@@ -441,6 +491,40 @@ final class AskProviderStore: ObservableObject {
                 version: nil
             )
         )
+    }
+
+    /// Detection for the `apple` engine's default helper, which is not on
+    /// anyone's PATH: it ships in this app's `Contents/Helpers`, the same
+    /// place the bundled muxad looks. Nil for any other name, and when the
+    /// helper is missing — a development build — so PATH still gets a say.
+    nonisolated static func bundledHelperDetection(
+        for executable: String,
+        helpersDirectory: String,
+        isExecutable: (String) -> Bool
+    ) -> AskProviderDetection? {
+        guard executable == AskProviderEngine.appleHelperName else { return nil }
+        let path = (helpersDirectory as NSString).appendingPathComponent(executable)
+        guard isExecutable(path) else { return nil }
+        return .installed(InstalledTool(name: executable, path: path, version: nil))
+    }
+
+    /// Whether an installed `apple` instance can answer: the probe's verdict
+    /// on the model the instance names. No probe yet, or none that could be
+    /// read, stays usable — muxad reports the real reason on the first Ask.
+    nonisolated static func appleUsability(
+        model: String?,
+        probe: AskAppleProbe?
+    ) -> AskProviderUsability {
+        guard let probe else { return .usable }
+        guard let choice = AskAppleModel(configured: model) else {
+            let accepted = AskAppleModel.allCases.map(\.rawValue).joined(separator: ", ")
+            return .unavailable(String(localized: "Unknown model. Use one of: \(accepted)."))
+        }
+        guard let status = probe.status(of: choice) else {
+            return .unavailable(String(localized: "The \(choice.rawValue) model needs a newer macOS."))
+        }
+        if status.available { return .usable }
+        return .unavailable(status.message ?? String(localized: "The \(choice.rawValue) model is unavailable."))
     }
 
     /// The built-in list with `selected` mirroring the daemon's agent.

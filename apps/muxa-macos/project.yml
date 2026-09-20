@@ -53,6 +53,12 @@ targets:
       - name: Embed muxa runtime
         script: '"$SRCROOT/Scripts/embed-muxad.sh"'
         basedOnDependencyAnalysis: false
+      # muxa-afm, the bridge muxad's `apple` Ask engine spawns. Its own
+      # script so MUXA_SKIP_EMBED can skip the Rust rebuild without
+      # skipping a helper that compiles in a second.
+      - name: Embed Ask helper
+        script: '"$SRCROOT/Scripts/embed-ask-helper.sh"'
+        basedOnDependencyAnalysis: false
 
   MuxaTests:
     type: bundle.unit-test

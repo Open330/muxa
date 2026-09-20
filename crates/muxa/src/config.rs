@@ -435,8 +435,9 @@ pub const DEFAULT_ASK_TIMEOUT_SECS: u64 = 30 * 60;
 pub struct AskConfig {
     pub enabled: bool,
     /// Provider instance the next question goes to. Either one of the
-    /// built-in ids — `claude`, `codex`, `gemini` (agent CLIs), or
-    /// `anthropic`, `openai` (HTTPS APIs) — or the id of an
+    /// built-in ids — `claude`, `codex`, `gemini` (agent CLIs),
+    /// `anthropic`, `openai` (HTTPS APIs), or `apple` (the Mac's own
+    /// Foundation Models) — or the id of an
     /// `[ask.providers.<id>]` instance the operator added. See
     /// [`crate::ask::supported_agents`] for the built-ins.
     pub agent: String,
@@ -486,7 +487,8 @@ impl Default for AskConfig {
 ///
 /// The table id is the instance's name on the wire, in `[ask] agent`, and
 /// in `muxa ask --agent`. `engine` names the closed set of code that
-/// drives it (`claude`, `codex`, `gemini`, `anthropic`, `openai`), so the
+/// drives it (`claude`, `codex`, `gemini`, `anthropic`, `openai`,
+/// `apple`), so the
 /// operator can keep several instances of one engine side by side — a
 /// work and a personal `OpenAI` account, two Anthropic keys, a second
 /// `claude` binary — each with its own key.
@@ -496,8 +498,9 @@ impl Default for AskConfig {
 /// `[ask.providers.anthropic] model = "…"` keep meaning "the built-in
 /// anthropic provider, with this model". `title` is what clients show and
 /// defaults to a humanized id. `model` overrides the engine's default
-/// (`claude-sonnet-5` for `anthropic`, `gpt-5` for `openai`; the agent
-/// CLIs use their own unless one is named here). `api_key_env` names an
+/// (`claude-sonnet-5` for `anthropic`, `gpt-5` for `openai`, `on-device`
+/// for `apple`, whose other model is `private-cloud`; the agent CLIs use
+/// their own unless one is named here). `api_key_env` names an
 /// environment variable the daemon reads the key from — a pointer, so a
 /// raw secret is never written into this file. `executable` overrides the
 /// binary a CLI engine spawns and is ignored by the API engines.

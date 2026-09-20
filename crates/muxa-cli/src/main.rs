@@ -133,10 +133,10 @@ enum Cmd {
         #[command(subcommand)]
         action: MsgCmd,
     },
-    /// Ask a headless provider and print the durable reply. The five
-    /// built-ins are claude, codex, gemini, anthropic, and openai; add your
-    /// own with `muxa ask provider add`, and `muxa ask providers` lists
-    /// every one the daemon can drive.
+    /// Ask a headless provider and print the durable reply. The built-ins
+    /// are claude, codex, gemini, anthropic, and openai — plus apple on a
+    /// Mac; add your own with `muxa ask provider add`, and `muxa ask
+    /// providers` lists every one the daemon can drive.
     #[command(args_conflicts_with_subcommands = true)]
     Ask {
         #[command(subcommand)]
@@ -523,6 +523,8 @@ enum AskEngineArg {
     Anthropic,
     #[value(name = "openai")]
     OpenAi,
+    /// Apple's on-device and Private Cloud Compute models (macOS 26+).
+    Apple,
 }
 
 impl AskEngineArg {
@@ -533,6 +535,7 @@ impl AskEngineArg {
             Self::Gemini => "gemini",
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
+            Self::Apple => "apple",
         }
     }
 }
@@ -1035,7 +1038,10 @@ fn render_ask_providers(providers: &[muxa::ask::AskProviderInfo]) -> String {
             }
             muxa::ask::AskProviderKind::Api => "api".into(),
         };
-        let credential = if provider.credential_present {
+        let credential = if provider.credential_env.is_empty() {
+            // The apple engine: the model belongs to the signed-in Mac.
+            "no key needed".to_string()
+        } else if provider.credential_present {
             format!("{} present", provider.credential_env)
         } else if provider.credential_required {
             format!("{} missing", provider.credential_env)

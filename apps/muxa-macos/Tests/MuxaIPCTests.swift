@@ -3789,6 +3789,96 @@ func askProviderExecutablePathDetectionSkipsThePathProbe() throws {
 }
 
 @Test
+func askAppleEngineIsAKeylessCLIShippedInTheBundle() throws {
+    let engine = AskProviderEngine.apple
+    #expect(engine.kind == .cli)
+    #expect(engine.title == "Apple Intelligence")
+    #expect(engine.defaultExecutable == "muxa-afm")
+    #expect(engine.defaultCredentialEnv.isEmpty)
+    #expect(engine.defaultModel == "on-device")
+    #expect(!engine.credentialRequired)
+    #expect(!engine.takesCredential)
+    #expect(engine.installCommand == nil)
+    #expect(AskProviderEngine.claude.takesCredential)
+
+    // muxad's row: an empty `credential_env` is how it says "no key".
+    let row = try JSONDecoder().decode(MuxaAskProvider.self, from: Data(#"""
+    {"id":"apple","title":"Apple Intelligence","engine":"apple","kind":"cli",
+     "executable":"muxa-afm","credential_env":"","credential_required":false,
+     "credential_present":false,"model":"on-device","selected":true,
+     "builtin":true,"configured":false}
+    """#.utf8))
+    #expect(row.isApple)
+    #expect(!row.takesCredential)
+    #expect(!row.isConfigured)
+    #expect(row.symbolName == "apple.logo")
+    #expect(MuxaAskProvider(rawValue: "apple")?.title == "Apple Intelligence")
+    // A keyless engine this build has never heard of is still keyless…
+    let unknown = MuxaAskProvider(id: "local", title: "Local", kind: .cli, credentialEnv: "", engine: "llama")
+    #expect(!unknown.takesCredential)
+    // …while every engine with a key variable keeps its key row.
+    #expect(MuxaAskProvider.claude.takesCredential)
+    #expect(MuxaAskProvider.openai.takesCredential)
+    // The pre-`ask_providers_v1` fallback never offers what an old muxad
+    // cannot run.
+    #expect(!MuxaAskProvider.builtIn.contains { $0.id == "apple" })
+
+    // No key row means no key is ever put in a sign-in shell's environment.
+    let environment = MuxaProviderCredentialStore.environment(["PATH": "/bin"], for: row)
+    #expect(environment[""] == nil)
+}
+
+@Test
+func askAppleHelperIsFoundInTheAppBundleBeforePath() throws {
+    let helpers = "/Applications/Muxa.app/Contents/Helpers"
+    let bundled = AskProviderStore.bundledHelperDetection(
+        for: "muxa-afm",
+        helpersDirectory: helpers
+    ) { $0 == "\(helpers)/muxa-afm" }
+    let tool = try #require(bundled?.tool)
+    #expect(tool.name == "muxa-afm")
+    #expect(tool.path == "\(helpers)/muxa-afm")
+    // A development build without the helper leaves the answer to PATH.
+    #expect(AskProviderStore.bundledHelperDetection(for: "muxa-afm", helpersDirectory: helpers) { _ in false } == nil)
+    // Only the engine's own default is looked up there.
+    #expect(AskProviderStore.bundledHelperDetection(for: "claude", helpersDirectory: helpers) { _ in true } == nil)
+}
+
+@Test
+func askAppleUsabilityFollowsTheProbeForTheModelTheInstanceNames() throws {
+    let probe = try #require(AskAppleProbe.decode(#"""
+    {"models":[{"available":true,"context_size":8192,"id":"on-device"},
+               {"available":false,"id":"private-cloud","reason":"system_not_ready",
+                "message":"Private Cloud Compute is not ready"}],
+     "protocol_version":1}
+    """#))
+    #expect(probe.status(of: .onDevice)?.contextSize == 8192)
+    #expect(AskProviderStore.appleUsability(model: nil, probe: probe) == .usable)
+    #expect(AskProviderStore.appleUsability(model: "on-device", probe: probe) == .usable)
+    // The helper's aliases mean the same model here.
+    #expect(AskProviderStore.appleUsability(model: " PCC ", probe: probe)
+        == .unavailable("Private Cloud Compute is not ready"))
+    #expect(AskAppleModel(configured: "private-cloud-compute") == .privateCloud)
+    #expect(AskAppleModel(configured: "default") == .onDevice)
+    #expect(AskAppleModel(configured: "gpt-5") == nil)
+    // A name the helper would refuse is flagged before an Ask is spent on it.
+    #expect(!AskProviderStore.appleUsability(model: "gpt-5", probe: probe).isUsable)
+    #expect(AskProviderStore.appleUsability(model: "gpt-5", probe: probe).reason == "unavailable")
+
+    // macOS 26 reports only the on-device model.
+    let older = try #require(AskAppleProbe.decode(#"{"models":[{"available":true,"id":"on-device"}]}"#))
+    #expect(!AskProviderStore.appleUsability(model: "private-cloud", probe: older).isUsable)
+    // Apple Intelligence switched off: the helper's sentence is what shows.
+    let off = try #require(AskAppleProbe.decode(#"""
+    {"models":[{"available":false,"id":"on-device","message":"Apple Intelligence is turned off"}]}
+    """#))
+    #expect(AskProviderStore.appleUsability(model: nil, probe: off) == .unavailable("Apple Intelligence is turned off"))
+    // No probe yet, or one that could not be read: muxad reports the reason.
+    #expect(AskProviderStore.appleUsability(model: nil, probe: nil) == .usable)
+    #expect(AskAppleProbe.decode("not json") == nil)
+}
+
+@Test
 func askProviderDraftValidatesIdsTheWayTheDaemonDoes() {
     #expect(AskProviderDraft.isValidIdentifier("anthropic-work"))
     #expect(AskProviderDraft.isValidIdentifier("openai_2"))
@@ -3822,7 +3912,7 @@ func askProviderDraftValidatesIdsTheWayTheDaemonDoes() {
     #expect(draft.validationMessage(taken: none)?.isEmpty == false)
 
     // The engine supplies every default the sheet only hints at.
-    #expect(AskProviderEngine.allCases.map(\.rawValue) == ["claude", "codex", "gemini", "anthropic", "openai"])
+    #expect(AskProviderEngine.allCases.map(\.rawValue) == ["claude", "codex", "gemini", "anthropic", "openai", "apple"])
     #expect(AskProviderEngine.gemini.defaultExecutable == "gemini")
     #expect(AskProviderEngine.gemini.defaultCredentialEnv == "GEMINI_API_KEY")
     #expect(AskProviderEngine.anthropic.defaultExecutable == nil)
