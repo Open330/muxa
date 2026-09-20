@@ -522,7 +522,7 @@ private struct OnboardingChecklistPage: View {
             }
         } action: {
             if !model.isConnected {
-                OnboardingSettingsButton()
+                OnboardingSettingsButton(tab: .runtime)
             }
         }
     }
@@ -583,7 +583,7 @@ private struct OnboardingChecklistPage: View {
                     model.select(.ask)
                 }
             case .some(false):
-                OnboardingSettingsButton()
+                OnboardingSettingsButton(tab: .providers)
             case .none:
                 EmptyView()
             }
@@ -602,7 +602,7 @@ private struct OnboardingChecklistPage: View {
                 Text("\(workDirectory) is not currently available.")
             }
         } action: {
-            OnboardingSettingsButton()
+            OnboardingSettingsButton(tab: .general)
         }
     }
 
@@ -686,20 +686,34 @@ private struct OnboardingToolLine: View {
     }
 }
 
-/// Opens Settings: `SettingsLink` on macOS 14, the AppKit selector on 13.
+/// Opens Settings on the tab that fixes the row: the `openSettings` action on
+/// macOS 14, the AppKit selector on 13. A bare `SettingsLink` has no hook to
+/// pick the tab first, so it reopened whichever tab was shown last.
 private struct OnboardingSettingsButton: View {
+    let tab: MuxaSettingsTab
+
     var body: some View {
         if #available(macOS 14.0, *) {
-            SettingsLink {
-                Text("Open Settings…")
-            }
+            OnboardingOpenSettingsButton(tab: tab)
         } else {
             Button("Open Settings…") {
-                let opened = NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-                if !opened {
-                    NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
-                }
+                MuxaSettingsOpener.select(tab)
+                MuxaSettingsOpener.openLegacySettingsWindow()
             }
+        }
+    }
+}
+
+@available(macOS 14.0, *)
+private struct OnboardingOpenSettingsButton: View {
+    @Environment(\.openSettings) private var openSettings
+    let tab: MuxaSettingsTab
+
+    var body: some View {
+        Button("Open Settings…") {
+            MuxaSettingsOpener.select(tab)
+            openSettings()
+            NSApp.activate(ignoringOtherApps: true)
         }
     }
 }
