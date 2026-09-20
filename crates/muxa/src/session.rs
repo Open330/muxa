@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,6 +26,13 @@ const DEFAULT_ROWS: u16 = 40;
 const MAX_BUFFER_BYTES: usize = 512 * 1024;
 const READ_CHUNK_BYTES: usize = 8192;
 const EXITED_SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+/// How long an exit waits for the PTY reader to reach end-of-file before
+/// being reported anyway. The child's last bytes are in the kernel's PTY
+/// buffer when `wait()` returns, and the reader needs a moment to move them
+/// into ours; without this a client sees `exited` and stops reading before
+/// the final output arrives. Bounded because a grandchild that keeps the
+/// PTY open would otherwise hold the exit back forever.
+const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, strum::Display)]
@@ -279,6 +286,7 @@ impl PtySessionBackend {
             buffer: Mutex::new(OutputBuffer::new(MAX_BUFFER_BYTES)),
             activity: Mutex::new(0),
             activity_changed: Condvar::new(),
+            reader_done: AtomicBool::new(false),
         });
 
         let session_for_reader = session.clone();
@@ -294,6 +302,10 @@ impl PtySessionBackend {
                     i32::try_from(s.exit_code()).unwrap_or(1)
                 }
             });
+            // The reader and this thread race: the child can be reaped before
+            // its last write has been read off the PTY. Let the reader finish
+            // first, so `exited` never arrives ahead of the output.
+            session_for_wait.wait_for_reader(EXIT_DRAIN_GRACE);
             if let Ok(mut meta) = session_for_wait.meta.lock() {
                 meta.exited = true;
                 meta.exit_status = exit_status;
@@ -491,6 +503,9 @@ struct PtySession {
     /// `Condvar::wait_timeout` hand-off.
     activity: Mutex<u64>,
     activity_changed: Condvar,
+    /// Set by the reader thread once the PTY has no more to give, which is
+    /// what makes an `exited` report mean "and you have seen everything".
+    reader_done: AtomicBool,
 }
 
 impl PtySession {
@@ -551,19 +566,50 @@ impl PtySession {
         offset: u64,
         timeout: Duration,
     ) -> Result<SessionOutput, SessionError> {
-        let activity = self
+        let deadline = std::time::Instant::now() + timeout;
+        let mut activity = self
             .activity
             .lock()
             .map_err(|_| SessionError::Pty("session activity lock poisoned".into()))?;
-        let output = self.read_output(offset)?;
-        if output.next_offset != offset || output.truncated || output.exited || timeout.is_zero() {
-            return Ok(output);
+        loop {
+            let output = self.read_output(offset)?;
+            if output.next_offset != offset || output.truncated || output.exited {
+                return Ok(output);
+            }
+            // Activity is published for more than new output — a resize, a
+            // reader reaching end-of-file — and a condvar may wake for no
+            // reason at all, so a wake is a reason to look again, not an
+            // answer. The deadline is the only way out with nothing new.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(output);
+            }
+            let (guard, _) = self
+                .activity_changed
+                .wait_timeout(activity, remaining)
+                .map_err(|_| SessionError::Pty("session activity lock poisoned".into()))?;
+            activity = guard;
         }
-        let (_activity, _wait) = self
-            .activity_changed
-            .wait_timeout(activity, timeout)
-            .map_err(|_| SessionError::Pty("session activity lock poisoned".into()))?;
-        self.read_output(offset)
+    }
+
+    /// Blocks until the reader thread has hit end-of-file, or `grace` has
+    /// passed. The reader publishes activity when it finishes, so this waits
+    /// on the same condvar rather than polling.
+    fn wait_for_reader(&self, grace: Duration) {
+        let deadline = std::time::Instant::now() + grace;
+        let Ok(mut activity) = self.activity.lock() else {
+            return;
+        };
+        while !self.reader_done.load(Ordering::Acquire) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match self.activity_changed.wait_timeout(activity, remaining) {
+                Ok((guard, _)) => activity = guard,
+                Err(_) => return,
+            }
+        }
     }
 
     fn publish_activity(&self) {
@@ -659,6 +705,11 @@ fn read_pty_loop(mut reader: Box<dyn Read + Send>, session: Arc<PtySession>) {
             Err(_) => break,
         }
     }
+    // End-of-file (or the EIO macOS and Linux raise once the slave side is
+    // gone): everything the child wrote is in the buffer. Say so, and wake
+    // the exit watcher that may be holding the exit back for exactly this.
+    session.reader_done.store(true, Ordering::Release);
+    session.publish_activity();
 }
 
 fn next_session_id() -> String {
@@ -745,6 +796,50 @@ mod tests {
             .unwrap();
         assert!(output.data.contains("ready"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// The child's last bytes and its exit race through two threads. A
+    /// client that stops reading at `exited` must still have seen them.
+    #[test]
+    fn session_exit_is_reported_only_after_the_last_output_is_readable() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let backend = PtySessionBackend::default();
+        for round in 0..20 {
+            let session = backend
+                .spawn_session(SpawnSession {
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), format!("printf 'last words {round}'")],
+                    env: Vec::new(),
+                    cwd: None,
+                    name: None,
+                    cols: Some(80),
+                    rows: Some(24),
+                })
+                .unwrap();
+            let mut seen = String::new();
+            let mut offset = 0;
+            let started = std::time::Instant::now();
+            loop {
+                let output = backend
+                    .read_output_wait(&session.id, offset, Duration::from_secs(2))
+                    .unwrap();
+                seen.push_str(&output.data);
+                offset = output.next_offset;
+                if output.exited {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "round {round}: the exit was never reported"
+                );
+            }
+            assert!(
+                seen.contains(&format!("last words {round}")),
+                "round {round}: exited before the output could be read: {seen:?}"
+            );
+        }
     }
 
     #[test]

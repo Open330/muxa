@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A session's exit is no longer reported before its last output can be
+  read.** The PTY reader and the process watcher are separate threads, so a
+  child that printed and exited could be reaped, and `exited` published,
+  before its final bytes had been read off the PTY. A client that stops
+  reading at `exited` then missed them — the same race made the
+  `session_wait_wakes_for_output_instead_of_polling` test fail on most CI
+  runs. The exit now waits for the reader to reach end-of-file, up to half a
+  second so a grandchild holding the PTY open cannot hold the exit back, and
+  a session wait re-checks for output after every wake instead of returning
+  whatever a wake for a resize, an end-of-file, or nothing at all happened
+  to find.
+
 ## [0.8.48] - 2026-09-20
 
 ### Added
