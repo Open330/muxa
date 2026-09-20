@@ -189,7 +189,13 @@ API engine은 resume할 세션이 없으므로 muxad가 자기 이력에서 그 
 외부 계정으로 아무것도 보내지 않습니다. `model`로 두 시스템 모델 중 하나를
 고릅니다. 기본값 `on-device`는 Mac 밖으로 나가지 않으며 컨텍스트가 8,192
 토큰이고, `private-cloud`는 Apple의 Private Cloud Compute입니다(macOS 27 이상,
-32,768 토큰, Apple의 사용량 quota 적용). 이 프레임워크는 Swift 전용이라 muxad는
+32,768 토큰, Apple의 사용량 quota 적용). 현재 `private-cloud`는 동작하지
+않습니다. macOS 27 SDK로 빌드한 헬퍼가 필요한데 GitHub 러너 이미지에는 아직
+그 SDK가 없고, 그렇게 빌드해 Developer ID로 서명한 헬퍼조차 시스템이
+`ModelManagerError 1046`으로 거부했습니다. Private Cloud Compute가 프로세스에
+무엇을 요구하든 command-line 헬퍼에는 그것이 없는 것으로 보입니다. 옵션은 나중
+빌드에서 쓸 수 있도록 남겨 두었고, 이 모델로 턴을 보내면 왜 답할 수 없는지
+알려줍니다. 이 프레임워크는 Swift 전용이라 muxad는
 `Muxa.app/Contents/Helpers`에 포함된 작은 헬퍼 `muxa-afm`을 통해 호출합니다.
 muxad는 헬퍼를 자기 실행 파일 옆, `/Applications/Muxa.app`, `PATH` 순서로 찾고,
 `executable`로 다른 사본을 지정할 수 있습니다. API처럼 세션이 없으므로 대화를
