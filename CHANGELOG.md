@@ -16,9 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compatibility check searched the whole file for `arm64-macos`, and the
   macOS 27 SDK names it in a few re-exported sub-libraries while libSystem
   itself does not — so the SDK read as compatible and then failed to link.
-  The check now reads libSystem's own target list, installed SDKs are tried
-  oldest first (Zig's libc++ does not compile against the macOS 27 headers
-  either), and when none qualifies the oldest is wrapped in a generated
+  The check now reads libSystem's own target list. The SDKs this build has
+  always preferred are still tried first, so a release runner gets the one it
+  always got; then any other installed SDK Zig can link against; and when
+  none qualifies, the newest SDK Zig's libc++ still compiles against (it does
+  not against the macOS 27 headers) is wrapped in a generated
   `.build/zig-macos-sdk`: symlinks into the real SDK, plus a copy of
   `libSystem.tbd` with arm64 listed beside arm64e. Only Zig's host link reads
   it; Xcode still links the app against the real SDK. A macos-15 release

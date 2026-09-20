@@ -117,7 +117,7 @@ sdk_links_with_zig() {
         grep -q "$(zig_host_target)"
 }
 
-# Every macOS SDK installed here, oldest first, as "<version> <real path>".
+# Every macOS SDK installed here as "<version> <real path>", oldest first.
 # The name is no guide: MacOSX.sdk is whatever the newest one happens to be.
 installed_macos_sdks() {
     local sdk
@@ -165,31 +165,65 @@ make_zig_sdk_shim() {
     ' "$base/usr/lib/libSystem.tbd" > "$shim/usr/lib/libSystem.tbd"
 }
 
-# The SDK Zig's build runner links against. An installed SDK that still lists
-# the host target is used as it is, oldest first — Zig $ZIG_VERSION predates
-# the newest headers too, and its libc++ does not compile against the macOS 27
-# SDK's. Xcode 26.4 and later dropped plain arm64 from libSystem.tbd, so on a
-# Mac that has only those the oldest one is wrapped in a shim instead.
+# The SDKs this build has always preferred, in that order. Zig uses the SDK it
+# is given for everything — the host link and ghostty's own macOS target — so a
+# release runner must keep getting the one it has always got.
+preferred_macos_sdks() {
+    printf '%s\n' \
+        /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk \
+        /Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk \
+        "$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
+}
+
+# The newest macOS SDK major whose headers Zig $ZIG_VERSION's bundled libc++
+# still compiles against. The macOS 27 SDK's do not (`INFINITY` undeclared
+# building libcxx), so a shim is never based on one while an older SDK exists.
+ZIG_NEWEST_SDK_MAJOR=26
+
+# The SDK Zig builds against, in order of preference:
+#   1. a preferred SDK Zig can link against as it is — unchanged behaviour
+#      wherever this build already worked;
+#   2. any other installed SDK it can link against, newest first;
+#   3. otherwise a shim. Xcode 26.4 and later dropped plain arm64 from
+#      libSystem.tbd, so a Mac with only those has nothing for 1 or 2. The
+#      shim wraps the newest SDK Zig's libc++ can still compile against.
 compatible_zig_macos_sdk() {
-    local version sdk oldest=""
+    local version sdk base="" fallback=""
+    while read -r sdk; do
+        if [ -d "$sdk" ] && sdk_links_with_zig "$sdk"; then
+            printf '%s\n' "$sdk"
+            return
+        fi
+    done < <(preferred_macos_sdks)
+
     while read -r version sdk; do
-        [ -n "$oldest" ] || oldest=$sdk
         if sdk_links_with_zig "$sdk"; then
             printf '%s\n' "$sdk"
             return
         fi
-    done < <(installed_macos_sdks)
-    if [ -z "$oldest" ]; then
+        # Newest first: the first one at or below the ceiling is the base.
+        [ -n "$fallback" ] || fallback=$sdk
+        if [ -z "$base" ] && [ "${version%%.*}" -le "$ZIG_NEWEST_SDK_MAJOR" ] 2>/dev/null; then
+            base=$sdk
+        fi
+    done < <(installed_macos_sdks | sort -rV)
+
+    if [ -z "$fallback" ]; then
         echo "no macOS SDK was found; install Xcode or the Command Line Tools" >&2
         exit 1
     fi
+    if [ -z "$base" ]; then
+        base=$fallback
+        echo "libghostty: only SDKs newer than macOS $ZIG_NEWEST_SDK_MAJOR are installed;" \
+            "Zig $ZIG_VERSION may fail to compile libc++ against $base" >&2
+    fi
     sdk="$BUILD_DIR/zig-macos-sdk"
-    make_zig_sdk_shim "$oldest" "$sdk"
+    make_zig_sdk_shim "$base" "$sdk"
     if ! sdk_links_with_zig "$sdk"; then
-        echo "could not make $oldest linkable for Zig $ZIG_VERSION" >&2
+        echo "could not make $base linkable for Zig $ZIG_VERSION" >&2
         exit 1
     fi
-    echo "libghostty: wrapped $oldest for Zig (its libSystem.tbd lists no $(zig_host_target))" >&2
+    echo "libghostty: wrapped $base for Zig (its libSystem.tbd lists no $(zig_host_target))" >&2
     printf '%s\n' "$sdk"
 }
 
