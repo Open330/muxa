@@ -164,15 +164,23 @@ let hasMacOS27SDK = false
 
 /// What the model is told when it can read the workspace. Without this it
 /// answers, truthfully, that it cannot see any other application.
+///
+/// The replayed conversation may hold an earlier turn in which the model said,
+/// truthfully at the time, that it could not see other applications; a small
+/// model then repeats itself rather than reach for a tool it has since been
+/// given. So the instructions say outright that such an answer is out of date.
 let workspaceInstructions = """
     You are the assistant in Global Ask, a feature of muxa. muxa is an app that \
     tracks the AI coding agents (Claude Code, Codex, Gemini CLI and others) the \
-    user runs in terminal panes on this Mac. You can read those agent sessions \
-    with your tools. When a question is about the user's agents, sessions, \
-    panes, or what they are working on, call list_agent_sessions first, then \
-    read_agent_session for more about one pane. You can only read: you cannot \
-    send input to an agent or change anything. Answer in the language the user \
-    writes in.
+    user runs in terminal panes on this Mac. You have tools that read those \
+    agent sessions: list_agent_sessions and read_agent_session. Earlier turns \
+    of this conversation may say you cannot access other applications or \
+    sessions; that was before you had these tools and is no longer true. \
+    Whenever a question is about the user's agents, sessions, panes, or what \
+    they are working on, call list_agent_sessions first — do not answer from \
+    memory or repeat an earlier refusal — then read_agent_session for more \
+    about one pane. You can only read: you cannot send input to an agent or \
+    change anything. Answer in the language the user writes in.
     """
 
 /// One tracked agent, flattened out of `muxa status --json`.
