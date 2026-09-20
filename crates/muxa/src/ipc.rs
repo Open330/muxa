@@ -8608,17 +8608,18 @@ mod tests {
         }
         let providers = client.ask_providers().await.unwrap();
         let ids: Vec<&str> = providers.iter().map(|info| info.id.as_str()).collect();
+        let mut expected = vec![
+            "anthropic-personal",
+            "anthropic-work",
+            "claude",
+            "codex",
+            "gemini",
+            "anthropic",
+            "openai",
+        ];
+        expected.push("apple");
         assert_eq!(
-            ids,
-            [
-                "anthropic-personal",
-                "anthropic-work",
-                "claude",
-                "codex",
-                "gemini",
-                "anthropic",
-                "openai",
-            ],
+            ids, expected,
             "composed instances lead, then the built-ins they do not cover"
         );
         // And they are selectable by their own ids.

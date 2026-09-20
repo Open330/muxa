@@ -198,6 +198,10 @@ title = "Anthropic (work)"          # optional; defaults to a humanized id
 model = "claude-opus-5"             # optional
 api_key_env = "WORK_ANTHROPIC_KEY"  # optional; this instance's own key
 executable = "/opt/homebrew/bin/claude"  # optional; CLI engines only
+
+[ask.providers.apple-cloud]         # Apple's models (macOS 26+): no key at all
+engine = "apple"
+model = "private-cloud"             # on-device (default) | private-cloud (macOS 27+)
 ```
 
 Opt-in headless questions from `muxa watch`: `a` composes one, `A` browses
@@ -237,24 +241,54 @@ for the schema, limits, privacy boundary, and free versus paid tests.
 
 An **engine** is the code that drives a provider: the argv a CLI takes, the
 JSON an API answers with, the environment variable its key lives in. There
-are five and they are fixed — `claude`, `codex`, and `gemini` drive the
+are six and they are fixed — `claude`, `codex`, and `gemini` drive the
 agent CLIs in print mode (`claude -p`, `codex exec --json`, `gemini -p
 --output-format json`) and resume their own sessions between questions;
 `anthropic` and `openai` call the Messages and Chat Completions APIs
-directly over HTTPS. API engines have no session to resume, so muxad
-replays the conversation's earlier turns from its own history — the most
-recent 40 turns or 60k characters — ahead of each question; `cwd`,
-`additional_dirs`, and `permission_mode` do not apply to them.
+directly over HTTPS; `apple` runs the Mac's own Foundation Models. API
+engines have no session to resume, so muxad replays the conversation's
+earlier turns from its own history — the most recent 40 turns or 60k
+characters — ahead of each question; `cwd`, `additional_dirs`, and
+`permission_mode` do not apply to them.
+
+`apple` (macOS 26 or later, with Apple Intelligence turned on) takes no key
+and sends nothing to a vendor account. `model` picks between the two system
+models: `on-device`, the default, which never leaves the Mac and has an
+8,192-token context; and `private-cloud`, Apple's Private Cloud Compute
+(macOS 27 or later, 32,768 tokens, subject to Apple's usage quota). The
+framework is Swift-only, so muxad reaches it through `muxa-afm`, a small
+helper that ships in `Muxa.app/Contents/Helpers`. muxad looks for it beside
+its own executable, then in `/Applications/Muxa.app`, then on `PATH`;
+`executable` names another copy. Like the APIs it keeps no session, so the
+conversation is replayed — cut to 6k characters to fit the on-device
+window, and cut further by the helper if the model still reports an
+overflow. `cwd`, `additional_dirs`, and `permission_mode` do not apply:
+these models answer questions and touch no files.
+
+The agent CLIs can look at your workspace because they have a shell; a bare
+model cannot, and would answer that it has no access to other applications.
+So on a Global Ask turn the helper gives the model two read-only tools,
+answered by `muxa status --json` and `muxa recap` against the daemon the
+question came from: `list_agent_sessions` (every tracked agent — pane, state,
+title, directory, latest prompt and reply) and `read_agent_session` (one pane
+in detail). It can read; it cannot send input to an agent or change anything.
+The model decides when to call them, so nothing is read for a question that
+is not about your agents. With `on-device` what it reads never leaves the
+Mac; with `private-cloud` it is sent to Apple's Private Cloud Compute along
+with the question. One-shot turns such as `muxa work init` get no tools. The
+built-in `apple` provider is listed on every host, so one config.toml can
+serve a Mac and a Linux box; a turn on a host that cannot run it fails with a
+plain "runs only on macOS".
 
 A **provider** is an `[ask.providers.<id>]` table you compose. The id is
 yours to pick (a TOML bare key: letters, digits, `-`, `_`), and `engine`
-says which of the five drives it. Several providers may share one engine —
+says which of the six drives it. Several providers may share one engine —
 a work and a personal OpenAI account, two Anthropic keys, a second `claude`
 binary — and each keeps its own conversation, so switching between them
 resumes rather than restarts. `[ask] agent` and `muxa ask --agent` name a
 provider id, not an engine.
 
-The five engine ids are also providers of themselves, so a fresh install
+The engine ids are also providers of themselves, so a fresh install
 works with no `[ask.providers]` at all: `muxa ask providers` lists what you
 composed first, then every built-in no id of yours has taken over. A table
 named after a built-in and *without* `engine` tunes that built-in — which

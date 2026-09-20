@@ -38,7 +38,7 @@ pub struct InitArgs {
     /// Describe the setup in your own words. Omit to be asked.
     #[arg(long)]
     pub describe: Option<String>,
-    /// Resolver: claude, codex, gemini, anthropic, or openai. Defaults to
+    /// Resolver: claude, codex, gemini, anthropic, openai, or apple. Defaults to
     /// `[ticket].agent`.
     #[arg(long)]
     pub agent: Option<String>,
@@ -424,9 +424,10 @@ program = 'claude'
     #[test]
     fn only_providers_that_could_actually_run_are_offered() {
         let none = BTreeMap::new();
-        // Every CLI installed, no key anywhere: the three CLIs, in order.
+        // Every CLI installed, no key anywhere: the three agent CLIs, in
+        // order, then the keyless apple helper.
         let all = available_agents(&none, &|_| true, &|_| None);
-        assert_eq!(all, ["claude", "codex", "gemini"]);
+        assert_eq!(all, ["claude", "codex", "gemini", "apple"]);
         // The launcher knows agy/opencode; the headless bridge does not, so
         // they must never appear here however installed.
         assert!(!all.iter().any(|name| name == "agy"), "{all:?}");

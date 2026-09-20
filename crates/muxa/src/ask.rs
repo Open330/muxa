@@ -61,6 +61,19 @@ const API_MAX_TOKENS: u32 = 8192;
 pub const REPLAY_MAX_TURNS: usize = 40;
 /// …and at most this many characters of them, newest first.
 pub const REPLAY_MAX_CHARS: usize = 60_000;
+/// The same budget for the `apple` engine. Its on-device model has an
+/// 8,192-token window shared by the replay, the prompt, and the answer, so
+/// the replay gets a fraction of what an API is sent. The helper drops more
+/// of it when the model still reports an overflow — characters are only an
+/// estimate of tokens, and a poor one outside English.
+pub const APPLE_REPLAY_MAX_CHARS: usize = 6_000;
+
+/// The bridge to Apple's Foundation Models. It ships in
+/// `Muxa.app/Contents/Helpers`, next to the bundled `muxad`.
+const APPLE_HELPER: &str = "muxa-afm";
+/// Where the helper is when this `muxad` is not the bundled one — a
+/// Homebrew daemon serving an installed app.
+const APPLE_HELPER_IN_APP: &str = "/Applications/Muxa.app/Contents/Helpers/muxa-afm";
 
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -117,6 +130,11 @@ pub struct AskOptions {
     /// The `config.toml` the daemon read `[ask]` from, so provider settings
     /// can be written back where they came from.
     pub config_path: Option<PathBuf>,
+    /// The daemon's own IPC socket. An engine with no shell of its own —
+    /// `apple` — is handed it so its helper can read the workspace back
+    /// (which agents are running, what they were last asked) the way the
+    /// agent CLIs can by running `muxa status` themselves.
+    pub socket: Option<PathBuf>,
 }
 
 /// One-turn provider credential. It is accepted only over the owner-only IPC
@@ -152,6 +170,7 @@ impl Default for AskOptions {
             keep: DEFAULT_KEEP,
             providers: BTreeMap::new(),
             config_path: None,
+            socket: None,
         }
     }
 }
@@ -763,12 +782,13 @@ impl AskStore {
             return Err(AskError::ConversationBusy);
         }
         let resume = conversation.agent_session_id.clone();
-        // API providers remember nothing between calls; the store is their
-        // thread. Read it before the new entry joins so the prompt being
-        // asked is not replayed as history.
-        let history = match provider.kind() {
-            AskProviderKind::Api => replay_history(&self.entries.read().await, &conversation_id),
-            AskProviderKind::Cli => Vec::new(),
+        // API providers and the apple helper remember nothing between
+        // calls; the store is their thread. Read it before the new entry
+        // joins so the prompt being asked is not replayed as history.
+        let history = if provider.engine.replays_history() {
+            replay_history(&self.entries.read().await, &conversation_id)
+        } else {
+            Vec::new()
         };
         let engine = provider.engine;
         let now = OffsetDateTime::now_utc();
@@ -829,6 +849,10 @@ impl AskStore {
                     model: provider.model(),
                     executable: provider.executable(),
                     api_key: api_key.as_deref(),
+                    workspace: store.opts.socket.as_deref().map(|socket| Workspace {
+                        socket,
+                        config: store.opts.config_path.as_deref(),
+                    }),
                 })
                 .await;
             store.finish(&id, outcome).await;
@@ -877,6 +901,7 @@ impl AskStore {
                 model: provider.model(),
                 executable: provider.executable(),
                 api_key: api_key.as_deref(),
+                workspace: None,
             })
             .await
             .map_err(AskError::Io)
@@ -920,6 +945,7 @@ impl AskStore {
                     model: instance.model(),
                     executable: None,
                     api_key: api_key.as_deref(),
+                    workspace: None,
                 },
                 Some(instruction),
             )
@@ -1243,7 +1269,7 @@ pub struct OneShot<'a> {
 /// built on them are not: a new instance is config, a new engine is code.
 #[must_use]
 pub fn supported_agents() -> &'static [&'static str] {
-    &["claude", "codex", "gemini", "anthropic", "openai"]
+    &["claude", "codex", "gemini", "anthropic", "openai", "apple"]
 }
 
 /// The engine a built-in provider id drives, or `None` for an id the
@@ -1480,6 +1506,7 @@ pub async fn one_shot_configured(
             model: instance.model(),
             executable: instance.executable(),
             api_key: api_key.as_deref(),
+            workspace: None,
         })
         .await
         .map_err(AskError::Io)
@@ -1512,7 +1539,8 @@ pub struct AskProviderInfo {
     /// The CLI binary for `cli` providers, including an instance's
     /// `executable` override; `null` for APIs.
     pub executable: Option<String>,
-    /// Environment variable the provider's key is read from.
+    /// Environment variable the provider's key is read from. Empty for an
+    /// engine that takes no key at all (`apple`).
     pub credential_env: String,
     /// `false` for CLIs, which may be logged in already.
     pub credential_required: bool,
@@ -1527,7 +1555,7 @@ pub struct AskProviderInfo {
     pub model: Option<String>,
     /// Mirrors the store's current agent.
     pub selected: bool,
-    /// One of the five ids muxa ships. A built-in is always listed, with
+    /// One of the ids muxa ships. A built-in is always listed, with
     /// or without an `[ask.providers.<id>]` table, and `ask_provider_remove`
     /// only ever clears that table rather than taking the row away.
     #[serde(default)]
@@ -1592,16 +1620,21 @@ pub enum AskEngine {
     Gemini,
     Anthropic,
     OpenAi,
+    /// Apple's Foundation Models — the on-device model, or Private Cloud
+    /// Compute — reached through the `muxa-afm` helper because the
+    /// framework is Swift-only and has no CLI of its own.
+    Apple,
 }
 
 impl AskEngine {
     /// Every provider, in the order clients list them.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Claude,
         Self::Codex,
         Self::Gemini,
         Self::Anthropic,
         Self::OpenAi,
+        Self::Apple,
     ];
 
     #[must_use]
@@ -1612,6 +1645,7 @@ impl AskEngine {
             "gemini" => Some(Self::Gemini),
             "anthropic" => Some(Self::Anthropic),
             "openai" => Some(Self::OpenAi),
+            "apple" => Some(Self::Apple),
             _ => None,
         }
     }
@@ -1625,6 +1659,7 @@ impl AskEngine {
             Self::Gemini => "gemini",
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
+            Self::Apple => "apple",
         }
     }
 
@@ -1636,14 +1671,41 @@ impl AskEngine {
             Self::Gemini => "Gemini CLI",
             Self::Anthropic => "Anthropic API",
             Self::OpenAi => "OpenAI API",
+            Self::Apple => "Apple Intelligence",
         }
     }
 
     #[must_use]
     pub fn kind(self) -> AskProviderKind {
         match self {
-            Self::Claude | Self::Codex | Self::Gemini => AskProviderKind::Cli,
+            // `apple` is a CLI as far as a client can tell: a binary that
+            // is either there or not, and no key to ask for.
+            Self::Claude | Self::Codex | Self::Gemini | Self::Apple => AskProviderKind::Cli,
             Self::Anthropic | Self::OpenAi => AskProviderKind::Api,
+        }
+    }
+
+    /// Whether this host can run the engine. The built-in list is the same
+    /// everywhere — one `config.toml` may serve a Mac and a Linux box, and
+    /// clients rely on every id in [`supported_agents`] being listed — so
+    /// `apple` is offered on Linux too, and a turn there fails with a plain
+    /// "runs only on macOS" rather than the row quietly missing.
+    #[must_use]
+    pub fn runs_on_this_host(self) -> bool {
+        match self {
+            Self::Apple => cfg!(target_os = "macos"),
+            Self::Claude | Self::Codex | Self::Gemini | Self::Anthropic | Self::OpenAi => true,
+        }
+    }
+
+    /// Whether the store is this engine's thread. The agent CLIs resume a
+    /// session of their own; an API and the `apple` helper remember nothing
+    /// between calls, so every turn carries the conversation with it.
+    #[must_use]
+    pub fn replays_history(self) -> bool {
+        match self {
+            Self::Anthropic | Self::OpenAi | Self::Apple => true,
+            Self::Claude | Self::Codex | Self::Gemini => false,
         }
     }
 
@@ -1654,12 +1716,14 @@ impl AskEngine {
             Self::Claude => Some("claude"),
             Self::Codex => Some("codex"),
             Self::Gemini => Some("gemini"),
+            Self::Apple => Some(APPLE_HELPER),
             Self::Anthropic | Self::OpenAi => None,
         }
     }
 
     /// The environment variable the provider's key is read from — and, for
-    /// a one-turn credential, written to in the child's environment.
+    /// a one-turn credential, written to in the child's environment. Empty
+    /// for `apple`, which has no key: the model belongs to the signed-in Mac.
     #[must_use]
     pub fn credential_env(self) -> &'static str {
         match self {
@@ -1667,6 +1731,7 @@ impl AskEngine {
             Self::Codex => "CODEX_API_KEY",
             Self::Gemini => "GEMINI_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
+            Self::Apple => "",
         }
     }
 
@@ -1677,12 +1742,14 @@ impl AskEngine {
     }
 
     /// The model an API provider uses when none is configured. CLIs pick
-    /// their own.
+    /// their own. `apple` names its default so a client can show which of
+    /// the two system models a turn runs on; `private-cloud` is the other.
     #[must_use]
     pub fn default_model(self) -> Option<&'static str> {
         match self {
             Self::Anthropic => Some("claude-sonnet-5"),
             Self::OpenAi => Some("gpt-5"),
+            Self::Apple => Some("on-device"),
             Self::Claude | Self::Codex | Self::Gemini => None,
         }
     }
@@ -1691,7 +1758,7 @@ impl AskEngine {
         match self {
             Self::Anthropic => ANTHROPIC_MESSAGES_URL,
             Self::OpenAi => OPENAI_CHAT_URL,
-            Self::Claude | Self::Codex | Self::Gemini => "",
+            Self::Claude | Self::Codex | Self::Gemini | Self::Apple => "",
         }
     }
 
@@ -1803,14 +1870,16 @@ impl AskEngine {
                 }
                 ("gemini", args)
             }
-            Self::Anthropic | Self::OpenAi => ("", Vec::new()),
+            // `apple` takes its turn as JSON on stdin; see `run_apple`.
+            Self::Anthropic | Self::OpenAi | Self::Apple => ("", Vec::new()),
         }
     }
 
     async fn run(self, turn: Turn<'_>) -> Result<AskAnswer, String> {
-        match self.kind() {
-            AskProviderKind::Cli => self.run_cli(&turn).await,
-            AskProviderKind::Api => self.call_api(self.api_url(), &turn).await,
+        match self {
+            Self::Claude | Self::Codex | Self::Gemini => self.run_cli(&turn).await,
+            Self::Anthropic | Self::OpenAi => self.call_api(self.api_url(), &turn).await,
+            Self::Apple => run_apple(&turn).await,
         }
     }
 
@@ -1849,6 +1918,7 @@ impl AskEngine {
             Self::Codex => parse_codex_jsonl(&stdout),
             Self::Gemini => parse_gemini_json(&stdout),
             Self::Anthropic | Self::OpenAi => unreachable!("API providers do not spawn"),
+            Self::Apple => unreachable!("the apple engine runs through run_apple"),
         }
     }
 
@@ -1904,7 +1974,9 @@ impl AskEngine {
                 .post(url)
                 .bearer_auth(api_key)
                 .json(&openai_body(model, &messages)),
-            Self::Claude | Self::Codex | Self::Gemini => unreachable!("CLI providers spawn"),
+            Self::Claude | Self::Codex | Self::Gemini | Self::Apple => {
+                unreachable!("CLI providers spawn")
+            }
         };
         let response = request.send().await.map_err(|e| {
             if e.is_timeout() {
@@ -1924,9 +1996,112 @@ impl AskEngine {
         match self {
             Self::Anthropic => parse_anthropic_response(status, &body),
             Self::OpenAi => parse_openai_response(status, &body),
-            Self::Claude | Self::Codex | Self::Gemini => unreachable!("CLI providers spawn"),
+            Self::Claude | Self::Codex | Self::Gemini | Self::Apple => {
+                unreachable!("CLI providers spawn")
+            }
         }
     }
+}
+
+/// The helper a bare `muxa-afm` means: beside this executable, which is
+/// where the bundled `muxad` finds it; else inside an installed `Muxa.app`,
+/// for a Homebrew `muxad` serving that app; else whatever `PATH` holds. A
+/// path the operator configured is used as written. `exists` is injected so
+/// the order is testable without touching the filesystem.
+fn resolve_apple_helper(
+    configured: &str,
+    current_exe: Option<&Path>,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if configured != APPLE_HELPER {
+        return PathBuf::from(configured);
+    }
+    let beside = current_exe
+        .and_then(Path::parent)
+        .map(|directory| directory.join(APPLE_HELPER));
+    beside
+        .into_iter()
+        .chain([PathBuf::from(APPLE_HELPER_IN_APP)])
+        .find(|candidate| exists(candidate))
+        .unwrap_or_else(|| PathBuf::from(APPLE_HELPER))
+}
+
+/// The request `muxa-afm` reads on stdin. The prompt travels here rather
+/// than in argv because the replayed conversation comes with it.
+fn apple_request(turn: &Turn<'_>) -> serde_json::Value {
+    let history: Vec<serde_json::Value> = budgeted_turns(turn.history, APPLE_REPLAY_MAX_CHARS)
+        .into_iter()
+        .map(|exchange| serde_json::json!({"prompt": exchange.prompt, "answer": exchange.answer}))
+        .collect();
+    let mut request = serde_json::json!({
+        "prompt": turn.prompt,
+        "history": history,
+        "model": turn.model,
+    });
+    // With this the helper offers the model read-only tools over the
+    // operator's agent sessions. Without it the model can only say, rightly,
+    // that it cannot see any other application.
+    if let Some(workspace) = turn.workspace {
+        request["muxa"] = serde_json::json!({
+            "socket": workspace.socket,
+            "config": workspace.config,
+        });
+    }
+    request
+}
+
+/// One turn through `muxa-afm`: the request on stdin, one JSON object on
+/// stdout, and on failure a non-zero exit whose last stderr line is the
+/// reason — written by the helper for a person, so it is reported as is.
+async fn run_apple(turn: &Turn<'_>) -> Result<AskAnswer, String> {
+    use tokio::io::AsyncWriteExt;
+
+    let title = AskEngine::Apple.title();
+    if !AskEngine::Apple.runs_on_this_host() {
+        return Err(format!("{title} runs only on macOS 26 or later"));
+    }
+    let current_exe = std::env::current_exe().ok();
+    let helper = resolve_apple_helper(
+        turn.executable.unwrap_or(APPLE_HELPER),
+        current_exe.as_deref(),
+        Path::is_file,
+    );
+    let mut child = tokio::process::Command::new(&helper)
+        .current_dir(turn.cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "{title}: the {APPLE_HELPER} helper was not found — it ships in \
+                     Muxa.app/Contents/Helpers; point [ask.providers.apple] executable at it"
+                )
+            } else {
+                format!("spawning {}: {e}", helper.display())
+            }
+        })?;
+    let request = apple_request(turn).to_string();
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    let exchange = async {
+        // A helper that refuses the request exits before reading all of it;
+        // its stderr says why, so a broken pipe here is not the error.
+        let _ = stdin.write_all(request.as_bytes()).await;
+        drop(stdin);
+        child.wait_with_output().await
+    };
+    let output = tokio::time::timeout(turn.timeout, exchange)
+        .await
+        .map_err(|_| timeout_message(title, turn.timeout))?
+        .map_err(|e| format!("{title}: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim().lines().next_back().unwrap_or("no stderr");
+        return Err(format!("{title}: {detail}"));
+    }
+    parse_apple_json(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Everything one provider turn needs, resolved by the caller so the
@@ -1945,6 +2120,17 @@ struct Turn<'a> {
     /// Binary a CLI engine spawns, when the instance overrides it.
     executable: Option<&'a str>,
     api_key: Option<&'a str>,
+    /// Read access to the workspace for an engine that cannot get it on its
+    /// own. Only a Global Ask turn carries it: a one-shot drafting turn is
+    /// about the text it was given, not about the operator's agents.
+    workspace: Option<Workspace<'a>>,
+}
+
+/// Where the daemon answering this turn listens, and the config it loaded.
+#[derive(Debug, Clone, Copy)]
+struct Workspace<'a> {
+    socket: &'a Path,
+    config: Option<&'a Path>,
 }
 
 fn timeout_message(what: &str, timeout: Duration) -> String {
@@ -1969,6 +2155,11 @@ fn resolve_api_key(
     credential: Option<String>,
     env: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
+    // An engine with no key variable takes no key from anywhere, so a stray
+    // `api_key_env` on an `apple` instance never reads as "key present".
+    if instance.credential_env().is_empty() {
+        return None;
+    }
     credential
         .filter(|key| !key.trim().is_empty())
         .or_else(|| env(instance.credential_env()))
@@ -2012,18 +2203,9 @@ pub struct ChatMessage {
 /// followed by the new prompt.
 #[must_use]
 pub fn replay_messages(history: &[ReplayTurn], prompt: &str) -> Vec<ChatMessage> {
-    let mut kept = Vec::new();
-    let mut chars = 0usize;
-    for turn in history.iter().rev() {
-        let size = turn.prompt.chars().count() + turn.answer.chars().count();
-        if kept.len() >= REPLAY_MAX_TURNS || chars + size > REPLAY_MAX_CHARS {
-            break;
-        }
-        chars += size;
-        kept.push(turn);
-    }
+    let kept = budgeted_turns(history, REPLAY_MAX_CHARS);
     let mut messages = Vec::with_capacity(kept.len() * 2 + 1);
-    for turn in kept.into_iter().rev() {
+    for turn in kept {
         messages.push(ChatMessage {
             role: "user",
             content: turn.prompt.clone(),
@@ -2038,6 +2220,23 @@ pub fn replay_messages(history: &[ReplayTurn], prompt: &str) -> Vec<ChatMessage>
         content: prompt.to_string(),
     });
     messages
+}
+
+/// The newest turns of `history` that fit [`REPLAY_MAX_TURNS`] and
+/// `max_chars`, oldest first. Whole turns only.
+fn budgeted_turns(history: &[ReplayTurn], max_chars: usize) -> Vec<&ReplayTurn> {
+    let mut kept = Vec::new();
+    let mut chars = 0usize;
+    for turn in history.iter().rev() {
+        let size = turn.prompt.chars().count() + turn.answer.chars().count();
+        if kept.len() >= REPLAY_MAX_TURNS || chars + size > max_chars {
+            break;
+        }
+        chars += size;
+        kept.push(turn);
+    }
+    kept.reverse();
+    kept
 }
 
 /// `POST /v1/messages` body: `{model, max_tokens, system?, messages}`.
@@ -2186,6 +2385,23 @@ fn parse_claude_json(stdout: &str) -> Result<AskAnswer, String> {
         cost_usd: value
             .get("total_cost_usd")
             .and_then(serde_json::Value::as_f64),
+    })
+}
+
+/// `muxa-afm` answers with `{"result": …, "model": …}`. There is no session
+/// to resume and nothing is billed, so the text is the whole answer.
+fn parse_apple_json(stdout: &str) -> Result<AskAnswer, String> {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("parsing {APPLE_HELPER} JSON: {e}"))?;
+    let text = value
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{APPLE_HELPER} JSON has no result field"))?
+        .to_string();
+    Ok(AskAnswer {
+        text,
+        session_id: None,
+        cost_usd: None,
     })
 }
 
@@ -2483,6 +2699,13 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// `ids`, then the `apple` built-in, which closes every built-in list.
+    fn with_host_builtins(ids: &[&'static str]) -> Vec<&'static str> {
+        let mut ids = ids.to_vec();
+        ids.push("apple");
+        ids
+    }
+
     /// The built-in instance for one engine, as `provider_instances` would
     /// mint it with no `[ask.providers]` at all.
     fn builtin(engine: AskEngine) -> AskProviderInstance {
@@ -2658,7 +2881,7 @@ mod tests {
     fn every_provider_id_round_trips_in_the_documented_order() {
         assert_eq!(
             supported_agents(),
-            &["claude", "codex", "gemini", "anthropic", "openai"]
+            &["claude", "codex", "gemini", "anthropic", "openai", "apple"]
         );
         for (provider, id) in AskEngine::ALL.iter().zip(supported_agents()) {
             assert_eq!(provider.id(), *id);
@@ -2706,10 +2929,13 @@ mod tests {
         // Configured ids lead, in id order; the untouched built-ins follow
         // in their own.
         let ids: Vec<&str> = infos.iter().map(|info| info.id.as_str()).collect();
-        assert_eq!(ids, ["codex", "openai", "claude", "gemini", "anthropic"]);
+        assert_eq!(
+            ids,
+            with_host_builtins(&["codex", "openai", "claude", "gemini", "anthropic"])
+        );
         assert!(
             infos.iter().all(|info| info.builtin),
-            "all five are built in"
+            "every listed row is built in"
         );
         // `configured` is the other question: which rows have a table.
         assert_eq!(
@@ -2986,6 +3212,7 @@ mod tests {
             model,
             executable: None,
             api_key: Some(api_key),
+            workspace: None,
         };
         let answer = AskEngine::Anthropic
             .call_api(
@@ -3053,6 +3280,7 @@ mod tests {
                         model: Some("test-model"),
                         executable: None,
                         api_key: Some("test-key"),
+                        workspace: None,
                     },
                     Some("trusted policy"),
                 )
@@ -3677,7 +3905,10 @@ mod tests {
 
         let instances = provider_instances(&config.ask.providers);
         let ids: Vec<&str> = instances.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, ["anthropic", "claude", "codex", "gemini", "openai"]);
+        assert_eq!(
+            ids,
+            with_host_builtins(&["anthropic", "claude", "codex", "gemini", "openai"])
+        );
         assert!(instances.iter().all(|i| i.builtin));
         // A tuned built-in is both built in and configured; the three with
         // no table are built in only.
@@ -3775,12 +4006,12 @@ mod tests {
         assert_eq!(work.title, "Anthropic (work)");
         assert_eq!(personal.title, "Anthropic Personal");
 
-        // Both are offered, ahead of the five that ship with muxa.
+        // Both are offered, ahead of the ones that ship with muxa.
         let infos = provider_infos(&providers, "anthropic-work", env);
         let ids: Vec<&str> = infos.iter().map(|info| info.id.as_str()).collect();
         assert_eq!(
             ids,
-            [
+            with_host_builtins(&[
                 "anthropic-work",
                 "anthropic_personal",
                 "claude",
@@ -3788,7 +4019,7 @@ mod tests {
                 "gemini",
                 "anthropic",
                 "openai",
-            ]
+            ])
         );
         assert_eq!(
             infos
@@ -3904,6 +4135,292 @@ mod tests {
         )
         .unwrap();
         assert_eq!(api.executable(), None);
+    }
+
+    #[test]
+    fn the_apple_engine_is_a_keyless_cli_that_replays_its_thread() {
+        let apple = AskEngine::Apple;
+        assert_eq!(apple.kind(), AskProviderKind::Cli);
+        assert_eq!(apple.executable(), Some("muxa-afm"));
+        assert_eq!(apple.credential_env(), "");
+        assert!(!apple.credential_required());
+        assert_eq!(apple.default_model(), Some("on-device"));
+        // The CLIs resume their own session; this one has none to resume.
+        assert!(apple.replays_history());
+        assert!(!AskEngine::Claude.replays_history());
+        assert!(AskEngine::OpenAi.replays_history());
+        assert_eq!(apple.runs_on_this_host(), cfg!(target_os = "macos"));
+
+        // No variable to read, so no key ever resolves — and none is needed.
+        let info = instance_info(&builtin(apple), "apple", |_| Some("ambient".into()));
+        assert!(!info.credential_present);
+        assert!(!info.credential_required);
+        assert_eq!(info.model.as_deref(), Some("on-device"));
+        assert!(info.selected);
+
+        // The second system model is an ordinary instance of the engine.
+        let cloud = resolve_instance(
+            "apple-cloud",
+            &AskProviderConfig {
+                engine: Some("apple".into()),
+                model: Some("private-cloud".into()),
+                ..AskProviderConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cloud.engine, apple);
+        assert_eq!(cloud.model(), Some("private-cloud"));
+        assert_eq!(cloud.title, "Apple Cloud");
+        // A configured instance leads the list, as any configured one does.
+        let providers = BTreeMap::from([(
+            "apple-cloud".to_string(),
+            AskProviderConfig {
+                engine: Some("apple".into()),
+                ..AskProviderConfig::default()
+            },
+        )]);
+        assert_eq!(provider_instances(&providers)[0].id, "apple-cloud");
+    }
+
+    #[test]
+    fn the_apple_helper_is_found_beside_muxad_then_in_the_app_then_on_path() {
+        let bundled = Path::new("/Applications/Muxa.app/Contents/Helpers/muxad");
+        let homebrew = Path::new("/opt/homebrew/bin/muxad");
+        let everything = |_: &Path| true;
+        let nothing = |_: &Path| false;
+
+        // The bundled daemon: its sibling.
+        assert_eq!(
+            resolve_apple_helper("muxa-afm", Some(bundled), everything),
+            Path::new("/Applications/Muxa.app/Contents/Helpers/muxa-afm")
+        );
+        // A Homebrew daemon has no sibling, so the installed app's copy.
+        assert_eq!(
+            resolve_apple_helper("muxa-afm", Some(homebrew), |candidate| {
+                candidate == Path::new(APPLE_HELPER_IN_APP)
+            }),
+            Path::new(APPLE_HELPER_IN_APP)
+        );
+        // Neither: leave it to PATH, where a developer may have put one.
+        assert_eq!(
+            resolve_apple_helper("muxa-afm", Some(homebrew), nothing),
+            Path::new("muxa-afm")
+        );
+        assert_eq!(
+            resolve_apple_helper("muxa-afm", None, nothing),
+            Path::new("muxa-afm")
+        );
+        // What the operator configured is used as written, found or not.
+        assert_eq!(
+            resolve_apple_helper("/custom/muxa-afm", Some(bundled), nothing),
+            Path::new("/custom/muxa-afm")
+        );
+    }
+
+    #[test]
+    fn the_apple_request_carries_a_replay_cut_to_the_on_device_budget() {
+        let turn = |prompt: &str, answer: &str| ReplayTurn {
+            prompt: prompt.into(),
+            answer: answer.into(),
+        };
+        // Three turns of 2,500 characters: only the newest two fit 6,000.
+        let filler = "x".repeat(2_490);
+        let history = [
+            turn("oldest", &filler),
+            turn("middle", &filler),
+            turn("newest", &filler),
+        ];
+        let request = apple_request(&Turn {
+            prompt: "now",
+            resume: None,
+            history: &history,
+            cwd: Path::new("."),
+            permission_mode: AskPermissionMode::Default,
+            additional_dirs: &[],
+            timeout: Duration::from_secs(5),
+            model: Some("private-cloud"),
+            executable: None,
+            api_key: None,
+            workspace: None,
+        });
+        assert_eq!(request["prompt"], "now");
+        assert_eq!(request["model"], "private-cloud");
+        let replayed: Vec<&str> = request["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|exchange| exchange["prompt"].as_str().unwrap())
+            .collect();
+        assert_eq!(replayed, ["middle", "newest"], "oldest first, whole turns");
+        assert_eq!(request["history"][1]["answer"], filler.as_str());
+        // A one-shot turn is about its own text: no way back into muxa.
+        assert!(request.get("muxa").is_none());
+    }
+
+    #[test]
+    fn a_global_ask_turn_hands_the_apple_helper_the_way_back_to_muxad() {
+        let request = apple_request(&Turn {
+            prompt: "which of my agents is waiting on me?",
+            resume: None,
+            history: &[],
+            cwd: Path::new("."),
+            permission_mode: AskPermissionMode::Default,
+            additional_dirs: &[],
+            timeout: Duration::from_secs(5),
+            model: None,
+            executable: None,
+            api_key: None,
+            workspace: Some(Workspace {
+                socket: Path::new("/tmp/muxa-501.sock"),
+                config: Some(Path::new("/etc/muxa/config.toml")),
+            }),
+        });
+        assert_eq!(
+            request["muxa"],
+            serde_json::json!({
+                "socket": "/tmp/muxa-501.sock",
+                "config": "/etc/muxa/config.toml",
+            })
+        );
+    }
+
+    #[test]
+    fn the_apple_answer_is_the_result_field() {
+        let answer =
+            parse_apple_json("{\"model\":\"on-device\",\"result\":\"tmux multiplexes\"}\n")
+                .unwrap();
+        assert_eq!(answer.text, "tmux multiplexes");
+        assert_eq!(answer.session_id, None);
+        assert_eq!(answer.cost_usd, None);
+        assert!(parse_apple_json("{\"model\":\"on-device\"}")
+            .unwrap_err()
+            .contains("no result field"));
+        assert!(parse_apple_json("not json").is_err());
+    }
+
+    /// An executable script standing in for `muxa-afm`.
+    #[cfg(target_os = "macos")]
+    fn fake_apple_helper(directory: &Path, name: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = directory.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_apple_conversation_is_replayed_to_the_helper_on_stdin() {
+        let directory = tempdir().unwrap();
+        // Records each request it is sent, and answers with how many it saw.
+        let helper = fake_apple_helper(
+            directory.path(),
+            "muxa-afm",
+            "n=$(ls request-*.json 2>/dev/null | wc -l | tr -d ' ')\n\
+             cat > \"request-$n.json\"\n\
+             printf '{\"model\":\"on-device\",\"result\":\"answer %s\"}' \"$n\"",
+        );
+        let store = AskStore::in_memory(AskOptions {
+            enabled: true,
+            agent: "apple".into(),
+            cwd: directory.path().to_path_buf(),
+            socket: Some(PathBuf::from("/tmp/muxa-test.sock")),
+            providers: BTreeMap::from([(
+                "apple".to_string(),
+                AskProviderConfig {
+                    executable: Some(helper.display().to_string()),
+                    ..AskProviderConfig::default()
+                },
+            )]),
+            ..AskOptions::default()
+        });
+
+        let answered = |id: String| {
+            let store = Arc::clone(&store);
+            async move {
+                for _ in 0..200 {
+                    let entries = store.list().await;
+                    let entry = entries.iter().find(|entry| entry.id == id).unwrap();
+                    if entry.status != AskStatus::Running {
+                        return entry.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                panic!("the fake helper never answered");
+            }
+        };
+        let first = answered(store.ask("first question").await.unwrap().id).await;
+        assert_eq!(first.status, AskStatus::Answered, "{:?}", first.error);
+        assert_eq!(first.answer, "answer 0");
+        assert_eq!(first.agent_session_id, None, "nothing to resume");
+        let second = answered(store.ask("second question").await.unwrap().id).await;
+        assert_eq!(second.answer, "answer 1");
+
+        let request = |n: usize| -> serde_json::Value {
+            let text = std::fs::read_to_string(directory.path().join(format!("request-{n}.json")))
+                .unwrap();
+            serde_json::from_str(&text).unwrap()
+        };
+        assert_eq!(request(0)["prompt"], "first question");
+        assert_eq!(request(0)["history"], serde_json::json!([]));
+        assert_eq!(request(0)["model"], "on-device");
+        // A conversation turn can read the workspace back through muxad.
+        assert_eq!(request(0)["muxa"]["socket"], "/tmp/muxa-test.sock");
+        // The store is the thread: the first exchange rides along.
+        assert_eq!(request(1)["prompt"], "second question");
+        assert_eq!(
+            request(1)["history"],
+            serde_json::json!([{"prompt": "first question", "answer": "answer 0"}])
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_apple_failure_reports_the_helpers_own_reason() {
+        let directory = tempdir().unwrap();
+        let helper = fake_apple_helper(
+            directory.path(),
+            "muxa-afm",
+            "cat > /dev/null\necho 'noise' >&2\necho 'Apple Intelligence is turned off' >&2\nexit 3",
+        );
+        let one_shot = |executable: String| {
+            let cwd = directory.path().to_path_buf();
+            async move {
+                one_shot_configured(
+                    OneShot {
+                        agent: "apple",
+                        prompt: "hi",
+                        cwd: &cwd,
+                        permission_mode: AskPermissionMode::Default,
+                        additional_dirs: &[],
+                        timeout: Duration::from_secs(30),
+                    },
+                    Some(&AskProviderConfig {
+                        executable: Some(executable),
+                        ..AskProviderConfig::default()
+                    }),
+                )
+                .await
+            }
+        };
+        let AskError::Io(reason) = one_shot(helper.display().to_string()).await.unwrap_err() else {
+            panic!("a helper failure is an Io error");
+        };
+        assert_eq!(
+            reason,
+            "Apple Intelligence: Apple Intelligence is turned off"
+        );
+
+        // A helper that is not there says where it should have been.
+        let AskError::Io(missing) = one_shot("/definitely/missing/muxa-afm".into())
+            .await
+            .unwrap_err()
+        else {
+            panic!("a missing helper is an Io error");
+        };
+        assert!(missing.contains("helper was not found"), "{missing}");
+        assert!(missing.contains("Contents/Helpers"), "{missing}");
     }
 
     #[allow(clippy::too_many_lines)] // one add/refuse/remove lifecycle, in order

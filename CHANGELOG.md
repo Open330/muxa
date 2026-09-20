@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Apple Intelligence is a Global Ask provider.** A new `apple` engine runs
+  the Mac's own Foundation Models — no API key, no vendor account, nothing
+  to install. It is a built-in provider on macOS 26 and later, listed beside
+  `claude`, `codex`, `gemini`, `anthropic` and `openai`, and `model` chooses
+  between the two system models: `on-device` (the default; 8,192-token
+  context, never leaves the Mac) and `private-cloud` (Apple's Private Cloud
+  Compute; macOS 27, 32,768 tokens). `muxa ask --agent apple`, `muxa ask
+  provider add … --engine apple` and Settings › Providers all speak it.
+
+  Foundation Models is a Swift-only, in-process framework with no CLI, so
+  muxad cannot call it and there is nothing to drive in print mode. The
+  engine therefore spawns `muxa-afm`, a small helper that now ships in
+  `Muxa.app/Contents/Helpers` beside muxad: one JSON request on stdin, one
+  JSON answer on stdout, the reason for a failure as the last line of
+  stderr. muxad finds it beside its own executable, then in
+  `/Applications/Muxa.app` (a Homebrew muxad serving an installed app), then
+  on `PATH`; `[ask.providers.<id>] executable` names another copy. The
+  helper keeps the app's macOS 13 floor — the framework is weak-linked and
+  every use sits behind `#available` — so on an older Mac it runs and says
+  what is missing rather than failing to launch. The helper also compiles
+  without the macOS 26 SDK, which is a trap for whoever builds the app: it
+  would ship a provider that can never answer. So its build step looks for
+  an installed Xcode whose SDK has Foundation Models and compiles the helper
+  with that one, whichever Xcode builds the app, and a Release build that
+  finds none fails instead of shipping it. Private Cloud Compute and
+  `LanguageModelError` exist only in the macOS 27 SDK, so those uses are
+  compiled in by FoundationModels module version, not just guarded by
+  `#available`: built with an Xcode 26 SDK — what a macos-15 release runner
+  has — the helper answers on-device and reports that this build has no
+  private-cloud model.
+
+  Like the API engines it has no session to resume, so the store is its
+  thread: muxad replays the conversation on every turn, cut to 6,000
+  characters for the on-device window. Characters only estimate tokens, so
+  when the model still reports an overflow the helper drops the older half
+  of the replay and tries again, down to the bare prompt, before giving up.
+
+  The agent CLIs can look at the workspace because they have a shell; a bare
+  model cannot, and asked "can you read my muxa agent sessions?" it answered,
+  truthfully, that it has no access to other applications. So on a Global Ask
+  turn muxad hands the helper its own socket, and the helper gives the model
+  two read-only tools backed by `muxa status --json` and `muxa recap`:
+  `list_agent_sessions` and `read_agent_session`. The model decides when to
+  call them, the lists are cut to fit the on-device window, and it can only
+  read — never send input to an agent. `on-device` keeps what it reads on the
+  Mac; `private-cloud` sends it to Apple's Private Cloud Compute with the
+  question. One-shot turns (`muxa work init`) get no tools.
+
+  Being installed is never the interesting question for this provider, so
+  Settings › Providers asks the helper (`muxa-afm --probe`) instead and shows
+  the system's own answer — Apple Intelligence turned off, the model still
+  downloading, a Mac that is not eligible — and offers neither an API key
+  field nor a sign-in, because there is no key. The built-in row is listed
+  on every host, so one `config.toml` can serve a Mac and a Linux box; a
+  turn on a host that cannot run it fails with a plain "runs only on macOS".
 - **Global Ask answers can leave the app.** Until now the only way to take an
   answer anywhere was to select text by hand (or the Copy button on a code
   block). Every exchange — in the Ask tab and in the Inbox's Ask scope — now

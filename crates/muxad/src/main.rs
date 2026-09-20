@@ -185,7 +185,7 @@ async fn main() -> Result<()> {
     let store = Store::shared_with_history(history.clone());
     let collaboration = build_collaboration(&cfg).await;
     let collaboration_audit = build_collaboration_audit(&cfg);
-    let ask = build_ask(&cfg, config_path.clone()).await;
+    let ask = build_ask(&cfg, config_path.clone(), Some(socket.clone())).await;
     let automation = build_automation(&cfg, config_path.clone());
     let pipeline_runs = PipelineRunStore::load(paths::default_pipeline_run_file())
         .context("loading durable pipeline Runs")?;
@@ -545,7 +545,11 @@ async fn await_shutdown_task(name: &'static str, handle: Option<tokio::task::Joi
 /// Resolve `[ask]` into a live store. Mirrors `build_collaboration`:
 /// the history path is only materialized when the feature is on, so a
 /// disabled ask never creates a file.
-async fn build_ask(cfg: &Config, config_path: Option<PathBuf>) -> Arc<AskStore> {
+async fn build_ask(
+    cfg: &Config,
+    config_path: Option<PathBuf>,
+    socket: Option<PathBuf>,
+) -> Arc<AskStore> {
     let options = AskOptions {
         enabled: cfg.ask.enabled,
         agent: cfg.ask.agent.clone(),
@@ -565,6 +569,7 @@ async fn build_ask(cfg: &Config, config_path: Option<PathBuf>) -> Arc<AskStore> 
         keep: cfg.ask.keep,
         providers: cfg.ask.providers.clone(),
         config_path,
+        socket,
     };
     let store = AskStore::load(options).await;
     if cfg.ask.enabled {
