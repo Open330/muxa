@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A conversation in which Apple Intelligence once said it could not see
+  your agents now recovers on its own.** 0.8.49 told the model that such an
+  earlier answer was out of date; with three of them in a row in the replay,
+  the on-device model still repeated itself on one run in three, and putting
+  the live session list into the instructions made it worse, not better — a
+  small model keeps the story it told three turns ago. So when the workspace
+  tools are available the helper drops those turns from the replay: a short
+  answer that is nothing but the model's "I cannot access external
+  applications" boilerplate is left out, and a long answer that merely
+  mentions the phrase stays. Against the real conversation that showed the
+  problem: ten runs, no refusals, seven of them reading the sessions.
+
 ## [0.8.49] - 2026-09-20
 
 ### Changed
