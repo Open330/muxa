@@ -142,6 +142,23 @@ let builtWithoutSDK = HelperFailure(
     reason: "sdk_missing",
     message: "this muxa-afm was built without the Foundation Models SDK"
 )
+let builtWithoutPrivateCloud = HelperFailure(
+    code: .unavailable,
+    reason: "sdk_missing",
+    message: "this muxa-afm was built with a macOS 26 SDK, which has no private-cloud model; use on-device"
+)
+
+// `#available` asks what the Mac running this can do. Whether a symbol exists
+// to compile against is a different question, and a release runner answers it
+// with an older Xcode than a developer's Mac: Private Cloud Compute,
+// `LanguageModelError` and friends arrived with the macOS 27 SDK, which is
+// FoundationModels 2.x. Built against a macOS 26 SDK the helper still answers
+// on-device and says plainly that it has no private-cloud model.
+#if canImport(FoundationModels, _version: 2)
+let hasMacOS27SDK = true
+#else
+let hasMacOS27SDK = false
+#endif
 
 // MARK: - Reading the workspace
 
@@ -419,6 +436,7 @@ func onDeviceUnavailable(_ model: SystemLanguageModel) -> HelperFailure? {
     }
 }
 
+#if canImport(FoundationModels, _version: 2)
 @available(macOS 27.0, *)
 func privateCloudUnavailable(_ model: PrivateCloudComputeLanguageModel) -> HelperFailure? {
     switch model.availability {
@@ -444,6 +462,7 @@ func privateCloudUnavailable(_ model: PrivateCloudComputeLanguageModel) -> Helpe
         )
     }
 }
+#endif
 
 @available(macOS 26.0, *)
 func transcript(
@@ -477,9 +496,11 @@ func isContextOverflow(_ error: any Error) -> Bool {
     if case LanguageModelSession.GenerationError.exceededContextWindowSize = error {
         return true
     }
+    #if canImport(FoundationModels, _version: 2)
     if #available(macOS 27.0, *), case LanguageModelError.contextSizeExceeded = error {
         return true
     }
+    #endif
     return false
 }
 
@@ -503,10 +524,14 @@ func respond(to request: TurnRequest, choice: ModelChoice, log: ToolLog) async t
             if let failure = onDeviceUnavailable(model) { throw failure }
             session = LanguageModelSession(model: model, tools: tools, transcript: replay)
         case .privateCloud:
+            #if canImport(FoundationModels, _version: 2)
             guard #available(macOS 27.0, *) else { throw privateCloudTooOld }
             let model = PrivateCloudComputeLanguageModel()
             if let failure = privateCloudUnavailable(model) { throw failure }
             session = LanguageModelSession(model: model, tools: tools, transcript: replay)
+            #else
+            throw builtWithoutPrivateCloud
+            #endif
         }
         do {
             return try await session.respond(to: request.prompt).content
@@ -528,7 +553,9 @@ func probeModels() async -> [ProbeResponse.Model] {
     let onDevice = SystemLanguageModel.default
     let onDeviceFailure = onDeviceUnavailable(onDevice)
     var contextSize: Int?
+    #if canImport(FoundationModels, _version: 2)
     if #available(macOS 27.0, *) { contextSize = onDevice.contextSize }
+    #endif
     var models = [
         ProbeResponse.Model(
             id: ModelChoice.onDevice.rawValue,
@@ -538,6 +565,7 @@ func probeModels() async -> [ProbeResponse.Model] {
             contextSize: contextSize
         ),
     ]
+    #if canImport(FoundationModels, _version: 2)
     if #available(macOS 27.0, *) {
         let privateCloud = PrivateCloudComputeLanguageModel()
         let failure = privateCloudUnavailable(privateCloud)
@@ -549,6 +577,19 @@ func probeModels() async -> [ProbeResponse.Model] {
             contextSize: failure == nil ? try? await privateCloud.contextSize : nil
         ))
     }
+    #else
+    // Say so rather than leave the row out: on macOS 27 the model exists, and
+    // only this build of the helper cannot reach it.
+    if #available(macOS 27.0, *) {
+        models.append(ProbeResponse.Model(
+            id: ModelChoice.privateCloud.rawValue,
+            available: false,
+            reason: builtWithoutPrivateCloud.reason,
+            message: builtWithoutPrivateCloud.message,
+            contextSize: nil
+        ))
+    }
+    #endif
     return models
 }
 

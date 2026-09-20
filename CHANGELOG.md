@@ -33,7 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would ship a provider that can never answer. So its build step looks for
   an installed Xcode whose SDK has Foundation Models and compiles the helper
   with that one, whichever Xcode builds the app, and a Release build that
-  finds none fails instead of shipping it.
+  finds none fails instead of shipping it. Private Cloud Compute and
+  `LanguageModelError` exist only in the macOS 27 SDK, so those uses are
+  compiled in by FoundationModels module version, not just guarded by
+  `#available`: built with an Xcode 26 SDK — what a macos-15 release runner
+  has — the helper answers on-device and reports that this build has no
+  private-cloud model.
 
   Like the API engines it has no session to resume, so the store is its
   thread: muxad replays the conversation on every turn, cut to 6,000
