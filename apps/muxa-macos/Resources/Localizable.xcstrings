@@ -1,1116 +1,6 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
-    "A shell is being created": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "셸을 생성하고 있습니다"
-          }
-        }
-      }
-    },
-    "Ambiguous agent destination; open its pane instead": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "에이전트 대상을 구분할 수 없습니다. 해당 패널을 여세요"
-          }
-        }
-      }
-    },
-    "Ask: Open global Ask": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Ask: 전역 Ask 열기"
-          }
-        }
-      }
-    },
-    "Daemon is not connected": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "데몬에 연결되어 있지 않습니다"
-          }
-        }
-      }
-    },
-    "Editor: Close active editor": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "편집기: 활성 편집기 닫기"
-          }
-        }
-      }
-    },
-    "Editor: Keep open (pin)": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "편집기: 열린 상태로 고정"
-          }
-        }
-      }
-    },
-    "Editor: Next editor": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "편집기: 다음 편집기"
-          }
-        }
-      }
-    },
-    "Editor: Previous editor": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "편집기: 이전 편집기"
-          }
-        }
-      }
-    },
-    "Editor: Split right": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "편집기: 오른쪽으로 분할"
-          }
-        }
-      }
-    },
-    "Native shell": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "네이티브 셸"
-          }
-        }
-      }
-    },
-    "No active editor": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "활성 편집기가 없습니다"
-          }
-        }
-      }
-    },
-    "Search sessions, windows, panes, shells, work, agents": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "세션, 윈도우, 패널, 셸, 작업, 에이전트 검색"
-          }
-        }
-      }
-    },
-    "Selected": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "선택됨"
-          }
-        }
-      }
-    },
-    "Shell: New native shell": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "셸: 새 네이티브 셸"
-          }
-        }
-      }
-    },
-    "View: Focus sidebar": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "보기: 사이드바에 포커스"
-          }
-        }
-      }
-    },
-    "View: Show Explore": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "보기: 탐색 표시"
-          }
-        }
-      }
-    },
-    "View: Show Inbox": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "보기: 받은 편지함 표시"
-          }
-        }
-      }
-    },
-    "View: Show Shells": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "보기: 셸 표시"
-          }
-        }
-      }
-    },
-    "View: Show Work": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "보기: 작업 표시"
-          }
-        }
-      }
-    },
-    "Watch: Open native Live Watch": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Watch: 네이티브 Live Watch 열기"
-          }
-        }
-      }
-    },
-    "Work is starting": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "작업을 시작하고 있습니다"
-          }
-        }
-      }
-    },
-    "Work: Open Command Center": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "작업: 명령 센터 열기"
-          }
-        }
-      }
-    },
-    "Work: Start configured Work": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "작업: 설정된 작업 시작"
-          }
-        }
-      }
-    },
-    "Workspace: Refresh": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "워크스페이스: 새로 고침"
-          }
-        }
-      }
-    },
-    "esc  dismiss": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "esc  닫기"
-          }
-        }
-      }
-    },
-    "↑↓ / ⇧⇥ ⇥  select": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "↑↓ / ⇧⇥ ⇥  선택"
-          }
-        }
-      }
-    },
-    "↵  open": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "↵  열기"
-          }
-        }
-      }
-    },
-    "Command Palette…": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "명령 팔레트…"
-          }
-        }
-      }
-    },
-    "Focus Next Editor Group": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "다음 편집기 그룹에 포커스"
-          }
-        }
-      }
-    },
-    "Focus Previous Editor Group": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "이전 편집기 그룹에 포커스"
-          }
-        }
-      }
-    },
-    "Focus Sidebar Filter": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "사이드바 필터에 포커스"
-          }
-        }
-      }
-    },
-    "Last Editor": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "마지막 편집기"
-          }
-        }
-      }
-    },
-    "Open Ask": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Ask 열기"
-          }
-        }
-      }
-    },
-    "Open Inbox": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "받은 편지함 열기"
-          }
-        }
-      }
-    },
-    "Quick Open…": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "빠른 이동…"
-          }
-        }
-      }
-    },
-    "Show prompt status details": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "프롬프트 전송 상태 자세히 보기"
-          }
-        }
-      }
-    },
-    "No destinations available": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "이동할 대상이 없습니다"
-          }
-        }
-      }
-    },
-    "No matching results": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "검색 결과가 없습니다"
-          }
-        }
-      }
-    },
-    "Sessions and work appear here when available.": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "사용 가능한 세션과 작업이 여기에 표시됩니다."
-          }
-        }
-      }
-    },
-    "Try a name, host, socket, or a shorter query.": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "이름, 호스트, 소켓 또는 더 짧은 검색어로 검색하세요."
-          }
-        }
-      }
-    },
-    "Editor %lld": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "편집기 %lld"
-          }
-        }
-      }
-    },
-    "%lld results": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "결과 %lld개"
-          }
-        }
-      }
-    },
-    "Navigate": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "이동"
-          }
-        }
-      }
-    },
-    "Advanced has unsaved configuration changes. Save or reload it before changing this." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "고급 설정에 저장하지 않은 변경 사항이 있습니다. 이 항목을 변경하기 전에 저장하거나 다시 불러오세요."
-          }
-        }
-      }
-    },
-    "Ask conditions require an OpenAI or Anthropic API provider ID with API key/configuration. CLI providers are not supported." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Ask 조건에는 API 키와 설정이 갖춰진 OpenAI 또는 Anthropic API 공급자 ID가 필요합니다. CLI 공급자는 지원하지 않습니다."
-          }
-        }
-      }
-    },
-    "Context hash: %@" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "컨텍스트 해시: %@"
-          }
-        }
-      }
-    },
-    "muxad does not support Ask conditions; update muxa and restart muxad. The condition was not removed." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "muxad가 Ask 조건을 지원하지 않습니다. muxa를 업데이트한 뒤 muxad를 다시 시작하세요. 조건은 삭제되지 않았습니다."
-          }
-        }
-      }
-    },
-    "muxad rejected the judgment" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "muxad가 판단 요청을 거부했습니다."
-          }
-        }
-      }
-    },
-    "pipeline agent #%lld" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파이프라인 에이전트 #%lld"
-          }
-        }
-      }
-    },
-    "Provider: %@ · Model: %@" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "공급자: %@ · 모델: %@"
-          }
-        }
-      }
-    },
-    "Save or discard launch option changes before editing Raw TOML." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "TOML 원문을 편집하기 전에 실행 옵션 변경 사항을 저장하거나 버리세요."
-          }
-        }
-      }
-    },
-    "[mcp.guide].options still supplies %@'s fallback. Provider defaults override it, even when empty. These legacy settings are preserved; edit them in Raw TOML if needed." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "[mcp.guide].options는 여전히 %@의 대체 옵션으로 사용됩니다. 공급자 기본값이 있으면 빈 목록이어도 이를 대체합니다. 기존 설정은 유지되며, 필요하면 TOML 원문에서 수정할 수 있습니다."
-          }
-        }
-      }
-    },
-    "Add Argument" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "인수 추가"
-          }
-        }
-      }
-    },
-    "API Ask provider ID" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "API Ask 공급자 ID"
-          }
-        }
-      }
-    },
-    "Argument (empty string allowed)" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "인수(빈 문자열 허용)"
-          }
-        }
-      }
-    },
-    "Ask condition · Fixed action on match" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Ask 조건 · 일치 시 지정된 동작 실행"
-          }
-        }
-      }
-    },
-    "Ask condition · Observe only (no action)" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Ask 조건 · 관찰만(동작 실행 안 함)"
-          }
-        }
-      }
-    },
-    "Ask condition (optional)" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Ask 조건(선택 사항)"
-          }
-        }
-      }
-    },
-    "Ask condition test" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Ask 조건 테스트"
-          }
-        }
-      }
-    },
-    "Ask judgment calls per hour must be between 1 and 30." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "시간당 Ask 판단 호출 수는 1~30회여야 합니다."
-          }
-        }
-      }
-    },
-    "Ask judgment required (not run by this free test)" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Ask 판단 필요(이 무료 테스트에서는 실행하지 않음)"
-          }
-        }
-      }
-    },
-    "Ask only judges the condition; it cannot choose or run an action. Observe-only logs judgments without executing this fixed action." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Ask는 조건만 판단하며 동작을 선택하거나 실행할 수 없습니다. 관찰 전용 모드에서는 지정된 동작을 실행하지 않고 판단 결과만 기록합니다."
-          }
-        }
-      }
-    },
-    "Ask timeout must be between 5 and 120 seconds." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Ask 제한 시간은 5~120초여야 합니다."
-          }
-        }
-      }
-    },
-    "Bounded recent screen/current state and work/workspace IDs leave this machine for the selected API provider. This uses one potentially billed, read-only, tool-free turn and executes no action, even with observe-only off." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "길이가 제한된 최근 화면/현재 상태와 작업/워크스페이스 ID가 기기 밖의 선택한 API 공급자로 전송됩니다. 도구를 사용하지 않는 읽기 전용 호출 1회이며 요금이 발생할 수 있습니다. 관찰 전용 모드를 꺼도 동작은 실행하지 않습니다."
-          }
-        }
-      }
-    },
-    "Choose an API Ask provider ID backed by OpenAI or Anthropic. Configure its API key in Ask providers; Claude/Codex CLI providers are not supported." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "OpenAI 또는 Anthropic 기반의 API Ask 공급자 ID를 선택하세요. Ask 공급자 설정에서 API 키를 구성하세요. Claude/Codex CLI 공급자는 지원하지 않습니다."
-          }
-        }
-      }
-    },
-    "Choose an explicit configured Ask provider." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "설정된 Ask 공급자를 명시적으로 선택하세요."
-          }
-        }
-      }
-    },
-    "Condition judged" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "조건 판단 완료"
-          }
-        }
-      }
-    },
-    "Configuration editor" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "설정 편집기"
-          }
-        }
-      }
-    },
-    "Default: openai. Requires API provider configuration and a key available to muxad; this request does not forward app-only Keychain keys. Only OpenAI, Anthropic, or named API instances backed by them are supported—not Claude/Codex CLI providers." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "기본값: openai. API 공급자 설정과 muxad에서 사용할 수 있는 키가 필요합니다. 이 요청은 앱 전용 키체인 키를 전달하지 않습니다. OpenAI, Anthropic 또는 이를 기반으로 이름을 지정한 API 인스턴스만 지원하며, Claude/Codex CLI 공급자는 지원하지 않습니다."
-          }
-        }
-      }
-    },
-    "Describe the Ask condition in natural language." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Ask 조건을 자연어로 입력하세요."
-          }
-        }
-      }
-    },
-    "Discard and Reload" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "변경 사항 버리고 다시 불러오기"
-          }
-        }
-      }
-    },
-    "Discard Launch Changes" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실행 옵션 변경 사항 버리기"
-          }
-        }
-      }
-    },
-    "Discard unsaved configuration changes and reload?" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "저장하지 않은 설정 변경 사항을 버리고 다시 불러올까요?"
-          }
-        }
-      }
-    },
-    "Each entry is one literal CLI argument, not a shell command. Options replace the entire inherited list; they are never appended. Changes affect future launches, not running agents." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "각 항목은 셸 명령이 아닌 하나의 CLI 인수입니다. 옵션은 상속된 목록 전체를 대체하며, 기존 목록에 추가되지 않습니다. 변경 사항은 이후 실행에만 적용되며 실행 중인 에이전트에는 영향을 주지 않습니다."
-          }
-        }
-      }
-    },
-    "Each judgment is one read-only, tool-free Ask turn. Only bounded recent screen text, current state, and work/workspace IDs are sent—not full goal lookup. This context leaves your machine for the selected API provider and may be billed. Judgment call limits are separate from action firing limits." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "각 판단은 도구를 사용하지 않는 읽기 전용 Ask 호출 1회입니다. 길이가 제한된 최근 화면 텍스트, 현재 상태, 작업/워크스페이스 ID만 전송하며 목표 전체를 조회하지 않습니다. 이 컨텍스트는 기기 밖의 선택한 API 공급자로 전송되며 요금이 발생할 수 있습니다. 판단 호출 제한과 동작 실행 제한은 별도로 적용됩니다."
-          }
-        }
-      }
-    },
-    "Effective options: %@" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "적용될 옵션: %@"
-          }
-        }
-      }
-    },
-    "Explicit []: no extra options, even if defaults exist." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "명시적 빈 목록 []: 기본값이 있어도 추가 옵션을 사용하지 않습니다."
-          }
-        }
-      }
-    },
-    "Fixed action" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "지정된 동작"
-          }
-        }
-      }
-    },
-    "Free deterministic check: no Ask turn, no action, and nothing recorded. Ask conditions require the separate billed test in the rule editor." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "무료 규칙 검사: Ask를 호출하거나 동작을 실행하지 않으며, 기록도 남기지 않습니다. Ask 조건은 규칙 편집기에서 별도의 유료 테스트로 확인해야 합니다."
-          }
-        }
-      }
-    },
-    "Inherit legacy guide options or no options" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "기존 가이드 옵션 상속, 없으면 옵션 없음"
-          }
-        }
-      }
-    },
-    "Inherit provider defaults" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "공급자 기본값 상속"
-          }
-        }
-      }
-    },
-    "Judge a natural-language condition" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "자연어 조건 판단"
-          }
-        }
-      }
-    },
-    "Judging condition" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "조건 판단 중"
-          }
-        }
-      }
-    },
-    "Judging…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "판단 중…"
-          }
-        }
-      }
-    },
-    "Judgment: %@" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "판단 결과: %@"
-          }
-        }
-      }
-    },
-    "Launch options" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실행 옵션"
-          }
-        }
-      }
-    },
-    "Launch options could not be read. Correct the configuration in Raw TOML and reload." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실행 옵션을 읽지 못했습니다. TOML 원문에서 설정을 수정한 뒤 다시 불러오세요."
-          }
-        }
-      }
-    },
-    "Legacy guide options" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "기존 가이드 옵션"
-          }
-        }
-      }
-    },
-    "Maximum judgment calls per hour: %u" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "시간당 최대 판단 호출 수: %u"
-          }
-        }
-      }
-    },
-    "Move argument up" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "인수 위로 이동"
-          }
-        }
-      }
-    },
-    "Natural-language condition" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "자연어 조건"
-          }
-        }
-      }
-    },
-    "No pipeline agents configured. Add pipelines in Raw TOML." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "설정된 파이프라인 에이전트가 없습니다. TOML 원문에서 파이프라인을 추가하세요."
-          }
-        }
-      }
-    },
-    "Observe only — log judgments, execute no action" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "관찰만 — 판단 결과만 기록하고 동작은 실행하지 않음"
-          }
-        }
-      }
-    },
-    "Override inherited options" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "상속된 옵션 재정의"
-          }
-        }
-      }
-    },
-    "Pane ID to try against" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "테스트할 페인 ID"
-          }
-        }
-      }
-    },
-    "Pipeline overrides" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파이프라인 재정의"
-          }
-        }
-      }
-    },
-    "Provider defaults" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "공급자 기본값"
-          }
-        }
-      }
-    },
-    "Raw TOML" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "TOML 원문"
-          }
-        }
-      }
-    },
-    "Raw TOML has unsaved changes. Save or reload it first." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "TOML 원문에 저장하지 않은 변경 사항이 있습니다. 먼저 저장하거나 다시 불러오세요."
-          }
-        }
-      }
-    },
-    "Reload to refresh launch options from the configuration file." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "다시 불러오면 설정 파일의 최신 실행 옵션을 확인할 수 있습니다."
-          }
-        }
-      }
-    },
-    "Reload to review the current file before applying launch options again." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실행 옵션을 다시 적용하기 전에 파일을 다시 불러와 현재 내용을 확인하세요."
-          }
-        }
-      }
-    },
-    "Remove argument" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "인수 삭제"
-          }
-        }
-      }
-    },
-    "Send context and judge (billed)" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "컨텍스트 전송 후 판단(유료)"
-          }
-        }
-      }
-    },
-    "Send pane context for one billed Ask turn?" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "페인 컨텍스트를 전송해 유료 Ask 호출을 1회 진행할까요?"
-          }
-        }
-      }
-    },
-    "This muxad does not support launch option forms. Update the daemon or use Raw TOML." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 muxad는 실행 옵션 폼을 지원하지 않습니다. 데몬을 업데이트하거나 TOML 원문을 사용하세요."
-          }
-        }
-      }
-    },
-    "Timeout: %llu seconds" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "제한 시간: %llu초"
-          }
-        }
-      }
-    },
-    "Try condition — one billed API turn…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "조건 테스트 — 유료 API 호출 1회…"
-          }
-        }
-      }
-    },
-    "Unknown is not a match and must not execute an action." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "판단 불가(unknown)는 조건 일치가 아니며 동작을 실행해서는 안 됩니다."
-          }
-        }
-      }
-    },
-    "Update muxad for automation_ask_v1. This condition cannot be saved on an older daemon." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "automation_ask_v1을 지원하도록 muxad를 업데이트하세요. 이전 데몬에서는 이 조건을 저장할 수 없습니다."
-          }
-        }
-      }
-    },
-    "Use Empty List []" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "빈 목록 [] 사용"
-          }
-        }
-      }
-    },
-    "Your raw text is preserved. Reload to take the file's version, or review it before saving again." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "편집한 원문은 유지됩니다. 다시 불러와 파일의 내용을 사용하거나, 다시 저장하기 전에 내용을 검토하세요."
-          }
-        }
-      }
-    },
     "#%@ · %lld panes" : {
       "localizations" : {
         "en" : {
@@ -1202,6 +92,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%1$@이(가) %2$lld초 안에 응답하지 않았습니다"
+          }
+        }
+      }
+    },
+    "%@ failed: %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ failed: %2$@"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 실패: %@"
           }
         }
       }
@@ -1481,6 +387,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@의 설정을 읽지 못했습니다"
+          }
+        }
+      }
+    },
+    "%lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld"
           }
         }
       }
@@ -2188,6 +1104,16 @@
         }
       }
     },
+    "%lld results" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결과 %lld개"
+          }
+        }
+      }
+    },
     "%lld routes select this pipeline; they will keep their match but lose the pipeline." : {
       "localizations" : {
         "en" : {
@@ -2414,6 +1340,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Work %1$lld개 · 에이전트 %2$lld개"
+          }
+        }
+      }
+    },
+    "%lld%% of the release disk image" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "릴리스 디스크 이미지의 %lld%%"
           }
         }
       }
@@ -2722,6 +1658,16 @@
         }
       }
     },
+    "A shell is being created" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "셸을 생성하고 있습니다"
+          }
+        }
+      }
+    },
     "A small random delay is added so several agents do not resume at once." : {
       "extractionState" : "stale",
       "localizations" : {
@@ -2835,6 +1781,16 @@
         }
       }
     },
+    "API Ask provider ID" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API Ask 공급자 ID"
+          }
+        }
+      }
+    },
     "API key" : {
       "localizations" : {
         "ko" : {
@@ -2897,6 +1853,7 @@
       }
     },
     "Action" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -2952,6 +1909,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "추가"
+          }
+        }
+      }
+    },
+    "Add Argument" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "인수 추가"
           }
         }
       }
@@ -3117,11 +2084,22 @@
       }
     },
     "Advanced has unsaved changes. Save or reload it before changing this." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "고급 탭에 저장하지 않은 변경이 있습니다. 저장하거나 다시 로드한 뒤에 바꿔 주세요."
+          }
+        }
+      }
+    },
+    "Advanced has unsaved configuration changes. Save or reload it before changing this." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "고급 설정에 저장하지 않은 변경 사항이 있습니다. 이 항목을 변경하기 전에 저장하거나 다시 불러오세요."
           }
         }
       }
@@ -3317,6 +2295,16 @@
         }
       }
     },
+    "Ambiguous agent destination; open its pane instead" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 대상을 구분할 수 없습니다. 해당 패널을 여세요"
+          }
+        }
+      }
+    },
     "An AIR artifact is a JSON object." : {
       "localizations" : {
         "ko" : {
@@ -3458,6 +2446,16 @@
         }
       }
     },
+    "Argument (empty string allowed)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "인수(빈 문자열 허용)"
+          }
+        }
+      }
+    },
     "Ask" : {
       "localizations" : {
         "ko" : {
@@ -3509,11 +2507,93 @@
       }
     },
     "Ask any configured provider from the Inbox without starting a pipeline." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "파이프라인을 시작하지 않고 Inbox에서 설정된 프로바이더에게 바로 물어볼 수 있습니다."
+          }
+        }
+      }
+    },
+    "Ask condition (optional)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 조건(선택 사항)"
+          }
+        }
+      }
+    },
+    "Ask condition test" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 조건 테스트"
+          }
+        }
+      }
+    },
+    "Ask condition · Fixed action on match" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 조건 · 일치 시 지정된 동작 실행"
+          }
+        }
+      }
+    },
+    "Ask condition · Observe only (no action)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 조건 · 관찰만(동작 실행 안 함)"
+          }
+        }
+      }
+    },
+    "Ask conditions require an OpenAI or Anthropic API provider ID with API key/configuration. CLI providers are not supported." : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 조건에는 API 키와 설정이 갖춰진 OpenAI 또는 Anthropic API 공급자 ID가 필요합니다. CLI 공급자는 지원하지 않습니다."
+          }
+        }
+      }
+    },
+    "Ask judgment calls per hour must be between 1 and 30." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "시간당 Ask 판단 호출 수는 1~30회여야 합니다."
+          }
+        }
+      }
+    },
+    "Ask judgment required (not run by this free test)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 판단 필요(이 무료 테스트에서는 실행하지 않음)"
+          }
+        }
+      }
+    },
+    "Ask only judges the condition; it cannot choose or run an action. Observe-only logs judgments without executing this fixed action." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask는 조건만 판단하며 동작을 선택하거나 실행할 수 없습니다. 관찰 전용 모드에서는 지정된 동작을 실행하지 않고 판단 결과만 기록합니다."
           }
         }
       }
@@ -3524,6 +2604,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "설명에 맞는 파이프라인을 프로바이더에게 요청합니다 (⌘↩)"
+          }
+        }
+      }
+    },
+    "Ask timeout must be between 5 and 120 seconds." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 제한 시간은 5~120초여야 합니다."
+          }
+        }
+      }
+    },
+    "Ask: Open global Ask" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask: 전역 Ask 열기"
           }
         }
       }
@@ -3688,6 +2788,16 @@
         }
       }
     },
+    "Bounded recent screen/current state and work/workspace IDs leave this machine for the selected API provider. This uses one potentially billed, read-only, tool-free turn and executes no action, even with observe-only off." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "길이가 제한된 최근 화면/현재 상태와 작업/워크스페이스 ID가 기기 밖의 선택한 API 공급자로 전송됩니다. 도구를 사용하지 않는 읽기 전용 호출 1회이며 요금이 발생할 수 있습니다. 관찰 전용 모드를 꺼도 동작은 실행하지 않습니다."
+          }
+        }
+      }
+    },
     "Build Plan" : {
       "localizations" : {
         "ko" : {
@@ -3791,12 +2901,62 @@
         }
       }
     },
+    "Check Now" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "지금 확인"
+          }
+        }
+      }
+    },
+    "Check automatically" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동으로 확인"
+          }
+        }
+      }
+    },
+    "Check for Updates…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "업데이트 확인…"
+          }
+        }
+      }
+    },
+    "Check for updates automatically" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동으로 업데이트 확인"
+          }
+        }
+      }
+    },
     "Checking" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "확인 중"
+          }
+        }
+      }
+    },
+    "Checking the published SHA-256 and the Developer ID signature." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "공개된 SHA-256과 Developer ID 서명을 확인하고 있습니다."
           }
         }
       }
@@ -3817,6 +2977,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "확인 중…"
+          }
+        }
+      }
+    },
+    "Checksum mismatch: the release publishes %@ and the download hashes to %@. Nothing was installed." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Checksum mismatch: the release publishes %1$@ and the download hashes to %2$@. Nothing was installed."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "체크섬 불일치: 릴리스가 공개한 값은 %@이고 내려받은 파일의 해시는 %@입니다. 아무것도 설치하지 않았습니다."
           }
         }
       }
@@ -3877,6 +3053,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "탐색기에서 세션, 윈도우 또는 페인을 선택하세요. Muxa가 실행 중인 페인으로 연결합니다."
+          }
+        }
+      }
+    },
+    "Choose an API Ask provider ID backed by OpenAI or Anthropic. Configure its API key in Ask providers; Claude/Codex CLI providers are not supported." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OpenAI 또는 Anthropic 기반의 API Ask 공급자 ID를 선택하세요. Ask 공급자 설정에서 API 키를 구성하세요. Claude/Codex CLI 공급자는 지원하지 않습니다."
+          }
+        }
+      }
+    },
+    "Choose an explicit configured Ask provider." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정된 Ask 공급자를 명시적으로 선택하세요."
           }
         }
       }
@@ -4071,6 +3267,16 @@
         }
       }
     },
+    "Command Palette…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "명령 팔레트…"
+          }
+        }
+      }
+    },
     "Command or absolute path" : {
       "localizations" : {
         "ko" : {
@@ -4137,6 +3343,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "에이전트, 프롬프트, after 연결을 시각적으로 구성합니다"
+          }
+        }
+      }
+    },
+    "Condition judged" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "조건 판단 완료"
+          }
+        }
+      }
+    },
+    "Configuration editor" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정 편집기"
           }
         }
       }
@@ -4258,6 +3484,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "컨텍스트"
+          }
+        }
+      }
+    },
+    "Context hash: %@" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "컨텍스트 해시: %@"
           }
         }
       }
@@ -4444,6 +3681,16 @@
         }
       }
     },
+    "Copy Homebrew Command" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Homebrew 명령 복사"
+          }
+        }
+      }
+    },
     "Copy Question" : {
       "localizations" : {
         "ko" : {
@@ -4584,6 +3831,16 @@
         }
       }
     },
+    "Daemon is not connected" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "데몬에 연결되어 있지 않습니다"
+          }
+        }
+      }
+    },
     "Dark" : {
       "localizations" : {
         "ko" : {
@@ -4640,6 +3897,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "기본 프로바이더"
+          }
+        }
+      }
+    },
+    "Default: openai. Requires API provider configuration and a key available to muxad; this request does not forward app-only Keychain keys. Only OpenAI, Anthropic, or named API instances backed by them are supported—not Claude/Codex CLI providers." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본값: openai. API 공급자 설정과 muxad에서 사용할 수 있는 키가 필요합니다. 이 요청은 앱 전용 키체인 키를 전달하지 않습니다. OpenAI, Anthropic 또는 이를 기반으로 이름을 지정한 API 인스턴스만 지원하며, Claude/Codex CLI 공급자는 지원하지 않습니다."
           }
         }
       }
@@ -4774,6 +4041,16 @@
         }
       }
     },
+    "Describe the Ask condition in natural language." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 조건을 자연어로 입력하세요."
+          }
+        }
+      }
+    },
     "Describe the line-up in plain language; the Ask provider drafts a pipeline you can refine, edit, or save" : {
       "localizations" : {
         "ko" : {
@@ -4874,6 +4151,36 @@
         }
       }
     },
+    "Discard Launch Changes" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 옵션 변경 사항 버리기"
+          }
+        }
+      }
+    },
+    "Discard and Reload" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "변경 사항 버리고 다시 불러오기"
+          }
+        }
+      }
+    },
+    "Discard unsaved configuration changes and reload?" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장하지 않은 설정 변경 사항을 버리고 다시 불러올까요?"
+          }
+        }
+      }
+    },
     "Disconnected" : {
       "localizations" : {
         "ko" : {
@@ -4914,6 +4221,26 @@
         }
       }
     },
+    "Downloading Muxa %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa %@ 내려받는 중"
+          }
+        }
+      }
+    },
+    "Download…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "내려받기…"
+          }
+        }
+      }
+    },
     "Draft" : {
       "localizations" : {
         "ko" : {
@@ -4950,6 +4277,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "초안 생성이 취소되었습니다."
+          }
+        }
+      }
+    },
+    "Each entry is one literal CLI argument, not a shell command. Options replace the entire inherited list; they are never appended. Changes affect future launches, not running agents." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "각 항목은 셸 명령이 아닌 하나의 CLI 인수입니다. 옵션은 상속된 목록 전체를 대체하며, 기존 목록에 추가되지 않습니다. 변경 사항은 이후 실행에만 적용되며 실행 중인 에이전트에는 영향을 주지 않습니다."
+          }
+        }
+      }
+    },
+    "Each judgment is one read-only, tool-free Ask turn. Only bounded recent screen text, current state, and work/workspace IDs are sent—not full goal lookup. This context leaves your machine for the selected API provider and may be billed. Judgment call limits are separate from action firing limits." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "각 판단은 도구를 사용하지 않는 읽기 전용 Ask 호출 1회입니다. 길이가 제한된 최근 화면 텍스트, 현재 상태, 작업/워크스페이스 ID만 전송하며 목표 전체를 조회하지 않습니다. 이 컨텍스트는 기기 밖의 선택한 API 공급자로 전송되며 요금이 발생할 수 있습니다. 판단 호출 제한과 동작 실행 제한은 별도로 적용됩니다."
           }
         }
       }
@@ -5024,12 +4371,82 @@
         }
       }
     },
+    "Editor %lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "편집기 %lld"
+          }
+        }
+      }
+    },
+    "Editor: Close active editor" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "편집기: 활성 편집기 닫기"
+          }
+        }
+      }
+    },
+    "Editor: Keep open (pin)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "편집기: 열린 상태로 고정"
+          }
+        }
+      }
+    },
+    "Editor: Next editor" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "편집기: 다음 편집기"
+          }
+        }
+      }
+    },
+    "Editor: Previous editor" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "편집기: 이전 편집기"
+          }
+        }
+      }
+    },
+    "Editor: Split right" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "편집기: 오른쪽으로 분할"
+          }
+        }
+      }
+    },
     "Edit…" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "편집…"
+          }
+        }
+      }
+    },
+    "Effective options: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "적용될 옵션: %@"
           }
         }
       }
@@ -5271,6 +4688,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "만료됨"
+          }
+        }
+      }
+    },
+    "Explicit []: no extra options, even if defaults exist." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "명시적 빈 목록 []: 기본값이 있어도 추가 옵션을 사용하지 않습니다."
           }
         }
       }
@@ -5581,6 +5008,16 @@
         }
       }
     },
+    "Fixed action" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "지정된 동작"
+          }
+        }
+      }
+    },
     "Fleet hosts" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -5588,6 +5025,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "플릿 호스트"
+          }
+        }
+      }
+    },
+    "Focus Next Editor Group" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다음 편집기 그룹에 포커스"
+          }
+        }
+      }
+    },
+    "Focus Previous Editor Group" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이전 편집기 그룹에 포커스"
+          }
+        }
+      }
+    },
+    "Focus Sidebar Filter" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "사이드바 필터에 포커스"
           }
         }
       }
@@ -5632,6 +5099,16 @@
         }
       }
     },
+    "Free deterministic check: no Ask turn, no action, and nothing recorded. Ask conditions require the separate billed test in the rule editor." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "무료 규칙 검사: Ask를 호출하거나 동작을 실행하지 않으며, 기록도 남기지 않습니다. Ask 조건은 규칙 편집기에서 별도의 유료 테스트로 확인해야 합니다."
+          }
+        }
+      }
+    },
     "General" : {
       "localizations" : {
         "ko" : {
@@ -5648,6 +5125,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "시작하기"
+          }
+        }
+      }
+    },
+    "GitHub answered the update check with HTTP %lld." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GitHub이 업데이트 확인에 HTTP %lld로 응답했습니다."
+          }
+        }
+      }
+    },
+    "GitHub is rate-limiting requests from this network. The next check will try again later." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GitHub이 이 네트워크의 요청을 제한하고 있습니다. 다음 확인 때 다시 시도합니다."
+          }
+        }
+      }
+    },
+    "GitHub returned a release document Muxa could not read." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GitHub이 Muxa가 읽을 수 없는 릴리스 문서를 반환했습니다."
           }
         }
       }
@@ -5774,6 +5281,7 @@
       }
     },
     "Headless Claude Code and Codex questions owned by muxad" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -5789,6 +5297,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "프롬프트 숨기기"
+          }
+        }
+      }
+    },
+    "Homebrew installed this copy, so Muxa hands the upgrade to it. Muxa quits, `%@` runs, and Muxa reopens." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 복사본은 Homebrew가 설치했으므로 업그레이드를 Homebrew에 맡깁니다. Muxa가 종료되고 `%@`가 실행된 뒤 다시 열립니다."
+          }
+        }
+      }
+    },
+    "Homebrew installed this copy, so Muxa upgrades it with `%@` rather than replacing the bundle behind Homebrew's back." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 복사본은 Homebrew가 설치했으므로, 번들을 Homebrew 몰래 교체하지 않고 `%@`로 업그레이드합니다."
           }
         }
       }
@@ -6049,6 +5577,26 @@
         }
       }
     },
+    "Inherit legacy guide options or no options" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기존 가이드 옵션 상속, 없으면 옵션 없음"
+          }
+        }
+      }
+    },
+    "Inherit provider defaults" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "공급자 기본값 상속"
+          }
+        }
+      }
+    },
     "Install" : {
       "localizations" : {
         "ko" : {
@@ -6079,12 +5627,52 @@
         }
       }
     },
+    "Install and Relaunch" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설치 후 다시 실행"
+          }
+        }
+      }
+    },
     "Install the %@ command and make sure it is on your PATH, then re-check." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@ 명령을 설치하고 PATH에 포함되어 있는지 확인한 뒤 다시 확인하세요."
+          }
+        }
+      }
+    },
+    "Installed by Homebrew (cask muxa-app)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Homebrew로 설치됨 (cask muxa-app)"
+          }
+        }
+      }
+    },
+    "Installed from the release disk image" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "릴리스 디스크 이미지에서 설치됨"
+          }
+        }
+      }
+    },
+    "Installed version" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설치된 버전"
           }
         }
       }
@@ -6101,6 +5689,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "설치됨 · %1$@ %2$@ (%3$@)"
+          }
+        }
+      }
+    },
+    "Installing Muxa %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa %@ 설치 중"
           }
         }
       }
@@ -6141,6 +5739,46 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "지터가 muxad가 읽을 수 있는 시간 형식이 아닙니다."
+          }
+        }
+      }
+    },
+    "Judge a natural-language condition" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자연어 조건 판단"
+          }
+        }
+      }
+    },
+    "Judging condition" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "조건 판단 중"
+          }
+        }
+      }
+    },
+    "Judging…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "판단 중…"
+          }
+        }
+      }
+    },
+    "Judgment: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "판단 결과: %@"
           }
         }
       }
@@ -6236,12 +5874,42 @@
         }
       }
     },
+    "Last Editor" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "마지막 편집기"
+          }
+        }
+      }
+    },
     "Last activity" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "최근 활동"
+          }
+        }
+      }
+    },
+    "Last checked %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "마지막 확인 %@"
+          }
+        }
+      }
+    },
+    "Last checked %@." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "마지막 확인 %@."
           }
         }
       }
@@ -6262,6 +5930,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "지연 시간"
+          }
+        }
+      }
+    },
+    "Later" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "나중에"
           }
         }
       }
@@ -6326,6 +6004,26 @@
         }
       }
     },
+    "Launch options" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 옵션"
+          }
+        }
+      }
+    },
+    "Launch options could not be read. Correct the configuration in Raw TOML and reload." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 옵션을 읽지 못했습니다. TOML 원문에서 설정을 수정한 뒤 다시 불러오세요."
+          }
+        }
+      }
+    },
     "Launch order" : {
       "localizations" : {
         "ko" : {
@@ -6352,6 +6050,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "실행 파일을 비워 두면 muxad의 PATH에 있는 명령을 사용합니다. 절대 경로를 지정하면 두 번째 설치본을 고정할 수 있습니다."
+          }
+        }
+      }
+    },
+    "Legacy guide options" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기존 가이드 옵션"
           }
         }
       }
@@ -6426,6 +6134,16 @@
         }
       }
     },
+    "Local build from a source checkout" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "소스 체크아웃에서 만든 로컬 빌드"
+          }
+        }
+      }
+    },
     "Local host" : {
       "localizations" : {
         "ko" : {
@@ -6452,6 +6170,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "PATH에서 %@을(를) 찾는 중…"
+          }
+        }
+      }
+    },
+    "Looking for a newer release…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "새 릴리스를 찾는 중…"
           }
         }
       }
@@ -6556,6 +6284,16 @@
         }
       }
     },
+    "Maximum judgment calls per hour: %u" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "시간당 최대 판단 호출 수: %u"
+          }
+        }
+      }
+    },
     "Message" : {
       "localizations" : {
         "ko" : {
@@ -6646,12 +6384,32 @@
         }
       }
     },
+    "More" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "더 보기"
+          }
+        }
+      }
+    },
     "Most changes apply when muxad restarts. Saving checks the file has not changed underneath and refuses a document muxa cannot parse." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "대부분의 변경은 muxad를 다시 시작해야 적용됩니다. 저장할 때 파일이 그 사이 바뀌지 않았는지 확인하고, muxa가 해석할 수 없는 문서는 거부합니다."
+          }
+        }
+      }
+    },
+    "Move argument up" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "인수 위로 이동"
           }
         }
       }
@@ -6686,6 +6444,36 @@
         }
       }
     },
+    "Muxa %@ is available" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa %@을(를) 사용할 수 있습니다"
+          }
+        }
+      }
+    },
+    "Muxa %@ is installed. The automatic restart could not be scheduled — quit and reopen Muxa to finish." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa %@을(를) 설치했습니다. 자동 재시작을 예약하지 못했으니 Muxa를 종료했다가 다시 열어 마무리하세요."
+          }
+        }
+      }
+    },
+    "Muxa %@ is the newest release." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa %@이(가) 최신 릴리스입니다."
+          }
+        }
+      }
+    },
     "Muxa Module" : {
       "localizations" : {
         "ko" : {
@@ -6702,6 +6490,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Muxa 워크스페이스"
+          }
+        }
+      }
+    },
+    "Muxa cannot write to %@. Move Muxa.app to /Applications, or install the new version from the DMG yourself." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa가 %@에 쓸 수 없습니다. Muxa.app을 /Applications로 옮기거나 DMG에서 새 버전을 직접 설치하세요."
+          }
+        }
+      }
+    },
+    "Muxa checks for a new release once a day and never installs one without being asked." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa는 하루에 한 번 새 릴리스를 확인하며, 요청하지 않으면 설치하지 않습니다."
           }
         }
       }
@@ -6738,6 +6546,46 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Muxa가 데몬에 연결되어 있지 않습니다."
+          }
+        }
+      }
+    },
+    "Muxa is running from a disk image or a read-only copy. Move Muxa.app to /Applications first." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa가 디스크 이미지나 읽기 전용 복사본에서 실행 중입니다. 먼저 Muxa.app을 /Applications로 옮기세요."
+          }
+        }
+      }
+    },
+    "Muxa is running from a read-only copy. Move Muxa.app to /Applications to update in place." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa가 읽기 전용 복사본에서 실행 중입니다. 제자리 업데이트를 하려면 Muxa.app을 /Applications로 옮기세요."
+          }
+        }
+      }
+    },
+    "Muxa quits and reopens on the new version. tmux sessions keep running, and the bundled muxad re-execs onto the new build on its own." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa가 종료되고 새 버전으로 다시 열립니다. tmux 세션은 계속 실행되며, 번들된 muxad는 스스로 새 빌드로 re-exec합니다."
+          }
+        }
+      }
+    },
+    "Muxa quits so Homebrew can replace it, then reopens. Output is kept in ~/Library/Logs/Muxa/update.log." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Homebrew가 교체할 수 있도록 Muxa가 종료된 뒤 다시 열립니다. 출력은 ~/Library/Logs/Muxa/update.log에 남습니다."
           }
         }
       }
@@ -6791,6 +6639,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Muxa는 코딩 에이전트를 tmux 안에서 실행하고, 모든 페인과 호스트, 그리고 에이전트가 사용자에게 던지는 모든 질문을 한 윈도우에 모읍니다."
+          }
+        }
+      }
+    },
+    "Muxa verifies the release's published SHA-256 and Developer ID signature before replacing itself, then reopens." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa는 릴리스가 공개한 SHA-256과 Developer ID 서명을 확인한 뒤 자신을 교체하고 다시 열립니다."
           }
         }
       }
@@ -6886,6 +6744,16 @@
         }
       }
     },
+    "Native shell" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "네이티브 셸"
+          }
+        }
+      }
+    },
     "Native shell is no longer available" : {
       "localizations" : {
         "ko" : {
@@ -6912,6 +6780,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "에이전트와 나란히 직접 입력하고 싶을 때 쓰는 네이티브 터미널입니다."
+          }
+        }
+      }
+    },
+    "Natural-language condition" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자연어 조건"
+          }
+        }
+      }
+    },
+    "Navigate" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이동"
           }
         }
       }
@@ -7157,6 +7045,16 @@
         }
       }
     },
+    "No active editor" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "활성 편집기가 없습니다"
+          }
+        }
+      }
+    },
     "No agent CLI was found. Install Claude Code, Codex, Gemini CLI, or OpenCode, then check again." : {
       "localizations" : {
         "ko" : {
@@ -7213,6 +7111,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "아직 대화가 없습니다"
+          }
+        }
+      }
+    },
+    "No destinations available" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이동할 대상이 없습니다"
           }
         }
       }
@@ -7288,6 +7196,7 @@
       }
     },
     "No matching Ask history" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -7333,6 +7242,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "일치하는 요청 없음"
+          }
+        }
+      }
+    },
+    "No matching results" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "검색 결과가 없습니다"
           }
         }
       }
@@ -7413,6 +7332,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 Work의 참여자 중 AIR 1 트레이스로 기술할 수 있는 에이전트가 없습니다."
+          }
+        }
+      }
+    },
+    "No pipeline agents configured. Add pipelines in Raw TOML." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정된 파이프라인 에이전트가 없습니다. TOML 원문에서 파이프라인을 추가하세요."
           }
         }
       }
@@ -7688,6 +7617,7 @@
       }
     },
     "Nothing was fired and nothing was recorded." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -7747,6 +7677,16 @@
         }
       }
     },
+    "OSStatus %lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OSStatus %lld"
+          }
+        }
+      }
+    },
     "Observe" : {
       "localizations" : {
         "ko" : {
@@ -7773,6 +7713,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "관찰 전용"
+          }
+        }
+      }
+    },
+    "Observe only — log judgments, execute no action" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "관찰만 — 판단 결과만 기록하고 동작은 실행하지 않음"
           }
         }
       }
@@ -7937,6 +7887,16 @@
         }
       }
     },
+    "Open Ask" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 열기"
+          }
+        }
+      }
+    },
     "Open Claude Code" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -7974,6 +7934,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "호스트 열기"
+          }
+        }
+      }
+    },
+    "Open Inbox" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "받은 편지함 열기"
           }
         }
       }
@@ -8080,6 +8050,16 @@
         }
       }
     },
+    "Open a pipeline as a graph you can edit, and hand a finished Work's run evidence to anyone — in AIR, the Agent Intermediate Representation." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파이프라인을 편집할 수 있는 그래프로 열고, 완료된 Work의 실행 증거를 누구에게나 전달하세요 — AIR(Agent Intermediate Representation)로."
+          }
+        }
+      }
+    },
     "Open a terminal on this Mac, or on an online fleet host from the network menu above." : {
       "localizations" : {
         "ko" : {
@@ -8111,6 +8091,7 @@
       }
     },
     "Open global Ask" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -8171,6 +8152,7 @@
       }
     },
     "Open native Live Watch" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -8381,6 +8363,16 @@
         }
       }
     },
+    "Override inherited options" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "상속된 옵션 재정의"
+          }
+        }
+      }
+    },
     "Overview" : {
       "localizations" : {
         "ko" : {
@@ -8397,6 +8389,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "페인"
+          }
+        }
+      }
+    },
+    "Pane ID to try against" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "테스트할 페인 ID"
           }
         }
       }
@@ -8547,6 +8549,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "파이프라인 완료"
+          }
+        }
+      }
+    },
+    "Pipeline overrides" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파이프라인 재정의"
           }
         }
       }
@@ -8723,12 +8735,33 @@
         }
       }
     },
+    "Provider defaults" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "공급자 기본값"
+          }
+        }
+      }
+    },
     "Provider for new conversations; disabled entries need a CLI install or an API key in Settings" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "새 대화에 사용할 프로바이더입니다. 비활성화된 항목은 CLI 설치 또는 설정의 API 키가 필요합니다"
+          }
+        }
+      }
+    },
+    "Provider: %@ · Model: %@" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "공급자: %@ · 모델: %@"
           }
         }
       }
@@ -8773,6 +8806,16 @@
         }
       }
     },
+    "Quick Open…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "빠른 이동…"
+          }
+        }
+      }
+    },
     "Quit" : {
       "localizations" : {
         "ko" : {
@@ -8800,6 +8843,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "원시 데이터"
+          }
+        }
+      }
+    },
+    "Raw TOML" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TOML 원문"
+          }
+        }
+      }
+    },
+    "Raw TOML has unsaved changes. Save or reload it first." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TOML 원문에 저장하지 않은 변경 사항이 있습니다. 먼저 저장하거나 다시 불러오세요."
           }
         }
       }
@@ -9015,6 +9078,7 @@
       }
     },
     "Refresh workspace" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -9104,6 +9168,26 @@
         }
       }
     },
+    "Release %@ ships no Mac app. Updating will be offered once a release carries a signed DMG again." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "릴리스 %@에는 Mac 앱이 없습니다. 서명된 DMG를 포함한 릴리스가 다시 나오면 업데이트를 제안합니다."
+          }
+        }
+      }
+    },
+    "Release Notes" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "릴리스 노트"
+          }
+        }
+      }
+    },
     "Reload" : {
       "localizations" : {
         "ko" : {
@@ -9185,6 +9269,26 @@
         }
       }
     },
+    "Reload to refresh launch options from the configuration file." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 불러오면 설정 파일의 최신 실행 옵션을 확인할 수 있습니다."
+          }
+        }
+      }
+    },
+    "Reload to review the current file before applying launch options again." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 옵션을 다시 적용하기 전에 파일을 다시 불러와 현재 내용을 확인하세요."
+          }
+        }
+      }
+    },
     "Reloaded from disk." : {
       "localizations" : {
         "ko" : {
@@ -9251,6 +9355,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "제거하고 키 삭제"
+          }
+        }
+      }
+    },
+    "Remove argument" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "인수 삭제"
           }
         }
       }
@@ -9361,6 +9475,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "저장된 API 키 교체"
+          }
+        }
+      }
+    },
+    "Replacing the application bundle." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "애플리케이션 번들을 교체하고 있습니다."
           }
         }
       }
@@ -9513,6 +9637,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "응답"
+          }
+        }
+      }
+    },
+    "Restarting Muxa %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa %@ 다시 시작 중"
           }
         }
       }
@@ -9707,6 +9841,16 @@
         }
       }
     },
+    "Running from a read-only copy" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "읽기 전용 복사본에서 실행 중"
+          }
+        }
+      }
+    },
     "Runs on Apple's Private Cloud Compute, no key needed" : {
       "localizations" : {
         "ko" : {
@@ -9867,6 +10011,16 @@
         }
       }
     },
+    "Save or discard launch option changes before editing Raw TOML." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TOML 원문을 편집하기 전에 실행 옵션 변경 사항을 저장하거나 버리세요."
+          }
+        }
+      }
+    },
     "Save to Keychain" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -10009,12 +10163,32 @@
         }
       }
     },
+    "Search sessions, windows, panes, shells, work, agents" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션, 윈도우, 패널, 셸, 작업, 에이전트 검색"
+          }
+        }
+      }
+    },
     "Select a message" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "메시지를 선택하세요"
+          }
+        }
+      }
+    },
+    "Selected" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "선택됨"
           }
         }
       }
@@ -10065,6 +10239,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 에이전트/페인에 프롬프트 보내기"
+          }
+        }
+      }
+    },
+    "Send context and judge (billed)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "컨텍스트 전송 후 판단(유료)"
+          }
+        }
+      }
+    },
+    "Send pane context for one billed Ask turn?" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "페인 컨텍스트를 전송해 유료 Ask 호출을 1회 진행할까요?"
           }
         }
       }
@@ -10227,6 +10421,16 @@
         }
       }
     },
+    "Sessions and work appear here when available." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "사용 가능한 세션과 작업이 여기에 표시됩니다."
+          }
+        }
+      }
+    },
     "Set up your workspace" : {
       "localizations" : {
         "ko" : {
@@ -10288,6 +10492,16 @@
         }
       }
     },
+    "Shell: New native shell" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "셸: 새 네이티브 셸"
+          }
+        }
+      }
+    },
     "Shells" : {
       "localizations" : {
         "ko" : {
@@ -10309,6 +10523,7 @@
       }
     },
     "Show managed work" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -10319,6 +10534,7 @@
       }
     },
     "Show native shells" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -10334,6 +10550,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "프롬프트 보기"
+          }
+        }
+      }
+    },
+    "Show prompt status details" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "프롬프트 전송 상태 자세히 보기"
           }
         }
       }
@@ -10378,6 +10604,26 @@
         }
       }
     },
+    "Sidebar" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "사이드바"
+          }
+        }
+      }
+    },
+    "Skip This Version" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 버전 건너뛰기"
+          }
+        }
+      }
+    },
     "Skipped" : {
       "localizations" : {
         "ko" : {
@@ -10394,6 +10640,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "소켓"
+          }
+        }
+      }
+    },
+    "Software Update" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "소프트웨어 업데이트"
           }
         }
       }
@@ -10530,6 +10786,7 @@
       }
     },
     "Start configured Work" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -10701,6 +10958,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "아직 쿨다운 중"
+          }
+        }
+      }
+    },
+    "Still looking for AIR Workbench." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "AIR Workbench를 계속 찾고 있습니다."
           }
         }
       }
@@ -11169,7 +11436,64 @@
         }
       }
     },
+    "The disk image contains no Muxa.app." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "디스크 이미지에 Muxa.app이 없습니다."
+          }
+        }
+      }
+    },
+    "The disk image could not be mounted: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "디스크 이미지를 마운트할 수 없습니다: %@"
+          }
+        }
+      }
+    },
+    "The download failed with HTTP %lld." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다운로드가 HTTP %lld로 실패했습니다."
+          }
+        }
+      }
+    },
+    "The downloaded app is not signed by this build's Developer ID team, so it was discarded: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "내려받은 앱이 이 빌드의 Developer ID 팀으로 서명되지 않아 폐기했습니다: %@"
+          }
+        }
+      }
+    },
+    "The downloaded app reports version %@ but the release is %@. Nothing was installed." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "The downloaded app reports version %1$@ but the release is %2$@. Nothing was installed."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "내려받은 앱은 버전 %@을(를) 보고하지만 릴리스는 %@입니다. 아무것도 설치하지 않았습니다."
+          }
+        }
+      }
+    },
     "The editor now holds your version and the file's latest text is the baseline. Save again to apply yours on top, or Reload to take the file's." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -11310,6 +11634,16 @@
         }
       }
     },
+    "The release's .sha256 sidecar is empty, so the download could not be verified." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "릴리스의 .sha256 사이드카가 비어 있어 다운로드를 검증할 수 없습니다."
+          }
+        }
+      }
+    },
     "The route decides the folder." : {
       "localizations" : {
         "ko" : {
@@ -11366,6 +11700,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "실행 중인 muxad가 앱 내 초안 작성을 지원하지 않아, 번들된 muxa CLI가 대신 프로바이더에게 요청합니다."
+          }
+        }
+      }
+    },
+    "The update check did not finish." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "업데이트 확인을 끝내지 못했습니다."
           }
         }
       }
@@ -11520,6 +11864,36 @@
         }
       }
     },
+    "This install cannot be updated in place." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 설치본은 제자리에서 업데이트할 수 없습니다."
+          }
+        }
+      }
+    },
+    "This is a local build from a source checkout, so Muxa will not replace it. Run Scripts/build-app.sh again after pulling." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "소스 체크아웃에서 만든 로컬 빌드이므로 Muxa가 교체하지 않습니다. pull 후 Scripts/build-app.sh를 다시 실행하세요."
+          }
+        }
+      }
+    },
+    "This is a local build from a source checkout. Muxa reports new releases but will not replace it." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "소스 체크아웃에서 만든 로컬 빌드입니다. Muxa는 새 릴리스를 알리기만 하고 교체하지 않습니다."
+          }
+        }
+      }
+    },
     "This muxad cannot edit its configuration" : {
       "localizations" : {
         "ko" : {
@@ -11547,6 +11921,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 muxad는 설정을 저장할 수 없습니다. 아래 블록을 muxa 설정 파일에 복사해 넣은 뒤 muxad를 다시 로드하세요."
+          }
+        }
+      }
+    },
+    "This muxad does not support launch option forms. Update the daemon or use Raw TOML." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 muxad는 실행 옵션 폼을 지원하지 않습니다. 데몬을 업데이트하거나 TOML 원문을 사용하세요."
           }
         }
       }
@@ -11597,6 +11981,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 페인은 일시적으로 확대되어 Live Pane 크기를 따릅니다. 연결을 끊으면 tmux 설정이 복원됩니다"
+          }
+        }
+      }
+    },
+    "This release published no notes." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 릴리스에는 공개된 노트가 없습니다."
           }
         }
       }
@@ -11661,6 +12055,16 @@
         }
       }
     },
+    "Timeout: %llu seconds" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "제한 시간: %llu초"
+          }
+        }
+      }
+    },
     "Timing" : {
       "localizations" : {
         "ko" : {
@@ -11687,6 +12091,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "구조"
+          }
+        }
+      }
+    },
+    "Try a name, host, socket, or a shorter query." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이름, 호스트, 소켓 또는 더 짧은 검색어로 검색하세요."
+          }
+        }
+      }
+    },
+    "Try condition — one billed API turn…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "조건 테스트 — 유료 API 호출 1회…"
           }
         }
       }
@@ -11727,6 +12151,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "사용할 수 없음"
+          }
+        }
+      }
+    },
+    "Unknown is not a match and must not execute an action." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "판단 불가(unknown)는 조건 일치가 아니며 동작을 실행해서는 안 됩니다."
           }
         }
       }
@@ -11801,12 +12235,42 @@
         }
       }
     },
+    "Update muxad for automation_ask_v1. This condition cannot be saved on an older daemon." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "automation_ask_v1을 지원하도록 muxad를 업데이트하세요. 이전 데몬에서는 이 조건을 저장할 수 없습니다."
+          }
+        }
+      }
+    },
     "Update muxad to draft pipelines" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "파이프라인 초안을 만들려면 muxad를 업데이트하세요"
+          }
+        }
+      }
+    },
+    "Update to %@…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@(으)로 업데이트…"
+          }
+        }
+      }
+    },
+    "Update to Muxa %@…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa %@(으)로 업데이트…"
           }
         }
       }
@@ -11831,12 +12295,32 @@
         }
       }
     },
+    "Updates" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "업데이트"
+          }
+        }
+      }
+    },
     "Upgrade required" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "업그레이드 필요"
+          }
+        }
+      }
+    },
+    "Upgrade with Homebrew" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Homebrew로 업그레이드"
           }
         }
       }
@@ -11878,6 +12362,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "에이전트 페인에서 협업을 사용하세요. 해당 페인을 다시 열지 않아도 답변이 여기에 표시됩니다."
+          }
+        }
+      }
+    },
+    "Use Empty List []" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "빈 목록 [] 사용"
           }
         }
       }
@@ -11933,6 +12427,26 @@
         }
       }
     },
+    "Verifying Muxa %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa %@ 검증 중"
+          }
+        }
+      }
+    },
+    "Version %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "버전 %@"
+          }
+        }
+      }
+    },
     "Version skew" : {
       "localizations" : {
         "ko" : {
@@ -11949,6 +12463,56 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "버전 정보 없음"
+          }
+        }
+      }
+    },
+    "View: Focus sidebar" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보기: 사이드바에 포커스"
+          }
+        }
+      }
+    },
+    "View: Show Explore" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보기: 탐색 표시"
+          }
+        }
+      }
+    },
+    "View: Show Inbox" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보기: 받은 편지함 표시"
+          }
+        }
+      }
+    },
+    "View: Show Shells" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보기: 셸 표시"
+          }
+        }
+      }
+    },
+    "View: Show Work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보기: 작업 표시"
           }
         }
       }
@@ -12101,6 +12665,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "깨우기"
+          }
+        }
+      }
+    },
+    "Watch: Open native Live Watch" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Watch: 네이티브 Live Watch 열기"
           }
         }
       }
@@ -12317,12 +12891,42 @@
         }
       }
     },
+    "Work is starting" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업을 시작하고 있습니다"
+          }
+        }
+      }
+    },
     "Work plan is ready" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Work 플랜이 준비되었습니다"
+          }
+        }
+      }
+    },
+    "Work: Open Command Center" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업: 명령 센터 열기"
+          }
+        }
+      }
+    },
+    "Work: Start configured Work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업: 설정된 작업 시작"
           }
         }
       }
@@ -12373,6 +12977,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "워크스페이스 (선택)"
+          }
+        }
+      }
+    },
+    "Workspace: Refresh" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "워크스페이스: 새로 고침"
           }
         }
       }
@@ -12483,12 +13097,32 @@
         }
       }
     },
+    "Your raw text is preserved. Reload to take the file's version, or review it before saving again." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "편집한 원문은 유지됩니다. 다시 불러와 파일의 내용을 사용하거나, 다시 저장하기 전에 내용을 검토하세요."
+          }
+        }
+      }
+    },
     "Your requests in full" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "내가 보낸 요청 전문"
+          }
+        }
+      }
+    },
+    "[mcp.guide].options still supplies %@'s fallback. Provider defaults override it, even when empty. These legacy settings are preserved; edit them in Raw TOML if needed." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "[mcp.guide].options는 여전히 %@의 대체 옵션으로 사용됩니다. 공급자 기본값이 있으면 빈 목록이어도 이를 대체합니다. 기존 설정은 유지되며, 필요하면 TOML 원문에서 수정할 수 있습니다."
           }
         }
       }
@@ -12575,6 +13209,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "작업 폴더 %@"
+          }
+        }
+      }
+    },
+    "esc  dismiss" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "esc  닫기"
+          }
+        }
+      }
+    },
+    "exit %lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "종료 코드 %lld"
           }
         }
       }
@@ -12761,6 +13415,17 @@
         }
       }
     },
+    "muxad does not support Ask conditions; update muxa and restart muxad. The condition was not removed." : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "muxad가 Ask 조건을 지원하지 않습니다. muxa를 업데이트한 뒤 muxad를 다시 시작하세요. 조건은 삭제되지 않았습니다."
+          }
+        }
+      }
+    },
     "muxad needs an upgrade: %@" : {
       "localizations" : {
         "ko" : {
@@ -12777,6 +13442,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "muxad는 에이전트가 사람을 기다리기 시작하거나, 오류가 나거나, 턴 도중 멈출 때 알립니다. 같은 에이전트의 반복 알림은 30초 동안 억제됩니다."
+          }
+        }
+      }
+    },
+    "muxad rejected the judgment" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "muxad가 판단 요청을 거부했습니다."
           }
         }
       }
@@ -12951,6 +13627,17 @@
         }
       }
     },
+    "pipeline agent #%lld" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파이프라인 에이전트 #%lld"
+          }
+        }
+      }
+    },
     "prepare" : {
       "localizations" : {
         "ko" : {
@@ -13027,6 +13714,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "muxa watch에 표시될 작업 라벨 (선택)"
+          }
+        }
+      }
+    },
+    "the bundle carries no code signature" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "번들에 코드 서명이 없습니다"
+          }
+        }
+      }
+    },
+    "the code requirement could not be built" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "코드 요구 사항을 만들 수 없습니다"
           }
         }
       }
@@ -13249,6 +13956,46 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "• 위의 마스터 스위치와 일시 정지가 모든 규칙을 멈춥니다."
+          }
+        }
+      }
+    },
+    "↑↓ / ⇧⇥ ⇥  select" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "↑↓ / ⇧⇥ ⇥  선택"
+          }
+        }
+      }
+    },
+    "↵  open" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "↵  열기"
+          }
+        }
+      }
+    },
+    "⇧⌘P" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⇧⌘P"
+          }
+        }
+      }
+    },
+    "⌘P" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⌘P"
           }
         }
       }

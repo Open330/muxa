@@ -8,6 +8,7 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
         // a previously closed/off-screen workbench as the desired launch
         // state and create no visible window at all.
         MuxaPreferences.registerDefaults()
+        MuxaUpdatePreferences.registerDefaults()
         UserDefaults.standard.set(true, forKey: "ApplePersistenceIgnoreState")
         // `MUXA_TERMINAL_DEBUG=1 open -a Muxa` (or launching the binary
         // directly) prints libghostty's lifecycle, metrics, and IO tracing to
@@ -37,6 +38,8 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
         // working install. A module that is switched off is not probed, so
         // an operator who uses none still pays nothing.
         Task { await MuxaModuleRegistry.shared.probeEnabled() }
+        // Once a day, quietly. Nothing is downloaded until someone asks.
+        MuxaUpdater.shared.startAutomaticChecks()
         if UserDefaults.standard.bool(forKey: MuxaPreferences.showWorkbenchOnLaunchKey) {
             presentWorkbench(remainingAttempts: 50)
         }
@@ -79,6 +82,7 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
 struct MuxaApp: App {
     @NSApplicationDelegateAdaptor(MuxaApplicationDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
+    @StateObject private var updater = MuxaUpdater.shared
     @AppStorage(MuxaPreferences.appearanceKey) private var appearance = MuxaAppearance.system.rawValue
 
     var body: some Scene {
@@ -98,6 +102,15 @@ struct MuxaApp: App {
             MuxaSettingsView(model: model)
                 .preferredColorScheme(preferredColorScheme)
         }
+
+        // Muxa › Check for Updates…, the menu bar's update row, and Settings ›
+        // General all open this one window (see AppUpdateViews.swift).
+        Window("Software Update", id: MuxaUpdatePreferences.windowID) {
+            MuxaSoftwareUpdateView(updater: updater)
+                .preferredColorScheme(preferredColorScheme)
+        }
+        .defaultSize(width: 560, height: 440)
+        .defaultPosition(.center)
 
         // First-launch Welcome guide; reopened from Help › Welcome Guide…
         // (see OnboardingView.swift for the launch decision).
@@ -135,6 +148,7 @@ struct MuxaApp: App {
         .commands {
             CommandGroup(replacing: .printItem) {}
             MuxaEditorMenuCommands()
+            MuxaUpdateMenuCommands()
             OnboardingMenuCommands()
             CommandGroup(after: .newItem) {
                 Button("Start Muxa Work…") { model.presentWorkStart() }
@@ -246,6 +260,7 @@ private struct MuxaEditorMenuCommands: Commands {
 
 private struct MenuBarContent: View {
     @ObservedObject var model: AppModel
+    @ObservedObject private var updater = MuxaUpdater.shared
     @Environment(\.openWindow) private var openWindow
 
     private var liveSessionCount: Int {
@@ -316,6 +331,7 @@ private struct MenuBarContent: View {
                     Label("Settings…", systemImage: "gearshape")
                 }
             }
+            MuxaUpdateMenuBarItem(updater: updater)
             Button("Quit") { NSApp.terminate(nil) }
         }
         .padding(12)

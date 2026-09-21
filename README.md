@@ -116,8 +116,8 @@ brew install open330/tap/muxa
 muxa init
 ```
 
-For the Mac app (notarized, updates through Homebrew since it has no
-built-in updater):
+For the Mac app (notarized; it checks for releases itself and updates in
+place, or hands the upgrade back to Homebrew when Homebrew installed it):
 
 ```bash
 brew install --cask open330/tap/muxa-app

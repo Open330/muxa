@@ -94,9 +94,14 @@ That installs the notarized `Muxa.app` into `/Applications`. The app carries
 its own `muxa` and `muxad` in `Contents/Helpers`, so it works without the
 formula; install both if you also want `muxa` on your `PATH`.
 
-Muxa.app has no built-in updater, which makes Homebrew its update path:
-`brew upgrade` moves an installed app to the newest release. Downloading the
-DMG from the release page works too, but then updating is on you.
+Muxa.app updates itself. It checks for a new release once a day and shows it
+under **Muxa › Check for Updates…**, in Settings › General, and in the menu
+bar; nothing is downloaded until you ask for it. A copy Homebrew installed is
+upgraded with `brew upgrade --cask muxa-app` rather than replaced behind
+Homebrew's back, so the Caskroom never disagrees with what is on disk. A copy
+that came out of the DMG replaces its own bundle after checking the release's
+published SHA-256 and Developer ID signature, then reopens. `brew upgrade`
+still works for either. See [Muxa for Mac](MACOS.md#software-update).
 
 `brew uninstall --cask muxa-app` removes the app. `--zap` additionally
 removes its preferences and caches; it deliberately leaves
