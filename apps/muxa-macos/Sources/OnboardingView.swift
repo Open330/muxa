@@ -32,24 +32,10 @@ enum OnboardingPreferences {
     }
 
     /// Component-wise numeric comparison ("0.1.9" < "0.1.10", "0.2" == "0.2.0").
-    /// Non-numeric suffixes such as "-beta" are ignored.
+    /// Shared with the updater (`MuxaVersion`) so the guide and Software
+    /// Update cannot disagree about which of two versions is newer.
     static func compareVersions(_ lhs: String, _ rhs: String) -> ComparisonResult {
-        let left = numericComponents(of: lhs)
-        let right = numericComponents(of: rhs)
-        for index in 0..<max(left.count, right.count) {
-            let leftValue = index < left.count ? left[index] : 0
-            let rightValue = index < right.count ? right[index] : 0
-            if leftValue < rightValue { return .orderedAscending }
-            if leftValue > rightValue { return .orderedDescending }
-        }
-        return .orderedSame
-    }
-
-    private static func numericComponents(of version: String) -> [Int] {
-        version
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .split(separator: ".")
-            .map { Int($0.prefix { $0.isNumber }) ?? 0 }
+        MuxaVersion.compare(lhs, rhs)
     }
 
     /// The Welcome window must never open inside a test host. Covers the

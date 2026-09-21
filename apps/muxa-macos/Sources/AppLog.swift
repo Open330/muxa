@@ -7,4 +7,5 @@ enum MuxaLog {
     static let app = Logger(subsystem: subsystem, category: "app")
     static let daemon = Logger(subsystem: subsystem, category: "daemon")
     static let terminal = Logger(subsystem: subsystem, category: "terminal")
+    static let update = Logger(subsystem: subsystem, category: "update")
 }

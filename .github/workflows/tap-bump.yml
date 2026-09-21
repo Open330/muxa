@@ -174,9 +174,10 @@ jobs:
             end
           end
           EOF
-          # Muxa.app has no self-updater, so `brew upgrade` is the only way an
-          # installed app ever moves forward. That is what earns the cask its
-          # place; it is not merely a nicer install.
+          # Muxa.app updates itself, but a cask install is upgraded by
+          # 'brew upgrade --cask muxa-app' — the app detects the Caskroom
+          # entry and hands the job back rather than replacing a bundle
+          # Homebrew's metadata still describes.
           #
           # Named muxa-app, not muxa: the tap already ships Formula/muxa.rb,
           # and a formula and cask of the same name make `brew install muxa`
@@ -193,8 +194,10 @@ jobs:
             desc "Native workbench for the muxa agent orchestration daemon"
             homepage "https://github.com/Open330/muxa"
 
-            # No Sparkle in this app: Homebrew is the update path, so leave
-            # auto_updates at its default of false.
+            # auto_updates stays at its default of false on purpose. The app
+            # self-updates only on the channels Homebrew does not own; a cask
+            # install is delegated straight back to Homebrew, so this cask
+            # must keep upgrading it. (No backticks here: see above.)
             depends_on macos: :ventura
 
             app "Muxa.app"

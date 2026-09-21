@@ -243,11 +243,11 @@ brew install --cask open330/tap/muxa-app
 
 The cask is named `muxa-app` rather than `muxa` because the tap already
 ships `Formula/muxa.rb`, and a formula and cask of one name make
-`brew install muxa` ambiguous. It matters more here than it does for a
-typical app: Muxa.app has no Sparkle and no updater of its own, so
-`brew upgrade` is the only way an installed copy ever moves forward.
-`tap-bump` rewrites the cask from the release's DMG checksum, and skips it
-when a release carries no DMG rather than pointing at a download that 404s.
+`brew install muxa` ambiguous. `tap-bump` rewrites the cask from the
+release's DMG checksum, and skips it when a release carries no DMG rather
+than pointing at a download that 404s. A cask install stays Homebrew's to
+upgrade — see [Software Update](#software-update) for why the app hands it
+back rather than replacing the bundle itself.
 
 Build one locally:
 
@@ -304,6 +304,63 @@ The version comes from `[workspace.package]` in `Cargo.toml` and is pushed
 into the app's `MARKETING_VERSION` at build time, then verified against the
 built bundle. The daemon and the app that embeds it cannot disagree about
 which release a user is running.
+
+## Software Update
+
+Muxa.app updates itself. There is no Sparkle, no appcast, and no second
+signing key: the release the app installs is the one `release.yml` already
+published, and the checks it runs are on assets that already exist.
+
+The flow is the CLI's, in a window. `muxa upgrade` resolves its install
+channel and does the right thing per channel; `Sources/AppUpdater.swift` does
+the same for the bundle.
+
+| Where the copy came from | What "update" does |
+|---|---|
+| Homebrew cask (`<prefix>/Caskroom/muxa-app` exists) | quits, runs `brew upgrade --cask muxa-app`, reopens |
+| The release DMG, or any other hand-install | downloads `Muxa-<version>.dmg`, verifies, swaps its own bundle, reopens |
+| A build directory (`.build/DerivedData`, `Build/Products`) | reports the release; never replaces the build |
+| `/Volumes/…` or an App Translocation copy | asks to be moved to `/Applications` first |
+
+The Homebrew case is delegation on purpose. The `app` artifact moves the
+bundle into `/Applications` and leaves the version in the Caskroom, so an app
+that replaced itself would leave `brew list --cask --versions muxa-app`
+describing something that is no longer on disk. Detection is the Caskroom
+entry, not `brew` — running `brew` on every launch costs about a second on a
+cold cache. Because `brew upgrade` quits the app itself (the cask carries
+`uninstall quit: "dev.muxa.mac"`), the upgrade runs from a detached script
+that waits for the app to exit, and its output is kept in
+`~/Library/Logs/Muxa/update.log` so a failure is not silent.
+
+The self-replacing case checks three things before anything moves:
+
+1. the DMG against the `Muxa-<version>.dmg.sha256` sidecar the release
+   publishes — the same sidecar the Homebrew cask's `sha256` comes from;
+2. the app inside it against a code requirement built from **this build's own
+   team identifier** (`SecCodeCopySelf`), plus the Developer ID intermediate
+   and leaf marker OIDs, with `kSecCSCheckNestedCode` so the `muxa` and
+   `muxad` in `Contents/Helpers` are covered too. A validly-signed app from
+   anyone else fails this;
+3. the downloaded bundle's `CFBundleShortVersionString` against the version
+   the release advertised.
+
+Only then is the bundle exchanged, with `replaceItemAt` on the same volume —
+a rename, so a failure leaves the old app exactly where it was. A relaunch
+script waits for the old process to exit and reopens the new one.
+
+Nothing restarts the daemon. The bundle carries `muxad` in
+`Contents/Helpers`, and `binary_watch` in muxad already notices the path it
+was launched from resolving to a different file and re-execs onto the new
+build within about 30 seconds — the same mechanism that covers a Homebrew
+formula upgrade.
+
+Automatic checking is on by default: once a day, `GET /repos/Open330/muxa/
+releases/latest`, and nothing more. A found release appears under **Muxa ›
+Check for Updates…**, in the menu-bar popover, and in Settings › General;
+downloading and installing always need a click. **Skip This Version** stays
+quiet until a version newer than the skipped one appears. A release cut
+without the signing secrets carries no DMG, and the app says so rather than
+offering a download that would 404.
 
 ## Headless providers and API keys
 

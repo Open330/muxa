@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Muxa.app updates itself.** It checks for a new release once a day and
+  surfaces it under **Muxa › Check for Updates…**, in the menu-bar popover,
+  and in Settings › General; nothing is downloaded until asked. The flow is
+  `muxa upgrade`'s, in a window: a Homebrew cask install is handed back to
+  `brew upgrade --cask muxa-app` rather than replaced behind Homebrew's back,
+  and any other install downloads `Muxa-<version>.dmg`, checks it against the
+  `.sha256` sidecar the release already publishes, checks the app inside
+  against this build's own Developer ID team — nested code included, so the
+  bundled `muxa` and `muxad` are covered — and only then exchanges its own
+  bundle with `replaceItemAt` and reopens. A failed check installs nothing
+  and leaves the running app in place.
+
+  No Sparkle, no appcast, no second signing key: the assets are the ones
+  `release.yml` already attaches. A local build from a source checkout and a
+  copy running from a disk image report the release but are never replaced.
+  The daemon needs no restart — muxad's `binary_watch` notices the helper it
+  was launched from changing and re-execs onto the new build on its own.
 ## [0.8.50] - 2026-09-20
 
 ### Fixed

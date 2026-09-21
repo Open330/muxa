@@ -141,6 +141,8 @@ private struct MuxaGeneralSettingsView: View {
                 }
             }
 
+            MuxaUpdateSettingsSection(updater: MuxaUpdater.shared)
+
             Section("Work") {
                 HStack {
                     TextField("Default project folder", text: $workDirectory)
