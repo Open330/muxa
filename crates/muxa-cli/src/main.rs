@@ -2986,7 +2986,6 @@ fn jump_to_pane_rmux_target(socket: &str, session: &str, window: &str, pane: &st
         socket: socket.to_string(),
     });
     let mut attach_view = None;
-    let mut switch_client = None;
     let mut selected_session = session.to_string();
     if current.as_deref() == Some(socket) {
         let result = (|| -> Result<()> {
@@ -3002,15 +3001,18 @@ fn jump_to_pane_rmux_target(socket: &str, session: &str, window: &str, pane: &st
                 )?
             };
             let view = tmux_work::prepare_jump_view(&control, &client, session, window)?;
-            selected_session.clone_from(&view.id);
-            attach_view = Some(view);
-            switch_client = Some(client);
-            Ok(())
+            let target = format!("{}:{window}.{pane}", view.id);
+            // Validate and select the exact destination in the switch itself.
+            // rmux terminates the invoking popup on a cross-session switch,
+            // so no required commands may follow it.
+            backend
+                .run_control(&["switch-client", "-c", &client, "-t", &target])
+                .map_err(anyhow::Error::msg)
         })();
         if let Err(error) = result {
             eprintln!("muxa: rmux jump failed: {error}");
-            return;
         }
+        return;
     } else if current.is_some() {
         eprintln!("muxa: cannot switch an rmux client across servers; attach to {socket} from a separate terminal");
         return;
@@ -3037,15 +3039,7 @@ fn jump_to_pane_rmux_target(socket: &str, session: &str, window: &str, pane: &st
             return;
         }
     }
-    if let Some(client) = switch_client {
-        // This must be the final required operation: rmux terminates the
-        // originating popup (including this process) on a session switch.
-        if let Err(error) =
-            backend.run_control(&["switch-client", "-c", &client, "-t", &selected_session])
-        {
-            eprintln!("muxa: rmux switch-client failed: {error}");
-        }
-    } else if current.is_none() {
+    if current.is_none() {
         match interactive_child::run_interactive(backend.command(None).args([
             "attach-session",
             "-t",

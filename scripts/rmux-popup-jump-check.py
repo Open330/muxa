@@ -130,6 +130,11 @@ with tempfile.TemporaryDirectory(prefix='muxa-popup-jump-') as tmp:
         collect(.5)
         assert view not in run('list-sessions', '-F', '#{session_id}').splitlines()
         print('PASS private view reaped after leaving', flush=True)
+        run('set-option', '-t', original, '@no_auto_view', '1')
+        shared = jump(client, fd, target)
+        assert shared == original, 'explicit opt-out must preserve the shared session'
+        assert clients()[other] == original and location(original) == target.split(':', 1)[1]
+        print('PASS explicit shared-session opt-out', flush=True)
     finally:
         subprocess.run(base + ['kill-server'], env=env, capture_output=True, timeout=10)
         for pid, fd in children:
