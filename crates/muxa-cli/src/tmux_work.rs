@@ -719,12 +719,12 @@ fn client_suffix(control: &Control, client: &str) -> Result<String> {
 
 /// Choose a private destination before changing the selected window. This
 /// avoids even a transient window switch in another terminal's session.
-pub(crate) fn private_jump_session(
+pub(crate) fn prepare_jump_view(
     control: &Control,
     client: &str,
     session: &str,
     window: &str,
-) -> Result<String> {
+) -> Result<AttachView> {
     let current = resolve_view_session(control, client)?;
     let linked = control.output(&["list-windows", "-t", &current.id, "-F", "#{window_id}"])?;
     let target = if linked.lines().any(|id| id == window) {
@@ -736,25 +736,41 @@ pub(crate) fn private_jump_session(
         .attached
         .saturating_sub(u32::from(current.id == target.id));
     if others == 0 {
-        return Ok(target.id);
+        return Ok(AttachView {
+            id: target.id,
+            control: control.clone(),
+            created: false,
+        });
     }
     let opted_out = control
         .output(&["show-options", "-v", "-t", &target.id, "@no_auto_view"])
         .unwrap_or_default();
     if !opted_out.trim().is_empty() {
-        return Ok(target.id);
+        return Ok(AttachView {
+            id: target.id,
+            control: control.clone(),
+            created: false,
+        });
     }
     let sessions = list_view_sessions(control)?;
     let source = canonical_view_source(&target, &sessions);
     let suffix = client_suffix(control, client)?;
     let view = prepare_view(control, client, &source, &suffix, &sessions)?;
-    activate_view(control, client, &current.id, &view)?;
-    Ok(view.id)
+    let view = AttachView {
+        id: view.id,
+        control: control.clone(),
+        created: view.created,
+    };
+    // A popup's process is terminated by switch-client. Arm cleanup on the
+    // server before switching, and keep preparation free of client moves.
+    arm_view_cleanup(control, &view.id, "client-session-changed[9001]")?;
+    Ok(view)
 }
 
-/// Keep a bare-terminal attach private as well. The owner is retained until
-/// attach exits; unlike destroy-unattached, this cannot reap a view before
-/// the interactive client has connected.
+/// Keep a bare-terminal attach private as well. The guard cleans up failed
+/// attaches; a server-side client-attached hook arms destroy-unattached only
+/// after the first client arrives, so abrupt client/parent exits are covered
+/// without reaping the view before it can be attached.
 pub(crate) struct AttachView {
     pub id: String,
     control: Control,
@@ -804,11 +820,27 @@ pub(crate) fn prepare_attach_view(control: &Control, target: &str) -> Result<Att
         "-s",
         &name,
     ])?;
-    Ok(AttachView {
+    let view = AttachView {
         id: id.trim().to_string(),
         control: control.clone(),
         created: true,
-    })
+    };
+    // Stable server-generated session ids are quoted to keep tmux from
+    // interpreting the leading '$' as an environment expansion in the hook.
+    // Retain the guard before installing the hook so an installation failure
+    // also removes this newly created, unattached view.
+    arm_view_cleanup(control, &view.id, "client-attached[9001]")?;
+    Ok(view)
+}
+
+fn arm_view_cleanup(control: &Control, session: &str, hook: &str) -> Result<()> {
+    control.run(&[
+        "set-hook",
+        "-t",
+        session,
+        hook,
+        &format!("set-option -t '{session}' destroy-unattached on"),
+    ])
 }
 
 pub async fn run_agent_control(args: AgentControlArgs, client: &Client) -> Result<()> {

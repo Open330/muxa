@@ -3007,17 +3007,19 @@ fn jump_to_pane_rmux_target(socket: &str, session: &str, window: &str, pane: &st
                     "multiple rmux clients share this session: open watch using the popup binding or pass --caller-client"
                 )?
             };
-            selected_session = tmux_work::private_jump_session(&control, &client, session, window)?;
-            // Switch only the client here. Window selection happens below,
-            // after it has its own view and with that view's session id.
+            let view = tmux_work::prepare_jump_view(&control, &client, session, window)?;
+            let target = format!("{}:{window}.{pane}", view.id);
+            // Validate and select the exact destination in the switch itself.
+            // rmux terminates the invoking popup on a cross-session switch,
+            // so no required commands may follow it.
             backend
-                .run_control(&["switch-client", "-c", &client, "-t", &selected_session])
+                .run_control(&["switch-client", "-c", &client, "-t", &target])
                 .map_err(anyhow::Error::msg)
         })();
         if let Err(error) = result {
             eprintln!("muxa: rmux jump failed: {error}");
-            return;
         }
+        return;
     } else if current.is_some() {
         eprintln!("muxa: cannot switch an rmux client across servers; attach to {socket} from a separate terminal");
         return;
