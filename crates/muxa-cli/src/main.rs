@@ -2986,6 +2986,7 @@ fn jump_to_pane_rmux_target(socket: &str, session: &str, window: &str, pane: &st
         socket: socket.to_string(),
     });
     let mut attach_view = None;
+    let mut switch_client = None;
     let mut selected_session = session.to_string();
     if current.as_deref() == Some(socket) {
         let result = (|| -> Result<()> {
@@ -3000,12 +3001,11 @@ fn jump_to_pane_rmux_target(socket: &str, session: &str, window: &str, pane: &st
                     "multiple rmux clients share this session: open watch using the popup binding or pass --caller-client"
                 )?
             };
-            selected_session = tmux_work::private_jump_session(&control, &client, session, window)?;
-            // Switch only the client here. Window selection happens below,
-            // after it has its own view and with that view's session id.
-            backend
-                .run_control(&["switch-client", "-c", &client, "-t", &selected_session])
-                .map_err(anyhow::Error::msg)
+            let view = tmux_work::prepare_jump_view(&control, &client, session, window)?;
+            selected_session.clone_from(&view.id);
+            attach_view = Some(view);
+            switch_client = Some(client);
+            Ok(())
         })();
         if let Err(error) = result {
             eprintln!("muxa: rmux jump failed: {error}");
@@ -3037,7 +3037,15 @@ fn jump_to_pane_rmux_target(socket: &str, session: &str, window: &str, pane: &st
             return;
         }
     }
-    if current.is_none() {
+    if let Some(client) = switch_client {
+        // This must be the final required operation: rmux terminates the
+        // originating popup (including this process) on a session switch.
+        if let Err(error) =
+            backend.run_control(&["switch-client", "-c", &client, "-t", &selected_session])
+        {
+            eprintln!("muxa: rmux switch-client failed: {error}");
+        }
+    } else if current.is_none() {
         match interactive_child::run_interactive(backend.command(None).args([
             "attach-session",
             "-t",
