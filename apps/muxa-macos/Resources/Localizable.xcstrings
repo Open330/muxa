@@ -461,6 +461,22 @@
         }
       }
     },
+    "%@, skips %lld" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@, skips %2$lld"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@, %lld개 건너뜀"
+          }
+        }
+      }
+    },
     "%lld" : {
       "localizations" : {
         "ko" : {
@@ -798,6 +814,16 @@
         }
       }
     },
+    "%lld failed" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개 실패"
+          }
+        }
+      }
+    },
     "%lld files" : {
       "localizations" : {
         "ko" : {
@@ -1074,6 +1100,16 @@
         }
       }
     },
+    "%lld not confirmed" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개 확인 안 됨"
+          }
+        }
+      }
+    },
     "%lld of %lld agents would be acted on" : {
       "localizations" : {
         "en" : {
@@ -1114,6 +1150,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "오퍼레이터 명령 %lld개와 보관된 답변"
+          }
+        }
+      }
+    },
+    "%lld panes" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "페인 %lld개"
           }
         }
       }
@@ -1280,6 +1326,16 @@
         }
       }
     },
+    "%lld sessions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션 %lld개"
+          }
+        }
+      }
+    },
     "%lld shells" : {
       "localizations" : {
         "en" : {
@@ -1308,12 +1364,32 @@
         }
       }
     },
+    "%lld to start by hand" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "직접 시작할 것 %lld개"
+          }
+        }
+      }
+    },
     "%lld waiting or new" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "대기 또는 새 항목 %lld개"
+          }
+        }
+      }
+    },
+    "%lld windows" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "윈도우 %lld개"
           }
         }
       }
@@ -1526,6 +1602,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "페인 %lld개 더"
+          }
+        }
+      }
+    },
+    "1 pane" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "페인 1개"
+          }
+        }
+      }
+    },
+    "1 session" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션 1개"
+          }
+        }
+      }
+    },
+    "1 window" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "윈도우 1개"
           }
         }
       }
@@ -2898,6 +3004,16 @@
         }
       }
     },
+    "Auto" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동"
+          }
+        }
+      }
+    },
     "Auto-Resume…" : {
       "localizations" : {
         "ko" : {
@@ -3187,6 +3303,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "취소됨"
+          }
+        }
+      }
+    },
+    "Capturing the workspace…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 공간을 캡처하는 중…"
           }
         }
       }
@@ -4247,6 +4373,16 @@
         }
       }
     },
+    "Create" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "생성"
+          }
+        }
+      }
+    },
     "Create Pipeline" : {
       "localizations" : {
         "ko" : {
@@ -4263,6 +4399,52 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Muxa를 벗어나지 않고 협업자 파이프라인을 만들거나 맞춥니다."
+          }
+        }
+      }
+    },
+    "Created" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "생성됨"
+          }
+        }
+      }
+    },
+    "Created %lld, skipped %lld; relaunched %lld of %lld panes" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Created %1$lld, skipped %2$lld; relaunched %3$lld of %4$lld panes"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld개 생성, %2$lld개 건너뜀. 페인 %4$lld개 중 %3$lld개 다시 실행"
+          }
+        }
+      }
+    },
+    "Creates %lld sessions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션 %lld개를 만듭니다"
+          }
+        }
+      }
+    },
+    "Creates 1 session" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션 1개를 만듭니다"
           }
         }
       }
@@ -4433,6 +4615,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "파이프라인 %@을(를) 삭제할까요?"
+          }
+        }
+      }
+    },
+    "Delete snapshot?" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "스냅샷을 삭제할까요?"
+          }
+        }
+      }
+    },
+    "Delete snapshot…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "스냅샷 삭제…"
           }
         }
       }
@@ -5078,6 +5280,16 @@
         }
       }
     },
+    "Every session already exists — nothing to restore." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모든 세션이 이미 있습니다. 복원할 것이 없습니다."
+          }
+        }
+      }
+    },
     "Every tmux pane on every host, live, whether or not Muxa started it." : {
       "localizations" : {
         "ko" : {
@@ -5144,6 +5356,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "실행 구조"
+          }
+        }
+      }
+    },
+    "Exists — missing parts added" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이미 있음 — 빠진 부분 추가"
+          }
+        }
+      }
+    },
+    "Exists — skipped" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이미 있음 — 건너뜀"
           }
         }
       }
@@ -6986,6 +7218,16 @@
         }
       }
     },
+    "Missing parts added" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "빠진 부분 추가됨"
+          }
+        }
+      }
+    },
     "Mode" : {
       "localizations" : {
         "ko" : {
@@ -8173,6 +8415,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "셸 연결 없음"
+          }
+        }
+      }
+    },
+    "No snapshots yet" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 스냅샷이 없습니다"
           }
         }
       }
@@ -9870,6 +10122,16 @@
         }
       }
     },
+    "Rebuild layout only" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "레이아웃만 다시 만들기"
+          }
+        }
+      }
+    },
     "Recap and latest response are kept separate; runtime and workload facts come directly from muxad." : {
       "localizations" : {
         "ko" : {
@@ -9906,6 +10168,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "실행 기록에 알림을 남깁니다. 에이전트는 건드리지 않습니다."
+          }
+        }
+      }
+    },
+    "Records every session, window layout, pane directory, and what each pane runs — agents come back on their own conversation." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모든 세션, 윈도우 레이아웃, 페인 폴더와 각 페인에서 실행 중인 것을 기록합니다. 에이전트는 원래 대화로 돌아옵니다."
+          }
+        }
+      }
+    },
+    "Recreate sessions, windows and directories, but leave every pane as an empty shell" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션, 윈도우, 폴더는 다시 만들고 모든 페인은 빈 셸로 둡니다"
+          }
+        }
+      }
+    },
+    "Recreates the sessions that are missing and relaunches what their panes ran. Sessions that already exist are left untouched." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "없는 세션을 다시 만들고 그 페인에서 실행하던 것을 다시 실행합니다. 이미 있는 세션은 건드리지 않습니다."
           }
         }
       }
@@ -10554,6 +10846,66 @@
         }
       }
     },
+    "Restore" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "복원"
+          }
+        }
+      }
+    },
+    "Restore Snapshot" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "스냅샷 복원"
+          }
+        }
+      }
+    },
+    "Restore Snapshot…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "스냅샷 복원…"
+          }
+        }
+      }
+    },
+    "Restore plan" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "복원 계획"
+          }
+        }
+      }
+    },
+    "Restore results" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "복원 결과"
+          }
+        }
+      }
+    },
+    "Restoring…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "복원하는 중…"
+          }
+        }
+      }
+    },
     "Resume" : {
       "localizations" : {
         "ko" : {
@@ -10944,6 +11296,16 @@
         }
       }
     },
+    "Save Snapshot" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "스냅샷 저장"
+          }
+        }
+      }
+    },
     "Save as Markdown…" : {
       "localizations" : {
         "ko" : {
@@ -11001,6 +11363,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@ 키를 로그인 키체인에 저장했습니다. 해당 Ask 프로세스에만 전달됩니다."
+          }
+        }
+      }
+    },
+    "Saved %@ on %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Saved %1$@ on %2$@"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%2$@에 %1$@ 저장함"
           }
         }
       }
@@ -11434,6 +11812,26 @@
         }
       }
     },
+    "Session: Restore snapshot…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션: 스냅샷 복원…"
+          }
+        }
+      }
+    },
+    "Session: Save snapshot" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션: 스냅샷 저장"
+          }
+        }
+      }
+    },
     "Sessions" : {
       "localizations" : {
         "ko" : {
@@ -11605,6 +12003,16 @@
         }
       }
     },
+    "Show in Restore…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "복원에서 보기…"
+          }
+        }
+      }
+    },
     "Show managed work" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -11713,6 +12121,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "건너뜀"
+          }
+        }
+      }
+    },
+    "Snapshots" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "스냅샷"
           }
         }
       }
@@ -12733,6 +13151,16 @@
         }
       }
     },
+    "The multiplexer is not running, so every session will be created." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "멀티플렉서가 실행 중이 아니므로 모든 세션을 새로 만듭니다."
+          }
+        }
+      }
+    },
     "The muxa configuration file muxad reads. Everything the daemon and the CLI can be configured with lives here." : {
       "localizations" : {
         "ko" : {
@@ -12859,6 +13287,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "실행 중인 muxad가 앱 내 초안 작성을 지원하지 않아, 번들된 muxa CLI가 대신 프로바이더에게 요청합니다."
+          }
+        }
+      }
+    },
+    "The snapshot %@ is removed. Running sessions are not affected." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "스냅샷 %@이(가) 삭제됩니다. 실행 중인 세션에는 영향이 없습니다."
+          }
+        }
+      }
+    },
+    "The snapshot from %@ is removed. Running sessions are not affected." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@의 스냅샷이 삭제됩니다. 실행 중인 세션에는 영향이 없습니다."
           }
         }
       }
@@ -13074,6 +13522,16 @@
         }
       }
     },
+    "This muxad doesn't support snapshots. Update it with `muxa upgrade`, then restart muxad." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 muxad는 스냅샷을 지원하지 않습니다. `muxa upgrade`로 업데이트한 뒤 muxad를 다시 시작하세요."
+          }
+        }
+      }
+    },
     "This muxad has no automation engine" : {
       "localizations" : {
         "ko" : {
@@ -13140,6 +13598,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 규칙이 이번 건에 이미 동작함"
+          }
+        }
+      }
+    },
+    "This snapshot cannot be read." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 스냅샷을 읽을 수 없습니다."
           }
         }
       }
@@ -13386,6 +13854,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "읽지 않음"
+          }
+        }
+      }
+    },
+    "Unreadable" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "읽을 수 없음"
           }
         }
       }
@@ -14438,6 +14916,16 @@
         }
       }
     },
+    "agent" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트"
+          }
+        }
+      }
+    },
     "alias" : {
       "localizations" : {
         "ko" : {
@@ -14828,6 +15316,16 @@
         }
       }
     },
+    "muxad is too old for snapshots" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "muxad가 오래되어 스냅샷을 쓸 수 없습니다"
+          }
+        }
+      }
+    },
     "muxad needs an upgrade: %@" : {
       "localizations" : {
         "ko" : {
@@ -14855,6 +15353,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "muxad가 판단 요청을 거부했습니다."
+          }
+        }
+      }
+    },
+    "muxad takes one automatically every 15 minutes when the workspace changes. You can also save one now from Explore \"…\" → Save Snapshot." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 공간이 바뀌면 muxad가 15분마다 자동으로 저장합니다. Explore \"…\" → 스냅샷 저장으로 지금 저장할 수도 있습니다."
           }
         }
       }
@@ -14959,12 +15467,32 @@
         }
       }
     },
+    "not confirmed" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "확인 안 됨"
+          }
+        }
+      }
+    },
     "not installed" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "설치되지 않음"
+          }
+        }
+      }
+    },
+    "not replayable" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 실행 불가"
           }
         }
       }
@@ -15070,12 +15598,32 @@
         }
       }
     },
+    "relaunched" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 실행됨"
+          }
+        }
+      }
+    },
     "remote" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "원격"
+          }
+        }
+      }
+    },
+    "replay %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 다시 실행"
           }
         }
       }
@@ -15090,12 +15638,42 @@
         }
       }
     },
+    "resume %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 이어서 실행"
+          }
+        }
+      }
+    },
+    "resume by hand" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "직접 이어서 실행"
+          }
+        }
+      }
+    },
     "role, for example implementer or reviewer" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "역할, 예: implementer 또는 reviewer"
+          }
+        }
+      }
+    },
+    "shell" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "셸"
           }
         }
       }
@@ -15136,6 +15714,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "오른쪽으로 분할"
+          }
+        }
+      }
+    },
+    "start by hand" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "직접 시작"
           }
         }
       }
