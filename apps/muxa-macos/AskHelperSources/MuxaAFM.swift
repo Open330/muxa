@@ -218,10 +218,13 @@ func isStaleRefusal(_ answer: String) -> Bool {
         "외부 애플리케이션에 액세스할 수 없",
         "다른 애플리케이션에 액세스할 수 없",
     ]
-    let firstPerson = ["i ", "i'", "as an ai", "저는", "제가", "죄송"]
     guard let phrase = refusals.lazy.compactMap({ text.range(of: $0) }).first else { return false }
-    let opening = text[..<phrase.lowerBound]
-    return opening.count <= 160 && firstPerson.contains { opening.contains($0) }
+    let opening = String(text[..<phrase.lowerBound])
+    // "I" as a word — "Hi there! Apps cannot access other applications" is
+    // not the model speaking of itself.
+    let firstPerson = opening.range(of: #"\bi\b"#, options: .regularExpression) != nil
+        || ["as an ai", "저는", "제가", "죄송"].contains { opening.contains($0) }
+    return opening.count <= 160 && firstPerson
 }
 
 /// The history a turn replays when the workspace can be read: the same
@@ -241,9 +244,12 @@ func replayableHistory(
     return (kept, last.prompt)
 }
 
-/// The prompt a turn sends when an earlier question was carried over.
+/// The prompt a turn sends when an earlier question was carried over. Only
+/// a short follow-up ("try again", "use your tools") leans on it; a longer
+/// prompt is a question of its own, and an old one in front would pull the
+/// small model back to it.
 func prompt(_ prompt: String, carrying question: String?) -> String {
-    guard let question, !question.isEmpty, question != prompt else { return prompt }
+    guard let question, !question.isEmpty, question != prompt, prompt.count <= 120 else { return prompt }
     return "Earlier question: \(question)\n\n\(prompt)"
 }
 

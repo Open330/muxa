@@ -166,9 +166,8 @@ final class AskProviderStore: ObservableObject {
             adopt([], selected: model.askAgent)
         }
         refreshKeyPresence()
-        if let owner = try? await DaemonSocketOwner.find(socketPath: model.client.socketPath) {
-            daemonDirectory = (owner.executablePath as NSString).deletingLastPathComponent
-        }
+        let owner = try? await DaemonSocketOwner.find(socketPath: model.client.socketPath)
+        daemonDirectory = owner.map { ($0.executablePath as NSString).deletingLastPathComponent }
         await detectInstalledTools()
         await probeAppleModels()
     }

@@ -65,7 +65,8 @@ The detail area is deliberately task-oriented:
   operation.
 - **Ask** lists the selected provider's Global Ask conversations, newest
   activity first; picking one opens it in the editor, where each exchange and
-  the whole conversation can be copied or saved as Markdown or as a prompt.
+  the whole conversation can be copied as Markdown or as a prompt, and a
+  conversation saved as a Markdown file.
 - **Shell** is the interactive native Ghostty surface owned by a muxad PTY.
   It also has a read-only **Raw** mode for the bounded PTY output stream.
 

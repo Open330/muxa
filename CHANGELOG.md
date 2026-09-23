@@ -20,8 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers in the user's language — and only when the answer opens by
   refusing in the first person, so a short answer that says a sandboxed app
   cannot access other applications stays in the replay. When the newest
-  turn is dropped, its question now leads the new prompt, so "use your tools
-  and try again" still says what to try.
+  turn is dropped and the new prompt is a short follow-up, the dropped
+  question leads it, so "use your tools and try again" still says what to
+  try.
 - **The Apple Intelligence helper is found in `~/Applications` too, and the
   app no longer promises a helper muxad cannot find.** A Homebrew muxad now
   looks in `~/Applications/Muxa.app` after `/Applications/Muxa.app`, and
