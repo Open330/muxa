@@ -101,6 +101,14 @@ enum MuxaTerminalKeybindings {
         "super+end=scroll_to_bottom",
         "super+page_up=scroll_page_up",
         "super+page_down=scroll_page_down",
+        // Ghostty's macOS line editing, which `clear` removes along with
+        // the app shortcuts: ⌘←/⌘→ start/end of line, ⌘⌫ delete to line
+        // start, ⌥←/⌥→ word by word.
+        "super+left=text:\\x01",
+        "super+right=text:\\x05",
+        "super+backspace=text:\\x15",
+        "alt+left=esc:b",
+        "alt+right=esc:f",
     ]
 
     /// Every terminal pane's configuration (each pane owns its controller).

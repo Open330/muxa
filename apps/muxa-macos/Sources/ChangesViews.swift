@@ -536,7 +536,9 @@ private struct ChangesFileList: View {
                 }
                 .padding(.bottom, 8)
             }
-            .changesListKeyboard { changes.moveSelection(by: $0) }
+            .changesListKeyboard { offset in
+                changes.moveSelection(by: offset, in: snapshot.groups.flatMap(files(in:)))
+            }
         }
         .background(MuxaTheme.sideBar(colorScheme))
     }
@@ -931,7 +933,8 @@ private struct ChangesDiffPane: View {
         if let editingCommentID {
             drafts.update(editingCommentID, body: body, in: key)
         } else if let selection = changes.selection,
-                  let comment = ReviewComment(path: file.path, lines: selection.lines(in: file), body: body) {
+                  var comment = ReviewComment(path: file.path, lines: selection.lines(in: file), body: body) {
+            comment.group = changes.selectedFile?.group
             drafts.add(comment, to: key)
             changes.selection = nil
         }

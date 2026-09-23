@@ -179,6 +179,10 @@ extension AppModel {
             guideDirection: guide?.direction,
             environment: placement == .native ? await nativeAgentEnvironment() : [:]
         )
+        // A second ⌥⌘T pressed while this one awaited its settings finds the
+        // first launch under way: let that one finish instead of opening the
+        // sheet over it with an error.
+        guard !agentLauncher.isStarting else { return }
         if let failure = await startAgent(request) {
             presentNewAgent(error: failure)
         }
@@ -188,9 +192,15 @@ extension AppModel {
     /// the snapshot shows it. Returns the error message, or nil on success.
     @discardableResult
     func startAgent(_ request: MuxaAgentStartRequest) async -> String? {
-        guard isConnected, !agentLauncher.isStarting else {
-            return String(localized: "Connect to muxad first.")
-        }
+        guard isConnected else { return String(localized: "Connect to muxad first.") }
+        guard !agentLauncher.isStarting else { return String(localized: "An agent is starting") }
+        // Panes that exist before the launch can never be the new agent's,
+        // even when another tmux server reuses the same `%N` id.
+        let existingPanes = Set(
+            executionSnapshot.watchHosts
+                .flatMap(\.sessions).flatMap(\.windows).flatMap(\.panes)
+                .map(\.id)
+        )
         agentLauncher.isStarting = true
         isStartingAgent = true
         agentLauncher.error = nil
@@ -219,7 +229,9 @@ extension AppModel {
             }
             agentLauncher.status = nil
             let hostAlias = request.hostAlias ?? localHostAlias
-            Task { [weak self] in await self?.openStartedAgent(result, hostAlias: hostAlias) }
+            Task { [weak self] in
+                await self?.openStartedAgent(result, hostAlias: hostAlias, excluding: existingPanes)
+            }
             return nil
         } catch {
             MuxaLog.app.error(
@@ -247,7 +259,11 @@ extension AppModel {
     /// Refreshes until the new agent's pane (or native session) is listed,
     /// then hands it to ContentView to open pinned. Gives up quietly after
     /// about 15 s: the pane still appears on a later refresh.
-    private func openStartedAgent(_ result: MuxaAgentStartResult, hostAlias: String) async {
+    private func openStartedAgent(
+        _ result: MuxaAgentStartResult,
+        hostAlias: String,
+        excluding existingPanes: Set<MuxaWatchPaneIdentity>
+    ) async {
         for delay in MuxaPendingAgentTab.refreshDelays {
             try? await Task.sleep(for: .seconds(delay))
             await refresh()
@@ -257,7 +273,7 @@ extension AppModel {
             if let selection = MuxaPendingAgentTab.selection(
                 for: result,
                 hostAlias: hostAlias,
-                panes: panes,
+                panes: panes.filter { !existingPanes.contains($0) },
                 sessionIDs: Set(sessions.map(\.id))
             ) {
                 agentLauncher.pendingEditor = selection

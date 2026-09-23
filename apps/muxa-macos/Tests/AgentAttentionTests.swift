@@ -182,7 +182,10 @@ private final class Harness {
 
 @Test func transitionRulesMatchMuxad() {
     #expect(MuxaNotificationRules.event(from: "working", to: "idle") == .finished)
-    #expect(MuxaNotificationRules.event(from: "starting", to: "stopped") == .finished)
+    #expect(MuxaNotificationRules.event(from: "working", to: "stopped") == .finished)
+    // A new agent passes starting → idle on its way up; that is not a turn.
+    #expect(MuxaNotificationRules.event(from: "starting", to: "idle") == nil)
+    #expect(MuxaNotificationRules.event(from: "starting", to: "stopped") == nil)
     #expect(MuxaNotificationRules.event(from: "idle", to: "stopped") == nil)
     #expect(MuxaNotificationRules.event(from: "working", to: "waiting_input") == .attention("waiting_input"))
     #expect(MuxaNotificationRules.event(from: "waiting_input", to: "error") == .attention("error"))

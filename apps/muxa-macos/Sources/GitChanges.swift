@@ -67,7 +67,11 @@ struct GitRunner: Sendable {
         [
             "--no-pager", "-C", directory,
             "-c", "core.quotepath=off",
+            // `color.ui` alone loses to a more specific `color.diff=always`
+            // in the operator's config, and escape codes break the parsers.
             "-c", "color.ui=false",
+            "-c", "color.diff=false",
+            "-c", "color.status=false",
             "-c", "core.fsmonitor=false",
             "-c", "diff.mnemonicPrefix=false",
             "-c", "diff.noprefix=false",

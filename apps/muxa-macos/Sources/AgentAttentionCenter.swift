@@ -51,7 +51,10 @@ enum MuxaNotificationRules {
         if MuxaAttention.states.contains(current), previous != current {
             return .attention(current)
         }
-        if MuxaAttention.activeStates.contains(previous), current == "idle" || current == "stopped" {
+        // Only a turn that was actually working finishes: every new agent
+        // passes starting → idle on its way up, and muxad's notifier skips
+        // that step too (`notify.rs`).
+        if previous == "working", current == "idle" || current == "stopped" {
             return .finished
         }
         return nil
@@ -115,7 +118,13 @@ final class MuxaAgentAttentionCenter: ObservableObject {
     /// Agents needing attention plus unread panes, for the Dock badge.
     @Published private(set) var dockCount = 0
     /// A pane a notification click asked to open; the workbench consumes it.
-    @Published var pendingOpen: MuxaWatchPaneIdentity?
+    @Published var pendingOpen: MuxaWatchPaneIdentity? {
+        didSet { pendingOpenAt = pendingOpen == nil ? nil : Date() }
+    }
+    /// When the click came in. A request for a pane that never shows up
+    /// expires, so a later pane reusing its `%N` id is not opened by it.
+    private(set) var pendingOpenAt: Date?
+    static let pendingOpenLifetime: TimeInterval = 30
 
     static let persistenceKey = "muxa.attention.seen.v1"
     static let pruneAfter: TimeInterval = 7 * 24 * 60 * 60
