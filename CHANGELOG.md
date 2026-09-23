@@ -14,15 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   swallowed the wake an attach or detach sends — so a detaching client's read
   held its connection for the full 15-second deadline. An attachment change
   now ends the wait, as it did before.
-- **Apple Intelligence recovers from its own refusals in more words.** The
-  stale-refusal filter now also catches contractions ("can't", "don't have
-  access", curly apostrophes) and the Korean boilerplate, since the model
-  answers in the user's language — and only when the answer opens by
-  refusing in the first person, so a short answer that says a sandboxed app
-  cannot access other applications stays in the replay. When the newest
-  turn is dropped and the new prompt is a short follow-up, the dropped
-  question leads it, so "use your tools and try again" still says what to
-  try.
+- **Apple Intelligence leaves out answers it gave without its tools by
+  what it was given, not by what it said.** The on-device model keeps no
+  session, so muxad replays the conversation on every turn — and a small
+  model replayed its own earlier "I cannot access other applications",
+  true before 0.8.48 gave it the workspace tools, sooner than call them.
+  0.8.50 recognised that answer by its English wording, which missed other
+  phrasings and other languages. muxad now records on each Ask entry
+  whether the turn had the workspace tools (`workspace_tools`), and a turn
+  that has them replays only turns that had them too; the helper's wording
+  filter is gone. Entries written before this version carry no such
+  record, so an Apple Intelligence conversation from 0.8.48–0.8.50 starts
+  its replay afresh once.
 - **The Apple Intelligence helper is found in `~/Applications` too, and the
   app no longer promises a helper muxad cannot find.** A Homebrew muxad now
   looks in `~/Applications/Muxa.app` after `/Applications/Muxa.app`, and

@@ -183,76 +183,6 @@ let workspaceInstructions = """
     change anything. Answer in the language the user writes in.
     """
 
-/// Whether an earlier answer is the model's own boilerplate for "I cannot
-/// see other applications" — true when it was given, before the workspace
-/// tools existed, and poison once replayed: a small model keeps the story it
-/// told three turns ago sooner than reach for a tool it has since been
-/// handed, and no wording of the instructions overrides three of them in a
-/// row. Such a turn is dropped from the replay. Only a short answer that
-/// opens by refusing in the first person qualifies; an answer that merely
-/// says, say, that a sandboxed app cannot access other applications is an
-/// answer, and stays. The model answers in the user's language, so the
-/// Korean boilerplate counts too.
-func isStaleRefusal(_ answer: String) -> Bool {
-    let text = answer.lowercased()
-        .replacingOccurrences(of: "\u{2019}", with: "'")
-        .replacingOccurrences(of: "can't", with: "cannot")
-        .replacingOccurrences(of: "can not", with: "cannot")
-        .replacingOccurrences(of: "don't", with: "do not")
-        .replacingOccurrences(of: "i'm", with: "i am")
-    guard text.count <= 400 else { return false }
-    let refusals = [
-        "cannot access external applications",
-        "cannot directly access external applications",
-        "cannot access other applications",
-        "cannot access your applications",
-        "can only work with the information provided in this conversation",
-        "unable to access external applications",
-        "unable to access other applications",
-        "do not have access to external applications",
-        "do not have access to other applications",
-        "외부 애플리케이션에 접근할 수 없",
-        "다른 애플리케이션에 접근할 수 없",
-        "외부 앱에 접근할 수 없",
-        "다른 앱에 접근할 수 없",
-        "외부 애플리케이션에 액세스할 수 없",
-        "다른 애플리케이션에 액세스할 수 없",
-    ]
-    guard let phrase = refusals.lazy.compactMap({ text.range(of: $0) }).first else { return false }
-    let opening = String(text[..<phrase.lowerBound])
-    // "I" as a word — "Hi there! Apps cannot access other applications" is
-    // not the model speaking of itself.
-    let firstPerson = opening.range(of: #"\bi\b"#, options: .regularExpression) != nil
-        || ["as an ai", "저는", "제가", "죄송"].contains { opening.contains($0) }
-    return opening.count <= 160 && firstPerson
-}
-
-/// The history a turn replays when the workspace can be read: the same
-/// exchanges, minus the stale refusals. Without tools every turn stays —
-/// the model's earlier answer was as true as it will be now.
-///
-/// Dropping the newest exchange would also drop the question the user is
-/// now following up ("use your tools and try again"), so that question is
-/// handed back as `carried`, for the new prompt to lead with.
-func replayableHistory(
-    _ history: [TurnRequest.Exchange],
-    hasTools: Bool
-) -> (history: [TurnRequest.Exchange], carried: String?) {
-    guard hasTools else { return (history, nil) }
-    let kept = history.filter { !isStaleRefusal($0.answer) }
-    guard let last = history.last, isStaleRefusal(last.answer) else { return (kept, nil) }
-    return (kept, last.prompt)
-}
-
-/// The prompt a turn sends when an earlier question was carried over. Only
-/// a short follow-up ("try again", "use your tools") leans on it; a longer
-/// prompt is a question of its own, and an old one in front would pull the
-/// small model back to it.
-func prompt(_ prompt: String, carrying question: String?) -> String {
-    guard let question, !question.isEmpty, question != prompt, prompt.count <= 120 else { return prompt }
-    return "Earlier question: \(question)\n\n\(prompt)"
-}
-
 /// One tracked agent, flattened out of `muxa status --json`.
 struct AgentSession {
     let pane: String
@@ -589,9 +519,8 @@ func isContextOverflow(_ error: any Error) -> Bool {
 @available(macOS 26.0, *)
 func respond(to request: TurnRequest, choice: ModelChoice, log: ToolLog) async throws -> String {
     let tools = request.muxa.map { workspaceTools(for: $0, log: log) } ?? []
-    let replayable = replayableHistory(request.history ?? [], hasTools: !tools.isEmpty)
-    var history = ArraySlice(replayable.history)
-    let promptText = prompt(request.prompt, carrying: replayable.carried)
+    // muxad has already left out the turns answered without these tools.
+    var history = ArraySlice(request.history ?? [])
     // The caller's instructions win; the workspace ones are only a default
     // for a turn that can actually use the tools they describe.
     let instructions = request.instructions ?? (tools.isEmpty ? nil : workspaceInstructions)
@@ -614,7 +543,7 @@ func respond(to request: TurnRequest, choice: ModelChoice, log: ToolLog) async t
             #endif
         }
         do {
-            return try await session.respond(to: promptText).content
+            return try await session.respond(to: request.prompt).content
         } catch where isContextOverflow(error) {
             guard !history.isEmpty else {
                 throw HelperFailure(

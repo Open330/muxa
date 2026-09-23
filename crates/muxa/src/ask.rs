@@ -213,6 +213,11 @@ pub struct AskEntry {
     pub cost_usd: Option<f64>,
     #[serde(default)]
     pub error: Option<String>,
+    /// The turn was handed muxad's read-only workspace tools — the `apple`
+    /// engine on a Global Ask turn. An entry written before the tools
+    /// existed has none, and deserializes as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub workspace_tools: bool,
 }
 
 /// A resumable Global Ask conversation. Provider session ids remain an
@@ -750,6 +755,7 @@ impl AskStore {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn ask_with_credential_mode(
         self: &Arc<Self>,
         prompt: &str,
@@ -787,11 +793,13 @@ impl AskStore {
         // API providers and the apple helper remember nothing between
         // calls; the store is their thread. Read it before the new entry
         // joins so the prompt being asked is not replayed as history.
-        let history = if provider.engine.replays_history() {
-            replay_history(&self.entries.read().await, &conversation_id)
-        } else {
-            Vec::new()
-        };
+        let workspace_tools = provider.engine == AskEngine::Apple && self.opts.socket.is_some();
+        let history = turn_history(
+            &self.entries.read().await,
+            &conversation_id,
+            provider.engine,
+            workspace_tools,
+        );
         let engine = provider.engine;
         let now = OffsetDateTime::now_utc();
         let entry = AskEntry {
@@ -807,6 +815,7 @@ impl AskStore {
             answered_at: None,
             cost_usd: None,
             error: None,
+            workspace_tools,
         };
 
         {
@@ -2221,14 +2230,51 @@ pub struct ReplayTurn {
     pub answer: String,
 }
 
+/// What a new turn of `conversation_id` replays: nothing for an engine
+/// that resumes its own session, and for a turn with the workspace tools
+/// only the turns that had them.
+fn turn_history(
+    entries: &[AskEntry],
+    conversation_id: &str,
+    engine: AskEngine,
+    workspace_tools: bool,
+) -> Vec<ReplayTurn> {
+    if !engine.replays_history() {
+        Vec::new()
+    } else if workspace_tools {
+        replay_history_with_tools(entries, conversation_id)
+    } else {
+        replay_history(entries, conversation_id)
+    }
+}
+
 /// The answered turns of `conversation_id`, oldest first, ready to replay.
 #[must_use]
 pub fn replay_history(entries: &[AskEntry], conversation_id: &str) -> Vec<ReplayTurn> {
+    answered_turns(entries, conversation_id, |_| true)
+}
+
+/// The same, for a turn that can read the workspace: only the turns that
+/// could read it too. A small model replayed its own earlier "I cannot see
+/// other applications" — true when it was said — sooner than call the tools
+/// it has since been given, so an answer given without the tools is left
+/// out rather than guessed at from its wording.
+#[must_use]
+pub fn replay_history_with_tools(entries: &[AskEntry], conversation_id: &str) -> Vec<ReplayTurn> {
+    answered_turns(entries, conversation_id, |entry| entry.workspace_tools)
+}
+
+fn answered_turns(
+    entries: &[AskEntry],
+    conversation_id: &str,
+    keep: impl Fn(&AskEntry) -> bool,
+) -> Vec<ReplayTurn> {
     entries
         .iter()
         .filter(|entry| {
             entry.conversation_id.as_deref() == Some(conversation_id)
                 && entry.status == AskStatus::Answered
+                && keep(entry)
         })
         .map(|entry| ReplayTurn {
             prompt: entry.prompt.clone(),
@@ -3106,6 +3152,7 @@ mod tests {
             answered_at: Some(now),
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         };
         let entries = vec![
             entry("1", "c1", AskStatus::Answered),
@@ -3127,6 +3174,52 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A turn with the workspace tools replays only turns that had them:
+    /// an earlier "I cannot see other applications" is left out by what the
+    /// turn was given, not by how the answer was worded.
+    #[test]
+    fn a_turn_with_workspace_tools_replays_only_turns_that_had_them() {
+        let now = OffsetDateTime::now_utc();
+        let entry = |id: &str, tools: bool| AskEntry {
+            id: id.into(),
+            conversation_id: Some("c1".into()),
+            prompt: format!("prompt {id}"),
+            answer: format!("answer {id}"),
+            status: AskStatus::Answered,
+            agent: "apple".into(),
+            agent_session_id: None,
+            cwd: "/tmp".into(),
+            asked_at: now,
+            answered_at: Some(now),
+            cost_usd: None,
+            error: None,
+            workspace_tools: tools,
+        };
+        let entries = vec![entry("before", false), entry("after", true)];
+        let prompts =
+            |turns: Vec<ReplayTurn>| turns.into_iter().map(|t| t.prompt).collect::<Vec<_>>();
+        assert_eq!(
+            prompts(replay_history_with_tools(&entries, "c1")),
+            ["prompt after"]
+        );
+        // Without tools nothing is left out: every answer is as true now.
+        assert_eq!(
+            prompts(replay_history(&entries, "c1")),
+            ["prompt before", "prompt after"]
+        );
+
+        // The flag is written only when set, and an entry stored before it
+        // existed reads as a turn without tools.
+        let stored = serde_json::to_value(&entries[0]).unwrap();
+        assert!(stored.get("workspace_tools").is_none());
+        assert_eq!(
+            serde_json::to_value(&entries[1]).unwrap()["workspace_tools"],
+            true
+        );
+        let legacy: AskEntry = serde_json::from_value(stored).unwrap();
+        assert!(!legacy.workspace_tools);
     }
 
     #[test]
@@ -3442,6 +3535,7 @@ mod tests {
             answered_at: None,
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         });
 
         let second = store
@@ -3509,6 +3603,7 @@ mod tests {
                 answered_at: Some(now),
                 cost_usd: None,
                 error: None,
+                workspace_tools: false,
             }],
             ..AskSnapshot::default()
         };
@@ -3589,6 +3684,7 @@ mod tests {
             answered_at: (status != AskStatus::Running).then_some(now),
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         };
         *store.entries.write().await = vec![
             entry("answered", AskStatus::Answered),
@@ -3624,6 +3720,7 @@ mod tests {
                 answered_at: Some(now),
                 cost_usd: None,
                 error: None,
+                workspace_tools: false,
             },
             AskEntry {
                 id: "running".into(),
@@ -3638,6 +3735,7 @@ mod tests {
                 answered_at: None,
                 cost_usd: None,
                 error: None,
+                workspace_tools: false,
             },
         ];
 
