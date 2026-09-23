@@ -64,7 +64,9 @@ struct NewAgentView: View {
     }
 
     private var selectedWindowSession: MuxaWatchSession? {
-        sessions.first { $0.sessionID == windowSessionID } ?? sessions.first
+        // Keyed by the full identity: `$0`-style session ids repeat across
+        // tmux servers.
+        sessions.first { $0.id == windowSessionID } ?? sessions.first
     }
 
     private var effectiveOptions: [String] {
@@ -274,7 +276,7 @@ struct NewAgentView: View {
                 Picker("Session", selection: $windowSessionID) {
                     ForEach(sessions) { session in
                         Text(verbatim: session.name.isEmpty ? session.sessionID : session.name)
-                            .tag(session.sessionID)
+                            .tag(session.id)
                     }
                 }
             case .newSession:
@@ -378,10 +380,10 @@ struct NewAgentView: View {
 
     private func defaultWindowSessionID() -> String {
         if let pane = launcher.focus.pane, launcher.focus.hostAlias == hostAlias,
-           sessions.contains(where: { $0.sessionID == pane.sessionID }) {
-            return pane.sessionID
+           let session = sessions.first(where: { $0.sessionID == pane.sessionID && $0.socket == pane.socket }) {
+            return session.id
         }
-        return sessions.first?.sessionID ?? ""
+        return sessions.first?.id ?? ""
     }
 
     private func chooseDirectory() {

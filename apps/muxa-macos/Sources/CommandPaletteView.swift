@@ -491,8 +491,11 @@ struct CommandPaletteView: View {
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, minHeight: 230)
                         }
-                        ForEach(Array(results.enumerated()), id: \.element.id) { index, item in
-                            row(item, digit: index < 9 && item.isEnabled ? index + 1 : nil)
+                        // ⌘N counts enabled rows only, the same way the jump
+                        // does, so the badge always names the row it opens.
+                        let enabledIDs = results.filter(\.isEnabled).map(\.stableID)
+                        ForEach(results) { item in
+                            row(item, digit: enabledIDs.firstIndex(of: item.stableID).flatMap { $0 < 9 ? $0 + 1 : nil })
                         }
                     }
                     .padding(8)

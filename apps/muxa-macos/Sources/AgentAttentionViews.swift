@@ -99,8 +99,13 @@ struct MuxaAttentionTracking: ViewModifier {
     /// A click can arrive before the pane's host has reported in (the click
     /// that launched Muxa); the request waits for the next snapshot.
     private func openPending() {
-        guard let pane = attention.pendingOpen,
-              model.executionSnapshot.watchPane(id: pane) != nil else { return }
+        guard let pane = attention.pendingOpen else { return }
+        if let at = attention.pendingOpenAt,
+           Date().timeIntervalSince(at) > MuxaAgentAttentionCenter.pendingOpenLifetime {
+            attention.pendingOpen = nil
+            return
+        }
+        guard model.executionSnapshot.watchPane(id: pane) != nil else { return }
         attention.pendingOpen = nil
         open(pane)
     }

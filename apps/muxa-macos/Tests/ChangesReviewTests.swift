@@ -487,3 +487,25 @@ func loaderReadsARealRepository() async throws {
     let notRepo = await loader.repositoryRoot(for: "/")
     #expect(notRepo == .failure(.notRepository("/")))
 }
+
+// MARK: - Review fixes
+
+/// A file both staged and changed has two diffs; a comment written on the
+/// staged one must not go outdated when the unstaged one is shown.
+@MainActor
+@Test func outdatedCheckOnlyUsesTheDiffTheCommentWasWrittenOn() throws {
+    let store = ReviewDraftStore()
+    store.register(hostAlias: "local", path: "/repo", root: "/repo")
+    let key = try #require(store.key(hostAlias: "local", path: "/repo"))
+    let file = try #require(UnifiedDiffParser.parse(sampleDiff).first)
+    var comment = try #require(ReviewComment(path: "src/app.rs", lines: [file.hunks[0].lines[2]], body: "staged note"))
+    comment.group = .staged
+    store.add(comment, to: key)
+
+    let other = sampleDiff.replacingOccurrences(of: "+let b = 3;", with: "+let b = 30;")
+    let otherFile = try #require(UnifiedDiffParser.parse(other).first)
+    store.refreshOutdated(in: key, file: otherFile, group: .unstaged)
+    #expect(store.draft(for: key).comments.first?.outdated == false)
+    store.refreshOutdated(in: key, file: otherFile, group: .staged)
+    #expect(store.draft(for: key).comments.first?.outdated == true)
+}

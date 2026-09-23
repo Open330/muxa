@@ -361,8 +361,15 @@ struct ContentView: View {
             openInbox: { openEditor(.inbox) },
             selectSidebar: { model.show($0) },
             focusSidebar: {
+                guard !sidebarVisible else {
+                    sidebarFocusRequest = UUID()
+                    return
+                }
+                // A side bar that is only now appearing is built with the
+                // request already set, and `onChange` ignores a starting
+                // value: ask again once it is on screen.
                 sidebarVisible = true
-                sidebarFocusRequest = UUID()
+                DispatchQueue.main.async { sidebarFocusRequest = UUID() }
             },
             jumpToAgent: { paletteMode = .agents },
             nextAttention: jumpToNextAttention,

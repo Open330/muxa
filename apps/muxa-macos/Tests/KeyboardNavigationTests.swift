@@ -208,6 +208,10 @@ import Testing
     for shortcut in ["super+w", "ctrl+tab", "ctrl+shift+tab", "super+1", "super+comma", "super+t"] {
         #expect(!bound.contains(Substring(shortcut)))
     }
+    // Line editing survives the `clear`.
+    for shortcut in ["super+left", "super+right", "super+backspace", "alt+left", "alt+right"] {
+        #expect(bound.contains(Substring(shortcut)))
+    }
 }
 
 @Test func nextAttentionCyclesThroughWaitingPanes() {

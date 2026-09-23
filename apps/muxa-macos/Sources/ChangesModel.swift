@@ -272,6 +272,10 @@ struct ReviewComment: Identifiable, Equatable, Sendable {
     var body: String
     /// Its quote is no longer in the current diff.
     var outdated = false
+    /// Which list the commented diff came from. A file both staged and
+    /// changed has two different diffs, and a comment is only re-checked
+    /// against the one it was written on.
+    var group: ChangeGroup?
 
     static let quoteLimit = 40
 
@@ -387,9 +391,10 @@ final class ReviewDraftStore: ObservableObject {
     }
 
     /// Re-checks the comments on `file`'s path against its fresh diff.
-    func refreshOutdated(in key: ReviewDraftKey, file: DiffFile) {
+    func refreshOutdated(in key: ReviewDraftKey, file: DiffFile, group: ChangeGroup? = nil) {
         guard var draft = drafts[key] else { return }
-        for index in draft.comments.indices where draft.comments[index].path == file.path {
+        for index in draft.comments.indices where draft.comments[index].path == file.path
+            && (group == nil || draft.comments[index].group == nil || draft.comments[index].group == group) {
             draft.comments[index].outdated = draft.comments[index].anchorLineID(in: file) == nil
         }
         if draft != drafts[key] { drafts[key] = draft }
@@ -536,8 +541,10 @@ final class ChangesModel: ObservableObject {
         loadDiff(keepCurrent: false)
     }
 
-    func moveSelection(by offset: Int) {
-        guard let files = snapshot?.files, !files.isEmpty else { return }
+    /// ↑/↓ follow the rows as shown — grouped and filtered — not the
+    /// status output's raw order. The view passes its visible order.
+    func moveSelection(by offset: Int, in visible: [ChangedFile]? = nil) {
+        guard let files = visible ?? snapshot?.files, !files.isEmpty else { return }
         let index = files.firstIndex { $0.id == selectedFileID } ?? (offset > 0 ? -1 : files.count)
         select(fileID: files[max(0, min(files.count - 1, index + offset))].id)
     }
@@ -614,6 +621,9 @@ final class ChangesModel: ObservableObject {
         switch await loader.repositoryRoot(for: path) {
         case .success(let value): root = value
         case .failure(let failure):
+            // A restart cancelled this run: the child was killed on
+            // purpose, and its successor owns the state now.
+            guard !Task.isCancelled else { return }
             if case .error(let message) = failure, snapshot != nil {
                 refreshError = message
             } else {
@@ -628,6 +638,9 @@ final class ChangesModel: ObservableObject {
         switch await loader.status(root: root) {
         case .success(let value): status = value
         case .failure(let failure):
+            // A restart cancelled this run: the child was killed on
+            // purpose, and its successor owns the state now.
+            guard !Task.isCancelled else { return }
             if case .error(let message) = failure, snapshot != nil {
                 refreshError = message
             } else {
@@ -675,6 +688,7 @@ final class ChangesModel: ObservableObject {
                     omittedCount: status.omittedCount, compare: .branch, base: base, countsLoaded: true
                 )
             case .failure(let failure):
+                guard !Task.isCancelled else { return }
                 if case .error(let message) = failure { refreshError = message } else { fail(failure) }
                 return
             }
@@ -732,10 +746,13 @@ final class ChangesModel: ObservableObject {
         let key = draftKey
         diffTask = Task { [weak self] in
             let result = await loader.diff(root: root, file: file, base: base)
-            guard !Task.isCancelled, let self, self.selectedFileID == file.id else { return }
+            // The repository may have changed under a slow diff (the
+            // source switched): only the one it was read from may show it.
+            guard !Task.isCancelled, let self, self.selectedFileID == file.id,
+                  self.snapshot?.root == root else { return }
             switch result {
             case .success(let loaded):
-                if let key { self.drafts.refreshOutdated(in: key, file: loaded.file) }
+                if let key { self.drafts.refreshOutdated(in: key, file: loaded.file, group: file.group) }
                 let lines = loaded.file.lineCount
                 if ChangesRefreshRules.isLarge(lines: lines, bytes: loaded.bytes),
                    !self.forcedLargePaths.contains(loaded.file.path) {
