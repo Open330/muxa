@@ -294,13 +294,9 @@ enum Cmd {
         command: Vec<String>,
     },
     /// Attach this terminal to a muxa-owned PTY session.
-    Attach {
-        session: String,
-    },
+    Attach { session: String },
     /// Mark a muxa-owned PTY session as detached.
-    Detach {
-        session: String,
-    },
+    Detach { session: String },
     /// Register an arbitrary background process (shell script, game,
     /// automation loop) so it shows up in `muxa status`/`muxa watch`,
     /// tracked by pid liveness. Defaults `--pid` to the calling shell.
@@ -369,9 +365,6 @@ enum Cmd {
     /// Falls back to `journalctl --user -u muxad` on Linux when the
     /// systemd unit is the source of truth.
     Logs(logs::Args),
-    /// Update muxa from the source repo: `git pull` → cargo install
-    /// `muxad` + `muxa-cli` → restart the daemon → verify the IPC
-    /// socket is responsive. One command for the full update flow.
     /// Capture this multiplexer's workspace — sessions, windows, panes,
     /// geometry, and what each pane is running — so a restart can be undone
     Snapshot(reload::SnapshotArgs),
@@ -383,6 +376,9 @@ enum Cmd {
     /// from outside the server it restarts
     Reload(reload::ReloadArgs),
 
+    /// Update muxa from the source repo: `git pull` → cargo install
+    /// `muxad` + `muxa-cli` → restart the daemon → verify the IPC
+    /// socket is responsive. One command for the full update flow.
     Upgrade(upgrade::Args),
     /// Delete accumulated "orphan" agent rows — paneless, surfaceless,
     /// pid-less ghosts left by remote/detached sessions (e.g. codex driven
