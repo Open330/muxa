@@ -1080,6 +1080,7 @@ private struct FleetPaneWorkspace: View {
             breadcrumbs
                 .layoutPriority(-1)
             Spacer(minLength: 8)
+            MuxaPaneUsageAccessory(agent: pane.agent) // WS-C usage
             MuxaTextTabs(items: PaneModule.allCases, selection: $module, title: \.title)
             Button {
                 Task { await model.refresh() }
@@ -3774,10 +3775,11 @@ private struct FleetPaneInspector: View {
         Label(agentStateLabel(agent.state), systemImage: "circle.fill")
             .foregroundStyle(agentStateColor(agent.state))
         if let modelName = agent.model { Text(modelName) }
+        // WS-C usage
         if let context = agent.contextUsedPercent {
-            let percent = "\(context.formatted(.number.precision(.fractionLength(0))))%"
-            Text("context \(percent)")
+            MuxaContextMeter(percent: context)
         }
+        MuxaRateLimitBadge(agent: agent)
     }
 }
 

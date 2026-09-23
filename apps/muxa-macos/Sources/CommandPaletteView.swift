@@ -352,7 +352,8 @@ enum MuxaPaletteItems {
                     title: pane.pane.agentAlias.map { "@\($0)" }
                         ?? pane.agent?.aiTitle
                         ?? (pane.pane.title.isEmpty ? pane.pane.currentCommand : pane.pane.title),
-                    subtitle: [state, pane.host.alias, "\(pane.pane.session) › \(window)", pane.pane.paneID]
+                    subtitle: ([state] + MuxaUsageFormat.paletteFragments(for: pane.agent) // WS-C usage
+                        + [pane.host.alias, "\(pane.pane.session) › \(window)", pane.pane.paneID])
                         .filter { !$0.isEmpty }.joined(separator: " · "),
                     systemImage: MuxaAttention.needsAttention(pane)
                         ? "exclamationmark.circle.fill" : "person.crop.circle",
