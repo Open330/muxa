@@ -256,7 +256,7 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
             path: path.to_owned(),
             replayable: command.as_deref().is_some_and(is_replayable),
             command,
-            agent: agents.get(pane_id).cloned(),
+            agent: agents.get(&namespaced(endpoint.host, pane_id)).cloned(),
         });
     }
 
@@ -308,6 +308,23 @@ fn fold_window_groups(listing: &str) -> (Vec<WindowShape>, BTreeMap<String, Stri
         .map(|(_, window)| window)
         .collect();
     (windows, owner)
+}
+
+/// The registry names a pane by its host — `rmux:%12` — while the host's own
+/// control commands report the bare `%12` they mint. Without the namespace the
+/// two never meet, and no pane would ever be recognised as an agent's.
+fn namespaced(host: HostKind, pane_id: &str) -> String {
+    let prefix = match host {
+        HostKind::Rmux => muxa::backend::rmux::PANE_ID_PREFIX,
+        HostKind::Cmux => muxa::backend::cmux::PANE_ID_PREFIX,
+        HostKind::Herdr => muxa::backend::herdr::PANE_ID_PREFIX,
+        HostKind::Tmux | HostKind::Zellij => return pane_id.to_owned(),
+    };
+    if pane_id.starts_with(prefix) {
+        pane_id.to_owned()
+    } else {
+        format!("{prefix}{pane_id}")
+    }
 }
 
 fn agents_by_pane(agents: &[muxa::Agent]) -> HashMap<String, AgentShape> {
@@ -845,6 +862,14 @@ mod tests {
             session_id: "synthetic-7".into(),
         });
         assert_eq!(relaunch_command(&codex).as_deref(), Some("codex --yolo"));
+    }
+
+    #[test]
+    fn a_pane_id_is_looked_up_under_its_host_namespace() {
+        // The registry stores `rmux:%12`; the control command reports `%12`.
+        assert_eq!(namespaced(HostKind::Rmux, "%12"), "rmux:%12");
+        assert_eq!(namespaced(HostKind::Rmux, "rmux:%12"), "rmux:%12");
+        assert_eq!(namespaced(HostKind::Tmux, "%12"), "%12");
     }
 
     #[test]

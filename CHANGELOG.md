@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interval; and servers that rewrite their own argv into a status line (puma)
   are reported for a human rather than replayed as a command.
 
+  Agents are matched under their host namespace: the registry names a pane
+  `rmux:%12` while the host's own control commands report the bare `%12`, so
+  without it no pane would ever be recognised as an agent's and no
+  conversation would resume.
+
 ## [0.8.51] - 2026-09-23
 
 ### Fixed
