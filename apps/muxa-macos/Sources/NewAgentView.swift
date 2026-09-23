@@ -155,7 +155,7 @@ struct NewAgentView: View {
         .background {
             // ⌘↩ starts from anywhere in the sheet, like the other composers,
             // including while the prompt editor has focus.
-            Button("") { if canStart { submit() } }
+            Button { if canStart { submit() } } label: { EmptyView() }
                 .keyboardShortcut(.return, modifiers: .command)
                 .hidden()
         }
