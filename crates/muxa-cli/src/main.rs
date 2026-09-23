@@ -369,9 +369,6 @@ enum Cmd {
     /// Falls back to `journalctl --user -u muxad` on Linux when the
     /// systemd unit is the source of truth.
     Logs(logs::Args),
-    /// Update muxa from the source repo: `git pull` → cargo install
-    /// `muxad` + `muxa-cli` → restart the daemon → verify the IPC
-    /// socket is responsive. One command for the full update flow.
     /// Capture this multiplexer's workspace — sessions, windows, panes,
     /// geometry, and what each pane is running — so a restart can be undone
     Snapshot(reload::SnapshotArgs),
@@ -383,6 +380,9 @@ enum Cmd {
     /// from outside the server it restarts
     Reload(reload::ReloadArgs),
 
+    /// Update muxa from the source repo: `git pull` → cargo install
+    /// `muxad` + `muxa-cli` → restart the daemon → verify the IPC
+    /// socket is responsive. One command for the full update flow.
     Upgrade(upgrade::Args),
     /// Delete accumulated "orphan" agent rows — paneless, surfaceless,
     /// pid-less ghosts left by remote/detached sessions (e.g. codex driven
@@ -3881,6 +3881,23 @@ mod tests {
     use muxa::AgentKind;
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn snapshot_restore_reload_and_upgrade_each_carry_their_own_help() {
+        use clap::CommandFactory;
+        let command = Args::command();
+        let about = |name: &str| {
+            command
+                .find_subcommand(name)
+                .and_then(|sub| sub.get_about())
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        };
+        assert!(about("snapshot").starts_with("Capture this multiplexer"));
+        assert!(about("restore").starts_with("Rebuild a workspace"));
+        assert!(about("reload").starts_with("Snapshot, restart"));
+        assert!(about("upgrade").starts_with("Update muxa from the source repo"));
+    }
 
     #[test]
     fn rmux_client_resolution_uses_the_invoking_session_without_guessing() {

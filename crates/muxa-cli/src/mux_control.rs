@@ -147,12 +147,12 @@ mod tests {
                 socket: "/tmp/selected-server.sock".into(),
             };
             let cmd = command(&endpoint).unwrap();
-            let expected_socket = if host == HostKind::Tmux {
-                "/dev/null"
-            } else {
-                "/tmp/selected-server.sock"
-            };
-            assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["-S", expected_socket]);
+            // A full path names its server on both hosts; tmux used to send
+            // it through the basename lookup and end up on `/dev/null`.
+            assert_eq!(
+                cmd.get_args().collect::<Vec<_>>(),
+                ["-S", "/tmp/selected-server.sock"]
+            );
             let program = std::path::Path::new(cmd.get_program())
                 .file_name()
                 .unwrap()
