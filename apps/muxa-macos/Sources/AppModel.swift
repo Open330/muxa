@@ -100,6 +100,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var isAttachingPane = false
     @Published private(set) var attachError: String?
     @Published var isPresentingWorkStart = false
+    /// The Save / Restore snapshot sheet, when one is up. WS-F: snapshot
+    @Published var sessionSnapshotSheet: MuxaSessionSnapshotSheet?
     /// Pipeline the Start Work sheet should preselect when opened from a
     /// pipeline card; nil leaves the route default.
     @Published var workStartPreselectedPipeline: String?

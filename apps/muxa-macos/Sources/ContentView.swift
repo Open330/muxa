@@ -83,6 +83,10 @@ struct ContentView: View {
         .sheet(isPresented: $model.isPresentingHostRegistration) {
             HostRegistrationView(model: model)
         }
+        // WS-F: snapshot
+        .sheet(item: $model.sessionSnapshotSheet) { sheet in
+            SessionSnapshotSheetHost(model: model, sheet: sheet)
+        }
         .sheet(item: $model.pipelineEditorTarget) { target in
             PipelineEditorView(target: target, model: model)
         }
@@ -448,6 +452,9 @@ struct ContentView: View {
             // WS-B: new agent
             case .newAgent: model.presentNewAgent()
             case .newDefaultAgent: Task { await model.quickStartAgent() }
+            // WS-F: snapshot
+            case .saveSnapshot: model.presentSessionSnapshots(.save)
+            case .restoreSnapshot: model.presentSessionSnapshots(.restore)
             }
         }
     }
@@ -1099,6 +1106,9 @@ private struct MuxaSidebar: View {
                                 .tag(order)
                         }
                     }
+                    // WS-F: snapshot
+                    Divider()
+                    SessionSnapshotMenuItems(model: model)
                 } label: {
                     Image(systemName: "ellipsis")
                 }

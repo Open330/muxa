@@ -19,11 +19,16 @@ use clap::Parser;
 use muxa::ipc::Client;
 use muxa::{AgentKind, BackendEndpoint, HostKind};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::mux_control;
+
+mod plan;
+mod store;
+
+use plan::RestoreReport;
 
 /// Bumped when a field stops being additive, so an old snapshot is rejected
 /// with a clear message instead of restoring a half-understood workspace.
@@ -46,11 +51,36 @@ pub struct SnapshotArgs {
     /// `--socket`. Defaults to the one muxa's tracked agents are on.
     #[arg(long)]
     mux_socket: Option<String>,
+
+    /// Print the result as JSON.
+    #[arg(long)]
+    json: bool,
+
+    /// List the snapshots under `$XDG_DATA_HOME/muxa/snapshots`, newest
+    /// first, instead of taking one.
+    #[arg(long, conflicts_with_all = ["out", "mux_socket", "delete", "auto"])]
+    list: bool,
+
+    /// Delete one snapshot, named by its directory under the snapshots dir.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["out", "mux_socket", "auto"])]
+    delete: Option<String>,
+
+    /// Take an automatic snapshot, as muxad does on its interval: skipped
+    /// when nothing changed since the newest snapshot of the same server,
+    /// and older automatic ones beyond `--keep-auto` are removed.
+    #[arg(long, hide = true, conflicts_with = "out")]
+    auto: bool,
+
+    /// How many automatic snapshots `--auto` keeps.
+    #[arg(long, hide = true, default_value_t = 10, requires = "auto")]
+    keep_auto: usize,
 }
 
 #[derive(Debug, Parser)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI switches
 pub struct RestoreArgs {
-    /// Snapshot directory. Defaults to the most recent one.
+    /// Snapshot directory. Defaults to the most recent one, automatic or
+    /// manual.
     snapshot: Option<PathBuf>,
 
     /// Actually run the restore. Without it the plan is printed and nothing
@@ -66,6 +96,15 @@ pub struct RestoreArgs {
     /// Control socket to restore into. Defaults to the snapshot's own.
     #[arg(long)]
     mux_socket: Option<String>,
+
+    /// Recreate only the sessions the server does not have, and leave every
+    /// existing session untouched — no panes added, nothing typed into it.
+    #[arg(long)]
+    only_missing: bool,
+
+    /// Print the plan — and with `--run` the per-pane results — as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -89,17 +128,33 @@ pub struct ReloadArgs {
     mux_socket: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     version: u32,
     taken_at: String,
+    /// Why it was taken. Automatic snapshots are the only ones muxad prunes;
+    /// a snapshot from before this field existed reads as manual.
+    #[serde(default)]
+    origin: SnapshotOrigin,
     host: String,
     socket: String,
     windows: Vec<WindowShape>,
     panes: Vec<PaneShape>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SnapshotOrigin {
+    /// `muxa snapshot`, or Save Snapshot in Muxa.app.
+    #[default]
+    Manual,
+    /// muxad's periodic snapshot.
+    Auto,
+    /// Taken by `muxa reload` just before it restarted the server.
+    Reload,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct WindowShape {
     session: String,
     index: String,
@@ -109,7 +164,7 @@ struct WindowShape {
     layout: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct PaneShape {
     session: String,
     window_index: String,
@@ -134,7 +189,7 @@ struct PaneShape {
     agent: Option<AgentShape>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct AgentShape {
     kind: String,
     /// The provider's own conversation id, which is what makes a resume
@@ -143,6 +198,30 @@ struct AgentShape {
 }
 
 pub async fn snapshot(client: &Client, args: SnapshotArgs) -> Result<()> {
+    if args.list {
+        return list(args.json);
+    }
+    if let Some(id) = args.delete.as_deref() {
+        let dir = store::delete(&store::root()?, id)?;
+        if args.json {
+            print_json(&serde_json::json!({ "deleted": id, "dir": dir }))?;
+        } else {
+            println!("deleted {}", dir.display());
+        }
+        return Ok(());
+    }
+    if args.auto {
+        let outcome = auto_snapshot(client, args.keep_auto).await?;
+        if args.json {
+            print_json(&outcome)?;
+        } else if let Some(reason) = outcome.reason {
+            println!("skipped: {reason}");
+        } else if let (Some(path), Some(summary)) = (&outcome.path, &outcome.summary_line) {
+            println!("{path}");
+            println!("  {summary}");
+        }
+        return Ok(());
+    }
     let endpoint = resolve_endpoint(client, args.mux_socket.as_deref()).await?;
     let snapshot = capture(client, &endpoint).await?;
     let dir = match args.out {
@@ -150,8 +229,176 @@ pub async fn snapshot(client: &Client, args: SnapshotArgs) -> Result<()> {
         None => default_snapshot_dir()?,
     };
     let path = write_snapshot(&snapshot, &dir)?;
+    if args.json {
+        print_json(&SaveOutcome::saved(&snapshot, &dir, &path, Vec::new()))?;
+        return Ok(());
+    }
     println!("{}", path.display());
     println!("  {}", summary(&snapshot));
+    Ok(())
+}
+
+/// What `muxa snapshot --json` (and `--auto --json`) reports.
+#[derive(Debug, Serialize)]
+struct SaveOutcome {
+    skipped: bool,
+    /// Why an automatic snapshot was not written: `no_server`,
+    /// `ambiguous_server` or `unchanged`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// The snapshot an unchanged workspace still matches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matches: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<plan::Summary>,
+    #[serde(skip)]
+    summary_line: Option<String>,
+    /// Automatic snapshots removed to stay within `--keep-auto`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pruned: Vec<String>,
+}
+
+impl SaveOutcome {
+    fn saved(snapshot: &Snapshot, dir: &Path, path: &Path, pruned: Vec<String>) -> Self {
+        Self {
+            skipped: false,
+            reason: None,
+            matches: None,
+            message: None,
+            id: dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            dir: Some(dir.display().to_string()),
+            path: Some(path.display().to_string()),
+            summary: Some(plan::summarize(snapshot)),
+            summary_line: Some(summary(snapshot)),
+            pruned,
+        }
+    }
+
+    fn skipped(reason: &'static str, message: Option<String>, matches: Option<String>) -> Self {
+        Self {
+            skipped: true,
+            reason: Some(reason),
+            matches,
+            message,
+            id: None,
+            dir: None,
+            path: None,
+            summary: None,
+            summary_line: None,
+            pruned: Vec::new(),
+        }
+    }
+}
+
+/// muxad's periodic snapshot. A workspace nobody changed since the last
+/// snapshot of its server is not written again, and only the newest
+/// `keep` automatic snapshots survive, so the directory stays a short,
+/// useful history rather than a pile of identical copies.
+async fn auto_snapshot(client: &Client, keep: usize) -> Result<SaveOutcome> {
+    let servers = tracked_servers(client).await?;
+    let endpoint = match servers.len() {
+        0 => return Ok(SaveOutcome::skipped("no_server", None, None)),
+        1 => {
+            let (socket, host) = servers.into_iter().next().expect("one entry");
+            endpoint_for(&host, socket)?
+        }
+        _ => {
+            let message = format!(
+                "agents span several servers ({}); automatic snapshots need one",
+                servers.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+            return Ok(SaveOutcome::skipped(
+                "ambiguous_server",
+                Some(message),
+                None,
+            ));
+        }
+    };
+    let mut snapshot = capture(client, &endpoint).await?;
+    if snapshot.panes.is_empty() {
+        return Ok(SaveOutcome::skipped("no_server", None, None));
+    }
+    snapshot.origin = SnapshotOrigin::Auto;
+    let root = store::root()?;
+    let existing = store::entries(&root);
+    if let Some(newest) = store::newest_of_server(&existing, &snapshot) {
+        if newest
+            .snapshot
+            .as_ref()
+            .is_ok_and(|previous| store::same_topology(previous, &snapshot))
+        {
+            return Ok(SaveOutcome::skipped(
+                "unchanged",
+                None,
+                Some(newest.id.clone()),
+            ));
+        }
+    }
+    let dir = store::unique_dir(&root, time::OffsetDateTime::now_utc().unix_timestamp());
+    let path = write_snapshot(&snapshot, &dir)?;
+    let mut pruned = Vec::new();
+    for entry in store::prunable(&store::entries(&root), keep) {
+        if std::fs::remove_dir_all(&entry.dir).is_ok() {
+            pruned.push(entry.id.clone());
+        }
+    }
+    Ok(SaveOutcome::saved(&snapshot, &dir, &path, pruned))
+}
+
+fn list(json: bool) -> Result<()> {
+    let root = store::root()?;
+    let entries = store::entries(&root);
+    if json {
+        let rows: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|entry| match &entry.snapshot {
+                Ok(snapshot) => serde_json::json!({
+                    "id": entry.id,
+                    "dir": entry.dir,
+                    "summary": plan::summarize(snapshot),
+                }),
+                Err(error) => serde_json::json!({
+                    "id": entry.id,
+                    "dir": entry.dir,
+                    "error": error,
+                }),
+            })
+            .collect();
+        return print_json(&serde_json::json!({ "root": root, "snapshots": rows }));
+    }
+    if entries.is_empty() {
+        println!("no snapshots under {}", root.display());
+    }
+    for entry in &entries {
+        match &entry.snapshot {
+            Ok(snapshot) => println!(
+                "{}  {:<6}  {}",
+                entry.id,
+                match snapshot.origin {
+                    SnapshotOrigin::Manual => "manual",
+                    SnapshotOrigin::Auto => "auto",
+                    SnapshotOrigin::Reload => "reload",
+                },
+                summary(snapshot)
+            ),
+            Err(error) => println!("{}  unreadable: {error}", entry.id),
+        }
+    }
+    Ok(())
+}
+
+fn print_json(value: &impl Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 
@@ -166,15 +413,87 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
         None => endpoint_for(&snapshot.host, snapshot.socket.clone())?,
     };
     let endpoint = control_endpoint(&endpoint);
-    println!("{} — {}", path.display(), summary(&snapshot));
+    let live = live_sessions(&endpoint);
+    let mut sessions = plan::plan(
+        &snapshot,
+        live.as_ref().unwrap_or(&BTreeSet::new()),
+        args.only_missing,
+        args.layout_only,
+    );
+    let document = |sessions: Vec<plan::SessionPlan>, totals: Option<plan::Totals>| {
+        let dir = if path.is_dir() {
+            path.clone()
+        } else {
+            path.parent().map(Path::to_path_buf).unwrap_or_default()
+        };
+        plan::RestoreDocument {
+            id: dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            dir: dir.display().to_string(),
+            summary: plan::summarize(&snapshot),
+            socket: snapshot.socket.clone(),
+            only_missing: args.only_missing,
+            layout_only: args.layout_only,
+            server_reachable: live.is_some(),
+            run: args.run,
+            sessions,
+            totals,
+        }
+    };
+    if !args.json {
+        println!("{} — {}", path.display(), summary(&snapshot));
+    }
     if !args.run {
-        print_plan(&snapshot, args.layout_only);
-        println!(
-            "\ndry run. Re-run with --run against a server that does not have these sessions."
-        );
+        if args.json {
+            return print_json(&document(sessions, None));
+        }
+        plan::print_plan(&sessions, args.layout_only);
+        if args.only_missing {
+            println!("\ndry run. Re-run with --run to create the missing sessions.");
+        } else {
+            println!(
+                "\ndry run. Re-run with --run against a server that does not have these sessions."
+            );
+        }
         return Ok(());
     }
-    apply(&endpoint, &snapshot, args.layout_only)
+
+    let target = plan::without_skipped(&snapshot, &sessions);
+    let skipped: Vec<&str> = sessions
+        .iter()
+        .filter(|session| session.action == plan::SessionAction::Skip)
+        .map(|session| session.name.as_str())
+        .collect();
+    if !args.json && !skipped.is_empty() {
+        println!(
+            "leaving {} existing session(s) untouched: {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
+    let mut report = RestoreReport::new(!args.json);
+    let outcome = if target.windows.is_empty() {
+        report.say("nothing to restore: every session in the snapshot already exists");
+        Ok(())
+    } else {
+        apply(&endpoint, &target, args.layout_only, &mut report)
+    };
+    if args.json {
+        plan::attach_results(&mut sessions, &report);
+        let totals = plan::totals(&sessions);
+        print_json(&document(sessions, Some(totals)))?;
+    }
+    outcome
+}
+
+/// The sessions the server has right now; `None` when it does not answer,
+/// which for a restore means every recorded session is missing.
+fn live_sessions(endpoint: &BackendEndpoint) -> Option<BTreeSet<String>> {
+    mux_control::capture(endpoint, &["list-sessions", "-F", "#{session_name}"])
+        .ok()
+        .map(|listing| listing.lines().map(str::to_owned).collect())
 }
 
 pub async fn reload(client: &Client, args: ReloadArgs) -> Result<()> {
@@ -192,7 +511,8 @@ pub async fn reload(client: &Client, args: ReloadArgs) -> Result<()> {
         println!("reusing {} — {}", path.display(), summary(&snapshot));
         snapshot
     } else {
-        let snapshot = capture(client, &endpoint).await?;
+        let mut snapshot = capture(client, &endpoint).await?;
+        snapshot.origin = SnapshotOrigin::Reload;
         let path = write_snapshot(&snapshot, &default_snapshot_dir()?)?;
         println!("snapshot {} — {}", path.display(), summary(&snapshot));
         snapshot
@@ -210,7 +530,12 @@ pub async fn reload(client: &Client, args: ReloadArgs) -> Result<()> {
     let _ = mux_control::run(&control, &["kill-server"]);
     wait_for_server_to_stop(&control)?;
 
-    apply(&control, &snapshot, args.layout_only)?;
+    apply(
+        &control,
+        &snapshot,
+        args.layout_only,
+        &mut RestoreReport::new(true),
+    )?;
     println!(
         "\nagent conversations resume only where a provider id existed; \
          `muxa prune` clears the rows whose panes are gone."
@@ -278,6 +603,7 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
 
     Ok(Snapshot {
         version: SNAPSHOT_VERSION,
+        origin: SnapshotOrigin::Manual,
         taken_at: time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
@@ -383,20 +709,38 @@ fn agents_by_pane(agents: &[muxa::Agent]) -> HashMap<String, AgentShape> {
 }
 
 /// Rebuild the shape, then put back what the panes were running.
-fn apply(endpoint: &BackendEndpoint, snapshot: &Snapshot, layout_only: bool) -> Result<()> {
-    rebuild_shape(endpoint, snapshot)?;
+fn apply(
+    endpoint: &BackendEndpoint,
+    snapshot: &Snapshot,
+    layout_only: bool,
+    report: &mut RestoreReport,
+) -> Result<()> {
+    rebuild_shape(endpoint, snapshot, report)?;
     if layout_only {
         return Ok(());
     }
-    replay_commands(endpoint, snapshot);
+    replay_commands(endpoint, snapshot, report);
     Ok(())
 }
 
 /// Sessions, windows, panes, geometry, working directories.
-fn rebuild_shape(endpoint: &BackendEndpoint, snapshot: &Snapshot) -> Result<()> {
+fn rebuild_shape(
+    endpoint: &BackendEndpoint,
+    snapshot: &Snapshot,
+    report: &mut RestoreReport,
+) -> Result<()> {
     let mut created = 0_usize;
     for window in &snapshot.windows {
-        created += ensure_window(endpoint, snapshot, window)?;
+        match ensure_window(endpoint, snapshot, window) {
+            Ok(count) => {
+                created += count;
+                report.reached.insert(window.session.clone());
+            }
+            Err(error) => {
+                report.failed = Some((window.session.clone(), format!("{error:#}")));
+                return Err(error);
+            }
+        }
     }
 
     // Every window starts with one pane, so the first pane recorded for each
@@ -413,6 +757,7 @@ fn rebuild_shape(endpoint: &BackendEndpoint, snapshot: &Snapshot) -> Result<()> 
             endpoint,
             &["split-window", "-d", "-t", &target, "-c", &pane.path],
         ) {
+            report.pane_failed(pane_target(pane), format!("could not split — {error}"));
             split_failures.push((pane_target(pane), error));
         }
     }
@@ -429,7 +774,7 @@ fn rebuild_shape(endpoint: &BackendEndpoint, snapshot: &Snapshot) -> Result<()> 
     for pane in &snapshot.panes {
         let target = pane_target(pane);
         wait_for_shell(endpoint, &target);
-        let _ = mux_control::run(
+        if let Err(error) = mux_control::run(
             endpoint,
             &[
                 "send-keys",
@@ -438,15 +783,14 @@ fn rebuild_shape(endpoint: &BackendEndpoint, snapshot: &Snapshot) -> Result<()> 
                 &format!("cd {}", shell_quote(&pane.path)),
                 "Enter",
             ],
-        );
+        ) {
+            report.pane_failed(target, error);
+        }
     }
 
-    println!(
-        "rebuilt {created} session(s)/window(s), {} pane(s)",
-        snapshot.panes.len()
-    );
+    report.say(&plan::rebuilt_line(created, snapshot.panes.len()));
     for (target, error) in split_failures {
-        println!("  {target}: could not split — {error}");
+        report.say(&plan::split_failure_line(&target, &error));
     }
     Ok(())
 }
@@ -568,7 +912,7 @@ fn window_indexes(endpoint: &BackendEndpoint, session_target: &str) -> Vec<Strin
 }
 
 /// Type each pane's own command line back into it.
-fn replay_commands(endpoint: &BackendEndpoint, snapshot: &Snapshot) {
+fn replay_commands(endpoint: &BackendEndpoint, snapshot: &Snapshot, report: &mut RestoreReport) {
     let mut replayed = 0_usize;
     let mut manual = Vec::new();
     for pane in &snapshot.panes {
@@ -580,12 +924,14 @@ fn replay_commands(endpoint: &BackendEndpoint, snapshot: &Snapshot) {
             continue;
         }
         let target = pane_target(pane);
-        let _ = mux_control::run(endpoint, &["send-keys", "-t", &target, &command, "Enter"]);
-        replayed += 1;
+        match mux_control::run(endpoint, &["send-keys", "-t", &target, &command, "Enter"]) {
+            Ok(()) => replayed += 1,
+            Err(error) => report.pane_failed(target, error),
+        }
     }
-    println!("relaunched {replayed} pane(s)");
+    report.say(&plan::relaunched_line(replayed));
     for target in manual {
-        println!("  {target}: argv was a process title, not a command — start it by hand");
+        report.say(&plan::manual_line(&target));
     }
 }
 
@@ -675,34 +1021,6 @@ fn shell_word(value: &str) -> String {
     }
 }
 
-fn print_plan(snapshot: &Snapshot, layout_only: bool) {
-    for window in &snapshot.windows {
-        let panes = snapshot
-            .panes
-            .iter()
-            .filter(|pane| pane.session == window.session && pane.window_index == window.index)
-            .count();
-        println!(
-            "  {}:{} {} — {panes} pane(s)",
-            window.session, window.index, window.name
-        );
-    }
-    if layout_only {
-        return;
-    }
-    for pane in &snapshot.panes {
-        let Some(command) = relaunch_command(pane) else {
-            continue;
-        };
-        let note = if pane.replayable {
-            ""
-        } else {
-            "  [process title, not a command]"
-        };
-        println!("  {}{note}\n    {command}", pane_target(pane));
-    }
-}
-
 fn summary(snapshot: &Snapshot) -> String {
     let sessions: std::collections::BTreeSet<_> = snapshot
         .windows
@@ -732,6 +1050,25 @@ async fn resolve_endpoint(client: &Client, socket: Option<&str>) -> Result<Backe
             .unwrap_or(HostKind::Tmux);
         return endpoint_for(&host.to_string(), socket.to_owned());
     }
+    let sockets = tracked_servers(client).await?;
+    match sockets.len() {
+        1 => {
+            let (socket, host) = sockets.into_iter().next().expect("one entry");
+            endpoint_for(&host, socket)
+        }
+        0 => bail!(
+            "muxad tracks no tmux/rmux agents, so there is nothing to work out the \
+             target server from; pass --mux-socket"
+        ),
+        _ => bail!(
+            "agents span several servers ({}); pass --mux-socket to name one",
+            sockets.keys().cloned().collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// The control sockets muxa's tracked agents live on, each with its host.
+async fn tracked_servers(client: &Client) -> Result<BTreeMap<String, String>> {
     let agents = client
         .snapshot()
         .await
@@ -748,20 +1085,7 @@ async fn resolve_endpoint(client: &Client, socket: Option<&str>) -> Result<Backe
             sockets.insert(socket.clone(), host.to_string());
         }
     }
-    match sockets.len() {
-        1 => {
-            let (socket, host) = sockets.into_iter().next().expect("one entry");
-            endpoint_for(&host, socket)
-        }
-        0 => bail!(
-            "muxad tracks no tmux/rmux agents, so there is nothing to work out the \
-             target server from; pass --mux-socket"
-        ),
-        _ => bail!(
-            "agents span several servers ({}); pass --mux-socket to name one",
-            sockets.keys().cloned().collect::<Vec<_>>().join(", ")
-        ),
-    }
+    Ok(sockets)
 }
 
 fn endpoint_for(host: &str, socket: String) -> Result<BackendEndpoint> {
@@ -827,7 +1151,7 @@ fn default_snapshot_dir() -> Result<PathBuf> {
     let root =
         muxa::paths::default_snapshot_dir().context("no data directory to write snapshots into")?;
     let stamp = time::OffsetDateTime::now_utc().unix_timestamp();
-    Ok(root.join(stamp.to_string()))
+    Ok(store::unique_dir(&root, stamp))
 }
 
 fn newest_snapshot() -> Result<PathBuf> {

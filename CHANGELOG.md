@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Snapshots are taken for you, and restoring one is safe to press.**
+  muxad takes an automatic workspace snapshot every 15 minutes when the
+  workspace changed, keeping the newest 10 (`[snapshot]
+  auto_interval_minutes`, `keep_auto`; `0` turns it off); snapshots taken by
+  hand or by `muxa reload` are never pruned. `muxa restore --only-missing`
+  recreates only the sessions the server lacks and never adds panes to one it
+  already has, and the dry run now says per session "will create", "exists —
+  skipped" or "exists — panes will be ADDED". `muxa snapshot --list`,
+  `muxa snapshot --delete <id>`, and `--json` on `snapshot` and `restore`
+  make all of it scriptable.
+- **Save and restore snapshots from Muxa for Mac.** Explore "…" → Save
+  Snapshot / Restore Snapshot…, also in the command palette. The restore
+  sheet lists snapshots (automatic ones badged), previews each as session ›
+  window › pane with what every pane will run, dry-runs the restore, and
+  shows per-pane results. It always restores only the missing sessions.
+  Needs muxad with the `mux_snapshot_v1` capability.
+
 ### Fixed
 
 - **`muxa peers`, `muxa msg` and `muxa identity` speak for the right pane on

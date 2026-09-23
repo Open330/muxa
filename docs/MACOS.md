@@ -15,7 +15,10 @@ and encodes user input.
 - attaches a libghostty surface to an existing session;
 - sends input, resize, and attach state over the owner-only Unix socket;
 - reconnects terminal output by byte offset;
-- keeps the PTY alive when its native window closes; and
+- keeps the PTY alive when its native window closes;
+- saves and restores workspace snapshots (Explore "…" → Save Snapshot /
+  Restore Snapshot…) through muxad's `mux_snapshot_v1` requests, which run
+  `muxa snapshot` / `muxa restore --only-missing --json`; and
 - provides both a main window and a menu-bar control.
 
 External tmux, cmux, rmux, herdr, and zellij surfaces remain execution

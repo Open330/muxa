@@ -205,6 +205,14 @@
 # path        = "/home/$USER/.local/share/muxa/state.json"
 # debounce_ms = 200                  # coalesce window between dirty signal and write
 
+# Workspace snapshots. muxad takes an automatic one every
+# `auto_interval_minutes` when the workspace changed since the last snapshot
+# of its server, and keeps the newest `keep_auto` of them. Snapshots taken by
+# hand (`muxa snapshot`, Muxa.app) or by `muxa reload` are never pruned.
+[snapshot]
+# auto_interval_minutes = 15         # 0 turns automatic snapshots off
+# keep_auto             = 10
+
 # tmux session foreground-time tracker. A session counts as active while an
 # interactive tmux client has that session foregrounded. `muxa watch`
 # (work view — the default) shows the workspace cumulative total in its DUR column.

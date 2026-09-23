@@ -206,6 +206,31 @@ enum RequestBody {
     AgentStart {
         request: crate::agent_control::AgentStartRequest,
     },
+    // WS-F: snapshot
+    /// Workspace snapshots, run through `muxa snapshot` / `muxa restore
+    /// --json` (`mux_snapshot_v1`). Local host only. Newest first.
+    MuxSnapshotList,
+    /// Take a manual snapshot of the server muxa's agents are on.
+    MuxSnapshotSave,
+    /// Dry-run a restore of one snapshot: per session "create" or "skip".
+    MuxSnapshotPlan {
+        id: String,
+    },
+    /// Start restoring the sessions of one snapshot that the server does
+    /// not have; existing sessions are never touched. Poll with
+    /// `mux_snapshot_restore_status`.
+    MuxSnapshotRestore {
+        id: String,
+        #[serde(default)]
+        layout_only: bool,
+    },
+    MuxSnapshotRestoreStatus {
+        operation_id: String,
+    },
+    MuxSnapshotDelete {
+        id: String,
+    },
+    // END WS-F: snapshot
     /// Draft one pipeline from a description with a read-only headless
     /// turn, validated with the `pipeline set` rules and retried once on a
     /// draft that would not launch. Writes nothing.
@@ -726,7 +751,8 @@ const CAPABILITIES: &[&str] = &[
     "pipeline_subscribe",
     "work_control_v1",
     "work_command_v1",
-    "agent_start_v1", // WS-B: new agent
+    "agent_start_v1",  // WS-B: new agent
+    "mux_snapshot_v1", // WS-F: snapshot
     "handle_namespace_v1",
     "session_bytes_v1",
     "session_attachment_identity_v1",
@@ -863,6 +889,14 @@ pub struct Response {
     /// `agent_start_v1`: the started agent's surface. WS-B: new agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_start: Option<crate::agent_control::AgentStartResult>,
+    // WS-F: snapshot
+    /// `mux_snapshot_v1`: the CLI's own JSON — the listing, a saved
+    /// snapshot, or a restore plan — passed through untouched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mux_snapshot: Option<serde_json::Value>,
+    /// `mux_snapshot_v1`: a restore operation and, once done, its report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mux_snapshot_operation: Option<crate::mux_snapshot_control::MuxSnapshotOperation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_compose: Option<WorkComposeOutput>,
     /// `automation_v1`: the rule list plus the engine's switch/pause.
@@ -929,6 +963,8 @@ impl Response {
             work_operation: None,
             work_command: None,
             agent_start: None,
+            mux_snapshot: None,
+            mux_snapshot_operation: None,
             work_compose: None,
             automation_rules: None,
             automation_log: None,
@@ -986,6 +1022,19 @@ impl Response {
     fn with_agent_start(result: crate::agent_control::AgentStartResult) -> Self {
         let mut response = Self::ok();
         response.agent_start = Some(result);
+        response
+    }
+    // WS-F: snapshot
+    fn with_mux_snapshot(value: serde_json::Value) -> Self {
+        let mut response = Self::ok();
+        response.mux_snapshot = Some(value);
+        response
+    }
+    fn with_mux_snapshot_operation(
+        operation: crate::mux_snapshot_control::MuxSnapshotOperation,
+    ) -> Self {
+        let mut response = Self::ok();
+        response.mux_snapshot_operation = Some(operation);
         response
     }
     fn with_work_compose(output: WorkComposeOutput) -> Self {
@@ -1563,6 +1612,7 @@ pub struct Server {
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
     work_up: Arc<WorkUpManager>,
+    mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>, // WS-F: snapshot
     /// The daemon's `config.toml`, for the requests that read and replace it
     /// whole. `None` when muxad was started without one.
     config_path: Option<PathBuf>,
@@ -1573,6 +1623,8 @@ impl Server {
     pub fn new(socket_path: PathBuf, store: SharedStore) -> Self {
         let backend = default_backend();
         let work_up = WorkUpManager::new(socket_path.clone());
+        let mux_snapshots =
+            crate::mux_snapshot_control::MuxSnapshotControl::new(socket_path.clone());
         Self {
             socket_path,
             store,
@@ -1587,6 +1639,7 @@ impl Server {
             fleet: None,
             pipeline_runs: PipelineRunStore::in_memory(),
             work_up,
+            mux_snapshots,
             config_path: None,
             handler_limit: MAX_INFLIGHT_HANDLERS,
         }
@@ -1678,6 +1731,18 @@ impl Server {
             })),
         );
         self.fleet = Some(fleet);
+        self
+    }
+
+    // WS-F: snapshot
+    /// Share muxad's snapshot control with its automatic-snapshot task, so a
+    /// restore started from the app holds that task off.
+    #[must_use]
+    pub fn with_mux_snapshots(
+        mut self,
+        mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>,
+    ) -> Self {
+        self.mux_snapshots = mux_snapshots;
         self
     }
 
@@ -1787,6 +1852,7 @@ impl Server {
                     let fleet = self.fleet.clone();
                     let pipeline_runs = self.pipeline_runs.clone();
                     let work_up = self.work_up.clone();
+                    let mux_snapshots = self.mux_snapshots.clone();
                     let config_path = self.config_path.clone();
                     let stopping = stopping_rx.clone();
                     handlers.spawn(async move {
@@ -1807,6 +1873,7 @@ impl Server {
                                 fleet,
                                 pipeline_runs,
                                 work_up,
+                                mux_snapshots,
                                 config_path,
                                 stopping,
                             ))
@@ -2724,6 +2791,18 @@ fn represented_participant(
     None
 }
 
+// WS-F: snapshot
+/// A finished snapshot request as a response: the CLI's document, or its
+/// error line.
+fn mux_snapshot_response(
+    outcome: Result<serde_json::Value, crate::mux_snapshot_control::MuxSnapshotError>,
+) -> Response {
+    match outcome {
+        Ok(value) => Response::with_mux_snapshot(value),
+        Err(error) => Response::err(error.to_string()),
+    }
+}
+
 async fn record_collaboration_audit(
     audit: &CollaborationAuditLog,
     actor: &CollaborationConnectionActor,
@@ -2766,7 +2845,8 @@ async fn record_collaboration_audit(
         restart,
         fleet,
         pipeline_runs,
-        work_up
+        work_up,
+        mux_snapshots
     )
 )]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // IPC dispatch table and its shared daemon state
@@ -2784,6 +2864,7 @@ async fn handle(
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
     work_up: Arc<WorkUpManager>,
+    mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>,
     config_path: Option<PathBuf>,
     mut stopping: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError> {
@@ -3012,6 +3093,40 @@ async fn handle(
                         Err(error) => Response::err(error),
                     }
                 }
+                // WS-F: snapshot
+                RequestBody::MuxSnapshotList => {
+                    kind = "mux_snapshot_list";
+                    mux_snapshot_response(mux_snapshots.list().await)
+                }
+                RequestBody::MuxSnapshotSave => {
+                    kind = "mux_snapshot_save";
+                    mux_snapshot_response(mux_snapshots.save().await)
+                }
+                RequestBody::MuxSnapshotPlan { id } => {
+                    kind = "mux_snapshot_plan";
+                    mux_snapshot_response(mux_snapshots.plan(&id).await)
+                }
+                RequestBody::MuxSnapshotDelete { id } => {
+                    kind = "mux_snapshot_delete";
+                    mux_snapshot_response(mux_snapshots.delete(&id).await)
+                }
+                RequestBody::MuxSnapshotRestore { id, layout_only } => {
+                    kind = "mux_snapshot_restore";
+                    match mux_snapshots.restore(&id, layout_only).await {
+                        Ok(operation) => Response::with_mux_snapshot_operation(operation),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::MuxSnapshotRestoreStatus { operation_id } => {
+                    kind = "mux_snapshot_restore_status";
+                    match mux_snapshots.status(&operation_id).await {
+                        Some(operation) => Response::with_mux_snapshot_operation(operation),
+                        None => Response::err(format!(
+                            "snapshot restore {operation_id:?} was not found"
+                        )),
+                    }
+                }
+                // END WS-F: snapshot
                 RequestBody::WorkCompose {
                     description,
                     agent,
@@ -5042,6 +5157,23 @@ impl Client {
             )));
         }
         serde_json::from_value(response["agent_start"].clone()).map_err(RuntimeError::Json)
+    }
+
+    // WS-F: snapshot
+    /// The workspace snapshots, newest first, as `muxa snapshot --list
+    /// --json` prints them. Requires `mux_snapshot_v1`.
+    pub async fn mux_snapshot_list(&self) -> Result<serde_json::Value, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "mux_snapshot_list",
+        });
+        let response = self
+            .call_with_timeout(&req, WORK_COMMAND_CLIENT_TIMEOUT)
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        Ok(response["mux_snapshot"].clone())
     }
 
     /// Ask the daemon which additive features it supports and, when it can
@@ -7521,6 +7653,9 @@ mod tests {
             None,
             PipelineRunStore::in_memory(),
             WorkUpManager::new(PathBuf::from("/tmp/muxa-disconnect-test.sock")),
+            crate::mux_snapshot_control::MuxSnapshotControl::new(PathBuf::from(
+                "/tmp/muxa-disconnect-test.sock",
+            )),
             None,
             stopping_rx,
         ));
@@ -10402,6 +10537,50 @@ mod work_command_tests {
         assert!(CAPABILITIES.contains(&"agent_start_v1"));
         let plain = serde_json::to_value(Response::ok()).unwrap();
         assert!(plain.get("agent_start").is_none());
+    }
+
+    // WS-F: snapshot
+    #[test]
+    fn mux_snapshot_requests_decode_the_documented_shapes() {
+        let decode = |json: &str| serde_json::from_str::<Request>(json).unwrap().body;
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_list"}"#),
+            RequestBody::MuxSnapshotList
+        ));
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_save"}"#),
+            RequestBody::MuxSnapshotSave
+        ));
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_plan","id":"1790000000"}"#),
+            RequestBody::MuxSnapshotPlan { id } if id == "1790000000"
+        ));
+        match decode(r#"{"protocol":6,"kind":"mux_snapshot_restore","id":"1790000000"}"#) {
+            RequestBody::MuxSnapshotRestore { id, layout_only } => {
+                assert_eq!(id, "1790000000");
+                assert!(!layout_only, "restores the commands unless asked not to");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            decode(
+                r#"{"protocol":6,"kind":"mux_snapshot_restore_status","operation_id":"snapshot-restore-1"}"#
+            ),
+            RequestBody::MuxSnapshotRestoreStatus { .. }
+        ));
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_delete","id":"1790000000"}"#),
+            RequestBody::MuxSnapshotDelete { .. }
+        ));
+        assert!(CAPABILITIES.contains(&"mux_snapshot_v1"));
+        let plain = serde_json::to_value(Response::ok()).unwrap();
+        assert!(plain.get("mux_snapshot").is_none());
+        assert!(plain.get("mux_snapshot_operation").is_none());
+        let listed = serde_json::to_value(Response::with_mux_snapshot(
+            serde_json::json!({"snapshots": []}),
+        ))
+        .unwrap();
+        assert_eq!(listed["mux_snapshot"]["snapshots"], serde_json::json!([]));
     }
 
     #[tokio::test]
