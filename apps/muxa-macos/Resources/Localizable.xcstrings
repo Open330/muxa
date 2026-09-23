@@ -798,16 +798,6 @@
         }
       }
     },
-    "%lld failed" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%lld개 실패"
-          }
-        }
-      }
-    },
     "%lld files" : {
       "localizations" : {
         "ko" : {
@@ -1128,16 +1118,6 @@
         }
       }
     },
-    "%lld panes" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "페인 %lld개"
-          }
-        }
-      }
-    },
     "%lld panes · %lld agents" : {
       "localizations" : {
         "en" : {
@@ -1300,16 +1280,6 @@
         }
       }
     },
-    "%lld sessions" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "세션 %lld개"
-          }
-        }
-      }
-    },
     "%lld shells" : {
       "localizations" : {
         "en" : {
@@ -1334,16 +1304,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "셸 %lld개"
-          }
-        }
-      }
-    },
-    "%lld start fresh" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%lld개 새로 시작"
           }
         }
       }
@@ -1566,36 +1526,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "페인 %lld개 더"
-          }
-        }
-      }
-    },
-    "1 agent" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "에이전트 1개"
-          }
-        }
-      }
-    },
-    "1 pane" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "페인 1개"
-          }
-        }
-      }
-    },
-    "1 session" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "세션 1개"
           }
         }
       }
@@ -2219,16 +2149,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "코멘트 추가"
-          }
-        }
-      }
-    },
-    "Add missing windows" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "빠진 윈도우 추가"
           }
         }
       }
@@ -3271,16 +3191,6 @@
         }
       }
     },
-    "Capturing tmux sessions…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "tmux 세션을 캡처하는 중…"
-          }
-        }
-      }
-    },
     "Changes" : {
       "localizations" : {
         "ko" : {
@@ -4023,16 +3933,6 @@
         }
       }
     },
-    "Contents" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "내용"
-          }
-        }
-      }
-    },
     "Context" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -4367,38 +4267,6 @@
         }
       }
     },
-    "Created %lld sessions, %lld windows, %lld panes" : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "Created %1$lld sessions, %2$lld windows, %3$lld panes"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "세션 %lld개, 윈도우 %lld개, 페인 %lld개를 만들었습니다"
-          }
-        }
-      }
-    },
-    "Creates %lld sessions, %lld windows, %lld panes" : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "Creates %1$lld sessions, %2$lld windows, %3$lld panes"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "세션 %lld개, 윈도우 %lld개, 페인 %lld개를 만듭니다"
-          }
-        }
-      }
-    },
     "Current context" : {
       "localizations" : {
         "ko" : {
@@ -4549,16 +4417,6 @@
         }
       }
     },
-    "Delete %@" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%@ 삭제"
-          }
-        }
-      }
-    },
     "Delete comment" : {
       "localizations" : {
         "ko" : {
@@ -4575,26 +4433,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "파이프라인 %@을(를) 삭제할까요?"
-          }
-        }
-      }
-    },
-    "Delete snapshot" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "스냅샷 삭제"
-          }
-        }
-      }
-    },
-    "Delete snapshot?" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "스냅샷을 삭제할까요?"
           }
         }
       }
@@ -6898,16 +6736,6 @@
         }
       }
     },
-    "Letters, digits, '.', '_' and '-'. Leave empty to use the date and time." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "영문자, 숫자, '.', '_', '-'만 쓸 수 있습니다. 비워 두면 날짜와 시각을 사용합니다."
-          }
-        }
-      }
-    },
     "Light" : {
       "localizations" : {
         "ko" : {
@@ -8345,16 +8173,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "셸 연결 없음"
-          }
-        }
-      }
-    },
-    "No snapshots yet" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "아직 스냅샷이 없습니다"
           }
         }
       }
@@ -10072,16 +9890,6 @@
         }
       }
     },
-    "Record every tmux session, window layout, and agent session so they can come back after a restart." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "재시작 후 되살릴 수 있도록 모든 tmux 세션, 윈도우 레이아웃, 에이전트 세션을 기록합니다."
-          }
-        }
-      }
-    },
     "Recorded in the run log and posted by muxad. The agent is not touched." : {
       "localizations" : {
         "ko" : {
@@ -10098,16 +9906,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "실행 기록에 알림을 남깁니다. 에이전트는 건드리지 않습니다."
-          }
-        }
-      }
-    },
-    "Recreates sessions that are missing and resumes their agents. Sessions that already exist are left alone." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "없는 세션을 다시 만들고 그 안의 에이전트를 이어서 실행합니다. 이미 있는 세션은 건드리지 않습니다."
           }
         }
       }
@@ -10554,16 +10352,6 @@
         }
       }
     },
-    "Replace" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "바꾸기"
-          }
-        }
-      }
-    },
     "Replace Daemon" : {
       "localizations" : {
         "ko" : {
@@ -10762,66 +10550,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "응답"
-          }
-        }
-      }
-    },
-    "Restore" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "복원"
-          }
-        }
-      }
-    },
-    "Restore Snapshot" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "스냅샷 복원"
-          }
-        }
-      }
-    },
-    "Restore Snapshot…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "스냅샷 복원…"
-          }
-        }
-      }
-    },
-    "Restore plan" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "복원 계획"
-          }
-        }
-      }
-    },
-    "Restore results" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "복원 결과"
-          }
-        }
-      }
-    },
-    "Restoring %@…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%@ 복원 중…"
           }
         }
       }
@@ -11216,36 +10944,6 @@
         }
       }
     },
-    "Save Snapshot" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "스냅샷 저장"
-          }
-        }
-      }
-    },
-    "Save Snapshot…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "스냅샷 저장…"
-          }
-        }
-      }
-    },
-    "Save a snapshot of your tmux sessions so they can come back after a restart. muxad also saves one automatically when the layout changes." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "재시작 후 되살릴 수 있도록 tmux 세션의 스냅샷을 저장하세요. 레이아웃이 바뀌면 muxad도 자동으로 저장합니다."
-          }
-        }
-      }
-    },
     "Save as Markdown…" : {
       "localizations" : {
         "ko" : {
@@ -11303,22 +11001,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@ 키를 로그인 키체인에 저장했습니다. 해당 Ask 프로세스에만 전달됩니다."
-          }
-        }
-      }
-    },
-    "Saved %@: %@" : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "Saved %1$@: %2$@"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%@ 저장됨: %@"
           }
         }
       }
@@ -11752,26 +11434,6 @@
         }
       }
     },
-    "Session: Restore snapshot…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "세션: 스냅샷 복원…"
-          }
-        }
-      }
-    },
-    "Session: Save snapshot" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "세션: 스냅샷 저장"
-          }
-        }
-      }
-    },
     "Sessions" : {
       "localizations" : {
         "ko" : {
@@ -11943,16 +11605,6 @@
         }
       }
     },
-    "Show in Explore" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Explore에서 보기"
-          }
-        }
-      }
-    },
     "Show managed work" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -12025,16 +11677,6 @@
         }
       }
     },
-    "Show what a restore would create, without changing anything" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "아무것도 바꾸지 않고 복원 시 만들어질 것을 보여 줍니다"
-          }
-        }
-      }
-    },
     "Showing their last known messages" : {
       "localizations" : {
         "ko" : {
@@ -12065,32 +11707,12 @@
         }
       }
     },
-    "Skip existing sessions" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "기존 세션 건너뛰기"
-          }
-        }
-      }
-    },
     "Skipped" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "건너뜀"
-          }
-        }
-      }
-    },
-    "Snapshots" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "스냅샷"
           }
         }
       }
@@ -13241,16 +12863,6 @@
         }
       }
     },
-    "The snapshot file is removed. Running tmux sessions are not affected." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "스냅샷 파일이 삭제됩니다. 실행 중인 tmux 세션에는 영향이 없습니다."
-          }
-        }
-      }
-    },
     "The working tree matches HEAD." : {
       "localizations" : {
         "ko" : {
@@ -13462,16 +13074,6 @@
         }
       }
     },
-    "This muxad does not support session snapshots. Update Muxa and restart muxad." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 muxad는 세션 스냅샷을 지원하지 않습니다. Muxa를 업데이트하고 muxad를 다시 시작하세요."
-          }
-        }
-      }
-    },
     "This muxad has no automation engine" : {
       "localizations" : {
         "ko" : {
@@ -13538,16 +13140,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 규칙이 이번 건에 이미 동작함"
-          }
-        }
-      }
-    },
-    "This snapshot cannot be read." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 스냅샷을 읽을 수 없습니다."
           }
         }
       }
@@ -13794,16 +13386,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "읽지 않음"
-          }
-        }
-      }
-    },
-    "Unreadable" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "읽을 수 없음"
           }
         }
       }
@@ -14432,16 +14014,6 @@
         }
       }
     },
-    "Whether a session that already exists gets the windows it is missing" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이미 있는 세션에 빠진 윈도우를 추가할지 여부"
-          }
-        }
-      }
-    },
     "Window" : {
       "localizations" : {
         "ko" : {
@@ -14499,16 +14071,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Work"
-          }
-        }
-      }
-    },
-    "Work %@" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Work %@"
           }
         }
       }
@@ -14886,26 +14448,6 @@
         }
       }
     },
-    "as %@" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%@(으)로"
-          }
-        }
-      }
-    },
-    "auto" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "자동"
-          }
-        }
-      }
-    },
     "below" : {
       "localizations" : {
         "ko" : {
@@ -14933,16 +14475,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "컨텍스트 %@"
-          }
-        }
-      }
-    },
-    "created" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "생성됨"
           }
         }
       }
@@ -14987,16 +14519,6 @@
         }
       }
     },
-    "exists" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이미 있음"
-          }
-        }
-      }
-    },
     "exited %d" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -15004,16 +14526,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "종료 %d"
-          }
-        }
-      }
-    },
-    "failed" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실패"
           }
         }
       }
@@ -15034,16 +14546,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "예: implement-review"
-          }
-        }
-      }
-    },
-    "fresh start" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "새로 시작"
           }
         }
       }
@@ -15588,36 +15090,6 @@
         }
       }
     },
-    "resume" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이어서 실행"
-          }
-        }
-      }
-    },
-    "resumed %lld agents" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "에이전트 %lld개 이어서 실행함"
-          }
-        }
-      }
-    },
-    "resumes %lld agents" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "에이전트 %lld개 이어서 실행"
-          }
-        }
-      }
-    },
     "role, for example implementer or reviewer" : {
       "localizations" : {
         "ko" : {
@@ -15628,42 +15100,12 @@
         }
       }
     },
-    "shell" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "셸"
-          }
-        }
-      }
-    },
     "since %@" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@부터"
-          }
-        }
-      }
-    },
-    "skipped" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "건너뜀"
-          }
-        }
-      }
-    },
-    "skips %lld existing" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "기존 %lld개 건너뜀"
           }
         }
       }
@@ -15759,16 +15201,6 @@
         }
       }
     },
-    "tmux server %@" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "tmux 서버 %@"
-          }
-        }
-      }
-    },
     "tmux was not found. Install it with Homebrew (brew install tmux) and check again." : {
       "localizations" : {
         "ko" : {
@@ -15835,36 +15267,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "버전 정보 없음"
-          }
-        }
-      }
-    },
-    "will add windows" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "윈도우 추가 예정"
-          }
-        }
-      }
-    },
-    "will create" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "생성 예정"
-          }
-        }
-      }
-    },
-    "windows added" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "윈도우 추가됨"
           }
         }
       }
