@@ -20,6 +20,7 @@ mod mux_control;
 mod onboarding;
 mod peek;
 mod relay;
+mod reload;
 mod stats;
 mod theme;
 mod time_range;
@@ -293,9 +294,13 @@ enum Cmd {
         command: Vec<String>,
     },
     /// Attach this terminal to a muxa-owned PTY session.
-    Attach { session: String },
+    Attach {
+        session: String,
+    },
     /// Mark a muxa-owned PTY session as detached.
-    Detach { session: String },
+    Detach {
+        session: String,
+    },
     /// Register an arbitrary background process (shell script, game,
     /// automation loop) so it shows up in `muxa status`/`muxa watch`,
     /// tracked by pid liveness. Defaults `--pid` to the calling shell.
@@ -367,6 +372,17 @@ enum Cmd {
     /// Update muxa from the source repo: `git pull` → cargo install
     /// `muxad` + `muxa-cli` → restart the daemon → verify the IPC
     /// socket is responsive. One command for the full update flow.
+    /// Capture this multiplexer's workspace — sessions, windows, panes,
+    /// geometry, and what each pane is running — so a restart can be undone
+    Snapshot(reload::SnapshotArgs),
+
+    /// Rebuild a workspace from a snapshot. Prints the plan unless `--run`
+    Restore(reload::RestoreArgs),
+
+    /// Snapshot, restart the multiplexer, and put the workspace back. Run it
+    /// from outside the server it restarts
+    Reload(reload::ReloadArgs),
+
     Upgrade(upgrade::Args),
     /// Delete accumulated "orphan" agent rows — paneless, surfaceless,
     /// pid-less ghosts left by remote/detached sessions (e.g. codex driven
@@ -1342,6 +1358,9 @@ async fn main() -> Result<()> {
         Cmd::Onboard(onboard_args) => onboarding::run(onboard_args),
         Cmd::Mcp => mcp::run(client, cfg).await,
         Cmd::Logs(logs_args) => logs::run(logs_args).await,
+        Cmd::Snapshot(snapshot_args) => reload::snapshot(&client, snapshot_args).await,
+        Cmd::Restore(restore_args) => reload::restore(restore_args),
+        Cmd::Reload(reload_args) => reload::reload(&client, reload_args).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
         Cmd::Prune {
             older_than,

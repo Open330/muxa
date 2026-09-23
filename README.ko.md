@@ -242,6 +242,9 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 | `muxa agent control (--pane %N\|--session pty-N) --action interrupt` | managed tmux pane 또는 muxa-owned PTY agent session 하나를 중단하거나 명시적으로 종료. |
 | `muxa onboard [--tour live] [--lang auto\|en\|ko]` | 전용 sandbox에서 실제 tmux, watch, attend, mailbox를 다루는 16단계 tour. 기존 tmux 안에서는 실행을 거부합니다. `F2` 언어 전환, `--no-quiz`의 즉시 `F12` 제공, `--print` guide를 지원합니다. |
 | `muxa mcp` | coding agent가 상태 확인, 메시지, pane capture, 변경 대기, tmux lifecycle을 Muxa를 통해 수행하는 MCP stdio server. [docs/MCP.md](docs/MCP.md) 참고. |
+| `muxa snapshot` | 이 멀티플렉서의 작업 공간 — 세션·윈도우·pane·geometry·작업 디렉터리, 그리고 각 pane이 실행 중인 커맨드라인 — 을 `$XDG_DATA_HOME/muxa/snapshots`에 캡처. |
+| `muxa restore [DIR] [--run]` | 스냅샷에서 작업 공간 재구성. `--run` 없이는 계획만 출력 — 해당 세션이 남아 있는 서버에 복원하면 pane이 교체되지 않고 추가되기 때문. |
+| `muxa reload [--snapshot DIR]` | 스냅샷 → 멀티플렉서 재시작 → 작업 공간 복원. 새 tmux/rmux 빌드를 pane 서른 개를 손으로 다시 만들지 않고 적용하는 방법. 재시작 대상 서버 **바깥**에서 실행하며, muxa가 추적하던 pane은 자기 대화로 돌아온다. |
 | `muxa init` | install/uninstall wizard. |
 | `muxad` | daemon process. |
 
