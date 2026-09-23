@@ -38,6 +38,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
     case showWork, showWatch, showInbox, showShells, refresh
     case closeEditor, previousEditor, nextEditor, splitEditor, pinEditor, focusSidebar
     case jumpToAgent, nextAttention, toggleSidebar, reopenEditor, showShortcuts
+    case newAgent, newDefaultAgent // WS-B: new agent
 
     var id: Self { self }
 
@@ -64,6 +65,8 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .toggleSidebar: String(localized: "View: Toggle side bar")
         case .reopenEditor: String(localized: "Editor: Reopen closed editor")
         case .showShortcuts: String(localized: "Help: Keyboard shortcuts")
+        case .newAgent: String(localized: "Agent: New agent…")
+        case .newDefaultAgent: String(localized: "Agent: New default agent here")
         }
     }
 
@@ -87,6 +90,8 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .toggleSidebar: "⌘B"
         case .reopenEditor: "⇧⌘T"
         case .showShortcuts: "⌘/"
+        case .newAgent: "⌥⇧⌘T"
+        case .newDefaultAgent: "⌥⌘T"
         case .showWork, .showWatch, .showShells, .refresh: nil
         }
     }
@@ -111,6 +116,8 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .toggleSidebar: "sidebar.left"
         case .reopenEditor: "arrow.uturn.backward"
         case .showShortcuts: "keyboard"
+        case .newAgent: "sparkles.rectangle.stack"
+        case .newDefaultAgent: "sparkle"
         }
     }
 
@@ -125,6 +132,9 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
             if self == .newShell && model.isCreatingSession {
                 return String(localized: "A shell is being created")
             }
+        case .newAgent, .newDefaultAgent: // WS-B: new agent
+            guard model.isConnected else { return String(localized: "Daemon is not connected") }
+            if model.isStartingAgent { return String(localized: "An agent is starting") }
         case .closeEditor, .previousEditor, .nextEditor, .splitEditor, .pinEditor:
             guard let selection = model.sidebarSelection, model.isSelectionAvailable(selection) else {
                 return String(localized: "No active editor")

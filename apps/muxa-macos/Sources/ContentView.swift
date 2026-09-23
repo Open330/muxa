@@ -82,6 +82,7 @@ struct ContentView: View {
         .sheet(item: $model.pipelineEditorTarget) { target in
             PipelineEditorView(target: target, model: model)
         }
+        .muxaNewAgentPresentation(model: model, openEditor: openEditor) // WS-B: new agent
         .task {
             model.activateEditor(tabs.focusedSelection)
             model.start()
@@ -132,6 +133,15 @@ struct ContentView: View {
             }
             .help("New shell")
             .disabled(!model.isConnected || model.isCreatingSession)
+
+            // WS-B: new agent
+            Button {
+                model.presentNewAgent()
+            } label: {
+                Label("New Agent…", systemImage: "sparkles.rectangle.stack")
+            }
+            .help("New Agent… (⌥⇧⌘T)")
+            .disabled(!model.isConnected || model.isStartingAgent)
 
             Menu {
                 Button("Commands…") { paletteMode = .commands }
@@ -416,6 +426,9 @@ struct ContentView: View {
             case .toggleSidebar: sidebarVisible.toggle()
             case .reopenEditor: editorCommands.reopenClosed?()
             case .showShortcuts: showingShortcuts = true
+            // WS-B: new agent
+            case .newAgent: model.presentNewAgent()
+            case .newDefaultAgent: Task { await model.quickStartAgent() }
             }
         }
     }

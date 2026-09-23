@@ -191,6 +191,14 @@ struct MuxaApp: App {
                 Button("New Muxa Shell") { model.createShell() }
                     .keyboardShortcut("t", modifiers: .command)
                     .disabled(!model.isConnected || model.isCreatingSession)
+                // WS-B: new agent — ⌥⌘T starts the default agent in the
+                // focused editor's folder, as Orca's new agent tab does.
+                Button("New Default Agent") { Task { await model.quickStartAgent() } }
+                    .keyboardShortcut("t", modifiers: [.command, .option])
+                    .disabled(!model.isConnected || model.isStartingAgent)
+                Button("New Agent…") { model.presentNewAgent() }
+                    .keyboardShortcut("t", modifiers: [.command, .option, .shift])
+                    .disabled(!model.isConnected || model.isStartingAgent)
             }
         }
     }

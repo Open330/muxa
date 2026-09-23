@@ -35,6 +35,7 @@
 
 pub mod activity;
 pub mod adapters;
+pub mod agent_control;
 pub mod ask;
 pub mod automation;
 pub mod automation_judge;
