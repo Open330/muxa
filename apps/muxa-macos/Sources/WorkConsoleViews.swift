@@ -3273,6 +3273,7 @@ private struct WatchPaneRow: View {
                     Text(title)
                         .font(.callout)
                         .lineLimit(1)
+                    MuxaUnreadDot(pane: pane.id) // WS-A
                     Spacer(minLength: 3)
                     Text(subtitle)
                         .font(.caption2.monospaced())
@@ -3336,6 +3337,7 @@ struct WatchFlatPaneRow: View {
                         Text(title)
                             .font(.callout.weight(.medium))
                             .lineLimit(1)
+                        MuxaUnreadDot(pane: pane.id) // WS-A
                         Spacer(minLength: 3)
                         Text(pane.pane.paneID)
                             .font(.caption2.monospaced())

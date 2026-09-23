@@ -102,6 +102,8 @@ struct ContentView: View {
             model.activateEditor(tabs.focusedSelection)
         }
         .background(WorkbenchWindowPresenter())
+        // WS-A: unread tracking and notification-click routing.
+        .modifier(MuxaAttentionTracking(model: model, tabs: tabs, attention: model.attention, open: openAgentPane))
         .focusedSceneValue(\.muxaEditorCommands, editorCommands)
     }
 
@@ -296,7 +298,10 @@ struct ContentView: View {
     }
 
     private var editorCommands: MuxaEditorCommandActions {
-        MuxaEditorCommandActions(
+        // WS-A: nil while nothing is unread, which disables the menu item.
+        let attention = model.attention
+        let markAllRead: (() -> Void)? = attention.hasUnread ? { attention.markAllRead() } : nil
+        return MuxaEditorCommandActions(
             // nil once no tab is open, so ⌘W falls through to closing the
             // window.
             close: tabs.focusedSelection == nil ? nil : {
@@ -354,6 +359,7 @@ struct ContentView: View {
                 }
             },
             showShortcuts: { showingShortcuts = true },
+            markAllRead: markAllRead, // WS-A
             isEnabled: paletteMode == nil && !showingShortcuts && !model.isPresentingWorkStart
                 && !model.isPresentingHostRegistration && model.pipelineEditorTarget == nil
                 && !model.isConfirmingDaemonReplacement
@@ -379,9 +385,14 @@ struct ContentView: View {
             NSSound.beep()
             return
         }
-        model.selectWatchPane(next)
-        tabs.openPinned(.pane(next))
-        model.activateEditor(.pane(next))
+        openAgentPane(next)
+    }
+
+    /// Pins a pane in the focused group: ⇧⌘J and a notification click.
+    private func openAgentPane(_ pane: MuxaWatchPaneIdentity) {
+        model.selectWatchPane(pane)
+        tabs.openPinned(.pane(pane))
+        model.activateEditor(.pane(pane))
     }
 
     private func performPendingPaletteAction() {
@@ -416,6 +427,7 @@ struct ContentView: View {
             case .toggleSidebar: sidebarVisible.toggle()
             case .reopenEditor: editorCommands.reopenClosed?()
             case .showShortcuts: showingShortcuts = true
+            case .markAllRead: model.attention.markAllRead() // WS-A
             }
         }
     }
@@ -544,6 +556,7 @@ private struct WorkspaceTabBar: View {
                 title: Self.title(for: selection, model: model),
                 systemImage: tabIcon(for: selection),
                 stateColor: agentState(for: selection).map(agentStateColor),
+                unreadPane: unreadPane(for: selection), // WS-A
                 active: group?.active == selection,
                 preview: group?.preview == selection,
                 activate: { activate(selection) },
@@ -637,6 +650,15 @@ private struct WorkspaceTabBar: View {
         }
     }
 
+    // WS-A: the pane whose unread dot a tab carries.
+    private func unreadPane(for selection: MuxaSidebarSelection) -> MuxaWatchPaneIdentity? {
+        switch selection {
+        case .pane(let id): id
+        case .agent(let id): model.hostedAgents.first { $0.id == id }.flatMap(MuxaAgentAttentionCenter.paneIdentity)
+        default: nil
+        }
+    }
+
     private func tabIcon(for selection: MuxaSidebarSelection) -> String {
         switch selection {
         case .workBoard: "rectangle.3.group"
@@ -659,6 +681,7 @@ private struct EditorTab: View {
     let title: String
     let systemImage: String
     var stateColor: Color? = nil
+    var unreadPane: MuxaWatchPaneIdentity? = nil // WS-A
     let active: Bool
     let preview: Bool
     let activate: () -> Void
@@ -711,6 +734,13 @@ private struct EditorTab: View {
             }
             .buttonStyle(.muxaIcon(size: 18))
             .opacity(active || hovering ? 1 : 0)
+            // WS-A: an unseen agent shows a dot in the close slot, like an
+            // editor's unsaved-changes dot, until the tab is hovered.
+            .overlay {
+                if let unreadPane, !active, !hovering {
+                    MuxaUnreadDot(pane: unreadPane, size: 7).allowsHitTesting(false)
+                }
+            }
             .accessibilityLabel("Close \(title)")
             .help("Close \(title)")
             .padding(.trailing, 6)
@@ -906,7 +936,7 @@ private struct MuxaSidebar: View {
                 }
 
                 HStack(spacing: 0) {
-                    SidebarActivityRail(model: model)
+                    SidebarActivityRail(model: model, attention: model.attention)
 
                     MuxaTheme.border(colorScheme).frame(width: 1)
 
@@ -1655,6 +1685,7 @@ private struct MuxaSidebar: View {
 
 private struct SidebarActivityRail: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var attention: MuxaAgentAttentionCenter // WS-A
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1681,7 +1712,7 @@ private struct SidebarActivityRail: View {
         case .work:
             return model.workGroups.lazy.filter { $0.attentionCount > 0 }.count
         case .watch:
-            return 0
+            return attention.unreadPanes.count // WS-A
         case .inbox:
             let agentAttention = model.hostedAgents.lazy.filter {
                 ["waiting_input", "waiting_choice", "blocked", "error", "failed"]

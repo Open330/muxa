@@ -84,7 +84,10 @@ final class AppModel: ObservableObject {
 
     @Published private(set) var sessions: [MuxaSession] = []
     @Published private(set) var pipelineRuns: [MuxaPipelineRun] = []
-    @Published private(set) var executionSnapshot = MuxaExecutionSnapshot.empty
+    @Published private(set) var executionSnapshot = MuxaExecutionSnapshot.empty {
+        // WS-A: every snapshot, from either refresh path, updates unread state.
+        didSet { attention.ingest(executionSnapshot) }
+    }
     @Published private(set) var workGroups: [MuxaWorkGroup] = []
     @Published private(set) var hostedAgents: [MuxaHostedAgent] = []
     @Published private(set) var workspaceRevision: UInt64 = 0
@@ -152,6 +155,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var hostRegistrationError: String?
 
     let client: MuxaIPCClient
+    // WS-A: unread state and macOS notifications for agent transitions.
+    let attention: MuxaAgentAttentionCenter
     private let daemon = DaemonManager()
     private var refreshTask: Task<Void, Never>?
     private var fleetRefreshTask: Task<Void, Never>?
@@ -195,6 +200,17 @@ final class AppModel: ObservableObject {
 
     init(client: MuxaIPCClient = MuxaIPCClient()) {
         self.client = client
+        // WS-A: tests get an in-memory center that never touches
+        // UserDefaults, the notification center, or the Dock.
+        if Self.isRunningTests() {
+            attention = MuxaAgentAttentionCenter(defaults: nil)
+        } else {
+            attention = MuxaAgentAttentionCenter(
+                poster: MuxaUserNotifications.shared,
+                settings: { MuxaNotificationPreferences.current() }
+            )
+            MuxaUserNotifications.shared.attention = attention
+        }
     }
 
     /// Test seam. The app ingests execution snapshots through `refresh`, which

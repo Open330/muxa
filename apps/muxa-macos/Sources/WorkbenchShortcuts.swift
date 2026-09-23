@@ -12,12 +12,14 @@ enum MuxaAttention {
         pane.agent.map { states.contains($0.state) } ?? false
     }
 
-    /// Attention first, then working, then idle agents; plain shells last.
-    static func rank(_ pane: MuxaWatchPane) -> Int {
-        guard let state = pane.agent?.state else { return 3 }
+    /// Attention first, then agents that finished unseen, then working,
+    /// then idle agents; plain shells last.
+    static func rank(_ pane: MuxaWatchPane, unread: Bool = false) -> Int {
+        guard let state = pane.agent?.state else { return 4 }
         if states.contains(state) { return 0 }
-        if activeStates.contains(state) { return 1 }
-        return 2
+        if unread { return 1 } // WS-A
+        if activeStates.contains(state) { return 2 }
+        return 3
     }
 
     /// ⇧⌘J: the pane after `current` among those needing attention, wrapping
