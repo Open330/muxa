@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.51] - 2026-09-23
+
 ### Fixed
 
 - **Detaching a pane ends its parked read at once again.** 0.8.49 made a
@@ -3725,7 +3727,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.50...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.51...HEAD
+[0.8.51]: https://github.com/Open330/muxa/compare/v0.8.50...v0.8.51
 [0.8.50]: https://github.com/Open330/muxa/compare/v0.8.49...v0.8.50
 [0.8.49]: https://github.com/Open330/muxa/compare/v0.8.48...v0.8.49
 [0.8.48]: https://github.com/Open330/muxa/compare/v0.8.47...v0.8.48
