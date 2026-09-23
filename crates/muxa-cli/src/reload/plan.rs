@@ -52,7 +52,10 @@ pub(super) enum SessionResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum PaneResult {
+    /// Its program was seen holding the pane.
     Relaunched,
+    /// The command was typed, but the pane never showed it running.
+    Unconfirmed,
     Shell,
     Manual,
     Failed,
@@ -123,6 +126,7 @@ pub(super) struct Totals {
     pub sessions_failed: usize,
     pub panes: usize,
     pub relaunched: usize,
+    pub unconfirmed: usize,
     pub shell: usize,
     pub manual: usize,
     pub failed: usize,
@@ -163,6 +167,8 @@ pub(super) struct RestoreReport {
     /// Panes left for a person — a process title, a busy pane, an agent whose
     /// command line was never captured — with the reason.
     pub panes_left: BTreeMap<String, String>,
+    /// Panes whose command was sent but never seen running, with a note.
+    pub panes_unconfirmed: BTreeMap<String, String>,
 }
 
 impl RestoreReport {
@@ -181,6 +187,10 @@ impl RestoreReport {
 
     pub fn pane_failed(&mut self, target: String, error: String) {
         self.pane_failures.entry(target).or_insert(error);
+    }
+
+    pub fn pane_unconfirmed(&mut self, target: String, note: String) {
+        self.panes_unconfirmed.entry(target).or_insert(note);
     }
 
     pub fn pane_left(&mut self, target: String, note: String) {
@@ -355,6 +365,11 @@ pub(super) fn attach_results(sessions: &mut [SessionPlan], report: &RestoreRepor
                 pane.error = Some(error.clone());
                 continue;
             }
+            if let Some(note) = report.panes_unconfirmed.get(&pane.target) {
+                pane.result = Some(PaneResult::Unconfirmed);
+                pane.error = Some(note.clone());
+                continue;
+            }
             if let Some(note) = report.panes_left.get(&pane.target) {
                 pane.result = Some(PaneResult::Manual);
                 pane.error = Some(note.clone());
@@ -385,6 +400,7 @@ pub(super) fn totals(sessions: &[SessionPlan]) -> Totals {
             totals.panes += 1;
             match result {
                 PaneResult::Relaunched => totals.relaunched += 1,
+                PaneResult::Unconfirmed => totals.unconfirmed += 1,
                 PaneResult::Shell => totals.shell += 1,
                 PaneResult::Manual => totals.manual += 1,
                 PaneResult::Failed => totals.failed += 1,
@@ -622,6 +638,18 @@ mod tests {
         let mut report = RestoreReport::new(false);
         report.reached.insert("side".into());
         report.pane_failed("=side:0.0".into(), "can't find pane".into());
+        // Unconfirmed is its own result, never counted as relaunched.
+        let mut unconfirmed = plan(&snapshot(), &BTreeSet::new(), true, false);
+        let mut sent = RestoreReport::new(false);
+        sent.reached.extend(["work".to_owned(), "side".to_owned()]);
+        sent.pane_unconfirmed("=side:0.0".into(), "still at its prompt".into());
+        attach_results(&mut unconfirmed, &sent);
+        assert_eq!(
+            unconfirmed[1].windows[0].panes[0].result,
+            Some(PaneResult::Unconfirmed)
+        );
+        let counted = totals(&unconfirmed);
+        assert_eq!((counted.relaunched, counted.unconfirmed), (1, 1));
         attach_results(&mut sessions, &report);
         assert_eq!(sessions[0].result, Some(SessionResult::Skipped));
         assert_eq!(sessions[1].result, Some(SessionResult::Created));

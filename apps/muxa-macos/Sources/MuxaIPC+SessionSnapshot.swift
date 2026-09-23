@@ -174,10 +174,11 @@ struct MuxSnapshotPlan: Decodable, Hashable, Sendable {
     }
 
     enum PaneResult: MuxSnapshotOpenEnum {
-        case relaunched, shell, manual, failed, unknown(String)
+        case relaunched, unconfirmed, shell, manual, failed, unknown(String)
         init(raw: String) {
             switch raw {
             case "relaunched": self = .relaunched
+            case "unconfirmed": self = .unconfirmed
             case "shell": self = .shell
             case "manual": self = .manual
             case "failed": self = .failed
@@ -223,15 +224,31 @@ struct MuxSnapshotPlan: Decodable, Hashable, Sendable {
         let sessionsFailed: Int
         let panes: Int
         let relaunched: Int
+        /// Typed in, but never seen running.
+        let unconfirmed: Int
         let shell: Int
         let manual: Int
         let failed: Int
 
         enum CodingKeys: String, CodingKey {
-            case panes, relaunched, shell, manual, failed
+            case panes, relaunched, unconfirmed, shell, manual, failed
             case sessionsCreated = "sessions_created"
             case sessionsSkipped = "sessions_skipped"
             case sessionsFailed = "sessions_failed"
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            let count = { (key: CodingKeys) in try values.decodeIfPresent(Int.self, forKey: key) ?? 0 }
+            sessionsCreated = try count(.sessionsCreated)
+            sessionsSkipped = try count(.sessionsSkipped)
+            sessionsFailed = try count(.sessionsFailed)
+            panes = try count(.panes)
+            relaunched = try count(.relaunched)
+            unconfirmed = try count(.unconfirmed)
+            shell = try count(.shell)
+            manual = try count(.manual)
+            failed = try count(.failed)
         }
     }
 

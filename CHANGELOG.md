@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A restore types into a pane only once its shell is listening, and says
+  "relaunched" only when the program is running.** A shell still working
+  through its startup files has no line editor yet; a startup that prints
+  first looked ready, and the `cd` and relaunch typed then could be swallowed
+  by anything in that startup reading the terminal — while the restore
+  reported the pane relaunched. muxa now waits for the pane's terminal to
+  leave canonical mode (the line editor reading keys), and afterwards counts a
+  pane as relaunched only once its program is seen holding it; otherwise it
+  is reported as not confirmed, with the reason.
+
 - **`muxa reload` can bring the server back it just killed, and no longer
   doubles a workspace.** A snapshot recorded the server by the short socket
   name muxad keeps on a pane, which resolves only against a live server —

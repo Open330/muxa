@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use crate::mux_control;
 
+mod launch;
 mod plan;
 mod store;
 
@@ -1005,7 +1006,7 @@ fn window_indexes(endpoint: &BackendEndpoint, session_target: &str) -> Vec<Strin
 
 /// Type each pane's own command line back into it.
 fn replay_commands(endpoint: &BackendEndpoint, snapshot: &Snapshot, report: &mut RestoreReport) {
-    let mut replayed = 0_usize;
+    let mut sent = Vec::new();
     let mut manual = Vec::new();
     for pane in &snapshot.panes {
         let target = pane_target(pane);
@@ -1027,11 +1028,19 @@ fn replay_commands(endpoint: &BackendEndpoint, snapshot: &Snapshot, report: &mut
             continue;
         }
         match mux_control::run(endpoint, &["send-keys", "-t", &target, &command, "Enter"]) {
-            Ok(()) => replayed += 1,
+            Ok(()) => sent.push(target),
             Err(error) => report.pane_failed(target, error),
         }
     }
+    // Keys sent are not a program started: only a pane whose foreground
+    // moved off its shell counts as relaunched.
+    let unconfirmed = confirm_launches(endpoint, sent.clone());
+    let replayed = sent.len() - unconfirmed.len();
     report.say(&plan::relaunched_line(replayed));
+    for target in unconfirmed {
+        report.say(&plan::manual_line(&target, launch::UNCONFIRMED_NOTE));
+        report.pane_unconfirmed(target, launch::UNCONFIRMED_NOTE.to_owned());
+    }
     for (target, note) in manual {
         report.say(&plan::manual_line(&target, &note));
         report.pane_left(target, note);
@@ -1102,50 +1111,102 @@ fn pane_target(pane: &PaneShape) -> String {
 }
 
 /// A pane created a moment ago is still starting its shell, and keys sent
-/// before the prompt appears are swallowed. Poll for the shell instead of
-/// sleeping a guessed interval. A pane that keeps reporting some other
-/// program is not starting, it is busy — a shell's own startup may run a
-/// child for a moment, so it gets a short grace, not the full wait — and
-/// the answer is `false`: nothing should be typed into it.
+/// before its line editor is up can be swallowed by that startup. Poll for
+/// the shell instead of sleeping a guessed interval. A pane that keeps
+/// reporting some other program is not starting, it is busy — a shell's own
+/// startup may run a child for a moment, so it gets a short grace, not the
+/// full wait — and the answer is `false`: nothing should be typed into it.
+/// See [`launch`] for what counts as ready.
 fn wait_for_shell(endpoint: &BackendEndpoint, target: &str) -> bool {
-    let deadline = Instant::now() + SHELL_READY_TIMEOUT;
-    let mut busy_since: Option<Instant> = None;
-    let mut saw_shell = false;
-    while Instant::now() < deadline {
-        let command = mux_control::capture(
-            endpoint,
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                target,
-                "#{pane_current_command}",
-            ],
-        );
-        match command {
-            Ok(command) if is_shell(command.trim()) => {
-                // The pane runs its shell from the first instant, before the
-                // prompt is up and keys are read. The prompt being drawn is
-                // the only sign tmux can give that the shell is listening.
-                saw_shell = true;
-                busy_since = None;
-                if prompt_drawn(endpoint, target) {
-                    return true;
-                }
-            }
-            Ok(_) => {
-                let since = *busy_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= BUSY_GRACE {
-                    return false;
-                }
-            }
-            Err(_) => busy_since = None,
+    let started = Instant::now();
+    let mut watch = launch::ShellWatch::default();
+    let tty = pane_tty(endpoint, target);
+    while started.elapsed() < SHELL_READY_TIMEOUT {
+        let command = foreground(endpoint, target);
+        let shell = command.as_deref().is_some_and(|c| is_shell(c.trim()));
+        let prompt_drawn = shell && prompt_drawn(endpoint, target);
+        let line_editing = if prompt_drawn {
+            tty.as_deref().and_then(terminal_line_editing)
+        } else {
+            None
+        };
+        let probe = launch::PaneProbe {
+            command: command.as_deref(),
+            prompt_drawn,
+            line_editing,
+        };
+        match watch.observe(started.elapsed(), probe) {
+            launch::Readiness::Ready => return true,
+            launch::Readiness::Busy => return false,
+            launch::Readiness::Wait => {}
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    // A shell that never drew anything in all that time is taken at its
-    // word; a pane that was never a shell is not typed into.
-    saw_shell
+    watch.at_deadline()
+}
+
+/// `#{pane_current_command}`, or `None` when the server did not answer.
+fn foreground(endpoint: &BackendEndpoint, target: &str) -> Option<String> {
+    mux_control::capture(
+        endpoint,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{pane_current_command}",
+        ],
+    )
+    .ok()
+}
+
+/// The pane's terminal device, for reading its mode.
+fn pane_tty(endpoint: &BackendEndpoint, target: &str) -> Option<String> {
+    mux_control::capture(
+        endpoint,
+        &["display-message", "-p", "-t", target, "#{pane_tty}"],
+    )
+    .ok()
+    .map(|tty| tty.trim().to_owned())
+    .filter(|tty| tty.starts_with("/dev/"))
+}
+
+/// Whether the terminal at `tty` has a line editor reading it (non-canonical
+/// mode). Reading the mode opens the device but changes nothing on it.
+fn terminal_line_editing(tty: &str) -> Option<bool> {
+    let flag = if cfg!(target_os = "linux") {
+        "-F"
+    } else {
+        "-f"
+    };
+    let output = std::process::Command::new("stty")
+        .args([flag, tty, "-a"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    launch::line_editing(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Watch relaunched panes until each shows its program, and return the ones
+/// that never did. Every pane shares one deadline, so a workspace of many
+/// panes waits once, not once per pane.
+fn confirm_launches(endpoint: &BackendEndpoint, targets: Vec<String>) -> BTreeSet<String> {
+    let started = Instant::now();
+    let mut watch = launch::LaunchWatch::new(targets);
+    while !watch.is_settled() && started.elapsed() < launch::CONFIRM_TIMEOUT {
+        let pending: Vec<String> = watch.pending().cloned().collect();
+        for target in pending {
+            let command = foreground(endpoint, &target);
+            watch.observe(&target, command.as_deref());
+        }
+        if !watch.is_settled() {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    watch.unconfirmed()
 }
 
 /// Whether anything is on the pane's screen — a prompt, for a shell.

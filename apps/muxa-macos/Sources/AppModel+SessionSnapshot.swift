@@ -215,6 +215,7 @@ struct SessionSnapshotTreeRow: Identifiable, Hashable {
         case resumeByHand
         // Panes, after a restore.
         case relaunched
+        case unconfirmed
         case startByHand
     }
 
@@ -265,7 +266,7 @@ enum SessionSnapshotTree {
                         symbol: pane.action == .shell ? "terminal" : "play.rectangle",
                         title: abbreviate(pane.path), detail: nil, badge: badge,
                         help: pane.note ?? pane.command,
-                        message: pane.result == .failed ? pane.error : nil
+                        message: pane.result == .failed || pane.result == .unconfirmed ? pane.error : nil
                     ))
                 }
             }
@@ -295,6 +296,7 @@ enum SessionSnapshotTree {
         if let result = pane.result {
             switch result {
             case .relaunched: return .relaunched
+            case .unconfirmed: return .unconfirmed
             case .shell: return .shell
             case .manual: return .startByHand
             case .failed: return .failed
@@ -327,6 +329,9 @@ enum SessionSnapshotTree {
 
     static func totalsLine(_ totals: MuxSnapshotPlan.Totals) -> String {
         var line = String(localized: "Created \(totals.sessionsCreated), skipped \(totals.sessionsSkipped); relaunched \(totals.relaunched) of \(totals.panes) panes")
+        if totals.unconfirmed > 0 {
+            line += " · " + String(localized: "\(totals.unconfirmed) not confirmed")
+        }
         if totals.manual > 0 {
             line += " · " + String(localized: "\(totals.manual) to start by hand")
         }

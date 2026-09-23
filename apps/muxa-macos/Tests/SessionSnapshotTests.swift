@@ -33,9 +33,10 @@ private let reportJSON = #"""
   {"name":"side","action":"create","result":"created","windows":[{"index":"1","name":"dev","layout":"x","panes":[
     {"index":"0","path":"/srv","action":"resume","command":"claude --resume abc","agent_kind":"claude_code","result":"relaunched"},
     {"index":"1","path":"/srv","action":"replay","command":"make","result":"failed","error":"can't find pane: =side:1.1"},
-    {"index":"2","path":"/srv","action":"manual","command":"puma","result":"manual"}]}]}
+    {"index":"2","path":"/srv","action":"manual","command":"puma","result":"manual"},
+    {"index":"3","path":"/srv","action":"replay","command":"true","result":"unconfirmed","error":"sent, but the pane was still at its shell prompt after 10s"}]}]}
  ],
- "totals":{"sessions_created":1,"sessions_skipped":1,"sessions_failed":0,"panes":3,"relaunched":1,"shell":0,"manual":1,"failed":1}}
+ "totals":{"sessions_created":1,"sessions_skipped":1,"sessions_failed":0,"panes":4,"relaunched":1,"unconfirmed":1,"shell":0,"manual":1,"failed":1}}
 """#
 
 private func plan(_ json: String) throws -> MuxSnapshotPlan {
@@ -117,11 +118,12 @@ private func plan(_ json: String) throws -> MuxSnapshotPlan {
     let rows = SessionSnapshotTree.rows(plan: report)
     #expect(rows.filter { $0.depth == 0 }.map(\.badge) == [.skipped, .created])
     let panes = rows.filter { $0.depth == 2 }
-    #expect(panes.map(\.badge) == [.relaunched, .failed, .startByHand])
+    #expect(panes.map(\.badge) == [.relaunched, .failed, .startByHand, .unconfirmed])
     #expect(panes[1].message == "can't find pane: =side:1.1")
+    #expect(panes[3].message?.hasPrefix("sent, but") == true, "why it is not confirmed")
     let totals = try #require(report.totals)
     #expect(SessionSnapshotTree.totalsLine(totals)
-        == "Created 1, skipped 1; relaunched 1 of 3 panes · 1 to start by hand · 1 failed")
+        == "Created 1, skipped 1; relaunched 1 of 4 panes · 1 not confirmed · 1 to start by hand · 1 failed")
 }
 
 @Test func planLineCountsCreatesAndSkips() throws {

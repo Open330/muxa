@@ -461,7 +461,7 @@ private struct SessionSnapshotTreeRowView: View {
             if let message = row.message {
                 Text(verbatim: message)
                     .font(.system(size: 11))
-                    .foregroundStyle(.red)
+                    .foregroundStyle(row.badge == .unconfirmed ? Color.orange : Color.red)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.leading, 20)
@@ -503,6 +503,7 @@ private struct SessionSnapshotBadge: View {
         case .notReplayable: Text("not replayable")
         case .resumeByHand: Text("resume by hand")
         case .relaunched: Text("relaunched")
+        case .unconfirmed: Text("not confirmed")
         case .startByHand: Text("start by hand")
         }
     }
@@ -517,6 +518,7 @@ private struct SessionSnapshotBadge: View {
         case .replay: "play"
         case .shell: "terminal"
         case .notReplayable, .startByHand, .resumeByHand: "hand.raised"
+        case .unconfirmed: "questionmark.circle"
         }
     }
 
@@ -524,7 +526,7 @@ private struct SessionSnapshotBadge: View {
         switch badge {
         case .willCreate, .willFillMissing, .resume, .replay: .accentColor
         case .created, .filled, .relaunched: .green
-        case .notReplayable, .startByHand, .resumeByHand: .orange
+        case .notReplayable, .startByHand, .resumeByHand, .unconfirmed: .orange
         case .exists, .skipped, .shell: .secondary
         case .failed: .red
         }
