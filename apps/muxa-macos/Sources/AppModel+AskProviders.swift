@@ -133,6 +133,9 @@ final class AskProviderStore: ObservableObject {
     @Published private(set) var appleProbe: AskAppleProbe?
     private var detectionTask: Task<Void, Never>?
     private var appleProbeHelper: String?
+    /// Directory of the muxad serving the socket, once looked up; nil when
+    /// that could not be told, and the app's own helper is then trusted.
+    @Published private(set) var daemonDirectory: String?
 
     init() {}
 
@@ -163,6 +166,9 @@ final class AskProviderStore: ObservableObject {
             adopt([], selected: model.askAgent)
         }
         refreshKeyPresence()
+        if let owner = try? await DaemonSocketOwner.find(socketPath: model.client.socketPath) {
+            daemonDirectory = (owner.executablePath as NSString).deletingLastPathComponent
+        }
         await detectInstalledTools()
         await probeAppleModels()
     }
@@ -291,6 +297,7 @@ final class AskProviderStore: ObservableObject {
            let bundled = Self.bundledHelperDetection(
                for: executable,
                helpersDirectory: Self.bundledHelpersDirectory,
+               daemonDirectory: daemonDirectory,
                isExecutable: isExecutable
            ) {
             return bundled
@@ -506,14 +513,30 @@ final class AskProviderStore: ObservableObject {
     /// anyone's PATH: it ships in this app's `Contents/Helpers`, the same
     /// place the bundled muxad looks. Nil for any other name, and when the
     /// helper is missing — a development build — so PATH still gets a say.
+    ///
+    /// The app's copy counts only where muxad will look for it: beside the
+    /// daemon itself (the bundled muxad), or in a `Muxa.app` installed in
+    /// `/Applications` or `~/Applications` (a Homebrew muxad). An app run
+    /// from anywhere else next to a Homebrew daemon would otherwise say the
+    /// provider is ready while every turn fails with "helper not found".
     nonisolated static func bundledHelperDetection(
         for executable: String,
         helpersDirectory: String,
+        daemonDirectory: String? = nil,
+        homeDirectory: String = NSHomeDirectory(),
         isExecutable: (String) -> Bool
     ) -> AskProviderDetection? {
         guard executable == AskProviderEngine.appleHelperName else { return nil }
         let path = (helpersDirectory as NSString).appendingPathComponent(executable)
         guard isExecutable(path) else { return nil }
+        if let daemonDirectory {
+            let searched = [
+                daemonDirectory,
+                "/Applications/Muxa.app/Contents/Helpers",
+                (homeDirectory as NSString).appendingPathComponent("Applications/Muxa.app/Contents/Helpers"),
+            ].map { ($0 as NSString).standardizingPath }
+            guard searched.contains((helpersDirectory as NSString).standardizingPath) else { return nil }
+        }
         return .installed(InstalledTool(name: executable, path: path, version: nil))
     }
 

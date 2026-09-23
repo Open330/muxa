@@ -5773,16 +5773,6 @@
         }
       }
     },
-    "Headless Claude Code and Codex questions owned by muxad" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "muxad가 관리하는 헤드리스 Claude Code 및 Codex 질문"
-          }
-        }
-      }
-    },
     "Hide prompt" : {
       "localizations" : {
         "ko" : {
@@ -6606,12 +6596,12 @@
         }
       }
     },
-    "Model: on-device, or private-cloud for Private Cloud Compute (macOS 27 or later)." : {
+    "Model: on-device, or private-cloud for Private Cloud Compute (macOS 27 or later; not working yet)." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "모델: on-device, 또는 Private Cloud Compute를 쓰려면 private-cloud (macOS 27 이상)."
+            "value" : "모델: on-device, 또는 Private Cloud Compute를 쓰려면 private-cloud (macOS 27 이상, 아직 동작하지 않음)."
           }
         }
       }
@@ -7283,16 +7273,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "관리 중인 Work 없음"
-          }
-        }
-      }
-    },
-    "No matching Ask history" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "일치하는 Ask 기록 없음"
           }
         }
       }
@@ -9717,12 +9697,12 @@
         }
       }
     },
-    "Runs on this Mac's own models, with no key. Leave the model empty for on-device, or enter private-cloud for Private Cloud Compute (macOS 27 or later). The helper ships inside Muxa, so the executable can stay empty." : {
+    "Runs on this Mac's own models, with no key. Leave the model empty for on-device, or enter private-cloud for Private Cloud Compute (macOS 27 or later; it does not work yet). The helper ships inside Muxa, so the executable can stay empty." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "이 Mac의 자체 모델로 실행되며 키가 필요 없습니다. 모델을 비워 두면 on-device를 쓰고, private-cloud를 입력하면 Private Cloud Compute(macOS 27 이상)를 씁니다. 헬퍼는 Muxa에 포함되어 있으므로 실행 파일은 비워 둬도 됩니다."
+            "value" : "이 Mac의 자체 모델로 실행되며 키가 필요 없습니다. 모델을 비워 두면 on-device를 쓰고, private-cloud를 입력하면 Private Cloud Compute(macOS 27 이상, 아직 동작하지 않음)를 씁니다. 헬퍼는 Muxa에 포함되어 있으므로 실행 파일은 비워 둬도 됩니다."
           }
         }
       }

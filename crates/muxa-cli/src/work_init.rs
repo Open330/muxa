@@ -178,9 +178,12 @@ fn choose_agent(
     providers: &BTreeMap<String, AskProviderConfig>,
 ) -> Result<Option<String>> {
     use std::io::IsTerminal;
-    let available = available_agents(providers, &|name| which::which(name).is_ok(), &|name| {
-        std::env::var(name).ok()
-    });
+    // `muxa-afm` ships inside Muxa.app, not on PATH, so it is looked for
+    // where muxad will look for it when the turn runs.
+    let installed = |name: &str| {
+        which::which(name).is_ok() || muxa::ask::find_apple_helper(Some(name)).is_some()
+    };
+    let available = available_agents(providers, &installed, &|name| std::env::var(name).ok());
     if available.is_empty() {
         bail!(
             "no headless-capable provider is usable; install one of the agent CLIs or set an              API key for one of: {}",

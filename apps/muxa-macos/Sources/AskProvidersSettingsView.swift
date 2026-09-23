@@ -662,7 +662,7 @@ struct AskProviderCard: View {
                     .font(.body.monospaced())
             }
             if provider.isApple {
-                Text("Model: on-device, or private-cloud for Private Cloud Compute (macOS 27 or later).")
+                Text("Model: on-device, or private-cloud for Private Cloud Compute (macOS 27 or later; not working yet).")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -843,7 +843,7 @@ struct AskProviderAddSheet: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         } else if draft.engine == .apple {
-            Text("Runs on this Mac's own models, with no key. Leave the model empty for on-device, or enter private-cloud for Private Cloud Compute (macOS 27 or later). The helper ships inside Muxa, so the executable can stay empty.")
+            Text("Runs on this Mac's own models, with no key. Leave the model empty for on-device, or enter private-cloud for Private Cloud Compute (macOS 27 or later; it does not work yet). The helper ships inside Muxa, so the executable can stay empty.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

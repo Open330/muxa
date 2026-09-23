@@ -197,7 +197,8 @@ API engine은 resume할 세션이 없으므로 muxad가 자기 이력에서 그 
 빌드에서 쓸 수 있도록 남겨 두었고, 이 모델로 턴을 보내면 왜 답할 수 없는지
 알려줍니다. 이 프레임워크는 Swift 전용이라 muxad는
 `Muxa.app/Contents/Helpers`에 포함된 작은 헬퍼 `muxa-afm`을 통해 호출합니다.
-muxad는 헬퍼를 자기 실행 파일 옆, `/Applications/Muxa.app`, `PATH` 순서로 찾고,
+muxad는 헬퍼를 자기 실행 파일 옆, `/Applications/Muxa.app`, `~/Applications/Muxa.app`,
+`PATH` 순서로 찾고,
 `executable`로 다른 사본을 지정할 수 있습니다. API처럼 세션이 없으므로 대화를
 다시 넣어 보내는데, on-device 컨텍스트에 맞게 6k자로 자르고, 그래도 모델이
 초과를 보고하면 헬퍼가 더 줄입니다. 이 모델들은 질문에 답할 뿐 파일을 건드리지
@@ -258,7 +259,7 @@ muxa ask provider set anthropic --clear-model         # 생략한 플래그의 �
 muxa ask provider remove anthropic-work               # 내장 id는 설정만 지워집니다
 ```
 
-`add`는 이미 있는 id, TOML bare key가 아닌 id, 다섯 중에 없는 engine, 그리고 다른
+`add`는 이미 있는 id, TOML bare key가 아닌 id, 여섯 중에 없는 engine, 그리고 다른
 engine을 쓰려는 내장 id를 거부합니다. engine은 추가 시점에 고정됩니다. `set`은
 title·model·키 변수·바이너리를 바꾸고, engine을 바꾸려면 provider를 제거한 뒤 다시
 추가해야 합니다. 진행 중인 대화가 `claude` 세션 id를 `codex`에서 resume할 수는

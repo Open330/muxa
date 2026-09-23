@@ -31,8 +31,8 @@ enum AskExport {
             }
         }
         for entry in entries {
-            sections.append("## You\n\n\(trimmed(entry.prompt))")
-            sections.append("## \(providerTitle(entry.agent))\n\n\(reply(of: entry))")
+            sections.append("## You\n\n\(markdownBody(trimmed(entry.prompt)))")
+            sections.append("## \(providerTitle(entry.agent))\n\n\(markdownBody(reply(of: entry)))")
         }
         return sections.joined(separator: "\n\n") + "\n"
     }
@@ -50,10 +50,10 @@ enum AskExport {
         ]
         for entry in entries {
             lines.append("<user>")
-            lines.append(trimmed(entry.prompt))
+            lines.append(promptBody(trimmed(entry.prompt)))
             lines.append("</user>")
-            lines.append("<assistant name=\"\(providerTitle(entry.agent))\">")
-            lines.append(reply(of: entry))
+            lines.append("<assistant name=\"\(attribute(providerTitle(entry.agent)))\">")
+            lines.append(promptBody(reply(of: entry)))
             lines.append("</assistant>")
         }
         lines.append("</conversation>")
@@ -68,8 +68,66 @@ enum AskExport {
             .joined(separator: " ")
             .split(separator: " ")
             .joined(separator: " ")
+            .drop { $0 == "." || $0 == " " }
         let stem = cleaned.isEmpty ? "Global Ask" : String(cleaned.prefix(80))
         return "\(stem).md"
+    }
+
+    /// A message placed under the export's own `##` headings: its headings
+    /// move two levels down so they read as part of the message, and a code
+    /// fence it left open — an answer cut off mid-block — is closed, so it
+    /// cannot swallow the headings that follow.
+    static func markdownBody(_ text: String) -> String {
+        var fence: Substring?
+        var lines: [String] = []
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let stripped = line.drop { $0 == " " }
+            let marker = stripped.prefix { $0 == "`" || $0 == "~" }
+            if marker.count >= 3, Set(marker).count == 1 {
+                if let open = fence {
+                    if marker.first == open.first, marker.count >= open.count,
+                       stripped.dropFirst(marker.count).allSatisfy(\.isWhitespace) {
+                        fence = nil
+                    }
+                } else {
+                    fence = marker
+                }
+                lines.append(String(line))
+                continue
+            }
+            if fence == nil, line.hasPrefix("#") {
+                let level = line.prefix { $0 == "#" }.count
+                let rest = line.dropFirst(level)
+                if level <= 6, rest.isEmpty || rest.first == " " {
+                    lines.append(String(repeating: "#", count: min(level + 2, 6)) + rest)
+                    continue
+                }
+            }
+            lines.append(String(line))
+        }
+        if let open = fence {
+            lines.append(String(open))
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// A message placed between the prompt's own tags. Only the closing tags
+    /// of the wrapper are escaped — an answer that explains this very format
+    /// would otherwise end its block early — and the rest, code included,
+    /// reaches the next model as written.
+    static func promptBody(_ text: String) -> String {
+        text.replacingOccurrences(
+            of: "</(?=(conversation|user|assistant)>)",
+            with: "&lt;/",
+            options: [.regularExpression, .caseInsensitive]
+        )
+    }
+
+    private static func attribute(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "<", with: "&lt;")
     }
 
     /// What stands in the answer's place: the answer, or why there is none.

@@ -31,7 +31,7 @@
 //! engine, with its own title, model, key variable, and binary. Two
 //! instances can share an engine — a work and a personal `OpenAI` account,
 //! two Anthropic keys, a second `claude` binary — and each keeps its own
-//! conversation. The five engine ids are also instances of themselves, so
+//! conversation. The six engine ids are also instances of themselves, so
 //! a fresh install works with no `[ask.providers]` at all and an existing
 //! `[ask.providers.anthropic] model = "…"` keeps overriding the built-in.
 //!
@@ -74,6 +74,8 @@ const APPLE_HELPER: &str = "muxa-afm";
 /// Where the helper is when this `muxad` is not the bundled one — a
 /// Homebrew daemon serving an installed app.
 const APPLE_HELPER_IN_APP: &str = "/Applications/Muxa.app/Contents/Helpers/muxa-afm";
+/// The same app installed for one user, relative to their home.
+const APPLE_HELPER_IN_USER_APPS: &str = "Applications/Muxa.app/Contents/Helpers/muxa-afm";
 
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -2005,13 +2007,15 @@ impl AskEngine {
 
 /// The helper a bare `muxa-afm` means: beside this executable, which is
 /// where the bundled `muxad` finds it; else inside an installed `Muxa.app`,
-/// for a Homebrew `muxad` serving that app; else whatever `PATH` holds. A
-/// path the operator configured is used as written. `exists` is injected so
-/// the order is testable without touching the filesystem.
+/// in `/Applications` or the user's `~/Applications`, for a Homebrew
+/// `muxad` serving that app; else whatever `PATH` holds. A path the operator
+/// configured is used as written. `home` and `usable` are injected so the
+/// order is testable without touching the filesystem.
 fn resolve_apple_helper(
     configured: &str,
     current_exe: Option<&Path>,
-    exists: impl Fn(&Path) -> bool,
+    home: Option<&Path>,
+    usable: impl Fn(&Path) -> bool,
 ) -> PathBuf {
     if configured != APPLE_HELPER {
         return PathBuf::from(configured);
@@ -2019,11 +2023,53 @@ fn resolve_apple_helper(
     let beside = current_exe
         .and_then(Path::parent)
         .map(|directory| directory.join(APPLE_HELPER));
+    let in_user_apps = home.map(|home| home.join(APPLE_HELPER_IN_USER_APPS));
     beside
         .into_iter()
         .chain([PathBuf::from(APPLE_HELPER_IN_APP)])
-        .find(|candidate| exists(candidate))
+        .chain(in_user_apps)
+        .find(|candidate| usable(candidate))
         .unwrap_or_else(|| PathBuf::from(APPLE_HELPER))
+}
+
+/// Where `run_apple` would find the helper on this host, when it would find
+/// one at all — what `muxa work init` asks before offering the engine.
+pub fn find_apple_helper(configured: Option<&str>) -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok();
+    let resolved = resolve_apple_helper(
+        configured.unwrap_or(APPLE_HELPER),
+        current_exe.as_deref(),
+        dirs::home_dir().as_deref(),
+        is_executable_file,
+    );
+    if resolved.components().count() > 1 {
+        is_executable_file(&resolved).then_some(resolved)
+    } else {
+        which_on_path(&resolved)
+    }
+}
+
+/// A regular file this process may execute. A copy that exists but cannot
+/// run should not shadow a working one further down the search.
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+fn which_on_path(name: &Path) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|directory| directory.join(name))
+            .find(|candidate| is_executable_file(candidate))
+    })
 }
 
 /// The request `muxa-afm` reads on stdin. The prompt travels here rather
@@ -2064,7 +2110,8 @@ async fn run_apple(turn: &Turn<'_>) -> Result<AskAnswer, String> {
     let helper = resolve_apple_helper(
         turn.executable.unwrap_or(APPLE_HELPER),
         current_exe.as_deref(),
-        Path::is_file,
+        dirs::home_dir().as_deref(),
+        is_executable_file,
     );
     let mut child = tokio::process::Command::new(&helper)
         .current_dir(turn.cwd)
@@ -4186,33 +4233,41 @@ mod tests {
     fn the_apple_helper_is_found_beside_muxad_then_in_the_app_then_on_path() {
         let bundled = Path::new("/Applications/Muxa.app/Contents/Helpers/muxad");
         let homebrew = Path::new("/opt/homebrew/bin/muxad");
+        let home = Some(Path::new("/Users/op"));
         let everything = |_: &Path| true;
         let nothing = |_: &Path| false;
 
         // The bundled daemon: its sibling.
         assert_eq!(
-            resolve_apple_helper("muxa-afm", Some(bundled), everything),
+            resolve_apple_helper("muxa-afm", Some(bundled), home, everything),
             Path::new("/Applications/Muxa.app/Contents/Helpers/muxa-afm")
         );
         // A Homebrew daemon has no sibling, so the installed app's copy.
         assert_eq!(
-            resolve_apple_helper("muxa-afm", Some(homebrew), |candidate| {
+            resolve_apple_helper("muxa-afm", Some(homebrew), home, |candidate| {
                 candidate == Path::new(APPLE_HELPER_IN_APP)
             }),
             Path::new(APPLE_HELPER_IN_APP)
         );
+        // An app installed for one user, in ~/Applications.
+        let per_user = Path::new("/Users/op/Applications/Muxa.app/Contents/Helpers/muxa-afm");
+        assert_eq!(
+            resolve_apple_helper("muxa-afm", Some(homebrew), home, |candidate| candidate
+                == per_user),
+            per_user
+        );
         // Neither: leave it to PATH, where a developer may have put one.
         assert_eq!(
-            resolve_apple_helper("muxa-afm", Some(homebrew), nothing),
+            resolve_apple_helper("muxa-afm", Some(homebrew), home, nothing),
             Path::new("muxa-afm")
         );
         assert_eq!(
-            resolve_apple_helper("muxa-afm", None, nothing),
+            resolve_apple_helper("muxa-afm", None, None, nothing),
             Path::new("muxa-afm")
         );
         // What the operator configured is used as written, found or not.
         assert_eq!(
-            resolve_apple_helper("/custom/muxa-afm", Some(bundled), nothing),
+            resolve_apple_helper("/custom/muxa-afm", Some(bundled), home, nothing),
             Path::new("/custom/muxa-afm")
         );
     }

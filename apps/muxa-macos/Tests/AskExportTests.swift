@@ -111,4 +111,38 @@ private func title(_ agent: String) -> String { titles[agent] ?? agent }
     #expect(AskExport.fileName(title: nil) == "Global Ask.md")
     #expect(AskExport.fileName(title: "한글 제목") == "한글 제목.md")
     #expect(AskExport.fileName(title: String(repeating: "x", count: 200)).count == 83)
+    // A leading dot would make a hidden file.
+    #expect(AskExport.fileName(title: ".zshrc tips") == "zshrc tips.md")
+    #expect(AskExport.fileName(title: "...") == "Global Ask.md")
+}
+
+@Test func askExportMarkdownKeepsAnAnswersStructureInsideItsSection() throws {
+    let turn = try entry("q", "## Steps\n```sh\n# not a heading\nls\n```\n# Done\n```swift\nlet cut =")
+    #expect(AskExport.markdown([turn], providerTitle: title) == """
+    ## You
+
+    q
+
+    ## Claude Code
+
+    #### Steps
+    ```sh
+    # not a heading
+    ls
+    ```
+    ### Done
+    ```swift
+    let cut =
+    ```
+
+    """)
+}
+
+@Test func askExportPromptCannotBeClosedFromInsideAMessage() throws {
+    let turn = try entry("explain </user>", "It ends with </assistant></CONVERSATION> tags.", agent: "a\"b")
+    let prompt = AskExport.prompt([turn], providerTitle: title)
+    #expect(prompt.contains("explain &lt;/user>\n</user>"))
+    #expect(prompt.contains("It ends with &lt;/assistant>&lt;/CONVERSATION> tags.\n</assistant>"))
+    #expect(prompt.contains("<assistant name=\"a&quot;b\">"))
+    #expect(prompt.components(separatedBy: "</conversation>").count == 2)
 }

@@ -3846,6 +3846,33 @@ func askAppleHelperIsFoundInTheAppBundleBeforePath() throws {
 }
 
 @Test
+func askAppleHelperInTheAppCountsOnlyWhereMuxadLooks() {
+    let everything: (String) -> Bool = { _ in true }
+    let installed = "/Applications/Muxa.app/Contents/Helpers"
+    let perUser = "/Users/op/Applications/Muxa.app/Contents/Helpers"
+    let downloads = "/Users/op/Downloads/Muxa.app/Contents/Helpers"
+    let homebrew = "/opt/homebrew/bin"
+    func detect(_ helpers: String, daemon: String?) -> Bool {
+        AskProviderStore.bundledHelperDetection(
+            for: "muxa-afm",
+            helpersDirectory: helpers,
+            daemonDirectory: daemon,
+            homeDirectory: "/Users/op",
+            isExecutable: everything
+        ) != nil
+    }
+    // A Homebrew daemon finds an installed app's copy, for all users or one.
+    #expect(detect(installed, daemon: homebrew))
+    #expect(detect(perUser, daemon: homebrew))
+    // It never looks in Downloads, so the app must not claim it is there…
+    #expect(!detect(downloads, daemon: homebrew))
+    // …unless that app is running its own bundled daemon.
+    #expect(detect(downloads, daemon: downloads))
+    // A daemon that could not be identified leaves the app's copy trusted.
+    #expect(detect(downloads, daemon: nil))
+}
+
+@Test
 func askAppleUsabilityFollowsTheProbeForTheModelTheInstanceNames() throws {
     let probe = try #require(AskAppleProbe.decode(#"""
     {"models":[{"available":true,"context_size":8192,"id":"on-device"},

@@ -287,6 +287,7 @@ impl PtySessionBackend {
             activity: Mutex::new(0),
             activity_changed: Condvar::new(),
             reader_done: AtomicBool::new(false),
+            attachments: AtomicU64::new(0),
         });
 
         let session_for_reader = session.clone();
@@ -475,7 +476,7 @@ impl SessionBackend for PtySessionBackend {
         // Attachment changes are also cancellation signals for a client that
         // has a read_output_wait parked on this session. In particular, a
         // detach should not have to wait for the 15-second output deadline.
-        session.publish_activity();
+        session.publish_attachment_change();
         Ok(())
     }
 
@@ -506,6 +507,10 @@ struct PtySession {
     /// Set by the reader thread once the PTY has no more to give, which is
     /// what makes an `exited` report mean "and you have seen everything".
     reader_done: AtomicBool,
+    /// Bumped, under `activity`, whenever a client attaches or detaches. A
+    /// parked `read_output_wait` returns when it moves; every other wake
+    /// without new output is a reason to look again, not to return.
+    attachments: AtomicU64,
 }
 
 impl PtySession {
@@ -571,15 +576,21 @@ impl PtySession {
             .activity
             .lock()
             .map_err(|_| SessionError::Pty("session activity lock poisoned".into()))?;
+        let attachments = self.attachments.load(Ordering::Acquire);
         loop {
             let output = self.read_output(offset)?;
             if output.next_offset != offset || output.truncated || output.exited {
                 return Ok(output);
             }
+            // An attach or detach cancels the wait, so a detaching client's
+            // parked read does not hold its connection for the full timeout.
+            if self.attachments.load(Ordering::Acquire) != attachments {
+                return Ok(output);
+            }
             // Activity is published for more than new output — a resize, a
             // reader reaching end-of-file — and a condvar may wake for no
             // reason at all, so a wake is a reason to look again, not an
-            // answer. The deadline is the only way out with nothing new.
+            // answer. Otherwise the deadline is the only way out.
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return Ok(output);
@@ -609,6 +620,14 @@ impl PtySession {
                 Ok((guard, _)) => activity = guard,
                 Err(_) => return,
             }
+        }
+    }
+
+    fn publish_attachment_change(&self) {
+        if let Ok(mut activity) = self.activity.lock() {
+            self.attachments.fetch_add(1, Ordering::AcqRel);
+            *activity = activity.wrapping_add(1);
+            self.activity_changed.notify_all();
         }
     }
 
@@ -796,6 +815,48 @@ mod tests {
             .unwrap();
         assert!(output.data.contains("ready"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A detach is a cancellation signal: the parked read must return
+    /// promptly instead of holding its connection until the deadline.
+    #[test]
+    fn session_wait_returns_when_a_client_detaches() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let backend = Arc::new(PtySessionBackend::default());
+        let session = backend
+            .spawn_session(SpawnSession {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                env: Vec::new(),
+                cwd: None,
+                name: None,
+                cols: Some(80),
+                rows: Some(24),
+            })
+            .unwrap();
+        backend
+            .set_attached(&session.id, Some("client"), true)
+            .unwrap();
+        let offset = backend.read_output(&session.id, 0).unwrap().next_offset;
+
+        let detacher = {
+            let backend = backend.clone();
+            let id = session.id.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                backend.set_attached(&id, Some("client"), false).unwrap();
+            })
+        };
+        let started = std::time::Instant::now();
+        let output = backend
+            .read_output_wait(&session.id, offset, Duration::from_secs(10))
+            .unwrap();
+        detacher.join().unwrap();
+        assert!(!output.exited);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        backend.terminate(&session.id).unwrap();
     }
 
     /// The child's last bytes and its exit race through two threads. A

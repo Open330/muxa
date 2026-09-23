@@ -29,10 +29,11 @@ The native workspace follows two proven desktop navigation patterns:
 
 - VS Code's Activity Bar switches one contextual sidebar at a time while the
   editor area remains stable. Muxa applies that to **Work**, **Explore**,
-  **Inbox**, and **Shells**, with a filter scoped to the active context.
-  Explore owns topology and host registration, while Inbox owns the operator's
-  sent commands, durable replies, global Ask, and agents that require operator
-  attention. Explore already uses hosts as its
+  **Inbox**, **Ask**, and **Shells**, with a filter scoped to the active
+  context. Explore owns topology and host registration; Inbox owns the
+  operator's sent commands, durable replies, and agents that require operator
+  attention; Ask owns Global Ask conversations, which are questions to a
+  provider rather than requests from an agent. Explore already uses hosts as its
   roots, so it does not duplicate them in a separate Hosts activity.
 - Lens separates resource navigation from contextual details and supports
   drilling into a resource without flattening infrastructure identity. Muxa
@@ -59,9 +60,12 @@ The detail area is deliberately task-oriented:
   indistinguishable pane rows.
 - **Inbox** is an operator queue rather than another agent list. It reads the
   console's sent mailbox once per reachable host, deduplicates requests,
-  and exposes waiting, replied, and unread states together with Global Ask
-  history. Opening a command returns to its exact agent pane; reading a reply
-  uses the durable collaboration get operation.
+  and exposes waiting, replied, and unread states. Opening a command returns
+  to its exact agent pane; reading a reply uses the durable collaboration get
+  operation.
+- **Ask** lists the selected provider's Global Ask conversations, newest
+  activity first; picking one opens it in the editor, where each exchange and
+  the whole conversation can be copied or saved as Markdown or as a prompt.
 - **Shell** is the interactive native Ghostty surface owned by a muxad PTY.
   It also has a read-only **Raw** mode for the bounded PTY output stream.
 
@@ -165,9 +169,11 @@ for the Inbox and Ask conversations. The user-facing vocabulary is **Hosts**;
 Selecting a new item opens it as a replaceable preview tab. Pinning preserves
 the tab while another Work, Agent, Host, or Shell is inspected. `Command-Shift-P`
 opens the workspace command palette, and each sidebar context supports text and
-status filters (`All`, `Attention`, `Active`). The Inbox activity badge keeps
-agent attention, waiting commands, unread replies, and running Ask counts
-visible even when another context is selected. Editor tab
+status filters (`All`, `Attention`, `Active`); in Ask, Active is a
+conversation still being answered and Attention one whose last turn failed.
+The Inbox activity badge keeps agent attention, waiting commands, and unread
+replies visible even when another context is selected, and the Ask badge
+counts questions still being answered. Editor tab
 close controls and all Explorer disclosure/row targets use full-size hit areas
 rather than relying on the visible glyph alone.
 
@@ -307,8 +313,10 @@ which release a user is running.
 
 ## Headless providers and API keys
 
-Global Ask uses the installed `claude` and `codex` CLIs in their structured
-non-interactive modes. The app augments a GUI-launched muxad PATH with
+Global Ask uses the installed `claude`, `codex`, and `gemini` CLIs in their
+structured non-interactive modes, the Anthropic and OpenAI APIs with a key, or
+Apple Intelligence through the bundled `muxa-afm` helper on macOS 26 or later
+(see [Configuration](CONFIGURATION.md)). The app augments a GUI-launched muxad PATH with
 `~/.local/bin`, `~/.cargo/bin`, and Homebrew locations, while preserving
 normal Claude Code/Codex CLI sign-in.
 
