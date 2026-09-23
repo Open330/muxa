@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Detaching a pane ends its parked read at once again.** 0.8.49 made a
+  session wait look again after any wake without new output, which also
+  swallowed the wake an attach or detach sends — so a detaching client's read
+  held its connection for the full 15-second deadline. An attachment change
+  now ends the wait, as it did before.
+- **Apple Intelligence leaves out answers it gave without its tools by
+  what it was given, not by what it said.** The on-device model keeps no
+  session, so muxad replays the conversation on every turn — and a small
+  model replayed its own earlier "I cannot access other applications",
+  true before 0.8.48 gave it the workspace tools, sooner than call them.
+  0.8.50 recognised that answer by its English wording, which missed other
+  phrasings and other languages. muxad now records on each Ask entry
+  whether the turn had the workspace tools (`workspace_tools`), and a turn
+  that has them replays only turns that had them too; the helper's wording
+  filter is gone. Entries written before this version carry no such
+  record, so an Apple Intelligence conversation from 0.8.48–0.8.50 starts
+  its replay afresh once.
+- **The Apple Intelligence helper is found in `~/Applications` too, and the
+  app no longer promises a helper muxad cannot find.** A Homebrew muxad now
+  looks in `~/Applications/Muxa.app` after `/Applications/Muxa.app`, and
+  skips a copy it cannot execute. Settings › Providers now finds the helper
+  the way the running muxad does — beside the daemon, then in an installed
+  app — and probes that copy, so an app opened from Downloads beside a
+  Homebrew muxad no longer reads "Runs on this Mac" while every turn fails. `muxa work init` now offers the `apple` engine
+  when the helper is inside an installed app rather than only on `PATH`.
+- **Global Ask exports keep their shape.** An answer's own headings move
+  under the export's `##` sections, a code fence left open by a cut-off
+  answer is closed — in Markdown and in *Copy as Prompt*, where the
+  wrapper's tags would otherwise read as code — and *Copy as Prompt*
+  escapes a closing `</assistant>`, `</user>` or `</conversation>` inside a
+  message and quotes in the provider name. Saving to a file whose title starts with a dot no
+  longer makes a hidden file, and a failed save shows as a warning instead
+  of beside a checkmark.
+- **The Ask sidebar's status filter filters.** Active lists conversations
+  still being answered and Attention those whose last turn failed; before,
+  both showed every conversation.
+- Settings › Providers says that `private-cloud` does not work yet, as the
+  configuration guide does, and `docs/MACOS.md` describes the Ask container
+  instead of Ask inside the Inbox.
+
 ## [0.8.50] - 2026-09-20
 
 ### Fixed

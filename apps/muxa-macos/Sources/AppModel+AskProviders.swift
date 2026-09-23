@@ -133,6 +133,9 @@ final class AskProviderStore: ObservableObject {
     @Published private(set) var appleProbe: AskAppleProbe?
     private var detectionTask: Task<Void, Never>?
     private var appleProbeHelper: String?
+    /// Directory of the muxad serving the socket, once looked up; nil when
+    /// that could not be told, and the app's own helper is then trusted.
+    @Published private(set) var daemonDirectory: String?
 
     init() {}
 
@@ -163,6 +166,8 @@ final class AskProviderStore: ObservableObject {
             adopt([], selected: model.askAgent)
         }
         refreshKeyPresence()
+        let owner = try? await DaemonSocketOwner.find(socketPath: model.client.socketPath)
+        daemonDirectory = owner.map { ($0.executablePath as NSString).deletingLastPathComponent }
         await detectInstalledTools()
         await probeAppleModels()
     }
@@ -291,6 +296,7 @@ final class AskProviderStore: ObservableObject {
            let bundled = Self.bundledHelperDetection(
                for: executable,
                helpersDirectory: Self.bundledHelpersDirectory,
+               daemonDirectory: daemonDirectory,
                isExecutable: isExecutable
            ) {
             return bundled
@@ -506,15 +512,36 @@ final class AskProviderStore: ObservableObject {
     /// anyone's PATH: it ships in this app's `Contents/Helpers`, the same
     /// place the bundled muxad looks. Nil for any other name, and when the
     /// helper is missing — a development build — so PATH still gets a say.
+    ///
+    /// When the serving muxad is known, this is the copy it will run, found
+    /// in its own order: beside the daemon (the bundled muxad), then in a
+    /// `Muxa.app` installed in `/Applications` or `~/Applications` (a
+    /// Homebrew muxad). An app run from anywhere else next to a Homebrew
+    /// daemon would otherwise say the provider is ready while every turn
+    /// fails with "helper not found" — and the probe asks the copy that
+    /// will answer. When the daemon is unknown, the app's own copy stands.
     nonisolated static func bundledHelperDetection(
         for executable: String,
         helpersDirectory: String,
+        daemonDirectory: String? = nil,
+        homeDirectory: String = NSHomeDirectory(),
         isExecutable: (String) -> Bool
     ) -> AskProviderDetection? {
         guard executable == AskProviderEngine.appleHelperName else { return nil }
-        let path = (helpersDirectory as NSString).appendingPathComponent(executable)
-        guard isExecutable(path) else { return nil }
-        return .installed(InstalledTool(name: executable, path: path, version: nil))
+        let own = (helpersDirectory as NSString).appendingPathComponent(executable)
+        guard let daemonDirectory else {
+            return isExecutable(own) ? .installed(InstalledTool(name: executable, path: own, version: nil)) : nil
+        }
+        // muxad's own order: beside itself, then an installed app for all
+        // users, then for this one. PATH is the caller's fallback.
+        let found = [
+            daemonDirectory,
+            "/Applications/Muxa.app/Contents/Helpers",
+            (homeDirectory as NSString).appendingPathComponent("Applications/Muxa.app/Contents/Helpers"),
+        ]
+        .map { (($0 as NSString).appendingPathComponent(executable) as NSString).standardizingPath }
+        .first(where: isExecutable)
+        return found.map { .installed(InstalledTool(name: executable, path: $0, version: nil)) }
     }
 
     /// Whether an installed `apple` instance can answer: the probe's verdict

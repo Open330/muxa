@@ -264,7 +264,8 @@ process, a command-line helper does not have it. The option stays so a
 future build can pick it up; a turn on it says why it cannot answer. The
 framework is Swift-only, so muxad reaches it through `muxa-afm`, a small
 helper that ships in `Muxa.app/Contents/Helpers`. muxad looks for it beside
-its own executable, then in `/Applications/Muxa.app`, then on `PATH`;
+its own executable, then in `/Applications/Muxa.app`, then in
+`~/Applications/Muxa.app`, then on `PATH`;
 `executable` names another copy. Like the APIs it keeps no session, so the
 conversation is replayed — cut to 6k characters to fit the on-device
 window, and cut further by the helper if the model still reports an
@@ -331,7 +332,7 @@ muxa ask provider remove anthropic-work               # a built-in id only loses
 ```
 
 `add` refuses an id that already exists, an id that is not a TOML bare key,
-an engine that is not one of the five, and a built-in id asked to run
+an engine that is not one of the six, and a built-in id asked to run
 someone else's engine. The engine is fixed once added — `set` changes the
 title, model, key variable, and binary, and to change the engine you remove
 the provider and add it again, because a live conversation cannot resume a

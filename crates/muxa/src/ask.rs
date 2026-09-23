@@ -31,7 +31,7 @@
 //! engine, with its own title, model, key variable, and binary. Two
 //! instances can share an engine — a work and a personal `OpenAI` account,
 //! two Anthropic keys, a second `claude` binary — and each keeps its own
-//! conversation. The five engine ids are also instances of themselves, so
+//! conversation. The six engine ids are also instances of themselves, so
 //! a fresh install works with no `[ask.providers]` at all and an existing
 //! `[ask.providers.anthropic] model = "…"` keeps overriding the built-in.
 //!
@@ -74,6 +74,8 @@ const APPLE_HELPER: &str = "muxa-afm";
 /// Where the helper is when this `muxad` is not the bundled one — a
 /// Homebrew daemon serving an installed app.
 const APPLE_HELPER_IN_APP: &str = "/Applications/Muxa.app/Contents/Helpers/muxa-afm";
+/// The same app installed for one user, relative to their home.
+const APPLE_HELPER_IN_USER_APPS: &str = "Applications/Muxa.app/Contents/Helpers/muxa-afm";
 
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -211,6 +213,11 @@ pub struct AskEntry {
     pub cost_usd: Option<f64>,
     #[serde(default)]
     pub error: Option<String>,
+    /// The turn was handed muxad's read-only workspace tools — the `apple`
+    /// engine on a Global Ask turn. An entry written before the tools
+    /// existed has none, and deserializes as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub workspace_tools: bool,
 }
 
 /// A resumable Global Ask conversation. Provider session ids remain an
@@ -748,6 +755,7 @@ impl AskStore {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn ask_with_credential_mode(
         self: &Arc<Self>,
         prompt: &str,
@@ -785,11 +793,13 @@ impl AskStore {
         // API providers and the apple helper remember nothing between
         // calls; the store is their thread. Read it before the new entry
         // joins so the prompt being asked is not replayed as history.
-        let history = if provider.engine.replays_history() {
-            replay_history(&self.entries.read().await, &conversation_id)
-        } else {
-            Vec::new()
-        };
+        let workspace_tools = provider.engine == AskEngine::Apple && self.opts.socket.is_some();
+        let history = turn_history(
+            &self.entries.read().await,
+            &conversation_id,
+            provider.engine,
+            workspace_tools,
+        );
         let engine = provider.engine;
         let now = OffsetDateTime::now_utc();
         let entry = AskEntry {
@@ -805,6 +815,7 @@ impl AskStore {
             answered_at: None,
             cost_usd: None,
             error: None,
+            workspace_tools,
         };
 
         {
@@ -2005,13 +2016,15 @@ impl AskEngine {
 
 /// The helper a bare `muxa-afm` means: beside this executable, which is
 /// where the bundled `muxad` finds it; else inside an installed `Muxa.app`,
-/// for a Homebrew `muxad` serving that app; else whatever `PATH` holds. A
-/// path the operator configured is used as written. `exists` is injected so
-/// the order is testable without touching the filesystem.
+/// in `/Applications` or the user's `~/Applications`, for a Homebrew
+/// `muxad` serving that app; else whatever `PATH` holds. A path the operator
+/// configured is used as written. `home` and `usable` are injected so the
+/// order is testable without touching the filesystem.
 fn resolve_apple_helper(
     configured: &str,
     current_exe: Option<&Path>,
-    exists: impl Fn(&Path) -> bool,
+    home: Option<&Path>,
+    usable: impl Fn(&Path) -> bool,
 ) -> PathBuf {
     if configured != APPLE_HELPER {
         return PathBuf::from(configured);
@@ -2019,11 +2032,53 @@ fn resolve_apple_helper(
     let beside = current_exe
         .and_then(Path::parent)
         .map(|directory| directory.join(APPLE_HELPER));
+    let in_user_apps = home.map(|home| home.join(APPLE_HELPER_IN_USER_APPS));
     beside
         .into_iter()
         .chain([PathBuf::from(APPLE_HELPER_IN_APP)])
-        .find(|candidate| exists(candidate))
+        .chain(in_user_apps)
+        .find(|candidate| usable(candidate))
         .unwrap_or_else(|| PathBuf::from(APPLE_HELPER))
+}
+
+/// Where `run_apple` would find the helper on this host, when it would find
+/// one at all — what `muxa work init` asks before offering the engine.
+pub fn find_apple_helper(configured: Option<&str>) -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok();
+    let resolved = resolve_apple_helper(
+        configured.unwrap_or(APPLE_HELPER),
+        current_exe.as_deref(),
+        dirs::home_dir().as_deref(),
+        is_executable_file,
+    );
+    if resolved.components().count() > 1 {
+        is_executable_file(&resolved).then_some(resolved)
+    } else {
+        which_on_path(&resolved)
+    }
+}
+
+/// A regular file this process may execute. A copy that exists but cannot
+/// run should not shadow a working one further down the search.
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+fn which_on_path(name: &Path) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|directory| directory.join(name))
+            .find(|candidate| is_executable_file(candidate))
+    })
 }
 
 /// The request `muxa-afm` reads on stdin. The prompt travels here rather
@@ -2064,7 +2119,8 @@ async fn run_apple(turn: &Turn<'_>) -> Result<AskAnswer, String> {
     let helper = resolve_apple_helper(
         turn.executable.unwrap_or(APPLE_HELPER),
         current_exe.as_deref(),
-        Path::is_file,
+        dirs::home_dir().as_deref(),
+        is_executable_file,
     );
     let mut child = tokio::process::Command::new(&helper)
         .current_dir(turn.cwd)
@@ -2174,14 +2230,51 @@ pub struct ReplayTurn {
     pub answer: String,
 }
 
+/// What a new turn of `conversation_id` replays: nothing for an engine
+/// that resumes its own session, and for a turn with the workspace tools
+/// only the turns that had them.
+fn turn_history(
+    entries: &[AskEntry],
+    conversation_id: &str,
+    engine: AskEngine,
+    workspace_tools: bool,
+) -> Vec<ReplayTurn> {
+    if !engine.replays_history() {
+        Vec::new()
+    } else if workspace_tools {
+        replay_history_with_tools(entries, conversation_id)
+    } else {
+        replay_history(entries, conversation_id)
+    }
+}
+
 /// The answered turns of `conversation_id`, oldest first, ready to replay.
 #[must_use]
 pub fn replay_history(entries: &[AskEntry], conversation_id: &str) -> Vec<ReplayTurn> {
+    answered_turns(entries, conversation_id, |_| true)
+}
+
+/// The same, for a turn that can read the workspace: only the turns that
+/// could read it too. A small model replayed its own earlier "I cannot see
+/// other applications" — true when it was said — sooner than call the tools
+/// it has since been given, so an answer given without the tools is left
+/// out rather than guessed at from its wording.
+#[must_use]
+pub fn replay_history_with_tools(entries: &[AskEntry], conversation_id: &str) -> Vec<ReplayTurn> {
+    answered_turns(entries, conversation_id, |entry| entry.workspace_tools)
+}
+
+fn answered_turns(
+    entries: &[AskEntry],
+    conversation_id: &str,
+    keep: impl Fn(&AskEntry) -> bool,
+) -> Vec<ReplayTurn> {
     entries
         .iter()
         .filter(|entry| {
             entry.conversation_id.as_deref() == Some(conversation_id)
                 && entry.status == AskStatus::Answered
+                && keep(entry)
         })
         .map(|entry| ReplayTurn {
             prompt: entry.prompt.clone(),
@@ -3059,6 +3152,7 @@ mod tests {
             answered_at: Some(now),
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         };
         let entries = vec![
             entry("1", "c1", AskStatus::Answered),
@@ -3080,6 +3174,52 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A turn with the workspace tools replays only turns that had them:
+    /// an earlier "I cannot see other applications" is left out by what the
+    /// turn was given, not by how the answer was worded.
+    #[test]
+    fn a_turn_with_workspace_tools_replays_only_turns_that_had_them() {
+        let now = OffsetDateTime::now_utc();
+        let entry = |id: &str, tools: bool| AskEntry {
+            id: id.into(),
+            conversation_id: Some("c1".into()),
+            prompt: format!("prompt {id}"),
+            answer: format!("answer {id}"),
+            status: AskStatus::Answered,
+            agent: "apple".into(),
+            agent_session_id: None,
+            cwd: "/tmp".into(),
+            asked_at: now,
+            answered_at: Some(now),
+            cost_usd: None,
+            error: None,
+            workspace_tools: tools,
+        };
+        let entries = vec![entry("before", false), entry("after", true)];
+        let prompts =
+            |turns: Vec<ReplayTurn>| turns.into_iter().map(|t| t.prompt).collect::<Vec<_>>();
+        assert_eq!(
+            prompts(replay_history_with_tools(&entries, "c1")),
+            ["prompt after"]
+        );
+        // Without tools nothing is left out: every answer is as true now.
+        assert_eq!(
+            prompts(replay_history(&entries, "c1")),
+            ["prompt before", "prompt after"]
+        );
+
+        // The flag is written only when set, and an entry stored before it
+        // existed reads as a turn without tools.
+        let stored = serde_json::to_value(&entries[0]).unwrap();
+        assert!(stored.get("workspace_tools").is_none());
+        assert_eq!(
+            serde_json::to_value(&entries[1]).unwrap()["workspace_tools"],
+            true
+        );
+        let legacy: AskEntry = serde_json::from_value(stored).unwrap();
+        assert!(!legacy.workspace_tools);
     }
 
     #[test]
@@ -3395,6 +3535,7 @@ mod tests {
             answered_at: None,
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         });
 
         let second = store
@@ -3462,6 +3603,7 @@ mod tests {
                 answered_at: Some(now),
                 cost_usd: None,
                 error: None,
+                workspace_tools: false,
             }],
             ..AskSnapshot::default()
         };
@@ -3542,6 +3684,7 @@ mod tests {
             answered_at: (status != AskStatus::Running).then_some(now),
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         };
         *store.entries.write().await = vec![
             entry("answered", AskStatus::Answered),
@@ -3577,6 +3720,7 @@ mod tests {
                 answered_at: Some(now),
                 cost_usd: None,
                 error: None,
+                workspace_tools: false,
             },
             AskEntry {
                 id: "running".into(),
@@ -3591,6 +3735,7 @@ mod tests {
                 answered_at: None,
                 cost_usd: None,
                 error: None,
+                workspace_tools: false,
             },
         ];
 
@@ -4186,33 +4331,41 @@ mod tests {
     fn the_apple_helper_is_found_beside_muxad_then_in_the_app_then_on_path() {
         let bundled = Path::new("/Applications/Muxa.app/Contents/Helpers/muxad");
         let homebrew = Path::new("/opt/homebrew/bin/muxad");
+        let home = Some(Path::new("/Users/op"));
         let everything = |_: &Path| true;
         let nothing = |_: &Path| false;
 
         // The bundled daemon: its sibling.
         assert_eq!(
-            resolve_apple_helper("muxa-afm", Some(bundled), everything),
+            resolve_apple_helper("muxa-afm", Some(bundled), home, everything),
             Path::new("/Applications/Muxa.app/Contents/Helpers/muxa-afm")
         );
         // A Homebrew daemon has no sibling, so the installed app's copy.
         assert_eq!(
-            resolve_apple_helper("muxa-afm", Some(homebrew), |candidate| {
+            resolve_apple_helper("muxa-afm", Some(homebrew), home, |candidate| {
                 candidate == Path::new(APPLE_HELPER_IN_APP)
             }),
             Path::new(APPLE_HELPER_IN_APP)
         );
+        // An app installed for one user, in ~/Applications.
+        let per_user = Path::new("/Users/op/Applications/Muxa.app/Contents/Helpers/muxa-afm");
+        assert_eq!(
+            resolve_apple_helper("muxa-afm", Some(homebrew), home, |candidate| candidate
+                == per_user),
+            per_user
+        );
         // Neither: leave it to PATH, where a developer may have put one.
         assert_eq!(
-            resolve_apple_helper("muxa-afm", Some(homebrew), nothing),
+            resolve_apple_helper("muxa-afm", Some(homebrew), home, nothing),
             Path::new("muxa-afm")
         );
         assert_eq!(
-            resolve_apple_helper("muxa-afm", None, nothing),
+            resolve_apple_helper("muxa-afm", None, None, nothing),
             Path::new("muxa-afm")
         );
         // What the operator configured is used as written, found or not.
         assert_eq!(
-            resolve_apple_helper("/custom/muxa-afm", Some(bundled), nothing),
+            resolve_apple_helper("/custom/muxa-afm", Some(bundled), home, nothing),
             Path::new("/custom/muxa-afm")
         );
     }

@@ -21119,6 +21119,7 @@ mod tests {
             answered_at: None,
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         };
         app.ask_conversations = vec![
             conversation("newer", "Newer work"),
@@ -21274,6 +21275,7 @@ mod tests {
             answered_at: Some(OffsetDateTime::now_utc()),
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         };
         app.ask_entries = vec![mk("claude", "a"), mk("codex", "b"), mk("claude", "c")];
 
@@ -21309,6 +21311,7 @@ mod tests {
             answered_at: Some(now),
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         }];
         app.ask_panel.open = true;
         app
@@ -21476,6 +21479,7 @@ mod tests {
             answered_at: (status != muxa::ask::AskStatus::Running).then_some(now),
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         };
         app.ask_entries = vec![
             entry("done", muxa::ask::AskStatus::Answered),

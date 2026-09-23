@@ -1171,6 +1171,7 @@ struct MuxaAskView: View {
     @State private var agent = "claude"
     /// "Copied" or "Saved …", shown in the header for a moment after an export.
     @State private var exportNotice: String?
+    @State private var exportFailed = false
 
     private var activeConversation: MuxaAskConversation? {
         model.askConversations.first { $0.id == model.activeAskConversationID }
@@ -1211,10 +1212,10 @@ struct MuxaAskView: View {
                     Label {
                         Text(verbatim: exportNotice)
                     } icon: {
-                        Image(systemName: "checkmark.circle.fill")
+                        Image(systemName: exportFailed ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
                     }
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(exportFailed ? Color.orange : Color.secondary)
                     .lineLimit(1)
                 } else {
                     Text("Conversations resume where the provider left off")
@@ -1456,14 +1457,16 @@ struct MuxaAskView: View {
                 flash(String(localized: "Saved \(url.lastPathComponent)"))
             }
         } catch {
-            flash(error.localizedDescription)
+            flash(error.localizedDescription, failed: true)
         }
     }
 
-    private func flash(_ notice: String) {
+    private func flash(_ notice: String, failed: Bool = false) {
         exportNotice = notice
+        exportFailed = failed
         Task {
-            try? await Task.sleep(for: .seconds(2))
+            // A failure stays long enough to be read.
+            try? await Task.sleep(for: .seconds(failed ? 6 : 2))
             if exportNotice == notice { exportNotice = nil }
         }
     }

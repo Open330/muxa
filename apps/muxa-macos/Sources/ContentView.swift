@@ -982,8 +982,21 @@ private struct MuxaSidebar: View {
             .sorted { $0.updatedAt > $1.updatedAt }
     }
 
+    /// Status scopes read the conversation's newest turn: Active while it is
+    /// still being answered, Attention when it failed.
     private var filteredAskConversations: [MuxaAskConversation] {
-        askConversations.filter { matchesFilter([$0.title]) }
+        let latest = Dictionary(
+            model.askEntries.compactMap { entry in entry.conversationID.map { ($0, entry) } },
+            uniquingKeysWith: { first, second in first.askedAt >= second.askedAt ? first : second }
+        )
+        return askConversations.filter { conversation in
+            let newest = latest[conversation.id]
+            return matchesFilter([conversation.title])
+                && matchesScope(
+                    attention: newest?.status == "failed",
+                    active: newest?.status == "running"
+                )
+        }
     }
 
     private var sidebarCountLabel: String {
