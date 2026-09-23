@@ -2814,7 +2814,7 @@ async fn await_collaboration_reply(
     Ok(request.status.is_terminal().then_some(request))
 }
 
-fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
+pub(crate) fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
     let pane = muxa::default_backend()
         .current_pane()
         .or_else(current_process_host_pane)
