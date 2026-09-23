@@ -8,71 +8,41 @@ struct ContentView: View {
     @State private var pendingPaletteAction: MuxaPaletteAction?
     @State private var sidebarFocusRequest = UUID()
     @FocusState private var focusedEditorGroup: UUID?
+    @State private var chrome = TitleBarMetrics.fallback
+    @State private var showingShortcuts = false
+    @AppStorage("muxa.sidebar.visible") private var sidebarVisible = true
 
     var body: some View {
         VStack(spacing: 0) {
             HSplitView {
-                MuxaSidebar(
-                    model: model,
-                    openPinnedSession: { id in
-                        model.selectWatchSession(id)
-                        tabs.openPinned(.fleetSession(id))
-                    },
-                    openPinnedPane: { id in
-                        model.selectWatchPane(id)
-                        tabs.openPinned(.pane(id))
-                    },
-                    closeShell: dismissExitedShell,
-                    focusRequest: sidebarFocusRequest
-                )
-                    .frame(minWidth: 260, idealWidth: 300, maxWidth: 380)
+                if sidebarVisible {
+                    MuxaSidebar(
+                        model: model,
+                        chrome: chrome,
+                        openPinnedSession: { id in
+                            model.selectWatchSession(id)
+                            tabs.openPinned(.fleetSession(id))
+                        },
+                        openPinnedPane: { id in
+                            model.selectWatchPane(id)
+                            tabs.openPinned(.pane(id))
+                        },
+                        closeShell: dismissExitedShell,
+                        focusRequest: sidebarFocusRequest
+                    )
+                        // Each split pane is hosted on its own, so each opts out
+                        // of the hidden title bar's inset: its top row is the
+                        // title bar (see WorkbenchWindowChrome.swift).
+                        .ignoresSafeArea(.container, edges: .top)
+                        .frame(minWidth: 260, idealWidth: 300, maxWidth: 380)
+                }
                 editorRegion
                     .frame(minWidth: 560)
             }
-            .toolbar {
-                ToolbarItemGroup {
-                    Button {
-                        model.presentWorkStart()
-                    } label: {
-                        Label("Start Work", systemImage: "play.square.stack")
-                    }
-                    .disabled(!model.isConnected || model.isStartingWork)
-
-                    Button {
-                        model.createShell()
-                    } label: {
-                        Label("New shell", systemImage: "plus")
-                    }
-                    .disabled(!model.isConnected || model.isCreatingSession)
-
-                    Button {
-                        Task { await model.refresh() }
-                    } label: {
-                        Label("Refresh", systemImage: "arrow.clockwise")
-                    }
-                    .disabled(!model.isConnected)
-
-                    Button {
-                        paletteMode = .commands
-                    } label: {
-                        Label("Commands", systemImage: "command")
-                    }
-
-                    Button(role: .destructive) {
-                        model.terminateSelectedSession()
-                    } label: {
-                        Label("Terminate", systemImage: "stop.circle")
-                    }
-                    .disabled(
-                        !model.isConnected
-                            || model.selectedSessionID == nil
-                            || model.isTerminatingSession
-                    )
-                }
-            }
-            Divider()
             WorkbenchStatusBar(model: model)
         }
+        .ignoresSafeArea(.container, edges: .top)
+        .background(TitleBarMetricsReader(metrics: $chrome).allowsHitTesting(false))
         .frame(minWidth: 920, minHeight: 580)
         .alert(
             "Replace the running muxad?",
@@ -99,6 +69,9 @@ struct ContentView: View {
                 },
                 onCancel: { paletteMode = nil }
             )
+        }
+        .sheet(isPresented: $showingShortcuts) {
+            MuxaShortcutsSheet { showingShortcuts = false }
         }
         .sheet(isPresented: $model.isPresentingWorkStart) {
             WorkStartView(model: model, isPresented: $model.isPresentingWorkStart)
@@ -132,14 +105,84 @@ struct ContentView: View {
         .focusedSceneValue(\.muxaEditorCommands, editorCommands)
     }
 
+    /// The window's own actions, at the trailing end of the last editor
+    /// group's tab strip (the title bar row). The rarely used ones sit in a
+    /// "…" menu so the strip stays one quiet row.
+    private var windowActions: some View {
+        HStack(spacing: 1) {
+            Button {
+                paletteMode = .navigation
+            } label: {
+                Label("Go to Anything", systemImage: "magnifyingglass")
+            }
+            .help("Go to Anything (⌘P)")
+
+            Button {
+                model.presentWorkStart()
+            } label: {
+                Label("Start Work", systemImage: "play.square.stack")
+            }
+            .help("Start Work")
+            .disabled(!model.isConnected || model.isStartingWork)
+
+            Button {
+                model.createShell()
+            } label: {
+                Label("New shell", systemImage: "plus")
+            }
+            .help("New shell")
+            .disabled(!model.isConnected || model.isCreatingSession)
+
+            Menu {
+                Button("Commands…") { paletteMode = .commands }
+                Button("Refresh") { Task { await model.refresh() } }
+                    .disabled(!model.isConnected)
+                Divider()
+                Button("Terminate Session", role: .destructive) {
+                    model.terminateSelectedSession()
+                }
+                .disabled(
+                    !model.isConnected
+                        || model.selectedSessionID == nil
+                        || model.isTerminatingSession
+                )
+            } label: {
+                Image(systemName: "ellipsis")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .frame(width: 22, height: 22)
+            .help("More Actions")
+        }
+        .buttonStyle(.muxaIcon)
+    }
+
     @ViewBuilder
     private var editorRegion: some View {
         HSplitView {
             ForEach(tabs.groups) { group in
                 VStack(spacing: 0) {
-                    WorkspaceTabBar(model: model, tabs: tabs, groupID: group.id)
-                    Divider()
+                    WorkspaceTabBar(
+                        model: model,
+                        tabs: tabs,
+                        groupID: group.id,
+                        height: chrome.rowHeight,
+                        accessory: group.id == tabs.groups.last?.id ? AnyView(windowActions) : nil,
+                        // With the side bar hidden the first strip reaches
+                        // the window's leading edge and must clear the
+                        // traffic lights.
+                        leadingInset: !sidebarVisible && group.id == tabs.groups.first?.id
+                            ? chrome.leadingInset : 0
+                    )
+                    // Editors paint backgrounds that ignore the safe area;
+                    // the strip is the title bar and must stay on top of
+                    // them, for drawing and for clicks.
+                    .zIndex(1)
                     detail(for: group.active, groupID: group.id)
+                        // Buttons that don't pick a style of their own get
+                        // the workbench's flat one instead of AppKit's bezel.
+                        .buttonStyle(.muxaSecondary)
                         .frame(
                             maxWidth: .infinity,
                             maxHeight: .infinity,
@@ -152,7 +195,9 @@ struct ContentView: View {
                     maxHeight: .infinity,
                     alignment: .topLeading
                 )
+                .ignoresSafeArea(.container, edges: .top)
                 .focusable()
+                .muxaFocusEffectDisabled()
                 .focused($focusedEditorGroup, equals: group.id)
             }
         }
@@ -252,7 +297,9 @@ struct ContentView: View {
 
     private var editorCommands: MuxaEditorCommandActions {
         MuxaEditorCommandActions(
-            close: {
+            // nil once no tab is open, so ⌘W falls through to closing the
+            // window.
+            close: tabs.focusedSelection == nil ? nil : {
                 model.activateEditor(tabs.closeFocused())
             },
             next: {
@@ -294,8 +341,20 @@ struct ContentView: View {
             openAsk: { openEditor(.ask) },
             openInbox: { openEditor(.inbox) },
             selectSidebar: { model.show($0) },
-            focusSidebar: { sidebarFocusRequest = UUID() },
-            isEnabled: paletteMode == nil && !model.isPresentingWorkStart
+            focusSidebar: {
+                sidebarVisible = true
+                sidebarFocusRequest = UUID()
+            },
+            jumpToAgent: { paletteMode = .agents },
+            nextAttention: jumpToNextAttention,
+            toggleSidebar: { sidebarVisible.toggle() },
+            reopenClosed: {
+                if let selection = tabs.reopenClosed(isAvailable: model.isSelectionAvailable) {
+                    model.activateEditor(selection)
+                }
+            },
+            showShortcuts: { showingShortcuts = true },
+            isEnabled: paletteMode == nil && !showingShortcuts && !model.isPresentingWorkStart
                 && !model.isPresentingHostRegistration && model.pipelineEditorTarget == nil
                 && !model.isConfirmingDaemonReplacement
         )
@@ -306,6 +365,23 @@ struct ContentView: View {
         tabs.openPinned(selection)
         model.select(selection)
         model.activateEditor(selection)
+    }
+
+    /// ⇧⌘J: opens the next pane whose agent is waiting on the operator,
+    /// cycling in topology order from the pane being looked at.
+    private func jumpToNextAttention() {
+        let candidates = model.executionSnapshot.watchHosts
+            .flatMap(\.sessions).flatMap(\.windows).flatMap(\.panes)
+            .filter(MuxaAttention.needsAttention)
+            .map(\.id)
+        let current: MuxaWatchPaneIdentity? = if case .pane(let id) = tabs.focusedSelection { id } else { nil }
+        guard let next = MuxaAttention.next(after: current, in: candidates) else {
+            NSSound.beep()
+            return
+        }
+        model.selectWatchPane(next)
+        tabs.openPinned(.pane(next))
+        model.activateEditor(.pane(next))
     }
 
     private func performPendingPaletteAction() {
@@ -332,7 +408,14 @@ struct ContentView: View {
             case .nextEditor: editorCommands.next?()
             case .splitEditor: editorCommands.splitRight?()
             case .pinEditor: editorCommands.pin?()
-            case .focusSidebar: sidebarFocusRequest = UUID()
+            case .focusSidebar: editorCommands.focusSidebar?()
+            case .jumpToAgent:
+                // Reopen as the agent palette once this one has closed.
+                DispatchQueue.main.async { paletteMode = .agents }
+            case .nextAttention: jumpToNextAttention()
+            case .toggleSidebar: sidebarVisible.toggle()
+            case .reopenEditor: editorCommands.reopenClosed?()
+            case .showShortcuts: showingShortcuts = true
             }
         }
     }
@@ -369,6 +452,11 @@ private struct WorkspaceTabBar: View {
     @ObservedObject var model: AppModel
     @ObservedObject var tabs: MuxaWorkbenchTabs
     let groupID: UUID
+    /// The title bar row's height: the strip is the window's title bar.
+    let height: CGFloat
+    /// The window's actions, carried by the last group's strip only.
+    let accessory: AnyView?
+    var leadingInset: CGFloat = 0
     @Environment(\.openWindow) private var openWindow
 
     private var group: MuxaWorkbenchTabs.Group? {
@@ -377,95 +465,113 @@ private struct WorkspaceTabBar: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 0) {
-                    ForEach(group?.tabs ?? [], id: \.self) { selection in
-                        EditorTab(
-                            selection: selection,
-                            title: tabLabel(for: selection),
-                            systemImage: tabIcon(for: selection),
-                            active: group?.active == selection,
-                            preview: group?.preview == selection,
-                            activate: { activate(selection) },
-                            pin: { tabs.pin(selection, groupID: groupID) },
-                            close: { close(selection) },
-                            closeOthers: {
-                                tabs.closeOthers(keeping: selection, groupID: groupID)
-                                model.activateEditor(selection)
-                            },
-                            splitRight: { splitRight(selection) },
-                            moveToWindow: selection.moduleRoute.map { route in
-                                { openWindow(value: route) }
-                            }
-                        )
-                        .draggable(selection.tabIdentifier)
-                        .dropDestination(for: String.self) { identifiers, _ in
-                            guard let identifier = identifiers.first else { return false }
-                            tabs.move(
-                                tabIdentifier: identifier,
-                                before: selection,
-                                groupID: groupID
-                            )
-                            return true
-                        }
+            if leadingInset > 0 {
+                WindowDragArea().frame(width: leadingInset)
+            }
+            GeometryReader { strip in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 0) {
+                        tabItems
+                        // The strip is also the window's title bar: the space
+                        // after the last tab moves the window. It lives inside
+                        // the scroll view, which would otherwise take the click.
+                        WindowDragArea()
+                            .frame(minWidth: 24, maxWidth: .infinity, maxHeight: .infinity)
                     }
+                    .frame(minWidth: strip.size.width, maxHeight: .infinity, alignment: .leading)
                 }
             }
-
-            Divider().frame(height: 22)
 
             if let active = group?.active {
-                if group?.preview == active {
-                    Button {
-                        tabs.pin(active, groupID: groupID)
-                    } label: {
-                        Image(systemName: "pin")
-                            .frame(width: 27, height: 28)
+                HStack(spacing: 1) {
+                    if group?.preview == active {
+                        Button {
+                            tabs.pin(active, groupID: groupID)
+                        } label: {
+                            Image(systemName: "pin")
+                        }
+                        .help("Pin preview tab")
                     }
-                    .buttonStyle(.plain)
-                    .help("Pin preview tab")
-                }
 
-                Button {
-                    splitRight(active)
-                } label: {
-                    Image(systemName: "rectangle.split.2x1")
-                        .frame(width: 27, height: 28)
-                }
-                .buttonStyle(.plain)
-                .help("Open to the Side")
-
-                if let route = active.moduleRoute {
                     Button {
-                        openWindow(value: route)
+                        splitRight(active)
                     } label: {
-                        Image(systemName: "macwindow.badge.plus")
-                            .frame(width: 27, height: 28)
+                        Image(systemName: "rectangle.split.2x1")
                     }
-                    .buttonStyle(.plain)
-                    .help("Open in New Window")
-                }
+                    .help("Open to the Side")
 
-                Button {
-                    close(active)
-                } label: {
-                    Image(systemName: "xmark")
-                        .frame(width: 27, height: 28)
+                    if let route = active.moduleRoute {
+                        Button {
+                            openWindow(value: route)
+                        } label: {
+                            Image(systemName: "macwindow.badge.plus")
+                        }
+                        .help("Open in New Window")
+                    }
                 }
-                .buttonStyle(.plain)
-                .help("Close Editor")
+                .buttonStyle(.muxaIcon)
+                .padding(.leading, 6)
+            }
+
+            if let accessory {
+                MuxaTheme.border(colorScheme)
+                    .frame(width: 1, height: 16)
+                    .padding(.horizontal, 6)
+                accessory
             }
         }
+        .padding(.trailing, 6)
         .font(.system(size: 12))
         .foregroundStyle(.secondary)
-        .frame(height: 35)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Color(nsColor: .separatorColor).opacity(0.55))
-                .frame(height: 1)
+        .frame(height: height)
+        // The strip's bottom border sits under the tabs, so the active tab,
+        // filled with the editor's color, reads as joined to the editor.
+        .background(alignment: .bottom) {
+            ZStack(alignment: .bottom) {
+                MuxaTheme.tabStrip(colorScheme)
+                WindowDragArea()
+                MuxaTheme.border(colorScheme).frame(height: 1)
+                    .allowsHitTesting(false)
+            }
         }
     }
+
+    @ViewBuilder
+    private var tabItems: some View {
+        ForEach(group?.tabs ?? [], id: \.self) { selection in
+            EditorTab(
+                selection: selection,
+                title: Self.title(for: selection, model: model),
+                systemImage: tabIcon(for: selection),
+                stateColor: agentState(for: selection).map(agentStateColor),
+                active: group?.active == selection,
+                preview: group?.preview == selection,
+                activate: { activate(selection) },
+                pin: { tabs.pin(selection, groupID: groupID) },
+                close: { close(selection) },
+                closeOthers: {
+                    tabs.closeOthers(keeping: selection, groupID: groupID)
+                    model.activateEditor(selection)
+                },
+                splitRight: { splitRight(selection) },
+                moveToWindow: selection.moduleRoute.map { route in
+                    { openWindow(value: route) }
+                }
+            )
+            .draggable(selection.tabIdentifier)
+            .dropDestination(for: String.self) { identifiers, _ in
+                guard let identifier = identifiers.first else { return false }
+                tabs.move(
+                    tabIdentifier: identifier,
+                    before: selection,
+                    groupID: groupID
+                )
+                return true
+            }
+        }
+    }
+
+    @Environment(\.colorScheme) private var colorScheme
 
     private func activate(_ selection: MuxaSidebarSelection) {
         tabs.activate(selection, groupID: groupID)
@@ -483,7 +589,7 @@ private struct WorkspaceTabBar: View {
         model.activateEditor(selection)
     }
 
-    private func tabLabel(for selection: MuxaSidebarSelection) -> String {
+    static func title(for selection: MuxaSidebarSelection, model: AppModel) -> String {
         switch selection {
         case .workBoard:
             String(localized: "Work Command Center")
@@ -521,6 +627,16 @@ private struct WorkspaceTabBar: View {
         }
     }
 
+    /// The live state of the agent a tab shows, for the dot on its icon
+    /// (Orca marks agent tabs the same way).
+    private func agentState(for selection: MuxaSidebarSelection) -> String? {
+        switch selection {
+        case .pane(let id): model.executionSnapshot.watchPane(id: id)?.agent?.state
+        case .agent(let id): model.hostedAgents.first { $0.id == id }?.agent.state
+        default: nil
+        }
+    }
+
     private func tabIcon(for selection: MuxaSidebarSelection) -> String {
         switch selection {
         case .workBoard: "rectangle.3.group"
@@ -542,6 +658,7 @@ private struct EditorTab: View {
     let selection: MuxaSidebarSelection
     let title: String
     let systemImage: String
+    var stateColor: Color? = nil
     let active: Bool
     let preview: Bool
     let activate: () -> Void
@@ -553,19 +670,27 @@ private struct EditorTab: View {
     @State private var hovering = false
 
     var body: some View {
-        ZStack(alignment: .trailing) {
+        HStack(spacing: 4) {
             Button(action: activate) {
-                HStack(spacing: 7) {
+                HStack(spacing: 6) {
                     Image(systemName: systemImage)
+                        .font(.system(size: 11))
                         .foregroundStyle(active ? Color.accentColor : Color.secondary)
+                        .overlay(alignment: .bottomTrailing) {
+                            if let stateColor {
+                                Circle()
+                                    .fill(stateColor)
+                                    .frame(width: 6, height: 6)
+                                    .overlay(Circle().stroke(MuxaTheme.tabStrip(colorScheme), lineWidth: 1))
+                                    .offset(x: 3, y: 2)
+                            }
+                        }
                     Text(title)
                         .italic(preview)
                         .lineLimit(1)
-                    Spacer(minLength: 4)
                 }
-                .padding(.leading, 10)
-                .padding(.trailing, 38)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .padding(.leading, 12)
+                .frame(maxHeight: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -576,40 +701,38 @@ private struct EditorTab: View {
                 }
             )
 
-            if active || hovering {
-                Button(action: close) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
-                        .frame(width: 30, height: 34)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .background(
-                    active
-                        ? MuxaSurfacePalette.editor(for: colorScheme)
-                        : Color(nsColor: .controlBackgroundColor)
-                )
-                .accessibilityLabel("Close \(title)")
-                .help("Close \(title)")
-                .zIndex(2)
+            Spacer(minLength: 0)
+
+            // The close button's slot is always reserved so tabs never
+            // change width as the pointer moves across them.
+            Button(action: close) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
             }
+            .buttonStyle(.muxaIcon(size: 18))
+            .opacity(active || hovering ? 1 : 0)
+            .accessibilityLabel("Close \(title)")
+            .help("Close \(title)")
+            .padding(.trailing, 6)
         }
-        .frame(minWidth: 132, maxWidth: 230, minHeight: 35, maxHeight: 35)
+        .frame(minWidth: 120, maxWidth: 220, maxHeight: .infinity)
         .foregroundStyle(active ? Color.primary : Color.secondary)
-        .background(
-            active
-                ? MuxaSurfacePalette.editor(for: colorScheme)
-                : Color(nsColor: .controlBackgroundColor)
-        )
+        // A view, not a ShapeStyle: a style background would spread into the
+        // title bar's safe area above the tab.
+        .background {
+            Rectangle().fill(
+                active
+                    ? MuxaTheme.editor(colorScheme)
+                    : hovering ? MuxaTheme.hover(colorScheme) : Color.clear
+            )
+        }
         .overlay(alignment: .top) {
             Rectangle()
                 .fill(active ? Color.accentColor : Color.clear)
-                .frame(height: 2)
+                .frame(height: 1.5)
         }
         .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(Color(nsColor: .separatorColor).opacity(0.55))
-                .frame(width: 1)
+            MuxaTheme.border(colorScheme).frame(width: 1)
         }
         .onHover { hovering = $0 }
         .help(preview ? Text("Preview — double-click to keep open") : Text(title))
@@ -740,6 +863,7 @@ private struct MuxaSidebar: View {
     }
 
     @ObservedObject var model: AppModel
+    let chrome: TitleBarMetrics
     let openPinnedSession: (MuxaWatchSessionIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
     let closeShell: (String) -> Void
@@ -763,158 +887,66 @@ private struct MuxaSidebar: View {
 
     var body: some View {
         ZStack {
-            background.ignoresSafeArea()
+            background
 
-            HStack(spacing: 0) {
-                SidebarActivityRail(model: model)
+            VStack(spacing: 0) {
+                // The title bar row: the traffic lights, then the view's
+                // title and actions (see WorkbenchWindowChrome.swift).
+                HStack(spacing: 0) {
+                    Color.clear.frame(width: max(0, chrome.leadingInset - 14))
+                    sectionTitle
+                }
+                .frame(height: chrome.rowHeight)
+                .background(alignment: .bottom) {
+                    ZStack(alignment: .bottom) {
+                        WindowDragArea()
+                        MuxaTheme.border(colorScheme).frame(height: 1)
+                            .allowsHitTesting(false)
+                    }
+                }
 
-                Divider()
+                HStack(spacing: 0) {
+                    SidebarActivityRail(model: model)
 
-                VStack(spacing: 0) {
-                    HStack {
-                        Label(model.sidebarMode.title, systemImage: model.sidebarMode.systemImage)
-                            .font(.headline)
-                        Spacer()
-                        if model.sidebarMode == .watch {
-                            Button {
-                                model.select(.watch)
-                            } label: {
-                                Image(systemName: "rectangle.on.rectangle")
-                            }
-                            .buttonStyle(.borderless)
-                            .help("Open Live Watch")
-                            Button {
-                                model.presentHostRegistration()
-                            } label: {
-                                Image(systemName: "plus")
-                            }
-                            .buttonStyle(.borderless)
-                            .help("Register SSH Host")
-                        }
-                        if model.sidebarMode == .ask {
-                            Button {
-                                Task { await model.resetAskConversation() }
-                                model.select(.ask)
-                            } label: {
-                                Image(systemName: "plus.bubble")
-                            }
-                            .buttonStyle(.borderless)
-                            .disabled(!model.isConnected)
-                            .help("New Conversation")
-                        }
-                        if model.sidebarMode == .shells {
-                            Button {
-                                model.createShell()
-                            } label: {
-                                Image(systemName: "plus")
-                            }
-                            .buttonStyle(.borderless)
-                            .disabled(!model.isConnected || model.isCreatingSession)
-                            .help("New native shell")
+                    MuxaTheme.border(colorScheme).frame(width: 1)
+
+                    VStack(spacing: 0) {
+                        MuxaFilterField(
+                            prompt: model.sidebarMode.filterPrompt,
+                            text: $filterText,
+                            focused: $filterFocused
+                        ) {
                             Menu {
-                                if model.remoteShellHosts.isEmpty {
-                                    Text("No online fleet hosts")
-                                } else {
-                                    ForEach(model.remoteShellHosts) { host in
-                                        Button {
-                                            openRemoteShell(on: host)
-                                        } label: {
-                                            Label(host.alias, systemImage: "server.rack")
-                                        }
+                                Picker("Status", selection: $statusScope) {
+                                    ForEach(StatusScope.allCases) { scope in
+                                        Label(scope.title, systemImage: scope.systemImage)
+                                            .tag(scope)
                                     }
                                 }
                             } label: {
-                                Image(systemName: "network")
+                                Image(systemName: "line.3.horizontal.decrease")
+                                    .foregroundStyle(statusScope == .all ? Color.secondary : Color.accentColor)
                             }
                             .menuStyle(.borderlessButton)
+                            .menuIndicator(.hidden)
                             .fixedSize()
-                            .disabled(!model.isConnected || isOpeningRemoteShell)
-                            .help("New shell on a fleet host")
-                            MuxaModuleMenu(
-                                context: .app,
-                                model: model,
-                                registry: MuxaModuleRegistry.shared
-                            )
+                            .frame(width: 20, height: 20)
+                            .help("Filter by status")
                         }
-                        Text(verbatim: sidebarCountLabel)
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.top, 12)
-                    .padding(.bottom, 7)
-
-                    HStack(spacing: 6) {
-                        Image(systemName: "magnifyingglass")
-                            .foregroundStyle(.secondary)
-                        TextField(model.sidebarMode.filterPrompt, text: $filterText)
-                            .textFieldStyle(.plain)
-                            .focused($filterFocused)
-                            .onChange(of: focusRequest) { _ in filterFocused = true }
-                        Menu {
-                            Picker("Status", selection: $statusScope) {
-                                ForEach(StatusScope.allCases) { scope in
-                                    Label(scope.title, systemImage: scope.systemImage)
-                                        .tag(scope)
-                                }
-                            }
-                        } label: {
-                            Image(systemName: statusScope.systemImage)
-                                .foregroundStyle(statusScope == .all ? Color.secondary : Color.accentColor)
-                        }
-                        .menuStyle(.borderlessButton)
-                        .fixedSize()
-                        .help("Filter by status")
-                    }
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 6)
-                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7))
-                    .padding(.horizontal, 10)
-                    .padding(.bottom, 3)
-
-                    if model.sidebarMode == .watch {
-                        HStack(spacing: 6) {
-                            Menu {
-                                Picker("Group", selection: $exploreGrouping) {
-                                    ForEach(ExploreGrouping.allCases) { grouping in
-                                        Label(grouping.title, systemImage: grouping.systemImage)
-                                            .tag(grouping)
-                                    }
-                                }
-                            } label: {
-                                Label(exploreGrouping.title, systemImage: exploreGrouping.systemImage)
-                                    .lineLimit(1)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .menuStyle(.borderlessButton)
-                            .help("Group Explore by \(exploreGrouping.title.lowercased())")
-
-                            Menu {
-                                Picker("Order", selection: $exploreSort) {
-                                    ForEach(ExploreSort.allCases) { order in
-                                        Label(order.title, systemImage: order.systemImage)
-                                            .tag(order)
-                                    }
-                                }
-                            } label: {
-                                Label(exploreSort.compactTitle, systemImage: exploreSort.systemImage)
-                                    .lineLimit(1)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .menuStyle(.borderlessButton)
-                            .help("Order Explore by \(exploreSort.title.lowercased())")
-                        }
-                        .font(.caption)
+                        .onChange(of: focusRequest) { _ in filterFocused = true }
                         .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                    }
+                        .padding(.top, 8)
+                        .padding(.bottom, 6)
 
-                    List {
-                        contextualRows
+                        List {
+                            contextualRows
+                        }
+                        .environment(\.defaultMinListRowHeight, MuxaTheme.rowHeight)
+                        .buttonStyle(.muxaSecondary)
+                        .listStyle(.sidebar)
+                        .scrollContentBackground(.hidden)
+                        .background(Color.clear)
                     }
-                    .listStyle(.sidebar)
-                    .scrollContentBackground(.hidden)
-                    .background(Color.clear)
                 }
             }
         }
@@ -927,6 +959,104 @@ private struct MuxaSidebar: View {
         .onChange(of: model.sessions) { sessions in
             dismissedShellIDs = dismissedShellIDs.filter { id in
                 sessions.contains { $0.id == id }
+            }
+        }
+    }
+
+    private var sectionTitle: some View {
+        MuxaSectionTitle(title: model.sidebarMode.title) {
+            Text(verbatim: sidebarCountLabel)
+                .font(.system(size: 10, weight: .medium).monospacedDigit())
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5)
+                .frame(minHeight: 16)
+                .background(Color.primary.opacity(0.07), in: Capsule())
+                .padding(.trailing, 4)
+            if model.sidebarMode == .watch {
+                Button {
+                    model.select(.watch)
+                } label: {
+                    Image(systemName: "rectangle.on.rectangle")
+                }
+                .buttonStyle(.muxaIcon)
+                .help("Open Live Watch")
+                Button {
+                    model.presentHostRegistration()
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.muxaIcon)
+                .help("Register SSH Host")
+            }
+            if model.sidebarMode == .ask {
+                Button {
+                    Task { await model.resetAskConversation() }
+                    model.select(.ask)
+                } label: {
+                    Image(systemName: "plus.bubble")
+                }
+                .buttonStyle(.muxaIcon)
+                .disabled(!model.isConnected)
+                .help("New Conversation")
+            }
+            if model.sidebarMode == .shells {
+                Button {
+                    model.createShell()
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.muxaIcon)
+                .disabled(!model.isConnected || model.isCreatingSession)
+                .help("New native shell")
+                Menu {
+                    if model.remoteShellHosts.isEmpty {
+                        Text("No online fleet hosts")
+                    } else {
+                        ForEach(model.remoteShellHosts) { host in
+                            Button {
+                                openRemoteShell(on: host)
+                            } label: {
+                                Label(host.alias, systemImage: "server.rack")
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "network")
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .frame(width: 22, height: 22)
+                .disabled(!model.isConnected || isOpeningRemoteShell)
+                .help("New shell on a fleet host")
+                MuxaModuleMenu(
+                    context: .app,
+                    model: model,
+                    registry: MuxaModuleRegistry.shared
+                )
+            }
+            if model.sidebarMode == .watch {
+                Menu {
+                    Picker("Group", selection: $exploreGrouping) {
+                        ForEach(ExploreGrouping.allCases) { grouping in
+                            Label(grouping.title, systemImage: grouping.systemImage)
+                                .tag(grouping)
+                        }
+                    }
+                    Picker("Order", selection: $exploreSort) {
+                        ForEach(ExploreSort.allCases) { order in
+                            Label(order.title, systemImage: order.systemImage)
+                                .tag(order)
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .frame(width: 22, height: 22)
+                .help("Group by \(exploreGrouping.title.lowercased()), ordered by \(exploreSort.title.lowercased())")
             }
         }
     }
@@ -1329,7 +1459,7 @@ private struct MuxaSidebar: View {
                                     Image(systemName: "rectangle.on.rectangle")
                                         .foregroundStyle(.secondary)
                                 }
-                                .buttonStyle(.borderless)
+                                .buttonStyle(.muxaIcon)
                                 .controlSize(.small)
                                 .help("Open in Live Watch")
                             }
@@ -1421,7 +1551,7 @@ private struct MuxaSidebar: View {
                                 Image(systemName: "xmark")
                                     .foregroundStyle(.secondary)
                             }
-                            .buttonStyle(.borderless)
+                            .buttonStyle(.muxaIcon)
                             .controlSize(.small)
                             .help("Remove exited shell")
                         }
@@ -1527,52 +1657,24 @@ private struct SidebarActivityRail: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 0) {
             ForEach(MuxaSidebarMode.allCases) { mode in
-                Button {
-                    model.show(mode)
-                } label: {
-                    Image(systemName: mode.systemImage)
-                        .font(.system(size: 17, weight: .medium))
-                        .frame(width: 34, height: 34)
-                        .contentShape(Rectangle())
-                        .background(
-                            model.sidebarMode == mode ? Color.accentColor.opacity(0.18) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        )
-                        .overlay(alignment: .leading) {
-                            if model.sidebarMode == mode {
-                                Capsule()
-                                    .fill(Color.accentColor)
-                                    .frame(width: 3, height: 20)
-                                    .offset(x: -5)
-                            }
-                        }
-                        .overlay(alignment: .topTrailing) {
-                            let count = attentionCount(for: mode)
-                            if count > 0 {
-                                Text(verbatim: count > 99 ? "99+" : "\(count)")
-                                    .font(.system(size: 8, weight: .bold, design: .rounded))
-                                    .foregroundStyle(.white)
-                                    .padding(.horizontal, count > 9 ? 4 : 3)
-                                    .frame(minWidth: 14, minHeight: 14)
-                                    .background(.orange, in: Capsule())
-                                    .offset(x: 5, y: -4)
-                            }
-                        }
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(model.sidebarMode == mode ? Color.accentColor : Color.secondary)
-                .help(mode.title)
-                .accessibilityLabel(mode.title)
+                ActivityRailItem(
+                    mode: mode,
+                    active: model.sidebarMode == mode,
+                    badge: attentionCount(for: mode),
+                    select: { model.show(mode) }
+                )
             }
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 7)
-        .padding(.top, 10)
-        .frame(width: 49)
+        .padding(.top, 4)
+        .frame(width: MuxaTheme.activityBarWidth)
         .frame(maxHeight: .infinity)
+        .background(MuxaTheme.activityBar(colorScheme))
     }
+
+    @Environment(\.colorScheme) private var colorScheme
 
     private func attentionCount(for mode: MuxaSidebarMode) -> Int {
         switch mode {
@@ -1595,6 +1697,46 @@ private struct SidebarActivityRail: View {
         case .shells:
             return 0
         }
+    }
+}
+
+/// One activity bar icon: dimmed at rest, full strength with a 2pt accent bar
+/// on the leading edge when its view is showing, a count badge in the corner.
+private struct ActivityRailItem: View {
+    let mode: MuxaSidebarMode
+    let active: Bool
+    let badge: Int
+    let select: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: select) {
+            Image(systemName: mode.systemImage)
+                .font(.system(size: 17, weight: .regular))
+                .frame(width: MuxaTheme.activityBarWidth, height: 44)
+                .contentShape(Rectangle())
+                .overlay(alignment: .leading) {
+                    Rectangle()
+                        .fill(active ? Color.accentColor : Color.clear)
+                        .frame(width: 2)
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if badge > 0 {
+                        Text(verbatim: badge > 99 ? "99+" : "\(badge)")
+                            .font(.system(size: 9, weight: .semibold).monospacedDigit())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, badge > 9 ? 4 : 0)
+                            .frame(minWidth: 15, minHeight: 15)
+                            .background(Color.accentColor, in: Capsule())
+                            .offset(x: -7, y: -8)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(Color.primary.opacity(active || hovering ? 0.92 : 0.45))
+        .onHover { hovering = $0 }
+        .help(mode.title)
+        .accessibilityLabel(mode.title)
     }
 }
 
@@ -1773,8 +1915,47 @@ private struct InboxAgentRow: View {
 private struct WorkbenchStatusBar: View {
     @ObservedObject var model: AppModel
 
+    @Environment(\.colorScheme) private var colorScheme
+
+    /// Healthy, the bar is neutral like the rest of the chrome and only the
+    /// leading chip carries the accent; a problem turns the whole bar its
+    /// color so it can't be missed.
+    private var healthy: Bool {
+        if case .connected = model.connectionState { return true }
+        return false
+    }
+
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 0) {
+            connectionItems
+                .padding(.horizontal, 9)
+                .frame(maxHeight: .infinity)
+                .background(healthy ? Color.accentColor : Color.clear)
+                .foregroundStyle(.white)
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 14) {
+                Label("\(model.fleetHosts.count) hosts", systemImage: "server.rack")
+                Label("\(model.hostedAgents.count) agents", systemImage: "person.2")
+                Label("\(model.sessions.lazy.filter { !$0.exited }.count) shells", systemImage: "terminal")
+            }
+            .labelStyle(StatusBarLabelStyle())
+            .padding(.trailing, 10)
+            .foregroundStyle(healthy ? Color.secondary : Color.white)
+        }
+        .font(.system(size: 11))
+        .lineLimit(1)
+        .frame(maxWidth: .infinity, minHeight: MuxaTheme.statusBarHeight, maxHeight: MuxaTheme.statusBarHeight)
+        .background(healthy ? MuxaTheme.sideBar(colorScheme) : statusColor)
+        .overlay(alignment: .top) {
+            MuxaTheme.border(colorScheme).frame(height: 1)
+        }
+    }
+
+    @ViewBuilder
+    private var connectionItems: some View {
+        HStack(spacing: 8) {
             switch model.connectionState {
             case .connecting:
                 ProgressView()
@@ -1782,8 +1963,8 @@ private struct WorkbenchStatusBar: View {
                     .tint(.white)
                 Text("Connecting to muxad…")
             case .connected:
-                Label("muxad", systemImage: "circle.fill")
-                    .symbolRenderingMode(.monochrome)
+                Label("muxad", systemImage: "bolt.horizontal.fill")
+                    .labelStyle(StatusBarLabelStyle())
             case .upgradeRequired(let message):
                 Label("muxad upgrade required", systemImage: "arrow.triangle.2.circlepath")
                 Text(message).lineLimit(1)
@@ -1799,18 +1980,7 @@ private struct WorkbenchStatusBar: View {
                     .buttonStyle(.plain)
                     .underline()
             }
-
-            Spacer(minLength: 12)
-
-            Text("\(model.fleetHosts.count) hosts")
-            Text("\(model.hostedAgents.count) agents")
-            Text("\(model.sessions.lazy.filter { !$0.exited }.count) shells")
         }
-        .font(.system(size: 10.5, weight: .medium))
-        .foregroundStyle(.white)
-        .padding(.horizontal, 9)
-        .frame(maxWidth: .infinity, minHeight: 23, maxHeight: 23)
-        .background(statusColor)
     }
 
     private var statusColor: Color {
@@ -1819,6 +1989,15 @@ private struct WorkbenchStatusBar: View {
         case .connecting: Color(nsColor: .systemGray)
         case .upgradeRequired: Color.orange
         case .failed: Color.red
+        }
+    }
+}
+
+private struct StatusBarLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 4) {
+            configuration.icon.font(.system(size: 10))
+            configuration.title
         }
     }
 }
@@ -1848,7 +2027,7 @@ private struct SidebarConnectionStatus: View {
                     systemImage: "arrow.triangle.2.circlepath.circle.fill"
                 )
                 Button("Use Bundled muxad", action: useBundledDaemon)
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.muxaPrimary)
                     .controlSize(.small)
             case .failed(let message):
                 statusMessage(
@@ -2072,7 +2251,7 @@ private struct WorkDetailView: View {
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Text(work.title)
-                        .font(.largeTitle.weight(.semibold))
+                        .font(.system(size: 22, weight: .semibold))
                     HStack(spacing: 8) {
                         Label(work.pipelineLabel, systemImage: "point.3.connected.trianglepath.dotted")
                         if let generation = work.pipelineRun?.generation {
@@ -2124,7 +2303,7 @@ private struct WorkDetailView: View {
 
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Collaborators")
-                        .font(.title2.weight(.semibold))
+                        .font(.system(size: 14, weight: .semibold))
                     LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
                         ForEach(work.participants) { participant in
                             WorkParticipantCard(
@@ -2176,7 +2355,7 @@ private struct WorkMetric: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(verbatim: value)
-                .font(.title2.weight(.semibold).monospacedDigit())
+                .font(.system(size: 18, weight: .semibold).monospacedDigit())
                 .foregroundStyle(color)
             Text(title)
                 .font(.caption)
@@ -2259,9 +2438,9 @@ private struct WorkParticipantCard: View {
         .padding(14)
         .frame(maxWidth: .infinity, minHeight: 210, maxHeight: 210, alignment: .topLeading)
         .clipped()
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous)
                 .stroke(.separator.opacity(0.55), lineWidth: 0.5)
         }
     }
@@ -2323,7 +2502,7 @@ private struct PipelinePlaceholderCard: View {
         .padding(14)
         .frame(maxWidth: .infinity, minHeight: 210, maxHeight: 210, alignment: .topLeading)
         .clipped()
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
     }
 }
 
@@ -2452,7 +2631,7 @@ private struct FleetAgentDetailView: View {
                         .padding(.top, 9)
                     VStack(alignment: .leading, spacing: 4) {
                         Text(title)
-                            .font(.largeTitle.weight(.semibold))
+                            .font(.system(size: 22, weight: .semibold))
                         Text(agentStateLabel(participant.agent.state))
                             .foregroundStyle(agentStateColor(participant.agent.state))
                         Text(participant.agent.agentSessionID)
@@ -2468,7 +2647,7 @@ private struct FleetAgentDetailView: View {
                             } label: {
                                 Label("Open in Live Watch", systemImage: "rectangle.on.rectangle")
                             }
-                            .buttonStyle(.bordered)
+                            .buttonStyle(.muxaSecondary)
                             .disabled(participant.pane == nil)
                             .help("Follow this agent's pane in Live Watch")
                         }
@@ -2492,14 +2671,8 @@ private struct FleetAgentDetailView: View {
                     )
                 }
 
-                Picker("Agent detail", selection: $selectedTab) {
-                    ForEach(availableTabs) { tab in
-                        Text(tab.title).tag(tab)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 460)
+                MuxaSegmented(selection: $selectedTab, options: availableTabs) { Text($0.title) }
+                    .accessibilityLabel("Agent detail")
 
                 tabContent
             }
@@ -2611,7 +2784,7 @@ private struct FleetHostDetailView: View {
                     HostIdentityBadge(host: host, size: 40)
                     VStack(alignment: .leading, spacing: 4) {
                         Text(host.alias)
-                            .font(.largeTitle.weight(.semibold))
+                            .font(.system(size: 22, weight: .semibold))
                         Group {
                             if host.local {
                                 Text("Local host")
@@ -2634,7 +2807,7 @@ private struct FleetHostDetailView: View {
 
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Execution sessions")
-                        .font(.title2.weight(.semibold))
+                        .font(.system(size: 14, weight: .semibold))
                     Text("Each session is summarized by its windows and the latest retained agent context.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
@@ -2677,7 +2850,7 @@ private struct FleetHostDetailView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .padding(12)
-                .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+                .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
             }
             .padding(28)
             .frame(maxWidth: 1250, alignment: .leading)
@@ -2751,9 +2924,9 @@ private struct FleetSessionSummaryCard: View {
             .padding(14)
             .frame(maxWidth: .infinity, minHeight: 188, maxHeight: 188, alignment: .topLeading)
             .contentShape(Rectangle())
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 12)
+                RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous)
                     .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
             }
         }
@@ -2783,10 +2956,10 @@ private struct FleetSessionDetailView: View {
                         .font(.system(size: 28))
                         .foregroundStyle(.tint)
                         .frame(width: 42, height: 42)
-                        .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                        .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
                     VStack(alignment: .leading, spacing: 3) {
                         Text(session.name.isEmpty ? session.sessionID : session.name)
-                            .font(.largeTitle.weight(.semibold))
+                            .font(.system(size: 22, weight: .semibold))
                         Text("\(session.hostAlias) · \(session.windows.count) windows · \(panes.count) panes")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
@@ -2810,7 +2983,7 @@ private struct FleetSessionDetailView: View {
 
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Windows")
-                        .font(.title2.weight(.semibold))
+                        .font(.system(size: 14, weight: .semibold))
                     Text("Open any agent row to inspect its summary, latest response, and Live Pane.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
@@ -2874,7 +3047,7 @@ private struct FleetWindowDetailView: View {
 
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Agent reports")
-                        .font(.title2.weight(.semibold))
+                        .font(.system(size: 14, weight: .semibold))
                     Text("Recap and latest response are kept separate; runtime and workload facts come directly from muxad.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
@@ -2891,7 +3064,7 @@ private struct FleetWindowDetailView: View {
                 if !relatedMessages.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Collaboration in this window")
-                            .font(.title2.weight(.semibold))
+                            .font(.system(size: 14, weight: .semibold))
                         Text("\(relatedMessages.count) operator commands and their durable replies")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
@@ -2917,10 +3090,10 @@ private struct FleetWindowDetailView: View {
                 .font(.system(size: 28))
                 .foregroundStyle(.tint)
                 .frame(width: 42, height: 42)
-                .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
             VStack(alignment: .leading, spacing: 4) {
                 Text(window.name.isEmpty ? window.windowID : window.name)
-                    .font(.largeTitle.weight(.semibold))
+                    .font(.system(size: 22, weight: .semibold))
                 HStack(spacing: 7) {
                     Text("\(window.hostAlias) · \(window.panes.count) panes")
                         .foregroundStyle(.secondary)
@@ -2973,7 +3146,7 @@ private struct FleetWindowDetailView: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
     }
 
     private func panePriority(_ pane: MuxaWatchPane) -> Int {
@@ -3070,9 +3243,9 @@ private struct WindowAgentReportCard: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, minHeight: 300, alignment: .topLeading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 11))
+        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 11)
+            RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous)
                 .stroke(
                     paneNeedsAttentionForSummary(pane) ? Color.orange.opacity(0.5) : Color(nsColor: .separatorColor).opacity(0.45),
                     lineWidth: paneNeedsAttentionForSummary(pane) ? 1 : 0.5
@@ -3254,9 +3427,9 @@ private struct FleetWindowSummaryCard: View {
         .padding(14)
         .frame(maxWidth: .infinity, minHeight: 276, maxHeight: 276, alignment: .topLeading)
         .clipped()
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 12)
+            RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous)
                 .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
         }
     }
@@ -3354,7 +3527,7 @@ private struct HostMetric: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(verbatim: "\(value)\(suffix)")
-                .font(.title2.weight(.semibold).monospacedDigit())
+                .font(.system(size: 18, weight: .semibold).monospacedDigit())
             Text(title)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -3394,12 +3567,12 @@ private struct MuxaEmptyDetail: View {
                 .multilineTextAlignment(.center)
             HStack {
                 Button("Start Work") { model.presentWorkStart() }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.muxaPrimary)
                     .disabled(!model.isConnected || model.isStartingWork)
                 Button("Open Live Watch") { model.select(.watch) }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.muxaSecondary)
                 Button("New Shell") { model.createShell() }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.muxaSecondary)
                     .disabled(!model.isConnected || model.isCreatingSession)
             }
         }
@@ -3515,7 +3688,7 @@ struct TerminalPane: View {
                         } label: {
                             Image(systemName: "macwindow.on.rectangle")
                         }
-                        .buttonStyle(.borderless)
+                        .buttonStyle(.muxaIcon)
                         .help("Open this Shell in a separate window")
                     }
                     .padding(8)
@@ -3579,13 +3752,7 @@ enum MuxaSurfacePalette {
     }
 
     static func sidebar(for colorScheme: ColorScheme) -> Color {
-        switch colorScheme {
-        case .dark:
-            // Deliberately lighter and cooler than the terminal's #212121.
-            Color(red: 0.16, green: 0.18, blue: 0.21)
-        default:
-            Color(red: 0.93, green: 0.94, blue: 0.96)
-        }
+        MuxaTheme.sideBar(colorScheme)
     }
 
     static func terminal(for colorScheme: ColorScheme) -> Color {
@@ -3600,11 +3767,6 @@ enum MuxaSurfacePalette {
     }
 
     static func workspace(for colorScheme: ColorScheme) -> Color {
-        switch colorScheme {
-        case .dark:
-            Color(red: 0.11, green: 0.12, blue: 0.14)
-        default:
-            Color(red: 0.97, green: 0.97, blue: 0.98)
-        }
+        MuxaTheme.editor(colorScheme)
     }
 }

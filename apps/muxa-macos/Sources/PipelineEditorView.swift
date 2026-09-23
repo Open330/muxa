@@ -166,7 +166,7 @@ struct PipelineEditorView: View {
                 Button("Cancel") { close() }
                     .keyboardShortcut(.cancelAction)
                 Button(isNew ? "Create Pipeline" : "Save Pipeline") { save() }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.muxaPrimary)
                     .keyboardShortcut(.defaultAction)
                     .disabled(!problems.isEmpty || model.isSavingPipeline)
             }

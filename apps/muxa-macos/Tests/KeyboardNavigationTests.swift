@@ -1,3 +1,4 @@
+import AppKit
 import Testing
 @testable import Muxa
 
@@ -195,5 +196,57 @@ import Testing
             #expect(group.active.map { group.tabs.contains($0) } ?? group.tabs.isEmpty)
             #expect(group.preview.map { group.tabs.contains($0) } ?? true)
         }
+    }
+}
+
+/// The terminal's own keybindings are replaced so workbench shortcuts (⌘W,
+/// ⌃Tab, ⌘1–9) reach the menu bar; libghostty drops the whole configuration
+/// over a single invalid line, so it must load cleanly.
+@Test @MainActor func terminalKeybindingsLoadAndLeaveWorkbenchShortcutsFree() {
+    #expect(MuxaTerminalKeybindings.loadIssue() == nil)
+    let bound = MuxaTerminalKeybindings.bindings.map { $0.split(separator: "=")[0] }
+    for shortcut in ["super+w", "ctrl+tab", "ctrl+shift+tab", "super+1", "super+comma", "super+t"] {
+        #expect(!bound.contains(Substring(shortcut)))
+    }
+}
+
+@Test func nextAttentionCyclesThroughWaitingPanes() {
+    let a = MuxaWatchPaneIdentity(hostAlias: "local", socket: "s", paneID: "%1")
+    let b = MuxaWatchPaneIdentity(hostAlias: "local", socket: "s", paneID: "%2")
+    let elsewhere = MuxaWatchPaneIdentity(hostAlias: "local", socket: "s", paneID: "%9")
+    #expect(MuxaAttention.next(after: nil, in: [a, b]) == a)
+    #expect(MuxaAttention.next(after: a, in: [a, b]) == b)
+    #expect(MuxaAttention.next(after: b, in: [a, b]) == a)
+    #expect(MuxaAttention.next(after: elsewhere, in: [a, b]) == a)
+    #expect(MuxaAttention.next(after: a, in: []) == nil)
+}
+
+@Test @MainActor func reopenClosedRestoresMostRecentAvailableEditor() {
+    let tabs = MuxaWorkbenchTabs(persistenceKey: nil)
+    tabs.openPinned(.ask)
+    tabs.openPinned(.inbox)
+    tabs.closeFocused()
+    tabs.close(.ask, groupID: tabs.focusedGroupID)
+    #expect(tabs.reopenClosed(isAvailable: { $0 != .ask }) == .inbox)
+    #expect(tabs.focusedSelection == .inbox)
+    #expect(tabs.reopenClosed(isAvailable: { _ in true }) == nil)
+}
+
+@Test func paletteShortcutsSwitchModesAndJumpToResults() {
+    #expect(MuxaPaletteMode.shortcut(characters: "j", modifiers: .command) == .agents)
+    #expect(MuxaPaletteMode.shortcut(characters: "p", modifiers: .command) == .navigation)
+    #expect(MuxaPaletteMode.shortcut(characters: "p", modifiers: [.command, .shift]) == .commands)
+    #expect(MuxaPaletteMode.shortcut(characters: "j", modifiers: [.command, .shift]) == nil)
+    #expect(MuxaPaletteMode.resultIndex(characters: "1", modifiers: .command) == 0)
+    #expect(MuxaPaletteMode.resultIndex(characters: "9", modifiers: .command) == 8)
+    #expect(MuxaPaletteMode.resultIndex(characters: "0", modifiers: .command) == nil)
+    #expect(MuxaPaletteMode.resultIndex(characters: "1", modifiers: [.command, .shift]) == nil)
+}
+
+@Test func everyPaletteCommandShortcutAppearsInTheReference() {
+    let listed = MuxaShortcutCatalog.sections.flatMap(\.entries).map(\.keys)
+    for command in MuxaPaletteCommand.allCases {
+        guard let shortcut = command.shortcut else { continue }
+        #expect(listed.contains { $0.contains(shortcut) }, "\(command) \(shortcut) missing from ⌘/")
     }
 }

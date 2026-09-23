@@ -4,17 +4,27 @@ import SwiftUI
 enum MuxaPaletteMode: String, Identifiable {
     case navigation
     case commands
+    /// ⌘J: agents only, those needing attention first (Orca's jump palette).
+    case agents
 
     var id: Self { self }
 
     static func shortcut(characters: String?, modifiers: NSEvent.ModifierFlags) -> Self? {
-        guard characters?.lowercased() == "p" else { return nil }
         let flags = modifiers.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function])
-        switch flags {
-        case .command: return .navigation
-        case [.command, .shift]: return .commands
+        switch (characters?.lowercased(), flags) {
+        case ("p", .command): return .navigation
+        case ("p", [.command, .shift]): return .commands
+        case ("j", .command): return .agents
         default: return nil
         }
+    }
+
+    /// ⌘1–⌘9 inside the palette opens that result, zero-based.
+    static func resultIndex(characters: String?, modifiers: NSEvent.ModifierFlags) -> Int? {
+        let flags = modifiers.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function])
+        guard flags == .command, let characters, characters.count == 1,
+              let digit = Int(characters), (1...9).contains(digit) else { return nil }
+        return digit - 1
     }
 }
 
@@ -27,6 +37,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
     case startWork, workCommandCenter, liveWatch, ask, newShell
     case showWork, showWatch, showInbox, showShells, refresh
     case closeEditor, previousEditor, nextEditor, splitEditor, pinEditor, focusSidebar
+    case jumpToAgent, nextAttention, toggleSidebar, reopenEditor, showShortcuts
 
     var id: Self { self }
 
@@ -48,6 +59,35 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .splitEditor: String(localized: "Editor: Split right")
         case .pinEditor: String(localized: "Editor: Keep open (pin)")
         case .focusSidebar: String(localized: "View: Focus sidebar")
+        case .jumpToAgent: String(localized: "Go: Jump to agent")
+        case .nextAttention: String(localized: "Go: Next agent needing attention")
+        case .toggleSidebar: String(localized: "View: Toggle side bar")
+        case .reopenEditor: String(localized: "Editor: Reopen closed editor")
+        case .showShortcuts: String(localized: "Help: Keyboard shortcuts")
+        }
+    }
+
+    /// The menu binding, shown at the end of the row like VS Code does.
+    var shortcut: String? {
+        switch self {
+        case .startWork: "⌥⌘N"
+        case .workCommandCenter: "⇧⌘1"
+        case .liveWatch: "⇧⌘W"
+        case .ask: "⇧⌘2"
+        case .newShell: "⌘T"
+        case .showInbox: "⇧⌘3"
+        case .closeEditor: "⌘W"
+        case .previousEditor: "⌃⇧⇥"
+        case .nextEditor: "⌃⇥"
+        case .splitEditor: "⌘\\"
+        case .pinEditor: "⌥⌘↩"
+        case .focusSidebar: "⇧⌘F"
+        case .jumpToAgent: "⌘J"
+        case .nextAttention: "⇧⌘J"
+        case .toggleSidebar: "⌘B"
+        case .reopenEditor: "⇧⌘T"
+        case .showShortcuts: "⌘/"
+        case .showWork, .showWatch, .showShells, .refresh: nil
         }
     }
 
@@ -66,6 +106,11 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .nextEditor: "arrow.right"
         case .splitEditor: "rectangle.split.2x1"
         case .pinEditor: "pin"
+        case .jumpToAgent: "person.crop.circle.badge.exclamationmark"
+        case .nextAttention: "exclamationmark.circle"
+        case .toggleSidebar: "sidebar.left"
+        case .reopenEditor: "arrow.uturn.backward"
+        case .showShortcuts: "keyboard"
         }
     }
 
@@ -102,6 +147,8 @@ struct MuxaPaletteItem: Identifiable, Equatable {
     let systemImage: String
     let action: MuxaPaletteAction
     var disabledReason: String? = nil
+    var shortcut: String? = nil
+    var tint: Color? = nil
 
     var id: MuxaPaletteID { stableID }
     var isEnabled: Bool { disabledReason == nil }
@@ -285,6 +332,36 @@ enum MuxaPaletteItems {
         return items
     }
 
+    /// ⌘J: every pane running an agent, the ones needing the operator
+    /// first, then working, then idle — each group in topology order.
+    static func agents(watchHosts: [MuxaWatchHost]) -> [MuxaPaletteItem] {
+        let panes = watchHosts.flatMap(\.sessions).flatMap(\.windows).flatMap(\.panes)
+            .filter { $0.agent != nil }
+        return panes.enumerated()
+            .sorted { lhs, rhs in
+                let (l, r) = (MuxaAttention.rank(lhs.element), MuxaAttention.rank(rhs.element))
+                return l != r ? l < r : lhs.offset < rhs.offset
+            }
+            .map { _, pane in
+                let window = pane.pane.windowName.isEmpty ? pane.pane.windowID : pane.pane.windowName
+                let state = pane.agent.map { agentStateLabel($0.state) } ?? ""
+                return MuxaPaletteItem(
+                    stableID: MuxaPaletteID(components: [
+                        "agent-pane", pane.host.alias, pane.pane.endpointSocket, pane.pane.paneID,
+                    ]),
+                    title: pane.pane.agentAlias.map { "@\($0)" }
+                        ?? pane.agent?.aiTitle
+                        ?? (pane.pane.title.isEmpty ? pane.pane.currentCommand : pane.pane.title),
+                    subtitle: [state, pane.host.alias, "\(pane.pane.session) › \(window)", pane.pane.paneID]
+                        .filter { !$0.isEmpty }.joined(separator: " · "),
+                    systemImage: MuxaAttention.needsAttention(pane)
+                        ? "exclamationmark.circle.fill" : "person.crop.circle",
+                    action: .navigate(.pane(pane.id)),
+                    tint: pane.agent.map { agentStateColor($0.state) }
+                )
+            }
+    }
+
     private static func agentID(_ agent: MuxaHostedAgent) -> MuxaPaletteID {
         MuxaPaletteID(components: [
             "agent", agent.host.alias, agent.pane?.endpointSocket ?? agent.agent.tmuxSocket,
@@ -318,28 +395,53 @@ struct CommandPaletteView: View {
                 MuxaPaletteItem(
                     stableID: MuxaPaletteID(components: ["command", command.rawValue]), title: command.title,
                     subtitle: command.disabledReason(model: model) ?? "", systemImage: command.systemImage,
-                    action: .command(command), disabledReason: command.disabledReason(model: model)
+                    action: .command(command), disabledReason: command.disabledReason(model: model),
+                    shortcut: command.shortcut
                 )
             }
+        case .agents:
+            // Attention order is the point of this mode; recency would
+            // bury a blocked agent under the one just looked at.
+            candidates = MuxaPaletteItems.agents(watchHosts: model.executionSnapshot.watchHosts)
+            return MuxaPaletteSearch.results(candidates, query: query, recent: [])
         }
         return MuxaPaletteSearch.results(candidates, query: query, recent: recent)
+    }
+
+    private var placeholder: String {
+        switch mode {
+        case .navigation: String(localized: "Search sessions, windows, panes, shells, work, agents")
+        case .commands: String(localized: "Type a command")
+        case .agents: String(localized: "Jump to an agent — the ones needing you come first")
+        }
+    }
+
+    private var modeShortcut: String {
+        switch mode {
+        case .navigation: "⌘P"
+        case .commands: "⇧⌘P"
+        case .agents: "⌘J"
+        }
     }
 
     var body: some View {
         let results = items
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Image(systemName: mode == .navigation ? "magnifyingglass" : "chevron.right")
+                Image(systemName: mode == .commands ? "chevron.right" : mode == .agents ? "person.crop.circle" : "magnifyingglass")
                     .foregroundStyle(.secondary)
                 MuxaPaletteSearchField(
                     text: Binding(get: { query }, set: { updateQuery($0) }),
-                    placeholder: mode == .navigation
-                        ? String(localized: "Search sessions, windows, panes, shells, work, agents")
-                        : String(localized: "Type a command"),
+                    placeholder: placeholder,
                     onKey: handleKey,
-                    onModeChange: { mode = $0 }
+                    onModeChange: { mode = $0 },
+                    onJump: { index in
+                        let enabled = results.filter(\.isEnabled)
+                        guard enabled.indices.contains(index) else { return }
+                        choose(enabled[index].stableID)
+                    }
                 )
-                Text(mode == .navigation ? "⌘P" : "⇧⌘P")
+                Text(verbatim: modeShortcut)
                     .font(.caption.monospaced()).foregroundStyle(.secondary)
             }
             .padding(16)
@@ -357,8 +459,8 @@ struct CommandPaletteView: View {
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, minHeight: 230)
                         }
-                        ForEach(results) { item in
-                            row(item)
+                        ForEach(Array(results.enumerated()), id: \.element.id) { index, item in
+                            row(item, digit: index < 9 && item.isEnabled ? index + 1 : nil)
                         }
                     }
                     .padding(8)
@@ -375,6 +477,7 @@ struct CommandPaletteView: View {
             HStack(spacing: 14) {
                 Text("↑↓ / ⇧⇥ ⇥  select")
                 Text("↵  open")
+                Text("⌘1–9  jump")
                 Text("esc  dismiss")
                 Spacer()
                 Text("\(results.count) results")
@@ -390,13 +493,15 @@ struct CommandPaletteView: View {
         }
     }
 
-    private func row(_ item: MuxaPaletteItem) -> some View {
+    private func row(_ item: MuxaPaletteItem, digit: Int?) -> some View {
         Button {
             selectedID = item.stableID
             choose(item.stableID)
         } label: {
             HStack(spacing: 10) {
-                Image(systemName: item.systemImage).frame(width: 22)
+                Image(systemName: item.systemImage)
+                    .foregroundStyle(item.tint ?? Color.primary)
+                    .frame(width: 22)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(item.title).font(.body).lineLimit(1)
                     if !item.subtitle.isEmpty {
@@ -406,7 +511,18 @@ struct CommandPaletteView: View {
                 }
                 Spacer(minLength: 0)
                 if !item.isEnabled { Image(systemName: "lock").font(.caption) }
-                if item.stableID == selectedID { Image(systemName: "return").font(.caption) }
+                if let shortcut = item.shortcut {
+                    Text(verbatim: shortcut)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                if item.stableID == selectedID {
+                    Image(systemName: "return").font(.caption)
+                } else if let digit, item.shortcut == nil {
+                    Text(verbatim: "⌘\(digit)")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.tertiary)
+                }
             }
             .padding(.horizontal, 10).padding(.vertical, 9)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -453,6 +569,7 @@ struct MuxaPaletteSearchField: NSViewRepresentable {
     let placeholder: String
     let onKey: (MuxaPaletteKeyDecision) -> Void
     let onModeChange: (MuxaPaletteMode) -> Void
+    var onJump: (Int) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -462,6 +579,7 @@ struct MuxaPaletteSearchField: NSViewRepresentable {
         field.isEditable = true
         field.isSelectable = true
         field.onModeChange = onModeChange
+        field.onJump = onJump
         field.isBezeled = false
         field.drawsBackground = false
         field.focusRingType = .none
@@ -477,6 +595,7 @@ struct MuxaPaletteSearchField: NSViewRepresentable {
     func updateNSView(_ field: NSTextField, context: Context) {
         context.coordinator.parent = self
         (field as? MuxaPaletteTextField)?.onModeChange = onModeChange
+        (field as? MuxaPaletteTextField)?.onJump = onJump
         field.placeholderString = placeholder
         field.setAccessibilityLabel(placeholder)
         if field.stringValue != text, (field.currentEditor() as? NSTextView)?.hasMarkedText() != true {
@@ -510,10 +629,17 @@ final class MuxaPaletteTextField: NSTextField {
     var onModeChange: (MuxaPaletteMode) -> Void = { _ in } {
         didSet { (cell as? MuxaPaletteTextFieldCell)?.editor.onModeChange = onModeChange }
     }
+    var onJump: (Int) -> Void = { _ in } {
+        didSet { (cell as? MuxaPaletteTextFieldCell)?.editor.onJump = onJump }
+    }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if let mode = MuxaPaletteMode.shortcut(characters: event.charactersIgnoringModifiers, modifiers: event.modifierFlags) {
             onModeChange(mode)
+            return true
+        }
+        if let index = MuxaPaletteMode.resultIndex(characters: event.charactersIgnoringModifiers, modifiers: event.modifierFlags) {
+            onJump(index)
             return true
         }
         return super.performKeyEquivalent(with: event)
@@ -545,10 +671,15 @@ private final class MuxaPaletteTextFieldCell: NSTextFieldCell {
 private final class MuxaPaletteFieldEditor: NSTextView {
     private(set) var beganWithMarkedText = false
     var onModeChange: (MuxaPaletteMode) -> Void = { _ in }
+    var onJump: (Int) -> Void = { _ in }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if let mode = MuxaPaletteMode.shortcut(characters: event.charactersIgnoringModifiers, modifiers: event.modifierFlags) {
             onModeChange(mode)
+            return true
+        }
+        if let index = MuxaPaletteMode.resultIndex(characters: event.charactersIgnoringModifiers, modifiers: event.modifierFlags) {
+            onJump(index)
             return true
         }
         return super.performKeyEquivalent(with: event)

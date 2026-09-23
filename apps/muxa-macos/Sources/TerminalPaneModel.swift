@@ -3,7 +3,7 @@ import GhosttyTerminal
 
 @MainActor
 final class TerminalPaneModel: ObservableObject {
-    let terminalState = TerminalViewState()
+    let terminalState = TerminalViewState(terminalConfiguration: MuxaTerminalKeybindings.configuration)
 
     @Published private(set) var errorMessage: String?
     @Published private(set) var outputWasTruncated = false

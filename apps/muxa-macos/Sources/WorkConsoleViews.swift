@@ -96,7 +96,7 @@ struct WorkStartView: View {
                     .foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Start Work")
-                        .font(.title2.weight(.semibold))
+                        .font(.system(size: 14, weight: .semibold))
                     Text("Create or converge a collaborator pipeline without leaving Muxa.")
                         .foregroundStyle(.secondary)
                 }
@@ -207,7 +207,7 @@ struct WorkStartView: View {
                                 .foregroundStyle(.secondary)
                             Spacer()
                             Button("Configure Work…", action: configureWork)
-                                .buttonStyle(.borderedProminent)
+                                .buttonStyle(.muxaPrimary)
                         }
                     }
                 }
@@ -236,7 +236,7 @@ struct WorkStartView: View {
                 Button("Cancel") { isPresented = false }
                     .disabled(model.isStartingWork)
                 Button(dryRun ? "Build Plan" : "Start Work") { submit() }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.muxaPrimary)
                     .disabled(!canSubmit)
                     .keyboardShortcut(.defaultAction)
             }
@@ -510,7 +510,7 @@ struct WorkCommandCenterView: View {
 
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Hosts")
-                        .font(.title2.weight(.semibold))
+                        .font(.system(size: 14, weight: .semibold))
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 10) {
                             ForEach(model.fleetHosts) { host in
@@ -528,7 +528,7 @@ struct WorkCommandCenterView: View {
                                     }
                                     .padding(.horizontal, 11)
                                     .padding(.vertical, 8)
-                                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                                    .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -540,7 +540,7 @@ struct WorkCommandCenterView: View {
 
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Active Work")
-                        .font(.title2.weight(.semibold))
+                        .font(.system(size: 14, weight: .semibold))
                     if model.workGroups.isEmpty {
                         VStack(spacing: 12) {
                             Image(systemName: "square.stack.3d.up.slash")
@@ -552,11 +552,11 @@ struct WorkCommandCenterView: View {
                                 .foregroundStyle(.secondary)
                                 .multilineTextAlignment(.center)
                             Button("Start your first Work") { model.presentWorkStart() }
-                                .buttonStyle(.borderedProminent)
+                                .buttonStyle(.muxaPrimary)
                         }
                         .padding(32)
                         .frame(maxWidth: .infinity)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
                     } else {
                         LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
                             ForEach(model.workGroups) { work in
@@ -621,7 +621,7 @@ struct WorkCommandCenterView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text("Pipelines")
-                    .font(.title2.weight(.semibold))
+                    .font(.system(size: 14, weight: .semibold))
                 if let path = model.workOptions?.configPath {
                     Text(path)
                         .font(.caption2.monospaced())
@@ -640,7 +640,7 @@ struct WorkCommandCenterView: View {
                     } label: {
                         Label("Sync All to Hosts", systemImage: "arrow.triangle.2.circlepath")
                     }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(.muxaGhost)
                     .disabled(!syncingPipelines.isEmpty)
                     .help("Write every library pipeline to the hosts where it is missing or differs")
                 }
@@ -649,7 +649,7 @@ struct WorkCommandCenterView: View {
                 } label: {
                     Label("Describe…", systemImage: "sparkles")
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.muxaGhost)
                 .disabled(model.workOptions == nil || !model.isConnected)
                 .help("Describe a pipeline in plain language and let the Ask provider draft it")
                 Button {
@@ -657,14 +657,14 @@ struct WorkCommandCenterView: View {
                 } label: {
                     Label("New Pipeline…", systemImage: "plus")
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.muxaGhost)
                 .disabled(model.workOptions == nil)
                 Button {
                     Task { await model.loadAllWorkOptions() }
                 } label: {
                     Label("Reload", systemImage: "arrow.clockwise")
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.muxaGhost)
                 .help("Re-read pipelines and routes from every host")
             }
 
@@ -689,7 +689,7 @@ struct WorkCommandCenterView: View {
                         onDescribe: describeWithAgentAction
                     )
                     .padding(16)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
                 } else {
                     LazyVGrid(columns: pipelineColumns, alignment: .leading, spacing: 12) {
                         ForEach(options.pipelines) { pipeline in
@@ -733,14 +733,14 @@ struct WorkCommandCenterView: View {
                     .textSelection(.enabled)
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
             } else {
                 Text("Reading pipelines from the muxa config…")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
             }
         }
     }
@@ -809,7 +809,7 @@ struct WorkCommandCenterView: View {
             }
             .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
         }
     }
 
@@ -857,7 +857,7 @@ struct WorkCommandCenterView: View {
     private var commandCenterTitle: some View {
         VStack(alignment: .leading, spacing: 5) {
             Text("Work Command Center")
-                .font(.largeTitle.weight(.semibold))
+                .font(.system(size: 22, weight: .semibold))
                 .fixedSize(horizontal: false, vertical: true)
             Text("Start outcomes, coordinate collaborators, and inspect their execution without returning to tmux.")
                 .foregroundStyle(.secondary)
@@ -872,13 +872,13 @@ struct WorkCommandCenterView: View {
             } label: {
                 Label("Live Watch", systemImage: "waveform.path.ecg.rectangle")
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.muxaSecondary)
             Button {
                 model.presentWorkStart()
             } label: {
                 Label("Start Work", systemImage: "play.fill")
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.muxaPrimary)
             .disabled(!model.isConnected || model.isStartingWork)
         }
     }
@@ -892,7 +892,7 @@ private struct CommandCenterMetric: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(verbatim: "\(value)")
-                .font(.title.weight(.semibold).monospacedDigit())
+                .font(.system(size: 20, weight: .semibold).monospacedDigit())
                 .foregroundStyle(color)
             Text(title)
                 .font(.caption)
@@ -900,7 +900,7 @@ private struct CommandCenterMetric: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
     }
 }
 
@@ -974,9 +974,9 @@ private struct WorkCommandCard: View {
             }
             .padding(15)
             .frame(maxWidth: .infinity, minHeight: 140, alignment: .topLeading)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 12)
+                RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous)
                     .stroke(
                         work.attentionCount > 0
                             ? Color.orange.opacity(0.5)
@@ -1071,65 +1071,46 @@ private struct FleetPaneWorkspace: View {
         .onDisappear(perform: stopPanelAttach)
     }
 
+    /// A breadcrumb bar, like an editor's path above the file: the inspector
+    /// below already titles the pane, so this row only locates it and
+    /// switches the module.
     private var paneHeader: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 10) {
-                paneIdentity(showsLocation: true)
-                Spacer(minLength: 8)
-                modulePicker(width: 210)
-                Button {
-                    Task { await model.refresh() }
-                } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
-                }
+        HStack(spacing: 8) {
+            HostIdentityBadge(identity: pane.host, size: 14)
+            breadcrumbs
+                .layoutPriority(-1)
+            Spacer(minLength: 8)
+            MuxaTextTabs(items: PaneModule.allCases, selection: $module, title: \.title)
+            Button {
+                Task { await model.refresh() }
+            } label: {
+                Label("Refresh", systemImage: "arrow.clockwise")
             }
-
-            HStack(spacing: 8) {
-                paneIdentity(showsLocation: false)
-                Spacer(minLength: 4)
-                modulePicker(width: 150)
-                Button {
-                    Task { await model.refresh() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("Refresh")
-            }
+            .buttonStyle(.muxaIcon)
+            .help("Refresh")
         }
-        .padding(.horizontal, 14)
-        .frame(height: 48)
+        .padding(.leading, 12)
+        .padding(.trailing, 8)
+        .frame(height: MuxaTheme.breadcrumbHeight)
     }
 
-    private func paneIdentity(showsLocation: Bool) -> some View {
-        HStack(spacing: 10) {
-            HostIdentityBadge(identity: pane.host, size: 28)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(pane.agent?.aiTitle ?? pane.pane.agentAlias.map { "@\($0)" } ?? pane.pane.windowName)
-                    .font(.headline)
+    private var breadcrumbs: some View {
+        let parts = [pane.host.alias, pane.pane.session, pane.pane.windowName, pane.pane.paneID]
+            .filter { !$0.isEmpty }
+        return HStack(spacing: 4) {
+            ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
+                if index > 0 {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                Text(verbatim: part)
+                    .foregroundStyle(index == parts.count - 1 ? Color.primary : Color.secondary)
                     .lineLimit(1)
-                if showsLocation {
-                    Text(verbatim: "\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    private func modulePicker(width: CGFloat) -> some View {
-        Picker("Pane module", selection: $module) {
-            ForEach(PaneModule.allCases) { module in
-                Text(module.title).tag(module)
+                    .truncationMode(.middle)
             }
         }
-        .labelsHidden()
-        .pickerStyle(.segmented)
-        .frame(width: width)
+        .font(.system(size: 12))
     }
 
     private func attachInPanel() {
@@ -1268,7 +1249,7 @@ struct MuxaAskView: View {
                             Text("Enable & Reload")
                         }
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.muxaPrimary)
                     .disabled(model.isEnablingAsk)
                 }
                 .padding(.horizontal, 14)
@@ -1314,10 +1295,10 @@ struct MuxaAskView: View {
                     placeholder: "Ask about work across your hosts…"
                 )
                 .frame(minHeight: 72, maxHeight: 112)
-                .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
+                .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
                 .overlay {
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous)
+                        .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
                 }
                 .disabled(model.askEnabled == false || !model.isConnected)
                 ViewThatFits(in: .horizontal) {
@@ -1355,18 +1336,25 @@ struct MuxaAskView: View {
     private var askContextControls: some View {
         HStack(spacing: 7) {
             conversationMenu
-            Picker("Provider", selection: $agent) {
-                ForEach(providers.providers) { provider in
-                    Text(provider.title)
-                        .tag(provider.id)
-                        .disabled(!providers.isUsable(provider))
+            // A borderless menu instead of a bezeled pop-up button, so the
+            // composer's controls read as one quiet row.
+            Menu {
+                Picker("Provider", selection: $agent) {
+                    ForEach(providers.providers) { provider in
+                        Text(provider.title)
+                            .tag(provider.id)
+                            .disabled(!providers.isUsable(provider))
+                    }
+                    if !providers.providers.contains(where: { $0.id == agent }) {
+                        Text(providers.title(for: agent)).tag(agent)
+                    }
                 }
-                if !providers.providers.contains(where: { $0.id == agent }) {
-                    Text(providers.title(for: agent)).tag(agent)
-                }
+                .pickerStyle(.inline)
+            } label: {
+                Label(providers.title(for: agent), systemImage: "cpu")
             }
-            .labelsHidden()
-            .frame(width: 150)
+            .menuStyle(.borderlessButton)
+            .fixedSize()
             .help("Provider for new conversations; disabled entries need a CLI install or an API key in Settings")
 
         }
@@ -1490,7 +1478,7 @@ struct MuxaAskView: View {
         Button(action: send) {
             Label("Send", systemImage: "paperplane.fill")
         }
-        .buttonStyle(.borderedProminent)
+        .buttonStyle(.muxaPrimary)
         .keyboardShortcut(.return, modifiers: [.command])
         .help("Continue this conversation with the selected provider (⌘↩)")
         .disabled(
@@ -1929,7 +1917,7 @@ struct MuxaOperatorInboxView: View {
                         } label: {
                             Label("Inbox", systemImage: "chevron.left")
                         }
-                        .buttonStyle(.borderless)
+                        .buttonStyle(.muxaGhost)
                         Spacer()
                     }
                     .padding(.horizontal, 12)
@@ -2015,12 +2003,8 @@ struct MuxaOperatorInboxView: View {
     }
 
     private var inboxScopePicker: some View {
-        Picker("Mailbox", selection: $scope) {
-            ForEach(Scope.allCases) { value in Text(value.title).tag(value) }
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .accessibilityLabel("Inbox scope")
+        MuxaSegmented(selection: $scope, options: Array(Scope.allCases)) { Text($0.title) }
+            .accessibilityLabel("Inbox scope")
     }
 
     private var inboxSearchField: some View {
@@ -2204,7 +2188,7 @@ private struct OperatorMessageDetail: View {
                 } label: {
                     Label(openDestinationLabel, systemImage: "rectangle.and.hand.point.up.left")
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.muxaPrimary)
                 .disabled(openDestination == nil)
             }
             .padding(.horizontal, 16)
@@ -2255,14 +2239,14 @@ private struct OperatorMessageDetail: View {
                         .foregroundStyle(.red)
                         .padding(14)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.red.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                        .background(Color.red.opacity(0.06), in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
                     } else if message.isAwaitingAgentReply {
                         Label("Waiting for this agent to reply", systemImage: "clock")
                             .font(.subheadline.weight(.medium))
                             .foregroundStyle(.secondary)
                             .padding(14)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
                     }
                 }
                 .padding(18)
@@ -2296,7 +2280,7 @@ private struct OperatorMessageDetailSection: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(tint.opacity(0.055), in: RoundedRectangle(cornerRadius: 11))
+        .background(tint.opacity(0.055), in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
         .overlay(alignment: .leading) {
             RoundedRectangle(cornerRadius: 2)
                 .fill(tint.opacity(0.7))
@@ -2377,18 +2361,14 @@ private struct MuxaCollaborationView: View {
             HStack(spacing: 8) {
                 Label("Collaborate", systemImage: "person.2.wave.2")
                     .font(.headline)
-                Picker("Collaborate module", selection: $module) {
-                    ForEach(ModuleTab.allCases) { item in Text(item.title).tag(item) }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 180)
+                MuxaSegmented(selection: $module, options: Array(ModuleTab.allCases)) { Text($0.title) }
+                    .accessibilityLabel("Collaborate module")
                 Spacer()
                 if loading { ProgressView().controlSize(.mini) }
                 Button { Task { await load() } } label: {
                     Image(systemName: "arrow.clockwise")
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.muxaIcon)
             }
             .padding(.horizontal, 14)
             .frame(height: 40)
@@ -2398,24 +2378,19 @@ private struct MuxaCollaborationView: View {
             switch module {
             case .activity:
                 HStack(spacing: 10) {
-                    Picker("Mailbox", selection: $tab) {
-                        Text("Incoming \(mailbox.incoming.count)").tag(MailboxTab.incoming)
-                        Text("Sent \(mailbox.sent.count)").tag(MailboxTab.sent)
+                    MuxaSegmented(selection: $tab, options: [MailboxTab.incoming, .sent]) { tab in
+                        switch tab {
+                        case .incoming: Text("Incoming \(mailbox.incoming.count)")
+                        case .sent: Text("Sent \(mailbox.sent.count)")
+                        }
                     }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .frame(width: 220)
+                    .accessibilityLabel("Mailbox")
                     Spacer()
-                    Picker("Density", selection: $displayMode) {
-                        ForEach(DisplayMode.allCases) { item in Text(item.title).tag(item) }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .frame(width: 175)
+                    MuxaSegmented(selection: $displayMode, options: Array(DisplayMode.allCases)) { Text($0.title) }
+                        .accessibilityLabel("Density")
                 }
                 .padding(.horizontal, 12)
-                .frame(height: 40)
-                .background(Color.primary.opacity(0.025))
+                .frame(height: 36)
 
                 Divider()
 
@@ -2484,7 +2459,7 @@ private struct MuxaCollaborationView: View {
                 Spacer()
                 if sending { ProgressView().controlSize(.small) }
                 Button("Send Collaboration") { send() }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.muxaPrimary)
                     .disabled(sending || message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
@@ -2579,7 +2554,7 @@ private struct CollaborationRequestCard: View {
                     }
                     if request.status == "claimed" {
                         Button("Reply…", action: reply)
-                            .buttonStyle(.borderedProminent)
+                            .buttonStyle(.muxaPrimary)
                     }
                 }
                 .controlSize(.small)
@@ -2607,7 +2582,7 @@ private struct CollaborationReplyView: View {
     var replyBody: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Reply to \(request.from.label)")
-                .font(.title2.weight(.semibold))
+                .font(.system(size: 14, weight: .semibold))
             MarkdownContent(source: request.body)
                 .padding(10)
                 .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
@@ -2626,7 +2601,7 @@ private struct CollaborationReplyView: View {
                 Spacer()
                 Button("Cancel", action: completed)
                 Button("Reply") { send() }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.muxaPrimary)
                     .disabled(sending || replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
@@ -2708,7 +2683,7 @@ struct HostRegistrationView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Register Host")
-                        .font(.title2.weight(.semibold))
+                        .font(.system(size: 14, weight: .semibold))
                     Text("Add an OpenSSH target to Muxa's central host inventory.")
                         .foregroundStyle(.secondary)
                 }
@@ -2720,7 +2695,7 @@ struct HostRegistrationView: View {
                     .keyboardShortcut(.cancelAction)
                 Button("Register") { register() }
                     .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.muxaPrimary)
                     .disabled(model.isRegisteringHost || alias.trimmingCharacters(in: .whitespaces).isEmpty || ssh.trimmingCharacters(in: .whitespaces).isEmpty)
             }
             .padding(20)
@@ -2845,7 +2820,7 @@ private struct WatchLivePanePanel: View {
                     } label: {
                         Label("Click to Type", systemImage: "keyboard")
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.muxaPrimary)
                     .controlSize(.small)
                     .disabled(model.isAttachingPane || !canAttach)
                     .help(canAttach ? "Attach this pane here and enable keyboard input" : "This host is available in observe mode only")
@@ -2855,7 +2830,7 @@ private struct WatchLivePanePanel: View {
                     } label: {
                         Label("Stop", systemImage: "stop.fill")
                     }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(.muxaGhost)
                 }
             }
             .padding(.horizontal, 10)
@@ -3008,14 +2983,14 @@ struct WatchHostTree: View {
             HStack(spacing: 0) {
                 Button { manualExpansion = !expanded } label: {
                     hierarchyChevron(expanded)
-                        .frame(width: 30, height: 36)
+                        .frame(width: 16, height: MuxaTheme.rowHeight)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
 
                 Button { selectHost(group.host.alias) } label: {
                     HStack(spacing: 6) {
-                        HostIdentityBadge(host: group.host, size: 20)
+                        HostIdentityBadge(host: group.host, size: 16)
                         Text(group.host.alias)
                             .font(.callout.weight(.semibold))
                             .lineLimit(1)
@@ -3028,7 +3003,7 @@ struct WatchHostTree: View {
                             .frame(width: 6, height: 6)
                     }
                     .padding(.horizontal, 7)
-                    .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                    .frame(maxWidth: .infinity, minHeight: MuxaTheme.rowHeight, alignment: .leading)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -3105,7 +3080,7 @@ private struct WatchSessionTree: View {
                 explorerIndent(depth: 1)
                 Button { manualExpansion = !expanded } label: {
                     hierarchyChevron(expanded)
-                        .frame(width: 30, height: 34)
+                        .frame(width: 16, height: MuxaTheme.rowHeight)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -3135,7 +3110,7 @@ private struct WatchSessionTree: View {
                             .foregroundStyle(.tertiary)
                     }
                     .padding(.trailing, 7)
-                    .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+                    .frame(maxWidth: .infinity, minHeight: MuxaTheme.rowHeight, alignment: .leading)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -3201,7 +3176,7 @@ private struct WatchWindowTree: View {
                 explorerIndent(depth: 2)
                 Button { manualExpansion = !expanded } label: {
                     hierarchyChevron(expanded)
-                        .frame(width: 30, height: 34)
+                        .frame(width: 16, height: MuxaTheme.rowHeight)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -3223,7 +3198,7 @@ private struct WatchWindowTree: View {
                             .foregroundStyle(.tertiary)
                     }
                     .padding(.trailing, 7)
-                    .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+                    .frame(maxWidth: .infinity, minHeight: MuxaTheme.rowHeight, alignment: .leading)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -3286,7 +3261,7 @@ private struct WatchPaneRow: View {
         Button { selectPane(pane.id) } label: {
             HStack(spacing: 0) {
                 explorerIndent(depth: depth)
-                Color.clear.frame(width: 30)
+                Color.clear.frame(width: 16)
                 HStack(spacing: 6) {
                     Image(systemName: pane.agent == nil ? "terminal" : "person.crop.circle")
                         .font(.caption)
@@ -3310,7 +3285,7 @@ private struct WatchPaneRow: View {
                 }
                 .padding(.trailing, 8)
             }
-            .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+            .frame(maxWidth: .infinity, minHeight: MuxaTheme.rowHeight, alignment: .leading)
             .background(watchHighlightFill(highlight))
             .overlay(alignment: .leading) { WatchFollowedMarker(highlight: highlight) }
             .contentShape(Rectangle())
@@ -3407,14 +3382,14 @@ struct WatchFlatPaneRow: View {
 }
 
 private func explorerIndent(depth: Int) -> some View {
-    HStack(spacing: 11) {
+    HStack(spacing: MuxaTheme.treeIndent - 1) {
         ForEach(0..<depth, id: \.self) { _ in
             Rectangle()
                 .fill(Color(nsColor: .separatorColor).opacity(0.42))
                 .frame(width: 1)
         }
     }
-    .frame(width: CGFloat(depth) * 14, height: 34, alignment: .trailing)
+    .frame(width: CGFloat(depth) * MuxaTheme.treeIndent, height: MuxaTheme.rowHeight, alignment: .trailing)
 }
 
 private func hierarchyChevron(_ expanded: Bool) -> some View {
@@ -3540,9 +3515,9 @@ private struct FleetPaneInspector: View {
             }
         }
         .padding(12)
-        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
+        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 10)
+            RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous)
                 .stroke(Color(nsColor: .separatorColor).opacity(0.4), lineWidth: 0.5)
         }
     }
@@ -3723,7 +3698,7 @@ private struct FleetPaneInspector: View {
             HostIdentityBadge(identity: pane.host, size: 36)
             VStack(alignment: .leading, spacing: 2) {
                 Text(pane.agent?.aiTitle ?? pane.pane.agentAlias.map { "@\($0)" } ?? pane.pane.title.nonEmpty ?? pane.pane.currentCommand)
-                    .font(.title2.weight(.semibold))
+                    .font(.system(size: 14, weight: .semibold))
                     .lineLimit(2)
                 HStack(spacing: 7) {
                     Text(pane.host.alias)
@@ -3959,9 +3934,9 @@ private struct PanePromptComposer: View {
             get: { prompt },
             set: { prompt = $0; draftRevision = UUID() }
         ), axis: .vertical)
-            .textFieldStyle(.roundedBorder)
             .lineLimit(1...4)
             .focused($promptFocused)
+            .muxaFieldChrome(focused: promptFocused)
             .onSubmit(send)
     }
 
@@ -3974,7 +3949,7 @@ private struct PanePromptComposer: View {
 
     private var sendButton: some View {
         Button("Send", action: send)
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.muxaPrimary)
             .disabled(!PromptComposerRules.canSend(prompt: prompt, sending: sending, hosts: [host]))
     }
 
@@ -4035,7 +4010,7 @@ struct WorkPromptComposer: View {
         }
         .background(PromptComposerSendKey(focused: promptFocused, send: send))
         .padding(14)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
     }
 
     private var workPromptField: some View {
@@ -4043,9 +4018,9 @@ struct WorkPromptComposer: View {
             get: { prompt },
             set: { prompt = $0; draftRevision = UUID() }
         ), axis: .vertical)
-            .textFieldStyle(.roundedBorder)
             .lineLimit(1...4)
             .focused($promptFocused)
+            .muxaFieldChrome(focused: promptFocused)
             .onSubmit(send)
     }
 
@@ -4058,7 +4033,7 @@ struct WorkPromptComposer: View {
 
     private var workSendButton: some View {
         Button("Send to \(work.participants.count)", action: send)
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.muxaPrimary)
             .disabled(!PromptComposerRules.canSend(prompt: prompt, sending: sending, hosts: promptHosts))
     }
 

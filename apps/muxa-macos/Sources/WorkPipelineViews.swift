@@ -140,7 +140,7 @@ struct WorkPipelineCard: View {
                         Button(action: sync) {
                             Label("Sync to hosts", systemImage: "arrow.triangle.2.circlepath")
                         }
-                        .buttonStyle(.borderless)
+                        .buttonStyle(.muxaGhost)
                         .controlSize(.small)
                         .help("Write this pipeline to every host where it is missing or differs")
                     }
@@ -178,15 +178,15 @@ struct WorkPipelineCard: View {
                 Button(action: start) {
                     Label("Start…", systemImage: "play.fill")
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.muxaPrimary)
                 .controlSize(.small)
             }
         }
         .padding(14)
         .frame(maxWidth: .infinity, minHeight: 168, alignment: .topLeading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 12)
+            RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous)
                 .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
         }
     }
@@ -343,16 +343,16 @@ struct WorkPresetGallery: View {
                             } label: {
                                 Label("Install", systemImage: "square.and.arrow.down")
                             }
-                            .buttonStyle(.borderedProminent)
+                            .buttonStyle(.muxaPrimary)
                             .controlSize(.small)
                             .disabled(model.isApplyingWorkPreset)
                         }
                     }
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .topLeading)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                    .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
                     .overlay {
-                        RoundedRectangle(cornerRadius: 10)
+                        RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous)
                             .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
                     }
                 }
@@ -434,7 +434,7 @@ struct WorkPlanView: View {
                 Button(action: launch) {
                     Label("Launch now", systemImage: "play.fill")
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.muxaPrimary)
                 .controlSize(.small)
                 .disabled(steps.isEmpty)
             }
@@ -505,7 +505,7 @@ private struct WorkPlanStepRow: View {
                     Button(showsPrompt ? "Hide prompt" : "Show prompt") {
                         showsPrompt.toggle()
                     }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(.muxaGhost)
                     .font(.caption)
                 }
             }
@@ -557,7 +557,7 @@ struct WorkRoutesEditor: View {
                 } label: {
                     Label("Add Route", systemImage: "plus")
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.muxaGhost)
                 .disabled(editing)
             }
 
@@ -580,9 +580,9 @@ struct WorkRoutesEditor: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 12)
+            RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous)
                 .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
         }
         .onChange(of: host) { _ in
@@ -644,7 +644,7 @@ struct WorkRoutesEditor: View {
             } label: {
                 Image(systemName: "pencil")
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.muxaIcon)
             .disabled(editing || saving)
             .help("Edit this route")
             Button(role: .destructive) {
@@ -656,7 +656,7 @@ struct WorkRoutesEditor: View {
             } label: {
                 Image(systemName: "trash")
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.muxaIcon)
             .disabled(editing || saving)
             .help("Remove this route")
         }
@@ -706,7 +706,7 @@ struct WorkRoutesEditor: View {
                         if saved { editing = false }
                     }
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.muxaPrimary)
                 .controlSize(.small)
                 .disabled(saving || draft.match.trimmingCharacters(in: .whitespaces).isEmpty)
             }
