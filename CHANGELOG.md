@@ -29,16 +29,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The Apple Intelligence helper is found in `~/Applications` too, and the
   app no longer promises a helper muxad cannot find.** A Homebrew muxad now
   looks in `~/Applications/Muxa.app` after `/Applications/Muxa.app`, and
-  skips a copy it cannot execute. Settings › Providers counts the app's own
-  helper only where the running muxad will look for it, so an app opened
-  from Downloads beside a Homebrew muxad no longer reads "Runs on this Mac"
-  while every turn fails. `muxa work init` now offers the `apple` engine
+  skips a copy it cannot execute. Settings › Providers now finds the helper
+  the way the running muxad does — beside the daemon, then in an installed
+  app — and probes that copy, so an app opened from Downloads beside a
+  Homebrew muxad no longer reads "Runs on this Mac" while every turn fails. `muxa work init` now offers the `apple` engine
   when the helper is inside an installed app rather than only on `PATH`.
 - **Global Ask exports keep their shape.** An answer's own headings move
   under the export's `##` sections, a code fence left open by a cut-off
-  answer is closed, and *Copy as Prompt* escapes a closing
-  `</assistant>`, `</user>` or `</conversation>` inside a message and quotes
-  in the provider name. Saving to a file whose title starts with a dot no
+  answer is closed — in Markdown and in *Copy as Prompt*, where the
+  wrapper's tags would otherwise read as code — and *Copy as Prompt*
+  escapes a closing `</assistant>`, `</user>` or `</conversation>` inside a
+  message and quotes in the provider name. Saving to a file whose title starts with a dot no
   longer makes a hidden file, and a failed save shows as a warning instead
   of beside a checkmark.
 - **The Ask sidebar's status filter filters.** Active lists conversations

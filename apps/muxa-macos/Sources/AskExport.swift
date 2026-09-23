@@ -81,17 +81,7 @@ enum AskExport {
         var fence: Substring?
         var lines: [String] = []
         for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            let stripped = line.drop { $0 == " " }
-            let marker = stripped.prefix { $0 == "`" || $0 == "~" }
-            if marker.count >= 3, Set(marker).count == 1 {
-                if let open = fence {
-                    if marker.first == open.first, marker.count >= open.count,
-                       stripped.dropFirst(marker.count).allSatisfy(\.isWhitespace) {
-                        fence = nil
-                    }
-                } else {
-                    fence = marker
-                }
+            if track(&fence, past: line) {
                 lines.append(String(line))
                 continue
             }
@@ -113,14 +103,40 @@ enum AskExport {
 
     /// A message placed between the prompt's own tags. Only the closing tags
     /// of the wrapper are escaped — an answer that explains this very format
-    /// would otherwise end its block early — and the rest, code included,
-    /// reaches the next model as written.
+    /// would otherwise end its block early — and a code fence it left open is
+    /// closed, so the tags after it are not read as code. The rest, code
+    /// included, reaches the next model as written.
     static func promptBody(_ text: String) -> String {
-        text.replacingOccurrences(
+        let escaped = text.replacingOccurrences(
             of: "</(?=(conversation|user|assistant)>)",
             with: "&lt;/",
             options: [.regularExpression, .caseInsensitive]
         )
+        var fence: Substring?
+        for line in escaped.split(separator: "\n", omittingEmptySubsequences: false) {
+            track(&fence, past: line)
+        }
+        return fence.map { "\(escaped)\n\($0)" } ?? escaped
+    }
+
+    /// Moves `open` — the code fence a message has open so far — past
+    /// `line`, and says whether `line` was a fence at all: it opens one when
+    /// none is open, and closes `open` when it is the same kind, at least as
+    /// long, with nothing after it.
+    @discardableResult
+    private static func track(_ open: inout Substring?, past line: Substring) -> Bool {
+        let stripped = line.drop { $0 == " " }
+        let marker = stripped.prefix { $0 == "`" || $0 == "~" }
+        guard marker.count >= 3, Set(marker).count == 1 else { return false }
+        if let current = open {
+            if marker.first == current.first, marker.count >= current.count,
+               stripped.dropFirst(marker.count).allSatisfy(\.isWhitespace) {
+                open = nil
+            }
+        } else {
+            open = marker
+        }
+        return true
     }
 
     private static func attribute(_ value: String) -> String {

@@ -3846,30 +3846,31 @@ func askAppleHelperIsFoundInTheAppBundleBeforePath() throws {
 }
 
 @Test
-func askAppleHelperInTheAppCountsOnlyWhereMuxadLooks() {
-    let everything: (String) -> Bool = { _ in true }
+func askAppleHelperIsTheCopyTheServingMuxadWillRun() {
     let installed = "/Applications/Muxa.app/Contents/Helpers"
     let perUser = "/Users/op/Applications/Muxa.app/Contents/Helpers"
     let downloads = "/Users/op/Downloads/Muxa.app/Contents/Helpers"
     let homebrew = "/opt/homebrew/bin"
-    func detect(_ helpers: String, daemon: String?) -> Bool {
+    func path(own: String, daemon: String?, present: Set<String>) -> String? {
         AskProviderStore.bundledHelperDetection(
             for: "muxa-afm",
-            helpersDirectory: helpers,
+            helpersDirectory: own,
             daemonDirectory: daemon,
-            homeDirectory: "/Users/op",
-            isExecutable: everything
-        ) != nil
+            homeDirectory: "/Users/op"
+        ) { present.contains($0) }?.tool?.path
     }
     // A Homebrew daemon finds an installed app's copy, for all users or one.
-    #expect(detect(installed, daemon: homebrew))
-    #expect(detect(perUser, daemon: homebrew))
+    #expect(path(own: installed, daemon: homebrew, present: ["\(installed)/muxa-afm"]) == "\(installed)/muxa-afm")
+    #expect(path(own: perUser, daemon: homebrew, present: ["\(perUser)/muxa-afm"]) == "\(perUser)/muxa-afm")
     // It never looks in Downloads, so the app must not claim it is there…
-    #expect(!detect(downloads, daemon: homebrew))
+    #expect(path(own: downloads, daemon: homebrew, present: ["\(downloads)/muxa-afm"]) == nil)
     // …unless that app is running its own bundled daemon.
-    #expect(detect(downloads, daemon: downloads))
+    #expect(path(own: downloads, daemon: downloads, present: ["\(downloads)/muxa-afm"]) == "\(downloads)/muxa-afm")
+    // A daemon with its own sibling uses that one, before any installed app.
+    #expect(path(own: installed, daemon: "/dev/target", present: ["/dev/target/muxa-afm", "\(installed)/muxa-afm"])
+        == "/dev/target/muxa-afm")
     // A daemon that could not be identified leaves the app's copy trusted.
-    #expect(detect(downloads, daemon: nil))
+    #expect(path(own: downloads, daemon: nil, present: ["\(downloads)/muxa-afm"]) == "\(downloads)/muxa-afm")
 }
 
 @Test

@@ -146,3 +146,11 @@ private func title(_ agent: String) -> String { titles[agent] ?? agent }
     #expect(prompt.contains("<assistant name=\"a&quot;b\">"))
     #expect(prompt.components(separatedBy: "</conversation>").count == 2)
 }
+
+@Test func askExportPromptClosesAFenceACutOffAnswerLeftOpen() throws {
+    let turn = try entry("q", "```swift\nlet cut =")
+    #expect(AskExport.prompt([turn], providerTitle: title).contains("let cut =\n```\n</assistant>"))
+    // A closed fence is left as it is.
+    let whole = try entry("q", "```\ncode\n```")
+    #expect(AskExport.prompt([whole], providerTitle: title).contains("code\n```\n</assistant>"))
+}
