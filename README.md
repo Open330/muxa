@@ -317,6 +317,9 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa onboard [--tour live] [--lang auto\|en\|ko]` | Sixteen live steps on a throwaway muxa: real tmux, watch, attend, and mailbox. Refuses to nest inside an existing tmux session. `F2` switches language, `--no-quiz` offers `F12` immediately, and `--print` emits the written guide. |
 | `muxa automation list/test/log` | Rules that watch agent state and act on it — resume a session once its usage cap resets, nudge an idle agent, interrupt a stuck one. Ships enabled with no rules; `pause`, `cooldown`, per-rule hourly caps, a fire-time re-check, and a durable ledger keep it from running away. See [docs/AUTOMATION.md](docs/AUTOMATION.md). |
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
+| `muxa snapshot` | Capture this multiplexer's workspace — sessions, windows, panes, geometry, working directories, and each pane's own command line — into `$XDG_DATA_HOME/muxa/snapshots`. |
+| `muxa restore [DIR] [--run]` | Rebuild a workspace from a snapshot. Prints the plan unless `--run`, because restoring into a server that still has those sessions adds panes rather than replacing them. |
+| `muxa reload [--snapshot DIR]` | Snapshot, restart the multiplexer, and put the workspace back — the way to pick up a new tmux/rmux build without rebuilding thirty panes by hand. Run it from outside the server it restarts; a pane muxa tracked comes back on its own conversation. |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |
 

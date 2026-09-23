@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`muxa peers`, `muxa msg` and `muxa identity` speak for the right pane on
+  every host.** The CLI built its collaboration origin by reading `$TMUX_PANE`
+  and shortening `$TMUX` to a socket name, which is only correct on tmux. Hook
+  stamping and the pane scan namespace a pane by its host — `rmux:%102` — and
+  keep rmux and cmux endpoints as full paths, so on those hosts the origin
+  matched no tracked agent and every one of those commands refused with
+  "collaboration origin is not a hook-correlated tracked pane agent", naming a
+  pane whose agent was running perfectly well. The CLI now shares the MCP
+  server's origin, so the two cannot disagree again.
+
+### Added
+
+- **`muxa reload` restarts the multiplexer and puts the workspace back.**
+  Picking up a new tmux/rmux server build means restarting it, and a restart
+  discards every pane process and every agent conversation; rebuilding thirty
+  panes by hand is not realistic. `muxa snapshot` captures the shape —
+  sessions, windows, panes, geometry, working directories — plus each pane's
+  own command line, which has to be read before the restart because it lives
+  in the process table. `muxa restore` rebuilds from a snapshot and prints the
+  plan unless `--run`. `muxa reload` does all three, refusing to run inside
+  the server it is about to kill, and `--snapshot DIR` reuses an existing
+  capture so an interrupted restore can be retried.
+
+  A pane muxa tracked comes back on its own conversation: the provider's
+  session id is spliced in as `--resume` when the captured command line does
+  not already carry one. Four things the obvious implementation gets wrong are
+  handled: a session *group* lists each window once per member (what
+  `muxa workspace view` builds for a second terminal), so a 32-pane workspace
+  would otherwise restore as 380 panes; `select-layout` renumbers panes by
+  geometry, so directories are set per final index rather than inherited from
+  `split-window -c`; keys sent to a shell that has not reached a prompt are
+  swallowed, so the restore polls for the shell instead of sleeping a guessed
+  interval; and servers that rewrite their own argv into a status line (puma)
+  are reported for a human rather than replayed as a command.
+
+  Agents are matched under their host namespace: the registry names a pane
+  `rmux:%12` while the host's own control commands report the bare `%12`, so
+  without it no pane would ever be recognised as an agent's and no
+  conversation would resume.
+
 ## [0.8.51] - 2026-09-23
 
 ### Fixed

@@ -14,6 +14,7 @@ pub const COLLABORATION_AUDIT_FILENAME: &str = "collaboration-audit.ndjson";
 pub const ASK_FILENAME: &str = "ask.json";
 pub const NODE_ID_FILENAME: &str = "host-id";
 pub const DASHBOARD_WORK_FILENAME: &str = "dashboard-work.json";
+pub const SNAPSHOT_DIRNAME: &str = "snapshots";
 pub const PIPELINE_RUN_FILENAME: &str = "pipeline-runs.json";
 
 /// Default daemon socket path. Prefers `$XDG_RUNTIME_DIR/muxa.sock`; falls
@@ -51,6 +52,14 @@ pub fn default_activity_file() -> Option<PathBuf> {
 /// the prompt history so a single backup or rotation policy covers both.
 pub fn default_state_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(STATE_FILENAME))
+}
+
+/// Default directory for workspace snapshots:
+/// `$XDG_DATA_HOME/muxa/snapshots`. A snapshot is user-recoverable content —
+/// the shape of a workspace plus what each pane was running — so it belongs
+/// beside the prompt history rather than in the runtime or config dirs.
+pub fn default_snapshot_dir() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(SNAPSHOT_DIRNAME))
 }
 
 /// Stable physical-node identity used by Muxa Fleet. It intentionally lives
