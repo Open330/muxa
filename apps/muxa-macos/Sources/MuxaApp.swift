@@ -37,6 +37,9 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
         // working install. A module that is switched off is not probed, so
         // an operator who uses none still pays nothing.
         Task { await MuxaModuleRegistry.shared.probeEnabled() }
+        // WS-A: set before launch completes so a notification click that
+        // launched Muxa still reaches its pane.
+        if !AppModel.isRunningTests() { MuxaUserNotifications.shared.installDelegate() }
         if UserDefaults.standard.bool(forKey: MuxaPreferences.showWorkbenchOnLaunchKey) {
             presentWorkbench(remainingAttempts: 50)
         }
@@ -302,6 +305,9 @@ private struct MuxaEditorMenuCommands: Commands {
             Button("Next Agent Needing Attention") { dispatchActions?.nextAttention?() }
                 .keyboardShortcut("j", modifiers: [.command, .shift])
                 .disabled(actions?.nextAttention == nil)
+            // WS-A: clears every unread dot and the Dock count.
+            Button("Mark All Agents as Read") { dispatchActions?.markAllRead?() }
+                .disabled(actions?.markAllRead == nil)
             Divider()
             Button("Open Work Command Center") { dispatchActions?.openWorkCommandCenter?() }
                 .keyboardShortcut("1", modifiers: [.command, .shift])
@@ -403,5 +409,7 @@ private struct MenuBarContent: View {
         }
         .padding(12)
         .frame(width: 240)
+        // WS-A: lets a notification click reopen a closed workbench.
+        .onAppear { MuxaWorkbenchPresenter.remember(openWindow) }
     }
 }

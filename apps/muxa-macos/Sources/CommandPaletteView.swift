@@ -38,6 +38,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
     case showWork, showWatch, showInbox, showShells, refresh
     case closeEditor, previousEditor, nextEditor, splitEditor, pinEditor, focusSidebar
     case jumpToAgent, nextAttention, toggleSidebar, reopenEditor, showShortcuts
+    case markAllRead // WS-A
 
     var id: Self { self }
 
@@ -64,6 +65,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .toggleSidebar: String(localized: "View: Toggle side bar")
         case .reopenEditor: String(localized: "Editor: Reopen closed editor")
         case .showShortcuts: String(localized: "Help: Keyboard shortcuts")
+        case .markAllRead: String(localized: "Agents: Mark all as read") // WS-A
         }
     }
 
@@ -88,6 +90,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .reopenEditor: "⇧⌘T"
         case .showShortcuts: "⌘/"
         case .showWork, .showWatch, .showShells, .refresh: nil
+        case .markAllRead: nil // WS-A
         }
     }
 
@@ -111,6 +114,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .toggleSidebar: "sidebar.left"
         case .reopenEditor: "arrow.uturn.backward"
         case .showShortcuts: "keyboard"
+        case .markAllRead: "checkmark.circle" // WS-A
         }
     }
 
@@ -129,6 +133,9 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
             guard let selection = model.sidebarSelection, model.isSelectionAvailable(selection) else {
                 return String(localized: "No active editor")
             }
+        // WS-A
+        case .markAllRead:
+            guard model.attention.hasUnread else { return String(localized: "No unread agents") }
         default:
             break
         }
@@ -334,12 +341,18 @@ enum MuxaPaletteItems {
 
     /// ⌘J: every pane running an agent, the ones needing the operator
     /// first, then working, then idle — each group in topology order.
-    static func agents(watchHosts: [MuxaWatchHost]) -> [MuxaPaletteItem] {
+    static func agents(
+        watchHosts: [MuxaWatchHost],
+        unread: Set<MuxaWatchPaneIdentity> = [] // WS-A
+    ) -> [MuxaPaletteItem] {
         let panes = watchHosts.flatMap(\.sessions).flatMap(\.windows).flatMap(\.panes)
             .filter { $0.agent != nil }
         return panes.enumerated()
             .sorted { lhs, rhs in
-                let (l, r) = (MuxaAttention.rank(lhs.element), MuxaAttention.rank(rhs.element))
+                let (l, r) = (
+                    MuxaAttention.rank(lhs.element, unread: unread.contains(lhs.element.id)),
+                    MuxaAttention.rank(rhs.element, unread: unread.contains(rhs.element.id))
+                )
                 return l != r ? l < r : lhs.offset < rhs.offset
             }
             .map { _, pane in
@@ -356,7 +369,8 @@ enum MuxaPaletteItems {
                         + [pane.host.alias, "\(pane.pane.session) › \(window)", pane.pane.paneID])
                         .filter { !$0.isEmpty }.joined(separator: " · "),
                     systemImage: MuxaAttention.needsAttention(pane)
-                        ? "exclamationmark.circle.fill" : "person.crop.circle",
+                        ? "exclamationmark.circle.fill"
+                        : unread.contains(pane.id) ? "circle.fill" : "person.crop.circle", // WS-A
                     action: .navigate(.pane(pane.id)),
                     tint: pane.agent.map { agentStateColor($0.state) }
                 )
@@ -403,7 +417,10 @@ struct CommandPaletteView: View {
         case .agents:
             // Attention order is the point of this mode; recency would
             // bury a blocked agent under the one just looked at.
-            candidates = MuxaPaletteItems.agents(watchHosts: model.executionSnapshot.watchHosts)
+            candidates = MuxaPaletteItems.agents(
+                watchHosts: model.executionSnapshot.watchHosts,
+                unread: model.attention.unreadPanes // WS-A
+            )
             return MuxaPaletteSearch.results(candidates, query: query, recent: [])
         }
         return MuxaPaletteSearch.results(candidates, query: query, recent: recent)
