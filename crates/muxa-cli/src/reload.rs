@@ -1299,8 +1299,17 @@ async fn resolve_endpoint(client: &Client, socket: Option<&str>) -> Result<Backe
         // An explicit socket still needs a host to speak the right dialect.
         // The shell's own host is the best available answer; outside a
         // multiplexer the socket path is all there is to go on.
-        let host = muxa::backend::detect_host_env()
-            .or_else(|| host_from_socket_path(socket))
+        // A socket that is plainly a tmux server wins over the shell's host:
+        // tmux inside a cmux terminal is common, and cmux's variables would
+        // otherwise send an explicit tmux socket to cmux.
+        let host = host_from_socket_path(socket)
+            .or_else(|| {
+                (!socket.contains('/'))
+                    .then(|| muxa::tmux::resolve_socket_path(socket))
+                    .flatten()
+                    .map(|_| HostKind::Tmux)
+            })
+            .or_else(muxa::backend::detect_host_env)
             .unwrap_or(HostKind::Tmux);
         return endpoint_for(&host.to_string(), socket.to_owned());
     }
