@@ -302,6 +302,10 @@ private struct MuxaEditorMenuCommands: Commands {
             Button("Next Agent Needing Attention") { dispatchActions?.nextAttention?() }
                 .keyboardShortcut("j", modifiers: [.command, .shift])
                 .disabled(actions?.nextAttention == nil)
+            // WS-D
+            Button("Show Changes") { dispatchActions?.showChanges?() }
+                .keyboardShortcut("g", modifiers: [.control, .shift])
+                .disabled(actions?.showChanges == nil)
             Divider()
             Button("Open Work Command Center") { dispatchActions?.openWorkCommandCenter?() }
                 .keyboardShortcut("1", modifiers: [.command, .shift])

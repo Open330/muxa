@@ -354,6 +354,8 @@ struct ContentView: View {
                 }
             },
             showShortcuts: { showingShortcuts = true },
+            // WS-D: the focused pane or Work editor switches to Changes.
+            showChanges: { NotificationCenter.default.post(name: .muxaShowChanges, object: tabs.focusedSelection) },
             isEnabled: paletteMode == nil && !showingShortcuts && !model.isPresentingWorkStart
                 && !model.isPresentingHostRegistration && model.pipelineEditorTarget == nil
                 && !model.isConfirmingDaemonReplacement
@@ -416,6 +418,7 @@ struct ContentView: View {
             case .toggleSidebar: sidebarVisible.toggle()
             case .reopenEditor: editorCommands.reopenClosed?()
             case .showShortcuts: showingShortcuts = true
+            case .showChanges: editorCommands.showChanges?() // WS-D
             }
         }
     }
@@ -2234,6 +2237,7 @@ private struct WorkDetailView: View {
     let work: MuxaWorkGroup
     @ObservedObject var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
+    @State private var tab: WorkDetailTab = .overview // WS-D
 
     private let columns = [
         GridItem(.adaptive(minimum: 250, maximum: 390), spacing: 12, alignment: .top),
@@ -2243,7 +2247,21 @@ private struct WorkDetailView: View {
         GridItem(.adaptive(minimum: 112, maximum: 180), spacing: 12),
     ]
 
+    // WS-D: Overview | Changes; Overview is the page below, unchanged.
     var body: some View {
+        VStack(spacing: 0) {
+            WorkDetailTabBar(work: work, tab: $tab)
+            switch tab {
+            case .overview: overview
+            case .changes: ChangesWorkspaceView(work: work, model: model)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .muxaShowChanges)) { note in
+            if ChangesShowRequest.matches(note.object, work: work) { tab = .changes }
+        }
+    }
+
+    private var overview: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 VStack(alignment: .leading, spacing: 5) {
