@@ -3877,6 +3877,51 @@ fn status_state_cell(label: &str, state: AgentState, theme: CliTheme) -> Cell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// rmux exports the tmux compatibility variables alongside its own, and
+    /// the CLI once read `$TMUX_PANE` directly — yielding a bare `%118` where
+    /// hooks stamp `rmux:%118`, so the origin matched no tracked agent and
+    /// `muxa peers`/`msg`/`identity` refused on every host but tmux.
+    ///
+    /// The env cannot be set in-process (racy under parallel test threads, and
+    /// the workspace forbids the unsafe setter), so the test re-runs itself as
+    /// a child with the environment it needs.
+    #[test]
+    fn cli_collaboration_origin_preserves_rmux_identity() {
+        const PROBE: &str = "MUXA_TEST_CLI_ORIGIN_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            let origin = collaboration_origin().unwrap();
+            assert_eq!(origin.pane, "rmux:%118");
+            assert_eq!(
+                origin.socket.as_deref(),
+                Some("/tmp/muxa-origin-test/default")
+            );
+            assert!(!origin.console);
+            return;
+        }
+        // Isolate environment changes from parallel tests. rmux exports both
+        // native and tmux compatibility variables; native identity must win.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::cli_collaboration_origin_preserves_rmux_identity",
+                "--nocapture",
+            ])
+            .env(PROBE, "1")
+            .env("RMUX", "/tmp/muxa-origin-test/default,42,1")
+            .env("RMUX_PANE", "%118")
+            .env("TMUX", "/tmp/muxa-origin-test/default,42,1")
+            .env("TMUX_PANE", "%118")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     use muxa::collaboration::{CollaborationRequest, RoomId};
     use muxa::AgentKind;
     use time::macros::datetime;
