@@ -121,6 +121,10 @@ final class AppModel: ObservableObject {
     /// Whether the connected daemon can run Work commands on fleet hosts.
     @Published private(set) var supportsHostWorkCommands = false
     @Published private(set) var isStartingWork = false
+    // WS-B: new agent — the launcher holds the sheet's state; this mirror
+    // lets menu items (which observe AppModel only) disable while starting.
+    let agentLauncher = MuxaAgentLauncher()
+    @Published var isStartingAgent = false
     /// The last dry-run result, shown in the sheet so the operator sees the
     /// exact agents and prompts before launching for real.
     @Published private(set) var workStartPlan: MuxaWorkStartResult?

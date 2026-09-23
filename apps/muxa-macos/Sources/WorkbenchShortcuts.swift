@@ -82,6 +82,9 @@ enum MuxaShortcutCatalog {
             Section(title: String(localized: "Work & Shells"), entries: [
                 Entry(keys: "⌥⌘N", title: String(localized: "Start Work")),
                 Entry(keys: "⌘T", title: String(localized: "New Shell")),
+                // WS-B: new agent
+                Entry(keys: "⌥⌘T", title: String(localized: "New Default Agent (focused folder)")),
+                Entry(keys: "⌥⇧⌘T", title: String(localized: "New Agent…")),
                 Entry(keys: "⌘↩", title: String(localized: "Send Prompt from a Composer")),
             ]),
             // WS-D

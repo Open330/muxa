@@ -37,6 +37,12 @@ pub struct LaunchPipelineAgent {
 pub struct LaunchLegacyGuide {
     pub program: Option<String>,
     pub options: Vec<String>,
+    /// `[mcp.guide].placement` and `.direction`, so a client starting one
+    /// agent honours the same launch defaults MCP callers get.
+    #[serde(default)]
+    pub placement: crate::config::McpPlacement,
+    #[serde(default)]
+    pub direction: crate::config::McpSplitDirection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +124,8 @@ fn launch_settings(text: &str) -> Result<LaunchSettings, ConfigFileError> {
         legacy_guide: LaunchLegacyGuide {
             program: config.mcp.guide.agent,
             options: config.mcp.guide.options,
+            placement: config.mcp.guide.placement,
+            direction: config.mcp.guide.direction,
         },
     })
 }
@@ -441,6 +449,18 @@ options = ["--model", "other"]
             settings.pipelines[2].effective_options,
             ["--model", "other"]
         );
+    }
+
+    #[test]
+    fn launch_carries_the_guide_placement_and_direction() {
+        let configured =
+            launch_settings("[mcp.guide]\nplacement = \"window\"\ndirection = \"down\"\n").unwrap();
+        let wire = serde_json::to_value(&configured.legacy_guide).unwrap();
+        assert_eq!(wire["placement"], "window");
+        assert_eq!(wire["direction"], "down");
+        let defaults = serde_json::to_value(launch_settings("").unwrap().legacy_guide).unwrap();
+        assert_eq!(defaults["placement"], "pane");
+        assert_eq!(defaults["direction"], "right");
     }
 
     #[test]

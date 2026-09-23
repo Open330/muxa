@@ -78,6 +78,10 @@ struct MuxaLaunchSettings: Codable, Hashable, Sendable {
     struct LegacyGuide: Codable, Hashable, Sendable {
         var program: String?
         var options: [String]
+        // WS-B: new agent — `[mcp.guide]` placement/direction; absent from
+        // an older muxad.
+        var placement: String? = nil
+        var direction: String? = nil
     }
     var providers: [MuxaLaunchProvider]
     var pipelines: [MuxaLaunchPipelineAgent]
