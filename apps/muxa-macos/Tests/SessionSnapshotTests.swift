@@ -21,7 +21,8 @@ private let planJSON = #"""
     {"index":"0","path":"HOME/p","action":"resume","command":"claude --resume abc","agent_kind":"claude_code"},
     {"index":"1","path":"/srv","action":"replay","command":"npm run dev -- --port 5173 --host 0.0.0.0"},
     {"index":"2","path":"/srv","action":"manual","command":"puma 5.6.8 (tcp://0.0.0.0:5072)"},
-    {"index":"3","path":"/srv","action":"teleport"}]}]}
+    {"index":"3","path":"/srv","action":"teleport"},
+    {"index":"4","path":"/srv","action":"resume_by_hand","agent_kind":"codex","note":"command line was not captured; resume by hand with `codex resume xyz`"}]}]}
  ]}
 """#
 
@@ -58,6 +59,7 @@ private func plan(_ json: String) throws -> MuxSnapshotPlan {
     #expect(summary.takenAt != nil, "fractional RFC 3339 parses")
     #expect(summary.notReplayable == 1)
     #expect(summary.serverLabel == "tmux default")
+    #expect(MuxSnapshotSummary(socket: "/private/tmp/tmux-501/work").serverLabel == "tmux work")
     #expect(summary.countsLabel == "2 sessions · 6 windows · 32 panes")
     #expect(!entries[1].readable)
     #expect(entries[1].error?.contains("expected value") == true)
@@ -105,6 +107,8 @@ private func plan(_ json: String) throws -> MuxSnapshotPlan {
     #expect(panes[2].help == "npm run dev -- --port 5173 --host 0.0.0.0", "full command on hover")
     #expect(panes[3].badge == .notReplayable)
     #expect(panes[4].badge == nil, "an action this build does not know stays unlabelled")
+    #expect(panes[5].badge == .resumeByHand)
+    #expect(panes[5].help?.contains("codex resume xyz") == true, "the note is the hover text")
     #expect(rows.filter { $0.depth == 1 }.first?.detail == "1 pane")
 }
 

@@ -492,15 +492,16 @@ private struct SessionSnapshotBadge: View {
         switch badge {
         case .willCreate: Text("Create")
         case .exists: Text("Exists — skipped")
-        case .willAddPanes: Text("Exists — panes added")
+        case .willFillMissing: Text("Exists — missing parts added")
         case .created: Text("Created")
-        case .panesAdded: Text("Panes added")
+        case .filled: Text("Missing parts added")
         case .skipped: Text("Skipped")
         case .failed: Text("Failed")
         case .resume(let agent): Text("resume \(agent)")
         case .replay(let command): Text("replay \(command)")
         case .shell: Text("shell")
         case .notReplayable: Text("not replayable")
+        case .resumeByHand: Text("resume by hand")
         case .relaunched: Text("relaunched")
         case .startByHand: Text("start by hand")
         }
@@ -508,22 +509,22 @@ private struct SessionSnapshotBadge: View {
 
     private var symbol: String {
         switch badge {
-        case .willCreate, .willAddPanes: "plus.circle"
+        case .willCreate, .willFillMissing: "plus.circle"
         case .exists, .skipped: "minus.circle"
-        case .created, .panesAdded, .relaunched: "checkmark.circle"
+        case .created, .filled, .relaunched: "checkmark.circle"
         case .failed: "xmark.octagon"
         case .resume: "arrow.clockwise"
         case .replay: "play"
         case .shell: "terminal"
-        case .notReplayable, .startByHand: "hand.raised"
+        case .notReplayable, .startByHand, .resumeByHand: "hand.raised"
         }
     }
 
     private var color: Color {
         switch badge {
-        case .willCreate, .willAddPanes, .resume, .replay: .accentColor
-        case .created, .panesAdded, .relaunched: .green
-        case .notReplayable, .startByHand: .orange
+        case .willCreate, .willFillMissing, .resume, .replay: .accentColor
+        case .created, .filled, .relaunched: .green
+        case .notReplayable, .startByHand, .resumeByHand: .orange
         case .exists, .skipped, .shell: .secondary
         case .failed: .red
         }

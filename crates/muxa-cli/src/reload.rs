@@ -40,6 +40,10 @@ const SNAPSHOT_VERSION: u32 = 1;
 /// poll exits as soon as it is.
 const SHELL_READY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long a pane may report a program other than its shell before it counts
+/// as busy rather than as a shell still starting up.
+const BUSY_GRACE: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Parser)]
 pub struct SnapshotArgs {
     /// Directory to write the snapshot into. Defaults to a timestamped
@@ -84,8 +88,8 @@ pub struct RestoreArgs {
     snapshot: Option<PathBuf>,
 
     /// Actually run the restore. Without it the plan is printed and nothing
-    /// is created, because a restore into a server that still has these
-    /// sessions adds panes rather than replacing them.
+    /// is created. What already exists is kept: only missing sessions,
+    /// windows and panes are added, so a retry is safe.
     #[arg(long)]
     run: bool,
 
@@ -454,7 +458,8 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
             println!("\ndry run. Re-run with --run to create the missing sessions.");
         } else {
             println!(
-                "\ndry run. Re-run with --run against a server that does not have these sessions."
+                "\ndry run. Re-run with --run; sessions, windows and panes that already exist \
+                 are kept and only what is missing is created."
             );
         }
         return Ok(());
@@ -518,20 +523,44 @@ pub async fn reload(client: &Client, args: ReloadArgs) -> Result<()> {
         snapshot
     };
 
+    // Only a socket path survives the restart. An explicit --mux-socket names
+    // the server, as it does for `restore`; otherwise the snapshot does, and
+    // one from before paths were recorded still carries a short name, so it
+    // is pinned while the server is up to be asked.
+    let endpoint = if args.mux_socket.is_some() {
+        pinned(&endpoint)
+    } else {
+        pinned(&endpoint_for(&snapshot.host, snapshot.socket.clone())?)
+    };
+    if !Path::new(&endpoint.socket).is_absolute() {
+        bail!(
+            "{} is not a socket path, and the server it names cannot be asked for one; \
+             it could not be brought back after a restart. Pass --mux-socket with the path.",
+            endpoint.socket
+        );
+    }
+    let continuum = continuum_restores(&endpoint);
+
     if !args.yes && !confirm(&endpoint) {
         println!("aborted; nothing was touched.");
         return Ok(());
     }
 
-    // Resolved while the server still answers, so the restore below targets
-    // the socket the old server actually used rather than a guess.
-    let control = control_endpoint(&endpoint);
     println!("stopping {}", endpoint.socket);
-    let _ = mux_control::run(&control, &["kill-server"]);
-    wait_for_server_to_stop(&control)?;
+    let _ = mux_control::run(&endpoint, &["kill-server"]);
+    wait_for_server_to_stop(&endpoint)?;
+
+    if continuum {
+        // tmux-continuum rebuilds its own last save the moment the server
+        // starts. Racing it means every window gets its panes twice, so let
+        // it finish and then fill in only what it left out.
+        println!("tmux-continuum restores on start; waiting for it to settle");
+        let _ = mux_control::run(&endpoint, &["start-server"]);
+        wait_for_sessions_to_settle(&endpoint);
+    }
 
     apply(
-        &control,
+        &endpoint,
         &snapshot,
         args.layout_only,
         &mut RestoreReport::new(true),
@@ -545,9 +574,8 @@ pub async fn reload(client: &Client, args: ReloadArgs) -> Result<()> {
 
 /// Read the whole workspace shape off the host, plus what each pane runs.
 async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot> {
-    let control = control_endpoint(endpoint);
     let panes = mux_control::capture(
-        &control,
+        endpoint,
         &[
             "list-panes",
             "-a",
@@ -558,7 +586,7 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
     .map_err(anyhow::Error::msg)
     .context("listing panes")?;
     let windows = mux_control::capture(
-        &control,
+        endpoint,
         &[
             "list-windows",
             "-a",
@@ -569,10 +597,12 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
     .map_err(anyhow::Error::msg)
     .context("listing windows")?;
 
+    let socket = pinned(endpoint).socket;
+
     let agents = client
         .snapshot()
         .await
-        .map(|agents| agents_by_pane(&agents))
+        .map(|agents| agents_by_pane(&agents, &socket))
         .unwrap_or_default();
 
     let (windows, keep) = fold_window_groups(&windows);
@@ -608,10 +638,29 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
         host: endpoint.host.to_string(),
-        socket: endpoint.socket.clone(),
+        socket,
         windows,
         panes: shapes,
     })
+}
+
+/// The same server, named by its socket's absolute path. The short name muxad
+/// records on a pane (`default`) resolves only against a live server, and a
+/// snapshot has to outlive one — so the path is read while the server is
+/// still there to ask. A server that cannot be asked keeps its name.
+fn pinned(endpoint: &BackendEndpoint) -> BackendEndpoint {
+    if endpoint.host != HostKind::Tmux || Path::new(&endpoint.socket).is_absolute() {
+        return endpoint.clone();
+    }
+    let socket = mux_control::capture(endpoint, &["display-message", "-p", "#{socket_path}"])
+        .ok()
+        .map(|path| path.trim().to_owned())
+        .filter(|path| Path::new(path).is_absolute())
+        .unwrap_or_else(|| endpoint.socket.clone());
+    BackendEndpoint {
+        host: endpoint.host,
+        socket,
+    }
 }
 
 /// One window is listed once per session that shows it, because a session
@@ -669,12 +718,12 @@ fn namespaced(host: HostKind, pane_id: &str) -> String {
     }
 }
 
-/// The endpoint to send control commands to. A tmux server is named by a
-/// short socket name (`default`), and the lookup that turns a name into a
-/// socket path only finds sockets that exist — which, right after
-/// `kill-server`, this one does not, so every restore command used to land on
-/// `/dev/null`. Pinning the full path keeps the commands on the server being
-/// recreated. rmux endpoints are already paths.
+/// The endpoint `restore` sends control commands to. Snapshots record the
+/// socket's absolute path, which is used as given. One taken before paths
+/// were recorded carries a short name (`default`), which resolves only
+/// against a live server — so after a reboot it is pinned to the path tmux
+/// itself would create for that name rather than to `/dev/null`. rmux
+/// endpoints are already paths.
 fn control_endpoint(endpoint: &BackendEndpoint) -> BackendEndpoint {
     match endpoint.host {
         HostKind::Tmux => BackendEndpoint {
@@ -687,11 +736,20 @@ fn control_endpoint(endpoint: &BackendEndpoint) -> BackendEndpoint {
     }
 }
 
-fn agents_by_pane(agents: &[muxa::Agent]) -> HashMap<String, AgentShape> {
+/// The agents on *this* server, by pane id. Every tmux server numbers its
+/// panes from `%0`, so an id alone would attach the default server's agent
+/// to a pane of the same number elsewhere — and resume its conversation
+/// there. An agent without a recorded server is taken to be on the default
+/// one, which is what muxad assumes when it records nothing.
+fn agents_by_pane(agents: &[muxa::Agent], socket: &str) -> HashMap<String, AgentShape> {
     agents
         .iter()
         .filter_map(|agent| {
             let pane = agent.pane.clone()?;
+            let recorded = agent.tmux_socket.as_deref().unwrap_or("default");
+            if !muxa::backend::pane_endpoints_match(Some(&pane), socket, recorded) {
+                return None;
+            }
             let kind = match agent.kind {
                 AgentKind::ClaudeCode => "claude_code",
                 AgentKind::Codex => "codex",
@@ -730,10 +788,14 @@ fn rebuild_shape(
     report: &mut RestoreReport,
 ) -> Result<()> {
     let mut created = 0_usize;
+    let mut fresh: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for window in &snapshot.windows {
         match ensure_window(endpoint, snapshot, window) {
             Ok(count) => {
                 created += count;
+                if count > 0 {
+                    fresh.insert(format!("{}:{}", window.session, window.index));
+                }
                 report.reached.insert(window.session.clone());
             }
             Err(error) => {
@@ -743,22 +805,41 @@ fn rebuild_shape(
         }
     }
 
-    // Every window starts with one pane, so the first pane recorded for each
-    // window is already there — whatever its index, since `pane-base-index`
-    // may start the numbering at 1.
+    // A window that already has panes — a retried restore, or a plugin that
+    // restored its own save on server start — gets only the ones it lacks.
+    // Splitting unconditionally is how a restore doubles a workspace.
+    let mut kept = 0_usize;
     let mut split_failures = Vec::new();
-    for pane in panes_after_the_first(&snapshot.panes) {
-        let target = format!("={}:{}", pane.session, pane.window_index);
-        // `split-window -d` keeps splitting the same pane, halving it each
-        // time until there is no room left. Re-tiling first hands the split
-        // an evenly sized pane; the recorded layout replaces the tiling below.
-        let _ = mux_control::run(endpoint, &["select-layout", "-t", &target, "tiled"]);
-        if let Err(error) = mux_control::run(
-            endpoint,
-            &["split-window", "-d", "-t", &target, "-c", &pane.path],
-        ) {
-            report.pane_failed(pane_target(pane), format!("could not split — {error}"));
-            split_failures.push((pane_target(pane), error));
+    for window in &snapshot.windows {
+        let target = format!("={}:{}", window.session, window.index);
+        let wanted: Vec<_> = snapshot
+            .panes
+            .iter()
+            .filter(|pane| pane.session == window.session && pane.window_index == window.index)
+            .collect();
+        // A window that cannot be listed is not one with a single pane;
+        // splitting on a guess is the doubling this guards against.
+        let Some(have) = pane_count(endpoint, &target) else {
+            report.say(&format!("  {target}: could not list its panes; left as is"));
+            continue;
+        };
+        let have = have.max(1);
+        if !fresh.contains(&format!("{}:{}", window.session, window.index)) {
+            kept += have.min(wanted.len());
+        }
+        for pane in wanted.iter().skip(have) {
+            // `split-window -d` keeps splitting the same pane, halving it
+            // each time until there is no room left. Re-tiling first hands
+            // the split an evenly sized pane; the recorded layout replaces
+            // the tiling below.
+            let _ = mux_control::run(endpoint, &["select-layout", "-t", &target, "tiled"]);
+            if let Err(error) = mux_control::run(
+                endpoint,
+                &["split-window", "-d", "-t", &target, "-c", &pane.path],
+            ) {
+                report.pane_failed(pane_target(pane), format!("could not split — {error}"));
+                split_failures.push((pane_target(pane), error));
+            }
         }
     }
 
@@ -773,7 +854,11 @@ fn rebuild_shape(
     // rather than inherited from `split-window -c`.
     for pane in &snapshot.panes {
         let target = pane_target(pane);
-        wait_for_shell(endpoint, &target);
+        if !wait_for_shell(endpoint, &target) {
+            // Something is already running there; typing into it would be
+            // input to that program, not a directory change.
+            continue;
+        }
         if let Err(error) = mux_control::run(
             endpoint,
             &[
@@ -788,20 +873,11 @@ fn rebuild_shape(
         }
     }
 
-    report.say(&plan::rebuilt_line(created, snapshot.panes.len()));
+    report.say(&plan::rebuilt_line(created, snapshot.panes.len(), kept));
     for (target, error) in split_failures {
         report.say(&plan::split_failure_line(&target, &error));
     }
     Ok(())
-}
-
-/// Every pane but the first recorded one of each window, in snapshot order.
-fn panes_after_the_first(panes: &[PaneShape]) -> Vec<&PaneShape> {
-    let mut seen = std::collections::BTreeSet::new();
-    panes
-        .iter()
-        .filter(|pane| !seen.insert((pane.session.as_str(), pane.window_index.as_str())))
-        .collect()
 }
 
 /// The `columns x rows` a window had, from its layout string
@@ -895,6 +971,22 @@ fn ensure_window(
     Ok(created)
 }
 
+/// How many panes a window has right now; `None` when the server could not
+/// say, which is not the same as none.
+fn pane_count(endpoint: &BackendEndpoint, window_target: &str) -> Option<usize> {
+    mux_control::capture(
+        endpoint,
+        &["list-panes", "-t", window_target, "-F", "#{pane_id}"],
+    )
+    .ok()
+    .map(|listing| {
+        listing
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+    })
+}
+
 /// The window indexes a session currently has.
 fn window_indexes(endpoint: &BackendEndpoint, session_target: &str) -> Vec<String> {
     mux_control::capture(
@@ -916,23 +1008,53 @@ fn replay_commands(endpoint: &BackendEndpoint, snapshot: &Snapshot, report: &mut
     let mut replayed = 0_usize;
     let mut manual = Vec::new();
     for pane in &snapshot.panes {
+        let target = pane_target(pane);
         let Some(command) = relaunch_command(pane) else {
+            if let Some(hint) = resume_hint(pane) {
+                manual.push((target, hint));
+            }
             continue;
         };
         if !pane.replayable {
-            manual.push(pane_target(pane));
+            manual.push((
+                target,
+                "argv was a process title, not a command — start it by hand".to_owned(),
+            ));
             continue;
         }
-        let target = pane_target(pane);
+        if !wait_for_shell(endpoint, &target) {
+            manual.push((target, "already running something; left alone".to_owned()));
+            continue;
+        }
         match mux_control::run(endpoint, &["send-keys", "-t", &target, &command, "Enter"]) {
             Ok(()) => replayed += 1,
             Err(error) => report.pane_failed(target, error),
         }
     }
     report.say(&plan::relaunched_line(replayed));
-    for target in manual {
-        report.say(&plan::manual_line(&target));
+    for (target, note) in manual {
+        report.say(&plan::manual_line(&target, &note));
+        report.pane_left(target, note);
     }
+}
+
+/// What to tell a human about an agent pane whose command line was not
+/// captured: the conversation is still resumable, just not automatically,
+/// because the wrapper it was launched through is unknown.
+fn resume_hint(pane: &PaneShape) -> Option<String> {
+    let agent = pane.agent.as_ref()?;
+    if agent.session_id.is_empty() || agent.session_id.starts_with("synthetic") {
+        return None;
+    }
+    let resume = match agent.kind.as_str() {
+        "claude_code" => format!("claude --resume {}", agent.session_id),
+        "codex" => format!("codex resume {}", agent.session_id),
+        _ => return None,
+    };
+    Some(format!(
+        "command line was not captured; resume by hand with `{resume}` \
+         (through the same wrapper it was started with)"
+    ))
 }
 
 /// What to type back into a pane: its own command line, with the provider's
@@ -981,11 +1103,16 @@ fn pane_target(pane: &PaneShape) -> String {
 
 /// A pane created a moment ago is still starting its shell, and keys sent
 /// before the prompt appears are swallowed. Poll for the shell instead of
-/// sleeping a guessed interval.
-fn wait_for_shell(endpoint: &BackendEndpoint, target: &str) {
+/// sleeping a guessed interval. A pane that keeps reporting some other
+/// program is not starting, it is busy — a shell's own startup may run a
+/// child for a moment, so it gets a short grace, not the full wait — and
+/// the answer is `false`: nothing should be typed into it.
+fn wait_for_shell(endpoint: &BackendEndpoint, target: &str) -> bool {
     let deadline = Instant::now() + SHELL_READY_TIMEOUT;
+    let mut busy_since: Option<Instant> = None;
+    let mut saw_shell = false;
     while Instant::now() < deadline {
-        let idle = mux_control::capture(
+        let command = mux_control::capture(
             endpoint,
             &[
                 "display-message",
@@ -994,12 +1121,78 @@ fn wait_for_shell(endpoint: &BackendEndpoint, target: &str) {
                 target,
                 "#{pane_current_command}",
             ],
-        )
-        .is_ok_and(|command| is_shell(command.trim()));
-        if idle {
-            return;
+        );
+        match command {
+            Ok(command) if is_shell(command.trim()) => {
+                // The pane runs its shell from the first instant, before the
+                // prompt is up and keys are read. The prompt being drawn is
+                // the only sign tmux can give that the shell is listening.
+                saw_shell = true;
+                busy_since = None;
+                if prompt_drawn(endpoint, target) {
+                    return true;
+                }
+            }
+            Ok(_) => {
+                let since = *busy_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= BUSY_GRACE {
+                    return false;
+                }
+            }
+            Err(_) => busy_since = None,
         }
         std::thread::sleep(Duration::from_millis(200));
+    }
+    // A shell that never drew anything in all that time is taken at its
+    // word; a pane that was never a shell is not typed into.
+    saw_shell
+}
+
+/// Whether anything is on the pane's screen — a prompt, for a shell.
+fn prompt_drawn(endpoint: &BackendEndpoint, target: &str) -> bool {
+    mux_control::capture(endpoint, &["capture-pane", "-p", "-t", target])
+        .is_ok_and(|screen| !screen.trim().is_empty())
+}
+
+/// Whether tmux-continuum will rebuild its own save when this server starts.
+fn continuum_restores(endpoint: &BackendEndpoint) -> bool {
+    mux_control::capture(endpoint, &["show-options", "-gqv", "@continuum-restore"])
+        .is_ok_and(|value| value.trim() == "on")
+}
+
+/// Wait until the pane listing stops changing: a plugin restoring on server
+/// start works asynchronously, and nothing else says when it is done.
+fn wait_for_sessions_to_settle(endpoint: &BackendEndpoint) {
+    const QUIET: Duration = Duration::from_secs(3);
+    /// The restore is launched from the config as the server starts and
+    /// takes a moment to make its first session; quiet before then means
+    /// nothing.
+    const HEAD_START: Duration = Duration::from_secs(5);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(60);
+    let listing = || {
+        mux_control::capture(
+            endpoint,
+            &[
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}:#{window_index}.#{pane_index}",
+            ],
+        )
+        .unwrap_or_default()
+    };
+    let mut last = listing();
+    let mut quiet_since = Instant::now();
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+        let now = listing();
+        if now != last {
+            last = now;
+            quiet_since = Instant::now();
+        } else if quiet_since.elapsed() >= QUIET && started.elapsed() >= HEAD_START {
+            return;
+        }
     }
 }
 
@@ -1227,56 +1420,35 @@ fn child_command(pane_pid: u32) -> Option<ChildCommand> {
     })
 }
 
-/// BSD `ps` has no `--ppid`, so the children come from `pgrep -P` and each
-/// one's command line from `ps -p`. macOS only reports that line joined; the
-/// original argument boundaries are not recoverable without `sysctl`
-/// (`KERN_PROCARGS2`), which needs unsafe code this workspace forbids, so an
-/// argument that contained a space replays split on it.
+/// BSD `ps` has no `--ppid`, so every process is listed with its parent and
+/// the shell's children are picked out here. macOS only reports a command
+/// line joined; the original argument boundaries are not recoverable without
+/// `sysctl` (`KERN_PROCARGS2`), which needs unsafe code this workspace
+/// forbids, so an argument that contained a space replays split on it.
 #[cfg(not(target_os = "linux"))]
 fn child_command(pane_pid: u32) -> Option<ChildCommand> {
-    child_command_with(
-        pane_pid,
-        |pid| {
-            std::process::Command::new("pgrep")
-                .args(["-P", &pid.to_string()])
-                .output()
-                .map(|output| parse_pids(&String::from_utf8_lossy(&output.stdout)))
-                .unwrap_or_default()
-        },
-        |pid| {
-            std::process::Command::new("ps")
-                .args(["-o", "command=", "-p", &pid.to_string()])
-                .output()
-                .ok()
-                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        },
-    )
-}
-
-/// The first child of `pane_pid` that is not itself a shell, with the process
-/// table reached through `children` and `command_of` so the choice can be
-/// tested without one.
-#[cfg(any(not(target_os = "linux"), test))]
-fn child_command_with(
-    pane_pid: u32,
-    children: impl Fn(u32) -> Vec<u32>,
-    command_of: impl Fn(u32) -> Option<String>,
-) -> Option<ChildCommand> {
-    children(pane_pid).into_iter().find_map(|child| {
-        let command = command_of(child)?;
-        (!command.is_empty() && !is_shell(&command)).then_some(ChildCommand {
-            command,
-            argv: None,
-        })
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "ppid=,command="])
+        .output()
+        .ok()?;
+    children_of(&String::from_utf8_lossy(&output.stdout), pane_pid).map(|command| ChildCommand {
+        command,
+        argv: None,
     })
 }
 
+/// The first non-shell command among a process's children, from a
+/// `ps -axo ppid=,command=` listing.
 #[cfg(any(not(target_os = "linux"), test))]
-fn parse_pids(listing: &str) -> Vec<u32> {
-    listing
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .collect()
+fn children_of(listing: &str, parent: u32) -> Option<String> {
+    listing.lines().find_map(|line| {
+        let (ppid, command) = line.trim_start().split_once(char::is_whitespace)?;
+        if ppid.parse::<u32>().ok()? != parent {
+            return None;
+        }
+        let command = command.trim();
+        (!command.is_empty() && !is_shell(command)).then(|| command.to_owned())
+    })
 }
 
 fn is_shell(command: &str) -> bool {
@@ -1301,42 +1473,6 @@ mod tests {
             argv: None,
             agent: None,
         }
-    }
-
-    #[test]
-    fn a_pane_is_captured_from_its_child_not_its_shell() {
-        // macOS: `pgrep -P` lists the shell's children and `ps -p` names
-        // each; a nested shell is skipped in favour of the real command.
-        let children = |pid: u32| if pid == 10 { vec![11, 12] } else { vec![] };
-        let command_of = |pid: u32| match pid {
-            11 => Some("-zsh".to_owned()),
-            12 => Some("npm run dev".to_owned()),
-            _ => None,
-        };
-        assert_eq!(
-            child_command_with(10, children, command_of).map(|child| child.command),
-            Some("npm run dev".to_owned())
-        );
-        assert_eq!(child_command_with(99, children, command_of), None);
-        assert_eq!(parse_pids("123\n 456\n\nnot-a-pid\n"), vec![123, 456]);
-    }
-
-    #[test]
-    fn the_first_recorded_pane_of_each_window_is_not_split_again() {
-        // With `pane-base-index 1` there is no pane "0"; the window's own
-        // first pane must still be the one that is not created by a split.
-        let panes = [
-            pane("work", "1", "1", None),
-            pane("work", "1", "2", None),
-            pane("work", "2", "1", None),
-            pane("side", "1", "1", None),
-            pane("side", "1", "2", None),
-        ];
-        let split: Vec<String> = panes_after_the_first(&panes)
-            .into_iter()
-            .map(pane_target)
-            .collect();
-        assert_eq!(split, ["=work:1.2", "=side:1.2"]);
     }
 
     #[test]
@@ -1439,11 +1575,92 @@ mod tests {
     }
 
     #[test]
+    fn children_are_picked_out_of_a_bsd_ps_listing() {
+        let listing = "    1 /sbin/launchd\n\
+                       4242 -zsh\n\
+                       4242 aas e june@claude\n\
+                       4243 codex resume abc\n";
+        assert_eq!(
+            children_of(listing, 4242).as_deref(),
+            Some("aas e june@claude")
+        );
+        assert_eq!(
+            children_of(listing, 4243).as_deref(),
+            Some("codex resume abc")
+        );
+        assert_eq!(children_of(listing, 7), None);
+    }
+
+    #[test]
+    fn an_agent_without_a_command_line_gets_a_resume_hint_not_a_relaunch() {
+        let mut claude = pane("work", "0", "0", None);
+        claude.agent = Some(AgentShape {
+            kind: "claude_code".into(),
+            session_id: "abc-123".into(),
+        });
+        assert_eq!(relaunch_command(&claude), None);
+        assert!(resume_hint(&claude)
+            .unwrap()
+            .contains("claude --resume abc-123"));
+        let plain = pane("work", "0", "1", None);
+        assert_eq!(resume_hint(&plain), None);
+    }
+
+    #[test]
     fn a_pane_id_is_looked_up_under_its_host_namespace() {
         // The registry stores `rmux:%12`; the control command reports `%12`.
         assert_eq!(namespaced(HostKind::Rmux, "%12"), "rmux:%12");
         assert_eq!(namespaced(HostKind::Rmux, "rmux:%12"), "rmux:%12");
         assert_eq!(namespaced(HostKind::Tmux, "%12"), "%12");
+    }
+
+    #[test]
+    fn an_agent_on_another_server_is_not_attached_by_pane_number() {
+        let agent = |socket: Option<&str>| {
+            let now = time::OffsetDateTime::now_utc();
+            muxa::Agent {
+                kind: AgentKind::ClaudeCode,
+                session_id: "abc-123".into(),
+                surface: None,
+                pane: Some("%1".into()),
+                tmux_socket: socket.map(str::to_owned),
+                tmux_session: None,
+                cwd: None,
+                pid: None,
+                workload: muxa::WorkloadSummary::default(),
+                subagents: Vec::new(),
+                state: muxa::AgentState::Idle,
+                last_prompt: None,
+                last_prompt_at: None,
+                last_response: None,
+                recap: None,
+                ai_title: None,
+                last_notification: None,
+                model: None,
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: None,
+                rate_limit_5h_resets_at: None,
+                rate_limit_7d_pct: None,
+                rate_limit_7d_resets_at: None,
+                rate_limited_until: None,
+                rate_limit_scope: None,
+                rate_limit_source: None,
+                started_at: now,
+                last_activity_at: now,
+                state_entered_at: now,
+            }
+        };
+        let on_default = [agent(Some("default")), agent(None)];
+        let by_pane = agents_by_pane(&on_default, "/tmp/tmux-501/muxa-reload-test");
+        assert!(by_pane.is_empty());
+        let by_pane = agents_by_pane(&on_default, "/tmp/tmux-501/default");
+        assert_eq!(by_pane.len(), 1);
+        let by_pane = agents_by_pane(
+            &[agent(Some("muxa-reload-test"))],
+            "/tmp/tmux-501/muxa-reload-test",
+        );
+        assert_eq!(by_pane["%1"].session_id, "abc-123");
     }
 
     #[test]

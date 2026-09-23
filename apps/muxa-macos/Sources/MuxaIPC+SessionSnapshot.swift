@@ -72,8 +72,9 @@ struct MuxSnapshotSummary: Decodable, Hashable, Sendable {
         return "\(sessionText) · \(windowText) · \(paneText)"
     }
 
-    /// "tmux default", which server it came from.
-    var serverLabel: String { "\(host) \(socket)" }
+    /// "tmux default", which server it came from. Snapshots record the
+    /// socket's absolute path; its last component is the server's name.
+    var serverLabel: String { "\(host) \((socket as NSString).lastPathComponent)" }
 }
 
 /// The CLI writes RFC 3339 through the `time` crate, with or without
@@ -134,24 +135,24 @@ extension MuxSnapshotOpenEnum {
 /// `muxa restore --json`: the plan, and after `--run` what happened.
 struct MuxSnapshotPlan: Decodable, Hashable, Sendable {
     enum SessionAction: MuxSnapshotOpenEnum {
-        case create, skip, addPanes, unknown(String)
+        case create, skip, fillMissing, unknown(String)
         init(raw: String) {
             switch raw {
             case "create": self = .create
             case "skip": self = .skip
-            case "add_panes": self = .addPanes
+            case "fill_missing": self = .fillMissing
             default: self = .unknown(raw)
             }
         }
     }
 
     enum SessionResult: MuxSnapshotOpenEnum {
-        case created, skipped, panesAdded, failed, unknown(String)
+        case created, skipped, filled, failed, unknown(String)
         init(raw: String) {
             switch raw {
             case "created": self = .created
             case "skipped": self = .skipped
-            case "panes_added": self = .panesAdded
+            case "filled": self = .filled
             case "failed": self = .failed
             default: self = .unknown(raw)
             }
@@ -159,13 +160,14 @@ struct MuxSnapshotPlan: Decodable, Hashable, Sendable {
     }
 
     enum PaneAction: MuxSnapshotOpenEnum {
-        case resume, replay, shell, manual, unknown(String)
+        case resume, replay, shell, manual, resumeByHand, unknown(String)
         init(raw: String) {
             switch raw {
             case "resume": self = .resume
             case "replay": self = .replay
             case "shell": self = .shell
             case "manual": self = .manual
+            case "resume_by_hand": self = .resumeByHand
             default: self = .unknown(raw)
             }
         }
@@ -204,11 +206,13 @@ struct MuxSnapshotPlan: Decodable, Hashable, Sendable {
         let action: PaneAction
         let command: String?
         let agentKind: String?
+        /// What a person has to do, for a pane muxa cannot relaunch itself.
+        let note: String?
         let result: PaneResult?
         let error: String?
 
         enum CodingKeys: String, CodingKey {
-            case index, path, action, command, result, error
+            case index, path, action, command, note, result, error
             case agentKind = "agent_kind"
         }
     }

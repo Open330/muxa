@@ -6,7 +6,7 @@
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{relaunch_command, PaneShape, Snapshot, SnapshotOrigin};
+use super::{relaunch_command, resume_hint, PaneShape, Snapshot, SnapshotOrigin};
 
 /// What happens to one recorded session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -16,9 +16,10 @@ pub(super) enum SessionAction {
     Create,
     /// Already on the server and `--only-missing` leaves it alone.
     Skip,
-    /// Already on the server and, without `--only-missing`, gets the recorded
-    /// panes split into it on top of the ones it has.
-    AddPanes,
+    /// Already on the server and, without `--only-missing`, gets the windows
+    /// and panes it lacks; what it has is kept, but its idle shells are
+    /// still given their `cd` and recorded command.
+    FillMissing,
 }
 
 /// What a restored pane is given to run.
@@ -33,6 +34,9 @@ pub(super) enum PaneAction {
     Shell,
     /// The argv was a process title; a person has to start it.
     Manual,
+    /// A tracked agent whose command line was never captured: its
+    /// conversation can be resumed, but only by hand (`note` says how).
+    ResumeByHand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -40,7 +44,8 @@ pub(super) enum PaneAction {
 pub(super) enum SessionResult {
     Created,
     Skipped,
-    PanesAdded,
+    /// An existing session that got what it was missing.
+    Filled,
     Failed,
 }
 
@@ -81,6 +86,9 @@ pub(super) struct PanePlan {
     pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_kind: Option<String>,
+    /// What a person has to do, for a pane muxa cannot relaunch itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<PaneResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,6 +160,9 @@ pub(super) struct RestoreReport {
     pub failed: Option<(String, String)>,
     /// Per-pane failures, keyed by `=session:window.pane`.
     pub pane_failures: BTreeMap<String, String>,
+    /// Panes left for a person — a process title, a busy pane, an agent whose
+    /// command line was never captured — with the reason.
+    pub panes_left: BTreeMap<String, String>,
 }
 
 impl RestoreReport {
@@ -171,10 +182,14 @@ impl RestoreReport {
     pub fn pane_failed(&mut self, target: String, error: String) {
         self.pane_failures.entry(target).or_insert(error);
     }
+
+    pub fn pane_left(&mut self, target: String, note: String) {
+        self.panes_left.entry(target).or_insert(note);
+    }
 }
 
-pub(super) fn rebuilt_line(created: usize, panes: usize) -> String {
-    format!("rebuilt {created} session(s)/window(s), {panes} pane(s)")
+pub(super) fn rebuilt_line(created: usize, panes: usize, kept: usize) -> String {
+    format!("rebuilt {created} session(s)/window(s), {panes} pane(s) ({kept} already there)")
 }
 
 pub(super) fn split_failure_line(target: &str, error: &str) -> String {
@@ -185,8 +200,8 @@ pub(super) fn relaunched_line(relaunched: usize) -> String {
     format!("relaunched {relaunched} pane(s)")
 }
 
-pub(super) fn manual_line(target: &str) -> String {
-    format!("  {target}: argv was a process title, not a command — start it by hand")
+pub(super) fn manual_line(target: &str, note: &str) -> String {
+    format!("  {target}: {note}")
 }
 
 /// What one pane will be given to run, and the command line if any.
@@ -195,6 +210,9 @@ pub(super) fn pane_action(pane: &PaneShape, layout_only: bool) -> (PaneAction, O
         return (PaneAction::Shell, None);
     }
     let Some(command) = relaunch_command(pane) else {
+        if resume_hint(pane).is_some() {
+            return (PaneAction::ResumeByHand, None);
+        }
         return (PaneAction::Shell, None);
     };
     if !pane.replayable {
@@ -237,7 +255,7 @@ pub(super) fn plan(
             let action = match (live.contains(session), only_missing) {
                 (false, _) => SessionAction::Create,
                 (true, true) => SessionAction::Skip,
-                (true, false) => SessionAction::AddPanes,
+                (true, false) => SessionAction::FillMissing,
             };
             let windows = snapshot
                 .windows
@@ -259,6 +277,11 @@ pub(super) fn plan(
                                 action,
                                 command,
                                 agent_kind: pane.agent.as_ref().map(|agent| agent.kind.clone()),
+                                note: if action == PaneAction::ResumeByHand {
+                                    resume_hint(pane)
+                                } else {
+                                    None
+                                },
                                 result: None,
                                 error: None,
                                 target: super::pane_target(pane),
@@ -315,7 +338,7 @@ pub(super) fn attach_results(sessions: &mut [SessionPlan], report: &RestoreRepor
             continue;
         }
         session.result = Some(match session.action {
-            SessionAction::AddPanes => SessionResult::PanesAdded,
+            SessionAction::FillMissing => SessionResult::Filled,
             _ => SessionResult::Created,
         });
         if aborted {
@@ -332,10 +355,15 @@ pub(super) fn attach_results(sessions: &mut [SessionPlan], report: &RestoreRepor
                 pane.error = Some(error.clone());
                 continue;
             }
+            if let Some(note) = report.panes_left.get(&pane.target) {
+                pane.result = Some(PaneResult::Manual);
+                pane.error = Some(note.clone());
+                continue;
+            }
             pane.result = Some(match pane.action {
                 PaneAction::Resume | PaneAction::Replay => PaneResult::Relaunched,
                 PaneAction::Shell => PaneResult::Shell,
-                PaneAction::Manual => PaneResult::Manual,
+                PaneAction::Manual | PaneAction::ResumeByHand => PaneResult::Manual,
             });
         }
     }
@@ -345,7 +373,7 @@ pub(super) fn totals(sessions: &[SessionPlan]) -> Totals {
     let mut totals = Totals::default();
     for session in sessions {
         match session.result {
-            Some(SessionResult::Created | SessionResult::PanesAdded) => {
+            Some(SessionResult::Created | SessionResult::Filled) => {
                 totals.sessions_created += 1;
             }
             Some(SessionResult::Skipped) => totals.sessions_skipped += 1,
@@ -407,7 +435,7 @@ pub(super) fn plan_lines(sessions: &[SessionPlan], layout_only: bool) -> Vec<Str
         let decision = match session.action {
             SessionAction::Create => "will create",
             SessionAction::Skip => "exists — skipped",
-            SessionAction::AddPanes => "exists — panes will be ADDED",
+            SessionAction::FillMissing => "exists — only missing windows and panes will be added",
         };
         lines.push(format!("  {} — {decision}", session.name));
         for window in &session.windows {
@@ -428,6 +456,10 @@ pub(super) fn plan_lines(sessions: &[SessionPlan], layout_only: bool) -> Vec<Str
             continue;
         }
         for pane in session.windows.iter().flat_map(|window| &window.panes) {
+            if let Some(note) = pane.note.as_deref() {
+                lines.push(format!("  {}\n    {note}", pane.target));
+                continue;
+            }
             let Some(command) = pane.command.as_deref() else {
                 continue;
             };
@@ -526,12 +558,14 @@ mod tests {
     }
 
     #[test]
-    fn without_only_missing_a_live_session_is_flagged_as_adding_panes() {
+    fn without_only_missing_a_live_session_gets_only_what_it_lacks() {
         let live = BTreeSet::from(["work".to_owned()]);
         let sessions = plan(&snapshot(), &live, false, false);
-        assert_eq!(sessions[0].action, SessionAction::AddPanes);
+        assert_eq!(sessions[0].action, SessionAction::FillMissing);
         let lines = plan_lines(&sessions, false);
-        assert!(lines.contains(&"  work — exists — panes will be ADDED".to_owned()));
+        assert!(lines.contains(
+            &"  work — exists — only missing windows and panes will be added".to_owned()
+        ));
         assert!(lines.contains(&"  side — will create".to_owned()));
         assert_eq!(without_skipped(&snapshot(), &sessions).panes.len(), 4);
     }
@@ -558,6 +592,21 @@ mod tests {
                 ("=side:0.0", PaneAction::Replay, Some("npm run dev")),
             ]
         );
+        // An agent whose command line was never captured is resumed by
+        // hand, and the plan says with what.
+        let mut uncaptured = snapshot();
+        uncaptured.panes[0].agent = Some(AgentShape {
+            kind: "codex".into(),
+            session_id: "xyz".into(),
+        });
+        let sessions = plan(&uncaptured, &BTreeSet::new(), true, false);
+        let pane = &sessions[0].windows[0].panes[0];
+        assert_eq!(pane.action, PaneAction::ResumeByHand);
+        assert!(pane.note.as_deref().unwrap().contains("codex resume xyz"));
+        assert!(plan_lines(&sessions, false)
+            .iter()
+            .any(|line| line.starts_with("  =work:0.0\n    command line was not captured")));
+
         let layout_only = plan(&snapshot(), &BTreeSet::new(), true, true);
         assert!(layout_only
             .iter()
@@ -655,13 +704,20 @@ mod tests {
         // `muxa restore --run` printed these with `println!` before the
         // report existed; `--json` aside, the words must not move.
         assert_eq!(
-            rebuilt_line(3, 12),
-            "rebuilt 3 session(s)/window(s), 12 pane(s)"
+            rebuilt_line(3, 12, 4),
+            "rebuilt 3 session(s)/window(s), 12 pane(s) (4 already there)"
         );
         assert_eq!(relaunched_line(9), "relaunched 9 pane(s)");
         assert_eq!(
-            manual_line("=work:1.0"),
+            manual_line(
+                "=work:1.0",
+                "argv was a process title, not a command — start it by hand"
+            ),
             "  =work:1.0: argv was a process title, not a command — start it by hand"
+        );
+        assert_eq!(
+            manual_line("=work:0.2", "already running something; left alone"),
+            "  =work:0.2: already running something; left alone"
         );
         assert_eq!(
             split_failure_line("=work:0.5", "no space for new pane"),

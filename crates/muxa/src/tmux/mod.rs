@@ -26,6 +26,9 @@ use crate::backend::{ObservationCompleteness, PaneObservation};
 /// daemon reconciler; without a guard, a wedged tmux server can hold the
 /// first watch refresh for many seconds.
 const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+/// A control command that may have to start the server first: sourcing a
+/// `tmux.conf` with plugins takes longer than a call on a running server.
+const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Absolute path to the `tmux` binary, resolved once per process.
 ///
@@ -370,6 +373,29 @@ pub fn capture_control_on(socket: Option<&str>, args: &[&str]) -> Result<String,
         cmd,
         TMUX_COMMAND_TIMEOUT,
         format!("tmux {}", args.join(" ")),
+    )?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))
+}
+
+/// Run one tmux control command against a server socket *path*, verbatim.
+///
+/// Unlike [`capture_control_on`], the path is not required to name a live
+/// server: this is how a server is brought back at the same path after a
+/// `kill-server`, where nothing is left to resolve a short name against.
+/// Bringing a server up sources the user's config, so the wait is longer
+/// than for a control command on a running one.
+pub fn capture_control_at(path: &std::path::Path, args: &[&str]) -> Result<String, TmuxError> {
+    let mut cmd = tmux_command();
+    cmd.arg("-S").arg(path).args(args);
+    let out = command_output_with_timeout(
+        cmd,
+        SERVER_START_TIMEOUT,
+        format!("tmux -S {} {}", path.display(), args.join(" ")),
     )?;
     if !out.status.success() {
         return Err(TmuxError::NonZero(

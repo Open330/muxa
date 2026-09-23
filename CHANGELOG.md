@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand or by `muxa reload` are never pruned. `muxa restore --only-missing`
   recreates only the sessions the server lacks and never adds panes to one it
   already has, and the dry run now says per session "will create", "exists —
-  skipped" or "exists — panes will be ADDED". `muxa snapshot --list`,
+  skipped" or "exists — only missing windows and panes will be added".
+  `muxa snapshot --list`,
   `muxa snapshot --delete <id>`, and `--json` on `snapshot` and `restore`
   make all of it scriptable.
 - **Save and restore snapshots from Muxa for Mac.** Explore "…" → Save
@@ -27,6 +28,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Needs muxad with the `mux_snapshot_v1` capability.
 
 ### Fixed
+
+- **`muxa reload` can bring the server back it just killed, and no longer
+  doubles a workspace.** A snapshot recorded the server by the short socket
+  name muxad keeps on a pane, which resolves only against a live server —
+  so after `kill-server` every command went to `/dev/null` and the restore
+  failed on its first `new-session`. Snapshots now record the socket's
+  absolute path, and an absolute path is used as given. On macOS no pane's
+  command line was captured at all (`ps --ppid` is a GNU flag), so nothing
+  was relaunched; the BSD form is used. A restore into a server that already
+  has the sessions — a retry, or tmux-continuum rebuilding its own save on
+  server start — added every pane a second time; it now creates only what a
+  window lacks, types into idle shells only, and `reload` waits for
+  continuum to finish before filling in the rest. An agent pane whose
+  command line is unknown is reported with the `--resume` it would need
+  instead of being skipped silently, and the error for an unknown target
+  server names the actual flag, `--mux-socket`. Agents are matched to panes
+  on the snapshot's own server: every tmux server numbers panes from `%0`,
+  so a snapshot of a second server used to pick up the default server's
+  agent for the same pane number and splice its `--resume` onto whatever
+  that pane was running.
 
 - **`muxa peers`, `muxa msg` and `muxa identity` speak for the right pane on
   every host.** The CLI built its collaboration origin by reading `$TMUX_PANE`

@@ -201,10 +201,10 @@ struct SessionSnapshotTreeRow: Identifiable, Hashable {
         // Sessions, in a plan.
         case willCreate
         case exists
-        case willAddPanes
+        case willFillMissing
         // Sessions, after a restore.
         case created
-        case panesAdded
+        case filled
         case skipped
         case failed
         // Panes, in a plan.
@@ -212,6 +212,7 @@ struct SessionSnapshotTreeRow: Identifiable, Hashable {
         case replay(String)
         case shell
         case notReplayable
+        case resumeByHand
         // Panes, after a restore.
         case relaunched
         case startByHand
@@ -263,7 +264,7 @@ enum SessionSnapshotTree {
                         id: "\(windowID)/\(pane.index)", depth: 2,
                         symbol: pane.action == .shell ? "terminal" : "play.rectangle",
                         title: abbreviate(pane.path), detail: nil, badge: badge,
-                        help: pane.command,
+                        help: pane.note ?? pane.command,
                         message: pane.result == .failed ? pane.error : nil
                     ))
                 }
@@ -277,7 +278,7 @@ enum SessionSnapshotTree {
             switch result {
             case .created: return .created
             case .skipped: return .skipped
-            case .panesAdded: return .panesAdded
+            case .filled: return .filled
             case .failed: return .failed
             case .unknown: return nil
             }
@@ -285,7 +286,7 @@ enum SessionSnapshotTree {
         switch session.action {
         case .create: return .willCreate
         case .skip: return .exists
-        case .addPanes: return .willAddPanes
+        case .fillMissing: return .willFillMissing
         case .unknown: return nil
         }
     }
@@ -305,6 +306,7 @@ enum SessionSnapshotTree {
         case .replay: return .replay(truncated(pane.command ?? ""))
         case .shell: return .shell
         case .manual: return .notReplayable
+        case .resumeByHand: return .resumeByHand
         case .unknown: return nil
         }
     }
