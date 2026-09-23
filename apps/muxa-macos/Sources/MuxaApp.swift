@@ -308,6 +308,10 @@ private struct MuxaEditorMenuCommands: Commands {
             // WS-A: clears every unread dot and the Dock count.
             Button("Mark All Agents as Read") { dispatchActions?.markAllRead?() }
                 .disabled(actions?.markAllRead == nil)
+            // WS-D
+            Button("Show Changes") { dispatchActions?.showChanges?() }
+                .keyboardShortcut("g", modifiers: [.control, .shift])
+                .disabled(actions?.showChanges == nil)
             Divider()
             Button("Open Work Command Center") { dispatchActions?.openWorkCommandCenter?() }
                 .keyboardShortcut("1", modifiers: [.command, .shift])

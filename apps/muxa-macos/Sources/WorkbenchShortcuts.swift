@@ -59,6 +59,7 @@ enum MuxaShortcutCatalog {
                 Entry(keys: "⌘J", title: String(localized: "Jump to Agent (needing attention first)")),
                 Entry(keys: "⇧⌘J", title: String(localized: "Next Agent Needing Attention")),
                 Entry(keys: "⌘1 … ⌘9", title: String(localized: "Open result in Jump to Agent")),
+                Entry(keys: "⌃⇧G", title: String(localized: "Show Changes")), // WS-D
             ]),
             Section(title: String(localized: "Editors"), entries: [
                 Entry(keys: "⌘W", title: String(localized: "Close Editor (the window once none is open)")),
@@ -82,6 +83,13 @@ enum MuxaShortcutCatalog {
                 Entry(keys: "⌥⌘N", title: String(localized: "Start Work")),
                 Entry(keys: "⌘T", title: String(localized: "New Shell")),
                 Entry(keys: "⌘↩", title: String(localized: "Send Prompt from a Composer")),
+            ]),
+            // WS-D
+            Section(title: String(localized: "Changes"), entries: [
+                Entry(keys: "⌘R", title: String(localized: "Refresh Changes")),
+                Entry(keys: "⌥⌘C", title: String(localized: "Comment on Selected Lines")),
+                Entry(keys: "⌘↩", title: String(localized: "Add Comment / Send Review")),
+                Entry(keys: "⎋", title: String(localized: "Cancel Comment")),
             ]),
             Section(title: String(localized: "Terminal"), entries: [
                 Entry(keys: "⌘C  ⌘V", title: String(localized: "Copy / Paste")),

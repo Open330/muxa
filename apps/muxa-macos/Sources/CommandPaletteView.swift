@@ -39,6 +39,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
     case closeEditor, previousEditor, nextEditor, splitEditor, pinEditor, focusSidebar
     case jumpToAgent, nextAttention, toggleSidebar, reopenEditor, showShortcuts
     case markAllRead // WS-A
+    case showChanges // WS-D
 
     var id: Self { self }
 
@@ -66,6 +67,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .reopenEditor: String(localized: "Editor: Reopen closed editor")
         case .showShortcuts: String(localized: "Help: Keyboard shortcuts")
         case .markAllRead: String(localized: "Agents: Mark all as read") // WS-A
+        case .showChanges: String(localized: "Go: Show changes") // WS-D
         }
     }
 
@@ -89,6 +91,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .toggleSidebar: "⌘B"
         case .reopenEditor: "⇧⌘T"
         case .showShortcuts: "⌘/"
+        case .showChanges: "⌃⇧G" // WS-D
         case .showWork, .showWatch, .showShells, .refresh: nil
         case .markAllRead: nil // WS-A
         }
@@ -115,6 +118,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .reopenEditor: "arrow.uturn.backward"
         case .showShortcuts: "keyboard"
         case .markAllRead: "checkmark.circle" // WS-A
+        case .showChanges: "plus.forwardslash.minus" // WS-D
         }
     }
 

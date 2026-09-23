@@ -369,6 +369,7 @@ struct MuxaEditorCommandActions {
     var reopenClosed: (() -> Void)? = nil
     var showShortcuts: (() -> Void)? = nil
     var markAllRead: (() -> Void)? = nil // WS-A
+    var showChanges: (() -> Void)? = nil // WS-D
     var isEnabled: Bool = true
 }
 

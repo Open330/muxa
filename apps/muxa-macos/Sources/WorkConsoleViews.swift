@@ -1017,6 +1017,7 @@ private struct FleetPaneWorkspace: View {
     private enum PaneModule: CaseIterable, Identifiable {
         case overview
         case collaborate
+        case changes // WS-D
 
         var id: Self { self }
 
@@ -1024,6 +1025,7 @@ private struct FleetPaneWorkspace: View {
             switch self {
             case .overview: "Overview"
             case .collaborate: "Collaborate"
+            case .changes: "Changes" // WS-D
             }
         }
     }
@@ -1032,6 +1034,7 @@ private struct FleetPaneWorkspace: View {
     @ObservedObject var model: AppModel
     @State private var attachedSessionID: String?
     @State private var module: PaneModule = .overview
+    @ObservedObject private var reviewDrafts = ReviewDraftStore.shared // WS-D: Changes tab badge
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1053,6 +1056,8 @@ private struct FleetPaneWorkspace: View {
                             client: model.client,
                             mailboxRevision: model.mailboxRevisions[pane.host.alias]
                         )
+                    case .changes: // WS-D
+                        ChangesWorkspaceView(pane: pane, model: model)
                     }
                 }
                 .frame(minHeight: 180)
@@ -1069,6 +1074,12 @@ private struct FleetPaneWorkspace: View {
             }
         }
         .onDisappear(perform: stopPanelAttach)
+        // WS-D: ⌃⇧G Show Changes
+        .onReceive(NotificationCenter.default.publisher(for: .muxaShowChanges)) { note in
+            if ChangesShowRequest.matches(note.object, pane: pane, watchSelection: model.watchSelection) {
+                module = .changes
+            }
+        }
     }
 
     /// A breadcrumb bar, like an editor's path above the file: the inspector
@@ -1081,7 +1092,10 @@ private struct FleetPaneWorkspace: View {
                 .layoutPriority(-1)
             Spacer(minLength: 8)
             MuxaPaneUsageAccessory(agent: pane.agent) // WS-C usage
-            MuxaTextTabs(items: PaneModule.allCases, selection: $module, title: \.title)
+            // WS-D: the Changes tab carries the pending review comment count.
+            MuxaTextTabs(items: PaneModule.allCases, selection: $module) {
+                $0 == .changes ? ChangesTab.title(for: pane, drafts: reviewDrafts) : $0.title
+            }
             Button {
                 Task { await model.refresh() }
             } label: {
