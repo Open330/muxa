@@ -176,11 +176,15 @@ struct SessionSnapshotRestoreSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
+            // Like Cancel, closing waits for a running restore: its per-pane
+            // report only comes back to this sheet, and a new one cannot
+            // reattach to the operation.
             Button(action: close) {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.muxaIcon)
             .keyboardShortcut(.cancelAction)
+            .disabled(viewModel.phase == .restoring)
             .help("Close")
         }
         .padding(.horizontal, 20)

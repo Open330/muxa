@@ -95,7 +95,10 @@ final class SessionSnapshotViewModel: ObservableObject {
             error = nil
             let keep = selection.flatMap { id in snapshots.first { $0.id == id } }
             if let pick = keep ?? snapshots.first(where: \.readable) {
-                await select(pick.id, force: keep == nil)
+                // Always plan again: sessions may have changed outside the
+                // app, or a restore just finished, and `canRestore` must not
+                // stand on a stale dry run.
+                await select(pick.id, force: true)
             } else {
                 selection = nil
                 plan = nil

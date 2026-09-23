@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,6 +47,8 @@ pub enum MuxSnapshotError {
     InvalidId(String),
     #[error("a snapshot restore is running; try again when it finishes")]
     RestoreRunning,
+    #[error("a snapshot is being saved; try the restore again in a moment")]
+    SaveRunning,
     #[error("no data directory to keep snapshots in")]
     NoSnapshotDir,
     #[error(transparent)]
@@ -94,6 +96,20 @@ pub struct MuxSnapshotControl {
     root: Option<PathBuf>,
     next_id: AtomicU64,
     operations: tokio::sync::Mutex<Operations>,
+    /// Captures in flight. Raised only while `operations` is locked and
+    /// read by `restore` under the same lock, so a restore can never start
+    /// in the middle of a capture — which would record a half-restored
+    /// workspace. Lowered by [`SaveGuard`]'s drop, cancellation included.
+    saving: AtomicUsize,
+}
+
+/// Lowers [`MuxSnapshotControl::saving`] when a capture ends, however it ends.
+struct SaveGuard<'a>(&'a AtomicUsize);
+
+impl Drop for SaveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Ids name a directory directly under the snapshots root and nothing else —
@@ -126,6 +142,7 @@ impl MuxSnapshotControl {
             root,
             next_id: AtomicU64::new(1),
             operations: tokio::sync::Mutex::new(Operations::default()),
+            saving: AtomicUsize::new(0),
         })
     }
 
@@ -137,14 +154,14 @@ impl MuxSnapshotControl {
     /// `muxa snapshot --json`: a manual snapshot of the server muxa's agents
     /// are on.
     pub async fn save(&self) -> Result<serde_json::Value, MuxSnapshotError> {
-        self.refuse_during_restore().await?;
+        let _saving = self.begin_save().await?;
         self.json(&["snapshot", "--json"], SAVE).await
     }
 
     /// muxad's periodic snapshot; the CLI decides whether anything changed
     /// and prunes old automatic ones.
     pub async fn auto(&self, keep: usize) -> Result<serde_json::Value, MuxSnapshotError> {
-        self.refuse_during_restore().await?;
+        let _saving = self.begin_save().await?;
         let keep = keep.to_string();
         self.json(
             &["snapshot", "--auto", "--keep-auto", &keep, "--json"],
@@ -184,6 +201,9 @@ impl MuxSnapshotControl {
             .any(|operation| operation.state == MuxSnapshotOperationState::Running)
         {
             return Err(MuxSnapshotError::RestoreRunning);
+        }
+        if self.saving.load(Ordering::SeqCst) > 0 {
+            return Err(MuxSnapshotError::SaveRunning);
         }
         while operations.values.len() >= MAX_RETAINED_OPERATIONS {
             let Some(oldest) = operations.order.pop_front() else {
@@ -256,19 +276,20 @@ impl MuxSnapshotControl {
             .cloned()
     }
 
-    async fn refuse_during_restore(&self) -> Result<(), MuxSnapshotError> {
-        let running = self
-            .operations
-            .lock()
-            .await
+    /// Refuses while a restore runs; otherwise counts this capture in, under
+    /// the same lock `restore` checks it with.
+    async fn begin_save(&self) -> Result<SaveGuard<'_>, MuxSnapshotError> {
+        let operations = self.operations.lock().await;
+        let running = operations
             .values
             .values()
             .any(|operation| operation.state == MuxSnapshotOperationState::Running);
         if running {
-            Err(MuxSnapshotError::RestoreRunning)
-        } else {
-            Ok(())
+            return Err(MuxSnapshotError::RestoreRunning);
         }
+        self.saving.fetch_add(1, Ordering::SeqCst);
+        drop(operations);
+        Ok(SaveGuard(&self.saving))
     }
 
     fn dir(&self, id: &str) -> Result<PathBuf, MuxSnapshotError> {
@@ -354,6 +375,29 @@ mod tests {
         for id in ["", ".", "..", "../x", "a/b", ".hidden", &"x".repeat(65)] {
             assert!(!valid_id(id), "{id:?}");
         }
+    }
+
+    /// A capture in flight holds restores off until it finishes, so a restore
+    /// can never start in the middle of one.
+    #[tokio::test]
+    async fn a_restore_waits_for_a_capture_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_cli(dir.path(), "sleep 1\necho '{\"ok\":true}'");
+        let control = MuxSnapshotControl::with_parts(
+            dir.path().join("muxad.sock"),
+            binary,
+            Some(PathBuf::from("/snapshots")),
+        );
+        let saving = {
+            let control = Arc::clone(&control);
+            tokio::spawn(async move { control.save().await })
+        };
+        // Let the save get counted in before the restore asks.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let refused = control.restore("1790000000", false).await;
+        assert!(matches!(refused, Err(MuxSnapshotError::SaveRunning)), "{refused:?}");
+        saving.await.unwrap().unwrap();
+        assert_eq!(control.saving.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

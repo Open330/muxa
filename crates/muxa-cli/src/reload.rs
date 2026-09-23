@@ -352,7 +352,10 @@ async fn auto_snapshot(client: &Client, keep: usize) -> Result<SaveOutcome> {
     let dir = store::unique_dir(&root, time::OffsetDateTime::now_utc().unix_timestamp());
     let path = write_snapshot(&snapshot, &dir)?;
     let mut pruned = Vec::new();
-    for entry in store::prunable(&store::entries(&root), keep) {
+    // The snapshot just written is the newest automatic one, so keeping at
+    // least one is what keeps it: `keep_auto = 0` would otherwise delete it
+    // and report an id that no longer exists.
+    for entry in store::prunable(&store::entries(&root), keep.max(1)) {
         if std::fs::remove_dir_all(&entry.dir).is_ok() {
             pruned.push(entry.id.clone());
         }
@@ -848,6 +851,12 @@ fn rebuild_shape(
     for window in &snapshot.windows {
         let target = format!("={}:{}", window.session, window.index);
         let _ = mux_control::run(endpoint, &["select-layout", "-t", &target, &window.layout]);
+        // The recorded size was only needed to lay the panes out; hand the
+        // window back to the attached client's size so it neither clips nor
+        // leaves space unused on a different terminal.
+        if fresh.contains(&format!("{}:{}", window.session, window.index)) {
+            let _ = mux_control::run(endpoint, &["set-option", "-w", "-u", "-t", &target, "window-size"]);
+        }
     }
 
     // `select-layout` renumbers panes by geometry, which is not the order the
@@ -955,7 +964,10 @@ fn ensure_window(
         .with_context(|| format!("creating window {window_target}"))?;
         created += 1;
     }
-    if let Some((columns, rows)) = size {
+    // Only a window made here is sized: `resize-window` pins the window's
+    // `window-size` to `manual`, which a live window must never get. The
+    // pin is lifted again once the layout is applied (`rebuild_shape`).
+    if let Some((columns, rows)) = size.filter(|_| created > 0) {
         let _ = mux_control::run(
             endpoint,
             &[
@@ -1477,11 +1489,7 @@ fn child_command(pane_pid: u32) -> Option<ChildCommand> {
         std::fs::read_to_string(format!("/proc/{pane_pid}/task/{pane_pid}/children")).ok()?;
     children.split_whitespace().find_map(|child| {
         let raw = std::fs::read(format!("/proc/{child}/cmdline")).ok()?;
-        let argv: Vec<String> = String::from_utf8_lossy(&raw)
-            .split('\0')
-            .filter(|argument| !argument.is_empty())
-            .map(str::to_owned)
-            .collect();
+        let argv = split_cmdline(&raw);
         let command = argv.join(" ").trim().to_owned();
         (!command.is_empty() && !is_shell(&command)).then_some(ChildCommand {
             command,
@@ -1519,6 +1527,22 @@ fn children_of(listing: &str, parent: u32) -> Option<String> {
         let command = command.trim();
         (!command.is_empty() && !is_shell(command)).then(|| command.to_owned())
     })
+}
+
+/// `/proc/<pid>/cmdline` is NUL-terminated arguments. Only the final NUL is
+/// a terminator; an empty string between two NULs is a real argument
+/// (`--title ""`) and must survive, or the replay shifts every argument
+/// after it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn split_cmdline(raw: &[u8]) -> Vec<String> {
+    let raw = raw.strip_suffix(b"\0").unwrap_or(raw);
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(raw)
+        .split('\0')
+        .map(str::to_owned)
+        .collect()
 }
 
 fn is_shell(command: &str) -> bool {
@@ -1731,6 +1755,16 @@ mod tests {
             "/tmp/tmux-501/muxa-reload-test",
         );
         assert_eq!(by_pane["%1"].session_id, "abc-123");
+    }
+
+    #[test]
+    fn a_real_empty_argument_survives_the_cmdline_split() {
+        assert_eq!(
+            split_cmdline(b"app\0--title\0\0--verbose\0"),
+            vec!["app", "--title", "", "--verbose"]
+        );
+        assert_eq!(split_cmdline(b"sleep\x00777\x00"), vec!["sleep", "777"]);
+        assert!(split_cmdline(b"").is_empty());
     }
 
     #[test]
