@@ -195,10 +195,15 @@ pub async fn reload(client: &Client, args: ReloadArgs) -> Result<()> {
         snapshot
     };
 
-    // Only a socket path survives the restart; a snapshot from before paths
-    // were recorded still carries a short name, so pin it while the server
-    // is up to be asked.
-    let endpoint = pinned(&endpoint_for(&snapshot.host, snapshot.socket.clone())?);
+    // Only a socket path survives the restart. An explicit --mux-socket names
+    // the server, as it does for `restore`; otherwise the snapshot does, and
+    // one from before paths were recorded still carries a short name, so it
+    // is pinned while the server is up to be asked.
+    let endpoint = if args.mux_socket.is_some() {
+        pinned(&endpoint)
+    } else {
+        pinned(&endpoint_for(&snapshot.host, snapshot.socket.clone())?)
+    };
     if !Path::new(&endpoint.socket).is_absolute() {
         bail!(
             "{} is not a socket path, and the server it names cannot be asked for one; \
@@ -482,7 +487,13 @@ fn rebuild_shape(endpoint: &BackendEndpoint, snapshot: &Snapshot) -> Result<()> 
             .iter()
             .filter(|pane| pane.session == window.session && pane.window_index == window.index)
             .collect();
-        let have = pane_count(endpoint, &target).max(1);
+        // A window that cannot be listed is not one with a single pane;
+        // splitting on a guess is the doubling this guards against.
+        let Some(have) = pane_count(endpoint, &target) else {
+            println!("  {target}: could not list its panes; left as is");
+            continue;
+        };
+        let have = have.max(1);
         if !fresh.contains(&format!("{}:{}", window.session, window.index)) {
             kept += have.min(wanted.len());
         }
@@ -529,19 +540,20 @@ fn rebuild_shape(endpoint: &BackendEndpoint, snapshot: &Snapshot) -> Result<()> 
     Ok(())
 }
 
-/// How many panes a window has right now; zero when it does not exist.
-fn pane_count(endpoint: &BackendEndpoint, window_target: &str) -> usize {
+/// How many panes a window has right now; `None` when the server could not
+/// say, which is not the same as none.
+fn pane_count(endpoint: &BackendEndpoint, window_target: &str) -> Option<usize> {
     mux_control::capture(
         endpoint,
         &["list-panes", "-t", window_target, "-F", "#{pane_id}"],
     )
+    .ok()
     .map(|listing| {
         listing
             .lines()
             .filter(|line| !line.trim().is_empty())
             .count()
     })
-    .unwrap_or(0)
 }
 
 /// The window indexes a session currently has.
@@ -674,6 +686,7 @@ fn wait_for_shell(endpoint: &BackendEndpoint, target: &str) -> bool {
                 // prompt is up and keys are read. The prompt being drawn is
                 // the only sign tmux can give that the shell is listening.
                 saw_shell = true;
+                busy_since = None;
                 if prompt_drawn(endpoint, target) {
                     return true;
                 }
