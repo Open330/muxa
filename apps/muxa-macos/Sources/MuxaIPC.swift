@@ -317,6 +317,17 @@ struct MuxaAgent: Decodable, Hashable, Identifiable, Sendable {
     let model: String?
     let contextUsedPercent: Double?
     let costUSD: Double?
+    // WS-C usage: rate-limit fields from Claude's statusline heartbeat and
+    // Codex's rollout. Timestamps and enums stay strings, like `startedAt`;
+    // `MuxaUsage` parses them. All optional so older daemons still decode.
+    let rateLimit5hPercent: Double?
+    let rateLimit5hResetsAt: String?
+    let rateLimit7dPercent: Double?
+    let rateLimit7dResetsAt: String?
+    let rateLimitedUntil: String?
+    let rateLimitScope: String?
+    let rateLimitSource: String?
+    // WS-C usage end
     let startedAt: String?
     let lastActivityAt: String?
     let stateEnteredAt: String?
@@ -337,6 +348,15 @@ struct MuxaAgent: Decodable, Hashable, Identifiable, Sendable {
         case lastNotification = "last_notification"
         case contextUsedPercent = "context_used_pct"
         case costUSD = "cost_usd"
+        // WS-C usage
+        case rateLimit5hPercent = "rate_limit_5h_pct"
+        case rateLimit5hResetsAt = "rate_limit_5h_resets_at"
+        case rateLimit7dPercent = "rate_limit_7d_pct"
+        case rateLimit7dResetsAt = "rate_limit_7d_resets_at"
+        case rateLimitedUntil = "rate_limited_until"
+        case rateLimitScope = "rate_limit_scope"
+        case rateLimitSource = "rate_limit_source"
+        // WS-C usage end
         case startedAt = "started_at"
         case lastActivityAt = "last_activity_at"
         case stateEnteredAt = "state_entered_at"

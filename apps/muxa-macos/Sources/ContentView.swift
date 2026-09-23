@@ -39,7 +39,11 @@ struct ContentView: View {
                 editorRegion
                     .frame(minWidth: 560)
             }
-            WorkbenchStatusBar(model: model)
+            // WS-C usage: the usage popover jumps to a capped agent's pane.
+            WorkbenchStatusBar(model: model, openPane: { id in
+                model.selectWatchPane(id)
+                tabs.openPinned(.pane(id))
+            })
         }
         .ignoresSafeArea(.container, edges: .top)
         .background(TitleBarMetricsReader(metrics: $chrome).allowsHitTesting(false))
@@ -1914,6 +1918,7 @@ private struct InboxAgentRow: View {
 
 private struct WorkbenchStatusBar: View {
     @ObservedObject var model: AppModel
+    let openPane: (MuxaWatchPaneIdentity) -> Void
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -1936,6 +1941,10 @@ private struct WorkbenchStatusBar: View {
             Spacer(minLength: 12)
 
             HStack(spacing: 14) {
+                // WS-C usage: hidden while unhealthy, when the figures are stale.
+                if healthy {
+                    MuxaUsageStatusItems(agents: model.hostedAgents, openPane: openPane)
+                }
                 Label("\(model.fleetHosts.count) hosts", systemImage: "server.rack")
                 Label("\(model.hostedAgents.count) agents", systemImage: "person.2")
                 Label("\(model.sessions.lazy.filter { !$0.exited }.count) shells", systemImage: "terminal")
@@ -2634,6 +2643,7 @@ private struct FleetAgentDetailView: View {
                             .font(.system(size: 22, weight: .semibold))
                         Text(agentStateLabel(participant.agent.state))
                             .foregroundStyle(agentStateColor(participant.agent.state))
+                        MuxaRateLimitBadge(agent: participant.agent) // WS-C usage
                         Text(participant.agent.agentSessionID)
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
@@ -3271,7 +3281,7 @@ private struct WindowAgentReportCard: View {
         }
         if let model = agent.model { detailChip("Model", model, systemImage: "cpu") }
         if let context = agent.contextUsedPercent {
-            detailChip("Context", "\(Int(context.rounded()))%", systemImage: "gauge.with.dots.needle.33percent")
+            MuxaContextMeter(percent: context) // WS-C usage
         }
         if let cost = agent.costUSD {
             detailChip("Cost", cost.formatted(.currency(code: "USD")), systemImage: "dollarsign.circle")
