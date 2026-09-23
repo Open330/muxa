@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`muxa peers`, `muxa msg` and `muxa identity` speak for the right pane on
+  every host.** The CLI built its collaboration origin by reading `$TMUX_PANE`
+  and shortening `$TMUX` to a socket name, which is only correct on tmux. Hook
+  stamping and the pane scan namespace a pane by its host — `rmux:%102` — and
+  keep rmux and cmux endpoints as full paths, so on those hosts the origin
+  matched no tracked agent and every one of those commands refused with
+  "collaboration origin is not a hook-correlated tracked pane agent", naming a
+  pane whose agent was running perfectly well. The CLI now shares the MCP
+  server's origin, so the two cannot disagree again.
+
 ### Added
 
 - **`muxa reload` restarts the multiplexer and puts the workspace back.**

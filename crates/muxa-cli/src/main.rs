@@ -1437,23 +1437,15 @@ async fn cmd_prune(client: &Client, older_than: &str, all: bool, yes: bool) -> R
     Ok(())
 }
 
+/// The origin `muxa peers`/`msg`/`identity` speak for.
+///
+/// Shared with the MCP server rather than rebuilt here. Reading `$TMUX_PANE`
+/// directly yields a bare `%N`, but hook stamping and the pane scan namespace
+/// a pane by its host — `rmux:%N` — and record the endpoint the same way, so a
+/// CLI that qualified neither matched no tracked agent at all on any host but
+/// tmux. One function means the two can no longer disagree.
 fn collaboration_origin() -> Result<CollaborationOrigin> {
-    let pane = std::env::var("TMUX_PANE")
-        .context("collaboration commands must run inside a tmux pane (TMUX_PANE is unset)")?;
-    let socket = std::env::var("TMUX").ok().and_then(|value| {
-        let path = value.split(',').next()?.trim();
-        Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_string)
-    });
-    // `muxa msg` speaks for the agent whose pane it runs in — same reasoning as
-    // the MCP origin.
-    Ok(CollaborationOrigin {
-        pane,
-        socket,
-        console: false,
-    })
+    mcp::current_collaboration_origin().map_err(anyhow::Error::msg)
 }
 
 fn collaboration_request_kind(value: &str) -> Result<RequestKind> {
