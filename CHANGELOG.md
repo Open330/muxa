@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.53] - 2026-09-25
+
+### Fixed
+
+- **Muxa for Mac builds with Xcode 16 again.** v0.8.52's app build failed on
+  the release runner, so v0.8.52 was never published; this release carries
+  everything listed under 0.8.52. The app now posts notifications through
+  `UNUserNotificationCenter`'s callback APIs, which are safe to call from the
+  main actor with the macOS 15 SDK, and the DMG packaging prints the compiler
+  errors when the build fails instead of only `BUILD FAILED`.
+
 ## [0.8.52] - 2026-09-25
 
 ### Added
@@ -3859,7 +3870,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.52...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.53...HEAD
+[0.8.53]: https://github.com/Open330/muxa/compare/v0.8.52...v0.8.53
 [0.8.52]: https://github.com/Open330/muxa/compare/v0.8.51...v0.8.52
 [0.8.51]: https://github.com/Open330/muxa/compare/v0.8.50...v0.8.51
 [0.8.50]: https://github.com/Open330/muxa/compare/v0.8.49...v0.8.50
