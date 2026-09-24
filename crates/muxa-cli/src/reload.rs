@@ -855,7 +855,10 @@ fn rebuild_shape(
         // window back to the attached client's size so it neither clips nor
         // leaves space unused on a different terminal.
         if fresh.contains(&format!("{}:{}", window.session, window.index)) {
-            let _ = mux_control::run(endpoint, &["set-option", "-w", "-u", "-t", &target, "window-size"]);
+            let _ = mux_control::run(
+                endpoint,
+                &["set-option", "-w", "-u", "-t", &target, "window-size"],
+            );
         }
     }
 

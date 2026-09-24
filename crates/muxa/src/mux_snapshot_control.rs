@@ -395,7 +395,10 @@ mod tests {
         // Let the save get counted in before the restore asks.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let refused = control.restore("1790000000", false).await;
-        assert!(matches!(refused, Err(MuxSnapshotError::SaveRunning)), "{refused:?}");
+        assert!(
+            matches!(refused, Err(MuxSnapshotError::SaveRunning)),
+            "{refused:?}"
+        );
         saving.await.unwrap().unwrap();
         assert_eq!(control.saving.load(Ordering::SeqCst), 0);
     }
