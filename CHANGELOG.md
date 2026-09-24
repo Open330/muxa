@@ -7,7 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.52] - 2026-09-25
+
 ### Added
+
+- **Muxa for Mac works like an editor.** The side bar's title row and the
+  editor tab strip double as the title bar, so the window chrome is one
+  compact row instead of a toolbar over a tab bar. The activity bar, side bar,
+  tabs and status bar follow VS Code's Modern themes, and a flat design system
+  replaces stock bezeled buttons, segmented controls and fields across the
+  workbench. The embedded terminal no longer claims ⌘W, ⌃Tab, ⌘1–9 or ⌘, —
+  only its own copy, paste, scroll and line-editing keys — and ⌘W closes the
+  focused editor before it closes the window. New: ⌘J jumps to an agent (the
+  ones needing you first, ⌘1–9 opens a result), ⇧⌘J goes to the next agent
+  needing attention, ⌘B toggles the side bar, ⇧⌘T reopens a closed editor, and
+  ⌘/ lists every shortcut.
+- **Muxa for Mac tells you when an agent needs you.** A macOS notification
+  when an agent starts waiting for input or a choice, errors, or finishes a
+  turn; clicking it opens that pane. An agent that finished or started waiting
+  since you last looked keeps a dot on its tab and Explore row, the Explore
+  icon counts them, and the Dock badge counts them with the agents needing
+  attention. The pane you are looking at never notifies, and permission is
+  asked the first time there is something to say. Settings › Behaviour turns
+  each kind, the sound and the Dock badge off.
+- **Start an agent from Muxa for Mac.** ⌥⌘T starts the default agent in the
+  focused pane's folder; ⌥⇧⌘T opens a sheet for the agent, folder, host
+  (control-mode fleet hosts included) and placement — split, window, session
+  or a Muxa terminal. muxad runs `muxa agent start --json` for it
+  (`agent_start_v1`). `muxa agent start` outside tmux no longer fails its own
+  `--direction` check.
+- **Usage and rate limits in Muxa for Mac.** The status bar shows the 5-hour
+  and 7-day usage of each provider that reports it (Claude, Codex), orange
+  from 80% and red from 95% or when capped, with reset times, live-session
+  cost and the capped agents one click away. Each agent shows a context-window
+  meter and, when capped, when it can continue.
+- **Review an agent's changes in Muxa for Mac.** A Changes module on panes
+  and Work (⌃⇧G) lists the repository's staged, unstaged and untracked files —
+  or everything since the branch base — with a unified diff. Comments on lines
+  or ranges collect into a review that goes back to the agent as one prompt,
+  previewed first.
 
 - **Snapshots are taken for you, and restoring one is safe to press.**
   muxad takes an automatic workspace snapshot every 15 minutes when the
@@ -26,6 +64,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window › pane with what every pane will run, dry-runs the restore, and
   shows per-pane results. It always restores only the missing sessions.
   Needs muxad with the `mux_snapshot_v1` capability.
+
+- **`muxa reload` restarts the multiplexer and puts the workspace back.**
+  Picking up a new tmux/rmux server build means restarting it, and a restart
+  discards every pane process and every agent conversation; rebuilding thirty
+  panes by hand is not realistic. `muxa snapshot` captures the shape —
+  sessions, windows, panes, geometry, working directories — plus each pane's
+  own command line, which has to be read before the restart because it lives
+  in the process table. `muxa restore` rebuilds from a snapshot and prints the
+  plan unless `--run`. `muxa reload` does all three, refusing to run inside
+  the server it is about to kill, and `--snapshot DIR` reuses an existing
+  capture so an interrupted restore can be retried.
+
+  A pane muxa tracked comes back on its own conversation: the provider's
+  session id is spliced in as `--resume` when the captured command line does
+  not already carry one. Four things the obvious implementation gets wrong are
+  handled: a session *group* lists each window once per member (what
+  `muxa workspace view` builds for a second terminal), so a 32-pane workspace
+  would otherwise restore as 380 panes; `select-layout` renumbers panes by
+  geometry, so directories are set per final index rather than inherited from
+  `split-window -c`; keys sent to a shell that has not reached a prompt are
+  swallowed, so the restore polls for the shell instead of sleeping a guessed
+  interval; and servers that rewrite their own argv into a status line (puma)
+  are reported for a human rather than replayed as a command.
+
+  Agents are matched under their host namespace: the registry names a pane
+  `rmux:%12` while the host's own control commands report the bare `%12`, so
+  without it no pane would ever be recognised as an agent's and no
+  conversation would resume.
 
 ### Fixed
 
@@ -69,35 +135,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pane whose agent was running perfectly well. The CLI now shares the MCP
   server's origin, so the two cannot disagree again.
 
-### Added
+### Changed
 
-- **`muxa reload` restarts the multiplexer and puts the workspace back.**
-  Picking up a new tmux/rmux server build means restarting it, and a restart
-  discards every pane process and every agent conversation; rebuilding thirty
-  panes by hand is not realistic. `muxa snapshot` captures the shape —
-  sessions, windows, panes, geometry, working directories — plus each pane's
-  own command line, which has to be read before the restart because it lives
-  in the process table. `muxa restore` rebuilds from a snapshot and prints the
-  plan unless `--run`. `muxa reload` does all three, refusing to run inside
-  the server it is about to kill, and `--snapshot DIR` reuses an existing
-  capture so an interrupted restore can be retried.
-
-  A pane muxa tracked comes back on its own conversation: the provider's
-  session id is spliced in as `--resume` when the captured command line does
-  not already carry one. Four things the obvious implementation gets wrong are
-  handled: a session *group* lists each window once per member (what
-  `muxa workspace view` builds for a second terminal), so a 32-pane workspace
-  would otherwise restore as 380 panes; `select-layout` renumbers panes by
-  geometry, so directories are set per final index rather than inherited from
-  `split-window -c`; keys sent to a shell that has not reached a prompt are
-  swallowed, so the restore polls for the shell instead of sleeping a guessed
-  interval; and servers that rewrite their own argv into a status line (puma)
-  are reported for a human rather than replayed as a command.
-
-  Agents are matched under their host namespace: the registry names a pane
-  `rmux:%12` while the host's own control commands report the bare `%12`, so
-  without it no pane would ever be recognised as an agent's and no
-  conversation would resume.
+- **New Shell is ⌘T in Muxa for Mac** (was ⇧⌘N), as in every terminal.
 
 ## [0.8.51] - 2026-09-23
 
@@ -3819,7 +3859,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.51...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.52...HEAD
+[0.8.52]: https://github.com/Open330/muxa/compare/v0.8.51...v0.8.52
 [0.8.51]: https://github.com/Open330/muxa/compare/v0.8.50...v0.8.51
 [0.8.50]: https://github.com/Open330/muxa/compare/v0.8.49...v0.8.50
 [0.8.49]: https://github.com/Open330/muxa/compare/v0.8.48...v0.8.49
