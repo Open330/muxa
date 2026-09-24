@@ -53,8 +53,14 @@ VERSION="${VERSION#v}"
 log "Version $VERSION"
 
 log "Building Muxa.app (Release)"
-CONFIGURATION=Release MUXA_MARKETING_VERSION="$VERSION" \
-    "$SCRIPT_DIR/build-app.sh" >/dev/null
+BUILD_LOG="$(mktemp -t muxa-build)"
+if ! CONFIGURATION=Release MUXA_MARKETING_VERSION="$VERSION" \
+    "$SCRIPT_DIR/build-app.sh" >"$BUILD_LOG" 2>&1; then
+    # Quiet on success, but a failed build must show why.
+    grep -E 'error:|warning: .*(unavailable|deprecated)|BUILD FAILED' "$BUILD_LOG" | sort -u | head -80 >&2
+    tail -40 "$BUILD_LOG" >&2
+    fail "the app build failed; full log at $BUILD_LOG"
+fi
 [ -d "$BUILT_APP" ] || fail "the build produced no app at $BUILT_APP"
 
 BUNDLE_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
