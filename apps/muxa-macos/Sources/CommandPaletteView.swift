@@ -41,6 +41,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
     case markAllRead // WS-A
     case showChanges // WS-D
     case newAgent, newDefaultAgent // WS-B: new agent
+    case saveSnapshot, restoreSnapshot // WS-F: snapshot
 
     var id: Self { self }
 
@@ -71,6 +72,8 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .showChanges: String(localized: "Go: Show changes") // WS-D
         case .newAgent: String(localized: "Agent: New agent…")
         case .newDefaultAgent: String(localized: "Agent: New default agent here")
+        case .saveSnapshot: String(localized: "Session: Save snapshot") // WS-F: snapshot
+        case .restoreSnapshot: String(localized: "Session: Restore snapshot…") // WS-F: snapshot
         }
     }
 
@@ -99,6 +102,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .newDefaultAgent: "⌥⌘T"
         case .showWork, .showWatch, .showShells, .refresh: nil
         case .markAllRead: nil // WS-A
+        case .saveSnapshot, .restoreSnapshot: nil // WS-F: snapshot
         }
     }
 
@@ -126,6 +130,8 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .showChanges: "plus.forwardslash.minus" // WS-D
         case .newAgent: "sparkles.rectangle.stack"
         case .newDefaultAgent: "sparkle"
+        case .saveSnapshot: "camera" // WS-F: snapshot
+        case .restoreSnapshot: "clock.arrow.circlepath" // WS-F: snapshot
         }
     }
 
@@ -143,6 +149,8 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .newAgent, .newDefaultAgent: // WS-B: new agent
             guard model.isConnected else { return String(localized: "Daemon is not connected") }
             if model.isStartingAgent { return String(localized: "An agent is starting") }
+        case .saveSnapshot, .restoreSnapshot: // WS-F: snapshot
+            guard model.isConnected else { return String(localized: "Daemon is not connected") }
         case .closeEditor, .previousEditor, .nextEditor, .splitEditor, .pinEditor:
             guard let selection = model.sidebarSelection, model.isSelectionAvailable(selection) else {
                 return String(localized: "No active editor")

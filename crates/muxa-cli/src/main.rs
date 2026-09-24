@@ -3924,6 +3924,23 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     #[test]
+    fn snapshot_restore_reload_and_upgrade_each_carry_their_own_help() {
+        use clap::CommandFactory;
+        let command = Args::command();
+        let about = |name: &str| {
+            command
+                .find_subcommand(name)
+                .and_then(|sub| sub.get_about())
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        };
+        assert!(about("snapshot").starts_with("Capture this multiplexer"));
+        assert!(about("restore").starts_with("Rebuild a workspace"));
+        assert!(about("reload").starts_with("Snapshot, restart"));
+        assert!(about("upgrade").starts_with("Update muxa from the source repo"));
+    }
+
+    #[test]
     fn rmux_client_resolution_uses_the_invoking_session_without_guessing() {
         let listing = "/dev/pts/1\t$1\n/dev/pts/2\t$2\n";
         assert_eq!(

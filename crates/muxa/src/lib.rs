@@ -75,6 +75,8 @@ pub mod work;
 pub mod work_compose;
 #[doc(hidden)]
 pub mod work_control;
+// WS-F: snapshot
+pub mod mux_snapshot_control;
 pub mod work_pipeline_spec;
 pub mod work_presets;
 

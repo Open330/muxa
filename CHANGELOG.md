@@ -7,7 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Snapshots are taken for you, and restoring one is safe to press.**
+  muxad takes an automatic workspace snapshot every 15 minutes when the
+  workspace changed, keeping the newest 10 (`[snapshot]
+  auto_interval_minutes`, `keep_auto`; `0` turns it off); snapshots taken by
+  hand or by `muxa reload` are never pruned. `muxa restore --only-missing`
+  recreates only the sessions the server lacks and never adds panes to one it
+  already has, and the dry run now says per session "will create", "exists —
+  skipped" or "exists — only missing windows and panes will be added".
+  `muxa snapshot --list`,
+  `muxa snapshot --delete <id>`, and `--json` on `snapshot` and `restore`
+  make all of it scriptable.
+- **Save and restore snapshots from Muxa for Mac.** Explore "…" → Save
+  Snapshot / Restore Snapshot…, also in the command palette. The restore
+  sheet lists snapshots (automatic ones badged), previews each as session ›
+  window › pane with what every pane will run, dry-runs the restore, and
+  shows per-pane results. It always restores only the missing sessions.
+  Needs muxad with the `mux_snapshot_v1` capability.
+
 ### Fixed
+
+- **A restore types into a pane only once its shell is listening, and says
+  "relaunched" only when the program is running.** A shell still working
+  through its startup files has no line editor yet; a startup that prints
+  first looked ready, and the `cd` and relaunch typed then could be swallowed
+  by anything in that startup reading the terminal — while the restore
+  reported the pane relaunched. muxa now waits for the pane's terminal to
+  leave canonical mode (the line editor reading keys), and afterwards counts a
+  pane as relaunched only once its program is seen holding it; otherwise it
+  is reported as not confirmed, with the reason.
 
 - **`muxa reload` can bring the server back it just killed, and no longer
   doubles a workspace.** A snapshot recorded the server by the short socket
