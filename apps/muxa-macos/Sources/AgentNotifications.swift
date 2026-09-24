@@ -78,10 +78,15 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
     }
 
     func authorization() async -> Authorization {
-        switch await center.notificationSettings().authorizationStatus {
-        case .notDetermined: .notDetermined
-        case .denied: .denied
-        default: .allowed
+        // The callback form: before the macOS 26 SDK, UNNotificationSettings
+        // is not Sendable, so the async form cannot hand it to the main actor.
+        let status = await withCheckedContinuation { continuation in
+            center.getNotificationSettings { continuation.resume(returning: $0.authorizationStatus) }
+        }
+        switch status {
+        case .notDetermined: return .notDetermined
+        case .denied: return .denied
+        default: return .allowed
         }
     }
 
