@@ -4890,7 +4890,7 @@ mod tests {
         assert_eq!(start.host, agent_launch::LaunchHost::Auto);
         assert_eq!(start.placement, agent_launch::Placement::Pane);
         assert_eq!(start.target.as_deref(), Some("%42"));
-        assert_eq!(start.direction, agent_launch::SplitDirection::Down);
+        assert_eq!(start.direction, Some(agent_launch::SplitDirection::Down));
         assert!(start.json);
     }
 

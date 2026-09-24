@@ -268,7 +268,7 @@ pub fn tmux_command_scoped() -> Command {
 /// [`scanner::enumerate_sockets`] (which already honors `MUXA_TMUX_SOCKET`
 /// scoping and the macOS `/tmp`↔`/private/tmp` split) keeps the targeting
 /// byte-identical to how the pane was discovered in the first place.
-fn resolve_socket_path(short_name: &str) -> Option<PathBuf> {
+pub fn resolve_socket_path(short_name: &str) -> Option<PathBuf> {
     let short_name = short_name.trim();
     if short_name.is_empty() {
         return None;

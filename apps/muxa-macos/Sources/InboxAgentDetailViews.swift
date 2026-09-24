@@ -61,7 +61,7 @@ struct InboxAgentRequestCard: View {
                 Button(action: openInLiveWatch) {
                     Label("Open in Live Watch", systemImage: "rectangle.on.rectangle")
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.muxaPrimary)
                 .disabled(participant.pane == nil)
                 .help(
                     participant.pane == nil
@@ -115,7 +115,7 @@ struct InboxAgentRequestCard: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
     }
 }
 

@@ -200,6 +200,12 @@ enum RequestBody {
         #[serde(default)]
         stdin: Option<String>,
     },
+    // WS-B: new agent
+    /// Start one allowlisted agent through `muxa agent start --json`, on
+    /// this host or a control-mode Fleet host. Synchronous, bounded to 30 s.
+    AgentStart {
+        request: crate::agent_control::AgentStartRequest,
+    },
     /// Draft one pipeline from a description with a read-only headless
     /// turn, validated with the `pipeline set` rules and retried once on a
     /// draft that would not launch. Writes nothing.
@@ -720,6 +726,7 @@ const CAPABILITIES: &[&str] = &[
     "pipeline_subscribe",
     "work_control_v1",
     "work_command_v1",
+    "agent_start_v1", // WS-B: new agent
     "handle_namespace_v1",
     "session_bytes_v1",
     "session_attachment_identity_v1",
@@ -853,6 +860,9 @@ pub struct Response {
     pub work_operation: Option<WorkUpOperation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_command: Option<WorkCommandOutput>,
+    /// `agent_start_v1`: the started agent's surface. WS-B: new agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_start: Option<crate::agent_control::AgentStartResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_compose: Option<WorkComposeOutput>,
     /// `automation_v1`: the rule list plus the engine's switch/pause.
@@ -918,6 +928,7 @@ impl Response {
             pipeline_claims: None,
             work_operation: None,
             work_command: None,
+            agent_start: None,
             work_compose: None,
             automation_rules: None,
             automation_log: None,
@@ -970,6 +981,11 @@ impl Response {
     fn with_work_command(output: WorkCommandOutput) -> Self {
         let mut response = Self::ok();
         response.work_command = Some(output);
+        response
+    }
+    fn with_agent_start(result: crate::agent_control::AgentStartResult) -> Self {
+        let mut response = Self::ok();
+        response.agent_start = Some(result);
         response
     }
     fn with_work_compose(output: WorkComposeOutput) -> Self {
@@ -1383,6 +1399,38 @@ impl WorkUpManager {
                 stdin.as_deref(),
                 Some(&self.socket_path),
                 WorkCommandLimits::COMMAND,
+            )
+            .await
+            .map_err(|error| error.to_string()),
+        }
+    }
+
+    // WS-B: new agent
+    /// Start one agent with the canonical `muxa agent start`, here or on a
+    /// control-mode Fleet host, sharing the `work_command` concurrency cap.
+    async fn agent_start(
+        &self,
+        request: crate::agent_control::AgentStartRequest,
+    ) -> Result<crate::agent_control::AgentStartResult, String> {
+        request.validate().map_err(|error| error.to_string())?;
+        let args = request.arguments();
+        let remote = self.remote_for(request.host.as_deref(), &args).await?;
+        let _permit = self.commands.try_acquire().map_err(|_| {
+            format!("at most {MAX_CONCURRENT_WORK_COMMANDS} work commands may run at once")
+        })?;
+        match remote {
+            Some((host, runner)) => {
+                let output = runner
+                    .run(&host, args, None, WorkCommandLimits::COMMAND)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                crate::agent_control::parse_output(&output, Some(&host))
+                    .map_err(|error| error.to_string())
+            }
+            None => crate::agent_control::execute_local(
+                &work_control::resolve_muxa_binary(),
+                &request,
+                Some(&self.socket_path),
             )
             .await
             .map_err(|error| error.to_string()),
@@ -2953,6 +3001,14 @@ async fn handle(
                     kind = "work_command";
                     match work_up.command(host, args, stdin).await {
                         Ok(output) => Response::with_work_command(output),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                // WS-B: new agent
+                RequestBody::AgentStart { request } => {
+                    kind = "agent_start";
+                    match work_up.agent_start(request).await {
+                        Ok(result) => Response::with_agent_start(result),
                         Err(error) => Response::err(error),
                     }
                 }
@@ -4960,6 +5016,32 @@ impl Client {
             )));
         }
         serde_json::from_value(response["work_command"].clone()).map_err(RuntimeError::Json)
+    }
+
+    // WS-B: new agent
+    /// Start one allowlisted agent through the daemon, on its own host or a
+    /// control-mode Fleet host. Requires the `agent_start_v1` capability.
+    pub async fn agent_start(
+        &self,
+        request: &crate::agent_control::AgentStartRequest,
+    ) -> Result<crate::agent_control::AgentStartResult, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "agent_start",
+            "request": request,
+        });
+        let response = self
+            .call_with_timeout(&req, WORK_COMMAND_CLIENT_TIMEOUT)
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("agent start failed")
+                    .to_string(),
+            )));
+        }
+        serde_json::from_value(response["agent_start"].clone()).map_err(RuntimeError::Json)
     }
 
     /// Ask the daemon which additive features it supports and, when it can
@@ -10250,6 +10332,76 @@ mod work_command_tests {
             .await
             .unwrap_err();
         assert!(error.contains("fleet is not enabled"), "{error}");
+    }
+
+    // WS-B: new agent
+    fn agent_request(host: Option<&str>) -> crate::agent_control::AgentStartRequest {
+        serde_json::from_value(serde_json::json!({
+            "agent": "codex",
+            "host": host,
+            "placement": "window",
+            "target": "$3",
+            "cwd": "/srv/remote/checkout",
+            "prompt": "fix the flaky test",
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn agent_start_on_a_control_host_runs_the_cli_argv_on_the_runner() {
+        let runner = FakeRunner::new(
+            HostAccessMode::Control,
+            r#"{"schema_version":1,"host":"tmux","agent":"codex","placement":"window","pane":"%42","cwd":"/srv/remote/checkout","prompt_supplied":true}"#,
+        );
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        let result = manager
+            .agent_start(agent_request(Some("dev")))
+            .await
+            .unwrap();
+        assert_eq!(result.pane.as_deref(), Some("%42"));
+        assert_eq!(result.fleet_host.as_deref(), Some("dev"));
+        let runs = runner.runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].args, agent_request(Some("dev")).arguments());
+        assert_eq!(runs[0].limits, WorkCommandLimits::COMMAND);
+        // What the runner is asked to carry is what the relay will accept.
+        work_control::validate_work_command(&runs[0].args, None, WorkCommandSurface::Relay)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_start_is_refused_on_observe_hosts_and_bad_requests() {
+        let runner = FakeRunner::new(HostAccessMode::Observe, "{}");
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        let error = manager
+            .agent_start(agent_request(Some("dev")))
+            .await
+            .unwrap_err();
+        assert!(error.contains("observe-only"), "{error}");
+        let mut native = agent_request(Some("dev"));
+        native.placement = crate::agent_control::AgentPlacement::Native;
+        native.target = None;
+        let error = manager.agent_start(native).await.unwrap_err();
+        assert!(error.contains("this Mac"), "{error}");
+        assert!(runner.runs().is_empty());
+    }
+
+    #[test]
+    fn agent_start_request_decodes_and_response_encodes() {
+        let request: Request = serde_json::from_str(
+            r#"{"protocol":6,"kind":"agent_start","request":{"agent":"claude","placement":"session","cwd":"/srv/app"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(request.body, RequestBody::AgentStart { .. }));
+        assert!(CAPABILITIES.contains(&"agent_start_v1"));
+        let plain = serde_json::to_value(Response::ok()).unwrap();
+        assert!(plain.get("agent_start").is_none());
     }
 
     #[tokio::test]

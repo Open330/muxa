@@ -37,6 +37,9 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
         // working install. A module that is switched off is not probed, so
         // an operator who uses none still pays nothing.
         Task { await MuxaModuleRegistry.shared.probeEnabled() }
+        // WS-A: set before launch completes so a notification click that
+        // launched Muxa still reaches its pane.
+        if !AppModel.isRunningTests() { MuxaUserNotifications.shared.installDelegate() }
         if UserDefaults.standard.bool(forKey: MuxaPreferences.showWorkbenchOnLaunchKey) {
             presentWorkbench(remainingAttempts: 50)
         }
@@ -72,6 +75,54 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             self?.presentWorkbench(remainingAttempts: remainingAttempts - 1)
         }
+    }
+}
+
+/// Ghostty's default keybindings are those of a standalone terminal app —
+/// ⌘W close_surface, ⌃Tab next_tab, ⌘1–9 goto_tab, ⌘, open_config, and so
+/// on — and a focused terminal claims them in `performKeyEquivalent`, before
+/// the menu bar sees the key. Inside the workbench those shortcuts belong to
+/// Muxa's editor tabs and windows, so the defaults are cleared and only the
+/// bindings that act on the terminal's own contents are kept.
+enum MuxaTerminalKeybindings {
+    static let bindings = [
+        "super+c=copy_to_clipboard",
+        "super+v=paste_from_clipboard",
+        "super+shift+v=paste_from_selection",
+        "super+a=select_all",
+        "super+k=clear_screen",
+        "super+equal=increase_font_size:1",
+        "super+plus=increase_font_size:1",
+        "super+minus=decrease_font_size:1",
+        "super+zero=reset_font_size",
+        "super+up=jump_to_prompt:-1",
+        "super+down=jump_to_prompt:1",
+        "super+home=scroll_to_top",
+        "super+end=scroll_to_bottom",
+        "super+page_up=scroll_page_up",
+        "super+page_down=scroll_page_down",
+        // Ghostty's macOS line editing, which `clear` removes along with
+        // the app shortcuts: ⌘←/⌘→ start/end of line, ⌘⌫ delete to line
+        // start, ⌥←/⌥→ word by word.
+        "super+left=text:\\x01",
+        "super+right=text:\\x05",
+        "super+backspace=text:\\x15",
+        "alt+left=esc:b",
+        "alt+right=esc:f",
+    ]
+
+    /// Every terminal pane's configuration (each pane owns its controller).
+    static let configuration: TerminalConfiguration = bindings.reduce(
+        TerminalConfiguration().appending(.custom(key: "keybind", value: "clear"))
+    ) { configuration, binding in
+        configuration.appending(.custom(key: "keybind", value: binding))
+    }
+
+    /// libghostty rejects the whole configuration over one bad line, so a
+    /// test loads it once and expects no issue.
+    @MainActor
+    static func loadIssue() -> String? {
+        TerminalController(configuration: configuration).lastConfigurationIssue
     }
 }
 
@@ -132,6 +183,10 @@ struct MuxaApp: App {
                 .presentsOnboardingOnLaunch()
         }
         .defaultSize(width: 1120, height: 760)
+        // No title bar of its own: like Safari's compact tabs, the side bar's
+        // title row and the editor tab strip double as the title bar (see
+        // WorkbenchWindowChrome.swift).
+        .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .printItem) {}
             MuxaEditorMenuCommands()
@@ -142,9 +197,19 @@ struct MuxaApp: App {
                     .disabled(!model.isConnected || model.isStartingWork)
                 Button("Open Live Watch") { model.select(.watch) }
                     .keyboardShortcut("w", modifiers: [.command, .shift])
+                // ⌘T opens a terminal tab in every terminal and agent
+                // workbench (Terminal, Ghostty, iTerm, Orca).
                 Button("New Muxa Shell") { model.createShell() }
-                    .keyboardShortcut("n", modifiers: [.command, .shift])
+                    .keyboardShortcut("t", modifiers: .command)
                     .disabled(!model.isConnected || model.isCreatingSession)
+                // WS-B: new agent — ⌥⌘T starts the default agent in the
+                // focused editor's folder, as Orca's new agent tab does.
+                Button("New Default Agent") { Task { await model.quickStartAgent() } }
+                    .keyboardShortcut("t", modifiers: [.command, .option])
+                    .disabled(!model.isConnected || model.isStartingAgent)
+                Button("New Agent…") { model.presentNewAgent() }
+                    .keyboardShortcut("t", modifiers: [.command, .option, .shift])
+                    .disabled(!model.isConnected || model.isStartingAgent)
             }
         }
     }
@@ -177,10 +242,26 @@ private struct MuxaEditorMenuCommands: Commands {
         return actions
     }
 
+    /// ⌘W closes the focused editor tab, like a code editor, and the window
+    /// only once no tab is left — or when the key window is not the
+    /// workbench (Settings, a detached module) at all. It replaces File ›
+    /// Close, which sits ahead of the Editor menu and would otherwise take
+    /// ⌘W and close the whole workbench.
+    private func closeFrontmost() {
+        if let close = dispatchActions?.close {
+            close()
+        } else {
+            NSApp.keyWindow?.performClose(nil)
+        }
+    }
+
     var body: some Commands {
+        CommandGroup(replacing: .saveItem) {
+            Button(actions?.close == nil ? "Close Window" : "Close Editor", action: closeFrontmost)
+                .keyboardShortcut("w", modifiers: .command)
+        }
         CommandMenu("Editor") {
             Button("Close Editor") { dispatchActions?.close?() }
-                .keyboardShortcut("w", modifiers: .command)
                 .disabled(actions?.close == nil)
             Divider()
             Button("Previous Editor") { dispatchActions?.previous?() }
@@ -211,6 +292,20 @@ private struct MuxaEditorMenuCommands: Commands {
             Button("Split Editor Right") { dispatchActions?.splitRight?() }
                 .keyboardShortcut("\\", modifiers: .command)
                 .disabled(actions?.splitRight == nil)
+            Divider()
+            Button("Reopen Closed Editor") { dispatchActions?.reopenClosed?() }
+                .keyboardShortcut("t", modifiers: [.command, .shift])
+                .disabled(actions?.reopenClosed == nil)
+        }
+        CommandGroup(replacing: .sidebar) {
+            Button("Toggle Side Bar") { dispatchActions?.toggleSidebar?() }
+                .keyboardShortcut("b", modifiers: .command)
+                .disabled(actions?.toggleSidebar == nil)
+        }
+        CommandGroup(before: .help) {
+            Button("Keyboard Shortcuts") { dispatchActions?.showShortcuts?() }
+                .keyboardShortcut("/", modifiers: .command)
+                .disabled(actions?.showShortcuts == nil)
         }
         CommandMenu("Navigate") {
             Button("Quick Open…") { dispatchActions?.quickOpen?() }
@@ -219,6 +314,20 @@ private struct MuxaEditorMenuCommands: Commands {
             Button("Command Palette…") { dispatchActions?.commandPalette?() }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
                 .disabled(actions?.commandPalette == nil)
+            Divider()
+            Button("Jump to Agent…") { dispatchActions?.jumpToAgent?() }
+                .keyboardShortcut("j", modifiers: .command)
+                .disabled(actions?.jumpToAgent == nil)
+            Button("Next Agent Needing Attention") { dispatchActions?.nextAttention?() }
+                .keyboardShortcut("j", modifiers: [.command, .shift])
+                .disabled(actions?.nextAttention == nil)
+            // WS-A: clears every unread dot and the Dock count.
+            Button("Mark All Agents as Read") { dispatchActions?.markAllRead?() }
+                .disabled(actions?.markAllRead == nil)
+            // WS-D
+            Button("Show Changes") { dispatchActions?.showChanges?() }
+                .keyboardShortcut("g", modifiers: [.control, .shift])
+                .disabled(actions?.showChanges == nil)
             Divider()
             Button("Open Work Command Center") { dispatchActions?.openWorkCommandCenter?() }
                 .keyboardShortcut("1", modifiers: [.command, .shift])
@@ -320,5 +429,7 @@ private struct MenuBarContent: View {
         }
         .padding(12)
         .frame(width: 240)
+        // WS-A: lets a notification click reopen a closed workbench.
+        .onAppear { MuxaWorkbenchPresenter.remember(openWindow) }
     }
 }

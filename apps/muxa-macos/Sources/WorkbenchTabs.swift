@@ -19,6 +19,10 @@ final class MuxaWorkbenchTabs: ObservableObject {
     @Published private(set) var focusedGroupID: UUID {
         didSet { persist() }
     }
+    /// Editors closed this session, most recent last, for ⇧⌘T. Not persisted:
+    /// a reopen after relaunch would bring back tabs the operator already
+    /// chose to close.
+    private(set) var recentlyClosed: [MuxaSidebarSelection] = []
     private let persistenceKey: String?
     private let defaults: UserDefaults
 
@@ -138,6 +142,9 @@ final class MuxaWorkbenchTabs: ObservableObject {
         }
 
         groups[groupIndex].tabs.remove(at: tabIndex)
+        recentlyClosed.removeAll { $0 == selection }
+        recentlyClosed.append(selection)
+        if recentlyClosed.count > 20 { recentlyClosed.removeFirst() }
         groups[groupIndex].history.removeAll { $0 == selection }
         if groups[groupIndex].preview == selection {
             groups[groupIndex].preview = nil
@@ -156,6 +163,21 @@ final class MuxaWorkbenchTabs: ObservableObject {
             }
         }
         return focusedSelection
+    }
+
+    /// ⇧⌘T: reopens the most recently closed editor that still exists and is
+    /// not already open in the focused group, pinned there.
+    @discardableResult
+    func reopenClosed(
+        isAvailable: (MuxaSidebarSelection) -> Bool
+    ) -> MuxaSidebarSelection? {
+        let openTabs = group(id: focusedGroupID)?.tabs ?? []
+        while let selection = recentlyClosed.popLast() {
+            guard isAvailable(selection), !openTabs.contains(selection) else { continue }
+            openPinned(selection)
+            return selection
+        }
+        return nil
     }
 
     @discardableResult
@@ -341,6 +363,13 @@ struct MuxaEditorCommandActions {
     var openInbox: (() -> Void)? = nil
     var selectSidebar: ((MuxaSidebarMode) -> Void)? = nil
     var focusSidebar: (() -> Void)? = nil
+    var jumpToAgent: (() -> Void)? = nil
+    var nextAttention: (() -> Void)? = nil
+    var toggleSidebar: (() -> Void)? = nil
+    var reopenClosed: (() -> Void)? = nil
+    var showShortcuts: (() -> Void)? = nil
+    var markAllRead: (() -> Void)? = nil // WS-A
+    var showChanges: (() -> Void)? = nil // WS-D
     var isEnabled: Bool = true
 }
 
