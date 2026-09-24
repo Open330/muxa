@@ -78,16 +78,26 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
     }
 
     func authorization() async -> Authorization {
-        switch await center.notificationSettings().authorizationStatus {
-        case .notDetermined: .notDetermined
-        case .denied: .denied
-        default: .allowed
+        // Callback forms throughout: before the macOS 26 SDK neither
+        // UNUserNotificationCenter nor UNNotificationSettings is Sendable, so
+        // the async forms cannot cross from the main actor and back.
+        let status = await withCheckedContinuation { continuation in
+            center.getNotificationSettings { @Sendable settings in continuation.resume(returning: settings.authorizationStatus) }
+        }
+        switch status {
+        case .notDetermined: return .notDetermined
+        case .denied: return .denied
+        default: return .allowed
         }
     }
 
     @discardableResult
     func requestAuthorization() async -> Bool {
-        (try? await center.requestAuthorization(options: [.alert, .sound, .badge])) ?? false
+        await withCheckedContinuation { continuation in
+            center.requestAuthorization(options: [.alert, .sound, .badge]) { @Sendable granted, _ in
+                continuation.resume(returning: granted)
+            }
+        }
     }
 
     func post(_ notification: MuxaAgentNotification) {
@@ -107,9 +117,8 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
             case .notDetermined: guard await requestAuthorization() else { return }
             case .allowed: break
             }
-            do {
-                try await center.add(request)
-            } catch {
+            center.add(request) { @Sendable error in
+                guard let error else { return }
                 MuxaLog.app.warning("notification post failed: \(error.localizedDescription, privacy: .public)")
             }
         }
