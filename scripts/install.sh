@@ -39,6 +39,35 @@ need() {
   }
 }
 
+# Git Bash, MSYS2 and Cygwin all report a Windows-family `uname -s` while
+# providing a POSIX shell, so this script runs happily and then spends several
+# minutes compiling before dying inside `nix`, which has no Windows target.
+# Answer the question up front instead: muxa has no Windows host, and WSL is
+# not a workaround there but the actual supported environment.
+case "$(uname -s 2>/dev/null)" in
+  MINGW* | MSYS* | CYGWIN* | Windows_NT)
+    cat >&2 <<'WINDOWS_NOTICE'
+muxa-install: this is a Windows shell, and muxa has no Windows host.
+
+muxa observes agents running in tmux panes, and tmux does not run natively on
+Windows. Install inside WSL2, where muxa is the complete product:
+
+  wsl --install                 # once, if you have no distribution yet
+  wsl                           # then, inside it:
+  curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh
+
+Windows Terminal attaches to that distribution like any other shell, so
+`muxa watch` runs in a Windows Terminal tab with nothing bridging in between.
+
+Clone into the WSL filesystem (~/) rather than /mnt/c — the 9p mount makes
+cargo builds several times slower.
+
+See docs/WINDOWS.md for why native support is not planned.
+WINDOWS_NOTICE
+    exit 1
+    ;;
+esac
+
 need cargo
 need git
 

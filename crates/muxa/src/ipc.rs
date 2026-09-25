@@ -50,6 +50,7 @@ use crate::session::{
 };
 use crate::state::{Agent, SharedStore};
 use crate::tmux::PaneInfo;
+use crate::transport::{self, Listener, ReadHalf, Stream, WriteHalf};
 use crate::work::WorkIdentity;
 use crate::work_compose::{self, WorkComposeOutput, WorkComposeRequest};
 use crate::work_control::{
@@ -58,14 +59,11 @@ use crate::work_control::{
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinSet;
 
@@ -1770,8 +1768,7 @@ impl Server {
     #[allow(clippy::too_many_lines)] // accept loop plus bounded drain and socket cleanup
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) -> Result<(), RuntimeError> {
         self.bind_with_perms()?;
-        let listener = UnixListener::bind(&self.socket_path)?;
-        harden_permissions(&self.socket_path)?;
+        let listener = Listener::bind(&self.socket_path)?;
         tracing::info!(socket = %self.socket_path.display(), "listening");
 
         let mut handlers: JoinSet<()> = JoinSet::new();
@@ -1813,7 +1810,7 @@ impl Server {
                     break;
                 }
                 accept = listener.accept() => {
-                    let (stream, _) = match accept {
+                    let stream = match accept {
                         Ok(pair) => pair,
                         Err(e) if is_fd_exhaustion(&e) => {
                             // Out of file descriptors. Do NOT propagate: a
@@ -1916,21 +1913,20 @@ impl Server {
         }
 
         // Remove our own socket file so next startup is clean.
-        let _ = std::fs::remove_file(&self.socket_path);
+        transport::remove_endpoint(&self.socket_path);
         Ok(())
     }
 
     /// Pre-bind sequence: if a stale socket exists, remove it; then the
     /// caller binds and immediately chmods 0600 in `run`.
     fn bind_with_perms(&self) -> Result<(), RuntimeError> {
-        if self.socket_path.exists() {
-            // Probe: is anything listening?
-            if std::os::unix::net::UnixStream::connect(&self.socket_path).is_ok() {
-                return Err(RuntimeError::SocketInUse(self.socket_path.clone()));
-            }
-            // Stale socket, safe to remove.
-            std::fs::remove_file(&self.socket_path)?;
+        // A live endpoint means a daemon is already serving this path. Anything
+        // else that occupies it — an orphaned socket file from an abnormal exit —
+        // is ours to clear, and clearing a path that was never there succeeds.
+        if transport::endpoint_is_live(&self.socket_path) {
+            return Err(RuntimeError::SocketInUse(self.socket_path.clone()));
         }
+        transport::clear_endpoint(&self.socket_path)?;
         if let Some(parent) = self.socket_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -2003,10 +1999,7 @@ fn is_client_disconnect(e: &std::io::Error) -> bool {
     )
 }
 
-async fn write_line_or_closed(
-    writer: &mut OwnedWriteHalf,
-    bytes: &[u8],
-) -> Result<bool, RuntimeError> {
+async fn write_line_or_closed(writer: &mut WriteHalf, bytes: &[u8]) -> Result<bool, RuntimeError> {
     match writer.write_all(bytes).await {
         Ok(()) => {}
         Err(e) if is_client_disconnect(&e) => return Ok(false),
@@ -2095,7 +2088,7 @@ fn lagged_marker_bytes(
 /// disconnecting them. The next snapshot the client takes (via the
 /// fallback polling tick) will reconcile any holes.
 async fn stream_transitions(
-    mut writer: tokio::net::unix::OwnedWriteHalf,
+    mut writer: WriteHalf,
     mut rx: broadcast::Receiver<crate::state::Transition>,
     protocol: u32,
     emit_lagged: bool,
@@ -2164,7 +2157,7 @@ async fn stream_transitions(
 /// channel retains only a pending bit; sustained activity cannot grow a queue
 /// or postpone delivery indefinitely. Idle streams only send keepalives.
 async fn stream_agent_changes(
-    mut writer: OwnedWriteHalf,
+    mut writer: WriteHalf,
     mut changes: watch::Receiver<()>,
     protocol: u32,
 ) -> Result<(), RuntimeError> {
@@ -2191,7 +2184,7 @@ async fn stream_agent_changes(
 /// coherent selector-filtered snapshot. This keeps one busy remote agent from
 /// making the central TUI clone and redraw every host on a fixed timer.
 async fn stream_fleet_updates(
-    mut writer: tokio::net::unix::OwnedWriteHalf,
+    mut writer: WriteHalf,
     store: Arc<crate::fleet::FleetStore>,
     mut rx: broadcast::Receiver<FleetUpdate>,
     protocol: u32,
@@ -2269,7 +2262,7 @@ async fn stream_fleet_updates(
 /// no request content or participant identity; it is safe to propagate
 /// through Fleet as a cache invalidation while mailbox reads remain scoped.
 async fn stream_revision_updates(
-    mut writer: tokio::net::unix::OwnedWriteHalf,
+    mut writer: WriteHalf,
     mut changes: watch::Receiver<u64>,
     protocol: u32,
 ) -> Result<(), RuntimeError> {
@@ -2632,14 +2625,11 @@ impl CollaborationConnectionActor {
 }
 
 #[allow(clippy::similar_names)] // PID/UID/GID are the exact peer credential fields
-fn observe_collaboration_actor(stream: &UnixStream) -> CollaborationConnectionActor {
-    let credentials = stream.peer_cred().ok();
-    let caller_pid = credentials
-        .as_ref()
-        .and_then(tokio::net::unix::UCred::pid)
-        .and_then(|pid| u32::try_from(pid).ok());
-    let caller_uid: Option<u32> = credentials.as_ref().map(tokio::net::unix::UCred::uid);
-    let caller_gid: Option<u32> = credentials.as_ref().map(tokio::net::unix::UCred::gid);
+fn observe_collaboration_actor(stream: &Stream) -> CollaborationConnectionActor {
+    let peer = stream.peer_identity();
+    let caller_pid = peer.pid;
+    let caller_uid = peer.uid;
+    let caller_gid = peer.gid;
     let (executable, process_kind) =
         caller_pid.map_or((None, CollaborationClientKind::Unknown), process_identity);
     CollaborationConnectionActor {
@@ -2851,7 +2841,7 @@ async fn record_collaboration_audit(
 )]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // IPC dispatch table and its shared daemon state
 async fn handle(
-    stream: UnixStream,
+    stream: Stream,
     store: SharedStore,
     backend: SharedBackend,
     backends: Vec<SharedBackend>,
@@ -4445,9 +4435,7 @@ pub fn blocking_call(
     deadline: Duration,
 ) -> Option<serde_json::Value> {
     use std::io::{BufRead, BufReader as SyncBufReader, Write};
-    let mut stream = std::os::unix::net::UnixStream::connect(socket_path).ok()?;
-    stream.set_read_timeout(Some(deadline)).ok()?;
-    stream.set_write_timeout(Some(deadline)).ok()?;
+    let mut stream = transport::blocking_connect(socket_path, deadline).ok()?;
     let mut bytes = serde_json::to_vec(req).ok()?;
     bytes.push(b'\n');
     stream.write_all(&bytes).ok()?;
@@ -4496,8 +4484,7 @@ pub fn blocking_reserve_handle(
 }
 
 pub fn harden_permissions(socket_path: &Path) -> std::io::Result<()> {
-    let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(socket_path, perms)
+    transport::harden_permissions(socket_path)
 }
 
 /// Client-side helper. Single-shot request/response.
@@ -4598,7 +4585,7 @@ pub struct SendPromptOutcome {
 /// connection (shutdown) or `Err(_)` on a parse / IO failure that
 /// the caller will probably want to handle by reconnecting.
 pub struct TransitionStream {
-    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    reader: BufReader<ReadHalf>,
     line: String,
 }
 
@@ -4606,13 +4593,13 @@ pub struct TransitionStream {
 /// [`Client::fleet_subscribe`]. Callers fetch a coherent snapshot after
 /// coalescing one or more updates.
 pub struct FleetUpdateStream {
-    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    reader: BufReader<ReadHalf>,
     line: String,
 }
 
 /// Content-free durable mailbox revision stream.
 pub struct CollaborationUpdateStream {
-    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    reader: BufReader<ReadHalf>,
     line: String,
 }
 
@@ -4917,14 +4904,15 @@ impl Client {
         &self,
         selector: Option<&str>,
     ) -> Result<FleetUpdateStream, RuntimeError> {
-        let stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
-                    RuntimeError::NotConnected(self.socket_path.clone())
-                }
-                _ => RuntimeError::Io(error),
-            })?;
+        let stream =
+            Stream::connect(&self.socket_path)
+                .await
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
+                        RuntimeError::NotConnected(self.socket_path.clone())
+                    }
+                    _ => RuntimeError::Io(error),
+                })?;
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         self.send_hello(&mut reader, &mut writer).await?;
@@ -4992,14 +4980,15 @@ impl Client {
         &self,
         kind: &str,
     ) -> Result<CollaborationUpdateStream, RuntimeError> {
-        let stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
-                    RuntimeError::NotConnected(self.socket_path.clone())
-                }
-                _ => RuntimeError::Io(error),
-            })?;
+        let stream =
+            Stream::connect(&self.socket_path)
+                .await
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
+                        RuntimeError::NotConnected(self.socket_path.clone())
+                    }
+                    _ => RuntimeError::Io(error),
+                })?;
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         self.send_hello(&mut reader, &mut writer).await?;
@@ -6163,7 +6152,7 @@ impl Client {
     }
 
     async fn subscribe_inner(&self, kind: &str) -> Result<TransitionStream, RuntimeError> {
-        let stream = UnixStream::connect(&self.socket_path)
+        let stream = Stream::connect(&self.socket_path)
             .await
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
@@ -6436,7 +6425,7 @@ impl Client {
         // or nothing is listening — surface a friendly message that names the
         // socket path. Other IO errors (timeouts, permission denied, …) keep
         // their existing display via the `Io(#[from] _)` impl.
-        let stream = UnixStream::connect(&self.socket_path)
+        let stream = Stream::connect(&self.socket_path)
             .await
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
@@ -6700,7 +6689,7 @@ mod tests {
     async fn collaboration_wait_falls_back_for_legacy_daemon() {
         let dir = tempdir().unwrap();
         let socket = dir.path().join("legacy-collaboration.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = Listener::bind(&socket).unwrap();
         let terminal_request = serde_json::json!({
             "id": "legacy-request",
             "from": {
@@ -6733,7 +6722,7 @@ mod tests {
         });
         let server = tokio::spawn(async move {
             for expected_kind in ["collaboration_wait", "collaboration_get"] {
-                let (stream, _) = listener.accept().await.unwrap();
+                let stream = listener.accept().await.unwrap();
                 let (reader, mut writer) = stream.into_split();
                 let mut reader = BufReader::new(reader);
                 let mut line = String::new();
@@ -7153,6 +7142,11 @@ mod tests {
         assert_eq!(request.run_id.as_deref(), Some("tmux:default:@1"));
         let provenance = request.provenance.as_ref().unwrap();
         assert_eq!(provenance.client_kind, CollaborationClientKind::Watch);
+        // Peer credentials come from `SO_PEERCRED`; a host whose transport
+        // cannot report them leaves this `None` by design — see
+        // `transport::PeerIdentity`. `client_kind` above is declared by the
+        // client itself, so it holds either way.
+        #[cfg(unix)]
         assert_eq!(provenance.caller_pid, Some(std::process::id()));
         assert_eq!(
             provenance.origin_match,
@@ -7573,7 +7567,7 @@ mod tests {
         // the trailing newline so the handler is stuck inside
         // `read_line`. This simulates an in-flight handler at the moment
         // shutdown lands.
-        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut stream = Stream::connect(&sock).await.unwrap();
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "ingest",
@@ -7636,7 +7630,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_disconnect_before_response_is_clean_handler_exit() {
-        let (server_stream, mut client_stream) = tokio::net::UnixStream::pair().unwrap();
+        let (server_stream, mut client_stream) = Stream::pair().await.unwrap();
         let store = Store::shared();
         let (_stopping_tx, stopping_rx) = watch::channel(false);
         let handle = tokio::spawn(handle(
@@ -7805,12 +7799,12 @@ mod tests {
         let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
         wait_for_socket(&sock).await;
 
-        let mut holder = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut holder = Stream::connect(&sock).await.unwrap();
         holder.write_all(b"{").await.unwrap();
         holder.flush().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let mut second = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut second = Stream::connect(&sock).await.unwrap();
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "snapshot",
@@ -7864,7 +7858,7 @@ mod tests {
     /// the legacy strict-match path and the negotiated downgrade path
     /// in isolation.
     async fn raw_call(sock: &Path, req: &serde_json::Value) -> serde_json::Value {
-        let mut stream = tokio::net::UnixStream::connect(sock).await.unwrap();
+        let mut stream = Stream::connect(sock).await.unwrap();
         let mut bytes = serde_json::to_vec(req).unwrap();
         bytes.push(b'\n');
         stream.write_all(&bytes).await.unwrap();
@@ -9039,7 +9033,7 @@ mod tests {
 
         // Get a handler accepted and parked mid-request before the stop. This
         // is the exact ordering that could re-arm the old AtomicBool design.
-        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut stream = Stream::connect(&sock).await.unwrap();
         let mut request = serde_json::to_vec(&serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "restart",
@@ -9123,14 +9117,14 @@ mod tests {
             .await
             .expect_err("embedded server refuses restart");
         assert!(error.to_string().contains("restart"));
-        assert!(UnixStream::connect(&sock).await.is_ok());
+        assert!(Stream::connect(&sock).await.is_ok());
 
         let error = client
             .stop(Duration::from_secs(2))
             .await
             .expect_err("embedded server refuses stop");
         assert!(error.to_string().contains("stop"));
-        assert!(UnixStream::connect(&sock).await.is_ok());
+        assert!(Stream::connect(&sock).await.is_ok());
 
         tx.send(()).unwrap();
         handle.await.unwrap();
@@ -9174,7 +9168,7 @@ mod tests {
             .await;
 
         // Open one connection: hello v1, then snapshot.
-        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut stream = Stream::connect(&sock).await.unwrap();
         let mut hello = serde_json::to_vec(&serde_json::json!({
             "protocol": 1, "kind": "hello", "client": "v1-test",
         }))
@@ -9229,7 +9223,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut stream = Stream::connect(&sock).await.unwrap();
         let mut hello = serde_json::to_vec(&serde_json::json!({
             "protocol": 2, "kind": "hello", "client": "v2-test",
         }))
@@ -9293,7 +9287,7 @@ mod tests {
             })
             .await;
 
-        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let mut stream = Stream::connect(&sock).await.unwrap();
         let mut hello = serde_json::to_vec(&serde_json::json!({
             "protocol": 2, "kind": "hello", "client": "v2-test",
         }))
@@ -9936,7 +9930,7 @@ mod tests {
         use tokio::io::AsyncBufReadExt;
         let store = crate::state::Store::shared();
         let mut other = store.subscribe_changes();
-        let (client, server) = UnixStream::pair().unwrap();
+        let (client, server) = Stream::pair().await.unwrap();
         let (_, writer) = server.into_split();
         let pump = tokio::spawn(stream_agent_changes(
             writer,
@@ -10059,7 +10053,7 @@ mod tests {
         let transition_json = serde_json::to_string(&transition).unwrap();
 
         // Wire the marker + transition into a TransitionStream's reader.
-        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let (client_side, server_side) = Stream::pair().await.unwrap();
         let (cr, _cw) = client_side.into_split();
         let mut ts = TransitionStream {
             reader: BufReader::new(cr),

@@ -1,8 +1,13 @@
 //! Lightweight process-table snapshot shared by OS process-tree scanners.
 //!
-//! On non-Linux hosts the cheapest portable primitive is a single `ps` pass
-//! over the whole process table. Callers then walk this in memory instead of
-//! spawning `ps`/`pgrep` once per pane.
+//! On Unix hosts that are not Linux the cheapest portable primitive is a
+//! single `ps` pass over the whole process table. Callers then walk this in
+//! memory instead of spawning `ps`/`pgrep` once per pane.
+//!
+//! Windows has neither `/proc` nor `ps`. Rather than let it fall into the
+//! `ps` arm and fail at runtime with an empty table, the non-Unix arm is
+//! spelled out below and returns empty *deliberately*. See
+//! `docs/WINDOWS.md` for what wiring a real Windows process source needs.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -25,7 +30,7 @@ pub(crate) struct ProcessTable {
     children_by_parent: HashMap<u32, Vec<u32>>,
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(any(target_os = "linux", not(unix)), allow(dead_code))]
 impl ProcessTable {
     pub(crate) fn from_processes(processes: impl IntoIterator<Item = ProcessInfo>) -> Self {
         let mut table = Self::default();
@@ -88,7 +93,7 @@ impl ProcessTable {
 /// hooks only need parent IDs, and may run many times during an agent turn.
 /// One small `ps` snapshot is both cheaper and avoids needlessly reading
 /// command-line arguments that can contain sensitive values.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn read_parent_pid_map() -> HashMap<u32, u32> {
     let output = std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid="])
@@ -101,7 +106,7 @@ pub(crate) fn read_parent_pid_map() -> HashMap<u32, u32> {
     parse_parent_pid_map(&String::from_utf8_lossy(&output.stdout))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn parse_parent_pid_map(stdout: &str) -> HashMap<u32, u32> {
     stdout
         .lines()
@@ -115,7 +120,7 @@ fn parse_parent_pid_map(stdout: &str) -> HashMap<u32, u32> {
         .collect()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn read_current_process_table() -> ProcessTable {
     let output = std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid=,args="])
@@ -131,7 +136,7 @@ pub(crate) fn read_current_process_table() -> ProcessTable {
     parse_ps_table(&String::from_utf8_lossy(&output.stdout))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn parse_ps_table(stdout: &str) -> ProcessTable {
     let processes = stdout.lines().filter_map(|line| {
         let mut parts = line.split_whitespace();
@@ -155,6 +160,30 @@ fn parse_ps_table(stdout: &str) -> ProcessTable {
         })
     });
     ProcessTable::from_processes(processes)
+}
+
+// --- Non-Unix (Windows) -----------------------------------------------------
+//
+// Windows exposes neither `/proc` nor `ps`. These arms exist so that the
+// absence of a process source is one visible place in the tree, rather than an
+// accident of `not(target_os = "linux")` quietly selecting the `ps` code path
+// and failing at runtime with an empty table and a debug line nobody reads.
+//
+// Returning empty is honest rather than lossy: without a Windows `PaneBackend`
+// there are no panes whose descendants could be attributed anyway. Wiring a
+// real source (Toolhelp32 / WTS) is only worth doing once such a backend
+// exists to give the PIDs meaning. See `docs/WINDOWS.md`.
+
+#[cfg(not(unix))]
+pub(crate) fn read_parent_pid_map() -> HashMap<u32, u32> {
+    tracing::debug!("parent-pid snapshot unavailable: no process source on this platform");
+    HashMap::new()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn read_current_process_table() -> ProcessTable {
+    tracing::debug!("process-table snapshot unavailable: no process source on this platform");
+    ProcessTable::default()
 }
 
 #[cfg(test)]
@@ -197,7 +226,7 @@ mod tests {
         assert_eq!(table.descendants(1, 3, 1).len(), 1);
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn parses_ps_table_rows() {
         let table = parse_ps_table(
@@ -221,7 +250,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn parses_parent_pid_rows_without_command_arguments() {
         let parents = parse_parent_pid_map("  10   1\n  20  10\nmalformed\n 30 nope\n");

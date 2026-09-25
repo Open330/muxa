@@ -32,9 +32,9 @@
 //!
 //! See `docs/HERDR.md` for the full design.
 
+use super::unix_socket::UnixStream;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -90,7 +90,8 @@ impl HerdrBackend {
     /// Shorten the per-call timeout. Test-only so the "server accepts
     /// then hangs" case exercises the real timeout path without a
     /// full-second wait in the suite.
-    #[cfg(test)]
+    // Gated with its only consumer: the suite below needs a Unix socket.
+    #[cfg(all(test, unix))]
     fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -608,7 +609,7 @@ struct HerdrProcess {
     name: String,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::Path;

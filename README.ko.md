@@ -96,6 +96,13 @@ workflow까지 하나의 시나리오로 익히게 합니다. 기존 tmux server
 
 필요 조건: tmux 3.x(또는 herdr), Unix-like OS.
 
+**Windows에서는 WSL2 안에 설치하세요.** tmux는 Windows 네이티브 빌드가 없어
+WSL 밖에서는 Muxa가 관측할 대상 자체가 없습니다. WSL2에서는 Muxa가 온전한
+제품 그대로 동작하며, Windows Terminal이 해당 배포판에 다른 셸과 똑같이
+붙으므로 `muxa watch`를 Windows Terminal 탭에서 그대로 띄울 수 있습니다.
+빌드가 몇 배 느린 `/mnt/c` 대신 WSL 파일시스템(`~/`)에 클론하세요.
+자세한 내용은 [docs/WINDOWS.md](docs/WINDOWS.md).
+
 Homebrew(프리빌트 바이너리, Rust 툴체인 불필요):
 
 ```bash

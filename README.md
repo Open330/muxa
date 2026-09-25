@@ -109,6 +109,13 @@ If you decide to keep Muxa, install it with one of the following methods.
 
 Requires tmux 3.x (or herdr) and a Unix-like OS.
 
+**On Windows, install inside WSL2** — tmux has no native Windows build, so
+there is nothing for Muxa to observe outside it. Under WSL2 Muxa is the
+complete product, and Windows Terminal attaches to the distribution like any
+other shell, so `muxa watch` runs in a Windows Terminal tab. Clone into the WSL
+filesystem (`~/`) rather than `/mnt/c`, which is several times slower to build
+in. See [docs/WINDOWS.md](docs/WINDOWS.md).
+
 Homebrew (pre-built binaries, no Rust toolchain needed):
 
 ```bash
