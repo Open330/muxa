@@ -42,7 +42,11 @@ struct MuxaUsageStatusItems: View {
                 .buttonStyle(.plain)
                 .help("Usage and rate limits")
                 .popover(isPresented: $showsPopover, arrowEdge: .top) {
-                    MuxaUsagePopover(groups: groups, now: context.date) { id in
+                    MuxaUsagePopover(
+                        groups: groups,
+                        hostCosts: MuxaUsageHostCost.summaries(from: agents),
+                        now: context.date
+                    ) { id in
                         showsPopover = false
                         openPane(id)
                     }
@@ -64,9 +68,11 @@ private struct MuxaUsageStatusLabelStyle: LabelStyle {
 // MARK: - Popover
 
 /// Every account's windows with their resets, the live sessions' cost, and
-/// which agents are capped until when.
+/// which agents are capped until when. With agents on several hosts, an
+/// account shared by them shows once, and the live cost is split by host.
 struct MuxaUsagePopover: View {
     let groups: [MuxaUsageGroup]
+    var hostCosts: [MuxaUsageHostCost] = []
     let now: Date
     let openPane: (MuxaWatchPaneIdentity) -> Void
 
@@ -79,6 +85,9 @@ struct MuxaUsagePopover: View {
             ForEach(groups) { group in
                 groupCard(group)
             }
+            if hostCosts.count > 1 {
+                hostCostCard
+            }
             if groups.contains(where: { !$0.capped.isEmpty }) {
                 autoResumeFooter
             }
@@ -90,8 +99,10 @@ struct MuxaUsagePopover: View {
     private func groupCard(_ group: MuxaUsageGroup) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
-                Text(verbatim: "\(group.providerName) · \(group.hostAlias)")
+                Text(verbatim: "\(group.providerName) · \(group.hostAliases.joined(separator: ", "))")
                     .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                 Spacer(minLength: 8)
                 if let cost = group.liveCostUSD {
                     Text("\(cost.formatted(.currency(code: "USD"))) live sessions")
@@ -99,6 +110,12 @@ struct MuxaUsagePopover: View {
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
+            }
+            if group.isShared {
+                Text("Same account on \(group.hostAliases.count) hosts · freshest reading shown")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("These hosts report the same reset times, so they share one account's limits.")
             }
             ForEach(group.windows, id: \.kind) { window in
                 windowRow(window)
@@ -109,7 +126,7 @@ struct MuxaUsagePopover: View {
                     .foregroundStyle(.red)
                     .padding(.top, 2)
                 ForEach(group.capped) { capped in
-                    cappedRow(capped)
+                    cappedRow(capped, showsHost: group.isShared)
                 }
             }
         }
@@ -140,7 +157,7 @@ struct MuxaUsagePopover: View {
         }
     }
 
-    private func cappedRow(_ capped: MuxaUsageGroup.CappedAgent) -> some View {
+    private func cappedRow(_ capped: MuxaUsageGroup.CappedAgent, showsHost: Bool) -> some View {
         let paneID = capped.agent.pane.map {
             MuxaWatchPaneIdentity(hostAlias: capped.agent.host.alias, socket: $0.endpointSocket, paneID: $0.paneID)
         }
@@ -148,7 +165,9 @@ struct MuxaUsagePopover: View {
             if let paneID { openPane(paneID) }
         } label: {
             HStack(spacing: 6) {
-                Text(verbatim: MuxaUsageFormat.agentTitle(capped.agent))
+                Text(verbatim: showsHost
+                    ? "\(MuxaUsageFormat.agentTitle(capped.agent)) · \(capped.agent.host.alias)"
+                    : MuxaUsageFormat.agentTitle(capped.agent))
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 8)
@@ -166,6 +185,42 @@ struct MuxaUsagePopover: View {
         }
         .buttonStyle(.plain)
         .disabled(paneID == nil)
+    }
+
+    /// Live-session cost per host and in total. Each session runs on one
+    /// host, so the total counts none twice even when hosts share an account.
+    private var hostCostCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Live sessions by host")
+                .font(.system(size: 12, weight: .semibold))
+            ForEach(hostCosts) { host in
+                costRow(Text(verbatim: host.hostAlias), cost: host.liveCostUSD, sessions: host.sessionCount)
+            }
+            Divider()
+            costRow(
+                Text("Total").fontWeight(.semibold),
+                cost: hostCosts.reduce(0) { $0 + $1.liveCostUSD },
+                sessions: hostCosts.reduce(0) { $0 + $1.sessionCount }
+            )
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
+    }
+
+    private func costRow(_ label: Text, cost: Double, sessions: Int) -> some View {
+        HStack(spacing: 8) {
+            label
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 8)
+            Text("\(sessions) sessions")
+                .foregroundStyle(.secondary)
+            Text(verbatim: cost.formatted(.currency(code: "USD")))
+                .monospacedDigit()
+                .frame(minWidth: 56, alignment: .trailing)
+        }
+        .font(.caption)
     }
 
     private func capText(_ cap: MuxaRateLimitCap) -> String {

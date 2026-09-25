@@ -7034,6 +7034,16 @@
         }
       }
     },
+    "Live sessions by host" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "호스트별 실행 중인 세션"
+          }
+        }
+      }
+    },
     "Local" : {
       "localizations" : {
         "ko" : {
@@ -7184,6 +7194,16 @@
         }
       }
     },
+    "Mark as Read" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "읽음으로 표시"
+          }
+        }
+      }
+    },
     "Mark as not viewed" : {
       "localizations" : {
         "ko" : {
@@ -7240,6 +7260,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "메시지"
+          }
+        }
+      }
+    },
+    "Message for the agent" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트에게 보낼 메시지"
           }
         }
       }
@@ -11282,6 +11312,16 @@
         }
       }
     },
+    "Same account on %lld hosts · freshest reading shown" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "호스트 %lld개가 같은 계정 · 가장 최근 값 표시"
+          }
+        }
+      }
+    },
     "Same definition on %@" : {
       "localizations" : {
         "ko" : {
@@ -13397,6 +13437,16 @@
         }
       }
     },
+    "These hosts report the same reset times, so they share one account's limits." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 호스트들은 같은 초기화 시각을 보고하므로 한 계정의 한도를 함께 씁니다."
+          }
+        }
+      }
+    },
     "These values are read from muxa configuration." : {
       "localizations" : {
         "ko" : {
@@ -13784,6 +13834,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "구조"
+          }
+        }
+      }
+    },
+    "Total" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "합계"
           }
         }
       }
@@ -14912,6 +14972,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "편집한 원문은 유지됩니다. 다시 불러와 파일의 내용을 사용하거나, 다시 저장하기 전에 내용을 검토하세요."
+          }
+        }
+      }
+    },
+    "Your reply was not sent" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "답변을 보내지 못했습니다"
           }
         }
       }

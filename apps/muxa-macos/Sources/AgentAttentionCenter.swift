@@ -82,6 +82,55 @@ enum MuxaNotificationRules {
     }
 }
 
+/// The buttons a notification offers and what a response to one means,
+/// kept free of `UNUserNotificationCenter` so tests can state them.
+enum MuxaNotificationActions {
+    static let open = "muxa.action.open"
+    static let markRead = "muxa.action.mark-read"
+    static let reply = "muxa.action.reply"
+    /// Open and Mark as Read.
+    static let agentCategory = "muxa.agent"
+    /// Open, Reply…, and Mark as Read: only an agent waiting for free-form
+    /// input can take typed text; a choice needs its menu, and an error or a
+    /// finished turn is better answered from the pane.
+    static let inputCategory = "muxa.agent.input"
+    /// `UNNotificationDefaultActionIdentifier`: the notification body itself.
+    static let defaultAction = "com.apple.UNNotificationDefaultActionIdentifier"
+    /// Fleet host states that can take a prompt from the Mac.
+    static let replyHostStates: Set<String> = ["online", "version_skew"]
+
+    enum Route: Equatable, Sendable {
+        case open
+        case markRead
+        case reply(String)
+        case ignore
+    }
+
+    static func category(for event: MuxaNotificationRules.Event) -> String {
+        event == .attention("waiting_input") ? inputCategory : agentCategory
+    }
+
+    static func route(action: String, userText: String?) -> Route {
+        switch action {
+        case defaultAction, open: return .open
+        case markRead: return .markRead
+        case reply:
+            // An empty reply would only press Return in the agent's prompt.
+            let text = userText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return text.isEmpty ? .ignore : .reply(text)
+        default: return .ignore
+        }
+    }
+
+    /// Why a reply cannot reach `pane`, or nil when it can be sent.
+    static func replyBlocker(_ pane: MuxaWatchPane?) -> String? {
+        guard let pane else { return String(localized: "This pane is no longer available") }
+        let host = pane.host
+        if host.local || (host.mode == "control" && replyHostStates.contains(host.state)) { return nil }
+        return String(localized: "Not connected: \(host.alias)")
+    }
+}
+
 struct MuxaNotificationSettings: Equatable, Sendable {
     var notifyAttention = true
     var notifyFinished = true
@@ -96,6 +145,8 @@ struct MuxaAgentNotification: Equatable, Sendable {
     let body: String?
     let pane: MuxaWatchPaneIdentity?
     let sound: Bool
+    /// A `MuxaNotificationActions` category, or nil for no buttons.
+    let category: String?
 }
 
 @MainActor
@@ -142,6 +193,11 @@ final class MuxaAgentAttentionCenter: ObservableObject {
     private let poster: MuxaNotificationPosting?
     private let now: () -> Date
     var settings: () -> MuxaNotificationSettings
+    /// Delivers a notification reply; the app model wires it to muxad's
+    /// `send_prompt`, the path the pane's prompt composer uses.
+    var sendPrompt: (@MainActor (MuxaFleetHostIdentity, MuxaPaneInfo, String) async throws -> Void)?
+    /// How long a notification action waits for its pane to show up.
+    var actionPaneWait: TimeInterval = 10
 
     init(
         defaults: UserDefaults? = .standard,
@@ -215,9 +271,63 @@ final class MuxaAgentAttentionCenter: ObservableObject {
         markSeen(Set(Self.agentPanes(in: snapshot).map(\.id)))
     }
 
+    /// Mark as Read on a notification: the same as looking at the pane, and
+    /// it withdraws the pane's delivered notification.
+    func markRead(_ pane: MuxaWatchPaneIdentity) async {
+        _ = await resolve(pane)
+        markSeen([pane])
+    }
+
+    /// Reply… on a notification types `text` into the agent's pane as a
+    /// prompt. A reply that cannot be delivered comes back as a notification
+    /// carrying the text, so nothing the operator typed is dropped silently.
+    func reply(_ text: String, to pane: MuxaWatchPaneIdentity) async {
+        let target = await resolve(pane)
+        if let blocker = MuxaNotificationActions.replyBlocker(target) {
+            postReplyFailure(text, to: pane, reason: blocker)
+            return
+        }
+        guard let target, let sendPrompt else {
+            postReplyFailure(text, to: pane, reason: String(localized: "Muxa is not connected to its daemon."))
+            return
+        }
+        do {
+            try await sendPrompt(target.host, target.pane, text)
+        } catch {
+            MuxaLog.app.warning("notification reply failed: \(error.localizedDescription, privacy: .public)")
+            postReplyFailure(text, to: pane, reason: error.localizedDescription)
+            return
+        }
+        markSeen([pane])
+    }
+
     /// Re-applies settings that change the Dock badge without a snapshot.
     func refreshDockBadge() {
         poster?.setDockBadge(settings().dockBadge ? dockCount : 0)
+    }
+
+    /// The pane an action names. An action can launch the app, so the pane
+    /// gets a short grace period to arrive with the first snapshot.
+    private func resolve(_ pane: MuxaWatchPaneIdentity) async -> MuxaWatchPane? {
+        var remaining = actionPaneWait
+        while true {
+            if let found = snapshot.watchPane(id: pane) { return found }
+            guard remaining > 0 else { return nil }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            remaining -= 0.25
+        }
+    }
+
+    private func postReplyFailure(_ text: String, to pane: MuxaWatchPaneIdentity, reason: String) {
+        poster?.post(MuxaAgentNotification(
+            identifier: "reply:\(Self.key(pane))",
+            title: String(localized: "Your reply was not sent"),
+            subtitle: reason,
+            body: text,
+            pane: pane,
+            sound: settings().sound,
+            category: nil
+        ))
     }
 
     private func isLookedAt(_ pane: MuxaWatchPaneIdentity) -> Bool {
@@ -321,7 +431,8 @@ final class MuxaAgentAttentionCenter: ObservableObject {
             subtitle: [hosted.host.alias, location].compactMap { $0 }.joined(separator: " · "),
             body: body,
             pane: pane,
-            sound: sound
+            sound: sound,
+            category: MuxaNotificationActions.category(for: event)
         )
     }
 

@@ -401,12 +401,9 @@ struct ContentView: View {
     }
 
     /// ⇧⌘J: opens the next pane whose agent is waiting on the operator,
-    /// cycling in topology order from the pane being looked at.
+    /// cycling across every host in ⌘J order from the pane being looked at.
     private func jumpToNextAttention() {
-        let candidates = model.executionSnapshot.watchHosts
-            .flatMap(\.sessions).flatMap(\.windows).flatMap(\.panes)
-            .filter(MuxaAttention.needsAttention)
-            .map(\.id)
+        let candidates = MuxaAttention.cycle(in: model.executionSnapshot.watchHosts)
         let current: MuxaWatchPaneIdentity? = if case .pane(let id) = tabs.focusedSelection { id } else { nil }
         guard let next = MuxaAttention.next(after: current, in: candidates) else {
             NSSound.beep()
