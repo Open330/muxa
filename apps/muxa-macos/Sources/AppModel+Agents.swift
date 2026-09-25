@@ -166,18 +166,14 @@ extension AppModel {
             remembered: remembered.placement,
             guidePlacement: guide?.placement
         )
-        let request = MuxaAgentStartRequest.make(
+        let request = await defaultAgentStartRequest(
             program: program,
-            hostAlias: focus.hostAlias,
             placement: placement,
             focus: focus,
             windowSession: focus.pane == nil
                 ? sessions.first.map { (id: $0.sessionID, socket: $0.socket) }
                 : nil,
-            cwd: cwd,
-            options: remembered.options,
-            guideDirection: guide?.direction,
-            environment: placement == .native ? await nativeAgentEnvironment() : [:]
+            cwd: cwd
         )
         // A second ⌥⌘T pressed while this one awaited its settings finds the
         // first launch under way: let that one finish instead of opening the
@@ -186,6 +182,30 @@ extension AppModel {
         if let failure = await startAgent(request) {
             presentNewAgent(error: failure)
         }
+    }
+
+    /// A no-sheet launch request: the remembered provider options, the
+    /// configured split direction, and a native PTY's environment. Shared by
+    /// ⌥⌘T and the Welcome guide's first agent, which resolve the placement
+    /// themselves.
+    func defaultAgentStartRequest(
+        program: MuxaAgentProgram,
+        placement: MuxaAgentPlacementKind,
+        focus: MuxaAgentLaunchFocus,
+        windowSession: (id: String, socket: String)?,
+        cwd: String
+    ) async -> MuxaAgentStartRequest {
+        MuxaAgentStartRequest.make(
+            program: program,
+            hostAlias: focus.hostAlias,
+            placement: placement,
+            focus: focus,
+            windowSession: windowSession,
+            cwd: cwd,
+            options: agentLauncher.rememberedDefaults.options,
+            guideDirection: agentLauncher.launchSettings?.legacyGuide.direction,
+            environment: placement == .native ? await nativeAgentEnvironment() : [:]
+        )
     }
 
     /// Starts one agent and, in the background, opens its editor pinned once

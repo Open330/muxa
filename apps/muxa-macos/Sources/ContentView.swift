@@ -1500,7 +1500,7 @@ private struct MuxaSidebar: View {
             }
             Section("Needs attention") {
                 if attentionAgents.isEmpty {
-                    SidebarEmptyRow(title: "Nothing needs attention", systemImage: "checkmark.circle")
+                    InboxEmptyState(model: model)
                 } else if filteredAttentionAgents.isEmpty {
                     SidebarEmptyRow(title: "No matching requests", systemImage: "line.3.horizontal.decrease.circle")
                 } else {
@@ -1630,7 +1630,7 @@ private struct MuxaSidebar: View {
     private var watchContextualRows: some View {
         if model.executionSnapshot.watchHosts.allSatisfy({ $0.paneCount == 0 }) {
             Section("Execution topology") {
-                SidebarEmptyRow(title: "No panes detected", systemImage: "terminal")
+                ExploreEmptyState(model: model)
             }
         } else if filteredWatchPanes.isEmpty {
             Section("Execution topology") {

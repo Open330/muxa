@@ -157,7 +157,16 @@ struct MuxaApp: App {
                 .environmentObject(model)
                 .preferredColorScheme(preferredColorScheme)
         }
-        .defaultSize(width: 720, height: 560)
+        .defaultSize(width: 760, height: 600)
+        .defaultPosition(.center)
+        .windowResizability(.contentSize)
+
+        // After an upgrade: the release's highlights instead of the full
+        // guide; also under Help › What's New in Muxa.
+        Window("What's New in Muxa", id: OnboardingPreferences.whatsNewWindowID) {
+            WhatsNewView()
+                .preferredColorScheme(preferredColorScheme)
+        }
         .defaultPosition(.center)
         .windowResizability(.contentSize)
 
