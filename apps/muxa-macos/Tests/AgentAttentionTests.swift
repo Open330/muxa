@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import UserNotifications
 @testable import Muxa
 
 @MainActor
@@ -25,7 +26,12 @@ private struct AgentFixture {
 private let paneA = MuxaWatchPaneIdentity(hostAlias: "local", socket: "default", paneID: "%1")
 private let paneB = MuxaWatchPaneIdentity(hostAlias: "local", socket: "default", paneID: "%2")
 
-private func snapshot(_ agents: [AgentFixture], host: String = "local") throws -> MuxaExecutionSnapshot {
+private func snapshot(
+    _ agents: [AgentFixture],
+    host: String = "local",
+    local: Bool = true,
+    state: String = "online"
+) throws -> MuxaExecutionSnapshot {
     let panes: [[String: Any]] = agents.map { agent in
         var pane: [String: Any] = [
             "pane_id": agent.pane, "title": "t", "session_id": "$1", "session": "demo",
@@ -46,7 +52,7 @@ private func snapshot(_ agents: [AgentFixture], host: String = "local") throws -
         return wire
     }
     let host = try JSONDecoder().decode(MuxaFleetHost.self, from: JSONSerialization.data(withJSONObject: [
-        "alias": host, "local": true, "mode": "control", "state": "online",
+        "alias": host, "local": local, "mode": "control", "state": state,
         "remote": ["agents": wireAgents, "panes": panes],
     ]))
     return MuxaExecutionSnapshot(hosts: [host])
@@ -267,4 +273,89 @@ private final class Harness {
     let items = MuxaPaletteItems.agents(watchHosts: snap.watchHosts, unread: unread)
     #expect(items.map(\.title) == ["@waiting", "@unread", "@working", "@idle"])
     #expect(items[1].systemImage == "circle.fill")
+}
+
+@Test func onlyAnAgentWaitingForInputOffersReply() {
+    #expect(MuxaNotificationActions.category(for: .attention("waiting_input")) == MuxaNotificationActions.inputCategory)
+    for state in ["waiting_choice", "error", "failed", "blocked"] {
+        #expect(MuxaNotificationActions.category(for: .attention(state)) == MuxaNotificationActions.agentCategory)
+    }
+    #expect(MuxaNotificationActions.category(for: .finished) == MuxaNotificationActions.agentCategory)
+}
+
+@Test func notificationResponsesRouteToOpenMarkReadOrReply() {
+    typealias Actions = MuxaNotificationActions
+    #expect(Actions.defaultAction == UNNotificationDefaultActionIdentifier)
+    #expect(Actions.route(action: UNNotificationDefaultActionIdentifier, userText: nil) == .open)
+    #expect(Actions.route(action: Actions.open, userText: nil) == .open)
+    #expect(Actions.route(action: Actions.markRead, userText: nil) == .markRead)
+    #expect(Actions.route(action: Actions.reply, userText: "  run the tests\n") == .reply("run the tests"))
+    #expect(Actions.route(action: Actions.reply, userText: " \n ") == .ignore)
+    #expect(Actions.route(action: Actions.reply, userText: nil) == .ignore)
+    #expect(Actions.route(action: UNNotificationDismissActionIdentifier, userText: nil) == .ignore)
+}
+
+@Test @MainActor func postedNotificationsCarryTheirCategory() throws {
+    let h = Harness()
+    try h.ingest([AgentFixture()])
+    try h.ingest([AgentFixture(state: "waiting_input", enteredAt: "2026-09-23T10:01:00Z")])
+    #expect(h.poster.posted.last?.category == MuxaNotificationActions.inputCategory)
+    try h.ingest([AgentFixture(state: "waiting_choice", enteredAt: "2026-09-23T10:02:00Z")])
+    #expect(h.poster.posted.last?.category == MuxaNotificationActions.agentCategory)
+}
+
+@Test @MainActor func markReadFromANotificationClearsThePane() async throws {
+    let h = Harness()
+    try h.ingest([AgentFixture()])
+    try h.ingest([AgentFixture(state: "waiting_input", enteredAt: "2026-09-23T10:01:00Z")])
+    #expect(h.center.isUnread(paneA))
+    #expect(h.center.dockCount == 1)
+    await h.center.markRead(paneA)
+    #expect(!h.center.isUnread(paneA))
+    #expect(h.poster.removed.contains(MuxaAgentAttentionCenter.key(paneA)))
+}
+
+@Test @MainActor func aReplyIsSentToItsPaneAndMarksItRead() async throws {
+    let h = Harness()
+    var sent: [(String, String, String)] = []
+    h.center.sendPrompt = { host, pane, text in sent.append((host.alias, pane.paneID, text)) }
+    try h.ingest([AgentFixture()])
+    try h.ingest([AgentFixture(state: "waiting_input", enteredAt: "2026-09-23T10:01:00Z")])
+    let posted = h.poster.posted.count
+    await h.center.reply("yes, go ahead", to: paneA)
+    #expect(sent.count == 1)
+    #expect(sent.first?.0 == "local")
+    #expect(sent.first?.1 == "%1")
+    #expect(sent.first?.2 == "yes, go ahead")
+    #expect(!h.center.isUnread(paneA))
+    #expect(h.poster.posted.count == posted)
+}
+
+@Test @MainActor func aReplyThatCannotBeDeliveredComesBackAsANotification() async throws {
+    struct Refused: LocalizedError { var errorDescription: String? { "Prompt was rejected" } }
+    let h = Harness()
+    h.center.actionPaneWait = 0
+    h.center.sendPrompt = { _, _, _ in throw Refused() }
+    try h.ingest([AgentFixture()])
+    try h.ingest([AgentFixture(state: "waiting_input", enteredAt: "2026-09-23T10:01:00Z")])
+
+    await h.center.reply("try again", to: paneA)
+    let failed = try #require(h.poster.posted.last)
+    #expect(failed.subtitle == "Prompt was rejected")
+    #expect(failed.body == "try again")
+    #expect(failed.pane == paneA)
+    #expect(failed.category == nil)
+    #expect(h.center.isUnread(paneA))
+
+    await h.center.reply("hello", to: paneB)
+    #expect(h.poster.posted.last?.subtitle == "This pane is no longer available")
+    #expect(h.poster.posted.last?.body == "hello")
+
+    var sent = 0
+    h.center.sendPrompt = { _, _, _ in sent += 1 }
+    try h.center.ingest(snapshot([AgentFixture()], host: "gpu", local: false, state: "offline"))
+    let remote = MuxaWatchPaneIdentity(hostAlias: "gpu", socket: "default", paneID: "%1")
+    await h.center.reply("status?", to: remote)
+    #expect(sent == 0)
+    #expect(h.poster.posted.last?.subtitle == "Not connected: gpu")
 }
