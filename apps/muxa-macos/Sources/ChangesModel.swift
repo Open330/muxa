@@ -151,6 +151,8 @@ struct ChangesLoader: Sendable {
     struct LoadedDiff: Sendable {
         let file: DiffFile
         let bytes: Int
+        /// `DiffFingerprint` of `file`, taken off the main actor.
+        let fingerprint: String
     }
 
     func diff(root: String, file: ChangedFile, base: BranchBase?) async -> Result<LoadedDiff, ChangesFailure> {
@@ -177,7 +179,39 @@ struct ChangesLoader: Sendable {
         let parsed = UnifiedDiffParser.parse(output.stdoutText, truncated: output.truncated)
         var diff = parsed.first(where: { $0.path == file.path }) ?? parsed.first ?? DiffFile()
         if diff.newPath == nil, !diff.isDeleted { diff.newPath = file.path }
-        return .success(LoadedDiff(file: diff, bytes: output.stdout.count))
+        return .success(LoadedDiff(file: diff, bytes: output.stdout.count, fingerprint: DiffFingerprint.of(diff)))
+    }
+
+    /// Current diff fingerprints for `files`, keyed by file id: one git run
+    /// per list rather than one per file, since only viewed files are
+    /// re-checked. Files git could not diff in full are left out.
+    func fingerprints(root: String, files: [ChangedFile], base: BranchBase?) async -> [String: String] {
+        var result: [String: String] = [:]
+        let files = Array(files.prefix(1_000))
+        var batches: [([String], [ChangedFile])] = [
+            (["diff", "--cached", "-M"] + Self.diffFlags, files.filter { $0.group == .staged }),
+            (["diff"] + Self.diffFlags, files.filter { $0.group == .unstaged || $0.group == .conflicts }),
+        ]
+        if let base {
+            batches.append((["diff", "-M"] + Self.diffFlags + [base.sha], files.filter { $0.group == .branch }))
+        }
+        for (args, files) in batches where !files.isEmpty {
+            let paths = files.flatMap { file in [file.origPath, file.path].compactMap { $0 } }
+            let output = await git.run(args + ["--"] + paths, in: root, limit: Self.statusLimit, timeout: 20)
+            guard output.status == 0 else { continue }
+            let byPath = DiffFingerprint.byPath(parsing: output.stdoutText, truncated: output.truncated)
+            for file in files {
+                if let fingerprint = byPath[file.path] { result[file.id] = fingerprint }
+            }
+        }
+        // `--no-index` takes one pair of paths per run.
+        for file in files.filter({ $0.group == .untracked }).prefix(200) {
+            guard !Task.isCancelled else { break }
+            if case .success(let loaded) = await diff(root: root, file: file, base: base), !loaded.file.truncated {
+                result[file.id] = loaded.fingerprint
+            }
+        }
+        return result
     }
 
     /// An untracked file's line count, read straight from disk: small text
@@ -497,6 +531,11 @@ final class ChangesModel: ObservableObject {
     @Published var selection: DiffSelection?
 
     let drafts: ReviewDraftStore
+    let viewed: ViewedFilesStore
+    /// The latest diff fingerprint seen for each file id, so marking a
+    /// file viewed records what the operator actually looked at.
+    private var fingerprints: [String: String] = [:]
+    private var viewedTask: Task<Void, Never>?
     private var loader: ChangesLoader?
     private var refreshTask: Task<Void, Never>?
     private var refreshGeneration = 0
@@ -505,9 +544,10 @@ final class ChangesModel: ObservableObject {
     private var settleTask: Task<Void, Never>?
     private var forcedLargePaths: Set<String> = []
 
-    init(source: ChangesSource, drafts: ReviewDraftStore = .shared) {
+    init(source: ChangesSource, drafts: ReviewDraftStore = .shared, viewed: ViewedFilesStore = .shared) {
         self.source = source
         self.drafts = drafts
+        self.viewed = viewed
     }
 
     var draftKey: ReviewDraftKey? {
@@ -523,6 +563,7 @@ final class ChangesModel: ObservableObject {
         self.source = source
         snapshot = nil
         diff = .none
+        fingerprints = [:]
         restart()
     }
 
@@ -547,6 +588,77 @@ final class ChangesModel: ObservableObject {
         guard let files = visible ?? snapshot?.files, !files.isEmpty else { return }
         let index = files.firstIndex { $0.id == selectedFileID } ?? (offset > 0 ? -1 : files.count)
         select(fileID: files[max(0, min(files.count - 1, index + offset))].id)
+    }
+
+    // MARK: Viewed
+
+    func viewedKey(for file: ChangedFile) -> String? {
+        snapshot.map { ViewedFiles.key(hostAlias: source.hostAlias, root: $0.root, fileID: file.id) }
+    }
+
+    func isViewed(_ file: ChangedFile) -> Bool {
+        viewedKey(for: file).map(viewed.isViewed) ?? false
+    }
+
+    /// Marks or clears a file's Viewed box. Marking a file whose diff has
+    /// not been read yet reads it first; the selected file's hunks fold
+    /// away once it is viewed, the way GitHub collapses a viewed file.
+    func toggleViewed(_ file: ChangedFile) {
+        guard let key = viewedKey(for: file) else { return }
+        if viewed.isViewed(key) {
+            viewed.unmark(key)
+            if file.id == selectedFileID { collapsedHunks = [] }
+            return
+        }
+        if let fingerprint = fingerprints[file.id] {
+            markViewed(file, key: key, fingerprint: fingerprint)
+            return
+        }
+        guard let loader, let snapshot else { return }
+        let root = snapshot.root
+        let base = snapshot.base
+        Task { [weak self] in
+            let result = await loader.fingerprints(root: root, files: [file], base: base)
+            guard let self, let fingerprint = result[file.id], self.snapshot?.root == root else { return }
+            self.fingerprints[file.id] = fingerprint
+            self.markViewed(file, key: key, fingerprint: fingerprint)
+        }
+    }
+
+    private func markViewed(_ file: ChangedFile, key: String, fingerprint: String) {
+        viewed.mark(key, fingerprint: fingerprint)
+        if file.id == selectedFileID, case .loaded(let diff) = diff {
+            collapsedHunks = Set(diff.hunks.map(\.id))
+        }
+    }
+
+    /// Keeps fresh fingerprints and drops the viewed marks of files whose
+    /// diff has moved on since they were marked.
+    private func noteFingerprints(_ fresh: [String: String], root: String) {
+        fingerprints.merge(fresh) { $1 }
+        var byKey: [String: String] = [:]
+        for (fileID, fingerprint) in fresh {
+            byKey[ViewedFiles.key(hostAlias: source.hostAlias, root: root, fileID: fileID)] = fingerprint
+        }
+        viewed.reconcile(byKey)
+    }
+
+    /// Re-checks the files marked viewed against their current diffs, in
+    /// the background after each refresh.
+    private func verifyViewed(_ snapshot: GitChangesSnapshot) {
+        viewedTask?.cancel()
+        guard let loader else { return }
+        let marked = snapshot.files.filter { file in
+            viewed.isViewed(ViewedFiles.key(hostAlias: source.hostAlias, root: snapshot.root, fileID: file.id))
+        }
+        guard !marked.isEmpty else { return }
+        let root = snapshot.root
+        let base = snapshot.base
+        viewedTask = Task { [weak self] in
+            let fresh = await loader.fingerprints(root: root, files: marked, base: base)
+            guard !Task.isCancelled, let self, self.snapshot?.root == root else { return }
+            self.noteFingerprints(fresh, root: root)
+        }
     }
 
     func showLargeDiff() {
@@ -701,6 +813,7 @@ final class ChangesModel: ObservableObject {
             drafts.markMissing(in: key, changedPaths: Set(next.files.map(\.path)))
         }
         loadDiff(keepCurrent: true)
+        verifyViewed(next)
     }
 
     private func fail(_ failure: ChangesFailure) {
@@ -753,6 +866,12 @@ final class ChangesModel: ObservableObject {
             switch result {
             case .success(let loaded):
                 if let key { self.drafts.refreshOutdated(in: key, file: loaded.file, group: file.group) }
+                self.noteFingerprints([file.id: loaded.fingerprint], root: root)
+                // A viewed file opens folded; a refresh of the one on
+                // screen keeps whatever the operator unfolded.
+                if !(keepCurrent && showsSameFile), self.isViewed(file) {
+                    self.collapsedHunks = Set(loaded.file.hunks.map(\.id))
+                }
                 let lines = loaded.file.lineCount
                 if ChangesRefreshRules.isLarge(lines: lines, bytes: loaded.bytes),
                    !self.forcedLargePaths.contains(loaded.file.path) {
