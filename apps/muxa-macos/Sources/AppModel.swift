@@ -692,6 +692,13 @@ final class AppModel: ObservableObject {
     }
 
     func createShell() {
+        createShell(typing: nil)
+    }
+
+    /// A new shell tab with `text` typed at its prompt but not run: the
+    /// operator reads it and presses Return (the Welcome guide's install
+    /// commands).
+    func createShell(typing text: String?) {
         guard isConnected, !isCreatingSession else { return }
         isCreatingSession = true
         Task {
@@ -724,6 +731,18 @@ final class AppModel: ObservableObject {
                 shellNumber += 1
                 registerSpawnedSession(session)
                 await refresh()
+                if let text, !text.isEmpty {
+                    // Give the shell a moment to draw its prompt so the
+                    // text lands after it rather than above it.
+                    try? await Task.sleep(for: .milliseconds(600))
+                    do {
+                        try await client.writeSession(id: session.id, bytes: Data(text.utf8))
+                    } catch {
+                        MuxaLog.app.warning(
+                            "typing into the new shell failed: \(error.localizedDescription, privacy: .public)"
+                        )
+                    }
+                }
             } catch {
                 MuxaLog.app.error(
                     "session creation failed: \(error.localizedDescription, privacy: .public)"

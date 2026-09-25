@@ -428,6 +428,13 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
         args.only_missing,
         args.layout_only,
     );
+    // What the server has now, window by window: a dry run shows it beside
+    // the snapshot. Only a server that answered is compared; one that is
+    // down has nothing running to compare with.
+    let new_sessions = live
+        .as_ref()
+        .and_then(|_| live_shape(&endpoint))
+        .map(|shape| plan::compare(&mut sessions, &shape));
     let document = |sessions: Vec<plan::SessionPlan>, totals: Option<plan::Totals>| {
         let dir = if path.is_dir() {
             path.clone()
@@ -447,6 +454,7 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
             server_reachable: live.is_some(),
             run: args.run,
             sessions,
+            new_sessions: new_sessions.clone(),
             totals,
         }
     };
@@ -458,6 +466,9 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
             return print_json(&document(sessions, None));
         }
         plan::print_plan(&sessions, args.layout_only);
+        for line in plan::new_lines(&sessions, new_sessions.as_deref().unwrap_or_default()) {
+            println!("{line}");
+        }
         if args.only_missing {
             println!("\ndry run. Re-run with --run to create the missing sessions.");
         } else {
@@ -503,6 +514,17 @@ fn live_sessions(endpoint: &BackendEndpoint) -> Option<BTreeSet<String>> {
     mux_control::capture(endpoint, &["list-sessions", "-F", "#{session_name}"])
         .ok()
         .map(|listing| listing.lines().map(str::to_owned).collect())
+}
+
+/// Every session, window and pane the server has right now; `None` when it
+/// does not answer.
+fn live_shape(endpoint: &BackendEndpoint) -> Option<plan::LiveShape> {
+    mux_control::capture(
+        endpoint,
+        &["list-panes", "-a", "-F", plan::LIVE_PANE_FORMAT],
+    )
+    .ok()
+    .map(|listing| plan::parse_live_shape(&listing))
 }
 
 pub async fn reload(client: &Client, args: ReloadArgs) -> Result<()> {

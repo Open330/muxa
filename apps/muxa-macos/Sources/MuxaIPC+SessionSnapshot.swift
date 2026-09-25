@@ -173,6 +173,18 @@ struct MuxSnapshotPlan: Decodable, Hashable, Sendable {
         }
     }
 
+    /// Whether something the snapshot recorded is on the server now.
+    enum LiveState: MuxSnapshotOpenEnum {
+        case missing, present, unknown(String)
+        init(raw: String) {
+            switch raw {
+            case "missing": self = .missing
+            case "present": self = .present
+            default: self = .unknown(raw)
+            }
+        }
+    }
+
     enum PaneResult: MuxSnapshotOpenEnum {
         case relaunched, unconfirmed, shell, manual, failed, unknown(String)
         init(raw: String) {
@@ -190,14 +202,35 @@ struct MuxSnapshotPlan: Decodable, Hashable, Sendable {
     struct Session: Decodable, Hashable, Sendable {
         let name: String
         let action: SessionAction
+        /// Whether it is running now; nil from a CLI that predates the
+        /// comparison.
+        let state: LiveState?
         let result: SessionResult?
         let error: String?
         let windows: [Window]
+        /// Windows it has now that the snapshot does not.
+        let newWindows: [LiveWindow]?
+
+        enum CodingKeys: String, CodingKey {
+            case name, action, state, result, error, windows
+            case newWindows = "new_windows"
+        }
+
+        /// Running now: the CLI says so, or — before it could — the plan
+        /// does not create it.
+        var isRunning: Bool {
+            switch state {
+            case .present?: true
+            case .missing?: false
+            case .unknown?, nil: action != .create
+            }
+        }
     }
 
     struct Window: Decodable, Hashable, Sendable {
         let index: String
         let name: String
+        let state: LiveState?
         let panes: [Pane]
     }
 
@@ -205,6 +238,7 @@ struct MuxSnapshotPlan: Decodable, Hashable, Sendable {
         let index: String
         let path: String
         let action: PaneAction
+        let state: LiveState?
         let command: String?
         let agentKind: String?
         /// What a person has to do, for a pane muxa cannot relaunch itself.
@@ -213,9 +247,29 @@ struct MuxSnapshotPlan: Decodable, Hashable, Sendable {
         let error: String?
 
         enum CodingKeys: String, CodingKey {
-            case index, path, action, command, note, result, error
+            case index, path, action, state, command, note, result, error
             case agentKind = "agent_kind"
         }
+    }
+
+    /// A session running now that the snapshot does not have. A restore
+    /// never closes it.
+    struct LiveSession: Decodable, Hashable, Sendable {
+        let name: String
+        let windows: [LiveWindow]
+    }
+
+    struct LiveWindow: Decodable, Hashable, Sendable {
+        let index: String
+        let name: String
+        let panes: [LivePane]
+    }
+
+    struct LivePane: Decodable, Hashable, Sendable {
+        let index: String
+        let path: String
+        /// The foreground program; nil for a bare shell.
+        let command: String?
     }
 
     struct Totals: Decodable, Hashable, Sendable {
@@ -255,17 +309,41 @@ struct MuxSnapshotPlan: Decodable, Hashable, Sendable {
     let id: String
     let summary: MuxSnapshotSummary?
     let serverReachable: Bool
+    /// Whether existing sessions are left alone (`--only-missing`).
+    let onlyMissing: Bool
     let run: Bool
     let sessions: [Session]
+    /// Sessions running now that the snapshot does not have; nil when the
+    /// CLI did not compare (too old, or the server's panes could not be
+    /// listed).
+    let newSessions: [LiveSession]?
     let totals: Totals?
 
     enum CodingKeys: String, CodingKey {
         case id, summary, run, sessions, totals
         case serverReachable = "server_reachable"
+        case onlyMissing = "only_missing"
+        case newSessions = "new_sessions"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        summary = try values.decodeIfPresent(MuxSnapshotSummary.self, forKey: .summary)
+        serverReachable = try values.decode(Bool.self, forKey: .serverReachable)
+        onlyMissing = try values.decodeIfPresent(Bool.self, forKey: .onlyMissing) ?? true
+        run = try values.decode(Bool.self, forKey: .run)
+        sessions = try values.decode([Session].self, forKey: .sessions)
+        newSessions = try values.decodeIfPresent([LiveSession].self, forKey: .newSessions)
+        totals = try values.decodeIfPresent(Totals.self, forKey: .totals)
     }
 
     var sessionsToCreate: Int { sessions.filter { $0.action == .create }.count }
     var sessionsToSkip: Int { sessions.filter { $0.action == .skip }.count }
+    /// Running sessions a full restore adds missing windows and panes to.
+    var sessionsToFill: Int { sessions.filter { $0.action == .fillMissing }.count }
+    /// Whether the CLI compared the snapshot with what runs now.
+    var isCompared: Bool { newSessions != nil }
 }
 
 /// A restore muxad runs in the background and the sheet polls.
@@ -364,8 +442,10 @@ final class MuxaSessionSnapshotClient: Sendable {
         try await payload(Self.requestObject("mux_snapshot_save"))
     }
 
-    func plan(id: String) async throws -> MuxSnapshotPlan {
-        try await payload(Self.requestObject("mux_snapshot_plan", ["id": id]))
+    /// `onlyMissing: false` needs `mux_snapshot_plan_v1`; an older muxad
+    /// ignores the field and always plans only the missing sessions.
+    func plan(id: String, onlyMissing: Bool = true) async throws -> MuxSnapshotPlan {
+        try await payload(Self.requestObject("mux_snapshot_plan", ["id": id, "only_missing": onlyMissing]))
     }
 
     func delete(id: String) async throws {
@@ -374,8 +454,11 @@ final class MuxaSessionSnapshotClient: Sendable {
         )
     }
 
-    func restore(id: String, layoutOnly: Bool) async throws -> MuxSnapshotOperation {
-        try await operation(Self.requestObject("mux_snapshot_restore", ["id": id, "layout_only": layoutOnly]))
+    func restore(id: String, layoutOnly: Bool, onlyMissing: Bool = true) async throws -> MuxSnapshotOperation {
+        try await operation(Self.requestObject(
+            "mux_snapshot_restore",
+            ["id": id, "layout_only": layoutOnly, "only_missing": onlyMissing]
+        ))
     }
 
     func status(operationID: String) async throws -> MuxSnapshotOperation {
@@ -411,6 +494,8 @@ final class MuxaSessionSnapshotClient: Sendable {
 
 extension MuxaIPCClient {
     static let muxSnapshotCapability = "mux_snapshot_v1"
+    /// Plans and restores that may fill running sessions (`only_missing`).
+    static let muxSnapshotPlanCapability = "mux_snapshot_plan_v1"
 
     /// A snapshot client bound to this daemon's socket.
     nonisolated func makeSessionSnapshotClient() -> MuxaSessionSnapshotClient {

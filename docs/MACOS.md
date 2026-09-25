@@ -18,7 +18,10 @@ and encodes user input.
 - keeps the PTY alive when its native window closes;
 - saves and restores workspace snapshots (Explore "…" → Save Snapshot /
   Restore Snapshot…) through muxad's `mux_snapshot_v1` requests, which run
-  `muxa snapshot` / `muxa restore --only-missing --json`; and
+  `muxa snapshot` / `muxa restore --only-missing --json`; the restore
+  preview compares the snapshot with what runs now, and with
+  `mux_snapshot_plan_v1` "Only missing sessions" can be turned off to also
+  fill in running sessions; and
 - provides both a main window and a menu-bar control.
 
 External tmux, cmux, rmux, herdr, and zellij surfaces remain execution

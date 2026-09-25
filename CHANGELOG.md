@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Compare a snapshot with what runs now before restoring it.** Muxa for
+  Mac's Restore Snapshot sheet marks every session, window and pane as
+  missing now or running, lists what is new since the snapshot (a restore
+  never closes it), and sums it up — "2 sessions to recreate, 5 already
+  running, 1 new since snapshot". The Restore button says what it will do,
+  and with muxad's `mux_snapshot_plan_v1` an "Only missing sessions" switch
+  can be turned off to also fill in the windows and panes running sessions
+  lack. `muxa restore --json` adds `state`, `new_windows` and
+  `new_sessions`, and the dry-run text lists what is new since the snapshot.
+
 ## [0.8.53] - 2026-09-25
 
 ### Fixed

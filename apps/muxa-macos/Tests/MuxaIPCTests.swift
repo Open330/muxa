@@ -2403,21 +2403,50 @@ func workbenchLaunchReactivationKeepsRestoredPreview() throws {
 
 // MARK: - Onboarding (peer: onboarding)
 
-@Test func onboardingShowsForFirstLaunchAndOlderRecordedVersions() {
-    #expect(OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: nil))
-    #expect(OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: ""))
-    #expect(OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: "0.1.0"))
-    #expect(OnboardingPreferences.shouldPresent(currentVersion: "0.1.10", completedVersion: "0.1.9"))
-    #expect(OnboardingPreferences.shouldPresent(currentVersion: "1.0", completedVersion: "0.9.9"))
+/// One release with highlights, so the decision does not depend on the
+/// shipped list.
+private let onboardingTestReleases = [
+    MuxaWhatsNew.Release(version: "0.2.0", highlights: [
+        MuxaWhatsNew.Highlight(systemImage: "star", title: "New", detail: "Something new"),
+    ]),
+]
+
+@Test func onboardingShowsTheFullGuideOnlyOnFirstLaunch() {
+    #expect(OnboardingPreferences.launchPresentation(
+        currentVersion: "0.2.0", completedVersion: nil, releases: onboardingTestReleases
+    ) == .welcomeGuide)
+    #expect(OnboardingPreferences.launchPresentation(
+        currentVersion: "0.2.0", completedVersion: " ", releases: onboardingTestReleases
+    ) == .welcomeGuide)
+    // First run with no highlights at all is still the full guide.
+    #expect(OnboardingPreferences.launchPresentation(
+        currentVersion: "0.2.0", completedVersion: nil, releases: []
+    ) == .welcomeGuide)
+}
+
+@Test func onboardingShowsWhatsNewAfterAnUpgradeWithHighlights() {
+    #expect(OnboardingPreferences.launchPresentation(
+        currentVersion: "0.2.0", completedVersion: "0.1.0", releases: onboardingTestReleases
+    ) == .whatsNew(version: "0.2.0"))
+    // A patch release without its own entry still surfaces the one skipped.
+    #expect(OnboardingPreferences.launchPresentation(
+        currentVersion: "0.2.1", completedVersion: "0.1.9", releases: onboardingTestReleases
+    ) == .whatsNew(version: "0.2.1"))
+    // Upgrading past a release without highlights stays quiet.
+    #expect(OnboardingPreferences.launchPresentation(
+        currentVersion: "0.2.1", completedVersion: "0.2.0", releases: onboardingTestReleases
+    ) == nil)
 }
 
 @Test func onboardingStaysQuietForEqualOrNewerRecordedVersions() {
-    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: "0.2.0"))
-    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: "0.2"))
-    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.2", completedVersion: "0.2.0"))
-    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.1.9", completedVersion: "0.1.10"))
-    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: "0.3.0-beta"))
+    let releases = onboardingTestReleases
+    #expect(OnboardingPreferences.launchPresentation(currentVersion: "0.2.0", completedVersion: "0.2.0", releases: releases) == nil)
+    #expect(OnboardingPreferences.launchPresentation(currentVersion: "0.2.0", completedVersion: "0.2", releases: releases) == nil)
+    #expect(OnboardingPreferences.launchPresentation(currentVersion: "0.2", completedVersion: "0.2.0", releases: releases) == nil)
+    #expect(OnboardingPreferences.launchPresentation(currentVersion: "0.1.9", completedVersion: "0.1.10", releases: releases) == nil)
+    #expect(OnboardingPreferences.launchPresentation(currentVersion: "0.2.0", completedVersion: "0.3.0-beta", releases: releases) == nil)
     #expect(OnboardingPreferences.compareVersions("0.1.0-beta", "0.1.0") == .orderedSame)
+    #expect(OnboardingPreferences.compareVersions("0.1.9", "0.1.10") == .orderedAscending)
 }
 
 @Test func onboardingNeverPresentsInsideTestHosts() {
@@ -2427,7 +2456,7 @@ func workbenchLaunchReactivationKeepsRestoredPreview() throws {
     #expect(OnboardingPreferences.isRunningTests(environment: ["SWIFT_TESTING_ENABLED": "1"]))
     #expect(!OnboardingPreferences.isRunningTests(environment: ["PATH": "/usr/bin"]))
     #expect(OnboardingPreferences.isRunningTests())
-    #expect(!OnboardingPreferences.shouldPresentOnLaunch(currentVersion: "9.9.9"))
+    #expect(OnboardingPreferences.launchPresentationOnLaunch(currentVersion: "9.9.9") == nil)
 }
 
 @Test func onboardingRecordsTheCompletedVersionInDefaults() throws {
@@ -2436,17 +2465,17 @@ func workbenchLaunchReactivationKeepsRestoredPreview() throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let environment = ["PATH": "/usr/bin"]
 
-    #expect(OnboardingPreferences.shouldPresentOnLaunch(
-        defaults: defaults, currentVersion: "0.2.0", environment: environment
-    ))
-    OnboardingPreferences.markCompleted(version: "0.2.0", defaults: defaults)
-    #expect(defaults.string(forKey: OnboardingPreferences.completedVersionKey) == "0.2.0")
-    #expect(!OnboardingPreferences.shouldPresentOnLaunch(
-        defaults: defaults, currentVersion: "0.2.0", environment: environment
-    ))
-    #expect(OnboardingPreferences.shouldPresentOnLaunch(
-        defaults: defaults, currentVersion: "0.3.0", environment: environment
-    ))
+    #expect(OnboardingPreferences.launchPresentationOnLaunch(
+        defaults: defaults, currentVersion: "0.1.0", environment: environment, releases: onboardingTestReleases
+    ) == .welcomeGuide)
+    OnboardingPreferences.markCompleted(version: "0.1.0", defaults: defaults)
+    #expect(defaults.string(forKey: OnboardingPreferences.completedVersionKey) == "0.1.0")
+    #expect(OnboardingPreferences.launchPresentationOnLaunch(
+        defaults: defaults, currentVersion: "0.1.0", environment: environment, releases: onboardingTestReleases
+    ) == nil)
+    #expect(OnboardingPreferences.launchPresentationOnLaunch(
+        defaults: defaults, currentVersion: "0.2.0", environment: environment, releases: onboardingTestReleases
+    ) == .whatsNew(version: "0.2.0"))
 }
 
 @Test func onboardingChecklistMapsDetectedTools() {
