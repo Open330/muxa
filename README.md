@@ -49,9 +49,8 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 
 - **Keeps your setup.** Reads agent state from Claude Code, Codex, and
   Gemini CLI (and its Antigravity successor) hooks, with screen detection
-  for hook-less agents, and maps it
-  onto the tmux panes you already have. You don't launch agents through
-  muxa, and you don't switch multiplexers. tmux, [rmux](https://rmux.io),
+  for hook-less agents, and maps it onto the tmux panes you already have.
+  You don't launch agents through muxa, and you don't switch multiplexers. tmux, [rmux](https://rmux.io),
   and [herdr](https://herdr.dev) can be observed at the same time; zellij
   has a CLI baseline.
 - **Tells you who is waiting.** tmux status line, the `muxa watch` TUI,

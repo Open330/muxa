@@ -47,8 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 
 - **지금 환경을 그대로 둡니다.** Claude Code, Codex, Gemini CLI(후속인
   Antigravity CLI `agy` 포함)의 hook에서 에이전트 상태를 읽고(hook이 없는
-  에이전트는 화면으로 감지), 이미 열어 둔 tmux
-  pane에 연결합니다. 에이전트를 Muxa로 띄울 필요도, 멀티플렉서를 바꿀 필요도
+  에이전트는 화면으로 감지), 이미 열어 둔 tmux pane에 연결합니다. 에이전트를 Muxa로 띄울 필요도, 멀티플렉서를 바꿀 필요도
   없습니다. tmux, [rmux](https://rmux.io), [herdr](https://herdr.dev)를 동시에
   관찰할 수 있고 zellij는 CLI baseline을 지원합니다.
 - **누가 기다리는지 알려 줍니다.** tmux 상태바, `muxa watch` TUI, 데스크톱
