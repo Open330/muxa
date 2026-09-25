@@ -61,10 +61,27 @@ pub(super) enum PaneResult {
     Failed,
 }
 
+/// Whether something the snapshot recorded is on the server right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum LiveState {
+    /// Not there; a restore creates it.
+    Missing,
+    /// Already there; a restore keeps it as it is.
+    Present,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct SessionPlan {
     pub name: String,
     pub action: SessionAction,
+    /// Whether the session is running now. Always known: an unreachable
+    /// server has no sessions.
+    pub state: LiveState,
+    /// Windows the live session has that the snapshot does not. A restore
+    /// never closes them; they are listed so the comparison is complete.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub new_windows: Vec<LiveWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<SessionResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,6 +94,10 @@ pub(super) struct WindowPlan {
     pub index: String,
     pub name: String,
     pub layout: String,
+    /// Whether the window is on the server now; absent when the server's
+    /// windows could not be listed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<LiveState>,
     pub panes: Vec<PanePlan>,
 }
 
@@ -85,6 +106,10 @@ pub(super) struct PanePlan {
     pub index: String,
     pub path: String,
     pub action: PaneAction,
+    /// Whether the window already has a pane in this place. A restore only
+    /// splits off the panes a window lacks, counted in recorded order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<LiveState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,8 +173,173 @@ pub(super) struct RestoreDocument {
     pub server_reachable: bool,
     pub run: bool,
     pub sessions: Vec<SessionPlan>,
+    /// Sessions running now that the snapshot does not have. A restore
+    /// never touches them. Absent when the server's panes could not be
+    /// listed, so a reader can tell "none" from "not compared".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_sessions: Option<Vec<LiveSession>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub totals: Option<Totals>,
+}
+
+/// The server's shape right now, for comparing a snapshot against it:
+/// every session with the windows it shows, in the server's order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct LiveShape {
+    pub sessions: Vec<LiveSession>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct LiveSession {
+    pub name: String,
+    pub windows: Vec<LiveWindow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct LiveWindow {
+    pub index: String,
+    pub name: String,
+    pub panes: Vec<LivePane>,
+    /// `@12`. A window a session group shares is listed once per session
+    /// that shows it, under the same id.
+    #[serde(skip)]
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct LivePane {
+    pub index: String,
+    pub path: String,
+    /// The foreground program, unless it is the pane's shell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+/// The `list-panes -a` format [`parse_live_shape`] reads.
+pub(super) const LIVE_PANE_FORMAT: &str = "#{session_name}\t#{window_index}\t#{window_id}\t#{window_name}\t#{pane_index}\t#{pane_current_path}\t#{pane_current_command}";
+
+/// Read a `list-panes -a -F LIVE_PANE_FORMAT` listing into sessions and
+/// their windows.
+pub(super) fn parse_live_shape(listing: &str) -> LiveShape {
+    let mut shape = LiveShape::default();
+    for line in listing.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        let [session, window_index, window_id, window_name, pane_index, path, command] = f[..]
+        else {
+            continue;
+        };
+        if shape
+            .sessions
+            .last()
+            .is_none_or(|last| last.name != session)
+        {
+            shape.sessions.push(LiveSession {
+                name: session.to_owned(),
+                windows: Vec::new(),
+            });
+        }
+        let windows = &mut shape.sessions.last_mut().expect("pushed above").windows;
+        if windows.last().is_none_or(|last| last.index != window_index) {
+            windows.push(LiveWindow {
+                index: window_index.to_owned(),
+                name: window_name.to_owned(),
+                panes: Vec::new(),
+                id: window_id.to_owned(),
+            });
+        }
+        windows
+            .last_mut()
+            .expect("pushed above")
+            .panes
+            .push(LivePane {
+                index: pane_index.to_owned(),
+                path: path.to_owned(),
+                command: Some(command)
+                    .filter(|command| !command.is_empty() && !super::is_shell(command))
+                    .map(str::to_owned),
+            });
+    }
+    shape
+}
+
+/// Mark every planned window and pane missing or present against the
+/// server's shape, record the windows a live session gained since the
+/// snapshot, and return the sessions the server gained.
+///
+/// A session that only shows windows of a recorded session — the view
+/// `muxa workspace view` groups onto a workspace — is not new: the snapshot
+/// already has those windows, under their owner.
+pub(super) fn compare(sessions: &mut [SessionPlan], live: &LiveShape) -> Vec<LiveSession> {
+    for session in sessions.iter_mut() {
+        let now = live
+            .sessions
+            .iter()
+            .find(|candidate| candidate.name == session.name);
+        for window in &mut session.windows {
+            let have = now.and_then(|now| now.windows.iter().find(|w| w.index == window.index));
+            window.state = Some(if have.is_some() {
+                LiveState::Present
+            } else {
+                LiveState::Missing
+            });
+            let count = have.map_or(0, |have| have.panes.len());
+            for (position, pane) in window.panes.iter_mut().enumerate() {
+                pane.state = Some(if position < count {
+                    LiveState::Present
+                } else {
+                    LiveState::Missing
+                });
+            }
+        }
+        session.new_windows = now
+            .map(|now| {
+                now.windows
+                    .iter()
+                    .filter(|w| !session.windows.iter().any(|mine| mine.index == w.index))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    let recorded: BTreeSet<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
+    let shown: BTreeSet<&str> = live
+        .sessions
+        .iter()
+        .filter(|session| recorded.contains(session.name.as_str()))
+        .flat_map(|session| &session.windows)
+        .map(|window| window.id.as_str())
+        .collect();
+    live.sessions
+        .iter()
+        .filter(|session| !recorded.contains(session.name.as_str()))
+        .filter(|session| {
+            !session
+                .windows
+                .iter()
+                .all(|window| shown.contains(window.id.as_str()))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The dry-run text for what the server has that the snapshot does not.
+pub(super) fn new_lines(sessions: &[SessionPlan], new_sessions: &[LiveSession]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for session in new_sessions {
+        lines.push(format!(
+            "  {} — new since the snapshot; left alone",
+            session.name
+        ));
+    }
+    for session in sessions {
+        for window in &session.new_windows {
+            lines.push(format!(
+                "  {}:{} {} — new since the snapshot; left alone",
+                session.name, window.index, window.name
+            ));
+        }
+    }
+    lines
 }
 
 /// What `apply` did, collected as it goes. With `echo` it also prints the
@@ -275,6 +465,7 @@ pub(super) fn plan(
                     index: window.index.clone(),
                     name: window.name.clone(),
                     layout: window.layout.clone(),
+                    state: None,
                     panes: snapshot
                         .panes
                         .iter()
@@ -285,6 +476,7 @@ pub(super) fn plan(
                                 index: pane.pane_index.clone(),
                                 path: pane.path.clone(),
                                 action,
+                                state: None,
                                 command,
                                 agent_kind: pane.agent.as_ref().map(|agent| agent.kind.clone()),
                                 note: if action == PaneAction::ResumeByHand {
@@ -303,6 +495,12 @@ pub(super) fn plan(
             SessionPlan {
                 name: session.to_owned(),
                 action,
+                state: if action == SessionAction::Create {
+                    LiveState::Missing
+                } else {
+                    LiveState::Present
+                },
+                new_windows: Vec::new(),
                 result: None,
                 error: None,
                 windows,
@@ -711,6 +909,7 @@ mod tests {
             server_reachable: true,
             run: false,
             sessions: plan(&snapshot(), &live, true, false),
+            new_sessions: None,
             totals: None,
         };
         let value = serde_json::to_value(&document).unwrap();
@@ -751,5 +950,131 @@ mod tests {
             split_failure_line("=work:0.5", "no space for new pane"),
             "  =work:0.5: could not split — no space for new pane"
         );
+    }
+
+    /// `list-panes -a` of a server that has `work` window 0 with one of its
+    /// two panes, a window `work:5` the snapshot never saw, `side` gone,
+    /// a new session `scratch`, and `work-view`, a group view that only
+    /// shows `work`'s windows.
+    const LIVE: &str = "work\t0\t@1\tw0\t0\t/tmp\tzsh\n\
+                        work\t5\t@9\tlogs\t0\t/var/log\ttail\n\
+                        work-view\t0\t@1\tw0\t0\t/tmp\tzsh\n\
+                        work-view\t5\t@9\tlogs\t0\t/var/log\ttail\n\
+                        scratch\t0\t@4\tnotes\t0\t/home/me\tvim\n\
+                        scratch\t0\t@4\tnotes\t1\t/home/me\t-zsh\n\
+                        a line that is not a pane\n";
+
+    #[test]
+    fn a_live_listing_reads_into_sessions_windows_and_panes() {
+        let shape = parse_live_shape(LIVE);
+        let names: Vec<_> = shape.sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["work", "work-view", "scratch"]);
+        let scratch = &shape.sessions[2];
+        assert_eq!(scratch.windows.len(), 1);
+        assert_eq!(scratch.windows[0].name, "notes");
+        let commands: Vec<_> = scratch.windows[0]
+            .panes
+            .iter()
+            .map(|pane| pane.command.as_deref())
+            .collect();
+        assert_eq!(commands, [Some("vim"), None], "a login shell is no command");
+    }
+
+    #[test]
+    fn compare_marks_what_is_missing_present_and_new_since_the_snapshot() {
+        let live = BTreeSet::from(["work".to_owned(), "scratch".to_owned()]);
+        let mut sessions = plan(&snapshot(), &live, false, false);
+        let new_sessions = compare(&mut sessions, &parse_live_shape(LIVE));
+
+        let work = &sessions[0];
+        assert_eq!(
+            (work.action, work.state),
+            (SessionAction::FillMissing, LiveState::Present)
+        );
+        let windows: Vec<_> = work
+            .windows
+            .iter()
+            .map(|w| (w.index.as_str(), w.state))
+            .collect();
+        assert_eq!(
+            windows,
+            [
+                ("0", Some(LiveState::Present)),
+                ("1", Some(LiveState::Missing))
+            ]
+        );
+        // Window 0 has one of its two recorded panes: the second would be
+        // split off, the first is kept.
+        let panes: Vec<_> = work.windows[0].panes.iter().map(|p| p.state).collect();
+        assert_eq!(panes, [Some(LiveState::Present), Some(LiveState::Missing)]);
+        assert_eq!(
+            work.windows[1].panes[0].state,
+            Some(LiveState::Missing),
+            "a missing window has none of its panes"
+        );
+        let gained: Vec<_> = work.new_windows.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(gained, ["logs"]);
+
+        let side = &sessions[1];
+        assert_eq!(
+            (side.action, side.state),
+            (SessionAction::Create, LiveState::Missing)
+        );
+        assert!(side
+            .windows
+            .iter()
+            .all(|w| w.state == Some(LiveState::Missing)));
+        assert!(side.new_windows.is_empty());
+
+        // `scratch` is new; `work-view` only shows `work`'s windows.
+        let names: Vec<_> = new_sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["scratch"]);
+        assert_eq!(
+            new_lines(&sessions, &new_sessions),
+            [
+                "  scratch — new since the snapshot; left alone",
+                "  work:5 logs — new since the snapshot; left alone"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_comparison_is_additive_json() {
+        let live = BTreeSet::from(["work".to_owned()]);
+        let mut sessions = plan(&snapshot(), &live, true, false);
+        let uncompared = serde_json::to_value(&sessions).unwrap();
+        assert_eq!(uncompared[0]["state"], "present");
+        assert_eq!(uncompared[1]["state"], "missing");
+        assert!(uncompared[0]["windows"][0].get("state").is_none());
+        assert!(uncompared[0].get("new_windows").is_none());
+
+        let new_sessions = compare(&mut sessions, &parse_live_shape(LIVE));
+        let document = RestoreDocument {
+            id: "1".into(),
+            dir: "/s/1".into(),
+            summary: summarize(&snapshot()),
+            socket: "default".into(),
+            only_missing: true,
+            layout_only: false,
+            server_reachable: true,
+            run: false,
+            sessions,
+            new_sessions: Some(new_sessions),
+            totals: None,
+        };
+        let value = serde_json::to_value(&document).unwrap();
+        assert_eq!(value["sessions"][0]["windows"][1]["state"], "missing");
+        assert_eq!(
+            value["sessions"][0]["windows"][0]["panes"][0]["state"],
+            "present"
+        );
+        let gained = &value["sessions"][0]["new_windows"][0];
+        assert_eq!(gained["index"], "5");
+        assert_eq!(gained["panes"][0]["command"], "tail");
+        assert!(gained.get("id").is_none(), "the window id stays internal");
+        let scratch = &value["new_sessions"][0];
+        assert_eq!(scratch["name"], "scratch");
+        assert_eq!(scratch["windows"][0]["panes"][0]["path"], "/home/me");
+        assert!(scratch["windows"][0]["panes"][1].get("command").is_none());
     }
 }

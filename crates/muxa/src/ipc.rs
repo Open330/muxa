@@ -103,6 +103,12 @@ const fn default_session_wait_ms() -> u64 {
     15_000
 }
 
+/// A snapshot plan or restore leaves existing sessions alone unless the
+/// client says otherwise (`mux_snapshot_plan_v1`).
+const fn mux_snapshot_only_missing() -> bool {
+    true
+}
+
 /// Overall deadline for a client request/response round trip (connect +
 /// hello + write + read). No caller should ever block forever against a
 /// wedged or half-dead daemon.
@@ -212,17 +218,27 @@ enum RequestBody {
     MuxSnapshotList,
     /// Take a manual snapshot of the server muxa's agents are on.
     MuxSnapshotSave,
-    /// Dry-run a restore of one snapshot: per session "create" or "skip".
+    /// Dry-run a restore of one snapshot: per session "create" or "skip",
+    /// and (`mux_snapshot_plan_v1`) what is missing, present or new since
+    /// the snapshot on the server now.
     MuxSnapshotPlan {
         id: String,
+        /// `mux_snapshot_plan_v1`: false plans existing sessions to get
+        /// the windows and panes they lack. Absent means true, which is
+        /// all a `mux_snapshot_v1` daemon does.
+        #[serde(default = "mux_snapshot_only_missing")]
+        only_missing: bool,
     },
     /// Start restoring the sessions of one snapshot that the server does
-    /// not have; existing sessions are never touched. Poll with
+    /// not have; unless `only_missing` is false (`mux_snapshot_plan_v1`),
+    /// existing sessions are never touched. Poll with
     /// `mux_snapshot_restore_status`.
     MuxSnapshotRestore {
         id: String,
         #[serde(default)]
         layout_only: bool,
+        #[serde(default = "mux_snapshot_only_missing")]
+        only_missing: bool,
     },
     MuxSnapshotRestoreStatus {
         operation_id: String,
@@ -753,6 +769,7 @@ const CAPABILITIES: &[&str] = &[
     "work_command_v1",
     "agent_start_v1",  // WS-B: new agent
     "mux_snapshot_v1", // WS-F: snapshot
+    "mux_snapshot_plan_v1",
     "handle_namespace_v1",
     "session_bytes_v1",
     "session_attachment_identity_v1",
@@ -3102,17 +3119,21 @@ async fn handle(
                     kind = "mux_snapshot_save";
                     mux_snapshot_response(mux_snapshots.save().await)
                 }
-                RequestBody::MuxSnapshotPlan { id } => {
+                RequestBody::MuxSnapshotPlan { id, only_missing } => {
                     kind = "mux_snapshot_plan";
-                    mux_snapshot_response(mux_snapshots.plan(&id).await)
+                    mux_snapshot_response(mux_snapshots.plan(&id, only_missing).await)
                 }
                 RequestBody::MuxSnapshotDelete { id } => {
                     kind = "mux_snapshot_delete";
                     mux_snapshot_response(mux_snapshots.delete(&id).await)
                 }
-                RequestBody::MuxSnapshotRestore { id, layout_only } => {
+                RequestBody::MuxSnapshotRestore {
+                    id,
+                    layout_only,
+                    only_missing,
+                } => {
                     kind = "mux_snapshot_restore";
-                    match mux_snapshots.restore(&id, layout_only).await {
+                    match mux_snapshots.restore(&id, layout_only, only_missing).await {
                         Ok(operation) => Response::with_mux_snapshot_operation(operation),
                         Err(error) => Response::err(error.to_string()),
                     }
@@ -10553,15 +10574,37 @@ mod work_command_tests {
         ));
         assert!(matches!(
             decode(r#"{"protocol":6,"kind":"mux_snapshot_plan","id":"1790000000"}"#),
-            RequestBody::MuxSnapshotPlan { id } if id == "1790000000"
+            RequestBody::MuxSnapshotPlan { id, only_missing: true } if id == "1790000000"
+        ));
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_plan","id":"1","only_missing":false}"#),
+            RequestBody::MuxSnapshotPlan {
+                only_missing: false,
+                ..
+            }
         ));
         match decode(r#"{"protocol":6,"kind":"mux_snapshot_restore","id":"1790000000"}"#) {
-            RequestBody::MuxSnapshotRestore { id, layout_only } => {
+            RequestBody::MuxSnapshotRestore {
+                id,
+                layout_only,
+                only_missing,
+            } => {
                 assert_eq!(id, "1790000000");
                 assert!(!layout_only, "restores the commands unless asked not to");
+                assert!(
+                    only_missing,
+                    "a mux_snapshot_v1 client never fills live sessions"
+                );
             }
             other => panic!("unexpected {other:?}"),
         }
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_restore","id":"1","only_missing":false}"#),
+            RequestBody::MuxSnapshotRestore {
+                only_missing: false,
+                ..
+            }
+        ));
         assert!(matches!(
             decode(
                 r#"{"protocol":6,"kind":"mux_snapshot_restore_status","operation_id":"snapshot-restore-1"}"#
@@ -10573,6 +10616,7 @@ mod work_command_tests {
             RequestBody::MuxSnapshotDelete { .. }
         ));
         assert!(CAPABILITIES.contains(&"mux_snapshot_v1"));
+        assert!(CAPABILITIES.contains(&"mux_snapshot_plan_v1"));
         let plain = serde_json::to_value(Response::ok()).unwrap();
         assert!(plain.get("mux_snapshot").is_none());
         assert!(plain.get("mux_snapshot_operation").is_none());

@@ -46,6 +46,9 @@ struct SessionSnapshotSheetHost: View {
                 viewModel.markUnsupported()
                 return
             }
+            if await model.client.supports(MuxaIPCClient.muxSnapshotPlanCapability) {
+                viewModel.markCanFillRunningSessions()
+            }
             if sheet == .restore {
                 await viewModel.load()
             }
@@ -170,7 +173,9 @@ struct SessionSnapshotRestoreSheet: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Restore Snapshot")
                     .font(.system(size: 14, weight: .semibold))
-                Text("Recreates the sessions that are missing and relaunches what their panes ran. Sessions that already exist are left untouched.")
+                Text(viewModel.onlyMissing
+                    ? String(localized: "Recreates the sessions that are missing and relaunches what their panes ran. Sessions that already exist are left untouched.")
+                    : String(localized: "Recreates the sessions that are missing and adds the windows and panes running sessions lack; their idle shells are given their recorded directory and command. Nothing that runs now is closed."))
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -320,11 +325,21 @@ struct SessionSnapshotRestoreSheet: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             } else if let plan = viewModel.plan, !plan.run {
-                Text(SessionSnapshotTree.planLine(plan))
+                Text(SessionSnapshotTree.summaryLine(plan))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             HStack(spacing: 10) {
+                if viewModel.canFillRunningSessions {
+                    Toggle("Only missing sessions", isOn: Binding(
+                        get: { viewModel.onlyMissing },
+                        set: { value in Task { await viewModel.setOnlyMissing(value) } }
+                    ))
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 12))
+                    .disabled(viewModel.isBusy || viewModel.phase == .finished || !viewModel.supported)
+                    .help("Leave running sessions untouched. Turn off to also add the windows and panes they lack")
+                }
                 Toggle("Rebuild layout only", isOn: $viewModel.layoutOnly)
                     .toggleStyle(.checkbox)
                     .font(.system(size: 12))
@@ -342,7 +357,7 @@ struct SessionSnapshotRestoreSheet: View {
                     Button("Cancel", action: close)
                         .buttonStyle(.muxaGhost)
                         .disabled(viewModel.phase == .restoring)
-                    Button("Restore") { Task { await viewModel.restore() } }
+                    Button(viewModel.restoreButtonTitle) { Task { await viewModel.restore() } }
                         .buttonStyle(.muxaPrimary)
                         .keyboardShortcut(.defaultAction)
                         .disabled(!viewModel.canRestore)
@@ -454,6 +469,10 @@ private struct SessionSnapshotTreeRowView: View {
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                if let mark = row.mark {
+                    SessionSnapshotMarkChip(mark: mark)
                 }
                 Spacer(minLength: 8)
                 if let badge = row.badge {
@@ -474,6 +493,50 @@ private struct SessionSnapshotTreeRowView: View {
         }
         .padding(.leading, CGFloat(row.depth) * MuxaTheme.treeIndent + 6)
         .padding(.trailing, 6)
+    }
+}
+
+/// Whether a line is missing now, running, or new since the snapshot.
+private struct SessionSnapshotMarkChip: View {
+    let mark: SessionSnapshotTreeRow.LiveMark
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        title
+            .font(.system(size: 10, weight: .medium))
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(MuxaTheme.segmentTrack(colorScheme))
+            )
+            .help(help)
+    }
+
+    private var title: Text {
+        switch mark {
+        case .missing: Text("Missing")
+        case .running: Text("Running")
+        case .new: Text("New since snapshot")
+        }
+    }
+
+    private var help: Text {
+        switch mark {
+        case .missing: Text("Not running now")
+        case .running: Text("Already running")
+        case .new: Text("Running now but not in the snapshot. Restoring never closes it.")
+        }
+    }
+
+    private var color: Color {
+        switch mark {
+        case .missing: .orange
+        case .running: .green
+        case .new: .accentColor
+        }
     }
 }
 

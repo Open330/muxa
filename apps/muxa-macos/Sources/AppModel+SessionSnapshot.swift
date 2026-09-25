@@ -46,6 +46,11 @@ final class SessionSnapshotViewModel: ObservableObject {
     @Published private(set) var restoreStartedAt: Date?
     /// Rebuild sessions, windows and directories but start nothing in them.
     @Published var layoutOnly = false
+    /// Leave running sessions alone (`--only-missing`). Only a muxad with
+    /// `mux_snapshot_plan_v1` can be asked for anything else.
+    @Published private(set) var onlyMissing = true
+    /// Whether this muxad plans and restores without `--only-missing`.
+    @Published private(set) var canFillRunningSessions = false
 
     private let client: MuxaSessionSnapshotClient
     private let pollInterval: Duration
@@ -66,11 +71,19 @@ final class SessionSnapshotViewModel: ObservableObject {
         snapshots.first { $0.id == selection }
     }
 
-    /// Restore is offered only once the dry run says it would create
-    /// something: a snapshot whose sessions all exist has nothing to do.
+    /// Restore is offered only once the dry run — made with the current
+    /// only-missing choice — says it would do something: a snapshot whose
+    /// sessions all exist has nothing to do when running ones are left alone.
     var canRestore: Bool {
-        supported && !isBusy && phase != .finished
-            && plan?.run == false && (plan?.sessionsToCreate ?? 0) > 0
+        guard supported, !isBusy, phase != .finished, let plan, !plan.run,
+              plan.onlyMissing == onlyMissing else { return false }
+        return SessionSnapshotTree.sessionsToRestore(plan) > 0
+    }
+
+    /// What the Restore button says it will do.
+    var restoreButtonTitle: String {
+        guard let plan, !plan.run else { return String(localized: "Restore") }
+        return SessionSnapshotTree.restoreTitle(plan)
     }
 
     static let unsupportedMessage = String(
@@ -81,6 +94,20 @@ final class SessionSnapshotViewModel: ObservableObject {
         supported = false
         error = Self.unsupportedMessage
         hasLoaded = true
+    }
+
+    /// The daemon advertises `mux_snapshot_plan_v1`.
+    func markCanFillRunningSessions() {
+        canFillRunningSessions = true
+    }
+
+    /// Switch between leaving running sessions alone and filling in what
+    /// they lack, and plan the selection again for the new choice.
+    func setOnlyMissing(_ value: Bool) async {
+        guard canFillRunningSessions || value, value != onlyMissing, !isBusy else { return }
+        onlyMissing = value
+        guard let selection, phase != .finished else { return }
+        await select(selection, force: true)
     }
 
     func load() async {
@@ -118,10 +145,11 @@ final class SessionSnapshotViewModel: ObservableObject {
         let previous = phase
         phase = .planning
         defer { if phase == .planning { phase = previous == .loading ? .loading : .idle } }
+        let onlyMissing = onlyMissing
         do {
-            let plan = try await client.plan(id: id)
+            let plan = try await client.plan(id: id, onlyMissing: onlyMissing)
             // A later click may have moved on while this one was planning.
-            if selection == id {
+            if selection == id && self.onlyMissing == onlyMissing {
                 self.plan = plan
                 error = nil
             }
@@ -157,7 +185,7 @@ final class SessionSnapshotViewModel: ObservableObject {
         restoreStartedAt = Date()
         statusMessage = String(localized: "Restoring…")
         do {
-            var operation = try await client.restore(id: id, layoutOnly: layoutOnly)
+            var operation = try await client.restore(id: id, layoutOnly: layoutOnly, onlyMissing: onlyMissing)
             while operation.state == .running {
                 try await Task.sleep(for: pollInterval)
                 operation = try await client.status(operationID: operation.operationID)
@@ -200,6 +228,16 @@ final class SessionSnapshotViewModel: ObservableObject {
 
 /// One line of the snapshot tree.
 struct SessionSnapshotTreeRow: Identifiable, Hashable {
+    /// How the line compares with what runs now.
+    enum LiveMark: Hashable {
+        /// Recorded, not running now: a restore recreates it.
+        case missing
+        /// Recorded and running now.
+        case running
+        /// Running now, not in the snapshot; a restore never closes it.
+        case new
+    }
+
     enum Badge: Hashable {
         // Sessions, in a plan.
         case willCreate
@@ -231,6 +269,48 @@ struct SessionSnapshotTreeRow: Identifiable, Hashable {
     /// The full command behind a truncated badge, or an error.
     let help: String?
     let message: String?
+    /// Set where it adds something: on every session, and on a window or
+    /// pane only when it differs from the line above it.
+    var mark: LiveMark? = nil
+}
+
+/// The dry run compared with what runs now, counted for the summary line.
+struct SessionSnapshotComparison: Equatable {
+    /// Recorded sessions that are not running: a restore recreates them.
+    var toRecreate = 0
+    /// Recorded sessions that are running now.
+    var running = 0
+    /// Sessions running now that the snapshot does not have.
+    var newSinceSnapshot = 0
+    /// Windows running sessions gained since the snapshot.
+    var newWindows = 0
+    /// Recorded windows missing from running sessions.
+    var missingWindows = 0
+    /// Recorded panes missing from running sessions, their missing
+    /// windows' included: what a full restore splits off.
+    var missingPanes = 0
+    /// Whether the CLI compared at all; without it only session presence
+    /// is known.
+    var compared = false
+
+    init() {}
+
+    init(plan: MuxSnapshotPlan) {
+        compared = plan.isCompared
+        newSinceSnapshot = plan.newSessions?.count ?? 0
+        for session in plan.sessions {
+            guard session.isRunning else {
+                toRecreate += 1
+                continue
+            }
+            running += 1
+            newWindows += session.newWindows?.count ?? 0
+            for window in session.windows {
+                if window.state == .missing { missingWindows += 1 }
+                missingPanes += window.panes.filter { $0.state == .missing }.count
+            }
+        }
+    }
 }
 
 /// Flattens a plan — or, after a restore, its report — into the indented
@@ -242,39 +322,95 @@ enum SessionSnapshotTree {
 
     static func rows(plan: MuxSnapshotPlan?) -> [SessionSnapshotTreeRow] {
         guard let plan else { return [] }
+        // A report's comparison was taken before the restore ran; after it,
+        // the results say what changed.
+        let compare = !plan.run
         var rows: [SessionSnapshotTreeRow] = []
         for session in plan.sessions {
             let sessionID = "s:\(session.name)"
+            let sessionMark: SessionSnapshotTreeRow.LiveMark = session.isRunning ? .running : .missing
             rows.append(SessionSnapshotTreeRow(
                 id: sessionID, depth: 0, symbol: "rectangle.stack", title: session.name,
                 detail: nil, badge: sessionBadge(session), help: nil,
-                message: session.result == .failed ? session.error : nil
+                message: session.result == .failed ? session.error : nil,
+                mark: compare ? sessionMark : nil
             ))
             let skipped = session.action == .skip
             for window in session.windows {
                 let windowID = "\(sessionID)/\(window.index)"
+                let windowMark = mark(window.state)
                 rows.append(SessionSnapshotTreeRow(
                     id: windowID, depth: 1, symbol: "macwindow", title: "\(window.index): \(window.name)",
-                    detail: window.panes.count == 1
-                        ? String(localized: "1 pane")
-                        : String(localized: "\(window.panes.count) panes"),
-                    badge: nil, help: nil, message: nil
+                    detail: panesLabel(window.panes.count),
+                    badge: nil, help: nil, message: nil,
+                    mark: compare && windowMark != sessionMark ? windowMark : nil
                 ))
                 for pane in window.panes {
                     // A skipped session keeps its panes on screen for
                     // reference, but nothing happens to them.
                     let badge = skipped ? nil : paneBadge(pane)
+                    let paneMark = mark(pane.state)
                     rows.append(SessionSnapshotTreeRow(
                         id: "\(windowID)/\(pane.index)", depth: 2,
                         symbol: pane.action == .shell ? "terminal" : "play.rectangle",
                         title: abbreviate(pane.path), detail: nil, badge: badge,
                         help: pane.note ?? pane.command,
-                        message: pane.result == .failed || pane.result == .unconfirmed ? pane.error : nil
+                        message: pane.result == .failed || pane.result == .unconfirmed ? pane.error : nil,
+                        mark: compare && paneMark != (windowMark ?? sessionMark) ? paneMark : nil
                     ))
                 }
             }
+            if compare {
+                for window in session.newWindows ?? [] {
+                    rows += liveRows(window, id: "\(sessionID)/+\(window.index)", depth: 1, mark: .new)
+                }
+            }
+        }
+        guard compare else { return rows }
+        for session in plan.newSessions ?? [] {
+            let sessionID = "n:\(session.name)"
+            rows.append(SessionSnapshotTreeRow(
+                id: sessionID, depth: 0, symbol: "rectangle.stack", title: session.name,
+                detail: nil, badge: nil, help: nil, message: nil, mark: .new
+            ))
+            for window in session.windows {
+                rows += liveRows(window, id: "\(sessionID)/\(window.index)", depth: 1, mark: nil)
+            }
         }
         return rows
+    }
+
+    /// A window that runs now and is not in the snapshot, with its panes'
+    /// directories and programs.
+    private static func liveRows(
+        _ window: MuxSnapshotPlan.LiveWindow, id: String, depth: Int,
+        mark: SessionSnapshotTreeRow.LiveMark?
+    ) -> [SessionSnapshotTreeRow] {
+        var rows = [SessionSnapshotTreeRow(
+            id: id, depth: depth, symbol: "macwindow", title: "\(window.index): \(window.name)",
+            detail: panesLabel(window.panes.count), badge: nil, help: nil, message: nil, mark: mark
+        )]
+        for pane in window.panes {
+            rows.append(SessionSnapshotTreeRow(
+                id: "\(id)/\(pane.index)", depth: depth + 1,
+                symbol: pane.command == nil ? "terminal" : "play.rectangle",
+                title: abbreviate(pane.path), detail: pane.command, badge: nil,
+                help: pane.command, message: nil
+            ))
+        }
+        return rows
+    }
+
+    private static func mark(_ state: MuxSnapshotPlan.LiveState?) -> SessionSnapshotTreeRow.LiveMark? {
+        switch state {
+        case .missing?: .missing
+        case .present?: .running
+        case .unknown?, nil: nil
+        }
+    }
+
+    private static func panesLabel(_ count: Int) -> String {
+        count == 1 ? String(localized: "1 pane") : String(localized: "\(count) panes")
     }
 
     static func sessionBadge(_ session: MuxSnapshotPlan.Session) -> SessionSnapshotTreeRow.Badge? {
@@ -316,18 +452,48 @@ enum SessionSnapshotTree {
         }
     }
 
-    /// What the dry run will do, for the footer.
-    static func planLine(_ plan: MuxSnapshotPlan) -> String {
-        let create = plan.sessionsToCreate
-        let skip = plan.sessionsToSkip
-        if create == 0 {
-            return String(localized: "Every session already exists — nothing to restore.")
+    /// The comparison in one line, for the footer: "3 sessions to
+    /// recreate, 5 already running, 2 new since snapshot".
+    static func summaryLine(_ plan: MuxSnapshotPlan) -> String {
+        let counts = SessionSnapshotComparison(plan: plan)
+        var parts: [String] = []
+        switch counts.toRecreate {
+        case 0: parts.append(String(localized: "No sessions to recreate"))
+        case 1: parts.append(String(localized: "1 session to recreate"))
+        default: parts.append(String(localized: "\(counts.toRecreate) sessions to recreate"))
         }
-        let createText = create == 1
-            ? String(localized: "Creates 1 session")
-            : String(localized: "Creates \(create) sessions")
-        guard skip > 0 else { return createText }
-        return String(localized: "\(createText), skips \(skip)")
+        if counts.running > 0 {
+            parts.append(String(localized: "\(counts.running) already running"))
+        }
+        if counts.newSinceSnapshot > 0 {
+            parts.append(String(localized: "\(counts.newSinceSnapshot) new since snapshot"))
+        }
+        if !plan.onlyMissing && counts.missingPanes > 0 {
+            parts.append(counts.missingPanes == 1
+                ? String(localized: "1 pane to add to running sessions")
+                : String(localized: "\(counts.missingPanes) panes to add to running sessions"))
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    /// Sessions a restore of this plan acts on: the missing ones, plus the
+    /// running ones it fills in when it does not leave them alone.
+    static func sessionsToRestore(_ plan: MuxSnapshotPlan) -> Int {
+        plan.sessionsToCreate + (plan.onlyMissing ? 0 : plan.sessionsToFill)
+    }
+
+    /// The Restore button, saying what pressing it does.
+    static func restoreTitle(_ plan: MuxSnapshotPlan) -> String {
+        let create = plan.sessionsToCreate
+        let fill = plan.onlyMissing ? 0 : plan.sessionsToFill
+        switch (create, fill) {
+        case (0, 0): return String(localized: "Nothing to Restore")
+        case (1, 0): return String(localized: "Recreate 1 Session")
+        case (_, 0): return String(localized: "Recreate \(create) Sessions")
+        case (0, 1): return String(localized: "Fill In 1 Session")
+        case (0, _): return String(localized: "Fill In \(fill) Sessions")
+        default: return String(localized: "Recreate \(create), Fill In \(fill)")
+        }
     }
 
     static func totalsLine(_ totals: MuxSnapshotPlan.Totals) -> String {
