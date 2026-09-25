@@ -2,10 +2,11 @@
 
 <img src="assets/logo.svg" alt="Muxa 로고" width="144" />
 
-**tmux를 작업 단위로 구성하는 AI agent 관측·오케스트레이션 도구.**
+**tmux에서 돌리는 코딩 에이전트 중 지금 나를 기다리는 것을 알려 주고, 바로 데려다 줍니다.**
 
-에이전트가 working, waiting, idle, error 중 어디에 있는지 tmux 상태바,
-실시간 TUI, 데스크톱 알림, 로컬 리포트에서 확인합니다.
+래퍼도, 새 터미널도 필요 없습니다. 이미 tmux에서 돌리고 있는 Claude Code,
+Codex, Gemini CLI 세션을 지켜보다가 어느 에이전트가 나를 기다리는지 알려 주고
+그 pane으로 옮겨 줍니다.
 
 [![CI](https://github.com/Open330/muxa/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/muxa/actions/workflows/ci.yml)
 ![MSRV](https://img.shields.io/badge/MSRV-1.89-informational)
@@ -18,30 +19,101 @@
 
 ---
 
-## README를 읽기 전에 Muxa 온보딩부터 체험해 보세요
+## 시작하기
 
-설치 없이 전체 화면 tour를 바로 체험하세요. script가 release 바이너리를 임시
-디렉터리로 받아 checksum을 검증한 뒤 진짜 `muxa onboard`를 실행하고 끝나면
-지웁니다. 지원되는 release 플랫폼과 network가 필요하고 live tour에는 tmux도
-필요합니다. non-interactive 가이드는 `muxa onboard --print`로 볼 수 있습니다.
+필요 조건: tmux 3.x(또는 herdr), Unix-like OS.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
+brew install open330/tap/muxa
+muxa init      # tmux와 에이전트 hook을 연결하고 데몬을 시작합니다
+muxa attend    # 가장 오래 기다린 에이전트로 이동합니다
 ```
 
 <div align="center">
   <img src="docs/demo.gif" alt="muxa watch에서 여러 agent의 상태를 한눈에 확인하고 필요한 agent로 이동하는 모습" width="900" />
 </div>
 
-`muxa`는 terminal multiplexer pane 안에서 실행되는 AI coding agent를 관측하는
-작은 daemon + CLI입니다. Claude Code, OpenAI Codex, Google Gemini CLI와 그
-후속인 Antigravity CLI(`agy`)의 기존
-hook/event 시스템을 사용하고, 이를 tmux pane/session과 연결합니다.
+설치 전에 먼저 둘러보고 싶다면 일회용 tmux server에서 전체 tour를 체험할 수
+있습니다. script가 checksum을 검증한 release 바이너리로 진짜 `muxa onboard`를
+실행하고, 끝나면 지웁니다. 기존 tmux server는 건드리지 않습니다.
+non-interactive 가이드는 `muxa onboard --print`로 볼 수 있습니다.
 
-tmux나 agent binary를 fork하지 않습니다. tmux는 기본 full backend이고,
-zellij는 CLI baseline과 richer plugin 경로를 준비 중입니다.
+```bash
+curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
+```
 
-## 작업 단위 tmux workflow에 최적화
+## 왜 Muxa인가
+
+- **지금 환경을 그대로 둡니다.** Claude Code, Codex, Gemini CLI의 hook에서
+  에이전트 상태를 읽고(hook이 없는 에이전트는 화면으로 감지), 이미 열어 둔 tmux
+  pane에 연결합니다. 에이전트를 Muxa로 띄울 필요도, 멀티플렉서를 바꿀 필요도
+  없습니다. tmux, [rmux](https://rmux.io), [herdr](https://herdr.dev)를 동시에
+  관찰할 수 있고 zellij는 CLI baseline을 지원합니다.
+- **누가 기다리는지 알려 줍니다.** tmux 상태바, `muxa watch` TUI, 데스크톱
+  알림으로 보여 줍니다.
+- **그 자리로 데려다 줍니다.** `muxa attend`는 가장 오래 막혀 있는 pane으로
+  이동하고, `--cycle`은 나를 기다리는 에이전트를 차례로 돕니다.
+- **한 에이전트가 나머지를 움직이게 합니다.** `muxa mcp`로 코딩 에이전트에게
+  같은 상태 정보와 prompt 전송, 변화 대기 도구를 줍니다.
+
+> [!IMPORTANT]
+> Beta입니다. event ingest, daemon, CLI, live TUI, desktop notification,
+> stats/report는 end-to-end로 동작하지만 1.0 전까지 API가 바뀔 수 있습니다.
+
+## 핵심 기능
+
+| Surface | 기능 |
+| --- | --- |
+| `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
+| `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 handle(`@claude`)·tmux pane id와 agent의 상태·요약·최근 프롬프트/응답과 마지막 프롬프트 시각을 얹으며, 가장 최근에 프롬프트를 보낸 pane은 따로 표시함. 숫자 키로 이동. `|`로 확대하고 `Tab`으로 저장된 텍스트/터미널 원문을 전환. |
+| `muxa watch` | agent/pane 관측, prompt, live preview, hierarchy-aware mailbox와 table/sequence 협업을 제공하는 기본 TUI. |
+| `muxa dashboard` | Work 중심 TUI. `P`는 선택 Work의 모든 live agent에 prompt를 보내고 `A`는 모두 중단. |
+| `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
+| `muxa stats` / `muxa report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
+| `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
+| `muxa activity` | stats/report에 들어간 raw duration ledger 조회. |
+| BarShelf widget (macOS) | active/working/waiting/error agent를 메뉴바 popover에서 요약. |
+| Dashboard | optional loopback HTTP UI + SSE live update + timeline 및 collaboration node-edge/sequence graph. |
+| Notifications | agent가 attention을 필요로 할 때 desktop alert. |
+
+## 다른 설치 방법
+
+주 설치 경로는 위의 Homebrew입니다. Mac 앱은 cask로 설치합니다(공증됨, 앱 자체
+업데이트 기능이 없어 Homebrew로 업데이트합니다).
+
+```bash
+brew install --cask open330/tap/muxa-app
+```
+
+또는 원샷 설치 스크립트(소스 빌드, Rust 1.89+ 필요):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh
+```
+
+source에서 설치:
+
+```bash
+git clone https://github.com/Open330/muxa.git
+cd muxa
+cargo install --path crates/muxad --locked
+cargo install --path crates/muxa-cli --locked
+muxa init
+```
+
+확인:
+
+```bash
+muxa daemon start
+muxa daemon status
+muxa status
+muxa watch
+```
+
+## tmux에서 작업 단위로 정리하기
+
+선택 사항입니다. 지금 쓰는 tmux 배치를 그대로 두어도 됩니다. 에이전트가 실행될
+자리까지 Muxa에 맡기고 싶다면 tmux에 작업 모델을 입힐 수 있습니다.
 
 Muxa는 tmux를 단순한 terminal pane 모음이 아니라 지속적인 작업 실행 모델로
 사용합니다.
@@ -69,64 +141,6 @@ Linear/GitHub/Jira issue는 Work에 연결되는 선택적 외부 참조이며 W
 `tmux new-session`부터 계층, detach/attach, sandbox agent, Muxa watch·attend·message
 workflow까지 하나의 시나리오로 익히게 합니다. 기존 tmux server는 건드리지 않고
 종료할 때 sandbox 전체를 삭제합니다.
-
-> [!IMPORTANT]
-> Beta입니다. event ingest, daemon, CLI, live TUI, desktop notification,
-> stats/report는 end-to-end로 동작하지만 1.0 전까지 API가 바뀔 수 있습니다.
-
-## 핵심 기능
-
-| Surface | 기능 |
-| --- | --- |
-| `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
-| `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 handle(`@claude`)·tmux pane id와 agent의 상태·요약·최근 프롬프트/응답과 마지막 프롬프트 시각을 얹으며, 가장 최근에 프롬프트를 보낸 pane은 따로 표시함. 숫자 키로 이동. `|`로 확대하고 `Tab`으로 저장된 텍스트/터미널 원문을 전환. |
-| `muxa watch` | agent/pane 관측, prompt, live preview, hierarchy-aware mailbox와 table/sequence 협업을 제공하는 기본 TUI. |
-| `muxa dashboard` | Work 중심 TUI. `P`는 선택 Work의 모든 live agent에 prompt를 보내고 `A`는 모두 중단. |
-| `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
-| `muxa stats` / `muxa report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
-| `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
-| `muxa activity` | stats/report에 들어간 raw duration ledger 조회. |
-| BarShelf widget (macOS) | active/working/waiting/error agent를 메뉴바 popover에서 요약. |
-| Dashboard | optional loopback HTTP UI + SSE live update + timeline 및 collaboration node-edge/sequence graph. |
-| Notifications | agent가 attention을 필요로 할 때 desktop alert. |
-
-## Muxa 설치
-
-체험 후 계속 사용하기로 했다면 아래 방법 중 하나로 설치합니다.
-
-필요 조건: tmux 3.x(또는 herdr), Unix-like OS.
-
-Homebrew(프리빌트 바이너리, Rust 툴체인 불필요):
-
-```bash
-brew install open330/tap/muxa
-muxa init
-```
-
-또는 원샷 설치 스크립트(소스 빌드, Rust 1.89+ 필요):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh
-```
-
-source에서 설치:
-
-```bash
-git clone https://github.com/Open330/muxa.git
-cd muxa
-cargo install --path crates/muxad --locked
-cargo install --path crates/muxa-cli --locked
-muxa init
-```
-
-확인:
-
-```bash
-muxa daemon start
-muxa daemon status
-muxa status
-muxa watch
-```
 
 ### `muxa watch`에서 바로 협업합니다
 
