@@ -350,9 +350,9 @@ struct ChangesWorkspaceView: View {
                 cleanView(snapshot)
             } else {
                 HSplitView {
-                    ChangesFileList(changes: changes, snapshot: snapshot, commentedPaths: commentedPaths)
+                    ChangesFileList(changes: changes, viewed: changes.viewed, snapshot: snapshot, commentedPaths: commentedPaths)
                         .frame(minWidth: 200, idealWidth: 260, maxWidth: 420)
-                    ChangesDiffPane(changes: changes, drafts: drafts)
+                    ChangesDiffPane(changes: changes, drafts: drafts, viewed: changes.viewed)
                         .frame(minWidth: 320, maxWidth: .infinity)
                 }
             }
@@ -492,6 +492,7 @@ struct ChangeCountsLabel: View {
 
 private struct ChangesFileList: View {
     @ObservedObject var changes: ChangesModel
+    @ObservedObject var viewed: ViewedFilesStore
     let snapshot: GitChangesSnapshot
     let commentedPaths: Set<String>
     @State private var filter = ""
@@ -513,6 +514,7 @@ private struct ChangesFileList: View {
                 }
                 .padding(8)
             }
+            viewedProgress
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(snapshot.groups, id: \.self) { group in
@@ -536,11 +538,40 @@ private struct ChangesFileList: View {
                 }
                 .padding(.bottom, 8)
             }
-            .changesListKeyboard { offset in
-                changes.moveSelection(by: offset, in: snapshot.groups.flatMap(files(in:)))
-            }
+            .changesListKeyboard(
+                move: { offset in
+                    changes.moveSelection(by: offset, in: snapshot.groups.flatMap(files(in:)))
+                },
+                toggleViewed: {
+                    if let file = changes.selectedFile { changes.toggleViewed(file) }
+                }
+            )
         }
         .background(MuxaTheme.sideBar(colorScheme))
+    }
+
+    /// "N of M viewed" over a thin bar, like GitHub's files-changed header.
+    private var viewedProgress: some View {
+        let total = snapshot.files.count
+        let count = snapshot.files.filter(changes.isViewed).count
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("\(count) of \(total) viewed")
+                .font(.system(size: 11).monospacedDigit())
+                .foregroundStyle(.secondary)
+            GeometryReader { geometry in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(MuxaTheme.segmentTrack(colorScheme))
+                    Capsule()
+                        .fill(Color.accentColor)
+                        .frame(width: total > 0 ? geometry.size.width * CGFloat(count) / CGFloat(total) : 0)
+                }
+            }
+            .frame(height: 3)
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 8)
+        .padding(.bottom, 2)
+        .help("Mark files viewed as you review them. A mark clears when the file changes again.")
     }
 
     private func title(for group: ChangeGroup, base: BranchBase?) -> String {
@@ -555,7 +586,17 @@ private struct ChangesFileList: View {
 
     private func row(_ file: ChangedFile) -> some View {
         let selected = file.id == changes.selectedFileID
-        return Button {
+        let isViewed = changes.isViewed(file)
+        return HStack(spacing: 0) {
+            rowButton(file, isViewed: isViewed)
+            ViewedCheckbox(isViewed: isViewed) { changes.toggleViewed(file) }
+                .padding(.trailing, 6)
+        }
+        .background(selected ? MuxaTheme.selection(colorScheme) : Color.clear)
+    }
+
+    private func rowButton(_ file: ChangedFile, isViewed: Bool) -> some View {
+        Button {
             changes.select(fileID: file.id)
         } label: {
             HStack(spacing: 6) {
@@ -584,10 +625,11 @@ private struct ChangesFileList: View {
                     pending: !snapshot.countsLoaded, isBinary: file.isBinary
                 )
             }
+            // A viewed file steps back so what is left to review stands out.
+            .opacity(isViewed ? 0.5 : 1)
             .padding(.leading, 14)
-            .padding(.trailing, 10)
+            .padding(.trailing, 4)
             .frame(height: MuxaTheme.rowHeight)
-            .background(selected ? MuxaTheme.selection(colorScheme) : Color.clear)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -604,10 +646,44 @@ private struct ChangesFileList: View {
     }
 }
 
+/// GitHub's per-file "Viewed" box, as a flat icon toggle.
+private struct ViewedCheckbox: View {
+    let isViewed: Bool
+    var showsTitle = false
+    let toggle: () -> Void
+
+    var body: some View {
+        if showsTitle {
+            Button(action: toggle) { label }
+                .buttonStyle(.muxaGhost)
+                .help(help)
+        } else {
+            Button(action: toggle) { label }
+                .buttonStyle(.muxaIcon(size: 20))
+                .help(help)
+        }
+    }
+
+    private var label: some View {
+        Label {
+            Text("Viewed")
+        } icon: {
+            // The button styles tint their label; the box keeps its own.
+            Image(systemName: isViewed ? "checkmark.square.fill" : "square")
+                .foregroundStyle(isViewed ? Color.accentColor : Color.secondary)
+        }
+    }
+
+    private var help: LocalizedStringKey {
+        isViewed ? "Mark as not viewed" : "Mark as viewed"
+    }
+}
+
 private extension View {
-    /// ↑/↓ move through the file list once it has focus.
+    /// ↑/↓ move through the file list once it has focus; on macOS 14 and
+    /// later j/k do too, and v toggles the selected file's Viewed box.
     @ViewBuilder
-    func changesListKeyboard(_ move: @escaping (Int) -> Void) -> some View {
+    func changesListKeyboard(move: @escaping (Int) -> Void, toggleViewed: @escaping () -> Void) -> some View {
         let handled = focusable().onMoveCommand { direction in
             switch direction {
             case .up: move(-1)
@@ -616,7 +692,18 @@ private extension View {
             }
         }
         if #available(macOS 14.0, *) {
-            handled.focusEffectDisabled()
+            handled
+                .onKeyPress(characters: CharacterSet(charactersIn: "jkv"), phases: .down) { press in
+                    guard press.modifiers.isEmpty || press.modifiers == .shift else { return .ignored }
+                    switch press.characters.lowercased() {
+                    case "j": move(1)
+                    case "k": move(-1)
+                    case "v": toggleViewed()
+                    default: return .ignored
+                    }
+                    return .handled
+                }
+                .focusEffectDisabled()
         } else {
             handled
         }
@@ -631,6 +718,8 @@ private enum DiffMetrics {
     static let numberWidth: CGFloat = 44
     static let markerWidth: CGFloat = 18
     static var gutterWidth: CGFloat { numberWidth * 2 + markerWidth }
+    /// One side of the split view numbers only its own file.
+    static var splitGutterWidth: CGFloat { numberWidth + markerWidth }
     static let font = Font.system(size: fontSize, design: .monospaced)
 
     /// One monospaced cell, for sizing the scrollable width to the longest
@@ -649,6 +738,7 @@ private enum DiffRow: Identifiable {
     case orphanHeader
     case hunk(DiffHunk, collapsed: Bool)
     case line(DiffLine)
+    case split(SplitDiffRow)
     case selectionActions(lines: Int)
     case composer(editing: UUID?)
     case comment(ReviewComment)
@@ -659,6 +749,7 @@ private enum DiffRow: Identifiable {
         case .orphanHeader: "orphans"
         case .hunk(let hunk, _): "hunk-\(hunk.id)"
         case .line(let line): "line-\(line.id)"
+        case .split(let row): "split-\(row.id)"
         case .selectionActions: "selection"
         case .composer(let editing): "composer-\(editing?.uuidString ?? "new")"
         case .comment(let comment): "comment-\(comment.id)"
@@ -670,6 +761,8 @@ private enum DiffRow: Identifiable {
 private struct ChangesDiffPane: View {
     @ObservedObject var changes: ChangesModel
     @ObservedObject var drafts: ReviewDraftStore
+    @ObservedObject var viewed: ViewedFilesStore
+    @AppStorage(DiffLayout.storageKey) private var layout = DiffLayout.unified
     @State private var composing = false
     @State private var editingCommentID: UUID?
     @State private var composerText = ""
@@ -703,6 +796,16 @@ private struct ChangesDiffPane: View {
                     changes.collapsedHunks = allCollapsed ? [] : Set(diff.hunks.map(\.id))
                 }
                 .buttonStyle(.muxaGhost)
+            }
+            MuxaSegmented(selection: $layout, options: DiffLayout.allCases) { layout in
+                switch layout {
+                case .unified: Text("Unified")
+                case .split: Text("Split")
+                }
+            }
+            .help("Show the diff as one column, or old and new side by side")
+            ViewedCheckbox(isViewed: changes.isViewed(file), showsTitle: true) {
+                changes.toggleViewed(file)
             }
         }
         .padding(.leading, 12)
@@ -782,20 +885,39 @@ private struct ChangesDiffPane: View {
             appendComments(orphans)
         }
         let selectionEnd = changes.selection?.range.upperBound
+        // The composer or the selection's actions, under the row holding
+        // the selection's last line.
+        func appendSelection(after lineIDs: [Int]) {
+            guard let selectionEnd, lineIDs.contains(selectionEnd), editingCommentID == nil else { return }
+            if composing {
+                rows.append(.composer(editing: nil))
+            } else if let selection = changes.selection {
+                rows.append(.selectionActions(lines: selection.lines(in: file).count))
+            }
+        }
         for hunk in file.hunks {
             let collapsed = changes.collapsedHunks.contains(hunk.id)
             rows.append(.hunk(hunk, collapsed: collapsed))
             guard !collapsed else { continue }
+            if layout == .split, !hunk.isCombined {
+                for row in SplitDiffPairer.rows(for: hunk) {
+                    rows.append(.split(row))
+                    let width = max(
+                        row.left.map { DiffMetrics.display($0.text).count } ?? 0,
+                        row.right.map { DiffMetrics.display($0.text).count } ?? 0
+                    )
+                    maxColumns = max(maxColumns, width)
+                    appendSelection(after: row.lineIDs)
+                    for id in row.lineIDs {
+                        if let comments = anchored[id] { appendComments(comments) }
+                    }
+                }
+                continue
+            }
             for line in hunk.lines {
                 rows.append(.line(line))
                 maxColumns = max(maxColumns, DiffMetrics.display(line.text).count)
-                if line.id == selectionEnd, editingCommentID == nil {
-                    if composing {
-                        rows.append(.composer(editing: nil))
-                    } else if let selection = changes.selection {
-                        rows.append(.selectionActions(lines: selection.lines(in: file).count))
-                    }
-                }
+                appendSelection(after: [line.id])
                 if let comments = anchored[line.id] { appendComments(comments) }
             }
         }
@@ -805,16 +927,21 @@ private struct ChangesDiffPane: View {
 
     private func diffList(_ file: DiffFile) -> some View {
         let built = rows(for: file)
+        let textWidth = CGFloat(built.maxColumns) * DiffMetrics.characterWidth
         return GeometryReader { geometry in
-            let contentWidth = max(
-                geometry.size.width,
-                DiffMetrics.gutterWidth + CGFloat(built.maxColumns) * DiffMetrics.characterWidth + 24
-            )
+            // Split view: two equal columns, each wide enough for the longest
+            // line on either side, scrolling together.
+            let contentWidth = layout == .split
+                ? max(geometry.size.width, 2 * (DiffMetrics.splitGutterWidth + textWidth + 12) + 1)
+                : max(geometry.size.width, DiffMetrics.gutterWidth + textWidth + 24)
             let cardWidth = min(max(geometry.size.width - DiffMetrics.gutterWidth - 24, 240), 640)
             ScrollView([.vertical, .horizontal]) {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(built.rows) { row in
-                        rowView(row, file: file, commented: built.commented, cardWidth: cardWidth)
+                        rowView(
+                            row, file: file, commented: built.commented, cardWidth: cardWidth,
+                            columnWidth: (contentWidth - 1) / 2
+                        )
                     }
                 }
                 .frame(width: contentWidth, alignment: .leading)
@@ -824,7 +951,7 @@ private struct ChangesDiffPane: View {
     }
 
     @ViewBuilder
-    private func rowView(_ row: DiffRow, file: DiffFile, commented: Set<Int>, cardWidth: CGFloat) -> some View {
+    private func rowView(_ row: DiffRow, file: DiffFile, commented: Set<Int>, cardWidth: CGFloat, columnWidth: CGFloat) -> some View {
         switch row {
         case .orphanHeader:
             Text("Comments on lines no longer in this diff")
@@ -849,6 +976,30 @@ private struct ChangesDiffPane: View {
                 selectable: selectable
             ) { extend in
                 select(line: line.id, in: file, extend: extend)
+            }
+        case .split(let row):
+            // Pairs only come from ordinary hunks, which are all selectable.
+            let selection = changes.selection?.range
+            HStack(spacing: 0) {
+                DiffSplitCell(
+                    line: row.left,
+                    side: .old,
+                    selected: row.left.map { selection?.contains($0.id) ?? false } ?? false,
+                    commented: row.left.map { commented.contains($0.id) } ?? false
+                ) { id, extend in
+                    select(line: id, in: file, extend: extend)
+                }
+                .frame(width: columnWidth)
+                MuxaTheme.border(colorScheme).frame(width: 1)
+                DiffSplitCell(
+                    line: row.right,
+                    side: .new,
+                    selected: row.right.map { selection?.contains($0.id) ?? false } ?? false,
+                    commented: row.right.map { commented.contains($0.id) } ?? false
+                ) { id, extend in
+                    select(line: id, in: file, extend: extend)
+                }
+                .frame(width: columnWidth)
             }
         case .selectionActions(let lines):
             let title: LocalizedStringKey = lines == 1 ? "Comment on line" : "Comment on \(lines) lines"
@@ -1037,6 +1188,92 @@ private struct DiffLineRow: View {
     }
 
     private var background: Color {
+        if selected { return MuxaTheme.selection(colorScheme) }
+        if commented { return MuxaTheme.diffCommentedBackground(colorScheme) }
+        switch line.kind {
+        case .added: return MuxaTheme.diffAddedBackground(colorScheme)
+        case .removed: return MuxaTheme.diffRemovedBackground(colorScheme)
+        case .context, .noNewline: return .clear
+        }
+    }
+}
+
+/// One side of a split-view row: the old file's line on the left, the new
+/// file's on the right, or a blank filler where that side has no line.
+private struct DiffSplitCell: View {
+    let line: DiffLine?
+    let side: ReviewSide
+    let selected: Bool
+    let commented: Bool
+    let tap: (_ lineID: Int, _ extend: Bool) -> Void
+    @State private var hovering = false
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var selectable: Bool {
+        guard let line else { return false }
+        return line.kind != .noNewline
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text(verbatim: number.map(String.init) ?? "")
+                .foregroundStyle(.tertiary)
+                .padding(.trailing, 6)
+                .frame(width: DiffMetrics.numberWidth, alignment: .trailing)
+                .frame(maxHeight: .infinity)
+                .background(gutterBackground)
+            Text(verbatim: marker)
+                .frame(width: DiffMetrics.markerWidth)
+                .foregroundStyle(hovering && selectable ? Color.accentColor : Color.secondary)
+            if let line {
+                Text(verbatim: DiffMetrics.display(line.text))
+                    .foregroundStyle(line.kind == .noNewline ? Color.secondary : Color.primary)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            Spacer(minLength: 0)
+        }
+        .font(DiffMetrics.font)
+        .frame(height: DiffMetrics.rowHeight)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(background)
+        .clipped()
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .onTapGesture {
+            guard selectable, let line else { return }
+            tap(line.id, NSEvent.modifierFlags.contains(.shift))
+        }
+    }
+
+    /// A context line carries both numbers; each side shows its own.
+    private var number: Int? {
+        side == .old ? line?.oldNumber : line?.newNumber
+    }
+
+    private var marker: String {
+        guard let line else { return "" }
+        if hovering && selectable { return "+" }
+        switch line.kind {
+        case .added: return "+"
+        case .removed: return "−"
+        case .context, .noNewline: return ""
+        }
+    }
+
+    private var gutterBackground: Color {
+        switch line?.kind {
+        case .added: MuxaTheme.diffAddedGutter(colorScheme)
+        case .removed: MuxaTheme.diffRemovedGutter(colorScheme)
+        default: .clear
+        }
+    }
+
+    private var background: Color {
+        guard let line else {
+            // Filler opposite a line the other side added or removed.
+            return Color.primary.opacity(colorScheme == .dark ? 0.04 : 0.035)
+        }
         if selected { return MuxaTheme.selection(colorScheme) }
         if commented { return MuxaTheme.diffCommentedBackground(colorScheme) }
         switch line.kind {

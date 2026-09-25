@@ -509,3 +509,216 @@ func loaderReadsARealRepository() async throws {
     store.refreshOutdated(in: key, file: otherFile, group: .staged)
     #expect(store.draft(for: key).comments.first?.outdated == true)
 }
+
+// MARK: - Split view
+
+private func hunk(_ lines: [DiffLine], combined: Bool = false) -> DiffHunk {
+    DiffHunk(
+        id: 0, header: "@@ -1 +1 @@", oldStart: 1, oldCount: 1, newStart: 1, newCount: 1,
+        section: "", lines: lines, isCombined: combined
+    )
+}
+
+/// "old|new" per row, by line text, with "·" for a filler side.
+private func summary(_ rows: [SplitDiffRow]) -> [String] {
+    rows.map { "\($0.left?.text ?? "·")|\($0.right?.text ?? "·")" }
+}
+
+@Test func splitPairsRemovalsWithTheAdditionsThatFollow() throws {
+    let file = try #require(UnifiedDiffParser.parse(sampleDiff).first)
+
+    let first = SplitDiffPairer.rows(for: file.hunks[0])
+    #expect(summary(first) == [
+        "let a = 1;|let a = 1;",
+        "let b = 2;|let b = 3;",
+        "·|let c = 4;",
+        "let d = 5;|let d = 5;",
+    ])
+    // Each side shows its own file's numbers; a context line carries both.
+    #expect(first.map { $0.left?.oldNumber } == [10, 11, nil, 12])
+    #expect(first.map { $0.right?.newNumber } == [10, 11, 12, 13])
+
+    // The trailing marker follows a context line, so it sits on both sides.
+    let second = SplitDiffPairer.rows(for: file.hunks[1])
+    #expect(summary(second) == [
+        "    old();|    new();",
+        "}|}",
+        "\\ No newline at end of file|\\ No newline at end of file",
+    ])
+}
+
+@Test func splitPadsTheShorterSideAndStartsANewBlockAfterAdditions() {
+    let rows = SplitDiffPairer.rows(for: hunk([
+        line(0, .removed, old: 1, new: nil, "r1"),
+        line(1, .removed, old: 2, new: nil, "r2"),
+        line(2, .removed, old: 3, new: nil, "r3"),
+        line(3, .added, old: nil, new: 1, "a1"),
+        line(4, .context, old: 4, new: 2, "c"),
+        line(5, .added, old: nil, new: 3, "a2"),
+        line(6, .removed, old: 5, new: nil, "r4"),
+        line(7, .added, old: nil, new: 4, "a3"),
+    ]))
+    #expect(summary(rows) == ["r1|a1", "r2|·", "r3|·", "c|c", "·|a2", "r4|a3"])
+    // Every line lands on exactly one row, so ids stay unique.
+    #expect(rows.map(\.id) == [0, 1, 2, 4, 5, 6])
+    #expect(rows.flatMap(\.lineIDs).sorted() == Array(0...7))
+    #expect(rows[0].lineIDs == [0, 3])
+    #expect(rows[3].lineIDs == [4])
+}
+
+@Test func splitKeepsANoNewlineMarkerOnItsOwnSide() {
+    let rows = SplitDiffPairer.rows(for: hunk([
+        line(0, .removed, old: 1, new: nil, "old"),
+        line(1, .noNewline, old: nil, new: nil, "\\ No newline at end of file"),
+        line(2, .added, old: nil, new: 1, "new"),
+    ]))
+    #expect(rows.count == 2)
+    #expect(rows[0].left?.text == "old" && rows[0].right?.text == "new")
+    #expect(rows[1].left?.kind == .noNewline && rows[1].right == nil)
+}
+
+@Test func splitRowsCommentOnTheSameLinesAsUnified() throws {
+    // Picking the right side of the changed row comments on the new line,
+    // the left side on the old one, exactly as the unified rows would.
+    let file = try #require(UnifiedDiffParser.parse(sampleDiff).first)
+    let row = SplitDiffPairer.rows(for: file.hunks[0])[1]
+    let right = try #require(row.right)
+    let left = try #require(row.left)
+
+    let newSide = try #require(DiffSelection.select(line: right.id, in: file, current: nil, extend: false))
+    let newComment = try #require(ReviewComment(path: file.path, lines: newSide.lines(in: file), body: "x"))
+    #expect(newComment.side == .new && newComment.startLine == 11)
+
+    let oldSide = try #require(DiffSelection.select(line: left.id, in: file, current: nil, extend: false))
+    let oldComment = try #require(ReviewComment(path: file.path, lines: oldSide.lines(in: file), body: "x"))
+    #expect(oldComment.side == .old && oldComment.startLine == 11)
+    #expect(oldComment.anchorLineID(in: file) == left.id)
+}
+
+// MARK: - Viewed files
+
+@Test func fingerprintFollowsTheDiffContentNotItsSource() throws {
+    let file = try #require(UnifiedDiffParser.parse(sampleDiff).first)
+    let again = try #require(UnifiedDiffParser.parse(sampleDiff).first)
+    #expect(DiffFingerprint.of(file) == DiffFingerprint.of(again))
+
+    let edited = sampleDiff.replacingOccurrences(of: "+let b = 3;", with: "+let b = 30;")
+    #expect(DiffFingerprint.of(try #require(UnifiedDiffParser.parse(edited).first)) != DiffFingerprint.of(file))
+    let shifted = sampleDiff.replacingOccurrences(of: "@@ -40,2 +41,2 @@", with: "@@ -50,2 +51,2 @@")
+    #expect(DiffFingerprint.of(try #require(UnifiedDiffParser.parse(shifted).first)) != DiffFingerprint.of(file))
+
+    // Read out of a multi-file diff, a file has the digest it has alone.
+    let other = """
+    diff --git a/other.txt b/other.txt
+    --- a/other.txt
+    +++ b/other.txt
+    @@ -1 +1 @@
+    -x
+    +y
+
+    """
+    let batch = DiffFingerprint.byPath(parsing: other + sampleDiff, truncated: false)
+    #expect(batch["src/app.rs"] == DiffFingerprint.of(file))
+    #expect(batch.count == 2)
+    // A file the byte cap cut off can't be vouched for.
+    #expect(DiffFingerprint.byPath(parsing: other + sampleDiff, truncated: true)["src/app.rs"] == nil)
+}
+
+@Test func viewedMarksResetWhenTheDiffChanges() {
+    var viewed = ViewedFiles()
+    let key = ViewedFiles.key(hostAlias: "local", root: "/repo", fileID: "unstaged:a.txt")
+    let staged = ViewedFiles.key(hostAlias: "local", root: "/repo", fileID: "staged:a.txt")
+    #expect(key != staged)
+    #expect(key != ViewedFiles.key(hostAlias: "local", root: "/other", fileID: "unstaged:a.txt"))
+
+    viewed.mark(key, fingerprint: "v1")
+    viewed.mark(staged, fingerprint: "s1")
+    #expect(viewed.isViewed(key))
+
+    // Same digest, or none known yet: the mark stands.
+    let unchanged = viewed.reconcile([key: "v1"])
+    let unknown = viewed.reconcile([:])
+    #expect(!unchanged && !unknown)
+    #expect(viewed.isViewed(key))
+
+    // The file changed again: only its mark goes.
+    let changed = viewed.reconcile([key: "v2", staged: "s1"])
+    #expect(changed)
+    #expect(!viewed.isViewed(key))
+    #expect(viewed.isViewed(staged))
+
+    viewed.unmark(staged)
+    #expect(viewed.records.isEmpty)
+}
+
+@Test func viewedMarksKeepTheNewestPastTheLimit() {
+    var viewed = ViewedFiles()
+    let start = Date(timeIntervalSince1970: 0)
+    for index in 0..<5 {
+        viewed.mark("k\(index)", fingerprint: "f", at: start.addingTimeInterval(Double(index)))
+    }
+    viewed.prune(limit: 3)
+    #expect(Set(viewed.records.keys) == ["k2", "k3", "k4"])
+}
+
+@MainActor
+@Test func viewedStorePersistsAcrossInstances() throws {
+    let suite = "muxa.changes.viewed.tests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+
+    let store = ViewedFilesStore(defaults: defaults)
+    store.mark("k", fingerprint: "f1")
+    #expect(ViewedFilesStore(defaults: defaults).isViewed("k"))
+
+    store.reconcile(["k": "f2"])
+    #expect(!ViewedFilesStore(defaults: defaults).isViewed("k"))
+    #expect(!ViewedFilesStore(defaults: nil).isViewed("k"))
+}
+
+@Test(.enabled(if: GitRunner.shared != nil))
+func batchFingerprintsMatchTheOneFileDiffs() async throws {
+    let git = try #require(gitAvailable())
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("muxa-viewed-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let dir = root.path
+
+    func run(_ args: String...) async {
+        let output = await git.run(
+            ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"] + args,
+            in: dir, limit: 1 << 20, timeout: 10
+        )
+        #expect(output.status == 0, "git \(args.joined(separator: " ")): \(output.stderr)")
+    }
+    await run("init", "-q", "-b", "main")
+    try "one\ntwo\n".write(toFile: "\(dir)/a.txt", atomically: true, encoding: .utf8)
+    try "keep\n".write(toFile: "\(dir)/b.txt", atomically: true, encoding: .utf8)
+    await run("add", ".")
+    await run("commit", "-q", "-m", "init")
+    try "one\n2\n".write(toFile: "\(dir)/a.txt", atomically: true, encoding: .utf8)
+    try "kept\n".write(toFile: "\(dir)/b.txt", atomically: true, encoding: .utf8)
+    await run("add", "b.txt")
+    try "new\n".write(toFile: "\(dir)/c.txt", atomically: true, encoding: .utf8)
+
+    let loader = ChangesLoader(git: git)
+    let resolved = try await loader.repositoryRoot(for: dir).get()
+    let files = try await loader.status(root: resolved).get().files
+    #expect(files.count == 3)
+
+    let batch = await loader.fingerprints(root: resolved, files: files, base: nil)
+    for file in files {
+        let single = try await loader.diff(root: resolved, file: file, base: nil).get()
+        #expect(batch[file.id] == single.fingerprint, "\(file.id)")
+    }
+
+    // Editing the file again changes its digest; the others keep theirs.
+    try "one\n3\n".write(toFile: "\(dir)/a.txt", atomically: true, encoding: .utf8)
+    let after = await loader.fingerprints(root: resolved, files: files, base: nil)
+    let unstaged = try #require(files.first { $0.group == .unstaged })
+    #expect(after[unstaged.id] != batch[unstaged.id])
+    for file in files where file.group != .unstaged {
+        #expect(after[file.id] == batch[file.id])
+    }
+}

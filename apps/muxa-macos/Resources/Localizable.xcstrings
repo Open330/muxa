@@ -1126,6 +1126,22 @@
         }
       }
     },
+    "%lld of %lld viewed" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$lld of %2$lld viewed"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%2$lld개 중 %1$lld개 확인함"
+          }
+        }
+      }
+    },
     "%lld operator commands and their durable replies" : {
       "localizations" : {
         "en" : {
@@ -7168,6 +7184,36 @@
         }
       }
     },
+    "Mark as not viewed" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "확인 안 함으로 표시"
+          }
+        }
+      }
+    },
+    "Mark as viewed" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "확인함으로 표시"
+          }
+        }
+      }
+    },
+    "Mark files viewed as you review them. A mark clears when the file changes again." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "검토한 파일을 확인함으로 표시하세요. 파일이 다시 바뀌면 표시가 지워집니다."
+          }
+        }
+      }
+    },
     "Match" : {
       "localizations" : {
         "ko" : {
@@ -12075,6 +12121,16 @@
         }
       }
     },
+    "Show the diff as one column, or old and new side by side" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "diff를 한 열로 보거나 변경 전후를 나란히 봅니다"
+          }
+        }
+      }
+    },
     "Show this guide again from Help › Welcome Guide." : {
       "localizations" : {
         "ko" : {
@@ -12151,6 +12207,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "완료를 보고하기 전에 테스트를 실행하는 단독 Claude"
+          }
+        }
+      }
+    },
+    "Split" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "분할"
           }
         }
       }
@@ -13808,6 +13874,16 @@
         }
       }
     },
+    "Unified" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "통합"
+          }
+        }
+      }
+    },
     "Unknown is not a match and must not execute an action." : {
       "localizations" : {
         "ko" : {
@@ -14196,6 +14272,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "보기: 사이드바 보기/숨기기"
+          }
+        }
+      }
+    },
+    "Viewed" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "확인함"
           }
         }
       }
