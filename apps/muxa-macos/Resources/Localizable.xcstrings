@@ -2871,6 +2871,16 @@
         }
       }
     },
+    "Answer agents from a notification" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "알림에서 바로 에이전트에 답하기"
+          }
+        }
+      }
+    },
     "Answered" : {
       "localizations" : {
         "ko" : {
@@ -4074,6 +4084,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "간략"
+          }
+        }
+      }
+    },
+    "Compare before you restore" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "복원 전에 비교하기"
           }
         }
       }
@@ -5446,6 +5466,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "기본 제공 엔진이 모두 설정되어 있습니다."
+          }
+        }
+      }
+    },
+    "Every host in one place" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모든 호스트를 한곳에서"
           }
         }
       }
@@ -11340,6 +11370,16 @@
         }
       }
     },
+    "Reply to an agent waiting for input, or mark it read, right from the banner." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "입력을 기다리는 에이전트에게 배너에서 바로 답장하거나 읽음으로 표시하세요."
+          }
+        }
+      }
+    },
     "Reply…" : {
       "localizations" : {
         "ko" : {
@@ -11488,6 +11528,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "스냅샷 복원"
+          }
+        }
+      }
+    },
+    "Restore Snapshot shows what is missing, what is already running, and what is new since the snapshot." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "스냅샷 복원에서 없는 것, 이미 실행 중인 것, 스냅샷 이후 새로 생긴 것을 보여줍니다."
           }
         }
       }
@@ -12801,6 +12851,16 @@
         }
       }
     },
+    "Side-by-side diffs" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "좌우 비교 diff"
+          }
+        }
+      }
+    },
     "Sidebar" : {
       "localizations" : {
         "ko" : {
@@ -13403,6 +13463,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%1$@을(를) %2$@(으)로 전환할까요?"
+          }
+        }
+      }
+    },
+    "Switch Changes to a split view and tick files as Viewed; a mark clears when the file changes again." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "변경 사항을 좌우 분할 보기로 바꾸고 파일을 검토 완료로 표시하세요. 파일이 다시 바뀌면 표시가 해제됩니다."
           }
         }
       }
@@ -16952,6 +17022,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "⌘1–9  바로 이동"
+          }
+        }
+      }
+    },
+    "⌘J shows agents from all your hosts, and usage counts an account shared by several Macs once." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⌘J로 모든 호스트의 에이전트를 볼 수 있고, 여러 Mac이 같은 계정을 쓰면 사용량을 한 번만 셉니다."
           }
         }
       }

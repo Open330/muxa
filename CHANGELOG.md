@@ -7,8 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.54] - 2026-09-25
+
 ### Added
 
+- **Answer agents from their notifications.** Muxa for Mac's agent
+  notifications have Open and Mark as Read buttons, and one waiting for
+  input has Reply…: the text goes to the agent's pane through muxad's
+  `send_prompt`, and a reply that cannot be sent comes back as a
+  notification carrying the text.
+- **Side-by-side diffs and Viewed marks in Changes.** A Unified / Split
+  switch, a Viewed box per file with "N of M viewed" (a mark clears when the
+  file's diff changes), and `j` / `k` / `v` in the file list.
+- **Every host in one place.** ⌘J badges each agent with its host and ranks
+  agents across hosts (⇧⌘J follows the same order), and the usage popover
+  shows a provider account shared by several hosts once, with live-session
+  cost per host.
+- **Onboarding that ends with a running agent.** The Welcome Guide starts
+  your first agent, fixes a missing tmux or agent CLI with Copy and Run in
+  Shell, asks for notification permission with the reason, and tours the
+  workbench and its shortcuts. After an upgrade a short What's New window
+  opens instead of the whole guide, and empty Explore and Inbox views say
+  what to do next.
 - **Compare a snapshot with what runs now before restoring it.** Muxa for
   Mac's Restore Snapshot sheet marks every session, window and pane as
   missing now or running, lists what is new since the snapshot (a restore
@@ -3882,7 +3902,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.53...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.54...HEAD
+[0.8.54]: https://github.com/Open330/muxa/compare/v0.8.53...v0.8.54
 [0.8.53]: https://github.com/Open330/muxa/compare/v0.8.52...v0.8.53
 [0.8.52]: https://github.com/Open330/muxa/compare/v0.8.51...v0.8.52
 [0.8.51]: https://github.com/Open330/muxa/compare/v0.8.50...v0.8.51
