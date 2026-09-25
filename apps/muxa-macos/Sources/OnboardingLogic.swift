@@ -150,6 +150,28 @@ enum MuxaWhatsNew {
 
     static var catalog: [Release] {
         [
+            Release(version: "0.8.54", highlights: [
+                Highlight(
+                    systemImage: "arrowshape.turn.up.left",
+                    title: String(localized: "Answer agents from a notification"),
+                    detail: String(localized: "Reply to an agent waiting for input, or mark it read, right from the banner.")
+                ),
+                Highlight(
+                    systemImage: "rectangle.split.2x1",
+                    title: String(localized: "Side-by-side diffs"),
+                    detail: String(localized: "Switch Changes to a split view and tick files as Viewed; a mark clears when the file changes again.")
+                ),
+                Highlight(
+                    systemImage: "clock.arrow.circlepath",
+                    title: String(localized: "Compare before you restore"),
+                    detail: String(localized: "Restore Snapshot shows what is missing, what is already running, and what is new since the snapshot.")
+                ),
+                Highlight(
+                    systemImage: "server.rack",
+                    title: String(localized: "Every host in one place"),
+                    detail: String(localized: "⌘J shows agents from all your hosts, and usage counts an account shared by several Macs once.")
+                ),
+            ]),
             Release(version: "0.8.53", highlights: [
                 Highlight(
                     systemImage: "rectangle.split.3x1",
