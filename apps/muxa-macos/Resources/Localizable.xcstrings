@@ -126,6 +126,16 @@
         }
       }
     },
+    "%@ has not been signed in on this Mac yet." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 Mac에서 아직 %@에 로그인하지 않았습니다."
+          }
+        }
+      }
+    },
     "%@ hit an error" : {
       "localizations" : {
         "ko" : {
@@ -1744,6 +1754,16 @@
         }
       }
     },
+    "A banner, a dot, and a Dock badge when an agent waits for you, fails, or finishes a turn. ⌘J jumps to the agent, ⇧⌘J to the next one waiting." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트가 입력을 기다리거나, 실패하거나, 턴을 마치면 배너와 점, Dock 배지로 알려 줍니다. ⌘J로 해당 에이전트로, ⇧⌘J로 다음 대기 중인 에이전트로 이동합니다."
+          }
+        }
+      }
+    },
     "A collaboration request is waiting for this agent." : {
       "localizations" : {
         "ko" : {
@@ -1850,6 +1870,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 ID로 설정된 프로바이더가 이미 있습니다."
+          }
+        }
+      }
+    },
+    "A quick question to any provider, without starting an agent." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트를 시작하지 않고 어떤 제공자에게든 빠르게 질문합니다."
           }
         }
       }
@@ -2135,6 +2165,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "활동"
+          }
+        }
+      }
+    },
+    "Activity bar" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "액티비티 바"
           }
         }
       }
@@ -2431,6 +2471,16 @@
         }
       }
     },
+    "Agent notifications" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 알림"
+          }
+        }
+      }
+    },
     "Agent reports" : {
       "localizations" : {
         "ko" : {
@@ -2501,12 +2551,32 @@
         }
       }
     },
-    "Agents waiting on you, plus Global Ask for a quick question to any provider." : {
+    "Agents run while you do something else. Muxa tells you when one of them needs you." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "답변을 기다리는 에이전트와, 어떤 프로바이더에게든 간단히 물어볼 수 있는 Global Ask입니다."
+            "value" : "다른 일을 하는 동안에도 에이전트는 계속 실행됩니다. 에이전트가 사용자를 필요로 하면 Muxa가 알려 줍니다."
+          }
+        }
+      }
+    },
+    "Agents waiting for your input or a choice, blocked, or failing show up here." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "입력이나 선택을 기다리거나, 막혔거나, 실패한 에이전트가 여기에 표시됩니다."
+          }
+        }
+      }
+    },
+    "Agents waiting on you: a question, a choice, or an error." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "사용자를 기다리는 에이전트: 질문, 선택, 오류."
           }
         }
       }
@@ -2591,6 +2661,16 @@
         }
       }
     },
+    "Allow Notifications" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "알림 허용"
+          }
+        }
+      }
+    },
     "Allow Notifications…" : {
       "localizations" : {
         "ko" : {
@@ -2667,6 +2747,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "한도가 초기화되면 자동화가 이 에이전트를 다시 이어서 실행할 수 있습니다."
+          }
+        }
+      }
+    },
+    "An editor-style workbench" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "코드 편집기 스타일의 워크벤치"
           }
         }
       }
@@ -2832,12 +2922,12 @@
         }
       }
     },
-    "Ask any configured provider from the Ask tab without starting a pipeline." : {
+    "Ask any configured provider from the Ask view without starting an agent." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "파이프라인을 시작하지 않고 Ask 탭에서 설정된 프로바이더에게 바로 물어볼 수 있습니다."
+            "value" : "에이전트를 시작하지 않고 Ask 보기에서 설정된 제공자에게 질문합니다."
           }
         }
       }
@@ -3090,6 +3180,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "muxad가 연결되면 사용할 수 있습니다."
+          }
+        }
+      }
+    },
+    "Available once muxad is connected. See the previous step." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "muxad에 연결되면 사용할 수 있습니다. 이전 단계를 확인하세요."
           }
         }
       }
@@ -3347,6 +3447,16 @@
         }
       }
     },
+    "Changes review" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "변경 사항 리뷰"
+          }
+        }
+      }
+    },
     "Changes vs %@" : {
       "localizations" : {
         "ko" : {
@@ -3383,6 +3493,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "확인 중"
+          }
+        }
+      }
+    },
+    "Checking muxad and your agent CLIs…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "muxad와 에이전트 CLI를 확인하는 중…"
           }
         }
       }
@@ -3467,6 +3587,16 @@
         }
       }
     },
+    "Choose a folder that exists on this Mac." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 Mac에 있는 폴더를 선택하세요."
+          }
+        }
+      }
+    },
     "Choose a session, window, or pane in Explorer. Muxa will resolve it to a live pane." : {
       "localizations" : {
         "ko" : {
@@ -3513,6 +3643,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "에이전트가 작업할 폴더를 선택하세요."
+          }
+        }
+      }
+    },
+    "Choose what Muxa notifies about in Settings › Behaviour." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "알림 받을 항목은 설정 › 동작에서 고를 수 있습니다."
           }
         }
       }
@@ -5300,6 +5440,16 @@
         }
       }
     },
+    "Every tmux pane on this Mac and your fleet hosts shows up here, whoever started it." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "누가 시작했든 이 Mac과 플릿 호스트의 모든 tmux 패인이 여기에 표시됩니다."
+          }
+        }
+      }
+    },
     "Everything here already matches muxa's defaults." : {
       "localizations" : {
         "ko" : {
@@ -5666,6 +5816,16 @@
         }
       }
     },
+    "Find your way around" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "워크벤치 둘러보기"
+          }
+        }
+      }
+    },
     "Finished or waiting since you last looked" : {
       "localizations" : {
         "ko" : {
@@ -5907,6 +6067,16 @@
         }
       }
     },
+    "For bigger outcomes, describe what done looks like. Agents do the work in stages, and Muxa tells you the moment one of them needs you." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "큰 작업은 완료된 모습을 설명하세요. 에이전트가 단계별로 작업하고, 누군가 사용자를 필요로 하는 순간 Muxa가 알려 줍니다."
+          }
+        }
+      }
+    },
     "For example --model opus" : {
       "localizations" : {
         "ko" : {
@@ -5923,16 +6093,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "지우기"
-          }
-        }
-      }
-    },
-    "Four surfaces, one workbench" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "네 개의 화면, 하나의 작업 공간"
           }
         }
       }
@@ -6211,6 +6371,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "프롬프트 숨기기"
+          }
+        }
+      }
+    },
+    "Highlights of this release." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이번 릴리스의 주요 변경 사항입니다."
           }
         }
       }
@@ -6521,6 +6691,16 @@
         }
       }
     },
+    "Install an agent CLI on the previous step first." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "먼저 이전 단계에서 에이전트 CLI를 설치하세요."
+          }
+        }
+      }
+    },
     "Install the %@ command and make sure it is on your PATH, then re-check." : {
       "localizations" : {
         "ko" : {
@@ -6573,6 +6753,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "중단"
+          }
+        }
+      }
+    },
+    "It runs in a Muxa terminal on this Mac and opens as a tab." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 Mac의 Muxa 터미널에서 실행되고 탭으로 열립니다."
+          }
+        }
+      }
+    },
+    "It runs in a new tmux session named after the folder and opens as a tab." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "폴더 이름을 딴 새 tmux 세션에서 실행되고 탭으로 열립니다."
           }
         }
       }
@@ -6727,6 +6927,16 @@
         }
       }
     },
+    "Keyboard shortcuts" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "키보드 단축키"
+          }
+        }
+      }
+    },
     "Keychain API key" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -6754,6 +6964,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "종류"
+          }
+        }
+      }
+    },
+    "Know when an agent needs you" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트가 필요로 할 때 알림 받기"
           }
         }
       }
@@ -6998,6 +7218,16 @@
         }
       }
     },
+    "Lists what the chosen view holds, with a filter on top. Hide or show it with ⌘B." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "선택한 보기의 항목을 필터와 함께 나열합니다. ⌘B로 숨기거나 표시합니다."
+          }
+        }
+      }
+    },
     "Live Pane" : {
       "localizations" : {
         "ko" : {
@@ -7074,6 +7304,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "PATH에서 에이전트 CLI를 찾는 중…"
+          }
+        }
+      }
+    },
+    "Looking for agent CLIs…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 CLI를 찾는 중…"
           }
         }
       }
@@ -7378,12 +7618,12 @@
         }
       }
     },
-    "Muxa checks these every time this guide opens. Nothing here is required to look around." : {
+    "Muxa checks again whenever you come back to this window. Nothing here is required to look around." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "이 안내를 열 때마다 Muxa가 아래 항목을 확인합니다. 둘러보는 데 필수인 항목은 없습니다."
+            "value" : "이 창으로 돌아올 때마다 Muxa가 다시 확인합니다. 둘러보는 데 필요한 항목은 없습니다."
           }
         }
       }
@@ -7420,6 +7660,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Muxa 알림"
+          }
+        }
+      }
+    },
+    "Muxa notifies you when an agent" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa는 에이전트가 다음과 같을 때 알려 줍니다"
           }
         }
       }
@@ -7483,6 +7733,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "보고 있는 페인은 알리지 않고, 같은 에이전트는 30초 안에 다시 알리지 않습니다. 마지막으로 연 이후 작업을 마쳤거나 기다리기 시작한 에이전트에는 다시 열 때까지 점이 표시됩니다."
+          }
+        }
+      }
+    },
+    "Muxa snapshots your tmux sessions automatically so they can be restored after a restart." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa가 tmux 세션을 자동으로 스냅샷해 재시작 후에도 복원할 수 있습니다."
           }
         }
       }
@@ -7704,6 +7964,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "결정이 필요합니다: %@. 에이전트는 이 요청에 답변하지 않습니다."
+          }
+        }
+      }
+    },
+    "Never for the pane you are looking at. An agent you have not opened since keeps a dot, and the Dock icon counts them." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "지금 보고 있는 패인에 대해서는 알리지 않습니다. 아직 열어 보지 않은 에이전트에는 점이 남고, Dock 아이콘에 그 수가 표시됩니다."
           }
         }
       }
@@ -7959,6 +8229,16 @@
         }
       }
     },
+    "No SSH hosts yet. Add one to watch its panes and run Work on it from this Mac." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 SSH 호스트가 없습니다. 호스트를 추가하면 이 Mac에서 그 호스트의 패인을 보고 Work를 실행할 수 있습니다."
+          }
+        }
+      }
+    },
     "No Work routing is configured yet. Install a preset above, or let an agent write the config in an interactive Shell tab." : {
       "localizations" : {
         "ko" : {
@@ -7989,12 +8269,22 @@
         }
       }
     },
-    "No agent CLI was found. Install Claude Code, Codex, Gemini CLI, or OpenCode, then check again." : {
+    "No agent CLI was found on this Mac." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "에이전트 CLI를 찾지 못했습니다. Claude Code, Codex, Gemini CLI 또는 OpenCode를 설치한 뒤 다시 확인하세요."
+            "value" : "이 Mac에서 에이전트 CLI를 찾지 못했습니다."
+          }
+        }
+      }
+    },
+    "No agent CLI was found. Install at least one, then come back to this window." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 CLI를 찾지 못했습니다. 하나 이상 설치한 뒤 이 창으로 돌아오세요."
           }
         }
       }
@@ -8099,12 +8389,32 @@
         }
       }
     },
+    "No fleet hosts" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "플릿 호스트 없음"
+          }
+        }
+      }
+    },
     "No groups" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "그룹 없음"
+          }
+        }
+      }
+    },
+    "No highlights were recorded for this version." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 버전에 기록된 주요 변경 사항이 없습니다."
           }
         }
       }
@@ -8690,6 +9000,16 @@
         }
       }
     },
+    "Notifications are allowed." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "알림이 허용되어 있습니다."
+          }
+        }
+      }
+    },
     "Notifications for Muxa are off in System Settings." : {
       "localizations" : {
         "ko" : {
@@ -8870,6 +9190,16 @@
         }
       }
     },
+    "One workbench for every agent" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모든 에이전트를 위한 하나의 워크벤치"
+          }
+        }
+      }
+    },
     "Online" : {
       "localizations" : {
         "ko" : {
@@ -9031,12 +9361,12 @@
         }
       }
     },
-    "Open Live Watch with ⌘⇧W to browse every pane on every host." : {
+    "Open Live Watch with ⇧⌘W to see every pane on every host side by side." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "⌘⇧W로 Live Watch를 열면 모든 호스트의 모든 페인을 살펴볼 수 있습니다."
+            "value" : "⇧⌘W로 Live Watch를 열어 모든 호스트의 모든 패인을 나란히 봅니다."
           }
         }
       }
@@ -9109,6 +9439,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "시스템 설정 열기"
+          }
+        }
+      }
+    },
+    "Open Welcome Guide" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "환영 안내 열기"
           }
         }
       }
@@ -9265,6 +9605,16 @@
         }
       }
     },
+    "Open tabs, then the window's actions at the right end: Go to Anything, Start Work, New Shell, New Agent, and a … menu for the rest." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "열린 탭과, 오른쪽 끝의 창 동작: 어디로든 이동, Work 시작, 새 셸, 새 에이전트, 그리고 나머지를 담은 … 메뉴."
+          }
+        }
+      }
+    },
     "Open the page" : {
       "localizations" : {
         "ko" : {
@@ -9346,6 +9696,16 @@
         }
       }
     },
+    "Opens a new shell tab with this command typed; press Return there to run it." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 명령이 입력된 새 셸 탭을 엽니다. 실행하려면 그 탭에서 Return 키를 누르세요."
+          }
+        }
+      }
+    },
     "Opens the CLI in a Muxa shell so you can sign in" : {
       "localizations" : {
         "ko" : {
@@ -9396,12 +9756,12 @@
         }
       }
     },
-    "Optional. Choose a default project folder so Start Work opens in the right place." : {
+    "Optional. Choose a default project folder so Start Work and your first agent open in the right place." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "선택 사항입니다. 기본 프로젝트 폴더를 지정하면 Work 시작이 올바른 위치에서 열립니다."
+            "value" : "선택 사항입니다. 기본 프로젝트 폴더를 지정하면 Work 시작과 첫 에이전트가 올바른 위치에서 열립니다."
           }
         }
       }
@@ -9618,6 +9978,16 @@
         }
       }
     },
+    "Pick a folder and an agent. Muxa starts it and opens it as a tab in the workbench. You can skip this and press ⌥⌘T later." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "폴더와 에이전트를 고르세요. Muxa가 에이전트를 시작하고 워크벤치에 탭으로 엽니다. 건너뛰고 나중에 ⌥⌘T를 눌러도 됩니다."
+          }
+        }
+      }
+    },
     "Pick a pipeline and say what done looks like." : {
       "localizations" : {
         "ko" : {
@@ -9759,12 +10129,22 @@
         }
       }
     },
-    "Press ⌘⇧P for the command palette: every action, one keystroke away." : {
+    "Press ⇧⌘P for the command palette: every action, one keystroke away." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "⌘⇧P를 누르면 명령 팔레트가 열립니다. 모든 동작을 단축키 하나로 실행하세요."
+            "value" : "⇧⌘P로 명령 팔레트를 엽니다. 모든 동작을 키 한 번으로 실행하세요."
+          }
+        }
+      }
+    },
+    "Press ⌘/ in the workbench for every shortcut." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "워크벤치에서 ⌘/를 누르면 모든 단축키를 볼 수 있습니다."
           }
         }
       }
@@ -10349,6 +10729,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "SSH 호스트를 등록하면 Muxa에서 해당 호스트의 에이전트를 확인할 수 있습니다."
+          }
+        }
+      }
+    },
+    "Register an SSH host to watch its panes and run Work there." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSH 호스트를 등록하면 그 호스트의 패인을 보고 Work를 실행할 수 있습니다."
           }
         }
       }
@@ -11106,6 +11496,16 @@
         }
       }
     },
+    "Run in Shell" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "셸에서 실행"
+          }
+        }
+      }
+    },
     "Run log" : {
       "localizations" : {
         "ko" : {
@@ -11494,6 +11894,16 @@
         }
       }
     },
+    "See how much of each provider's limit your agents have used." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트가 각 제공자의 한도를 얼마나 사용했는지 확인합니다."
+          }
+        }
+      }
+    },
     "Select All" : {
       "localizations" : {
         "ko" : {
@@ -11812,6 +12222,16 @@
         }
       }
     },
+    "Session snapshots" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션 스냅샷"
+          }
+        }
+      }
+    },
     "Session: Restore snapshot…" : {
       "localizations" : {
         "ko" : {
@@ -12105,12 +12525,32 @@
         }
       }
     },
+    "Side bar" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "사이드 바"
+          }
+        }
+      }
+    },
     "Sidebar" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "사이드바"
+          }
+        }
+      }
+    },
+    "Skip" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "건너뛰기"
           }
         }
       }
@@ -12241,6 +12681,16 @@
         }
       }
     },
+    "Start Claude, Codex, Gemini, or OpenCode in a folder; each opens as a tab." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "폴더에서 Claude, Codex, Gemini, OpenCode를 시작하면 각각 탭으로 열립니다."
+          }
+        }
+      }
+    },
     "Start Muxa Work…" : {
       "localizations" : {
         "ko" : {
@@ -12261,22 +12711,12 @@
         }
       }
     },
-    "Start Work from the toolbar, keep an eye on the Inbox, and open Live Watch whenever you want to see an agent's pane for yourself." : {
+    "Start Work is in the title row's actions, or press ⌥⌘N." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "툴바에서 Work를 시작하고, Inbox를 확인하고, 에이전트의 페인을 직접 보고 싶을 때 Live Watch를 여세요."
-          }
-        }
-      }
-    },
-    "Start Work lives in the toolbar of the main window, ready whenever you are." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Work 시작은 메인 윈도우 툴바에 있어 언제든 바로 쓸 수 있습니다."
+            "value" : "Work 시작은 제목 행의 동작에 있으며, ⌥⌘N으로도 열 수 있습니다."
           }
         }
       }
@@ -12318,6 +12758,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이전 대화를 지우지 않고 새 대화를 시작합니다"
+          }
+        }
+      }
+    },
+    "Start agents from the app" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "앱에서 에이전트 시작"
+          }
+        }
+      }
+    },
+    "Start an agent with ⌥⌘T or Work with ⌥⌘N, jump to whichever agent needs you with ⌘J, and keep an eye on the Inbox." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⌥⌘T로 에이전트를, ⌥⌘N으로 Work를 시작하고, ⌘J로 사용자를 기다리는 에이전트로 이동하며, Inbox를 계속 확인하세요."
           }
         }
       }
@@ -12369,6 +12829,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "첫 Work 시작하기"
+          }
+        }
+      }
+    },
+    "Start your first agent" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "첫 에이전트 시작하기"
           }
         }
       }
@@ -12449,6 +12919,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "상태"
+          }
+        }
+      }
+    },
+    "Status bar" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "상태 바"
           }
         }
       }
@@ -12727,6 +13207,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "시스템 알림 센터"
+          }
+        }
+      }
+    },
+    "Tabs in the title row, an activity bar with a side bar you toggle with ⌘B, and a status bar. Press ⌘/ for every shortcut." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "제목 행의 탭, ⌘B로 여닫는 사이드 바와 액티비티 바, 그리고 상태 바. ⌘/로 모든 단축키를 볼 수 있습니다."
           }
         }
       }
@@ -13171,6 +13661,16 @@
         }
       }
     },
+    "The muxad connection, provider usage, and how many hosts, agents, and shells are running." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "muxad 연결, 제공자 사용량, 실행 중인 호스트·에이전트·셸 수."
+          }
+        }
+      }
+    },
     "The muxad on this Mac is too old to start agents on fleet hosts; update Muxa and restart muxad." : {
       "localizations" : {
         "ko" : {
@@ -13281,6 +13781,16 @@
         }
       }
     },
+    "The running muxad cannot start agents. Update Muxa and restart muxad." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 중인 muxad는 에이전트를 시작할 수 없습니다. Muxa를 업데이트하고 muxad를 다시 시작하세요."
+          }
+        }
+      }
+    },
     "The running muxad predates in-app drafting; the bundled muxa CLI asks the provider instead." : {
       "localizations" : {
         "ko" : {
@@ -13307,6 +13817,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@의 스냅샷이 삭제됩니다. 실행 중인 세션에는 영향이 없습니다."
+          }
+        }
+      }
+    },
+    "The strip on the left edge switches between Work, Explore, Inbox, Ask, and Shells." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "왼쪽 가장자리의 막대로 Work, Explore, Inbox, Ask, 셸 사이를 전환합니다."
+          }
+        }
+      }
+    },
+    "The workbench is laid out like a code editor, so every part has one job." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "워크벤치는 코드 편집기처럼 배치되어 있어 각 영역이 하나의 역할을 합니다."
           }
         }
       }
@@ -13692,6 +14222,16 @@
         }
       }
     },
+    "Title row" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "제목 행"
+          }
+        }
+      }
+    },
     "Toggle Side Bar" : {
       "localizations" : {
         "ko" : {
@@ -13994,6 +14534,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "사용량과 한도"
+          }
+        }
+      }
+    },
+    "Usage in the status bar" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "상태 바의 사용량"
           }
         }
       }
@@ -14382,6 +14932,16 @@
         }
       }
     },
+    "Welcome Guide" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "환영 안내"
+          }
+        }
+      }
+    },
     "Welcome Guide…" : {
       "localizations" : {
         "ko" : {
@@ -14428,6 +14988,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "어떤 구성을 원하시나요?"
+          }
+        }
+      }
+    },
+    "What's New in Muxa" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa의 새로운 기능"
+          }
+        }
+      }
+    },
+    "What's New in Muxa %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa %@의 새로운 기능"
           }
         }
       }
@@ -14790,16 +15370,6 @@
         }
       }
     },
-    "You describe the outcome. Agents do the work in stages. Muxa tells you the moment one of them needs you." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "목표만 알려주면 에이전트가 단계별로 일을 처리하고, 사용자의 확인이 필요한 순간 Muxa가 알려줍니다."
-          }
-        }
-      }
-    },
     "You're ready" : {
       "localizations" : {
         "ko" : {
@@ -15018,6 +15588,16 @@
         }
       }
     },
+    "finished a turn" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "턴을 마쳤을 때"
+          }
+        }
+      }
+    },
     "folder on the host (optional)" : {
       "localizations" : {
         "ko" : {
@@ -15088,6 +15668,16 @@
         }
       }
     },
+    "hit an error or is blocked" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오류가 났거나 막혔을 때"
+          }
+        }
+      }
+    },
     "in %lldh %@m" : {
       "localizations" : {
         "en" : {
@@ -15120,6 +15710,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%lld초 후"
+          }
+        }
+      }
+    },
+    "is waiting for your input or a choice" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "입력이나 선택을 기다릴 때"
           }
         }
       }
@@ -15170,6 +15770,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "macOS가 Muxa의 알림을 허용했습니다."
+          }
+        }
+      }
+    },
+    "macOS asks once; you can change it later in System Settings." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "macOS가 한 번 묻습니다. 나중에 시스템 설정에서 바꿀 수 있습니다."
           }
         }
       }
@@ -15789,12 +16399,22 @@
         }
       }
     },
-    "tmux was not found. Install it with Homebrew (brew install tmux) and check again." : {
+    "tmux was not found, so it runs in a Muxa terminal on this Mac and opens as a tab." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tmux를 찾지 못했습니다. Homebrew로 설치(brew install tmux)한 뒤 다시 확인하세요."
+            "value" : "tmux를 찾지 못해 이 Mac의 Muxa 터미널에서 실행되고 탭으로 열립니다."
+          }
+        }
+      }
+    },
+    "tmux was not found. Install it with Homebrew, then come back to this window." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "tmux를 찾지 못했습니다. Homebrew로 설치한 뒤 이 창으로 돌아오세요."
           }
         }
       }
@@ -15990,6 +16610,16 @@
         }
       }
     },
+    "⌃⇧G shows what agents changed in the working tree; comment on lines and send the review back." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⌃⇧G로 에이전트가 작업 트리에서 바꾼 내용을 봅니다. 줄에 코멘트를 달고 리뷰를 돌려보내세요."
+          }
+        }
+      }
+    },
     "⌘1–9  jump" : {
       "localizations" : {
         "ko" : {
@@ -16006,6 +16636,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "⌘↩ 보내기"
+          }
+        }
+      }
+    },
+    "⌥⌘T starts your default agent in the focused folder; ⌥⇧⌘T picks the agent, folder, and placement." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⌥⌘T는 포커스된 폴더에서 기본 에이전트를 시작하고, ⌥⇧⌘T는 에이전트, 폴더, 배치를 직접 고릅니다."
           }
         }
       }

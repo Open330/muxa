@@ -234,6 +234,12 @@ private struct MuxaFleetSettingsPane: View {
                         ForEach(hosts) { host in
                             MuxaFleetSettingsRow(host: host)
                         }
+                        if !hosts.contains(where: { !$0.local }) {
+                            Label("No SSH hosts yet. Add one to watch its panes and run Work on it from this Mac.", systemImage: "info.circle")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
                     .padding(16)
                 }
