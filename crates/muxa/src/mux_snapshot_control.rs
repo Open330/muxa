@@ -170,13 +170,24 @@ impl MuxSnapshotControl {
         .await
     }
 
-    /// The dry run: what a restore of `id` would create and skip. Always
-    /// `--only-missing` — the app never adds panes to a live session.
-    pub async fn plan(&self, id: &str) -> Result<serde_json::Value, MuxSnapshotError> {
+    /// The dry run: what a restore of `id` would create and skip, beside
+    /// what the server has now. `only_missing` is what a client that
+    /// predates `mux_snapshot_plan_v1` always gets: existing sessions are
+    /// left alone. Without it, existing sessions are planned to get the
+    /// windows and panes they lack.
+    pub async fn plan(
+        &self,
+        id: &str,
+        only_missing: bool,
+    ) -> Result<serde_json::Value, MuxSnapshotError> {
         let dir = self.dir(id)?;
         let dir = dir.to_string_lossy();
-        self.json(&["restore", &dir, "--only-missing", "--json"], QUICK)
-            .await
+        let mut args = vec!["restore", &dir];
+        if only_missing {
+            args.push("--only-missing");
+        }
+        args.push("--json");
+        self.json(&args, QUICK).await
     }
 
     /// `muxa snapshot --delete <id>`.
@@ -187,11 +198,13 @@ impl MuxSnapshotControl {
     }
 
     /// Start `muxa restore <id> --only-missing --run --json` and return the
-    /// running operation.
+    /// running operation. Without `only_missing` (`mux_snapshot_plan_v1`),
+    /// existing sessions also get the windows and panes they lack.
     pub async fn restore(
         self: &Arc<Self>,
         id: &str,
         layout_only: bool,
+        only_missing: bool,
     ) -> Result<MuxSnapshotOperation, MuxSnapshotError> {
         let dir = self.dir(id)?;
         let mut operations = self.operations.lock().await;
@@ -228,13 +241,11 @@ impl MuxSnapshotControl {
             .insert(operation_id.clone(), operation.clone());
         drop(operations);
 
-        let mut args = vec![
-            "restore".to_owned(),
-            dir.to_string_lossy().into_owned(),
-            "--only-missing".to_owned(),
-            "--run".to_owned(),
-            "--json".to_owned(),
-        ];
+        let mut args = vec!["restore".to_owned(), dir.to_string_lossy().into_owned()];
+        if only_missing {
+            args.push("--only-missing".to_owned());
+        }
+        args.extend(["--run".to_owned(), "--json".to_owned()]);
         if layout_only {
             args.push("--layout-only".to_owned());
         }
@@ -394,7 +405,7 @@ mod tests {
         };
         // Let the save get counted in before the restore asks.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let refused = control.restore("1790000000", false).await;
+        let refused = control.restore("1790000000", false, true).await;
         assert!(
             matches!(refused, Err(MuxSnapshotError::SaveRunning)),
             "{refused:?}"
@@ -414,7 +425,8 @@ mod tests {
         );
         control.list().await.unwrap();
         control.save().await.unwrap();
-        control.plan("1790000000").await.unwrap();
+        control.plan("1790000000", true).await.unwrap();
+        control.plan("1790000000", false).await.unwrap();
         control.delete("1790000000").await.unwrap();
         control.auto(7).await.unwrap();
         assert_eq!(
@@ -422,11 +434,12 @@ mod tests {
             "snapshot --list --json\n\
              snapshot --json\n\
              restore /snapshots/1790000000 --only-missing --json\n\
+             restore /snapshots/1790000000 --json\n\
              snapshot --delete 1790000000 --json\n\
              snapshot --auto --keep-auto 7 --json\n"
         );
         assert!(matches!(
-            control.plan("../etc").await,
+            control.plan("../etc", true).await,
             Err(MuxSnapshotError::InvalidId(_))
         ));
     }
@@ -473,10 +486,10 @@ mod tests {
             binary,
             Some(PathBuf::from("/snapshots")),
         );
-        let running = control.restore("1790000000", true).await.unwrap();
+        let running = control.restore("1790000000", true, true).await.unwrap();
         assert_eq!(running.state, MuxSnapshotOperationState::Running);
         assert!(matches!(
-            control.restore("1790000000", false).await,
+            control.restore("1790000000", false, true).await,
             Err(MuxSnapshotError::RestoreRunning)
         ));
         assert!(matches!(
@@ -511,7 +524,7 @@ mod tests {
             binary,
             Some(PathBuf::from("/snapshots")),
         );
-        let running = control.restore("1000", false).await.unwrap();
+        let running = control.restore("1000", false, true).await.unwrap();
         let done = settle(&control, &running.operation_id).await;
         assert_eq!(done.state, MuxSnapshotOperationState::Failed);
         assert_eq!(done.message, "creating session work");

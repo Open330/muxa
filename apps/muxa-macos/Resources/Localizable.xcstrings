@@ -461,22 +461,6 @@
         }
       }
     },
-    "%@, skips %lld" : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "%1$@, skips %2$lld"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%@, %lld개 건너뜀"
-          }
-        }
-      }
-    },
     "%lld" : {
       "localizations" : {
         "ko" : {
@@ -743,6 +727,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "에이전트 %1$lld개 · Work 항목 %2$lld개"
+          }
+        }
+      }
+    },
+    "%lld already running" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개 이미 실행 중"
           }
         }
       }
@@ -1100,6 +1094,16 @@
         }
       }
     },
+    "%lld new since snapshot" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "스냅숏 이후 %lld개 새로 생김"
+          }
+        }
+      }
+    },
     "%lld not confirmed" : {
       "localizations" : {
         "ko" : {
@@ -1160,6 +1164,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "페인 %lld개"
+          }
+        }
+      }
+    },
+    "%lld panes to add to running sessions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 중인 세션에 추가할 페인 %lld개"
           }
         }
       }
@@ -1332,6 +1346,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "세션 %lld개"
+          }
+        }
+      }
+    },
+    "%lld sessions to recreate" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 만들 세션 %lld개"
           }
         }
       }
@@ -1616,12 +1640,32 @@
         }
       }
     },
+    "1 pane to add to running sessions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 중인 세션에 추가할 페인 1개"
+          }
+        }
+      }
+    },
     "1 session" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "세션 1개"
+          }
+        }
+      }
+    },
+    "1 session to recreate" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 만들 세션 1개"
           }
         }
       }
@@ -2597,6 +2641,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "알림 허용…"
+          }
+        }
+      }
+    },
+    "Already running" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이미 실행 중"
           }
         }
       }
@@ -4429,26 +4483,6 @@
         }
       }
     },
-    "Creates %lld sessions" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "세션 %lld개를 만듭니다"
-          }
-        }
-      }
-    },
-    "Creates 1 session" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "세션 1개를 만듭니다"
-          }
-        }
-      }
-    },
     "Current context" : {
       "localizations" : {
         "ko" : {
@@ -5280,16 +5314,6 @@
         }
       }
     },
-    "Every session already exists — nothing to restore." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "모든 세션이 이미 있습니다. 복원할 것이 없습니다."
-          }
-        }
-      }
-    },
     "Every tmux pane on every host, live, whether or not Muxa started it." : {
       "localizations" : {
         "ko" : {
@@ -5572,6 +5596,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "파일 모드 변경: %@"
+          }
+        }
+      }
+    },
+    "Fill In %lld Sessions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션 %lld개 채우기"
+          }
+        }
+      }
+    },
+    "Fill In 1 Session" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션 1개 채우기"
           }
         }
       }
@@ -6938,6 +6982,16 @@
         }
       }
     },
+    "Leave running sessions untouched. Turn off to also add the windows and panes they lack" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 중인 세션은 건드리지 않습니다. 끄면 빠진 창과 페인도 추가합니다"
+          }
+        }
+      }
+    },
     "Leave the executable empty to use the command on muxad's PATH. Point it at an absolute path to pin a second install." : {
       "localizations" : {
         "ko" : {
@@ -7244,6 +7298,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "메시지 스킬 (선택)"
+          }
+        }
+      }
+    },
+    "Missing" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "없음"
           }
         }
       }
@@ -7939,6 +8003,16 @@
         }
       }
     },
+    "New since snapshot" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "스냅숏 이후 새로 생김"
+          }
+        }
+      }
+    },
     "New window" : {
       "localizations" : {
         "ko" : {
@@ -8439,6 +8513,16 @@
         }
       }
     },
+    "No sessions to recreate" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 만들 세션 없음"
+          }
+        }
+      }
+    },
     "No shell binding" : {
       "localizations" : {
         "ko" : {
@@ -8609,6 +8693,16 @@
         }
       }
     },
+    "Not running now" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "지금 실행 중이 아님"
+          }
+        }
+      }
+    },
     "Not set up" : {
       "localizations" : {
         "ko" : {
@@ -8665,6 +8759,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "주의가 필요한 항목 없음"
+          }
+        }
+      }
+    },
+    "Nothing to Restore" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "복원할 것 없음"
           }
         }
       }
@@ -8946,6 +9050,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "메타데이터만 변경되었습니다."
+          }
+        }
+      }
+    },
+    "Only missing sessions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "없는 세션만"
           }
         }
       }
@@ -10212,12 +10326,58 @@
         }
       }
     },
+    "Recreate %lld Sessions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션 %lld개 다시 만들기"
+          }
+        }
+      }
+    },
+    "Recreate %lld, Fill In %lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld개 다시 만들기, %2$lld개 채우기"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Recreate %1$lld, Fill In %2$lld"
+          }
+        }
+      }
+    },
+    "Recreate 1 Session" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션 1개 다시 만들기"
+          }
+        }
+      }
+    },
     "Recreate sessions, windows and directories, but leave every pane as an empty shell" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "세션, 윈도우, 폴더는 다시 만들고 모든 페인은 빈 셸로 둡니다"
+          }
+        }
+      }
+    },
+    "Recreates the sessions that are missing and adds the windows and panes running sessions lack; their idle shells are given their recorded directory and command. Nothing that runs now is closed." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "없는 세션을 다시 만들고, 실행 중인 세션에 빠진 창과 페인을 추가합니다. 유휴 셸에는 기록된 디렉터리와 명령이 입력됩니다. 지금 실행 중인 것은 닫지 않습니다."
           }
         }
       }
@@ -11162,6 +11322,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@에서 Work 명령을 실행하려면 최신 muxad가 필요합니다. 번들 muxad 사용을 선택하거나 muxad를 다시 시작하세요"
+          }
+        }
+      }
+    },
+    "Running now but not in the snapshot. Restoring never closes it." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "지금 실행 중이지만 스냅숏에는 없습니다. 복원해도 닫히지 않습니다."
           }
         }
       }

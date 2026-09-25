@@ -39,6 +39,29 @@ private let reportJSON = #"""
  "totals":{"sessions_created":1,"sessions_skipped":1,"sessions_failed":0,"panes":4,"relaunched":1,"unconfirmed":1,"shell":0,"manual":1,"failed":1}}
 """#
 
+// `muxa restore --json` without `--only-missing`, compared with a server
+// that runs `work` with window 0 (one of its two panes) and a window 5 the
+// snapshot never saw, lacks `side` and `docs`, and has gained `scratch`.
+private let compareJSON = #"""
+{"id":"1790000900","dir":"/s/1790000900","socket":"default","only_missing":false,"layout_only":false,"server_reachable":true,"run":false,
+ "sessions":[
+  {"name":"work","action":"fill_missing","state":"present",
+   "new_windows":[{"index":"5","name":"logs","panes":[{"index":"0","path":"/var/log","command":"tail"}]}],
+   "windows":[
+    {"index":"0","name":"main","layout":"x","state":"present","panes":[
+      {"index":"0","path":"/tmp","action":"shell","state":"present"},
+      {"index":"1","path":"/tmp","action":"replay","command":"make watch","state":"missing"}]},
+    {"index":"1","name":"edit","layout":"x","state":"missing","panes":[
+      {"index":"0","path":"/tmp","action":"shell","state":"missing"}]}]},
+  {"name":"side","action":"create","state":"missing","windows":[{"index":"0","name":"dev","layout":"x","state":"missing","panes":[
+    {"index":"0","path":"/srv","action":"replay","command":"npm run dev","state":"missing"}]}]},
+  {"name":"docs","action":"create","state":"missing","windows":[{"index":"0","name":"d","layout":"x","state":"missing","panes":[
+    {"index":"0","path":"/srv","action":"shell","state":"missing"}]}]}
+ ],
+ "new_sessions":[{"name":"scratch","windows":[{"index":"0","name":"notes","panes":[
+   {"index":"0","path":"/home/me","command":"vim"},{"index":"1","path":"/home/me"}]}]}]}
+"""#
+
 private func plan(_ json: String) throws -> MuxSnapshotPlan {
     try JSONDecoder().decode(
         MuxSnapshotPlan.self,
@@ -126,10 +149,78 @@ private func plan(_ json: String) throws -> MuxSnapshotPlan {
         == "Created 1, skipped 1; relaunched 1 of 4 panes · 1 not confirmed · 1 to start by hand · 1 failed")
 }
 
-@Test func planLineCountsCreatesAndSkips() throws {
-    #expect(SessionSnapshotTree.planLine(try plan(planJSON)) == "Creates 1 session, skips 1")
+@Test func summaryLineCountsWhatIsMissingRunningAndNew() throws {
+    // A CLI that predates the comparison: presence comes from the action.
+    let old = try plan(planJSON)
+    #expect(!old.isCompared)
+    let unflagged = try plan(planJSON.replacingOccurrences(of: #""only_missing":true,"#, with: ""))
+    #expect(unflagged.onlyMissing, "a document without the field left running sessions alone")
+    #expect(SessionSnapshotTree.summaryLine(old) == "1 session to recreate, 1 already running")
     let allExist = planJSON.replacingOccurrences(of: #""action":"create""#, with: #""action":"skip""#)
-    #expect(SessionSnapshotTree.planLine(try plan(allExist)) == "Every session already exists — nothing to restore.")
+    #expect(SessionSnapshotTree.summaryLine(try plan(allExist)) == "No sessions to recreate, 2 already running")
+
+    let compared = try plan(compareJSON)
+    #expect(compared.isCompared)
+    #expect(!compared.onlyMissing)
+    let counts = SessionSnapshotComparison(plan: compared)
+    #expect(counts.toRecreate == 2)
+    #expect(counts.running == 1)
+    #expect(counts.newSinceSnapshot == 1)
+    #expect(counts.newWindows == 1)
+    #expect(counts.missingWindows == 1)
+    #expect(counts.missingPanes == 2, "the second pane of window 0 and the pane of window 1")
+    #expect(SessionSnapshotTree.summaryLine(compared)
+        == "2 sessions to recreate, 1 already running, 1 new since snapshot, 2 panes to add to running sessions")
+    let onlyMissing = compareJSON.replacingOccurrences(of: #""only_missing":false"#, with: #""only_missing":true"#)
+    #expect(SessionSnapshotTree.summaryLine(try plan(onlyMissing))
+        == "2 sessions to recreate, 1 already running, 1 new since snapshot", "nothing is added to running sessions")
+}
+
+@Test func restoreTitleSaysWhatPressingItDoes() throws {
+    let compared = try plan(compareJSON)
+    #expect(SessionSnapshotTree.restoreTitle(compared) == "Recreate 2, Fill In 1")
+    #expect(SessionSnapshotTree.sessionsToRestore(compared) == 3)
+    let onlyMissing = try plan(compareJSON.replacingOccurrences(
+        of: #""only_missing":false"#, with: #""only_missing":true"#
+    ))
+    #expect(SessionSnapshotTree.restoreTitle(onlyMissing) == "Recreate 2 Sessions")
+    #expect(SessionSnapshotTree.restoreTitle(try plan(planJSON)) == "Recreate 1 Session")
+    let allExist = planJSON.replacingOccurrences(of: #""action":"create""#, with: #""action":"skip""#)
+    #expect(SessionSnapshotTree.restoreTitle(try plan(allExist)) == "Nothing to Restore")
+    let fillOnly = compareJSON
+        .replacingOccurrences(of: #""action":"create""#, with: #""action":"fill_missing""#)
+    #expect(SessionSnapshotTree.restoreTitle(try plan(fillOnly)) == "Fill In 3 Sessions")
+}
+
+@Test func compareTreeMarksMissingRunningAndNewLines() throws {
+    let rows = SessionSnapshotTree.rows(plan: try plan(compareJSON))
+    let sessions = rows.filter { $0.depth == 0 }
+    #expect(sessions.map(\.title) == ["work", "side", "docs", "scratch"])
+    #expect(sessions.map(\.mark) == [.running, .missing, .missing, .new])
+    #expect(sessions.map(\.badge) == [.willFillMissing, .willCreate, .willCreate, nil])
+
+    // Under a running session only what differs is marked.
+    let work = rows.filter { $0.id.hasPrefix("s:work/") }
+    #expect(work.map(\.id) == [
+        "s:work/0", "s:work/0/0", "s:work/0/1", "s:work/1", "s:work/1/0", "s:work/+5", "s:work/+5/0",
+    ])
+    #expect(work.map(\.mark) == [nil, nil, .missing, .missing, nil, .new, nil])
+    #expect(work.last?.detail == "tail", "a new window's pane says what it runs")
+
+    // A missing session's lines are all missing; only the session says so.
+    #expect(rows.filter { $0.id.hasPrefix("s:side/") }.allSatisfy { $0.mark == nil })
+
+    let scratch = rows.filter { $0.id.hasPrefix("n:scratch/") }
+    #expect(scratch.map(\.depth) == [1, 2, 2])
+    #expect(scratch.map(\.detail) == ["2 panes", "vim", nil])
+    #expect(scratch.allSatisfy { $0.badge == nil }, "a restore does nothing to a new session")
+}
+
+@Test func reportTreeDropsTheComparison() throws {
+    let report = compareJSON.replacingOccurrences(of: #""run":false"#, with: #""run":true"#)
+    let rows = SessionSnapshotTree.rows(plan: try plan(report))
+    #expect(rows.allSatisfy { $0.mark == nil }, "the comparison was taken before the restore ran")
+    #expect(!rows.contains { $0.id.hasPrefix("n:") })
 }
 
 @Test func operationKeepsStateWhenTheReportIsUnreadable() throws {
@@ -191,6 +282,71 @@ private func sheetHandler(planBody: String) -> MuxaIPCRequestHandler {
     #expect(!old.supported)
     #expect(old.error == SessionSnapshotViewModel.unsupportedMessage)
     #expect(!old.canRestore)
+}
+
+@MainActor
+@Test func onlyMissingTogglePlansAgainAndRestoresTheSameWay() async throws {
+    let requests = MuxSnapshotRequestLog()
+    let handler: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        let kind = object["kind"] as? String ?? ""
+        let onlyMissing = object["only_missing"] as? Bool
+        requests.append("\(kind) \(onlyMissing.map { String($0) } ?? "-")")
+        switch kind {
+        case "mux_snapshot_list": return Data(listingJSON.utf8)
+        case "mux_snapshot_plan":
+            let body = compareJSON.replacingOccurrences(
+                of: #""only_missing":false"#, with: #""only_missing":\#(onlyMissing ?? true)"#
+            )
+            return Data(#"{"ok":true,"mux_snapshot":\#(body)}"#.utf8)
+        case "mux_snapshot_restore":
+            return Data(#"{"ok":true,"mux_snapshot_operation":{"operation_id":"op","state":"succeeded","id":"1790000900","message":"Snapshot restored"}}"#.utf8)
+        default: return Data(#"{"ok":true}"#.utf8)
+        }
+    }
+    let viewModel = SessionSnapshotViewModel(
+        client: MuxaSessionSnapshotClient(socketPath: "/tmp/muxa-snapshot-test.sock", request: handler),
+        pollInterval: .milliseconds(1)
+    )
+    await viewModel.load()
+    #expect(viewModel.onlyMissing)
+    #expect(viewModel.restoreButtonTitle == "Recreate 2 Sessions")
+
+    // A muxad without `mux_snapshot_plan_v1` is never asked to fill.
+    await viewModel.setOnlyMissing(false)
+    #expect(viewModel.onlyMissing)
+
+    viewModel.markCanFillRunningSessions()
+    await viewModel.setOnlyMissing(false)
+    #expect(!viewModel.onlyMissing)
+    #expect(viewModel.plan?.onlyMissing == false, "the preview was planned again")
+    #expect(viewModel.restoreButtonTitle == "Recreate 2, Fill In 1")
+    #expect(viewModel.canRestore)
+    await viewModel.restore()
+    #expect(requests.entries == [
+        "mux_snapshot_list -",
+        "mux_snapshot_plan true",
+        "mux_snapshot_plan false",
+        "mux_snapshot_restore false",
+    ])
+}
+
+/// The requests a stand-in muxad saw, in order.
+private final class MuxSnapshotRequestLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String] = []
+
+    func append(_ value: String) {
+        lock.lock()
+        values.append(value)
+        lock.unlock()
+    }
+
+    var entries: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
 }
 
 @MainActor
