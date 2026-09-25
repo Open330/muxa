@@ -1,0 +1,81 @@
+name: macOS app
+
+# The release builds Muxa for Mac with the runner's Xcode, which can be older
+# than the one on a developer's Mac and stricter about Sendable. Build and test
+# the app on every pull request that touches it, so a release is never the
+# first place it compiles.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/muxa-macos/**"
+      - ".github/workflows/macos-app.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/muxa-macos/**"
+      - ".github/workflows/macos-app.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    name: build and test
+    # Keep in step with the release's macOS app job.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Cache libghostty
+        uses: actions/cache@v4
+        with:
+          path: |
+            apps/muxa-macos/.build/dependencies
+            apps/muxa-macos/.build/toolchains
+            apps/muxa-macos/.build/libghostty.stamp
+          key: libghostty-${{ runner.os }}-${{ hashFiles('apps/muxa-macos/Dependencies.lock', 'apps/muxa-macos/Patches/libghostty-spm/*.patch') }}
+
+      - name: Build libghostty and generate the project
+        working-directory: apps/muxa-macos
+        run: |
+          Scripts/build-libghostty.sh
+          xcodegen generate
+
+      - name: Build and run MuxaTests
+        working-directory: apps/muxa-macos
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Muxa.xcodeproj \
+            -scheme Muxa \
+            -configuration Debug \
+            -derivedDataPath .build/DerivedData \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            test > "$RUNNER_TEMP/xcodebuild.log" 2>&1 && status=0 || status=$?
+          grep -E ': (error|warning): |Test Case .* failed|Executed [0-9]+ test|\*\* (TEST|BUILD) ' \
+            "$RUNNER_TEMP/xcodebuild.log" | sort -u | head -200 || true
+          exit "$status"
+
+      # The build extracts every new string into the catalog; one without a
+      # Korean value means a translation was forgotten.
+      - name: Check translations
+        working-directory: apps/muxa-macos
+        run: python3 Scripts/l10n-sync.py --check
+
+      - name: Upload the build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
