@@ -7018,6 +7018,16 @@
         }
       }
     },
+    "Live sessions by host" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "호스트별 실행 중인 세션"
+          }
+        }
+      }
+    },
     "Local" : {
       "localizations" : {
         "ko" : {
@@ -11236,6 +11246,16 @@
         }
       }
     },
+    "Same account on %lld hosts · freshest reading shown" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "호스트 %lld개가 같은 계정 · 가장 최근 값 표시"
+          }
+        }
+      }
+    },
     "Same definition on %@" : {
       "localizations" : {
         "ko" : {
@@ -13331,6 +13351,16 @@
         }
       }
     },
+    "These hosts report the same reset times, so they share one account's limits." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 호스트들은 같은 초기화 시각을 보고하므로 한 계정의 한도를 함께 씁니다."
+          }
+        }
+      }
+    },
     "These values are read from muxa configuration." : {
       "localizations" : {
         "ko" : {
@@ -13718,6 +13748,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "구조"
+          }
+        }
+      }
+    },
+    "Total" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "합계"
           }
         }
       }
