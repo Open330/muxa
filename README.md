@@ -38,7 +38,8 @@ muxa attend    # jump to the agent that has waited longest
 Not ready to install? Take the full tour in a throwaway tmux server — the
 script runs the real `muxa onboard` from a checksum-verified copy of the
 release binary, deletes it on exit, and never touches your existing tmux
-server. `muxa onboard --print` gives a non-interactive guide.
+server. It needs network access and a supported release platform; the live
+tour also needs tmux. `muxa onboard --print` gives a non-interactive guide.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
@@ -47,7 +48,8 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 ## Why muxa
 
 - **Keeps your setup.** Reads agent state from Claude Code, Codex, and
-  Gemini CLI hooks (screen detection for hook-less agents) and maps it
+  Gemini CLI (and its Antigravity successor) hooks, with screen detection
+  for hook-less agents, and maps it
   onto the tmux panes you already have. You don't launch agents through
   muxa, and you don't switch multiplexers. tmux, [rmux](https://rmux.io),
   and [herdr](https://herdr.dev) can be observed at the same time; zellij

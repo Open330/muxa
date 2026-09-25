@@ -35,7 +35,8 @@ muxa attend    # 가장 오래 기다린 에이전트로 이동합니다
 
 설치 전에 먼저 둘러보고 싶다면 일회용 tmux server에서 전체 tour를 체험할 수
 있습니다. script가 checksum을 검증한 release 바이너리로 진짜 `muxa onboard`를
-실행하고, 끝나면 지웁니다. 기존 tmux server는 건드리지 않습니다.
+실행하고, 끝나면 지웁니다. 기존 tmux server는 건드리지 않습니다. 지원되는
+release 플랫폼과 network가 필요하고 live tour에는 tmux도 필요합니다.
 non-interactive 가이드는 `muxa onboard --print`로 볼 수 있습니다.
 
 ```bash
@@ -44,8 +45,9 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 
 ## 왜 Muxa인가
 
-- **지금 환경을 그대로 둡니다.** Claude Code, Codex, Gemini CLI의 hook에서
-  에이전트 상태를 읽고(hook이 없는 에이전트는 화면으로 감지), 이미 열어 둔 tmux
+- **지금 환경을 그대로 둡니다.** Claude Code, Codex, Gemini CLI(후속인
+  Antigravity CLI `agy` 포함)의 hook에서 에이전트 상태를 읽고(hook이 없는
+  에이전트는 화면으로 감지), 이미 열어 둔 tmux
   pane에 연결합니다. 에이전트를 Muxa로 띄울 필요도, 멀티플렉서를 바꿀 필요도
   없습니다. tmux, [rmux](https://rmux.io), [herdr](https://herdr.dev)를 동시에
   관찰할 수 있고 zellij는 CLI baseline을 지원합니다.
