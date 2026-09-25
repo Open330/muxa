@@ -22,6 +22,40 @@ enum MuxaAttention {
         return 3
     }
 
+    /// Whether a host's panes are live. muxad keeps an offline host's last
+    /// snapshot, so its agents still list, but as they were when it dropped.
+    static func isReachable(_ host: MuxaFleetHostIdentity) -> Bool {
+        host.local || host.state == "online" || host.state == "degraded"
+    }
+
+    /// Every pane running an agent on every host, in ⌘J order: by `rank`,
+    /// then live hosts before ones whose snapshot is stale, then topology
+    /// order (the local host first, then hosts by name).
+    static func ranked(
+        _ watchHosts: [MuxaWatchHost],
+        unread: Set<MuxaWatchPaneIdentity> = []
+    ) -> [MuxaWatchPane] {
+        watchHosts.flatMap(\.sessions).flatMap(\.windows).flatMap(\.panes)
+            .filter { $0.agent != nil }
+            .enumerated()
+            .sorted { lhs, rhs in
+                let (l, r) = (
+                    rank(lhs.element, unread: unread.contains(lhs.element.id)),
+                    rank(rhs.element, unread: unread.contains(rhs.element.id))
+                )
+                if l != r { return l < r }
+                let (lLive, rLive) = (isReachable(lhs.element.host), isReachable(rhs.element.host))
+                if lLive != rLive { return lLive }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
+    }
+
+    /// ⇧⌘J's cycle: the panes needing attention on every host, in ⌘J order.
+    static func cycle(in watchHosts: [MuxaWatchHost]) -> [MuxaWatchPaneIdentity] {
+        ranked(watchHosts).filter(needsAttention).map(\.id)
+    }
+
     /// ⇧⌘J: the pane after `current` among those needing attention, wrapping
     /// around; the first one when `current` is not one of them.
     static func next(

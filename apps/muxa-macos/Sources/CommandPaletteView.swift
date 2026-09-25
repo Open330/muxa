@@ -178,6 +178,9 @@ struct MuxaPaletteItem: Identifiable, Equatable {
     var disabledReason: String? = nil
     var shortcut: String? = nil
     var tint: Color? = nil
+    /// ⌘J: the host the agent runs on, shown as a badge once agents span
+    /// more than the local host.
+    var host: MuxaFleetHostIdentity? = nil
 
     var id: MuxaPaletteID { stableID }
     var isEnabled: Bool { disabledReason == nil }
@@ -235,7 +238,8 @@ enum MuxaPaletteSearch {
         var seen = Set<MuxaPaletteID>()
         let unique = items.filter { seen.insert($0.stableID).inserted }
         return unique.enumerated().compactMap { offset, item -> (MuxaPaletteItem, Int, Int, Int, Int)? in
-            guard let score = score(query: query, text: item.title + " " + item.subtitle) else { return nil }
+            let text = [item.title, item.subtitle, item.host?.alias ?? ""].joined(separator: " ")
+            guard let score = score(query: query, text: text) else { return nil }
             let rank: Int
             if case .navigate(let selection) = item.action {
                 rank = recent.firstIndex(of: selection) ?? Int.max
@@ -361,42 +365,37 @@ enum MuxaPaletteItems {
         return items
     }
 
-    /// ⌘J: every pane running an agent, the ones needing the operator
-    /// first, then working, then idle — each group in topology order.
+    /// ⌘J: every pane running an agent on every host, the ones needing the
+    /// operator first, then working, then idle (`MuxaAttention.ranked`).
+    /// The host is a badge rather than subtitle text, and only once agents
+    /// run somewhere other than the local host.
     static func agents(
         watchHosts: [MuxaWatchHost],
         unread: Set<MuxaWatchPaneIdentity> = [] // WS-A
     ) -> [MuxaPaletteItem] {
-        let panes = watchHosts.flatMap(\.sessions).flatMap(\.windows).flatMap(\.panes)
-            .filter { $0.agent != nil }
-        return panes.enumerated()
-            .sorted { lhs, rhs in
-                let (l, r) = (
-                    MuxaAttention.rank(lhs.element, unread: unread.contains(lhs.element.id)),
-                    MuxaAttention.rank(rhs.element, unread: unread.contains(rhs.element.id))
-                )
-                return l != r ? l < r : lhs.offset < rhs.offset
-            }
-            .map { _, pane in
-                let window = pane.pane.windowName.isEmpty ? pane.pane.windowID : pane.pane.windowName
-                let state = pane.agent.map { agentStateLabel($0.state) } ?? ""
-                return MuxaPaletteItem(
-                    stableID: MuxaPaletteID(components: [
-                        "agent-pane", pane.host.alias, pane.pane.endpointSocket, pane.pane.paneID,
-                    ]),
-                    title: pane.pane.agentAlias.map { "@\($0)" }
-                        ?? pane.agent?.aiTitle
-                        ?? (pane.pane.title.isEmpty ? pane.pane.currentCommand : pane.pane.title),
-                    subtitle: ([state] + MuxaUsageFormat.paletteFragments(for: pane.agent) // WS-C usage
-                        + [pane.host.alias, "\(pane.pane.session) › \(window)", pane.pane.paneID])
-                        .filter { !$0.isEmpty }.joined(separator: " · "),
-                    systemImage: MuxaAttention.needsAttention(pane)
-                        ? "exclamationmark.circle.fill"
-                        : unread.contains(pane.id) ? "circle.fill" : "person.crop.circle", // WS-A
-                    action: .navigate(.pane(pane.id)),
-                    tint: pane.agent.map { agentStateColor($0.state) }
-                )
-            }
+        let panes = MuxaAttention.ranked(watchHosts, unread: unread)
+        let showsHosts = panes.contains { !$0.host.local }
+        return panes.map { pane in
+            let window = pane.pane.windowName.isEmpty ? pane.pane.windowID : pane.pane.windowName
+            let state = pane.agent.map { agentStateLabel($0.state) } ?? ""
+            return MuxaPaletteItem(
+                stableID: MuxaPaletteID(components: [
+                    "agent-pane", pane.host.alias, pane.pane.endpointSocket, pane.pane.paneID,
+                ]),
+                title: pane.pane.agentAlias.map { "@\($0)" }
+                    ?? pane.agent?.aiTitle
+                    ?? (pane.pane.title.isEmpty ? pane.pane.currentCommand : pane.pane.title),
+                subtitle: ([state] + MuxaUsageFormat.paletteFragments(for: pane.agent) // WS-C usage
+                    + ["\(pane.pane.session) › \(window)", pane.pane.paneID])
+                    .filter { !$0.isEmpty }.joined(separator: " · "),
+                systemImage: MuxaAttention.needsAttention(pane)
+                    ? "exclamationmark.circle.fill"
+                    : unread.contains(pane.id) ? "circle.fill" : "person.crop.circle", // WS-A
+                action: .navigate(.pane(pane.id)),
+                tint: pane.agent.map { agentStateColor($0.state) },
+                host: showsHosts ? pane.host : nil
+            )
+        }
     }
 
     private static func agentID(_ agent: MuxaHostedAgent) -> MuxaPaletteID {
@@ -553,6 +552,7 @@ struct CommandPaletteView: View {
                     }
                 }
                 Spacer(minLength: 0)
+                if let host = item.host { MuxaPaletteHostBadge(host: host) }
                 if !item.isEnabled { Image(systemName: "lock").font(.caption) }
                 if let shortcut = item.shortcut {
                     Text(verbatim: shortcut)
@@ -604,6 +604,31 @@ struct CommandPaletteView: View {
         guard !didFinish, let action = MuxaPaletteSelection.action(selected, in: items) else { return }
         didFinish = true
         onChoose(action)
+    }
+}
+
+/// The host a ⌘J row's agent runs on: its identity icon and alias, plus the
+/// host's state while its snapshot is stale.
+private struct MuxaPaletteHostBadge: View {
+    let host: MuxaFleetHostIdentity
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        let live = MuxaAttention.isReachable(host)
+        HStack(spacing: 4) {
+            HostIdentityBadge(identity: host, size: 13)
+            Text(verbatim: live ? host.alias : "\(host.alias) · \(fleetHostStateLabel(host.state))")
+                .lineLimit(1)
+        }
+        .font(.caption)
+        .foregroundStyle(live ? Color.primary : Color.secondary)
+        .padding(.leading, 3)
+        .padding(.trailing, 6)
+        .padding(.vertical, 2)
+        .background(MuxaTheme.segmentTrack(colorScheme), in: Capsule())
+        .fixedSize()
+        .accessibilityElement(children: .combine)
     }
 }
 

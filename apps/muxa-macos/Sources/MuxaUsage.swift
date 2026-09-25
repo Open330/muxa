@@ -73,6 +73,9 @@ struct MuxaUsageWindow: Hashable, Sendable {
     let kind: MuxaUsageWindowKind
     let percent: Double
     let resetsAt: Date?
+    /// When the reporting agent was last active, which is when the figure
+    /// was sampled; picks the freshest reading of an account across hosts.
+    var sampledAt: Date? = nil
 
     var level: MuxaUsageLevel { MuxaUsageLevel(percent: percent) }
 }
@@ -97,11 +100,15 @@ struct MuxaRateLimitCap: Hashable, Sendable {
     }
 }
 
-/// One rate-limit account: every live agent of one provider on one host.
+/// One rate-limit account: every live agent of one provider on one host,
+/// merged across hosts when their readings show it is the same account.
 ///
-/// The daemon reports no account id, so this assumes one account per
-/// (host, provider). Two Claude accounts on one host (different
+/// The daemon reports no account id, so a host is assumed to hold one
+/// account per provider, and two Claude accounts on one host (different
 /// `CLAUDE_CONFIG_DIR`s) merge into one group showing the freshest sample.
+/// Across hosts the reset instants are the account's fingerprint (see
+/// `MuxaUsageAccountMatch`). Limits are never summed: a merged account
+/// shows the freshest reading any of its hosts has.
 struct MuxaUsageGroup: Identifiable, Sendable {
     struct CappedAgent: Identifiable, Sendable {
         let agent: MuxaHostedAgent
@@ -110,18 +117,27 @@ struct MuxaUsageGroup: Identifiable, Sendable {
         var id: String { agent.id }
     }
 
-    let hostAlias: String
+    /// Every host whose sessions report this account: the local host first,
+    /// then by name. More than one only when their readings matched.
+    let hostAliases: [String]
     let hostIsLocal: Bool
     let provider: String
     let windows: [MuxaUsageWindow]
-    /// Summed `cost_usd` of the group's live sessions; stopped agents are
-    /// gone from the snapshot, so this is not a daily total.
+    /// Summed `cost_usd` of the group's live sessions on all its hosts;
+    /// stopped agents are gone from the snapshot, so this is not a daily
+    /// total. Each session lives on one host, so none is counted twice.
     let liveCostUSD: Double?
     let capped: [CappedAgent]
 
-    var id: String { "\(hostAlias)\u{1F}\(provider)" }
+    var id: String { "\(hostAliases.joined(separator: "+"))\u{1F}\(provider)" }
 
     var providerName: String { MuxaUsageFormat.providerName(provider) }
+
+    /// The host that names the group where one name must do.
+    var hostAlias: String { hostAliases.first ?? "" }
+
+    /// The same account seen from more than one host.
+    var isShared: Bool { hostAliases.count > 1 }
 
     var level: MuxaUsageLevel {
         if !capped.isEmpty { return .critical }
@@ -139,8 +155,8 @@ struct MuxaUsageGroup: Identifiable, Sendable {
     /// report nothing produce no group at all, so the UI can hide instead of
     /// showing zeros.
     static func groups(from agents: [MuxaHostedAgent], now: Date = .now) -> [MuxaUsageGroup] {
-        let byAccount = Dictionary(grouping: agents) { AccountKey(host: $0.host.alias, provider: $0.agent.kind) }
-        let groups = byAccount.compactMap { key, members -> MuxaUsageGroup? in
+        let byHost = Dictionary(grouping: agents) { AccountKey(host: $0.host.alias, provider: $0.agent.kind) }
+        let readings = byHost.compactMap { key, members -> MuxaUsageHostReading? in
             let windows = [
                 window(.fiveHour, in: members, now: now, percent: \.rateLimit5hPercent, resetsAt: \.rateLimit5hResetsAt),
                 window(.sevenDay, in: members, now: now, percent: \.rateLimit7dPercent, resetsAt: \.rateLimit7dResetsAt),
@@ -150,7 +166,7 @@ struct MuxaUsageGroup: Identifiable, Sendable {
             }
             guard !windows.isEmpty || !capped.isEmpty else { return nil }
             let costs = members.compactMap(\.agent.costUSD)
-            return MuxaUsageGroup(
+            return MuxaUsageHostReading(
                 hostAlias: key.host,
                 hostIsLocal: members.contains { $0.host.local },
                 provider: key.provider,
@@ -158,6 +174,9 @@ struct MuxaUsageGroup: Identifiable, Sendable {
                 liveCostUSD: costs.isEmpty ? nil : costs.reduce(0, +),
                 capped: capped
             )
+        }
+        let groups = Dictionary(grouping: readings, by: \.provider).values.flatMap { providerReadings in
+            MuxaUsageAccountMatch.accounts(providerReadings).map(merged)
         }
         return groups.sorted { lhs, rhs in
             if lhs.level != rhs.level { return lhs.level > rhs.level }
@@ -170,6 +189,28 @@ struct MuxaUsageGroup: Identifiable, Sendable {
     private struct AccountKey: Hashable {
         let host: String
         let provider: String
+    }
+
+    /// One account's readings from its hosts as one group: per window the
+    /// freshest sample, every cap, and the cost of every live session.
+    private static func merged(_ readings: [MuxaUsageHostReading]) -> MuxaUsageGroup {
+        let ordered = readings.sorted { lhs, rhs in
+            if lhs.hostIsLocal != rhs.hostIsLocal { return lhs.hostIsLocal }
+            return lhs.hostAlias < rhs.hostAlias
+        }
+        let windows = [MuxaUsageWindowKind.fiveHour, .sevenDay].compactMap { kind in
+            ordered.compactMap { reading in reading.windows.first { $0.kind == kind } }
+                .max { ($0.sampledAt ?? .distantPast) < ($1.sampledAt ?? .distantPast) }
+        }
+        let costs = ordered.compactMap(\.liveCostUSD)
+        return MuxaUsageGroup(
+            hostAliases: ordered.map(\.hostAlias),
+            hostIsLocal: ordered.contains(where: \.hostIsLocal),
+            provider: ordered.first?.provider ?? "",
+            windows: windows,
+            liveCostUSD: costs.isEmpty ? nil : costs.reduce(0, +),
+            capped: ordered.flatMap(\.capped)
+        )
     }
 
     /// The window as the freshest reporting agent saw it. Taking the maximum
@@ -189,11 +230,107 @@ struct MuxaUsageGroup: Identifiable, Sendable {
         guard let agent = freshest?.agent, let value = agent[keyPath: percent] else { return nil }
         let reset = MuxaUsageTimestamp.parse(agent[keyPath: resetsAt])
         if let reset, reset <= now { return nil }
-        return MuxaUsageWindow(kind: kind, percent: value, resetsAt: reset)
+        return MuxaUsageWindow(
+            kind: kind,
+            percent: value,
+            resetsAt: reset,
+            sampledAt: MuxaUsageTimestamp.parse(agent.lastActivityAt)
+        )
     }
 
     private static func activity(_ member: MuxaHostedAgent) -> Date {
         MuxaUsageTimestamp.parse(member.agent.lastActivityAt) ?? .distantPast
+    }
+}
+
+/// One provider's figures as one host reports them, before accounts are
+/// matched across hosts.
+struct MuxaUsageHostReading: Sendable {
+    let hostAlias: String
+    let hostIsLocal: Bool
+    let provider: String
+    let windows: [MuxaUsageWindow]
+    let liveCostUSD: Double?
+    let capped: [MuxaUsageGroup.CappedAgent]
+}
+
+/// Which hosts share one provider account, so the same Claude account
+/// signed in on several Macs shows once instead of once per Mac.
+///
+/// Claude's statusline and Codex's rollout both carry each window's reset
+/// instant as the provider computed it for the account, so hosts on one
+/// account report the same instants and two accounts almost never do.
+/// "Almost" matters for Claude, whose 5-hour resets can fall on the hour: a
+/// shared on-the-minute 5-hour reset alone is not proof, so a match needs
+/// the 7-day reset or a reset precise to the second. Every window both
+/// hosts report must agree; one disagreement means different accounts.
+enum MuxaUsageAccountMatch {
+    /// Slack for a provider that derives the instant per request.
+    static let tolerance: TimeInterval = 60
+
+    static func sameAccount(_ lhs: MuxaUsageHostReading, _ rhs: MuxaUsageHostReading) -> Bool {
+        guard lhs.provider == rhs.provider, lhs.hostAlias != rhs.hostAlias else { return false }
+        var conclusive = false
+        for left in lhs.windows {
+            guard let leftReset = left.resetsAt,
+                  let rightReset = rhs.windows.first(where: { $0.kind == left.kind })?.resetsAt else { continue }
+            guard abs(leftReset.timeIntervalSince(rightReset)) <= tolerance else { return false }
+            if left.kind == .sevenDay || !isWholeMinute(leftReset) { conclusive = true }
+        }
+        return conclusive
+    }
+
+    /// One provider's readings split into accounts, in input order. Matching
+    /// is transitive: hosts A–B and B–C matching make one account of three.
+    static func accounts(_ readings: [MuxaUsageHostReading]) -> [[MuxaUsageHostReading]] {
+        var parent = Array(readings.indices)
+        func root(_ index: Int) -> Int {
+            var index = index
+            while parent[index] != index { index = parent[index] }
+            return index
+        }
+        for left in readings.indices {
+            for right in readings.indices where right > left && sameAccount(readings[left], readings[right]) {
+                let (leftRoot, rightRoot) = (root(left), root(right))
+                if leftRoot != rightRoot { parent[max(leftRoot, rightRoot)] = min(leftRoot, rightRoot) }
+            }
+        }
+        return Dictionary(grouping: readings.indices, by: root)
+            .sorted { $0.key < $1.key }
+            .map { $0.value.map { readings[$0] } }
+    }
+
+    private static func isWholeMinute(_ date: Date) -> Bool {
+        date.timeIntervalSince1970.truncatingRemainder(dividingBy: 60) == 0
+    }
+}
+
+/// What the live sessions on one host have cost so far, across providers.
+struct MuxaUsageHostCost: Identifiable, Hashable, Sendable {
+    let hostAlias: String
+    let hostIsLocal: Bool
+    let liveCostUSD: Double
+    /// Live sessions that reported a cost.
+    let sessionCount: Int
+
+    var id: String { hostAlias }
+
+    /// Hosts whose live sessions report a cost, the local host first, then
+    /// by name. Each session counts once, on the host running it.
+    static func summaries(from agents: [MuxaHostedAgent]) -> [MuxaUsageHostCost] {
+        Dictionary(grouping: agents.filter { $0.agent.costUSD != nil }, by: \.host.alias)
+            .map { alias, members in
+                MuxaUsageHostCost(
+                    hostAlias: alias,
+                    hostIsLocal: members.contains { $0.host.local },
+                    liveCostUSD: members.compactMap(\.agent.costUSD).reduce(0, +),
+                    sessionCount: members.count
+                )
+            }
+            .sorted { lhs, rhs in
+                if lhs.hostIsLocal != rhs.hostIsLocal { return lhs.hostIsLocal }
+                return lhs.hostAlias < rhs.hostAlias
+            }
     }
 }
 
@@ -212,11 +349,13 @@ enum MuxaUsageFormat {
 
     /// The status-bar text: `Claude 5h 62% · 7d 31%`, or `Claude limited ·
     /// 14:05` while capped. Remote hosts are named so two accounts with the
-    /// same provider can be told apart.
+    /// same provider can be told apart; an account shared by several remote
+    /// hosts is named by its first, `mini +1 · Claude …`.
     static func statusText(
         _ group: MuxaUsageGroup, now: Date = .now, calendar: Calendar = .current, locale: Locale = .current
     ) -> String {
-        let prefix = group.hostIsLocal ? group.providerName : "\(group.hostAlias) · \(group.providerName)"
+        let host = group.isShared ? "\(group.hostAlias) +\(group.hostAliases.count - 1)" : group.hostAlias
+        let prefix = group.hostIsLocal ? group.providerName : "\(host) · \(group.providerName)"
         if !group.capped.isEmpty {
             let limited = String(localized: "limited")
             guard let until = group.cappedUntil else { return "\(prefix) \(limited)" }

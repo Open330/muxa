@@ -217,3 +217,110 @@ private func hosted(
     #expect(!quiet.subtitle.contains("ctx"))
     #expect(!quiet.subtitle.contains("limited"))
 }
+
+// `now` is 14:13:20 UTC, so +6400 s lands on the hour (16:00) and +3607 s
+// on an instant precise to the second.
+private let onTheHour: TimeInterval = 6_400
+private let toTheSecond: TimeInterval = 3_607
+private let weekly: TimeInterval = 3 * 86_400
+
+@Test func usageShowsAnAccountSharedByHostsOnceWithItsFreshestReading() throws {
+    let groups = MuxaUsageGroup.groups(from: [
+        try hosted([
+            "last_activity_at": stamp(-600), "cost_usd": 1.0,
+            "rate_limit_5h_pct": 40.0, "rate_limit_5h_resets_at": stamp(onTheHour),
+            "rate_limit_7d_pct": 20.0, "rate_limit_7d_resets_at": stamp(weekly),
+        ], id: "l1"),
+        // The same account on another Mac, sampled later; its 7-day reset
+        // is within the matching slack.
+        try hosted([
+            "last_activity_at": stamp(-10), "cost_usd": 2.0,
+            "rate_limit_5h_pct": 55.0, "rate_limit_5h_resets_at": stamp(onTheHour),
+            "rate_limit_7d_pct": 22.0, "rate_limit_7d_resets_at": stamp(weekly + 30),
+        ], id: "m1", host: "jiun-mini", local: false),
+        // Another account whose 5-hour window happens to reset in the same hour.
+        try hosted([
+            "last_activity_at": stamp(-5), "cost_usd": 0.5,
+            "rate_limit_5h_pct": 10.0, "rate_limit_5h_resets_at": stamp(onTheHour),
+            "rate_limit_7d_pct": 5.0, "rate_limit_7d_resets_at": stamp(weekly + 86_400),
+        ], id: "j1", host: "june-mbp", local: false),
+    ], now: now)
+    #expect(groups.map(\.hostAliases) == [["local", "jiun-mini"], ["june-mbp"]])
+    let shared = groups[0]
+    #expect(shared.isShared && shared.hostIsLocal)
+    #expect(shared.windows.map(\.percent) == [55, 22])
+    #expect(shared.liveCostUSD == 3)
+    #expect(MuxaUsageFormat.statusText(shared, now: now) == "Claude 5h 55% · 7d 22%")
+    #expect(MuxaUsageFormat.statusText(groups[1], now: now) == "june-mbp · Claude 5h 10% · 7d 5%")
+}
+
+@Test func usageAccountMatchNeedsConclusiveAgreeingResets() {
+    func reading(
+        _ host: String, provider: String = "claude", five: TimeInterval? = nil, seven: TimeInterval? = nil
+    ) -> MuxaUsageHostReading {
+        let offsets: [(MuxaUsageWindowKind, TimeInterval?)] = [(.fiveHour, five), (.sevenDay, seven)]
+        let windows = offsets.compactMap { kind, offset in
+            offset.map { MuxaUsageWindow(kind: kind, percent: 10, resetsAt: now.addingTimeInterval($0)) }
+        }
+        return MuxaUsageHostReading(
+            hostAlias: host, hostIsLocal: host == "local", provider: provider,
+            windows: windows, liveCostUSD: nil, capped: []
+        )
+    }
+    let match = MuxaUsageAccountMatch.sameAccount
+    // A shared on-the-hour 5-hour reset alone could be two accounts.
+    #expect(!match(reading("local", five: onTheHour), reading("mini", five: onTheHour)))
+    // One precise to the second, or the 7-day reset, is the account.
+    #expect(match(reading("local", five: toTheSecond), reading("mini", five: toTheSecond + 2)))
+    #expect(match(reading("local", seven: weekly), reading("mini", five: onTheHour, seven: weekly)))
+    // Any window that disagrees means another account.
+    #expect(!match(reading("local", five: onTheHour, seven: weekly), reading("mini", five: toTheSecond, seven: weekly)))
+    #expect(!match(reading("local", seven: weekly), reading("mini", seven: weekly + 3_600)))
+    // Different providers, nothing to compare, or one host never match.
+    #expect(!match(reading("local", seven: weekly), reading("mini", provider: "codex", seven: weekly)))
+    #expect(!match(reading("local"), reading("mini")))
+    #expect(!match(reading("mini", five: onTheHour), reading("mini", seven: weekly)))
+
+    // Matching is transitive: A–B on the 7-day reset, B–C on a precise
+    // 5-hour one, although A and C share no window.
+    let accounts = MuxaUsageAccountMatch.accounts([
+        reading("a", seven: weekly),
+        reading("elsewhere", seven: weekly + 86_400),
+        reading("b", five: toTheSecond, seven: weekly),
+        reading("c", five: toTheSecond),
+    ])
+    #expect(accounts.map { $0.map(\.hostAlias) } == [["a", "b", "c"], ["elsewhere"]])
+}
+
+@Test func usageMergesCapsAcrossRemoteHostsOfOneAccount() throws {
+    let groups = MuxaUsageGroup.groups(from: [
+        try hosted([
+            "rate_limit_5h_pct": 100.0, "rate_limit_5h_resets_at": stamp(toTheSecond),
+            "rate_limit_scope": "five_hour", "rate_limited_until": stamp(toTheSecond),
+        ], id: "capped", kind: "codex", host: "mini", local: false),
+        try hosted([
+            "rate_limit_5h_pct": 99.0, "rate_limit_5h_resets_at": stamp(toTheSecond),
+        ], id: "busy", kind: "codex", host: "jiun-mbp", local: false),
+        try hosted(["rate_limit_5h_pct": 20.0], id: "l1"),
+    ], now: now)
+    #expect(groups.map(\.id) == ["jiun-mbp+mini\u{1F}codex", "local\u{1F}claude"])
+    let shared = groups[0]
+    #expect(shared.capped.map(\.id) == ["mini:capped"])
+    #expect(shared.level == .critical)
+    #expect(MuxaUsageFormat.statusText(shared, now: now).hasPrefix("jiun-mbp +1 · Codex limited"))
+}
+
+@Test func usageSumsLiveCostPerHostOncePerSession() throws {
+    let costs = MuxaUsageHostCost.summaries(from: [
+        try hosted(["cost_usd": 1.0], id: "a"),
+        try hosted(["cost_usd": 0.5], id: "b", kind: "codex"),
+        try hosted(["cost_usd": 2.0], id: "c", host: "jiun-mini", local: false),
+        try hosted(["cost_usd": 4.0], id: "d", host: "june-mbp", local: false),
+        try hosted([:], id: "quiet", host: "june-mbp", local: false),
+        try hosted([:], id: "silent", host: "jiun-mbp", local: false),
+    ])
+    #expect(costs.map(\.hostAlias) == ["local", "jiun-mini", "june-mbp"])
+    #expect(costs.map(\.liveCostUSD) == [1.5, 2, 4])
+    #expect(costs.map(\.sessionCount) == [2, 1, 1])
+    #expect(costs.first?.hostIsLocal == true)
+}
