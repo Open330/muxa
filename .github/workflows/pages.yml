@@ -1,0 +1,48 @@
+name: pages
+
+# The landing page at https://open330.github.io/muxa/. `site/` holds the
+# page itself; the logo and the demo recordings are the ones the README
+# uses, copied in at deploy time so they are not kept twice in the repo.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "assets/logo.svg"
+      - "assets/icon.svg"
+      - "docs/demo.gif"
+      - "docs/demo-collab.gif"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cp -r site/. _site/
+          cp assets/logo.svg assets/icon.svg _site/
+          cp docs/demo.gif docs/demo-collab.gif _site/
+          touch _site/.nojekyll
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
