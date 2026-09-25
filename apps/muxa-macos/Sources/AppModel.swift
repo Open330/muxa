@@ -215,6 +215,9 @@ final class AppModel: ObservableObject {
                 poster: MuxaUserNotifications.shared,
                 settings: { MuxaNotificationPreferences.current() }
             )
+            attention.sendPrompt = { [client] host, pane, text in
+                try await client.sendFleetPrompt(host: host, pane: pane, text: text)
+            }
             MuxaUserNotifications.shared.attention = attention
         }
     }

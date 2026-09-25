@@ -46,7 +46,7 @@ enum MuxaWorkbenchPresenter {
 }
 
 /// `UNUserNotificationCenter` behind `MuxaNotificationPosting`, plus the
-/// delegate that routes a click back to its pane.
+/// delegate that routes a click or an action button back to its pane.
 ///
 /// Permission is asked for lazily — the first time there is something to
 /// post, or from Settings — never at launch, where the prompt would come
@@ -61,7 +61,13 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
 
     weak var attention: MuxaAgentAttentionCenter? {
         didSet {
-            guard let attention, let pending = pendingPane else { return }
+            guard let attention else { return }
+            let responses = pendingResponses
+            pendingResponses = []
+            for (route, pane) in responses {
+                Task { await self.perform(route, for: pane, in: attention) }
+            }
+            guard let pending = pendingPane else { return }
             pendingPane = nil
             attention.pendingOpen = pending
         }
@@ -69,12 +75,52 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
     /// A click that arrived before the app model existed, e.g. the one that
     /// launched the app.
     private var pendingPane: MuxaWatchPaneIdentity?
+    /// Mark as Read and Reply… that arrived before the app model existed; a
+    /// background action can launch the app just like a click.
+    private var pendingResponses: [(MuxaNotificationActions.Route, MuxaWatchPaneIdentity)] = []
     private var center: UNUserNotificationCenter { .current() }
 
     /// Must run before launch finishes so a click that launched the app is
     /// delivered to the delegate.
     func installDelegate() {
         center.delegate = self
+        center.setNotificationCategories(Self.categories())
+    }
+
+    /// Open brings Muxa forward like a click; Mark as Read and Reply… run in
+    /// the background so answering an agent does not pull the operator away.
+    private static func categories() -> Set<UNNotificationCategory> {
+        let open = UNNotificationAction(
+            identifier: MuxaNotificationActions.open,
+            title: String(localized: "Open"),
+            options: [.foreground]
+        )
+        let markRead = UNNotificationAction(
+            identifier: MuxaNotificationActions.markRead,
+            title: String(localized: "Mark as Read"),
+            options: []
+        )
+        let reply = UNTextInputNotificationAction(
+            identifier: MuxaNotificationActions.reply,
+            title: String(localized: "Reply…"),
+            options: [],
+            textInputButtonTitle: String(localized: "Send"),
+            textInputPlaceholder: String(localized: "Message for the agent")
+        )
+        return [
+            UNNotificationCategory(
+                identifier: MuxaNotificationActions.agentCategory,
+                actions: [open, markRead],
+                intentIdentifiers: [],
+                options: []
+            ),
+            UNNotificationCategory(
+                identifier: MuxaNotificationActions.inputCategory,
+                actions: [open, reply, markRead],
+                intentIdentifiers: [],
+                options: []
+            ),
+        ]
     }
 
     func authorization() async -> Authorization {
@@ -107,6 +153,7 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
         if let body = notification.body { content.body = body }
         content.threadIdentifier = notification.identifier
         if notification.sound { content.sound = .default }
+        if let category = notification.category { content.categoryIdentifier = category }
         if let pane = notification.pane {
             content.userInfo = ["host": pane.hostAlias, "socket": pane.socket, "pane": pane.paneID]
         }
@@ -133,7 +180,32 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
         if NSApp.dockTile.badgeLabel != label { NSApp.dockTile.badgeLabel = label }
     }
 
-    fileprivate func open(_ pane: MuxaWatchPaneIdentity?) {
+    fileprivate func respond(_ route: MuxaNotificationActions.Route, pane: MuxaWatchPaneIdentity?) async {
+        if route == .open {
+            open(pane)
+            return
+        }
+        guard let pane, route != .ignore else { return }
+        if let attention {
+            await perform(route, for: pane, in: attention)
+        } else {
+            pendingResponses.append((route, pane))
+        }
+    }
+
+    private func perform(
+        _ route: MuxaNotificationActions.Route,
+        for pane: MuxaWatchPaneIdentity,
+        in attention: MuxaAgentAttentionCenter
+    ) async {
+        switch route {
+        case .markRead: await attention.markRead(pane)
+        case .reply(let text): await attention.reply(text, to: pane)
+        case .open, .ignore: break
+        }
+    }
+
+    private func open(_ pane: MuxaWatchPaneIdentity?) {
         MuxaWorkbenchPresenter.present()
         guard let pane else { return }
         if let attention {
@@ -150,6 +222,10 @@ extension MuxaUserNotifications: UNUserNotificationCenterDelegate {
         didReceive response: UNNotificationResponse
     ) async {
         let info = response.notification.request.content.userInfo
+        let route = MuxaNotificationActions.route(
+            action: response.actionIdentifier,
+            userText: (response as? UNTextInputNotificationResponse)?.userText
+        )
         let pane: MuxaWatchPaneIdentity? = if let host = info["host"] as? String,
             let socket = info["socket"] as? String,
             let paneID = info["pane"] as? String {
@@ -157,7 +233,7 @@ extension MuxaUserNotifications: UNUserNotificationCenterDelegate {
         } else {
             nil
         }
-        await MuxaUserNotifications.shared.open(pane)
+        await MuxaUserNotifications.shared.respond(route, pane: pane)
     }
 
     /// The center already skips the pane being looked at, so anything that
