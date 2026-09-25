@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Muxa — know which coding agent is waiting on you</title>
+<meta name="description" content="Muxa watches the Claude Code, Codex, and Gemini CLI sessions you already run in tmux, tells you which one needs you, and takes you there. No wrapper, no new terminal." />
+<meta property="og:title" content="Muxa — know which coding agent is waiting on you" />
+<meta property="og:description" content="Know which tmux coding agent is waiting on you — and jump to it. Works with Claude Code, Codex, and Gemini CLI." />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://open330.github.io/muxa/" />
+<meta property="og:image" content="https://open330.github.io/muxa/logo.svg" />
+<link rel="icon" href="icon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #161922;
+    --surface-2: #1b1f2b;
+    --border: #1e2130;
+    --text: #e4e6ed;
+    --muted: #8b90a0;
+    --cyan: #00d4ff;
+    --cyan-dim: rgba(0, 212, 255, 0.12);
+    --white: #ffffff;
+    --radius: 12px;
+    --max: 1080px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--cyan); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre, kbd {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.92em;
+  }
+  code {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 0.08em 0.4em;
+    white-space: nowrap;
+  }
+  pre {
+    margin: 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.15rem;
+    overflow-x: auto;
+    line-height: 1.7;
+  }
+  pre code { background: none; border: 0; padding: 0; white-space: pre; }
+  pre .c { color: var(--muted); }
+  .wrap { max-width: var(--max); margin: 0 auto; padding: 0 20px; }
+
+  /* nav */
+  .nav {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(15, 17, 23, 0.85);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  .nav .wrap { display: flex; align-items: center; gap: 1.2rem; height: 60px; }
+  .brand { display: flex; align-items: center; gap: 0.6rem; color: var(--white); font-weight: 800; letter-spacing: -0.01em; }
+  .brand img { width: 28px; height: 28px; }
+  .nav-links { display: flex; gap: 1.1rem; margin-left: auto; align-items: center; }
+  .nav-links a { color: var(--muted); font-size: 0.93rem; font-weight: 600; }
+  .nav-links a:hover { color: var(--text); text-decoration: none; }
+  .lang {
+    display: inline-flex; border: 1px solid var(--border); border-radius: 999px; overflow: hidden; background: var(--surface);
+  }
+  .lang button {
+    appearance: none; border: 0; background: transparent; color: var(--muted);
+    font: inherit; font-size: 0.82rem; font-weight: 600; padding: 0.3rem 0.75rem; cursor: pointer;
+  }
+  .lang button[aria-pressed="true"] { background: var(--cyan); color: #06141a; }
+  @media (max-width: 640px) { .nav-links a.hide-sm { display: none; } }
+
+  /* hero */
+  .hero { padding: 5rem 0 3rem; text-align: center; }
+  .hero .badge {
+    display: inline-block; font-size: 0.78rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+    color: var(--cyan); background: var(--cyan-dim); border: 1px solid rgba(0,212,255,0.25);
+    border-radius: 999px; padding: 0.25rem 0.8rem; margin-bottom: 1.4rem;
+  }
+  .hero h1 {
+    font-size: clamp(2rem, 5vw, 3.4rem); line-height: 1.12; font-weight: 800; letter-spacing: -0.03em;
+    color: var(--white); margin: 0 auto 1.2rem; max-width: 18ch;
+  }
+  html[data-lang="ko"] .hero h1 { max-width: 22ch; letter-spacing: -0.02em; }
+  .hero h1 em { font-style: normal; color: var(--cyan); }
+  .hero p.lead { font-size: 1.15rem; color: var(--muted); max-width: 640px; margin: 0 auto 2rem; }
+  .hero pre { text-align: left; max-width: 560px; margin: 0 auto 1.5rem; }
+  .btns { display: flex; gap: 0.8rem; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.7rem 1.25rem; border-radius: 9px;
+    font-weight: 600; font-size: 0.95rem; border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  }
+  .btn:hover { text-decoration: none; border-color: var(--muted); }
+  .btn.primary { background: var(--cyan); color: #06141a; border-color: var(--cyan); }
+  .btn.primary:hover { filter: brightness(1.08); }
+  .btn svg { width: 18px; height: 18px; fill: currentColor; }
+
+  /* demo */
+  .demo { padding: 1rem 0 3rem; }
+  .demo figure { margin: 0; }
+  .demo img {
+    display: block; width: 100%; height: auto; border-radius: var(--radius); border: 1px solid var(--border);
+    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.5);
+  }
+  .demo figcaption { text-align: center; color: var(--muted); font-size: 0.9rem; margin-top: 0.9rem; }
+
+  /* sections */
+  section { padding: 3.5rem 0; }
+  section + section { border-top: 1px solid var(--border); }
+  h2 { font-size: 1.7rem; font-weight: 800; letter-spacing: -0.02em; color: var(--white); margin: 0 0 0.5rem; }
+  .sub { color: var(--muted); margin: 0 0 2rem; max-width: 640px; }
+  .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.25rem;
+  }
+  .card h3 { margin: 0 0 0.4rem; font-size: 1.02rem; font-weight: 700; color: var(--white); }
+  .card p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+  .card .k { display: inline-block; color: var(--cyan); font-family: "JetBrains Mono", monospace; font-size: 0.85rem; margin-bottom: 0.5rem; }
+
+  .cols { display: grid; gap: 1.2rem; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .cols h3 { font-size: 1rem; margin: 0 0 0.6rem; color: var(--white); }
+  .cols p { color: var(--muted); font-size: 0.92rem; margin: 0.6rem 0 0; }
+
+  .note {
+    border-left: 3px solid var(--cyan); background: var(--cyan-dim); border-radius: 0 var(--radius) var(--radius) 0;
+    padding: 0.9rem 1.1rem; color: var(--text); font-size: 0.95rem; margin-top: 2rem;
+  }
+
+  footer { border-top: 1px solid var(--border); padding: 2.5rem 0; color: var(--muted); font-size: 0.9rem; }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 1rem; justify-content: space-between; align-items: center; }
+  footer nav { display: flex; gap: 1rem; flex-wrap: wrap; }
+
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="Muxa"><img src="logo.svg" alt="" /> Muxa</a>
+    <nav class="nav-links">
+      <a class="hide-sm" href="#why" data-i18n="nav.why"></a>
+      <a class="hide-sm" href="#surfaces" data-i18n="nav.surfaces"></a>
+      <a class="hide-sm" href="#install" data-i18n="nav.install"></a>
+      <a href="https://github.com/Open330/muxa" rel="noopener">GitHub</a>
+      <div class="lang" role="group" aria-label="Language">
+        <button type="button" data-set-lang="en" aria-pressed="true">EN</button>
+        <button type="button" data-set-lang="ko" aria-pressed="false">한국어</button>
+      </div>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+  <section class="hero">
+    <div class="wrap">
+      <span class="badge" data-i18n="hero.badge"></span>
+      <h1 data-i18n-html="hero.title"></h1>
+      <p class="lead" data-i18n="hero.lead"></p>
+<pre><code>brew install open330/tap/muxa
+muxa init      <span class="c" data-i18n="hero.c1"></span>
+muxa attend    <span class="c" data-i18n="hero.c2"></span></code></pre>
+      <div class="btns">
+        <a class="btn primary" href="#install" data-i18n="hero.install"></a>
+        <a class="btn" href="https://github.com/Open330/muxa" rel="noopener">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          <span data-i18n="hero.github"></span>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <div class="demo">
+    <div class="wrap">
+      <figure>
+        <img src="demo.gif" alt="muxa watch: sixteen agent sessions on one screen, the inspector, the swarm view, and muxa attend jumping to the agent that needs you" loading="eager" />
+        <figcaption data-i18n-html="demo.caption"></figcaption>
+      </figure>
+    </div>
+  </div>
+
+  <section id="why">
+    <div class="wrap">
+      <h2 data-i18n="why.title"></h2>
+      <p class="sub" data-i18n="why.sub"></p>
+      <div class="grid">
+        <div class="card"><h3 data-i18n="why.1.h"></h3><p data-i18n-html="why.1.p"></p></div>
+        <div class="card"><h3 data-i18n="why.2.h"></h3><p data-i18n-html="why.2.p"></p></div>
+        <div class="card"><h3 data-i18n="why.3.h"></h3><p data-i18n-html="why.3.p"></p></div>
+        <div class="card"><h3 data-i18n="why.4.h"></h3><p data-i18n-html="why.4.p"></p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="surfaces">
+    <div class="wrap">
+      <h2 data-i18n="surfaces.title"></h2>
+      <p class="sub" data-i18n="surfaces.sub"></p>
+      <div class="grid">
+        <div class="card"><span class="k">muxa attend</span><h3 data-i18n="s.attend.h"></h3><p data-i18n-html="s.attend.p"></p></div>
+        <div class="card"><span class="k">muxa watch</span><h3 data-i18n="s.watch.h"></h3><p data-i18n-html="s.watch.p"></p></div>
+        <div class="card"><span class="k">muxa peek</span><h3 data-i18n="s.peek.h"></h3><p data-i18n-html="s.peek.p"></p></div>
+        <div class="card"><span class="k">muxa status-line</span><h3 data-i18n="s.status.h"></h3><p data-i18n-html="s.status.p"></p></div>
+        <div class="card"><span class="k">muxa dashboard</span><h3 data-i18n="s.dash.h"></h3><p data-i18n-html="s.dash.p"></p></div>
+        <div class="card"><span class="k">muxa stats · report · timeline</span><h3 data-i18n="s.stats.h"></h3><p data-i18n-html="s.stats.p"></p></div>
+        <div class="card"><span class="k">muxa automation</span><h3 data-i18n="s.auto.h"></h3><p data-i18n-html="s.auto.p"></p></div>
+        <div class="card"><span class="k">muxa reload</span><h3 data-i18n="s.reload.h"></h3><p data-i18n-html="s.reload.p"></p></div>
+        <div class="card"><span class="k">muxa mcp</span><h3 data-i18n="s.mcp.h"></h3><p data-i18n-html="s.mcp.p"></p></div>
+        <div class="card"><span class="k">Muxa for Mac</span><h3 data-i18n="s.mac.h"></h3><p data-i18n-html="s.mac.p"></p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="collab">
+    <div class="wrap">
+      <h2 data-i18n="collab.title"></h2>
+      <p class="sub" data-i18n-html="collab.sub"></p>
+      <figure class="demo" style="padding:0">
+        <img src="demo-collab.gif" alt="Two agents in one tmux window exchanging request and reply messages through muxa" loading="lazy" />
+        <figcaption data-i18n-html="collab.caption"></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section id="install">
+    <div class="wrap">
+      <h2 data-i18n="install.title"></h2>
+      <p class="sub" data-i18n-html="install.sub"></p>
+      <div class="cols">
+        <div>
+          <h3 data-i18n="install.brew.h"></h3>
+<pre><code>brew install open330/tap/muxa
+muxa init
+muxa doctor</code></pre>
+          <p data-i18n-html="install.brew.p"></p>
+        </div>
+        <div>
+          <h3 data-i18n="install.mac.h"></h3>
+<pre><code>brew install --cask open330/tap/muxa-app</code></pre>
+          <p data-i18n-html="install.mac.p"></p>
+        </div>
+        <div>
+          <h3 data-i18n="install.tour.h"></h3>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh</code></pre>
+          <p data-i18n-html="install.tour.p"></p>
+        </div>
+        <div>
+          <h3 data-i18n="install.src.h"></h3>
+<pre><code>git clone https://github.com/Open330/muxa.git
+cd muxa
+cargo install --path crates/muxad --locked
+cargo install --path crates/muxa-cli --locked
+muxa init</code></pre>
+          <p data-i18n-html="install.src.p"></p>
+        </div>
+      </div>
+      <div class="note" data-i18n-html="install.note"></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div data-i18n-html="footer.left"></div>
+    <nav>
+      <a href="https://github.com/Open330/muxa#readme" rel="noopener">README</a>
+      <a href="https://github.com/Open330/muxa/tree/main/docs" rel="noopener" data-i18n="footer.docs"></a>
+      <a href="https://github.com/Open330/muxa/blob/main/CHANGELOG.md" rel="noopener">Changelog</a>
+      <a href="https://github.com/Open330/muxa/releases" rel="noopener" data-i18n="footer.releases"></a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var T = {
+    en: {
+      "nav.why": "Why muxa",
+      "nav.surfaces": "What you get",
+      "nav.install": "Install",
+      "hero.badge": "tmux · Claude Code · Codex · Gemini CLI",
+      "hero.title": "Know which coding agent is <em>waiting on you</em> — and jump to it.",
+      "hero.lead": "No wrapper, no new terminal. Muxa watches the Claude Code, Codex, and Gemini CLI sessions you already run in tmux, tells you which one needs you, and takes you there.",
+      "hero.c1": "# wires tmux and agent hooks, starts the daemon",
+      "hero.c2": "# jump to the agent that has waited longest",
+      "hero.install": "Install",
+      "hero.github": "View on GitHub",
+      "demo.caption": "<code>muxa watch</code> — the fleet, the inspector, the swarm view, and <code>muxa attend</code>.",
+      "why.title": "Why muxa",
+      "why.sub": "It reads the state your agents already emit and maps it onto the panes you already have.",
+      "why.1.h": "Keeps your setup",
+      "why.1.p": "Agent state comes from Claude Code, Codex, and Gemini CLI hooks, with screen detection for hook-less agents. You don't launch agents through muxa and you don't switch multiplexers: tmux, <a href=\"https://rmux.io\">rmux</a>, and <a href=\"https://herdr.dev\">herdr</a> can be observed at the same time.",
+      "why.2.h": "Tells you who is waiting",
+      "why.2.p": "The tmux status line, the <code>muxa watch</code> TUI, desktop notifications, and the Mac app all show which agent is blocked on input, a choice, or an error.",
+      "why.3.h": "Takes you there",
+      "why.3.p": "<code>muxa attend</code> focuses the pane blocked longest; <code>--cycle</code> tabs through every agent that needs you. Bind it to a tmux key and stop hunting through windows.",
+      "why.4.h": "Lets one agent drive the rest",
+      "why.4.p": "<code>muxa mcp</code> gives a coding agent the same view, plus send-prompt and wait-for-change tools, so an orchestrator can prompt peers and wait for their state to change.",
+      "surfaces.title": "What you get",
+      "surfaces.sub": "Every surface reads the same daemon, so the status line, the TUIs, the Mac app, and MCP always agree.",
+      "s.attend.h": "Jump to who needs you",
+      "s.attend.p": "Focus the agent blocked on input, choice, or error longest. <code>--cycle</code> rotates; <code>--list</code> prints the queue.",
+      "s.watch.h": "The fleet on one screen",
+      "s.watch.p": "Session → window → pane topology with live previews, prompts, mailbox history, and the inspector.",
+      "s.peek.h": "Overlay for the current window",
+      "s.peek.p": "<code>prefix + q</code> dims every pane under its handle, state, and latest prompt; press a digit to jump.",
+      "s.status.h": "One line in tmux",
+      "s.status.p": "A <code>status-right</code> summary of the active pane's agent, so you see its state without leaving the shell.",
+      "s.dash.h": "Work-first console",
+      "s.dash.p": "Track Work, Runs, and external issues; <code>P</code> prompts and <code>A</code> aborts every live agent in a Work.",
+      "s.stats.h": "Local analytics",
+      "s.stats.p": "Prompt history, agent state duration, tmux foreground time, and human thinking time — as tables, Markdown, or a timeline TUI.",
+      "s.auto.h": "Rules on agent state",
+      "s.auto.p": "Resume a session once its usage cap resets, nudge an idle agent, interrupt a stuck one — with guards a rule cannot opt out of.",
+      "s.reload.h": "Restart tmux, keep the workspace",
+      "s.reload.p": "Snapshot sessions, windows, panes, and what each pane runs; restart the server and put it all back, agents on their own conversations.",
+      "s.mcp.h": "Orchestrate from an agent",
+      "s.mcp.p": "An MCP stdio server so a coding agent can inspect other agents, send prompts, capture panes, and wait for changes.",
+      "s.mac.h": "Native app",
+      "s.mac.p": "Session browser, editor-style workbench with an embedded terminal, notifications, usage meters, and a Changes review module.",
+      "collab.title": "Agents that talk to each other",
+      "collab.sub": "Same-window agents get a name and a durable mailbox. Requests and replies survive pane closes, agent restarts, and daemon restarts.",
+      "collab.caption": "<code>muxa msg</code> — an implementer asks a reviewer in the next pane and waits for the reply.",
+      "install.title": "Install",
+      "install.sub": "Requires tmux 3.x (or herdr) and a Unix-like OS. Homebrew is the main path; the rest are for the Mac app, a look before installing, and building from source.",
+      "install.brew.h": "Homebrew",
+      "install.brew.p": "<code>muxa init</code> wires tmux and the agent hooks and starts the daemon; <code>muxa doctor</code> checks the result.",
+      "install.mac.h": "Muxa for Mac",
+      "install.mac.p": "Notarized. Updates through Homebrew, since the app has no built-in updater.",
+      "install.tour.h": "Try it without installing",
+      "install.tour.p": "Runs the real <code>muxa onboard</code> in a throwaway tmux server from a checksum-verified release binary, and deletes it on exit. Your own tmux server is never touched.",
+      "install.src.h": "From source",
+      "install.src.p": "Rust 1.89 or newer. The one-shot <code>scripts/install.sh</code> does the same in one command.",
+      "install.note": "<strong>Beta.</strong> Event ingest, the daemon, the CLI, the live TUIs, notifications, stats, and reports work end to end, but APIs may still change before 1.0.",
+      "footer.left": "Part of <a href=\"https://github.com/Open330\">Open330</a> · open source tools for AI-agent workflows · MIT or Apache-2.0",
+      "footer.docs": "Docs",
+      "footer.releases": "Releases"
+    },
+    ko: {
+      "nav.why": "왜 muxa인가",
+      "nav.surfaces": "무엇을 얻나",
+      "nav.install": "설치",
+      "hero.badge": "tmux · Claude Code · Codex · Gemini CLI",
+      "hero.title": "지금 <em>나를 기다리는</em> 코딩 에이전트를 알려 주고, 바로 데려다 줍니다.",
+      "hero.lead": "래퍼도, 새 터미널도 필요 없습니다. 이미 tmux에서 돌리고 있는 Claude Code, Codex, Gemini CLI 세션을 지켜보다가 어느 에이전트가 나를 기다리는지 알려 주고 그 pane으로 옮겨 줍니다.",
+      "hero.c1": "# tmux와 에이전트 hook을 연결하고 데몬을 시작합니다",
+      "hero.c2": "# 가장 오래 기다린 에이전트로 이동합니다",
+      "hero.install": "설치하기",
+      "hero.github": "GitHub에서 보기",
+      "demo.caption": "<code>muxa watch</code> — 전체 에이전트, inspector, swarm 뷰, 그리고 <code>muxa attend</code>.",
+      "why.title": "왜 muxa인가",
+      "why.sub": "에이전트가 이미 내보내는 상태를 읽어서, 이미 쓰고 있는 pane 위에 얹습니다.",
+      "why.1.h": "지금 쓰는 환경을 그대로",
+      "why.1.p": "에이전트 상태는 Claude Code, Codex, Gemini CLI의 hook에서 오고, hook이 없는 에이전트는 화면 감지로 읽습니다. muxa로 에이전트를 띄우지도, 멀티플렉서를 바꾸지도 않습니다. tmux, <a href=\"https://rmux.io\">rmux</a>, <a href=\"https://herdr.dev\">herdr</a>를 동시에 볼 수 있습니다.",
+      "why.2.h": "누가 기다리는지 알려 줍니다",
+      "why.2.p": "tmux status line, <code>muxa watch</code> TUI, 데스크톱 알림, Mac 앱 모두 어느 에이전트가 입력, 선택, 오류로 멈춰 있는지 보여 줍니다.",
+      "why.3.h": "그 자리로 데려다 줍니다",
+      "why.3.p": "<code>muxa attend</code>는 가장 오래 멈춰 있는 pane으로 포커스를 옮기고, <code>--cycle</code>은 나를 기다리는 에이전트를 차례로 돕니다. tmux 키에 묶어 두면 창을 뒤질 일이 없습니다.",
+      "why.4.h": "에이전트 하나가 나머지를 지휘",
+      "why.4.p": "<code>muxa mcp</code>는 코딩 에이전트에게 같은 시야와 함께 프롬프트 전송, 상태 변화 대기 도구를 줍니다. 오케스트레이터가 동료 에이전트에게 지시하고 결과를 기다릴 수 있습니다.",
+      "surfaces.title": "무엇을 얻나",
+      "surfaces.sub": "모든 화면이 같은 데몬을 읽으므로 status line, TUI, Mac 앱, MCP가 항상 같은 상태를 보여 줍니다.",
+      "s.attend.h": "나를 기다리는 곳으로",
+      "s.attend.p": "입력, 선택, 오류로 가장 오래 멈춘 에이전트에 포커스합니다. <code>--cycle</code>은 순환, <code>--list</code>는 대기열 출력입니다.",
+      "s.watch.h": "한 화면에 전체 에이전트",
+      "s.watch.p": "세션 → 창 → pane 계층에 실시간 미리보기, 프롬프트, 메일함 기록, inspector가 붙습니다.",
+      "s.peek.h": "현재 창 오버레이",
+      "s.peek.p": "<code>prefix + q</code>로 각 pane 위에 handle, 상태, 최근 프롬프트를 띄우고 숫자 키로 바로 이동합니다.",
+      "s.status.h": "tmux 한 줄 요약",
+      "s.status.p": "활성 pane 에이전트의 상태를 <code>status-right</code>에 표시해 셸을 떠나지 않고 확인합니다.",
+      "s.dash.h": "Work 중심 콘솔",
+      "s.dash.p": "Work, Run, 외부 이슈를 추적하고 <code>P</code>로 프롬프트, <code>A</code>로 Work 안의 모든 에이전트를 중단합니다.",
+      "s.stats.h": "로컬 분석",
+      "s.stats.p": "프롬프트 기록, 에이전트 상태 지속 시간, tmux 전면 시간, 사람이 생각한 시간을 표, Markdown, 타임라인 TUI로 봅니다.",
+      "s.auto.h": "에이전트 상태 규칙",
+      "s.auto.p": "사용량 한도가 풀리면 세션을 재개하고, 놀고 있는 에이전트를 깨우고, 멈춘 에이전트를 중단합니다. 규칙이 벗어날 수 없는 안전장치가 있습니다.",
+      "s.reload.h": "tmux를 재시작해도 작업 공간 유지",
+      "s.reload.p": "세션, 창, pane, 각 pane이 실행 중인 명령을 스냅샷으로 남기고 서버를 재시작한 뒤 되돌립니다. 에이전트는 자기 대화를 이어갑니다.",
+      "s.mcp.h": "에이전트가 직접 오케스트레이션",
+      "s.mcp.p": "MCP stdio 서버로 코딩 에이전트가 다른 에이전트를 살피고, 프롬프트를 보내고, pane을 캡처하고, 변화를 기다립니다.",
+      "s.mac.h": "네이티브 앱",
+      "s.mac.p": "세션 브라우저, 터미널이 내장된 에디터 스타일 워크벤치, 알림, 사용량 표시, 변경 사항 리뷰 모듈.",
+      "collab.title": "서로 대화하는 에이전트",
+      "collab.sub": "같은 창의 에이전트는 이름과 durable 메일함을 갖습니다. 요청과 답장은 pane 종료, 에이전트 재시작, 데몬 재시작을 넘어 남습니다.",
+      "collab.caption": "<code>muxa msg</code> — 구현 담당이 옆 pane의 리뷰어에게 묻고 답장을 기다립니다.",
+      "install.title": "설치",
+      "install.sub": "필요 조건은 tmux 3.x(또는 herdr)와 Unix-like OS입니다. Homebrew가 기본 경로이고, 나머지는 Mac 앱, 설치 전 체험, 소스 빌드용입니다.",
+      "install.brew.h": "Homebrew",
+      "install.brew.p": "<code>muxa init</code>이 tmux와 에이전트 hook을 연결하고 데몬을 시작하며, <code>muxa doctor</code>가 결과를 점검합니다.",
+      "install.mac.h": "Muxa for Mac",
+      "install.mac.p": "공증된 앱입니다. 앱 안에 업데이트 기능이 없으므로 Homebrew로 갱신합니다.",
+      "install.tour.h": "설치 없이 체험",
+      "install.tour.p": "checksum을 검증한 release 바이너리로 일회용 tmux 서버에서 진짜 <code>muxa onboard</code>를 실행하고 끝나면 지웁니다. 기존 tmux 서버는 건드리지 않습니다.",
+      "install.src.h": "소스에서",
+      "install.src.p": "Rust 1.89 이상이 필요합니다. <code>scripts/install.sh</code>가 같은 일을 한 번에 합니다.",
+      "install.note": "<strong>베타.</strong> 이벤트 수집, 데몬, CLI, 실시간 TUI, 알림, 통계, 리포트는 끝까지 동작하지만 1.0 전에는 API가 바뀔 수 있습니다.",
+      "footer.left": "<a href=\"https://github.com/Open330\">Open330</a>의 프로젝트 · AI 에이전트 워크플로를 위한 오픈소스 도구 · MIT 또는 Apache-2.0",
+      "footer.docs": "문서",
+      "footer.releases": "릴리스"
+    }
+  };
+
+  function apply(lang) {
+    var t = T[lang] || T.en;
+    document.querySelectorAll("[data-i18n]").forEach(function (el) {
+      var key = el.getAttribute("data-i18n");
+      if (t[key] != null) el.textContent = t[key];
+    });
+    document.querySelectorAll("[data-i18n-html]").forEach(function (el) {
+      var key = el.getAttribute("data-i18n-html");
+      if (t[key] != null) el.innerHTML = t[key];
+    });
+    document.documentElement.lang = lang;
+    document.documentElement.setAttribute("data-lang", lang);
+    document.querySelectorAll("[data-set-lang]").forEach(function (b) {
+      b.setAttribute("aria-pressed", String(b.getAttribute("data-set-lang") === lang));
+    });
+    document.title = lang === "ko"
+      ? "Muxa — 나를 기다리는 코딩 에이전트를 알려 주는 tmux 도구"
+      : "Muxa — know which coding agent is waiting on you";
+  }
+
+  function initial() {
+    var q = new URLSearchParams(location.search).get("lang");
+    if (q === "ko" || q === "en") return q;
+    try {
+      var saved = localStorage.getItem("muxa.lang");
+      if (saved === "ko" || saved === "en") return saved;
+    } catch (e) {}
+    return /^ko\b/i.test(navigator.language || "") ? "ko" : "en";
+  }
+
+  document.querySelectorAll("[data-set-lang]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var lang = b.getAttribute("data-set-lang");
+      try { localStorage.setItem("muxa.lang", lang); } catch (e) {}
+      apply(lang);
+    });
+  });
+
+  apply(initial());
+})();
+</script>
+</body>
+</html>
