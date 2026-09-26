@@ -1649,7 +1649,7 @@ struct MuxaIPCTests {
     @Test @MainActor
     func activityBarSeparatesOutcomesTopologyInboxAndShells() {
         let model = AppModel()
-        #expect(MuxaSidebarMode.allCases == [.work, .watch, .inbox, .ask, .shells])
+        #expect(MuxaSidebarMode.allCases == [.work, .watch, .inbox, .ask, .shells, .files])
 
         model.select(.host("rtzr"))
 

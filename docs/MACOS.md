@@ -567,3 +567,41 @@ Their repositories and exact commits remain visible in `Dependencies.lock`.
 The host-managed I/O API is a maintained downstream patch until the equivalent
 public upstream embedding API is stable; all calls stay isolated behind
 `GhosttyTerminal` and `TerminalPaneModel`.
+
+## Files and artifact previews
+
+The Files activity-bar item opens a read-only file tree. Use **⇧⌘E** to show
+Files for the active agent or Work folder, or **⌘O** to choose a local file or
+folder. The host picker also browses registered SSH Fleet hosts; remote reads
+use the configured SSH target with batch authentication and require Python 3.
+
+The native outline supports arrow-key navigation, folder disclosure, and
+type-to-select. Click the workspace folder name (or **⇧⌘G**) for **Go to Folder**: paths
+complete after a short debounce, **Tab** completes a suggested directory, and
+**Return** opens the path. Relative paths resolve from the current workspace.
+Invalid paths leave the workspace unchanged.
+
+A single click keeps focus in the tree and opens a preview tab; another file replaces that preview.
+Double-click the file or pin its tab to keep it open. File tabs share the
+workbench's split groups, persistence, close/reopen history and **⌘P** search
+(recent files and files in folders already browsed).
+
+Markdown (`.md`, `.markdown`, `.mdown`, `.mkd`, `.mkdn`) renders headings, tables,
+lists, code blocks and links. PNG, JPEG, GIF, WebP, HEIC/HEIF, TIFF, BMP and
+ICO/ICNS icons render as images. SVG renders as an inert image with a Source
+switch; SVG scripts and external resources do not execute. Images and
+PDFs have native previews, and Office documents use macOS Quick Look. Markdown
+and HTML offer a Source switch; HTML is a static preview with scripts and
+network resources disabled. Relative document links and images resolve on the
+same host as the document. Embedded images are limited to the document folder.
+Text, Markdown, HTML and PDF previews support **⌘F**. Local previews refresh when
+the file changes; use Refresh for remote artifacts.
+
+Preview reads are limited to 16 MB, text display to 2 MB, and each folder listing
+to 1,000 entries. Files are never modified by the viewer. Local files can also
+be revealed in Finder or opened in their default application.
+
+**⌘W** closes the focused tab, including when a terminal, text view or web
+preview has keyboard focus. It keeps an empty workbench open. **⇧⌘W** closes the
+window, **⇧⌘T** reopens the last closed tab, and **⌃Tab / ⌃⇧Tab** move between
+tabs. Live Watch uses **⌃⌘W** so it does not conflict with Close Window.

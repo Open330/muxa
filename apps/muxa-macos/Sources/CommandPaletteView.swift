@@ -82,7 +82,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         switch self {
         case .startWork: "⌥⌘N"
         case .workCommandCenter: "⇧⌘1"
-        case .liveWatch: "⇧⌘W"
+        case .liveWatch: "⌃⌘W"
         case .ask: "⇧⌘2"
         case .newShell: "⌘T"
         case .showInbox: "⇧⌘3"
@@ -422,7 +422,16 @@ struct CommandPaletteView: View {
         let candidates: [MuxaPaletteItem]
         switch mode {
         case .navigation:
-            candidates = MuxaPaletteItems.navigation(
+            let fileLocations = recent.compactMap { selection -> MuxaFileLocation? in
+                if case .file(let location) = selection { return location }; return nil
+            } + model.browsedFiles
+            var seen = Set<MuxaFileLocation>()
+            let files = fileLocations.filter { seen.insert($0).inserted }.map { location in
+                MuxaPaletteItem(stableID: MuxaPaletteID(components: ["file", location.hostAlias, location.path]),
+                                title: location.name, subtitle: "\(location.hostAlias) · \(location.path)",
+                                systemImage: ArtifactPreviewKind(path: location.path).icon, action: .navigate(.file(location)))
+            }
+            candidates = files + MuxaPaletteItems.navigation(
                 watchSections: model.executionSnapshot.watchHosts, workGroups: model.workGroups,
                 sessions: model.sessions, agents: model.hostedAgents, localSocket: model.client.socketPath
             )

@@ -12,6 +12,7 @@ enum MuxaSidebarSelection: Codable, Hashable, Sendable {
     case fleetWindow(MuxaWatchWindowIdentity)
     case shell(String)
     case pane(MuxaWatchPaneIdentity)
+    case file(MuxaFileLocation)
 }
 
 enum MuxaSidebarMode: String, CaseIterable, Identifiable {
@@ -22,6 +23,7 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
     /// provider is not a request from an agent, which is what Inbox holds.
     case ask
     case shells
+    case files
 
     var id: Self { self }
 
@@ -32,6 +34,7 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
         case .inbox: String(localized: "Inbox")
         case .ask: String(localized: "Ask")
         case .shells: String(localized: "Shells")
+        case .files: String(localized: "Files")
         }
     }
 
@@ -43,6 +46,7 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
         case .inbox: String(localized: "Filter inbox")
         case .ask: String(localized: "Filter conversations")
         case .shells: String(localized: "Filter shells")
+        case .files: String(localized: "Filter files")
         }
     }
 
@@ -53,6 +57,7 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
         case .inbox: "tray.full"
         case .ask: "sparkles"
         case .shells: "terminal"
+        case .files: "folder"
         }
     }
 }
@@ -75,6 +80,9 @@ private struct MuxaInboxFetch: Sendable {
 
 @MainActor
 final class AppModel: ObservableObject {
+    @Published var fileRoot: MuxaFileLocation?
+    @Published var browsedFiles: [MuxaFileLocation] = []
+
     enum ConnectionState: Equatable {
         case connecting
         case connected
@@ -1746,6 +1754,7 @@ final class AppModel: ObservableObject {
     func show(_ mode: MuxaSidebarMode) {
         // Like VS Code's Activity Bar, this changes the visible view
         // container without replacing whichever editor tab is active.
+        if mode == .files, sidebarMode != .files, let directory = activeFileDirectory { fileRoot = directory }
         sidebarMode = mode
         if mode == .inbox, isConnected {
             Task { [weak self] in await self?.refreshOperatorInbox() }
@@ -1778,6 +1787,7 @@ final class AppModel: ObservableObject {
         case .fleetWindow: sidebarMode = .watch
         case .shell: sidebarMode = .shells
         case .pane: sidebarMode = .watch
+        case .file: sidebarMode = .files
         }
         sidebarSelection = selection
     }
@@ -1790,6 +1800,8 @@ final class AppModel: ObservableObject {
         // execution navigator. Returning to an already-open pane tab must
         // restore its Explorer highlight as well as the editor content.
         switch selection {
+        case .file:
+            sidebarMode = .files
         case .pane(let id):
             watchSelection = id
             sidebarMode = .watch
@@ -1826,7 +1838,7 @@ final class AppModel: ObservableObject {
             // Nothing selected: the Shells tab may legitimately be empty (or
             // show only exited shells); every other mode falls back to the
             // Work board.
-            if sidebarMode != .shells {
+            if sidebarMode != .shells && sidebarMode != .files {
                 sidebarMode = .work
                 self.sidebarSelection = .workBoard
             }
@@ -1874,7 +1886,7 @@ final class AppModel: ObservableObject {
 
     func isSelectionAvailable(_ selection: MuxaSidebarSelection) -> Bool {
         switch selection {
-        case .workBoard, .watch, .inbox, .ask:
+        case .workBoard, .watch, .inbox, .ask, .file:
             true
         case .work(let key):
             workGroups.contains { $0.identity == key }

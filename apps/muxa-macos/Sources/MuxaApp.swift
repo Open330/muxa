@@ -205,7 +205,7 @@ struct MuxaApp: App {
                     .keyboardShortcut("n", modifiers: [.command, .option])
                     .disabled(!model.isConnected || model.isStartingWork)
                 Button("Open Live Watch") { model.select(.watch) }
-                    .keyboardShortcut("w", modifiers: [.command, .shift])
+                    .keyboardShortcut("w", modifiers: [.command, .control])
                 // ⌘T opens a terminal tab in every terminal and agent
                 // workbench (Terminal, Ghostty, iTerm, Orca).
                 Button("New Muxa Shell") { model.createShell() }
@@ -239,8 +239,9 @@ private struct MuxaEditorMenuCommands: Commands {
     @FocusedValue(\.muxaEditorCommands) private var focusedActions
 
     private var actions: MuxaEditorCommandActions? {
-        guard let focusedActions, focusedActions.isEnabled else { return nil }
-        return focusedActions
+        let current = MuxaWorkbenchCommandBridge.actions(for: NSApp.keyWindow) ?? focusedActions
+        guard let current, current.isEnabled else { return nil }
+        return current
     }
 
     private var dispatchActions: MuxaEditorCommandActions? {
@@ -251,25 +252,32 @@ private struct MuxaEditorMenuCommands: Commands {
         return actions
     }
 
-    /// ⌘W closes the focused editor tab, like a code editor, and the window
-    /// only once no tab is left — or when the key window is not the
-    /// workbench (Settings, a detached module) at all. It replaces File ›
-    /// Close, which sits ahead of the Editor menu and would otherwise take
-    /// ⌘W and close the whole workbench.
+    /// ⌘W always closes a tab in the workbench. An empty workbench stays
+    /// open; ⇧⌘W explicitly closes its window. Auxiliary windows keep the
+    /// standard macOS close action.
     private func closeFrontmost() {
         if let close = dispatchActions?.close {
             close()
-        } else {
+        } else if NSApp.keyWindow?.identifier?.rawValue != "muxa.main-workbench" {
             NSApp.keyWindow?.performClose(nil)
         }
     }
 
     var body: some Commands {
         CommandGroup(replacing: .saveItem) {
-            Button(actions?.close == nil ? "Close Window" : "Close Editor", action: closeFrontmost)
+            Button("Close Tab", action: closeFrontmost)
                 .keyboardShortcut("w", modifiers: .command)
+            Button("Close Window") { NSApp.keyWindow?.performClose(nil) }
+                .keyboardShortcut("w", modifiers: [.command, .shift])
+            Divider()
+            Button("Open File or Folder…") { dispatchActions?.openFile?() }
+                .keyboardShortcut("o", modifiers: .command)
+                .disabled(actions?.openFile == nil)
         }
         CommandMenu("Editor") {
+            Button("Find in File") { dispatchActions?.findInFile?() }
+                .keyboardShortcut("f", modifiers: .command)
+                .disabled(actions?.findInFile == nil)
             Button("Close Editor") { dispatchActions?.close?() }
                 .disabled(actions?.close == nil)
             Divider()
@@ -307,6 +315,9 @@ private struct MuxaEditorMenuCommands: Commands {
                 .disabled(actions?.reopenClosed == nil)
         }
         CommandGroup(replacing: .sidebar) {
+            Button("Show Files") { dispatchActions?.showFiles?() }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
+                .disabled(actions?.showFiles == nil)
             Button("Toggle Side Bar") { dispatchActions?.toggleSidebar?() }
                 .keyboardShortcut("b", modifiers: .command)
                 .disabled(actions?.toggleSidebar == nil)

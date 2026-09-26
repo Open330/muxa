@@ -307,6 +307,8 @@ final class MuxaWorkbenchTabs: ObservableObject {
 extension MuxaSidebarSelection {
     var tabIdentifier: String {
         switch self {
+        case .file(let location):
+            "file:\(location.id)"
         case .workBoard:
             "work-board"
         case .watch:
@@ -370,6 +372,9 @@ struct MuxaEditorCommandActions {
     var showShortcuts: (() -> Void)? = nil
     var markAllRead: (() -> Void)? = nil // WS-A
     var showChanges: (() -> Void)? = nil // WS-D
+    var findInFile: (() -> Void)? = nil
+    var openFile: (() -> Void)? = nil
+    var showFiles: (() -> Void)? = nil
     var isEnabled: Bool = true
 }
 

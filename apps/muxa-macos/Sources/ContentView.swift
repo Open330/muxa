@@ -27,6 +27,7 @@ struct ContentView: View {
                             model.selectWatchPane(id)
                             tabs.openPinned(.pane(id))
                         },
+                        openFile: openFile,
                         closeShell: dismissExitedShell,
                         focusRequest: sidebarFocusRequest
                     )
@@ -117,6 +118,7 @@ struct ContentView: View {
         // WS-A: unread tracking and notification-click routing.
         .modifier(MuxaAttentionTracking(model: model, tabs: tabs, attention: model.attention, open: openAgentPane))
         .focusedSceneValue(\.muxaEditorCommands, editorCommands)
+        .background(MuxaWorkbenchCommandBridge(actions: editorCommands))
     }
 
     /// The window's own actions, at the trailing end of the last editor
@@ -157,6 +159,9 @@ struct ContentView: View {
             .disabled(!model.isConnected || model.isStartingAgent)
 
             Menu {
+                Button("Open File…") { chooseFile() }
+                Button("Show Files") { showFiles() }
+                Divider()
                 Button("Commands…") { paletteMode = .commands }
                 Button("Refresh") { Task { await model.refresh() } }
                     .disabled(!model.isConnected)
@@ -222,6 +227,12 @@ struct ContentView: View {
                 .focusable()
                 .muxaFocusEffectDisabled()
                 .focused($focusedEditorGroup, equals: group.id)
+                .background(MuxaEditorGroupFocusBridge {
+                    guard tabs.focusedGroupID != group.id else { return }
+                    tabs.focus(group.id)
+                    focusedEditorGroup = group.id
+                    model.activateEditor(group.active)
+                })
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -233,6 +244,9 @@ struct ContentView: View {
         groupID: UUID
     ) -> some View {
         switch selection {
+        case .file(let location):
+            ArtifactPreviewView(location: location, model: model, isFocused: groupID == tabs.focusedGroupID, openFile: openFile)
+                .id(location)
         case .workBoard:
             WorkCommandCenterView(model: model)
         case .watch:
@@ -323,8 +337,8 @@ struct ContentView: View {
         let attention = model.attention
         let markAllRead: (() -> Void)? = attention.hasUnread ? { attention.markAllRead() } : nil
         return MuxaEditorCommandActions(
-            // nil once no tab is open, so ⌘W falls through to closing the
-            // window.
+            // An empty workbench has no close-tab action; the window-owned
+            // keymap consumes ⌘W so it cannot close the whole window.
             close: tabs.focusedSelection == nil ? nil : {
                 model.activateEditor(tabs.closeFocused())
             },
@@ -390,10 +404,45 @@ struct ContentView: View {
             markAllRead: markAllRead, // WS-A
             // WS-D: the focused pane or Work editor switches to Changes.
             showChanges: { NotificationCenter.default.post(name: .muxaShowChanges, object: tabs.focusedSelection) },
+            findInFile: fileFindAction,
+            openFile: chooseFile,
+            showFiles: showFiles,
             isEnabled: paletteMode == nil && !showingShortcuts && !model.isPresentingWorkStart
                 && !model.isPresentingHostRegistration && model.pipelineEditorTarget == nil
                 && !model.isConfirmingDaemonReplacement
         )
+    }
+
+    private var fileFindAction: (() -> Void)? {
+        guard case .file = tabs.focusedSelection else { return nil }
+        return { NotificationCenter.default.post(name: .muxaFindInFile, object: nil) }
+    }
+
+    private func openFile(_ location: MuxaFileLocation, _ pinned: Bool) {
+        if pinned { tabs.openPinned(.file(location)) } else { tabs.openPreview(.file(location)) }
+        if pinned { focusedEditorGroup = tabs.focusedGroupID }
+        model.activateEditor(.file(location))
+    }
+
+    private func showFiles() {
+        if let directory = model.activeFileDirectory { model.fileRoot = directory }
+        sidebarVisible = true
+        model.show(.files)
+    }
+
+    private func chooseFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        var directory: ObjCBool = false
+        FileManager.default.fileExists(atPath: url.path, isDirectory: &directory)
+        let location = MuxaFileLocation(hostAlias: "local", path: url.path)
+        sidebarVisible = true
+        model.show(.files)
+        model.fileRoot = directory.boolValue ? location : location.parent
+        if !directory.boolValue { openFile(location, true) }
     }
 
     private func openEditor(_ selection: MuxaSidebarSelection) {
@@ -515,6 +564,7 @@ private struct WorkspaceTabBar: View {
                 WindowDragArea().frame(width: leadingInset)
             }
             GeometryReader { strip in
+                ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 0) {
                         tabItems
@@ -525,6 +575,11 @@ private struct WorkspaceTabBar: View {
                             .frame(minWidth: 24, maxWidth: .infinity, maxHeight: .infinity)
                     }
                     .frame(minWidth: strip.size.width, maxHeight: .infinity, alignment: .leading)
+                }
+                .onChange(of: group?.active) { active in
+                    if let active { proxy.scrollTo(active, anchor: .trailing) }
+                }
+                .onAppear { if let active = group?.active { proxy.scrollTo(active, anchor: .trailing) } }
                 }
             }
 
@@ -605,6 +660,7 @@ private struct WorkspaceTabBar: View {
                     { openWindow(value: route) }
                 }
             )
+            .id(selection)
             .draggable(selection.tabIdentifier)
             .dropDestination(for: String.self) { identifiers, _ in
                 guard let identifier = identifiers.first else { return false }
@@ -638,6 +694,8 @@ private struct WorkspaceTabBar: View {
 
     static func title(for selection: MuxaSidebarSelection, model: AppModel) -> String {
         switch selection {
+        case .file(let location):
+            location.name
         case .workBoard:
             String(localized: "Work Command Center")
         case .watch:
@@ -695,6 +753,7 @@ private struct WorkspaceTabBar: View {
 
     private func tabIcon(for selection: MuxaSidebarSelection) -> String {
         switch selection {
+        case .file: "doc"
         case .workBoard: "rectangle.3.group"
         case .watch: "waveform.path.ecg.rectangle"
         case .inbox: "tray.full"
@@ -930,6 +989,7 @@ private struct MuxaSidebar: View {
     let chrome: TitleBarMetrics
     let openPinnedSession: (MuxaWatchSessionIdentity) -> Void
     let openPinnedPane: (MuxaWatchPaneIdentity) -> Void
+    let openFile: (MuxaFileLocation, Bool) -> Void
     let closeShell: (String) -> Void
     let focusRequest: UUID
     @FocusState private var filterFocused: Bool
@@ -974,6 +1034,9 @@ private struct MuxaSidebar: View {
 
                     MuxaTheme.border(colorScheme).frame(width: 1)
 
+                    if model.sidebarMode == .files {
+                        ArtifactFileSidebar(model: model, openFile: openFile)
+                    } else {
                     VStack(spacing: 0) {
                         MuxaFilterField(
                             prompt: model.sidebarMode.filterPrompt,
@@ -1011,6 +1074,7 @@ private struct MuxaSidebar: View {
                         .scrollContentBackground(.hidden)
                         .background(Color.clear)
                     }
+                    }
                 }
             }
         }
@@ -1029,6 +1093,7 @@ private struct MuxaSidebar: View {
 
     private var sectionTitle: some View {
         MuxaSectionTitle(title: model.sidebarMode.title) {
+            if model.sidebarMode != .files {
             Text(verbatim: sidebarCountLabel)
                 .font(.system(size: 10, weight: .medium).monospacedDigit())
                 .foregroundStyle(.secondary)
@@ -1036,6 +1101,7 @@ private struct MuxaSidebar: View {
                 .frame(minHeight: 16)
                 .background(Color.primary.opacity(0.07), in: Capsule())
                 .padding(.trailing, 4)
+            }
             if model.sidebarMode == .watch {
                 Button {
                     model.select(.watch)
@@ -1157,6 +1223,7 @@ private struct MuxaSidebar: View {
         case .watch: model.executionSnapshot.watchHosts.reduce(0) { $0 + $1.paneCount }
         case .inbox: inboxBadgeCount
         case .ask: askConversations.count
+        case .files: 0
         case .shells: model.sessions.lazy.filter { !$0.exited }.count
         }
     }
@@ -1167,6 +1234,7 @@ private struct MuxaSidebar: View {
         case .watch: filteredWatchHosts.reduce(0) { $0 + $1.paneCount }
         case .inbox: inboxBadgeCount
         case .ask: filteredAskConversations.count
+        case .files: 0
         case .shells: filteredSessions.count
         }
     }
@@ -1454,6 +1522,7 @@ private struct MuxaSidebar: View {
     @ViewBuilder
     private var contextualRows: some View {
         switch model.sidebarMode {
+        case .files: EmptyView()
         case .work:
             Section("Workspace") {
                 Button {
@@ -1762,7 +1831,7 @@ private struct SidebarActivityRail: View {
         case .ask:
             // A question still being answered is the one thing worth a dot.
             return model.askEntries.lazy.filter { $0.status == "running" }.count
-        case .shells:
+        case .shells, .files:
             return 0
         }
     }

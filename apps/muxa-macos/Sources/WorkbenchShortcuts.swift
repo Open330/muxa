@@ -111,7 +111,10 @@ enum MuxaShortcutCatalog {
                 Entry(keys: "⇧⌘1", title: String(localized: "Open Work Command Center")),
                 Entry(keys: "⇧⌘2", title: String(localized: "Open Ask")),
                 Entry(keys: "⇧⌘3", title: String(localized: "Open Inbox")),
-                Entry(keys: "⇧⌘W", title: String(localized: "Open Live Watch")),
+                Entry(keys: "⌃⌘W", title: String(localized: "Open Live Watch")),
+                Entry(keys: "⇧⌘W", title: String(localized: "Close Window")),
+                Entry(keys: "⌘O", title: String(localized: "Open File or Folder")),
+                Entry(keys: "⇧⌘E", title: String(localized: "Show Files")),
             ]),
             Section(title: String(localized: "Work & Shells"), entries: [
                 Entry(keys: "⌥⌘N", title: String(localized: "Start Work")),
