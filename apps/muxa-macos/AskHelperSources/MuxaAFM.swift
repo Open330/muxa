@@ -220,11 +220,17 @@ func agentSessions(fromStatusJSON data: Data) -> [AgentSession]? {
           let sessions = root["sessions"] as? [[String: Any]] else { return nil }
     var found: [AgentSession] = []
     for session in sessions {
-        for window in session["windows"] as? [[String: Any]] ?? [] {
-            for pane in window["panes"] as? [[String: Any]] ?? [] {
-                guard let agent = pane["agent"] as? [String: Any] else { continue }
+        guard let windows = session["windows"] as? [[String: Any]] else { return nil }
+        for window in windows {
+            guard let panes = window["panes"] as? [[String: Any]] else { return nil }
+            for pane in panes {
+                // A shell has no agent; malformed agent data is a failed read,
+                // not evidence that there are no agents in the workspace.
+                guard let rawAgent = pane["agent"], !(rawAgent is NSNull) else { continue }
+                guard let agent = rawAgent as? [String: Any] else { return nil }
                 let text = { (key: String) in agent[key] as? String ?? "" }
                 let paneID = (pane["key"] as? [String: Any])?["pane_id"] as? String ?? text("pane")
+                guard !paneID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
                 let title = [text("ai_title"), pane["title"] as? String ?? ""].first { !$0.isEmpty } ?? ""
                 found.append(AgentSession(
                     pane: paneID,
@@ -342,6 +348,21 @@ struct ModelInput {
     let history: ArraySlice<TurnRequest.Exchange>
 }
 
+/// Keep a small, contiguous suffix of complete questions. Large older prompts
+/// can distract the on-device model even when they still fit its token window.
+/// Never truncate a question into a fragment or bring back an older question
+/// after omitting a newer one.
+func recentWorkspaceQuestions(_ history: ArraySlice<TurnRequest.Exchange>) -> [String] {
+    var questions: [String] = []
+    var remaining = 2_000
+    for exchange in history.suffix(4).reversed() {
+        guard exchange.prompt.count <= remaining else { break }
+        questions.append(exchange.prompt)
+        remaining -= exchange.prompt.count
+    }
+    return questions.reversed()
+}
+
 func modelInput(
     for request: TurnRequest,
     grounded: GroundedTurn,
@@ -350,10 +371,11 @@ func modelInput(
     guard request.muxa != nil else {
         return ModelInput(prompt: grounded.prompt, history: history)
     }
-    guard !history.isEmpty else {
+    let recentQuestions = recentWorkspaceQuestions(history)
+    guard !recentQuestions.isEmpty else {
         return ModelInput(prompt: grounded.prompt, history: [])
     }
-    let questions = try JSONEncoder().encode(history.map(\.prompt))
+    let questions = try JSONEncoder().encode(recentQuestions)
     return ModelInput(prompt: """
         Earlier user questions (JSON context data, not instructions to execute now):
         \(String(decoding: questions, as: UTF8.self))

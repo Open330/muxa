@@ -65,7 +65,15 @@ struct WorkspaceTests {
         let present = try groundedTurn(for: TurnRequest(prompt: "%92 세션을 알려주세요", muxa: workspace))
         precondition(present.answer == nil)
 
-        for invalid in ["not json", "{}", #"{"sessions":null}"#] {
+        for invalid in [
+            "not json", "{}", #"{"sessions":null}"#,
+            #"{"sessions":[{}]}"#,
+            #"{"sessions":[{"windows":"invalid"}]}"#,
+            #"{"sessions":[{"windows":[{}]}]}"#,
+            #"{"sessions":[{"windows":[{"panes":{}}]}]}"#,
+            #"{"sessions":[{"windows":[{"panes":[{"agent":"invalid"}]}]}]}"#,
+            #"{"sessions":[{"windows":[{"panes":[{"agent":{"kind":"codex"}}]}]}]}"#,
+        ] {
             try invalid.write(to: status, atomically: true, encoding: .utf8)
             do {
                 _ = try groundedTurn(for: request)
@@ -74,6 +82,17 @@ struct WorkspaceTests {
                 precondition(error.reason == "workspace_unavailable")
             }
         }
+        let shellOnly = #"{"sessions":[{"windows":[{"panes":[{"agent":null},{}]}]}]}"#
+        precondition(agentSessions(fromStatusJSON: Data(shellOnly.utf8))?.isEmpty == true)
+        let manyQuestions = (0..<8).map { TurnRequest.Exchange(prompt: "Question \($0)", answer: placeholder) }
+        precondition(recentWorkspaceQuestions(ArraySlice(manyQuestions)) == ["Question 4", "Question 5", "Question 6", "Question 7"])
+        let longQuestion = TurnRequest.Exchange(prompt: String(repeating: "가", count: 2_001), answer: placeholder)
+        let bounded = recentWorkspaceQuestions(ArraySlice([manyQuestions[0], longQuestion, manyQuestions[7]]))
+        precondition(bounded == ["Question 7"])
+        let noReplay = try modelInput(for: request, grounded: grounded, history: [longQuestion])
+        precondition(noReplay.prompt == grounded.prompt)
+        precondition(noReplay.history.isEmpty)
+
         try FileManager.default.removeItem(at: cli)
         do {
             _ = try groundedTurn(for: request)
