@@ -867,6 +867,8 @@ struct WorkCommandCenterView: View {
 
     private var commandCenterActions: some View {
         HStack(spacing: 10) {
+            Button("Fleet Dispatch") { model.isPresentingFleetDispatch = true }
+                .disabled(!model.isConnected)
             Button {
                 model.select(.watch)
             } label: {
@@ -1226,6 +1228,10 @@ struct MuxaAskView: View {
 
             Divider()
 
+            if model.askUsesSnapshots {
+                Text("Shared Ask history refreshes periodically from the coordinator.")
+                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14)
+            }
             if model.askEnabled == false {
                 HStack(alignment: .center, spacing: 12) {
                     Image(systemName: "sparkles.rectangle.stack")

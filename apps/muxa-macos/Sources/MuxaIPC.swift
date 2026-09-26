@@ -695,6 +695,8 @@ struct MuxaFleetHost: Decodable, Hashable, Identifiable, Sendable {
     let annotations: [String: String]?
     let remote: MuxaRemoteSnapshot?
 
+    var nodeID: String? = nil
+
     var id: String { alias }
     var identity: MuxaFleetHostIdentity {
         MuxaFleetHostIdentity(alias: alias, local: local, state: state, mode: mode)
@@ -702,6 +704,7 @@ struct MuxaFleetHost: Decodable, Hashable, Identifiable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case alias, local, mode, state, error, labels, annotations, remote
+        case nodeID = "node_id"
         case sshTarget = "ssh_target"
         case latencyMS = "latency_ms"
         case muxaVersion = "muxa_version"

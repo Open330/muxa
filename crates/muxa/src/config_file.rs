@@ -130,6 +130,37 @@ fn launch_settings(text: &str) -> Result<LaunchSettings, ConfigFileError> {
     })
 }
 
+/// Edit only the Fleet policy; the complete document is pinned for conflict detection.
+pub fn write_orchestration(
+    path: &Path,
+    expected_text: &str,
+    settings: &crate::orchestration::OrchestrationConfig,
+) -> Result<ConfigDocument, ConfigFileError> {
+    settings
+        .validate_settings()
+        .map_err(ConfigFileError::Invalid)?;
+    let mut document = expected_text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| ConfigFileError::Invalid(e.to_string()))?;
+    let text = toml::to_string(&std::collections::BTreeMap::from([(
+        "orchestration",
+        settings,
+    )]))
+    .map_err(|e| ConfigFileError::Invalid(e.to_string()))?;
+    let mut policy = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| ConfigFileError::Invalid(e.to_string()))?;
+    if document.as_table().is_empty() {
+        return write(
+            path,
+            &format!("{expected_text}\n{text}"),
+            Some(expected_text),
+        );
+    }
+    document["orchestration"] = policy.remove("orchestration").unwrap_or_default();
+    write(path, &document.to_string(), Some(expected_text))
+}
+
 pub fn read_launch(path: &Path) -> Result<LaunchDocument, ConfigFileError> {
     let config = read(path)?;
     let launch = launch_settings(&config.text)?;
@@ -803,5 +834,53 @@ options = ["--model", "other"]
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640);
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod orchestration_tests {
+    use super::*;
+    #[test]
+    fn policy_editor_preserves_unrelated_settings_rejects_conflicts_and_invalid_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let initial = "# preserve this\n[ask]\nenabled = true # permission\n";
+        std::fs::write(&path, initial).unwrap();
+        let mut policy = crate::orchestration::OrchestrationConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        policy.workspaces.insert(
+            "with.dot".into(),
+            crate::orchestration::WorkspacePolicy {
+                repo: "repo".into(),
+                url: "git@example.invalid:repo".into(),
+                pipeline: "solo".into(),
+                ..Default::default()
+            },
+        );
+        policy.workspaces.get_mut("with.dot").unwrap().nodes.insert(
+            "node.with.dot".into(),
+            crate::orchestration::PathOverrides {
+                root: Some("~/custom".into()),
+                ..Default::default()
+            },
+        );
+        let saved = write_orchestration(&path, initial, &policy).unwrap();
+        assert!(saved.text.starts_with(initial));
+        let parsed: Config = toml::from_str(&saved.text).unwrap();
+        assert_eq!(
+            parsed.orchestration.workspaces["with.dot"].nodes["node.with.dot"]
+                .root
+                .as_deref(),
+            Some("~/custom")
+        );
+        assert!(matches!(
+            write_orchestration(&path, initial, &policy),
+            Err(ConfigFileError::Conflict { .. })
+        ));
+        policy.paths.run = "runs/no-attempt".into();
+        assert!(write_orchestration(&path, &saved.text, &policy).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), saved.text);
     }
 }

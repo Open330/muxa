@@ -526,6 +526,28 @@ pub async fn shared_ask(cfg: &Config, client: &Client) -> Result<()> {
     print(&client.call(&request).await?)
 }
 
+/// Read authoritative workspace choices without creating a dispatch.
+pub async fn options(cfg: &Config, client: &Client, at_coordinator: bool) -> Result<()> {
+    if let Some(host) = coordinator(cfg, at_coordinator)? {
+        let output = client
+            .work_command(
+                Some(host),
+                &[
+                    "work".into(),
+                    "dispatch-options".into(),
+                    "--at-coordinator".into(),
+                ],
+                None,
+            )
+            .await?;
+        let mut value = output_json(output)?;
+        value["coordinator"] = json!(host);
+        print(&value)
+    } else {
+        print(&cfg.orchestration)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

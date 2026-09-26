@@ -47,6 +47,7 @@ pub const WORK_COMMAND_SUBCOMMANDS: &[&str] = &[
     "route",
     "dispatch",
     "dispatch-status",
+    "dispatch-options",
     "dispatch-execute",
     "dispatch-worker-status",
     "fleet-ask",
