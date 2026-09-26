@@ -91,7 +91,7 @@ struct FleetDispatchView: View {
                 Button("Preview placement") { send(preview: true) }.disabled(!store.request.isValid || store.busy || store.submitted || !supported)
                 Button(LocalizedStringKey(store.submitted ? "Retry same request" : "Dispatch Work")) { send(preview: false) }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!store.request.isValid || store.busy || !supported || options == nil || (!store.submitted && store.preview == nil))
+                    .disabled(!store.request.isValid || store.busy || !supported || options == nil)
             }
         }
         .padding(20).frame(width: 780, height: 760)
@@ -237,7 +237,9 @@ struct FleetDispatchSettingsView: View {
             supported = await model.client.supports("config_orchestration_v1")
             if supported { load() } else { message = "Update the CLI and daemon to edit Fleet dispatch settings." }
         }.onChange(of: workspace) { _ in node = "" }
-        .sheet(item: $labelHost) { host in FleetLabelEditor(model: model, host: host) }
+        .sheet(item: $labelHost) { host in
+            FleetLabelEditor(model: model, host: host, onSaved: refreshAfterLabelEdit)
+        }
     }
     @ViewBuilder private func paths(_ value: Binding<MuxaExecutionPaths>) -> some View {
         TextField("Root", text: value.root)
@@ -259,6 +261,17 @@ struct FleetDispatchSettingsView: View {
             catch { message = error.localizedDescription }
         }
     }
+    private func refreshAfterLabelEdit() async {
+        guard let document else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            let latest = try await client.readSettings()
+            self.document = try document.refreshedAfterLabelEdit(latest)
+            // Keep the user's policy draft; only the conflict-detection baseline advances.
+            message = nil
+        } catch { message = error.localizedDescription }
+    }
     private func save() {
         guard let document else { return }
         busy = true
@@ -276,6 +289,7 @@ struct FleetDispatchSettingsView: View {
 private struct FleetLabelEditor: View {
     @ObservedObject var model: AppModel
     let host: MuxaFleetHost
+    let onSaved: () async -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var key = ""
     @State private var value = ""
@@ -306,7 +320,7 @@ private struct FleetLabelEditor: View {
         busy = true; error = nil
         Task {
             defer { busy = false }
-            do { try await model.setHostLabel(host: host.alias, key: key, value: value); dismiss() }
+            do { try await model.setHostLabel(host: host.alias, key: key, value: value); await onSaved(); dismiss() }
             catch { self.error = error.localizedDescription }
         }
     }

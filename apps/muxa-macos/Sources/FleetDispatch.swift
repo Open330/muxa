@@ -87,26 +87,29 @@ struct MuxaDispatchReport: Equatable, Sendable {
 struct MuxaOrchestrationDocument: Decodable, Sendable {
     let config: MuxaDaemonConfigDocument
     let orchestration: MuxaOrchestrationSettings
+
+    /// Accept unrelated config edits without accepting a concurrent policy change.
+    func refreshedAfterLabelEdit(_ latest: Self) throws -> Self {
+        guard config.path == latest.config.path, orchestration == latest.orchestration else {
+            throw MuxaConfigConflict(message: "config.toml changed; reload before saving Fleet policy", current: latest.config)
+        }
+        return latest
+    }
 }
 
 /// Slow dispatch uses a dedicated connection; Work launch must not block app state updates.
 final class MuxaDispatchClient: Sendable {
-    static let timeout: TimeInterval = 650
     let socketPath: String
     private let transport: SerializedIPCTransport
-    init(socketPath: String) {
+    init(socketPath: String, request: @escaping MuxaIPCTimedRequestHandler = { path, payload, timeout in
+        try UnixSocket.request(path: path, payload: payload, timeout: timeout)
+    }) {
         self.socketPath = socketPath
-        transport = SerializedIPCTransport(label: "dev.muxa.mac.dispatch") { path, payload in
-            try UnixSocket.request(path: path, payload: payload, timeout: Self.timeout)
-        }
+        transport = SerializedIPCTransport(label: "dev.muxa.mac.dispatch", timedHandler: request)
     }
-    init(socketPath: String, request: @escaping MuxaIPCRequestHandler) {
-        self.socketPath = socketPath
-        transport = SerializedIPCTransport(label: "dev.muxa.mac.dispatch-test", handler: request)
-    }
-    func exchange(_ object: [String: Any]) async throws -> Data {
+    func exchange(_ object: [String: Any], timeout: TimeInterval = 10) async throws -> Data {
         let payload = try JSONSerialization.data(withJSONObject: object)
-        let data = try await transport.request(path: socketPath, payload: payload, timeout: Self.timeout)
+        let data = try await transport.request(path: socketPath, payload: payload, timeout: timeout)
         let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         if envelope?["ok"] as? Bool == false {
             let message = envelope?["error"] as? String ?? "Fleet request failed"
@@ -117,10 +120,10 @@ final class MuxaDispatchClient: Sendable {
         }
         return data
     }
-    func command(_ args: [String], input: Data? = nil) async throws -> Data {
+    func command(_ args: [String], input: Data? = nil, timeout: TimeInterval = 40) async throws -> Data {
         var request: [String: Any] = ["protocol": MuxaIPCClient.protocolVersion, "kind": "work_command", "args": ["work"] + args]
         if let input { request["stdin"] = String(decoding: input, as: UTF8.self) }
-        let data = try await exchange(request)
+        let data = try await exchange(request, timeout: timeout)
         struct Envelope: Decodable { let work_command: MuxaWorkCommandOutput }
         let output = try JSONDecoder().decode(Envelope.self, from: data).work_command
         guard output.exitCode == 0 else { throw MuxaIPCError.server(output.stderr) }
@@ -130,7 +133,7 @@ final class MuxaDispatchClient: Sendable {
         try await JSONDecoder().decode(MuxaOrchestrationSettings.self, from: command(["dispatch-options"]))
     }
     func dispatch(_ request: MuxaDispatchRequest, preview: Bool) async throws -> Data {
-        try await command(preview ? ["dispatch", "--plan"] : ["dispatch"], input: JSONEncoder().encode(request))
+        try await command(preview ? ["dispatch", "--plan"] : ["dispatch"], input: JSONEncoder().encode(request), timeout: preview ? 40 : 650)
     }
     func status(_ id: String) async throws -> MuxaDispatchReport {
         guard UUID(uuidString: id) != nil else { throw MuxaIPCError.server("Enter a dispatch UUID") }
