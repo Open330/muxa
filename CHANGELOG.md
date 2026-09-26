@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Local Fleet mailbox notifications use in-process revisions instead of a
+  subscription to the daemon's own IPC socket. Host refreshes read only the
+  selected host, and pipeline readiness checks no longer clone every Run.
+- A saturated Fleet host command queue returns an explicit retry error without
+  blocking command routing to other hosts.
+
 ### Fixed
 
 - IPC observation subscriptions now stop on daemon shutdown, including blocked

@@ -25,7 +25,7 @@ use muxa::{HostKind, PaneKey, SharedBackend, SharedStore, WindowKey};
 use time::OffsetDateTime;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock, Semaphore};
 use uuid::Uuid;
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -37,6 +37,7 @@ pub(crate) async fn start(
     backends: Vec<SharedBackend>,
     local_client: muxa::ipc::Client,
     daemon_generation: u64,
+    mailbox_changes: watch::Receiver<u64>,
     shutdown: broadcast::Receiver<()>,
 ) -> (FleetRuntime, tokio::task::JoinHandle<()>) {
     let store = Arc::new(FleetStore::new());
@@ -68,6 +69,7 @@ pub(crate) async fn start(
                 agents: local_agents,
                 backends,
                 client: local_client,
+                mailbox_changes,
                 transitions: local_transitions,
                 revision: local_revision,
                 identity_error,
@@ -123,6 +125,7 @@ struct LocalManagerInput {
     backends: Vec<SharedBackend>,
     client: muxa::ipc::Client,
     transitions: broadcast::Receiver<muxa::Transition>,
+    mailbox_changes: watch::Receiver<u64>,
     revision: Arc<AtomicU64>,
     identity_error: Option<String>,
     node_id: NodeId,
@@ -155,6 +158,7 @@ async fn run_manager(input: ManagerInput) {
             client: local.client,
             commands: local_rx,
             transitions: local.transitions,
+            mailbox_changes: local.mailbox_changes,
             revision: local.revision,
             identity_error: local.identity_error,
             shutdown: shutdown.resubscribe(),
@@ -187,11 +191,7 @@ async fn run_manager(input: ManagerInput) {
             command = commands.recv() => {
                 let Some(command) = command else { break; };
                 if let Some(route) = routes.get(&command.host) {
-                    if route.send(HostCommand::from(command)).await.is_err() {
-                        // The task disappeared between lookup and send.
-                        // There is no sender left to answer; the caller's
-                        // oneshot observes cancellation and reports it.
-                    }
+                    route_host_command(route, HostCommand::from(command));
                 } else {
                     let _ = command.reply.send(Err(format!(
                         "fleet host '{}' is not configured or is disabled",
@@ -205,6 +205,18 @@ async fn run_manager(input: ManagerInput) {
     drop(routes);
     for handle in handles {
         let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+}
+
+// Never await one saturated host queue in the shared router: doing so
+// blocks commands for every other host and delays shutdown handling.
+fn route_host_command(route: &mpsc::Sender<HostCommand>, command: HostCommand) {
+    if let Err(error) = route.try_send(command) {
+        let message = match &error {
+            mpsc::error::TrySendError::Full(_) => "fleet host command queue is full; retry later",
+            mpsc::error::TrySendError::Closed(_) => "fleet host command handler is unavailable",
+        };
+        let _ = error.into_inner().reply.send(Err(message.into()));
     }
 }
 
@@ -284,6 +296,7 @@ struct LocalTask {
     client: muxa::ipc::Client,
     commands: mpsc::Receiver<HostCommand>,
     transitions: broadcast::Receiver<muxa::Transition>,
+    mailbox_changes: watch::Receiver<u64>,
     revision: Arc<AtomicU64>,
     identity_error: Option<String>,
     shutdown: broadcast::Receiver<()>,
@@ -293,28 +306,21 @@ impl LocalTask {
     async fn run(mut self) {
         let mut refresh = tokio::time::interval(Duration::from_secs(self.fleet.refresh_secs));
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut mailbox_retry = tokio::time::interval(Duration::from_secs(2));
-        mailbox_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut mailbox_updates: Option<muxa::ipc::CollaborationUpdateStream> = None;
+        let mut mailbox_open = true;
+        // Reconcile replies persisted before this local observer started.
+        self.mailbox_changes.mark_changed();
         // The initial snapshot was collected before the manager was exposed.
         refresh.tick().await;
         loop {
             tokio::select! {
                 _ = self.shutdown.recv() => break,
                 _ = refresh.tick() => self.refresh().await,
-                _ = mailbox_retry.tick(), if mailbox_updates.is_none() => {
-                    mailbox_updates = self.client.collaboration_subscribe().await.ok();
-                    if mailbox_updates.is_some() {
-                        // Reconcile replies completed while the upstream stream was down.
-                        self.store.notify_mailbox(LOCAL_HOST_ALIAS, 0).await;
-                    }
-                }
-                mailbox = next_mailbox_update(&mut mailbox_updates), if mailbox_updates.is_some() => {
-                    match mailbox {
-                        Ok(Some(revision)) => {
-                            self.store.notify_mailbox(LOCAL_HOST_ALIAS, revision).await;
-                        }
-                        Ok(None) | Err(_) => mailbox_updates = None,
+                mailbox = self.mailbox_changes.changed(), if mailbox_open => {
+                    if mailbox.is_ok() {
+                        let revision = *self.mailbox_changes.borrow_and_update();
+                        self.store.notify_mailbox(LOCAL_HOST_ALIAS, revision).await;
+                    } else {
+                        mailbox_open = false;
                     }
                 }
                 transition = self.transitions.recv() => {
@@ -367,13 +373,7 @@ impl LocalTask {
             collect_local_snapshot(&self.agents, &self.backends, Arc::clone(&self.revision)).await;
         let observed = snapshot.observed_at;
         let identity_error = self.identity_error.clone();
-        let current = self
-            .store
-            .snapshot()
-            .await
-            .hosts
-            .into_iter()
-            .find(|host| host.local);
+        let current = self.store.host_snapshot(LOCAL_HOST_ALIAS).await;
         let changed = current
             .as_ref()
             .and_then(|host| host.remote.as_ref())
@@ -554,15 +554,6 @@ fn relay_supports_work_command(capabilities: &[String]) -> bool {
     capabilities
         .iter()
         .any(|capability| capability == FLEET_WORK_COMMAND_CAPABILITY)
-}
-
-async fn next_mailbox_update(
-    updates: &mut Option<muxa::ipc::CollaborationUpdateStream>,
-) -> Result<Option<u64>, muxa::ipc::RuntimeError> {
-    match updates {
-        Some(updates) => updates.recv().await,
-        None => std::future::pending().await,
-    }
 }
 
 /// Ignore observation timestamps/revision churn when deciding whether a
@@ -1507,13 +1498,7 @@ impl HostTask {
             } => {
                 let observed = snapshot.observed_at;
                 let revision = snapshot.revision;
-                let current = self
-                    .store
-                    .snapshot()
-                    .await
-                    .hosts
-                    .into_iter()
-                    .find(|host| host.alias == self.alias);
+                let current = self.store.host_snapshot(&self.alias).await;
                 let changed = current
                     .as_ref()
                     .and_then(|host| host.remote.as_ref())
@@ -1828,6 +1813,119 @@ mod tests {
         assert_eq!(host.annotations["example.com/owner"], "June");
         assert_eq!(host.daemon_generation, Some(9));
         assert_eq!(host.remote.unwrap().revision, 4);
+    }
+
+    #[tokio::test]
+    async fn local_mailbox_updates_do_not_require_a_running_ipc_server() {
+        let store = Arc::new(FleetStore::new());
+        let cfg = FleetConfig {
+            refresh_secs: 3600,
+            ..FleetConfig::default()
+        };
+        store
+            .upsert_host(local_host(
+                &cfg,
+                NodeId::generate(),
+                0,
+                RemoteSnapshot {
+                    revision: 0,
+                    observed_at: OffsetDateTime::now_utc(),
+                    agents: Vec::new(),
+                    panes: Vec::new(),
+                    sessions: Vec::new(),
+                    backends: Vec::new(),
+                },
+                None,
+            ))
+            .await;
+        let mut updates = store.subscribe();
+        let agents = muxa::Store::shared();
+        let (changes, mailbox_changes) = watch::channel(0_u64);
+        let (_commands, receiver) = mpsc::channel(1);
+        let (stop, shutdown) = broadcast::channel(1);
+        let dir = tempfile::tempdir().unwrap();
+        let task = LocalTask {
+            fleet: cfg,
+            store,
+            transitions: agents.subscribe(),
+            agents,
+            backends: Vec::new(),
+            client: muxa::ipc::Client::new(dir.path().join("absent.sock")),
+            mailbox_changes,
+            commands: receiver,
+            revision: Arc::new(AtomicU64::new(0)),
+            identity_error: None,
+            shutdown,
+        };
+        // Changes between subscription and task startup must not be lost.
+        changes.send_replace(42);
+        let task = tokio::spawn(task.run());
+        let update = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.host, LOCAL_HOST_ALIAS);
+        assert_eq!(update.mailbox_revision, Some(42));
+        changes.send_replace(43);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), updates.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .mailbox_revision,
+            Some(43)
+        );
+        drop(changes);
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn saturated_host_queue_rejects_work_without_blocking_other_hosts() {
+        let (busy, _busy_rx) = mpsc::channel(1);
+        let (free, mut free_rx) = mpsc::channel(1);
+        let (reply, _result) = oneshot::channel();
+        route_host_command(
+            &busy,
+            HostCommand {
+                operation: FleetOperation::Refresh,
+                reply,
+            },
+        );
+        let (reply, result) = oneshot::channel();
+        route_host_command(
+            &busy,
+            HostCommand {
+                operation: FleetOperation::Refresh,
+                reply,
+            },
+        );
+        assert!(result.await.unwrap().unwrap_err().contains("queue is full"));
+        let (reply, _result) = oneshot::channel();
+        route_host_command(
+            &free,
+            HostCommand {
+                operation: FleetOperation::Refresh,
+                reply,
+            },
+        );
+        assert!(matches!(
+            free_rx.try_recv().unwrap().operation,
+            FleetOperation::Refresh
+        ));
+        drop(free_rx);
+        let (reply, result) = oneshot::channel();
+        route_host_command(
+            &free,
+            HostCommand {
+                operation: FleetOperation::Refresh,
+                reply,
+            },
+        );
+        assert!(result.await.unwrap().unwrap_err().contains("unavailable"));
     }
 
     fn host_task(mode: HostAccessMode) -> HostTask {

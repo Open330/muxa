@@ -39,8 +39,9 @@ Work 검토 화면, 세션 분기를 같은 실행 계약 위에 추가한다.
    IPC drain 소요 시간을 debug 로그의 `elapsed_ms`로 확인할 수 있다.
 2. 부하 기준 마련: agent 수·구독 수별 IPC 지연 분포, 유휴 CPU·메모리,
    상태 변경부터 화면 반영까지의 지연, 저장 시간·잠금 대기를 측정한다.
-3. 측정 결과에 따라 로컬 Fleet의 자기 자신에 대한 IPC 구독을 내부 알림으로
-   단순화하고, PipelineRun 전체 저장 비용을 영속 operation 설계에 함께 반영한다.
+3. 로컬 Fleet 구독은 내부 revision 알림으로 전환했다. Fleet 갱신은 대상 host만
+   복사하고, pipeline readiness는 전체 Run 복사 없이 판단한다. PipelineRun 전체
+   저장 비용은 영속 operation 설계에 함께 반영할 후속 측정 대상이다.
 4. reconcile CLI 실행 비용이 유의미하면 공통 실행 service 전환에서 제거한다.
 
 구독 회귀 시험은 여섯 종류의 실제 IPC 구독을 유지한 종료, 종료 후 늦은 stream
@@ -51,6 +52,11 @@ takeover, 읽지 않는 클라이언트의 쓰기 정체를 다룬다. 단순히
 측정했다. 외부 구독 수 0·6·60·60·60개인 5회 실행에서 각각
 15.3·31.4·31.4·15.3·15.3 ms였고, 모두 IPC drain timeout 없이 종료했다.
 이는 유휴 구독 종료 시나리오의 관측값이며, 전체 부하 성능이나 p95 보장은 아니다.
+
+추가 점검에서는 한 host의 명령 큐가 포화되면 공유 router까지 대기하던 경로를
+제거했다. 해당 요청에 재시도 오류를 반환하며, 다른 host의 요청은 계속 전달한다.
+조회 비용 비교는 `cargo bench -p muxa --bench runtime_reads`로 재현할 수 있다.
+전체 점검 범위와 남은 측정 항목은 [성능 점검 기록](PERFORMANCE_REVIEW.ko.md)에 정리한다.
 
 ## 유지할 구조
 
