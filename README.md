@@ -2,10 +2,11 @@
 
 <img src="assets/logo.svg" alt="Muxa logo" width="144" />
 
-**Work-oriented AI-agent observability & orchestration for tmux.**
+**Know which tmux coding agent is waiting on you — and jump to it.**
 
-See which agents are working, waiting, idle, or blocked from your tmux
-status line, a live TUI, desktop notifications, and local reports.
+No wrapper, no new terminal. Muxa watches the Claude Code, Codex, and
+Gemini CLI sessions you already run in tmux, tells you which one needs
+you, and takes you there.
 
 [![CI](https://github.com/Open330/muxa/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/muxa/actions/workflows/ci.yml)
 ![MSRV](https://img.shields.io/badge/MSRV-1.89-informational)
@@ -18,16 +19,14 @@ status line, a live TUI, desktop notifications, and local reports.
 
 ---
 
-## Try Muxa onboarding before reading
+## Get started
 
-Launch the complete fullscreen tour. The script runs the real `muxa onboard`
-from a temporary copy of the release binary — checksum-verified, deleted on
-exit, nothing installed. It needs a supported release platform and network
-access; the live tour also needs tmux. Use `muxa onboard --print` for a
-non-interactive guide:
+Requires tmux 3.x (or herdr) and a Unix-like OS.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
+brew install open330/tap/muxa
+muxa init      # wires tmux and agent hooks, starts the daemon
+muxa attend    # jump to the agent that has waited longest
 ```
 
 <div align="center">
@@ -36,50 +35,30 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
   <sub><code>muxa watch</code> — the fleet, the inspector, the swarm view, and <code>muxa attend</code>.</sub>
 </div>
 
-`muxa` is a small daemon and CLI for observing — and now driving — AI
-coding agents running inside terminal multiplexer panes. It reads agent
-state from existing hook/event systems (Claude Code, OpenAI Codex, Google
-Gemini CLI and its Antigravity successor), falls back to screen-manifest
-detection for hook-less agents,
-and correlates it all with multiplexer panes and sessions. Through `muxa
-mcp` a coding agent can also orchestrate the others — inspect state, send
-prompts, wait for changes.
+Not ready to install? Take the full tour in a throwaway tmux server — the
+script runs the real `muxa onboard` from a checksum-verified copy of the
+release binary, deletes it on exit, and never touches your existing tmux
+server. It needs network access and a supported release platform; the live
+tour also needs tmux. `muxa onboard --print` gives a non-interactive guide.
 
-It does not fork the multiplexer or modify agent binaries. tmux,
-[rmux](https://rmux.io), and [herdr](https://herdr.dev) can be observed at the
-same time; zellij has a CLI baseline. See the Hosts table below.
+```bash
+curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
+```
 
-## Optimized for work-oriented tmux
+## Why muxa
 
-Muxa treats tmux as a work execution adapter, not just a collection of terminal
-panes. The durable logical model is Workspace → Work → Run → Agent session:
-
-| tmux object | Muxa meaning | How it is used |
-| --- | --- | --- |
-| **session** | Workspace execution context | Contains active Run windows for one managed workspace. |
-| **window** | One active Work Run | Carries a link to stable Work identity and cwd; closing it ends the Run. |
-| **pane** | Agent execution surface | Binds an implementer, reviewer, or helper Agent session to that Run. |
-
-The intended workflow is equally direct:
-
-1. Start a work ID once; Muxa creates or reuses the workspace session, creates
-   its work window, and starts the first agent pane.
-2. Add implementer, reviewer, or helper agents as additional panes in that
-   Work Run. Other Work items use sibling Run windows.
-3. Observe, preview, message, and control those agents through `muxa watch`,
-   or let an agent use the same policy through `muxa mcp`.
-4. Close an agent pane, work window, or whole workspace session explicitly.
-   Muxa refuses to terminate unmanaged tmux objects.
-
-An optional Linear/GitHub/Jira issue is a reference attached to Work, not the
-Work identity or local board stage. See [the Work domain model](docs/WORK_MODEL.md).
-In short: **Workspace → Work → Run → Agent session**, with tmux as the current
-binding. Run `muxa onboard` for one continuous safe scenario.
-It creates a private throwaway tmux server, daemon, and mailbox, then lets you
-type `tmux new-session`, see the hierarchy, prove detach/attach persistence,
-start sandboxed agents, and use the real Muxa watch, attend, and messaging
-workflow. It never touches your existing tmux server and removes the sandbox on
-exit.
+- **Keeps your setup.** Reads agent state from Claude Code, Codex, and
+  Gemini CLI (and its Antigravity successor) hooks, with screen detection
+  for hook-less agents, and maps it onto the tmux panes you already have.
+  You don't launch agents through muxa, and you don't switch multiplexers. tmux, [rmux](https://rmux.io),
+  and [herdr](https://herdr.dev) can be observed at the same time; zellij
+  has a CLI baseline.
+- **Tells you who is waiting.** tmux status line, the `muxa watch` TUI,
+  and desktop notifications.
+- **Takes you there.** `muxa attend` focuses the pane blocked longest;
+  `--cycle` tabs through every agent that needs you.
+- **Lets one agent drive the rest.** `muxa mcp` gives a coding agent the
+  same view, plus send-prompt and wait-for-change tools.
 
 > [!IMPORTANT]
 > Beta. Event ingest, the daemon, CLI, live TUI, desktop notifications,
@@ -103,21 +82,10 @@ exit.
 | Dashboard | Optional loopback HTTP UI with SSE live updates, timeline, and collaboration node-edge/sequence graphs. |
 | Notifications | Optional desktop alerts when agents need attention. |
 
-## Install Muxa
+## More install options
 
-If you decide to keep Muxa, install it with one of the following methods.
-
-Requires tmux 3.x (or herdr) and a Unix-like OS.
-
-Homebrew (pre-built binaries, no Rust toolchain needed):
-
-```bash
-brew install open330/tap/muxa
-muxa init
-```
-
-For the Mac app (notarized, updates through Homebrew since it has no
-built-in updater):
+Homebrew (above) is the main path. For the Mac app (notarized, updates
+through Homebrew since it has no built-in updater):
 
 ```bash
 brew install --cask open330/tap/muxa-app
@@ -165,6 +133,41 @@ non-interactive product smoke test.
 
 See [Muxa for Mac](docs/MACOS.md) for the architecture, build inputs, and IPC
 contract.
+
+## Organize work in tmux
+
+Optional: you can keep using your own tmux layout. If you want muxa to manage
+where agents run as well, it gives tmux a work model.
+
+Muxa treats tmux as a work execution adapter, not just a collection of terminal
+panes. The durable logical model is Workspace → Work → Run → Agent session:
+
+| tmux object | Muxa meaning | How it is used |
+| --- | --- | --- |
+| **session** | Workspace execution context | Contains active Run windows for one managed workspace. |
+| **window** | One active Work Run | Carries a link to stable Work identity and cwd; closing it ends the Run. |
+| **pane** | Agent execution surface | Binds an implementer, reviewer, or helper Agent session to that Run. |
+
+The intended workflow is equally direct:
+
+1. Start a work ID once; Muxa creates or reuses the workspace session, creates
+   its work window, and starts the first agent pane.
+2. Add implementer, reviewer, or helper agents as additional panes in that
+   Work Run. Other Work items use sibling Run windows.
+3. Observe, preview, message, and control those agents through `muxa watch`,
+   or let an agent use the same policy through `muxa mcp`.
+4. Close an agent pane, work window, or whole workspace session explicitly.
+   Muxa refuses to terminate unmanaged tmux objects.
+
+An optional Linear/GitHub/Jira issue is a reference attached to Work, not the
+Work identity or local board stage. See [the Work domain model](docs/WORK_MODEL.md).
+In short: **Workspace → Work → Run → Agent session**, with tmux as the current
+binding. Run `muxa onboard` for one continuous safe scenario.
+It creates a private throwaway tmux server, daemon, and mailbox, then lets you
+type `tmux new-session`, see the hierarchy, prove detach/attach persistence,
+start sandboxed agents, and use the real Muxa watch, attend, and messaging
+workflow. It never touches your existing tmux server and removes the sandbox on
+exit.
 
 ### Collaborate from `muxa watch`
 

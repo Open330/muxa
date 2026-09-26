@@ -400,6 +400,10 @@ async fn main() -> Result<()> {
         .find(|b| b.kind() == muxa::HostKind::Zellij)
         .cloned()
         .unwrap_or_else(|| primary.clone());
+    // WS-F: snapshot
+    let mux_snapshots = muxa::mux_snapshot_control::MuxSnapshotControl::new(socket.clone());
+    let mux_snapshot_handle =
+        spawn_mux_snapshot_task(&cfg.snapshot, Arc::clone(&mux_snapshots), &shutdown_tx);
     let server = Server::new(socket.clone(), store)
         .with_backend(ipc_backend)
         // The full observed set, so control methods (`send_prompt`,
@@ -415,6 +419,7 @@ async fn main() -> Result<()> {
         .with_config_path(config_path.clone())
         .with_fleet(fleet_runtime)
         .with_pipeline_runs(pipeline_runs.clone())
+        .with_mux_snapshots(mux_snapshots) // WS-F: snapshot
         .with_restart_controller(Arc::clone(&restart));
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
@@ -478,6 +483,7 @@ async fn main() -> Result<()> {
     await_shutdown_task("pipeline reconciler", Some(pipeline_reconciler_handle)).await;
     await_shutdown_task("pipeline state projection", Some(pipeline_state_handle)).await;
     await_shutdown_task("fleet manager", Some(fleet_handle)).await;
+    await_shutdown_task("workspace snapshot", mux_snapshot_handle).await; // WS-F: snapshot
 
     let _ = activity_transition_shutdown_tx.send(());
     await_shutdown_task("activity transition", activity_transition_handle).await;
@@ -672,6 +678,53 @@ fn spawn_pipeline_reconciler_task(
             }
         }
     })
+}
+
+// WS-F: snapshot
+/// Automatic workspace snapshots (`[snapshot]`, on by default every 15
+/// minutes). The first one waits a full interval: right after a reboot the
+/// multiplexer is empty or half rebuilt, and that is the workspace nobody
+/// wants as the newest snapshot. `muxa snapshot --auto` itself skips an
+/// unchanged workspace and prunes old automatic snapshots.
+fn spawn_mux_snapshot_task(
+    config: &muxa::config::SnapshotConfig,
+    control: Arc<muxa::mux_snapshot_control::MuxSnapshotControl>,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if config.auto_interval_minutes == 0 {
+        return None;
+    }
+    let period = std::time::Duration::from_secs(config.auto_interval_minutes.saturating_mul(60));
+    let keep = config.keep_auto;
+    let mut shutdown = shutdown_tx.subscribe();
+    Some(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticks.tick() => {}
+                _ = shutdown.recv() => break,
+            }
+            match control.auto(keep).await {
+                Ok(outcome) if outcome["skipped"].as_bool() == Some(true) => {
+                    let reason = outcome["reason"].as_str().unwrap_or("skipped");
+                    if reason == "ambiguous_server" {
+                        tracing::warn!(
+                            detail = outcome["message"].as_str().unwrap_or_default(),
+                            "automatic snapshot skipped"
+                        );
+                    } else {
+                        tracing::debug!(reason, "automatic snapshot skipped");
+                    }
+                }
+                Ok(outcome) => tracing::debug!(
+                    id = outcome["id"].as_str().unwrap_or_default(),
+                    "automatic snapshot written"
+                ),
+                Err(error) => tracing::warn!(%error, "automatic snapshot failed"),
+            }
+        }
+    }))
 }
 
 fn spawn_pipeline_state_task(
@@ -3397,6 +3450,9 @@ mod tests {
                 sender,
                 recipient,
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: RequestKind::Question,
                     body: "wake from revision".into(),
@@ -3541,6 +3597,9 @@ mod tests {
                 sender,
                 pending,
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: RequestKind::Review,
                     body: "review the pending diff".into(),
@@ -3619,6 +3678,9 @@ mod tests {
                 sender.clone(),
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "change only the authorized file".into(),
@@ -3673,6 +3735,9 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "unsafe\u{1b}[201~\rsubmit".into(),
@@ -3735,6 +3800,9 @@ mod tests {
                 console,
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "operator request body".into(),
@@ -3818,6 +3886,9 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "agent delegated body".into(),
@@ -3889,6 +3960,9 @@ mod tests {
                     sender.clone(),
                     recipient.clone(),
                     NewRequest {
+                        dispatch_id: None,
+                        source_node_id: None,
+                        delegation_parent: None,
                         initiator: None,
                         kind: RequestKind::Task,
                         body: body.into(),
@@ -3955,6 +4029,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // explicit durable request/recovery fixtures
     async fn full_wake_recovers_without_reinjecting_the_request_body() {
         let store = muxa::Store::shared();
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
@@ -4017,6 +4092,9 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "the prompt text is already buffered".into(),
@@ -4077,6 +4155,9 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: RequestKind::Review,
                     body: "secret request body".into(),
@@ -4196,6 +4277,9 @@ mod tests {
                 console.clone(),
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "dispatched by a human".into(),

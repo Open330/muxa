@@ -40,7 +40,18 @@ pub const MAX_WORK_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 /// Combined argv + stdin bytes one `work_command` may carry.
 pub const MAX_WORK_COMMAND_INPUT_BYTES: usize = 1024 * 1024;
 /// `muxa work` subcommands the IPC `work_command` kind may run.
-pub const WORK_COMMAND_SUBCOMMANDS: &[&str] = &["options", "preset", "pipeline", "route"];
+pub const WORK_COMMAND_SUBCOMMANDS: &[&str] = &[
+    "options",
+    "preset",
+    "pipeline",
+    "route",
+    "dispatch",
+    "dispatch-status",
+    "dispatch-options",
+    "dispatch-execute",
+    "dispatch-worker-status",
+    "fleet-ask",
+];
 /// Subcommands that only read configuration. Observe-mode hosts run these
 /// and nothing else.
 const WORK_COMMAND_READ_ONLY_SUBCOMMANDS: &[&str] = &["options"];
@@ -301,7 +312,11 @@ impl WorkCommandLimits {
     /// The budget a validated argv is entitled to.
     #[must_use]
     pub fn for_args(args: &[String]) -> Self {
-        if is_work_up(args) {
+        if is_work_up(args)
+            || args
+                .get(1)
+                .is_some_and(|s| matches!(s.as_str(), "dispatch" | "dispatch-execute"))
+        {
             Self::WORK_UP
         } else {
             Self::COMMAND
@@ -357,6 +372,18 @@ pub fn validate_work_command(
     stdin: Option<&str>,
     surface: WorkCommandSurface,
 ) -> Result<(), WorkCommandError> {
+    // WS-B: new agent — a remote `agent_start` travels as this frame too.
+    // The IPC surface has its own `agent_start` kind and keeps refusing it.
+    if surface == WorkCommandSurface::Relay && crate::agent_control::is_agent_start(args) {
+        crate::agent_control::validate_relay_argv(args).map_err(WorkCommandError::Invalid)?;
+        let input_bytes = args.iter().map(String::len).sum::<usize>() + optional_len(stdin);
+        if input_bytes > MAX_WORK_COMMAND_INPUT_BYTES {
+            return Err(WorkCommandError::Invalid(format!(
+                "request exceeds {MAX_WORK_COMMAND_INPUT_BYTES} bytes"
+            )));
+        }
+        return Ok(());
+    }
     let [command, subcommand, rest @ ..] = args else {
         return Err(WorkCommandError::Invalid(
             "expected `work <subcommand> …`".into(),
@@ -440,7 +467,27 @@ pub async fn execute_work_command(
     run_bounded(command, args, stdin, limits).await
 }
 
-async fn run_bounded(
+/// Fleet-managed Work always has an attachable tmux surface, independent of
+/// the coordinator's terminal backend. Detaching does not stop the agents.
+pub async fn execute_tmux_work(
+    binary: &Path,
+    args: &[String],
+    socket: &Path,
+) -> Result<WorkCommandOutput, WorkCommandError> {
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args(args)
+        .env("MUXA_SOCKET", socket)
+        .env("MUXA_HOST", "tmux")
+        .env("MUXA_HOSTS", "tmux")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env_remove("RMUX")
+        .env_remove("RMUX_PANE");
+    run_bounded(command, args, None, WorkCommandLimits::WORK_UP).await
+}
+
+pub(crate) async fn run_bounded(
     mut command: tokio::process::Command,
     args: &[String],
     stdin: Option<&str>,
@@ -632,6 +679,22 @@ mod tests {
         parts.iter().map(|part| (*part).to_string()).collect()
     }
 
+    #[tokio::test]
+    async fn fleet_launch_is_attachable_tmux_independent_of_callers_terminal() {
+        let output = execute_tmux_work(
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "printf '%s/%s/%s' \"$MUXA_HOST\" \"$MUXA_HOSTS\" \"${TMUX-unset}\"".into(),
+            ],
+            Path::new("/tmp/test-dispatch.sock"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "tmux/tmux/unset");
+    }
+
     fn work_request(host: Option<&str>) -> WorkUpRequest {
         WorkUpRequest {
             work: " native-app ".into(),
@@ -790,6 +853,25 @@ mod tests {
         );
         assert_eq!(
             WorkCommandLimits::for_args(&argv(&["work", "options"])),
+            WorkCommandLimits::COMMAND
+        );
+    }
+
+    #[test]
+    fn relay_surface_carries_agent_start_for_control_hosts_only() {
+        let start = argv(&["agent", "start", "--json", "--agent=claude", "--host=tmux"]);
+        validate_work_command(&start, None, WorkCommandSurface::Relay).unwrap();
+        assert!(validate_work_command(&start, None, WorkCommandSurface::Ipc).is_err());
+        let mut smuggled = start.clone();
+        smuggled.push("--socket=/tmp/other.sock".into());
+        assert!(validate_work_command(&smuggled, None, WorkCommandSurface::Relay).is_err());
+        assert!(matches!(
+            authorize_work_command("dev", HostAccessMode::Observe, &start),
+            Err(WorkCommandError::Forbidden(_))
+        ));
+        authorize_work_command("dev", HostAccessMode::Control, &start).unwrap();
+        assert_eq!(
+            WorkCommandLimits::for_args(&start),
             WorkCommandLimits::COMMAND
         );
     }

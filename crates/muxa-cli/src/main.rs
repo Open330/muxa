@@ -18,6 +18,7 @@ mod mcp;
 mod message_skill;
 mod mux_control;
 mod onboarding;
+mod orchestration;
 mod peek;
 mod relay;
 mod reload;
@@ -294,13 +295,9 @@ enum Cmd {
         command: Vec<String>,
     },
     /// Attach this terminal to a muxa-owned PTY session.
-    Attach {
-        session: String,
-    },
+    Attach { session: String },
     /// Mark a muxa-owned PTY session as detached.
-    Detach {
-        session: String,
-    },
+    Detach { session: String },
     /// Register an arbitrary background process (shell script, game,
     /// automation loop) so it shows up in `muxa status`/`muxa watch`,
     /// tracked by pid liveness. Defaults `--pid` to the calling shell.
@@ -369,9 +366,6 @@ enum Cmd {
     /// Falls back to `journalctl --user -u muxad` on Linux when the
     /// systemd unit is the source of truth.
     Logs(logs::Args),
-    /// Update muxa from the source repo: `git pull` → cargo install
-    /// `muxad` + `muxa-cli` → restart the daemon → verify the IPC
-    /// socket is responsive. One command for the full update flow.
     /// Capture this multiplexer's workspace — sessions, windows, panes,
     /// geometry, and what each pane is running — so a restart can be undone
     Snapshot(reload::SnapshotArgs),
@@ -383,6 +377,9 @@ enum Cmd {
     /// from outside the server it restarts
     Reload(reload::ReloadArgs),
 
+    /// Update muxa from the source repo: `git pull` → cargo install
+    /// `muxad` + `muxa-cli` → restart the daemon → verify the IPC
+    /// socket is responsive. One command for the full update flow.
     Upgrade(upgrade::Args),
     /// Delete accumulated "orphan" agent rows — paneless, surfaceless,
     /// pid-less ghosts left by remote/detached sessions (e.g. codex driven
@@ -665,6 +662,21 @@ enum WindowCmd {
 
 #[derive(Debug, Subcommand)]
 enum WorkCmd {
+    #[command(hide = true)]
+    FleetAsk,
+    /// Place a Work using shared Fleet policy; accepts a bounded JSON request.
+    Dispatch(orchestration::DispatchArgs),
+    /// Read a durable dispatch, including after a lost reply.
+    DispatchStatus(orchestration::StatusArgs),
+    /// Read registered workspaces from the shared coordinator.
+    DispatchOptions {
+        #[arg(long, hide = true)]
+        at_coordinator: bool,
+    },
+    #[command(hide = true)]
+    DispatchExecute(orchestration::ExecuteArgs),
+    #[command(hide = true)]
+    DispatchWorkerStatus { dispatch_id: String },
     /// Describe a work pipeline in your own words and let an agent write
     /// the `[ticket]`/`[[route]]`/`[pipeline.*]` config for you. Validated
     /// and shown before anything is written.
@@ -890,6 +902,20 @@ async fn run_work_cmd(
     client: &Client,
 ) -> Result<()> {
     match action {
+        WorkCmd::FleetAsk => orchestration::shared_ask(cfg, client).await,
+        WorkCmd::Dispatch(args) => {
+            orchestration::dispatch(args, cfg, client, config_path.as_deref()).await
+        }
+        WorkCmd::DispatchOptions { at_coordinator } => {
+            orchestration::options(cfg, client, at_coordinator).await
+        }
+        WorkCmd::DispatchStatus(args) => orchestration::status(args, cfg, client).await,
+        WorkCmd::DispatchExecute(args) => {
+            orchestration::execute(args, cfg, client, config_path.as_deref()).await
+        }
+        WorkCmd::DispatchWorkerStatus { dispatch_id } => {
+            orchestration::worker_status(&dispatch_id, client).await
+        }
         WorkCmd::Init(args) => work_init::run(args, cfg, config_path).await,
         WorkCmd::Compose(args) => work_compose::run(args, cfg).await,
         WorkCmd::Up(args) => work_up::run(args, cfg, config_path, Some(client)).await,
@@ -1728,6 +1754,9 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     &origin,
                     &target,
                     &NewRequest {
+                        dispatch_id: None,
+                        source_node_id: None,
+                        delegation_parent: None,
                         initiator: None,
                         kind,
                         body,
@@ -3883,10 +3912,72 @@ fn status_state_cell(label: &str, state: AgentState, theme: CliTheme) -> Cell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// rmux exports the tmux compatibility variables alongside its own, and
+    /// the CLI once read `$TMUX_PANE` directly — yielding a bare `%118` where
+    /// hooks stamp `rmux:%118`, so the origin matched no tracked agent and
+    /// `muxa peers`/`msg`/`identity` refused on every host but tmux.
+    ///
+    /// The env cannot be set in-process (racy under parallel test threads, and
+    /// the workspace forbids the unsafe setter), so the test re-runs itself as
+    /// a child with the environment it needs.
+    #[test]
+    fn cli_collaboration_origin_preserves_rmux_identity() {
+        const PROBE: &str = "MUXA_TEST_CLI_ORIGIN_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            let origin = collaboration_origin().unwrap();
+            assert_eq!(origin.pane, "rmux:%118");
+            assert_eq!(
+                origin.socket.as_deref(),
+                Some("/tmp/muxa-origin-test/default")
+            );
+            assert!(!origin.console);
+            return;
+        }
+        // Isolate environment changes from parallel tests. rmux exports both
+        // native and tmux compatibility variables; native identity must win.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::cli_collaboration_origin_preserves_rmux_identity",
+                "--nocapture",
+            ])
+            .env(PROBE, "1")
+            .env("RMUX", "/tmp/muxa-origin-test/default,42,1")
+            .env("RMUX_PANE", "%118")
+            .env("TMUX", "/tmp/muxa-origin-test/default,42,1")
+            .env("TMUX_PANE", "%118")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     use muxa::collaboration::{CollaborationRequest, RoomId};
     use muxa::AgentKind;
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn snapshot_restore_reload_and_upgrade_each_carry_their_own_help() {
+        use clap::CommandFactory;
+        let command = Args::command();
+        let about = |name: &str| {
+            command
+                .find_subcommand(name)
+                .and_then(|sub| sub.get_about())
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        };
+        assert!(about("snapshot").starts_with("Capture this multiplexer"));
+        assert!(about("restore").starts_with("Rebuild a workspace"));
+        assert!(about("reload").starts_with("Snapshot, restart"));
+        assert!(about("upgrade").starts_with("Update muxa from the source repo"));
+    }
 
     #[test]
     fn rmux_client_resolution_uses_the_invoking_session_without_guessing() {
@@ -4298,6 +4389,9 @@ mod tests {
         status: RequestStatus,
     ) -> CollaborationRequest {
         CollaborationRequest {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
             initiator: None,
             updates: Vec::new(),
             id: id.into(),
@@ -4888,7 +4982,7 @@ mod tests {
         assert_eq!(start.host, agent_launch::LaunchHost::Auto);
         assert_eq!(start.placement, agent_launch::Placement::Pane);
         assert_eq!(start.target.as_deref(), Some("%42"));
-        assert_eq!(start.direction, agent_launch::SplitDirection::Down);
+        assert_eq!(start.direction, Some(agent_launch::SplitDirection::Down));
         assert!(start.json);
     }
 

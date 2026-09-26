@@ -119,6 +119,57 @@ fn same_endpoint_in_room(left: &Participant, right: &Participant) -> bool {
     left.same_endpoint(right) && left.room == right.room
 }
 
+fn dispatch_request_id(
+    input: &NewRequest,
+    now: OffsetDateTime,
+) -> Result<String, CollaborationError> {
+    let id = if let Some(dispatch_id) = input.dispatch_id.as_deref() {
+        let uuid = uuid::Uuid::parse_str(dispatch_id).map_err(|_| {
+            CollaborationError::InvalidDispatch("dispatch_id must be a UUID".into())
+        })?;
+        format!("dispatch-{uuid}")
+    } else {
+        next_request_id(now)
+    };
+    if let Some(parent) = &input.delegation_parent {
+        if parent.request_id.is_empty() || parent.request_id.len() > 256 {
+            return Err(CollaborationError::InvalidDispatch(
+                "parent request id must be 1..256 bytes".into(),
+            ));
+        }
+    }
+    Ok(id)
+}
+
+fn dispatch_matches(
+    existing: &CollaborationRequest,
+    from: &Participant,
+    to: &Participant,
+    input: &NewRequest,
+    body: &str,
+) -> bool {
+    existing.from.same_endpoint(from)
+        && (existing.to.same_endpoint(to) || addresses(&existing.to, to))
+        && existing.kind == input.kind
+        && existing.body == body
+        && existing.expects_reply == input.expects_reply
+        && existing.work_mode == input.work_mode
+        && existing.source_node_id == input.source_node_id
+        && existing.delegation_parent == input.delegation_parent
+        && existing.parent_request_id == normalize_optional_id(input.parent_request_id.clone())
+        && input
+            .thread_id
+            .as_ref()
+            .is_none_or(|v| existing.thread_id.as_ref() == Some(v))
+        && existing.workspace_id == normalize_optional_id(input.workspace_id.clone())
+        && existing.work_id == normalize_optional_id(input.work_id.clone())
+        && existing.run_id == normalize_optional_id(input.run_id.clone())
+        && existing.paths == input.paths
+        && existing.artifacts == input.artifacts
+        && existing.links == input.links
+        && existing.air_artifacts == input.air_artifacts
+}
+
 fn same_participant_pair(
     parent: &CollaborationRequest,
     from: &Participant,
@@ -541,8 +592,23 @@ pub struct CollaborationUpdate {
     pub at: OffsetDateTime,
 }
 
+/// Cross-node causal link. Metadata only; it grants no participant authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationRef {
+    pub node_id: crate::fleet::NodeId,
+    pub request_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CollaborationRequest {
+    /// Caller-generated UUID, reused for retries of the same immutable request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<crate::fleet::NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_parent: Option<DelegationRef>,
     pub id: String,
     pub from: Participant,
     pub to: Participant,
@@ -683,6 +749,13 @@ pub struct RoomContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewRequest {
+    /// Caller-generated UUID, reused for retries of the same immutable request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<crate::fleet::NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_parent: Option<DelegationRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiator: Option<Box<Participant>>,
     pub kind: RequestKind,
@@ -715,6 +788,9 @@ pub struct NewRequest {
 impl Default for NewRequest {
     fn default() -> Self {
         Self {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
             initiator: None,
             kind: RequestKind::Question,
             body: String::new(),
@@ -791,6 +867,10 @@ pub struct CollaborationPage {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CollaborationError {
+    #[error("invalid dispatch metadata: {0}")]
+    InvalidDispatch(String),
+    #[error("dispatch {0} already exists with a different recipient or payload")]
+    DispatchConflict(String),
     #[error("agent collaboration is disabled; enable [collaboration].enabled")]
     Disabled,
     #[error(
@@ -1899,7 +1979,15 @@ impl CollaborationStore {
         let _transaction = self.transaction_lock.lock().await;
         let previous = self.requests.read().await.clone();
         let now = OffsetDateTime::now_utc();
-        let id = next_request_id(now);
+        let id = dispatch_request_id(&input, now)?;
+        if let Some(existing) = self.requests.read().await.get(&id) {
+            let same = dispatch_matches(existing, &from, &to, &input, &body);
+            return if same {
+                Ok(existing.clone())
+            } else {
+                Err(CollaborationError::DispatchConflict(id))
+            };
+        }
         let supplied_thread_id = normalize_optional_id(input.thread_id);
         let parent_request_id = normalize_optional_id(input.parent_request_id);
         let thread_id = if let Some(parent_request_id) = parent_request_id.as_deref() {
@@ -1930,6 +2018,9 @@ impl CollaborationStore {
             Some(supplied_thread_id.unwrap_or_else(|| id.clone()))
         };
         let request = CollaborationRequest {
+            dispatch_id: input.dispatch_id,
+            source_node_id: input.source_node_id,
+            delegation_parent: input.delegation_parent,
             id,
             from,
             to,
@@ -2406,7 +2497,8 @@ impl CollaborationStore {
                 .into_values()
                 .filter(|thread| {
                     thread.iter().all(|request| {
-                        request.status.is_terminal()
+                        request.dispatch_id.is_none()
+                            && request.status.is_terminal()
                             && request.wake_delivery.is_none()
                             && request.reply.as_ref().is_none_or(|_| {
                                 request.reply_read_at.is_some() || request.from.console
@@ -3297,6 +3389,56 @@ fn valid_identity_token(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::CollaborationScope;
+
+    #[tokio::test]
+    async fn dispatch_retries_survive_concurrency_restart_and_reject_changed_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CollaborationOptions {
+            path: Some(dir.path().join("mailbox.json")),
+            ..Default::default()
+        };
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        let from = participant("%1", "sender");
+        let to = participant("%2", "worker");
+        let input = NewRequest {
+            dispatch_id: Some(uuid::Uuid::new_v4().to_string()),
+            source_node_id: Some(crate::fleet::NodeId::generate()),
+            body: "implement once".into(),
+            delegation_parent: Some(DelegationRef {
+                node_id: crate::fleet::NodeId::generate(),
+                request_id: "external-parent".into(),
+            }),
+            ..Default::default()
+        };
+        let (a, b) = tokio::join!(
+            mailbox.create(from.clone(), to.clone(), input.clone()),
+            mailbox.create(from.clone(), to.clone(), input.clone())
+        );
+        let a = a.unwrap();
+        assert_eq!(a.id, b.unwrap().id);
+        assert_eq!(mailbox.claim_for(&to).await.unwrap().len(), 1);
+        let reloaded = CollaborationStore::load(options).await.unwrap();
+        assert_eq!(
+            reloaded
+                .create(from.clone(), to.clone(), input.clone())
+                .await
+                .unwrap()
+                .id,
+            a.id
+        );
+        let mut changed = input.clone();
+        changed.body = "different task".into();
+        assert!(matches!(
+            reloaded.create(from.clone(), to.clone(), changed).await,
+            Err(CollaborationError::DispatchConflict(_))
+        ));
+        assert!(matches!(
+            reloaded
+                .create(from, participant("%3", "other"), input)
+                .await,
+            Err(CollaborationError::DispatchConflict(_))
+        ));
+    }
 
     #[tokio::test]
     async fn request_updates_are_durable_bounded_and_do_not_complete_work() {

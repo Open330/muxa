@@ -9264,6 +9264,9 @@ async fn run_watch_collaboration_broadcast(
     for (pane, label) in recipients {
         let pane = pane.clone();
         let request = NewRequest {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
             initiator: None,
             kind,
             body: body.clone(),
@@ -9325,6 +9328,9 @@ async fn run_watch_collaboration_single(
                 }
             };
             let request = NewRequest {
+                dispatch_id: None,
+                source_node_id: None,
+                delegation_parent: None,
                 initiator: None,
                 kind,
                 body: composer.input,
@@ -20218,6 +20224,9 @@ mod tests {
     ) -> CollaborationRequest {
         let now = OffsetDateTime::now_utc();
         CollaborationRequest {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
             initiator: None,
             updates: Vec::new(),
             id: id.into(),
@@ -27426,6 +27435,9 @@ sort = ["state"]
 
     fn collab_request(to_pane: &str) -> CollaborationRequest {
         CollaborationRequest {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
             initiator: None,
             updates: Vec::new(),
             id: "req_1".into(),

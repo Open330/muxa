@@ -2645,7 +2645,9 @@ fn tmux_output_allow_no_server(args: &[&str]) -> Result<String> {
         Ok(output) => Ok(output),
         Err(error)
             if error.to_string().contains("no server running")
-                || error.to_string().contains("no sessions") =>
+                || error.to_string().contains("no sessions")
+                || (error.to_string().contains("error connecting to ")
+                    && error.to_string().contains("(No such file or directory)")) =>
         {
             Ok(String::new())
         }

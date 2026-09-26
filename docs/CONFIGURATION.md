@@ -50,6 +50,34 @@ interval_secs = 5
 This tmux foreground sampler remains as a compatibility source and helps
 stats while newer activity ledger intervals are accumulating.
 
+## Snapshots
+
+```toml
+[snapshot]
+auto_interval_minutes = 15   # 0 turns automatic snapshots off
+keep_auto = 10               # newest automatic snapshots kept
+```
+
+muxad takes an automatic workspace snapshot (`muxa snapshot --auto`) every
+`auto_interval_minutes`, starting one interval after it starts. Nothing is
+written when the workspace has not changed since the newest snapshot of the
+same server — the comparison covers sessions, windows, layouts, pane
+directories, commands and agent conversation ids, not timestamps or which
+window has focus. Only the newest `keep_auto` automatic snapshots are kept;
+snapshots taken with `muxa snapshot`, Save Snapshot in Muxa.app, or `muxa
+reload` are never pruned. When muxa's agents span several multiplexer servers
+the automatic snapshot is skipped with a warning in muxad's log.
+
+Snapshots live in `$XDG_DATA_HOME/muxa/snapshots/<id>/snapshot.json`
+(`~/Library/Application Support/muxa/snapshots` on macOS). `muxa snapshot
+--list` shows them, `muxa snapshot --delete <id>` removes one, and `muxa
+restore --only-missing` recreates only the sessions the server does not
+already have. `muxa restore` with no argument uses the newest snapshot,
+automatic or manual. Its dry run also lists the sessions and windows that are
+new since the snapshot, which a restore never closes; with `--json` each
+recorded session, window and pane carries a `state` of `missing` or
+`present`.
+
 ## MCP orchestration guide
 
 `muxa init` can install a canonical collaboration skill and global agent entry

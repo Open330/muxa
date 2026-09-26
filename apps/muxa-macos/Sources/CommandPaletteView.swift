@@ -4,17 +4,27 @@ import SwiftUI
 enum MuxaPaletteMode: String, Identifiable {
     case navigation
     case commands
+    /// ⌘J: agents only, those needing attention first (Orca's jump palette).
+    case agents
 
     var id: Self { self }
 
     static func shortcut(characters: String?, modifiers: NSEvent.ModifierFlags) -> Self? {
-        guard characters?.lowercased() == "p" else { return nil }
         let flags = modifiers.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function])
-        switch flags {
-        case .command: return .navigation
-        case [.command, .shift]: return .commands
+        switch (characters?.lowercased(), flags) {
+        case ("p", .command): return .navigation
+        case ("p", [.command, .shift]): return .commands
+        case ("j", .command): return .agents
         default: return nil
         }
+    }
+
+    /// ⌘1–⌘9 inside the palette opens that result, zero-based.
+    static func resultIndex(characters: String?, modifiers: NSEvent.ModifierFlags) -> Int? {
+        let flags = modifiers.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function])
+        guard flags == .command, let characters, characters.count == 1,
+              let digit = Int(characters), (1...9).contains(digit) else { return nil }
+        return digit - 1
     }
 }
 
@@ -27,6 +37,11 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
     case startWork, workCommandCenter, liveWatch, ask, newShell
     case showWork, showWatch, showInbox, showShells, refresh
     case closeEditor, previousEditor, nextEditor, splitEditor, pinEditor, focusSidebar
+    case jumpToAgent, nextAttention, toggleSidebar, reopenEditor, showShortcuts
+    case markAllRead // WS-A
+    case showChanges // WS-D
+    case newAgent, newDefaultAgent // WS-B: new agent
+    case saveSnapshot, restoreSnapshot // WS-F: snapshot
 
     var id: Self { self }
 
@@ -48,6 +63,46 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .splitEditor: String(localized: "Editor: Split right")
         case .pinEditor: String(localized: "Editor: Keep open (pin)")
         case .focusSidebar: String(localized: "View: Focus sidebar")
+        case .jumpToAgent: String(localized: "Go: Jump to agent")
+        case .nextAttention: String(localized: "Go: Next agent needing attention")
+        case .toggleSidebar: String(localized: "View: Toggle side bar")
+        case .reopenEditor: String(localized: "Editor: Reopen closed editor")
+        case .showShortcuts: String(localized: "Help: Keyboard shortcuts")
+        case .markAllRead: String(localized: "Agents: Mark all as read") // WS-A
+        case .showChanges: String(localized: "Go: Show changes") // WS-D
+        case .newAgent: String(localized: "Agent: New agent…")
+        case .newDefaultAgent: String(localized: "Agent: New default agent here")
+        case .saveSnapshot: String(localized: "Session: Save snapshot") // WS-F: snapshot
+        case .restoreSnapshot: String(localized: "Session: Restore snapshot…") // WS-F: snapshot
+        }
+    }
+
+    /// The menu binding, shown at the end of the row like VS Code does.
+    var shortcut: String? {
+        switch self {
+        case .startWork: "⌥⌘N"
+        case .workCommandCenter: "⇧⌘1"
+        case .liveWatch: "⌃⌘W"
+        case .ask: "⇧⌘2"
+        case .newShell: "⌘T"
+        case .showInbox: "⇧⌘3"
+        case .closeEditor: "⌘W"
+        case .previousEditor: "⌃⇧⇥"
+        case .nextEditor: "⌃⇥"
+        case .splitEditor: "⌘\\"
+        case .pinEditor: "⌥⌘↩"
+        case .focusSidebar: "⇧⌘F"
+        case .jumpToAgent: "⌘J"
+        case .nextAttention: "⇧⌘J"
+        case .toggleSidebar: "⌘B"
+        case .reopenEditor: "⇧⌘T"
+        case .showShortcuts: "⌘/"
+        case .showChanges: "⌃⇧G" // WS-D
+        case .newAgent: "⌥⇧⌘T"
+        case .newDefaultAgent: "⌥⌘T"
+        case .showWork, .showWatch, .showShells, .refresh: nil
+        case .markAllRead: nil // WS-A
+        case .saveSnapshot, .restoreSnapshot: nil // WS-F: snapshot
         }
     }
 
@@ -66,6 +121,17 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .nextEditor: "arrow.right"
         case .splitEditor: "rectangle.split.2x1"
         case .pinEditor: "pin"
+        case .jumpToAgent: "person.crop.circle.badge.exclamationmark"
+        case .nextAttention: "exclamationmark.circle"
+        case .toggleSidebar: "sidebar.left"
+        case .reopenEditor: "arrow.uturn.backward"
+        case .showShortcuts: "keyboard"
+        case .markAllRead: "checkmark.circle" // WS-A
+        case .showChanges: "plus.forwardslash.minus" // WS-D
+        case .newAgent: "sparkles.rectangle.stack"
+        case .newDefaultAgent: "sparkle"
+        case .saveSnapshot: "camera" // WS-F: snapshot
+        case .restoreSnapshot: "clock.arrow.circlepath" // WS-F: snapshot
         }
     }
 
@@ -80,10 +146,18 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
             if self == .newShell && model.isCreatingSession {
                 return String(localized: "A shell is being created")
             }
+        case .newAgent, .newDefaultAgent: // WS-B: new agent
+            guard model.isConnected else { return String(localized: "Daemon is not connected") }
+            if model.isStartingAgent { return String(localized: "An agent is starting") }
+        case .saveSnapshot, .restoreSnapshot: // WS-F: snapshot
+            guard model.isConnected else { return String(localized: "Daemon is not connected") }
         case .closeEditor, .previousEditor, .nextEditor, .splitEditor, .pinEditor:
             guard let selection = model.sidebarSelection, model.isSelectionAvailable(selection) else {
                 return String(localized: "No active editor")
             }
+        // WS-A
+        case .markAllRead:
+            guard model.attention.hasUnread else { return String(localized: "No unread agents") }
         default:
             break
         }
@@ -102,6 +176,11 @@ struct MuxaPaletteItem: Identifiable, Equatable {
     let systemImage: String
     let action: MuxaPaletteAction
     var disabledReason: String? = nil
+    var shortcut: String? = nil
+    var tint: Color? = nil
+    /// ⌘J: the host the agent runs on, shown as a badge once agents span
+    /// more than the local host.
+    var host: MuxaFleetHostIdentity? = nil
 
     var id: MuxaPaletteID { stableID }
     var isEnabled: Bool { disabledReason == nil }
@@ -159,7 +238,8 @@ enum MuxaPaletteSearch {
         var seen = Set<MuxaPaletteID>()
         let unique = items.filter { seen.insert($0.stableID).inserted }
         return unique.enumerated().compactMap { offset, item -> (MuxaPaletteItem, Int, Int, Int, Int)? in
-            guard let score = score(query: query, text: item.title + " " + item.subtitle) else { return nil }
+            let text = [item.title, item.subtitle, item.host?.alias ?? ""].joined(separator: " ")
+            guard let score = score(query: query, text: text) else { return nil }
             let rank: Int
             if case .navigate(let selection) = item.action {
                 rank = recent.firstIndex(of: selection) ?? Int.max
@@ -285,6 +365,39 @@ enum MuxaPaletteItems {
         return items
     }
 
+    /// ⌘J: every pane running an agent on every host, the ones needing the
+    /// operator first, then working, then idle (`MuxaAttention.ranked`).
+    /// The host is a badge rather than subtitle text, and only once agents
+    /// run somewhere other than the local host.
+    static func agents(
+        watchHosts: [MuxaWatchHost],
+        unread: Set<MuxaWatchPaneIdentity> = [] // WS-A
+    ) -> [MuxaPaletteItem] {
+        let panes = MuxaAttention.ranked(watchHosts, unread: unread)
+        let showsHosts = panes.contains { !$0.host.local }
+        return panes.map { pane in
+            let window = pane.pane.windowName.isEmpty ? pane.pane.windowID : pane.pane.windowName
+            let state = pane.agent.map { agentStateLabel($0.state) } ?? ""
+            return MuxaPaletteItem(
+                stableID: MuxaPaletteID(components: [
+                    "agent-pane", pane.host.alias, pane.pane.endpointSocket, pane.pane.paneID,
+                ]),
+                title: pane.pane.agentAlias.map { "@\($0)" }
+                    ?? pane.agent?.aiTitle
+                    ?? (pane.pane.title.isEmpty ? pane.pane.currentCommand : pane.pane.title),
+                subtitle: ([state] + MuxaUsageFormat.paletteFragments(for: pane.agent) // WS-C usage
+                    + ["\(pane.pane.session) › \(window)", pane.pane.paneID])
+                    .filter { !$0.isEmpty }.joined(separator: " · "),
+                systemImage: MuxaAttention.needsAttention(pane)
+                    ? "exclamationmark.circle.fill"
+                    : unread.contains(pane.id) ? "circle.fill" : "person.crop.circle", // WS-A
+                action: .navigate(.pane(pane.id)),
+                tint: pane.agent.map { agentStateColor($0.state) },
+                host: showsHosts ? pane.host : nil
+            )
+        }
+    }
+
     private static func agentID(_ agent: MuxaHostedAgent) -> MuxaPaletteID {
         MuxaPaletteID(components: [
             "agent", agent.host.alias, agent.pane?.endpointSocket ?? agent.agent.tmuxSocket,
@@ -309,7 +422,16 @@ struct CommandPaletteView: View {
         let candidates: [MuxaPaletteItem]
         switch mode {
         case .navigation:
-            candidates = MuxaPaletteItems.navigation(
+            let fileLocations = recent.compactMap { selection -> MuxaFileLocation? in
+                if case .file(let location) = selection { return location }; return nil
+            } + model.browsedFiles
+            var seen = Set<MuxaFileLocation>()
+            let files = fileLocations.filter { seen.insert($0).inserted }.map { location in
+                MuxaPaletteItem(stableID: MuxaPaletteID(components: ["file", location.hostAlias, location.path]),
+                                title: location.name, subtitle: "\(location.hostAlias) · \(location.path)",
+                                systemImage: ArtifactPreviewKind(path: location.path).icon, action: .navigate(.file(location)))
+            }
+            candidates = files + MuxaPaletteItems.navigation(
                 watchSections: model.executionSnapshot.watchHosts, workGroups: model.workGroups,
                 sessions: model.sessions, agents: model.hostedAgents, localSocket: model.client.socketPath
             )
@@ -318,28 +440,56 @@ struct CommandPaletteView: View {
                 MuxaPaletteItem(
                     stableID: MuxaPaletteID(components: ["command", command.rawValue]), title: command.title,
                     subtitle: command.disabledReason(model: model) ?? "", systemImage: command.systemImage,
-                    action: .command(command), disabledReason: command.disabledReason(model: model)
+                    action: .command(command), disabledReason: command.disabledReason(model: model),
+                    shortcut: command.shortcut
                 )
             }
+        case .agents:
+            // Attention order is the point of this mode; recency would
+            // bury a blocked agent under the one just looked at.
+            candidates = MuxaPaletteItems.agents(
+                watchHosts: model.executionSnapshot.watchHosts,
+                unread: model.attention.unreadPanes // WS-A
+            )
+            return MuxaPaletteSearch.results(candidates, query: query, recent: [])
         }
         return MuxaPaletteSearch.results(candidates, query: query, recent: recent)
+    }
+
+    private var placeholder: String {
+        switch mode {
+        case .navigation: String(localized: "Search sessions, windows, panes, shells, work, agents")
+        case .commands: String(localized: "Type a command")
+        case .agents: String(localized: "Jump to an agent — the ones needing you come first")
+        }
+    }
+
+    private var modeShortcut: String {
+        switch mode {
+        case .navigation: "⌘P"
+        case .commands: "⇧⌘P"
+        case .agents: "⌘J"
+        }
     }
 
     var body: some View {
         let results = items
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Image(systemName: mode == .navigation ? "magnifyingglass" : "chevron.right")
+                Image(systemName: mode == .commands ? "chevron.right" : mode == .agents ? "person.crop.circle" : "magnifyingglass")
                     .foregroundStyle(.secondary)
                 MuxaPaletteSearchField(
                     text: Binding(get: { query }, set: { updateQuery($0) }),
-                    placeholder: mode == .navigation
-                        ? String(localized: "Search sessions, windows, panes, shells, work, agents")
-                        : String(localized: "Type a command"),
+                    placeholder: placeholder,
                     onKey: handleKey,
-                    onModeChange: { mode = $0 }
+                    onModeChange: { mode = $0 },
+                    onJump: { index in
+                        let enabled = results.filter(\.isEnabled)
+                        guard enabled.indices.contains(index) else { return }
+                        choose(enabled[index].stableID)
+                    }
                 )
-                Text(mode == .navigation ? "⌘P" : "⇧⌘P")
+                Text(verbatim: modeShortcut)
                     .font(.caption.monospaced()).foregroundStyle(.secondary)
             }
             .padding(16)
@@ -357,8 +507,11 @@ struct CommandPaletteView: View {
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, minHeight: 230)
                         }
+                        // ⌘N counts enabled rows only, the same way the jump
+                        // does, so the badge always names the row it opens.
+                        let enabledIDs = results.filter(\.isEnabled).map(\.stableID)
                         ForEach(results) { item in
-                            row(item)
+                            row(item, digit: enabledIDs.firstIndex(of: item.stableID).flatMap { $0 < 9 ? $0 + 1 : nil })
                         }
                     }
                     .padding(8)
@@ -375,6 +528,7 @@ struct CommandPaletteView: View {
             HStack(spacing: 14) {
                 Text("↑↓ / ⇧⇥ ⇥  select")
                 Text("↵  open")
+                Text("⌘1–9  jump")
                 Text("esc  dismiss")
                 Spacer()
                 Text("\(results.count) results")
@@ -390,13 +544,15 @@ struct CommandPaletteView: View {
         }
     }
 
-    private func row(_ item: MuxaPaletteItem) -> some View {
+    private func row(_ item: MuxaPaletteItem, digit: Int?) -> some View {
         Button {
             selectedID = item.stableID
             choose(item.stableID)
         } label: {
             HStack(spacing: 10) {
-                Image(systemName: item.systemImage).frame(width: 22)
+                Image(systemName: item.systemImage)
+                    .foregroundStyle(item.tint ?? Color.primary)
+                    .frame(width: 22)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(item.title).font(.body).lineLimit(1)
                     if !item.subtitle.isEmpty {
@@ -405,8 +561,20 @@ struct CommandPaletteView: View {
                     }
                 }
                 Spacer(minLength: 0)
+                if let host = item.host { MuxaPaletteHostBadge(host: host) }
                 if !item.isEnabled { Image(systemName: "lock").font(.caption) }
-                if item.stableID == selectedID { Image(systemName: "return").font(.caption) }
+                if let shortcut = item.shortcut {
+                    Text(verbatim: shortcut)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                if item.stableID == selectedID {
+                    Image(systemName: "return").font(.caption)
+                } else if let digit, item.shortcut == nil {
+                    Text(verbatim: "⌘\(digit)")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.tertiary)
+                }
             }
             .padding(.horizontal, 10).padding(.vertical, 9)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -448,11 +616,37 @@ struct CommandPaletteView: View {
     }
 }
 
+/// The host a ⌘J row's agent runs on: its identity icon and alias, plus the
+/// host's state while its snapshot is stale.
+private struct MuxaPaletteHostBadge: View {
+    let host: MuxaFleetHostIdentity
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        let live = MuxaAttention.isReachable(host)
+        HStack(spacing: 4) {
+            HostIdentityBadge(identity: host, size: 13)
+            Text(verbatim: live ? host.alias : "\(host.alias) · \(fleetHostStateLabel(host.state))")
+                .lineLimit(1)
+        }
+        .font(.caption)
+        .foregroundStyle(live ? Color.primary : Color.secondary)
+        .padding(.leading, 3)
+        .padding(.trailing, 6)
+        .padding(.vertical, 2)
+        .background(MuxaTheme.segmentTrack(colorScheme), in: Capsule())
+        .fixedSize()
+        .accessibilityElement(children: .combine)
+    }
+}
+
 struct MuxaPaletteSearchField: NSViewRepresentable {
     @Binding var text: String
     let placeholder: String
     let onKey: (MuxaPaletteKeyDecision) -> Void
     let onModeChange: (MuxaPaletteMode) -> Void
+    var onJump: (Int) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -462,6 +656,7 @@ struct MuxaPaletteSearchField: NSViewRepresentable {
         field.isEditable = true
         field.isSelectable = true
         field.onModeChange = onModeChange
+        field.onJump = onJump
         field.isBezeled = false
         field.drawsBackground = false
         field.focusRingType = .none
@@ -477,6 +672,7 @@ struct MuxaPaletteSearchField: NSViewRepresentable {
     func updateNSView(_ field: NSTextField, context: Context) {
         context.coordinator.parent = self
         (field as? MuxaPaletteTextField)?.onModeChange = onModeChange
+        (field as? MuxaPaletteTextField)?.onJump = onJump
         field.placeholderString = placeholder
         field.setAccessibilityLabel(placeholder)
         if field.stringValue != text, (field.currentEditor() as? NSTextView)?.hasMarkedText() != true {
@@ -510,10 +706,17 @@ final class MuxaPaletteTextField: NSTextField {
     var onModeChange: (MuxaPaletteMode) -> Void = { _ in } {
         didSet { (cell as? MuxaPaletteTextFieldCell)?.editor.onModeChange = onModeChange }
     }
+    var onJump: (Int) -> Void = { _ in } {
+        didSet { (cell as? MuxaPaletteTextFieldCell)?.editor.onJump = onJump }
+    }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if let mode = MuxaPaletteMode.shortcut(characters: event.charactersIgnoringModifiers, modifiers: event.modifierFlags) {
             onModeChange(mode)
+            return true
+        }
+        if let index = MuxaPaletteMode.resultIndex(characters: event.charactersIgnoringModifiers, modifiers: event.modifierFlags) {
+            onJump(index)
             return true
         }
         return super.performKeyEquivalent(with: event)
@@ -545,10 +748,15 @@ private final class MuxaPaletteTextFieldCell: NSTextFieldCell {
 private final class MuxaPaletteFieldEditor: NSTextView {
     private(set) var beganWithMarkedText = false
     var onModeChange: (MuxaPaletteMode) -> Void = { _ in }
+    var onJump: (Int) -> Void = { _ in }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if let mode = MuxaPaletteMode.shortcut(characters: event.charactersIgnoringModifiers, modifiers: event.modifierFlags) {
             onModeChange(mode)
+            return true
+        }
+        if let index = MuxaPaletteMode.resultIndex(characters: event.charactersIgnoringModifiers, modifiers: event.modifierFlags) {
+            onJump(index)
             return true
         }
         return super.performKeyEquivalent(with: event)

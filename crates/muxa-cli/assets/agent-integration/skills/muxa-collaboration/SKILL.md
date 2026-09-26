@@ -84,3 +84,12 @@ or turn Muxa feedback into a GitHub PR workflow without grounded PR context.
 For concrete review, parallel implementation, and incoming-work examples, read
 [references/workflows.md](references/workflows.md) when helpful. Muxa's
 `[message.skills]` are outgoing prompt templates, distinct from this agent skill.
+
+## Fleet Work dispatch
+
+When the installed tools advertise `muxa_dispatch_work`, use it for authorized
+work placement. Supply a UUID dispatch_id, workspace, Work, exact commit and
+bounded objective. Muxa resolves node selection and personalized paths; do not
+copy host inventories into prompts. Reuse the ID after uncertain delivery and
+read `muxa_dispatch_status` before any recovery. Launched means started, not
+completed. Use the existing request for updates; report artifacts or blockers.

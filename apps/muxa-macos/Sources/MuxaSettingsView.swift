@@ -32,6 +32,7 @@ enum MuxaSettingsTab: String, CaseIterable, Identifiable {
     case behaviour
     case modules
     case fleet
+    case dispatch
     case runtime
     case advanced
 
@@ -86,6 +87,10 @@ struct MuxaSettingsView: View {
             MuxaFleetSettingsPane(model: model)
                 .tabItem { Label("Hosts", systemImage: "server.rack") }
                 .tag(MuxaSettingsTab.fleet.rawValue)
+
+            FleetDispatchSettingsView(model: model)
+                .tabItem { Label("Dispatch", systemImage: "network") }
+                .tag(MuxaSettingsTab.dispatch.rawValue)
 
             MuxaRuntimeSettingsPane(model: model)
                 .tabItem { Label("Runtime", systemImage: "terminal") }
@@ -233,6 +238,12 @@ private struct MuxaFleetSettingsPane: View {
                     LazyVStack(spacing: 10) {
                         ForEach(hosts) { host in
                             MuxaFleetSettingsRow(host: host)
+                        }
+                        if !hosts.contains(where: { !$0.local }) {
+                            Label("No SSH hosts yet. Add one to watch its panes and run Work on it from this Mac.", systemImage: "info.circle")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
                     .padding(16)

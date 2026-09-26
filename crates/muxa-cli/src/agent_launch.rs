@@ -261,9 +261,13 @@ pub struct StartArgs {
     /// to it, so a repeated flag never reaches the CLI twice.
     #[arg(long = "option")]
     pub options: Vec<String>,
-    /// Split to the right (default) or below the target pane.
-    #[arg(long, value_enum, default_value = "right")]
-    pub direction: SplitDirection,
+    /// Split to the right (the tmux default) or below the target pane.
+    ///
+    /// Optional rather than defaulting to `right`: a default the caller
+    /// never typed used to trip the native host's "--direction requires
+    /// tmux" check, so a plain `muxa agent start` outside tmux always failed.
+    #[arg(long, value_enum)]
+    pub direction: Option<SplitDirection>,
     /// Emit the structured result as JSON.
     #[arg(long)]
     pub json: bool,
@@ -365,7 +369,7 @@ impl StartRequest {
             task: args.task.clone(),
             alias: args.alias.clone(),
             generation: None,
-            direction: args.direction,
+            direction: args.direction.unwrap_or(SplitDirection::Right),
             socket: socket.to_path_buf(),
         }
     }
@@ -491,23 +495,8 @@ async fn run_native(
     socket_path: &Path,
     cfg: &muxa::config::Config,
 ) -> Result<()> {
-    if args.work.is_some() || args.workspace.is_some() {
-        bail!(
-            "managed --work/--workspace launch is not available on the native host yet; use --host tmux or `muxa run`"
-        );
-    }
-    if args.target.is_some() || args.placement != Placement::Pane {
-        bail!(
-            "--target and non-pane --placement require tmux; omit them for a native session or use --host tmux"
-        );
-    }
-    if !matches!(args.direction, SplitDirection::Auto) {
-        bail!("--direction requires tmux; omit it for a native session or use --host tmux");
-    }
-    if args.role.is_some() || args.task.is_some() || args.alias.is_some() {
-        bail!(
-            "--role, --task, and --alias require a managed Work binding, which is not available on the native host yet"
-        );
+    if let Some(refusal) = native_refusal(&args) {
+        bail!(refusal);
     }
 
     let cwd_source = args.cwd.unwrap_or(std::env::current_dir()?);
@@ -578,6 +567,32 @@ async fn run_native(
         );
     }
     Ok(())
+}
+
+/// Why `args` cannot start on the native host, or `None` when they can.
+fn native_refusal(args: &StartArgs) -> Option<&'static str> {
+    if args.work.is_some() || args.workspace.is_some() {
+        return Some(
+            "managed --work/--workspace launch is not available on the native host yet; use --host tmux or `muxa run`",
+        );
+    }
+    if args.target.is_some() || args.placement != Placement::Pane {
+        return Some(
+            "--target and non-pane --placement require tmux; omit them for a native session or use --host tmux",
+        );
+    }
+    if args
+        .direction
+        .is_some_and(|direction| direction != SplitDirection::Auto)
+    {
+        return Some("--direction requires tmux; omit it for a native session or use --host tmux");
+    }
+    if args.role.is_some() || args.task.is_some() || args.alias.is_some() {
+        return Some(
+            "--role, --task, and --alias require a managed Work binding, which is not available on the native host yet",
+        );
+    }
+    None
 }
 
 pub fn run_work_start(
@@ -1152,12 +1167,52 @@ mod tests {
             task: None,
             alias: Some("reviewer".into()),
             options: Vec::new(),
-            direction: SplitDirection::Right,
+            direction: Some(SplitDirection::Right),
             json: false,
         };
         let socket = PathBuf::from("/tmp/somewhere-else.sock");
         let cfg = muxa::config::Config::default();
         assert_eq!(StartRequest::from_args(&args, &socket, &cfg).socket, socket);
+    }
+
+    /// A plain `muxa agent start --agent claude` outside tmux resolves to the
+    /// native host. The direction the caller never typed must not refuse it,
+    /// while the tmux host keeps splitting right by default.
+    #[test]
+    fn omitted_direction_starts_natively_and_splits_right_in_tmux() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Harness {
+            #[command(flatten)]
+            start: StartArgs,
+        }
+        let parse = |argv: &[&str]| {
+            Harness::try_parse_from(std::iter::once("start").chain(argv.iter().copied()))
+                .unwrap()
+                .start
+        };
+        let plain = parse(&["--agent", "claude"]);
+        assert_eq!(plain.direction, None);
+        assert_eq!(native_refusal(&plain), None);
+        let cfg = muxa::config::Config::default();
+        let socket = PathBuf::from("/tmp/muxa.sock");
+        assert_eq!(
+            StartRequest::from_args(&plain, &socket, &cfg).direction,
+            SplitDirection::Right
+        );
+        assert_eq!(
+            native_refusal(&parse(&["--agent", "claude", "--direction", "auto"])),
+            None
+        );
+        assert!(native_refusal(&parse(&["--agent", "claude", "--direction", "down"])).is_some());
+        // The app passes every value as `--flag=value`; clap reads both.
+        let joined = parse(&[
+            "--agent=codex",
+            "--option=--model",
+            "--prompt=-x starts with a dash",
+        ]);
+        assert_eq!(joined.options, ["--model"]);
+        assert_eq!(joined.prompt.as_deref(), Some("-x starts with a dash"));
     }
 
     fn request(agent: AgentProgram, placement: Placement) -> StartRequest {

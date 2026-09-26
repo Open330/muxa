@@ -26,6 +26,9 @@ use crate::backend::{ObservationCompleteness, PaneObservation};
 /// daemon reconciler; without a guard, a wedged tmux server can hold the
 /// first watch refresh for many seconds.
 const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+/// A control command that may have to start the server first: sourcing a
+/// `tmux.conf` with plugins takes longer than a call on a running server.
+const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Absolute path to the `tmux` binary, resolved once per process.
 ///
@@ -265,7 +268,7 @@ pub fn tmux_command_scoped() -> Command {
 /// [`scanner::enumerate_sockets`] (which already honors `MUXA_TMUX_SOCKET`
 /// scoping and the macOS `/tmp`↔`/private/tmp` split) keeps the targeting
 /// byte-identical to how the pane was discovered in the first place.
-fn resolve_socket_path(short_name: &str) -> Option<PathBuf> {
+pub fn resolve_socket_path(short_name: &str) -> Option<PathBuf> {
     let short_name = short_name.trim();
     if short_name.is_empty() {
         return None;
@@ -275,6 +278,29 @@ fn resolve_socket_path(short_name: &str) -> Option<PathBuf> {
         .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(short_name))
 }
 
+/// Where a tmux server named `socket` listens, whether or not it is running.
+///
+/// A value carrying a `/` is already a path and is used verbatim. A short name
+/// resolves to the live socket when one exists, and otherwise to the path tmux
+/// itself would create for `-L <name>` — `$TMUX_TMPDIR/tmux-$UID/<name>`, or
+/// `/tmp/tmux-$UID/<name>`. That second case is what a restart needs: right
+/// after `kill-server` the socket file is gone, and [`resolve_socket_path`]
+/// alone would answer `None` for the very server about to be recreated.
+#[must_use]
+pub fn socket_path_or_default(socket: &str) -> PathBuf {
+    let socket = socket.trim();
+    if socket.contains('/') {
+        return PathBuf::from(socket);
+    }
+    resolve_socket_path(socket).unwrap_or_else(|| {
+        scanner::default_socket_dirs()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(socket)
+    })
+}
+
 /// Build a tmux `Command` pinned to the specific server named by `socket` (a
 /// pane row's recorded short socket name). Resolves the name to the live
 /// server's full socket path and passes `-S <path>` so the command can't leak
@@ -282,14 +308,22 @@ fn resolve_socket_path(short_name: &str) -> Option<PathBuf> {
 ///
 /// Falls back to [`tmux_command_scoped`] only when `socket` is `None`, i.e.
 /// when the caller has no recorded endpoint and explicitly requested the
-/// legacy single-server behavior. A supplied socket that no longer resolves
-/// is pinned to `/dev/null` so the command fails closed instead of leaking to
-/// the default server where the same `$N`, `@N`, or `%N` may exist.
+/// legacy single-server behavior. A full socket path is used as given. A
+/// supplied short name that no longer resolves is pinned to `/dev/null` so
+/// the command fails closed instead of leaking to the default server where
+/// the same `$N`, `@N`, or `%N` may exist.
 fn tmux_command_targeting(socket: Option<&str>) -> Command {
     if let Some(socket) = socket {
         let mut cmd = tmux_command();
-        cmd.arg("-S")
-            .arg(resolve_socket_path(socket).unwrap_or_else(|| PathBuf::from("/dev/null")));
+        // A full path names exactly one server already; only a short name
+        // needs the enumeration, which matches on basenames and so would
+        // never recognise a path.
+        let path = if socket.contains('/') {
+            PathBuf::from(socket.trim())
+        } else {
+            resolve_socket_path(socket).unwrap_or_else(|| PathBuf::from("/dev/null"))
+        };
+        cmd.arg("-S").arg(path);
         return cmd;
     }
     tmux_command_scoped()
@@ -339,6 +373,29 @@ pub fn capture_control_on(socket: Option<&str>, args: &[&str]) -> Result<String,
         cmd,
         TMUX_COMMAND_TIMEOUT,
         format!("tmux {}", args.join(" ")),
+    )?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))
+}
+
+/// Run one tmux control command against a server socket *path*, verbatim.
+///
+/// Unlike [`capture_control_on`], the path is not required to name a live
+/// server: this is how a server is brought back at the same path after a
+/// `kill-server`, where nothing is left to resolve a short name against.
+/// Bringing a server up sources the user's config, so the wait is longer
+/// than for a control command on a running one.
+pub fn capture_control_at(path: &std::path::Path, args: &[&str]) -> Result<String, TmuxError> {
+    let mut cmd = tmux_command();
+    cmd.arg("-S").arg(path).args(args);
+    let out = command_output_with_timeout(
+        cmd,
+        SERVER_START_TIMEOUT,
+        format!("tmux -S {} {}", path.display(), args.join(" ")),
     )?;
     if !out.status.success() {
         return Err(TmuxError::NonZero(
@@ -1355,12 +1412,46 @@ mod tests {
 
     #[test]
     fn unresolved_explicit_socket_fails_closed_instead_of_using_default_server() {
-        let command = tmux_command_targeting(Some("/__muxa_missing_socket__"));
+        let command = tmux_command_targeting(Some("__muxa_missing_socket__"));
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(args.windows(2).any(|pair| pair == ["-S", "/dev/null"]));
+    }
+
+    #[test]
+    fn an_explicit_socket_path_is_used_verbatim() {
+        // A path names one server already. Matching it against the socket
+        // enumeration (which compares basenames) could only ever miss.
+        let command = tmux_command_targeting(Some("/tmp/muxa-test/custom"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-S", "/tmp/muxa-test/custom"]));
+    }
+
+    #[test]
+    fn a_stopped_server_still_has_a_socket_path() {
+        // Right after `kill-server` the socket file is gone; the name must
+        // still point where tmux will recreate it, not at `/dev/null`.
+        let path = socket_path_or_default("__muxa_stopped_server__");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("__muxa_stopped_server__")
+        );
+        assert!(path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(|dir| dir.starts_with("tmux-")));
+        assert_eq!(
+            socket_path_or_default("/tmp/elsewhere/sock"),
+            PathBuf::from("/tmp/elsewhere/sock")
+        );
     }
 
     #[test]

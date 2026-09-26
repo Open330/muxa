@@ -1,6 +1,7 @@
 //! Endpoint-aware control for the tmux-compatible hosts. Never send an rmux
 //! socket to the native tmux binary, even when both expose the same ids.
 use muxa::{BackendEndpoint, HostKind};
+use std::path::Path;
 use std::process::Command;
 
 pub fn supported(host: HostKind) -> bool {
@@ -27,9 +28,26 @@ pub fn ambient_command_with_args<S: AsRef<str>>(args: &[S]) -> anyhow::Result<Co
     Ok(command)
 }
 
+/// A tmux endpoint names its server either by the short socket name muxad
+/// records on a pane (`default`), which must resolve to a live server, or by
+/// the socket's absolute path, which is taken as given — that is the only way
+/// to address a server that is not running yet, such as one being brought
+/// back after `kill-server`.
+fn tmux_socket_path(endpoint: &BackendEndpoint) -> Option<&Path> {
+    let path = Path::new(&endpoint.socket);
+    path.is_absolute().then_some(path)
+}
+
 pub fn command(endpoint: &BackendEndpoint) -> Result<Command, String> {
     match endpoint.host {
-        HostKind::Tmux => Ok(muxa::tmux::tmux_command_on(Some(&endpoint.socket))),
+        HostKind::Tmux => Ok(match tmux_socket_path(endpoint) {
+            Some(path) => {
+                let mut command = muxa::tmux::tmux_command();
+                command.arg("-S").arg(path);
+                command
+            }
+            None => muxa::tmux::tmux_command_on(Some(&endpoint.socket)),
+        }),
         HostKind::Rmux => Ok(muxa::RmuxBackend::with_endpoint(&endpoint.socket).command(None)),
         host => Err(format!("{host} does not support this operation")),
     }
@@ -37,8 +55,11 @@ pub fn command(endpoint: &BackendEndpoint) -> Result<Command, String> {
 
 pub fn capture(endpoint: &BackendEndpoint, args: &[&str]) -> Result<String, String> {
     match endpoint.host {
-        HostKind::Tmux => muxa::tmux::capture_control_on(Some(&endpoint.socket), args)
-            .map_err(|error| error.to_string()),
+        HostKind::Tmux => match tmux_socket_path(endpoint) {
+            Some(path) => muxa::tmux::capture_control_at(path, args),
+            None => muxa::tmux::capture_control_on(Some(&endpoint.socket), args),
+        }
+        .map_err(|error| error.to_string()),
         HostKind::Rmux => muxa::RmuxBackend::with_endpoint(&endpoint.socket).capture_control(args),
         host => Err(format!("{host} does not support this operation")),
     }
@@ -147,18 +168,24 @@ mod tests {
                 socket: "/tmp/selected-server.sock".into(),
             };
             let cmd = command(&endpoint).unwrap();
-            let expected_socket = if host == HostKind::Tmux {
-                "/dev/null"
-            } else {
-                "/tmp/selected-server.sock"
-            };
-            assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["-S", expected_socket]);
+            // An absolute path is the caller naming a server, running or
+            // not; only a short name has to resolve to a live one.
+            assert_eq!(
+                cmd.get_args().collect::<Vec<_>>(),
+                ["-S", "/tmp/selected-server.sock"]
+            );
             let program = std::path::Path::new(cmd.get_program())
                 .file_name()
                 .unwrap()
                 .to_string_lossy();
             assert_eq!(program.contains("rmux"), host == HostKind::Rmux);
         }
+        let by_name = command(&BackendEndpoint {
+            host: HostKind::Tmux,
+            socket: "__muxa_no_such_server__".into(),
+        })
+        .unwrap();
+        assert_eq!(by_name.get_args().collect::<Vec<_>>(), ["-S", "/dev/null"]);
         assert!(command(&BackendEndpoint {
             host: HostKind::Zellij,
             socket: String::new()

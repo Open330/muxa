@@ -18,6 +18,12 @@ struct BehaviourSettingsPane: View {
 
     var body: some View {
         Form {
+            // WS-A: the Mac app's own notifications and Dock badge.
+            MuxaAppNotificationsSection(
+                attention: model.attention,
+                daemonNotifierEnabled: store.behaviour.notifierEnabled
+            )
+
             Section("Notifications") {
                 Toggle("Post a desktop notification when an agent needs you", isOn: $settings.notifierEnabled)
                 Picker("Delivery", selection: $settings.notifierBackend) {

@@ -252,7 +252,7 @@ fn classify_socket_connect(result: std::io::Result<()>) -> bool {
     }
 }
 
-fn default_socket_dirs() -> Vec<PathBuf> {
+pub(crate) fn default_socket_dirs() -> Vec<PathBuf> {
     let uid = current_uid();
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Ok(d) = std::env::var("TMUX_TMPDIR") {

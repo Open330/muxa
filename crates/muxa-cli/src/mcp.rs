@@ -653,11 +653,24 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             }
         }),
         json!({
+            "name":"muxa_dispatch_work",
+            "description":"Delegate authorized Work through the shared Fleet coordinator. Resolves node selectors and personalized paths, prepares an isolated worktree at an exact commit, and launches the configured pipeline. Reuse dispatch_id on retries. plan=true is read-only; launched means started, not completed.",
+            "inputSchema":{"type":"object","required":["dispatch_id","workspace","work","commit","body"],"properties":{
+                "dispatch_id":{"type":"string"},"workspace":{"type":"string"},"work":{"type":"string"},"commit":{"type":"string"},"body":{"type":"string"},"selector":{"type":"string"},"host":{"type":"string"},"plan":{"type":"boolean","default":false}
+            }}
+        }),
+        json!({
+            "name":"muxa_dispatch_status","description":"Read the durable Fleet dispatch by UUID through the shared coordinator. Does not repeat execution.",
+            "inputSchema":{"type":"object","required":["dispatch_id"],"properties":{"dispatch_id":{"type":"string"}}}
+        }),
+        json!({
             "name": "muxa_fleet_call_peer",
             "description": "Send one durable structured collaboration request to one exact agent pane on a named Fleet host and optionally wait for its reply. The host and pane are always explicit; this tool never auto-selects or spawns a remote agent. Remote hosts must be configured mode='control' and advertise collaboration reply support. Defaults to review + read_only. Set execute=true only after explicit user authorization. If the bounded wait expires, continue with muxa_fleet_wait_reply and the returned pane_key.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "dispatch_id": {"type":"string", "description":"UUID for this dispatch. Reuse unchanged on any uncertain-delivery retry."},
+                    "delegation_parent": {"type":"object", "required":["node_id","request_id"], "properties":{"node_id":{"type":"string"},"request_id":{"type":"string"}}},
                     "host": { "type": "string", "description": "Exact Fleet host alias. The remote host must be explicitly configured mode='control'." },
                     "pane": { "type": "string", "description": "Exact or unambiguous live pane id/path, for example %12 or session/window/%12." },
                     "intent": { "type": "string", "enum": ["review", "question", "task"], "description": "Default review." },
@@ -1234,6 +1247,53 @@ async fn call_tool(
                     Err(error) => error_result(&format!("fleet send prompt failed: {error}")),
                 },
             )
+        }
+        "muxa_dispatch_work" => {
+            let mut command = vec!["work".to_string(), "dispatch".to_string()];
+            if args.get("plan").and_then(Value::as_bool).unwrap_or(false) {
+                command.push("--plan".into());
+            }
+            let mut request = args.clone();
+            if let Some(object) = request.as_object_mut() {
+                object.remove("plan");
+            }
+            match client
+                .work_command(None, &command, Some(&request.to_string()))
+                .await
+            {
+                Ok(output) if output.exit_code == 0 => {
+                    match serde_json::from_str::<Value>(&output.stdout) {
+                        Ok(value) => Ok(json_result(&value)),
+                        Err(e) => Ok(error_result(&e.to_string())),
+                    }
+                }
+                Ok(output) => Ok(error_result(&output.stderr)),
+                Err(e) => Ok(json_result(
+                    &json!({"state":"unknown","dispatch_id":args["dispatch_id"],"error":e.to_string(),"next_step":"read muxa_dispatch_status with this ID; do not create a replacement"}),
+                )),
+            }
+        }
+        "muxa_dispatch_status" => {
+            let Some(id) = args.get("dispatch_id").and_then(Value::as_str) else {
+                return Ok(error_result("dispatch_id required"));
+            };
+            match client
+                .work_command(
+                    None,
+                    &["work".into(), "dispatch-status".into(), id.into()],
+                    None,
+                )
+                .await
+            {
+                Ok(output) if output.exit_code == 0 => {
+                    match serde_json::from_str::<Value>(&output.stdout) {
+                        Ok(v) => Ok(json_result(&v)),
+                        Err(e) => Ok(error_result(&e.to_string())),
+                    }
+                }
+                Ok(output) => Ok(error_result(&output.stderr)),
+                Err(e) => Ok(error_result(&e.to_string())),
+            }
         }
         "muxa_fleet_call_peer" => Ok(fleet_call_peer(client, &args, &config.message.skills).await),
         "muxa_fleet_wait_reply" => Ok(fleet_wait_reply(client, &args).await),
@@ -1923,6 +1983,51 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
     }
 }
 
+/// Durable sender receipt written before any remote effect. A restarted caller
+/// can recover the deterministic request ID without inventing another task.
+fn persist_peer_dispatch(
+    id: &str,
+    host: &str,
+    node_id: &muxa::NodeId,
+    pane: &muxa::PaneKey,
+    request: &NewRequest,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let root =
+        muxa::paths::default_node_id_file().ok_or_else(|| anyhow::anyhow!("no data directory"))?;
+    let dir = root
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("no data parent"))?
+        .join("dispatches/peer-outbox");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{id}.json"));
+    let mut contract = serde_json::to_value(request)?;
+    // Agent state/cwd changes between retries are advisory, not a new task.
+    contract.as_object_mut().unwrap().remove("initiator");
+    let value = json!({"host":host,"node_id":node_id,"pane_key":pane,"request":contract,"request_id":format!("dispatch-{id}")});
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(&serde_json::to_vec(&value)?)?;
+            file.sync_all()?;
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+            if existing != value {
+                anyhow::bail!("dispatch_id already journals a different target or payload");
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
 /// Durable colleague call across a named physical Fleet host.
 ///
 /// Unlike the same-window call surface, every routing dimension is explicit:
@@ -1982,6 +2087,42 @@ async fn fleet_call_peer(
         Ok(target) => target,
         Err(error) => return error_result(&format!("fleet_call_peer failed: {error}")),
     };
+    let dispatch_id = match request.dispatch_id.as_deref() {
+        Some(id) => match uuid::Uuid::parse_str(id) {
+            Ok(id) => id.to_string(),
+            Err(_) => return error_result("dispatch_id must be a UUID"),
+        },
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+    request.dispatch_id = Some(dispatch_id.clone());
+    let snapshot = match client.fleet_snapshot(None).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return error_result(&error.to_string()),
+    };
+    request.source_node_id = snapshot
+        .hosts
+        .iter()
+        .find(|h| h.local)
+        .and_then(|h| h.node_id.clone());
+    if !snapshot.hosts.iter().any(|h| {
+        h.alias == host
+            && h.capabilities
+                .iter()
+                .any(|c| c == "collaboration_dispatch_v1")
+    }) {
+        return error_result("target must advertise collaboration_dispatch_v1; upgrade its muxa and muxad before durable dispatch");
+    }
+    let Some(node_id) = snapshot
+        .hosts
+        .iter()
+        .find(|h| h.alias == host)
+        .and_then(|h| h.node_id.as_ref())
+    else {
+        return error_result("target NodeId unavailable; refusing an unpinned peer dispatch");
+    };
+    if let Err(error) = persist_peer_dispatch(&dispatch_id, host, node_id, &pane_key, &request) {
+        return error_result(&format!("cannot journal dispatch before sending: {error}"));
+    }
     let result = match client
         .fleet_execute(
             host,
@@ -1993,12 +2134,20 @@ async fn fleet_call_peer(
         .await
     {
         Ok(result) => result,
-        Err(error) => return error_result(&format!("fleet_call_peer send failed: {error}")),
+        Err(error) => {
+            return json_result(&json!({
+                "sent": null, "completed": false, "reason": "delivery_unknown",
+                "dispatch_id": dispatch_id, "request_id": format!("dispatch-{dispatch_id}"),
+                "host": host, "pane_key": pane_key, "error": error.to_string(),
+                "next_step": "Look up this exact request first. Retry only with the same dispatch_id and unchanged payload; never create a replacement automatically."
+            }))
+        }
     };
     let Some(sent) = result.collaboration_request.map(|request| *request) else {
         return error_result("fleet_call_peer send returned no collaboration request");
     };
     let common = json!({
+        "dispatch_id": dispatch_id,
         "sent": true,
         "host": host,
         "pane_key": pane_key,
@@ -2939,6 +3088,13 @@ fn new_request_from_args(
     air_artifacts: Vec<AirArtifactReference>,
 ) -> std::result::Result<NewRequest, String> {
     Ok(NewRequest {
+        dispatch_id: optional_string(args, "dispatch_id")?,
+        source_node_id: None,
+        delegation_parent: args
+            .get("delegation_parent")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .map_err(|e| format!("invalid delegation_parent: {e}"))?,
         initiator: None,
         kind,
         body,
@@ -3824,6 +3980,8 @@ mod tests {
                 "muxa_fleet_status",
                 "muxa_fleet_capture",
                 "muxa_fleet_send_prompt",
+                "muxa_dispatch_work",
+                "muxa_dispatch_status",
                 "muxa_fleet_call_peer",
                 "muxa_update_request",
                 "muxa_fleet_update_request",

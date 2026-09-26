@@ -60,10 +60,12 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     "send_prompt",
     "collaboration",
     "collaboration_get",
+    "collaboration_dispatch_v1",
     "collaboration_update",
     FLEET_MAILBOX_WATCH_CAPABILITY,
     "exact_pane_ref",
     "labels_v1",
+    "orchestration_v1",
     "raw_capture_base64",
     FLEET_WORK_COMMAND_CAPABILITY,
 ];
@@ -1471,6 +1473,9 @@ mod tests {
             request_id: "relay-1".into(),
             pane: pane.clone(),
             request: Box::new(NewRequest {
+                dispatch_id: None,
+                source_node_id: None,
+                delegation_parent: None,
                 initiator: None,
                 kind: crate::collaboration::RequestKind::Review,
                 body: "review this change".into(),

@@ -114,7 +114,7 @@ struct PipelineComposerView: View {
                     .padding(.vertical, 3)
                 ForEach(PipelineComposerSession.examples, id: \.self) { example in
                     Button(example) { session.useExample(example) }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.muxaSecondary)
                         .controlSize(.small)
                         .disabled(session.isDrafting)
                 }
@@ -142,7 +142,7 @@ struct PipelineComposerView: View {
                     } label: {
                         Label(session.hasDraft ? "Draft again" : "Draft pipeline", systemImage: "sparkles")
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.muxaPrimary)
                     .keyboardShortcut(.return, modifiers: .command)
                     .disabled(!session.canDraft)
                     .help("Ask the provider for a pipeline that matches the description (⌘↩)")
@@ -313,7 +313,7 @@ struct PipelineComposerView: View {
                 } label: {
                     Label("Save to Library", systemImage: "square.and.arrow.down")
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.muxaPrimary)
                 .disabled(!session.canSave || isSaving)
             }
         }

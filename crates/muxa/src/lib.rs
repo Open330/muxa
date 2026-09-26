@@ -35,6 +35,7 @@
 
 pub mod activity;
 pub mod adapters;
+pub mod agent_control;
 pub mod ask;
 pub mod automation;
 pub mod automation_judge;
@@ -53,6 +54,7 @@ pub mod history;
 pub mod ipc;
 pub mod metrics;
 pub mod notify;
+pub mod orchestration;
 pub mod paths;
 pub mod pipeline;
 pub mod pipeline_run;
@@ -74,6 +76,8 @@ pub mod work;
 pub mod work_compose;
 #[doc(hidden)]
 pub mod work_control;
+// WS-F: snapshot
+pub mod mux_snapshot_control;
 pub mod work_pipeline_spec;
 pub mod work_presets;
 

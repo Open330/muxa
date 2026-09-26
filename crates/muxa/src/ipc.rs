@@ -103,6 +103,12 @@ const fn default_session_wait_ms() -> u64 {
     15_000
 }
 
+/// A snapshot plan or restore leaves existing sessions alone unless the
+/// client says otherwise (`mux_snapshot_plan_v1`).
+const fn mux_snapshot_only_missing() -> bool {
+    true
+}
+
 /// Overall deadline for a client request/response round trip (connect +
 /// hello + write + read). No caller should ever block forever against a
 /// wedged or half-dead daemon.
@@ -200,6 +206,47 @@ enum RequestBody {
         #[serde(default)]
         stdin: Option<String>,
     },
+    // WS-B: new agent
+    /// Start one allowlisted agent through `muxa agent start --json`, on
+    /// this host or a control-mode Fleet host. Synchronous, bounded to 30 s.
+    AgentStart {
+        request: crate::agent_control::AgentStartRequest,
+    },
+    // WS-F: snapshot
+    /// Workspace snapshots, run through `muxa snapshot` / `muxa restore
+    /// --json` (`mux_snapshot_v1`). Local host only. Newest first.
+    MuxSnapshotList,
+    /// Take a manual snapshot of the server muxa's agents are on.
+    MuxSnapshotSave,
+    /// Dry-run a restore of one snapshot: per session "create" or "skip",
+    /// and (`mux_snapshot_plan_v1`) what is missing, present or new since
+    /// the snapshot on the server now.
+    MuxSnapshotPlan {
+        id: String,
+        /// `mux_snapshot_plan_v1`: false plans existing sessions to get
+        /// the windows and panes they lack. Absent means true, which is
+        /// all a `mux_snapshot_v1` daemon does.
+        #[serde(default = "mux_snapshot_only_missing")]
+        only_missing: bool,
+    },
+    /// Start restoring the sessions of one snapshot that the server does
+    /// not have; unless `only_missing` is false (`mux_snapshot_plan_v1`),
+    /// existing sessions are never touched. Poll with
+    /// `mux_snapshot_restore_status`.
+    MuxSnapshotRestore {
+        id: String,
+        #[serde(default)]
+        layout_only: bool,
+        #[serde(default = "mux_snapshot_only_missing")]
+        only_missing: bool,
+    },
+    MuxSnapshotRestoreStatus {
+        operation_id: String,
+    },
+    MuxSnapshotDelete {
+        id: String,
+    },
+    // END WS-F: snapshot
     /// Draft one pipeline from a description with a read-only headless
     /// turn, validated with the `pipeline set` rules and retried once on a
     /// draft that would not launch. Writes nothing.
@@ -425,6 +472,11 @@ enum RequestBody {
     /// Hand out the daemon's `config.toml` as text, so a client can edit
     /// the sections that have no typed request of their own.
     ConfigRead {},
+    ConfigOrchestrationRead {},
+    ConfigOrchestrationWrite {
+        expected_text: String,
+        settings: crate::orchestration::OrchestrationConfig,
+    },
     ConfigLaunchRead {},
     ConfigLaunchWrite {
         expected_text: String,
@@ -708,6 +760,8 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_lifecycle",
     "collaboration_wait",
     "collaboration_subscribe",
+    "collaboration_dispatch_v1",
+    "orchestration_v1",
     "collaboration_identity",
     "collaboration_provenance",
     "collaboration_scope",
@@ -720,6 +774,9 @@ const CAPABILITIES: &[&str] = &[
     "pipeline_subscribe",
     "work_control_v1",
     "work_command_v1",
+    "agent_start_v1",  // WS-B: new agent
+    "mux_snapshot_v1", // WS-F: snapshot
+    "mux_snapshot_plan_v1",
     "handle_namespace_v1",
     "session_bytes_v1",
     "session_attachment_identity_v1",
@@ -734,6 +791,7 @@ const CAPABILITIES: &[&str] = &[
     "automation_v1",
     "automation_ask_v1",
     "config_launch_v1",
+    "config_orchestration_v1",
     "config_edit_v1",
 ];
 
@@ -853,6 +911,17 @@ pub struct Response {
     pub work_operation: Option<WorkUpOperation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_command: Option<WorkCommandOutput>,
+    /// `agent_start_v1`: the started agent's surface. WS-B: new agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_start: Option<crate::agent_control::AgentStartResult>,
+    // WS-F: snapshot
+    /// `mux_snapshot_v1`: the CLI's own JSON — the listing, a saved
+    /// snapshot, or a restore plan — passed through untouched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mux_snapshot: Option<serde_json::Value>,
+    /// `mux_snapshot_v1`: a restore operation and, once done, its report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mux_snapshot_operation: Option<crate::mux_snapshot_control::MuxSnapshotOperation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_compose: Option<WorkComposeOutput>,
     /// `automation_v1`: the rule list plus the engine's switch/pause.
@@ -868,6 +937,8 @@ pub struct Response {
     pub automation_judgment: Option<crate::automation_judge::AutomationJudgment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch: Option<crate::config_file::LaunchSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<crate::orchestration::OrchestrationConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -918,12 +989,16 @@ impl Response {
             pipeline_claims: None,
             work_operation: None,
             work_command: None,
+            agent_start: None,
+            mux_snapshot: None,
+            mux_snapshot_operation: None,
             work_compose: None,
             automation_rules: None,
             automation_log: None,
             automation_test: None,
             automation_judgment: None,
             launch: None,
+            orchestration: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -970,6 +1045,24 @@ impl Response {
     fn with_work_command(output: WorkCommandOutput) -> Self {
         let mut response = Self::ok();
         response.work_command = Some(output);
+        response
+    }
+    fn with_agent_start(result: crate::agent_control::AgentStartResult) -> Self {
+        let mut response = Self::ok();
+        response.agent_start = Some(result);
+        response
+    }
+    // WS-F: snapshot
+    fn with_mux_snapshot(value: serde_json::Value) -> Self {
+        let mut response = Self::ok();
+        response.mux_snapshot = Some(value);
+        response
+    }
+    fn with_mux_snapshot_operation(
+        operation: crate::mux_snapshot_control::MuxSnapshotOperation,
+    ) -> Self {
+        let mut response = Self::ok();
+        response.mux_snapshot_operation = Some(operation);
         response
     }
     fn with_work_compose(output: WorkComposeOutput) -> Self {
@@ -1248,6 +1341,7 @@ struct WorkUpOperations {
 
 struct WorkUpManager {
     socket_path: PathBuf,
+    config_path: Option<PathBuf>,
     /// Runs `work` argv on remote Fleet hosts. `None` while Fleet is not
     /// installed, in which case every non-local `host` is refused.
     remote: Option<Arc<dyn RemoteWorkRunner>>,
@@ -1324,6 +1418,7 @@ impl WorkUpManager {
     fn with_remote(socket_path: PathBuf, remote: Option<Arc<dyn RemoteWorkRunner>>) -> Arc<Self> {
         Arc::new(Self {
             socket_path,
+            config_path: None,
             remote,
             next_id: AtomicU64::new(1),
             operations: tokio::sync::Mutex::new(WorkUpOperations::default()),
@@ -1372,17 +1467,54 @@ impl WorkUpManager {
         let _permit = self.commands.try_acquire().map_err(|_| {
             format!("at most {MAX_CONCURRENT_WORK_COMMANDS} work commands may run at once")
         })?;
+        let limits = WorkCommandLimits::for_args(&args);
+        let mut local_args = args.clone();
+        if let Some(path) = &self.config_path {
+            local_args.splice(0..0, ["--config".into(), path.display().to_string()]);
+        }
         match remote {
             Some((host, runner)) => runner
-                .run(&host, args, stdin, WorkCommandLimits::COMMAND)
+                .run(&host, args, stdin, limits)
                 .await
                 .map_err(|error| error.to_string()),
             None => work_control::execute_work_command(
                 &work_control::resolve_muxa_binary(),
-                &args,
+                &local_args,
                 stdin.as_deref(),
                 Some(&self.socket_path),
-                WorkCommandLimits::COMMAND,
+                limits,
+            )
+            .await
+            .map_err(|error| error.to_string()),
+        }
+    }
+
+    // WS-B: new agent
+    /// Start one agent with the canonical `muxa agent start`, here or on a
+    /// control-mode Fleet host, sharing the `work_command` concurrency cap.
+    async fn agent_start(
+        &self,
+        request: crate::agent_control::AgentStartRequest,
+    ) -> Result<crate::agent_control::AgentStartResult, String> {
+        request.validate().map_err(|error| error.to_string())?;
+        let args = request.arguments();
+        let remote = self.remote_for(request.host.as_deref(), &args).await?;
+        let _permit = self.commands.try_acquire().map_err(|_| {
+            format!("at most {MAX_CONCURRENT_WORK_COMMANDS} work commands may run at once")
+        })?;
+        match remote {
+            Some((host, runner)) => {
+                let output = runner
+                    .run(&host, args, None, WorkCommandLimits::COMMAND)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                crate::agent_control::parse_output(&output, Some(&host))
+                    .map_err(|error| error.to_string())
+            }
+            None => crate::agent_control::execute_local(
+                &work_control::resolve_muxa_binary(),
+                &request,
+                Some(&self.socket_path),
             )
             .await
             .map_err(|error| error.to_string()),
@@ -1515,6 +1647,7 @@ pub struct Server {
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
     work_up: Arc<WorkUpManager>,
+    mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>, // WS-F: snapshot
     /// The daemon's `config.toml`, for the requests that read and replace it
     /// whole. `None` when muxad was started without one.
     config_path: Option<PathBuf>,
@@ -1525,6 +1658,8 @@ impl Server {
     pub fn new(socket_path: PathBuf, store: SharedStore) -> Self {
         let backend = default_backend();
         let work_up = WorkUpManager::new(socket_path.clone());
+        let mux_snapshots =
+            crate::mux_snapshot_control::MuxSnapshotControl::new(socket_path.clone());
         Self {
             socket_path,
             store,
@@ -1539,6 +1674,7 @@ impl Server {
             fleet: None,
             pipeline_runs: PipelineRunStore::in_memory(),
             work_up,
+            mux_snapshots,
             config_path: None,
             handler_limit: MAX_INFLIGHT_HANDLERS,
         }
@@ -1574,6 +1710,9 @@ impl Server {
     /// `config_write` can serve it. Without one, both refuse.
     #[must_use]
     pub fn with_config_path(mut self, path: Option<PathBuf>) -> Self {
+        if let Some(manager) = Arc::get_mut(&mut self.work_up) {
+            manager.config_path.clone_from(&path);
+        }
         self.config_path = path;
         self
     }
@@ -1629,7 +1768,22 @@ impl Server {
                 fleet: fleet.clone(),
             })),
         );
+        if let Some(manager) = Arc::get_mut(&mut self.work_up) {
+            manager.config_path.clone_from(&self.config_path);
+        }
         self.fleet = Some(fleet);
+        self
+    }
+
+    // WS-F: snapshot
+    /// Share muxad's snapshot control with its automatic-snapshot task, so a
+    /// restore started from the app holds that task off.
+    #[must_use]
+    pub fn with_mux_snapshots(
+        mut self,
+        mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>,
+    ) -> Self {
+        self.mux_snapshots = mux_snapshots;
         self
     }
 
@@ -1739,6 +1893,7 @@ impl Server {
                     let fleet = self.fleet.clone();
                     let pipeline_runs = self.pipeline_runs.clone();
                     let work_up = self.work_up.clone();
+                    let mux_snapshots = self.mux_snapshots.clone();
                     let config_path = self.config_path.clone();
                     let stopping = stopping_rx.clone();
                     handlers.spawn(async move {
@@ -1759,6 +1914,7 @@ impl Server {
                                 fleet,
                                 pipeline_runs,
                                 work_up,
+                                mux_snapshots,
                                 config_path,
                                 stopping,
                             ))
@@ -2676,6 +2832,18 @@ fn represented_participant(
     None
 }
 
+// WS-F: snapshot
+/// A finished snapshot request as a response: the CLI's document, or its
+/// error line.
+fn mux_snapshot_response(
+    outcome: Result<serde_json::Value, crate::mux_snapshot_control::MuxSnapshotError>,
+) -> Response {
+    match outcome {
+        Ok(value) => Response::with_mux_snapshot(value),
+        Err(error) => Response::err(error.to_string()),
+    }
+}
+
 async fn record_collaboration_audit(
     audit: &CollaborationAuditLog,
     actor: &CollaborationConnectionActor,
@@ -2703,6 +2871,42 @@ async fn record_collaboration_audit(
     audit.append(entry).await;
 }
 
+fn orchestration_config_response(
+    path: Option<&Path>,
+    update: Option<(&str, &crate::orchestration::OrchestrationConfig)>,
+) -> Response {
+    let Some(path) = path else {
+        return Response::err(NO_CONFIG_PATH);
+    };
+    let result = match update {
+        Some((expected, settings)) => {
+            crate::config_file::write_orchestration(path, expected, settings)
+        }
+        None => crate::config_file::read(path),
+    };
+    match result {
+        Ok(document) => match toml::from_str::<crate::Config>(&document.text) {
+            Ok(config) => {
+                let mut response = Response::with_config(document);
+                response.orchestration = Some(config.orchestration);
+                response
+            }
+            Err(e) => Response::err(e.to_string()),
+        },
+        Err(crate::config_file::ConfigFileError::Conflict { current }) => {
+            let mut response =
+                Response::err("config.toml changed; reload before saving Fleet policy");
+            response.config = Some(crate::config_file::ConfigDocument {
+                path: path.into(),
+                exists: true,
+                text: current,
+            });
+            response
+        }
+        Err(e) => Response::err(e.to_string()),
+    }
+}
+
 #[tracing::instrument(
     level = "debug",
     skip(
@@ -2718,7 +2922,8 @@ async fn record_collaboration_audit(
         restart,
         fleet,
         pipeline_runs,
-        work_up
+        work_up,
+        mux_snapshots
     )
 )]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // IPC dispatch table and its shared daemon state
@@ -2736,6 +2941,7 @@ async fn handle(
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
     work_up: Arc<WorkUpManager>,
+    mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>,
     config_path: Option<PathBuf>,
     mut stopping: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError> {
@@ -2810,6 +3016,64 @@ async fn handle(
         // logs rather than mis-attributing the timing.
         #[allow(unused_assignments)]
         let mut kind: &'static str = "dispatch_unknown";
+        // Global Ask has one owner. Entry hosts forward without replaying local history.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed).and_then(|value| {
+            let request: Request = serde_json::from_value(value.clone())?;
+            if negotiated.is_none() && request.protocol != 0 && request.protocol != PROTOCOL_VERSION
+            {
+                return Err(serde::de::Error::custom("protocol mismatch"));
+            }
+            Ok(value)
+        }) {
+            let ask_kind = value["kind"].as_str().unwrap_or("");
+            if crate::orchestration::shared_ask_kind(ask_kind) || ask_kind == "ask_subscribe" {
+                let policy = if let Ok(config) = config_path
+                    .as_deref()
+                    .map(|p| crate::Config::load_or_default(Some(p)))
+                    .transpose()
+                {
+                    config.map(|c| c.orchestration)
+                } else {
+                    let response = Response::err("cannot load coordinator routing configuration; refusing to fall back to a local Ask conversation");
+                    let bytes = encode_line(&response, negotiated.unwrap_or(PROTOCOL_VERSION))?;
+                    if !write_line_or_closed(&mut writer, &bytes).await? {
+                        return Ok(());
+                    }
+                    continue;
+                };
+                if let Some(host) = policy
+                    .filter(|p| p.enabled)
+                    .and_then(|p| p.coordinator)
+                    .filter(|h| h != "local")
+                {
+                    let result = if ask_kind == "ask_subscribe" {
+                        Err("shared Ask streaming requires a direct coordinator connection; use ask_list for snapshots".to_string())
+                    } else {
+                        work_up
+                            .command(
+                                Some(host),
+                                vec!["work".into(), "fleet-ask".into()],
+                                Some(trimmed.into()),
+                            )
+                            .await
+                            .and_then(|o| {
+                                if o.exit_code == 0 {
+                                    serde_json::from_str::<serde_json::Value>(&o.stdout)
+                                        .map_err(|e| e.to_string())
+                                } else {
+                                    Err(o.stderr)
+                                }
+                            })
+                    };
+                    let response = result.unwrap_or_else(|error| serde_json::json!({"ok":false,"protocol":PROTOCOL_VERSION,"error":error}));
+                    let bytes = encode_line(&response, negotiated.unwrap_or(PROTOCOL_VERSION))?;
+                    if !write_line_or_closed(&mut writer, &bytes).await? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
+        }
         let resp = match serde_json::from_str::<Request>(trimmed) {
             // Strict-match only applies in the legacy regime, and only
             // for non-`hello` kinds. Once the client has sent `hello`,
@@ -2956,6 +3220,52 @@ async fn handle(
                         Err(error) => Response::err(error),
                     }
                 }
+                // WS-B: new agent
+                RequestBody::AgentStart { request } => {
+                    kind = "agent_start";
+                    match work_up.agent_start(request).await {
+                        Ok(result) => Response::with_agent_start(result),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                // WS-F: snapshot
+                RequestBody::MuxSnapshotList => {
+                    kind = "mux_snapshot_list";
+                    mux_snapshot_response(mux_snapshots.list().await)
+                }
+                RequestBody::MuxSnapshotSave => {
+                    kind = "mux_snapshot_save";
+                    mux_snapshot_response(mux_snapshots.save().await)
+                }
+                RequestBody::MuxSnapshotPlan { id, only_missing } => {
+                    kind = "mux_snapshot_plan";
+                    mux_snapshot_response(mux_snapshots.plan(&id, only_missing).await)
+                }
+                RequestBody::MuxSnapshotDelete { id } => {
+                    kind = "mux_snapshot_delete";
+                    mux_snapshot_response(mux_snapshots.delete(&id).await)
+                }
+                RequestBody::MuxSnapshotRestore {
+                    id,
+                    layout_only,
+                    only_missing,
+                } => {
+                    kind = "mux_snapshot_restore";
+                    match mux_snapshots.restore(&id, layout_only, only_missing).await {
+                        Ok(operation) => Response::with_mux_snapshot_operation(operation),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::MuxSnapshotRestoreStatus { operation_id } => {
+                    kind = "mux_snapshot_restore_status";
+                    match mux_snapshots.status(&operation_id).await {
+                        Some(operation) => Response::with_mux_snapshot_operation(operation),
+                        None => Response::err(format!(
+                            "snapshot restore {operation_id:?} was not found"
+                        )),
+                    }
+                }
+                // END WS-F: snapshot
                 RequestBody::WorkCompose {
                     description,
                     agent,
@@ -3522,6 +3832,20 @@ async fn handle(
                         },
                         None => Response::err(NO_CONFIG_PATH.to_string()),
                     }
+                }
+                RequestBody::ConfigOrchestrationRead {} => {
+                    kind = "config_orchestration_read";
+                    orchestration_config_response(config_path.as_deref(), None)
+                }
+                RequestBody::ConfigOrchestrationWrite {
+                    expected_text,
+                    settings,
+                } => {
+                    kind = "config_orchestration_write";
+                    orchestration_config_response(
+                        config_path.as_deref(),
+                        Some((&expected_text, &settings)),
+                    )
                 }
                 RequestBody::ConfigLaunchRead {} => {
                     kind = "config_launch_read";
@@ -4949,7 +5273,10 @@ impl Client {
             "stdin": stdin,
         });
         let response = self
-            .call_with_timeout(&req, WORK_COMMAND_CLIENT_TIMEOUT)
+            .call_with_timeout(
+                &req,
+                WorkCommandLimits::for_args(args).timeout + WORK_COMMAND_CLIENT_TIMEOUT,
+            )
             .await?;
         if !response["ok"].as_bool().unwrap_or(false) {
             return Err(RuntimeError::Json(serde::de::Error::custom(
@@ -4960,6 +5287,49 @@ impl Client {
             )));
         }
         serde_json::from_value(response["work_command"].clone()).map_err(RuntimeError::Json)
+    }
+
+    // WS-B: new agent
+    /// Start one allowlisted agent through the daemon, on its own host or a
+    /// control-mode Fleet host. Requires the `agent_start_v1` capability.
+    pub async fn agent_start(
+        &self,
+        request: &crate::agent_control::AgentStartRequest,
+    ) -> Result<crate::agent_control::AgentStartResult, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "agent_start",
+            "request": request,
+        });
+        let response = self
+            .call_with_timeout(&req, WORK_COMMAND_CLIENT_TIMEOUT)
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("agent start failed")
+                    .to_string(),
+            )));
+        }
+        serde_json::from_value(response["agent_start"].clone()).map_err(RuntimeError::Json)
+    }
+
+    // WS-F: snapshot
+    /// The workspace snapshots, newest first, as `muxa snapshot --list
+    /// --json` prints them. Requires `mux_snapshot_v1`.
+    pub async fn mux_snapshot_list(&self) -> Result<serde_json::Value, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "mux_snapshot_list",
+        });
+        let response = self
+            .call_with_timeout(&req, WORK_COMMAND_CLIENT_TIMEOUT)
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        Ok(response["mux_snapshot"].clone())
     }
 
     /// Ask the daemon which additive features it supports and, when it can
@@ -6706,6 +7076,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // explicit wire-compatibility request fixtures
     async fn widening_a_listing_over_ipc_is_console_only() {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("muxa-collaboration-scope.sock");
@@ -6752,6 +7123,9 @@ mod tests {
                         &from,
                         to,
                         &NewRequest {
+                            dispatch_id: None,
+                            source_node_id: None,
+                            delegation_parent: None,
                             initiator: None,
                             kind: collaboration::RequestKind::Question,
                             body: body.into(),
@@ -6893,6 +7267,9 @@ mod tests {
                 &sender,
                 "role:review",
                 &NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: collaboration::RequestKind::Question,
                     body: "ambiguous".into(),
@@ -6918,6 +7295,9 @@ mod tests {
                 &sender,
                 "@reviewer",
                 &NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: collaboration::RequestKind::Review,
                     body: "review this".into(),
@@ -7008,6 +7388,9 @@ mod tests {
                 &sender,
                 "role:rust",
                 &NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: collaboration::RequestKind::Question,
                     body: "obsolete question".into(),
@@ -7056,6 +7439,9 @@ mod tests {
                 },
                 "pane:%1",
                 &NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: collaboration::RequestKind::Task,
                     body: "dispatch to launch pane".into(),
@@ -7444,6 +7830,9 @@ mod tests {
             None,
             PipelineRunStore::in_memory(),
             WorkUpManager::new(PathBuf::from("/tmp/muxa-disconnect-test.sock")),
+            crate::mux_snapshot_control::MuxSnapshotControl::new(PathBuf::from(
+                "/tmp/muxa-disconnect-test.sock",
+            )),
             None,
             stopping_rx,
         ));
@@ -8309,6 +8698,39 @@ mod tests {
         assert!(ask.list().await.is_empty());
         assert_eq!(client.call(&request).await.unwrap()["ok"], false);
         assert_eq!(automation.ledger().all().await.len(), 2);
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn orchestration_settings_ipc_roundtrips_and_rejects_stale_writes() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("orchestration.sock");
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "# existing\n").unwrap();
+        let server = Server::new(socket.clone(), Store::shared()).with_config_path(Some(path));
+        let (shutdown, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(async move { server.run(receiver).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let read = client
+            .call(&serde_json::json!({"kind":"config_orchestration_read"}))
+            .await
+            .unwrap();
+        assert_eq!(read["orchestration"]["enabled"], false);
+        let mut settings = read["orchestration"].clone();
+        settings["enabled"] = serde_json::json!(true);
+        let request = serde_json::json!({"kind":"config_orchestration_write", "expected_text":"# existing\n", "settings":settings});
+        let saved = client.call(&request).await.unwrap();
+        assert_eq!(saved["orchestration"]["enabled"], true);
+        assert!(saved["config"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("# existing\n"));
+        let stale = client.call(&request).await.unwrap();
+        assert_eq!(stale["ok"], false);
+        assert_eq!(stale["config"], saved["config"]);
+        assert!(CAPABILITIES.contains(&"config_orchestration_v1"));
         shutdown.send(()).unwrap();
         task.await.unwrap();
     }
@@ -10087,6 +10509,49 @@ mod work_command_tests {
         }
     }
 
+    #[tokio::test]
+    async fn global_ask_uses_coordinator_response_without_touching_local_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("entry.sock");
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[orchestration]\nenabled = true\ncoordinator = \"dev\"\n",
+        )
+        .unwrap();
+        let runner = FakeRunner::new(
+            HostAccessMode::Control,
+            r#"{"ok":true,"protocol":1,"ask_entries":[]}"#,
+        );
+        let mut server =
+            Server::new(socket.clone(), crate::Store::shared()).with_config_path(Some(config));
+        server.work_up = WorkUpManager::with_remote(socket.clone(), Some(runner.clone()));
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let handle = tokio::spawn(server.run(rx));
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let response = Client::new(socket)
+            .call(&serde_json::json!({"kind":"ask_list"}))
+            .await
+            .unwrap();
+        assert_eq!(response["ask_entries"], serde_json::json!([]));
+        let sent = runner.runs();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].host, "dev");
+        assert_eq!(sent[0].args, vec!["work", "fleet-ask"]);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(sent[0].stdin.as_deref().unwrap()).unwrap()
+                ["kind"],
+            "ask_list"
+        );
+        shutdown.send(()).unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
     }
@@ -10255,6 +10720,143 @@ mod work_command_tests {
             .await
             .unwrap_err();
         assert!(error.contains("fleet is not enabled"), "{error}");
+    }
+
+    // WS-B: new agent
+    fn agent_request(host: Option<&str>) -> crate::agent_control::AgentStartRequest {
+        serde_json::from_value(serde_json::json!({
+            "agent": "codex",
+            "host": host,
+            "placement": "window",
+            "target": "$3",
+            "cwd": "/srv/remote/checkout",
+            "prompt": "fix the flaky test",
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn agent_start_on_a_control_host_runs_the_cli_argv_on_the_runner() {
+        let runner = FakeRunner::new(
+            HostAccessMode::Control,
+            r#"{"schema_version":1,"host":"tmux","agent":"codex","placement":"window","pane":"%42","cwd":"/srv/remote/checkout","prompt_supplied":true}"#,
+        );
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        let result = manager
+            .agent_start(agent_request(Some("dev")))
+            .await
+            .unwrap();
+        assert_eq!(result.pane.as_deref(), Some("%42"));
+        assert_eq!(result.fleet_host.as_deref(), Some("dev"));
+        let runs = runner.runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].args, agent_request(Some("dev")).arguments());
+        assert_eq!(runs[0].limits, WorkCommandLimits::COMMAND);
+        // What the runner is asked to carry is what the relay will accept.
+        work_control::validate_work_command(&runs[0].args, None, WorkCommandSurface::Relay)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_start_is_refused_on_observe_hosts_and_bad_requests() {
+        let runner = FakeRunner::new(HostAccessMode::Observe, "{}");
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        let error = manager
+            .agent_start(agent_request(Some("dev")))
+            .await
+            .unwrap_err();
+        assert!(error.contains("observe-only"), "{error}");
+        let mut native = agent_request(Some("dev"));
+        native.placement = crate::agent_control::AgentPlacement::Native;
+        native.target = None;
+        let error = manager.agent_start(native).await.unwrap_err();
+        assert!(error.contains("this Mac"), "{error}");
+        assert!(runner.runs().is_empty());
+    }
+
+    #[test]
+    fn agent_start_request_decodes_and_response_encodes() {
+        let request: Request = serde_json::from_str(
+            r#"{"protocol":6,"kind":"agent_start","request":{"agent":"claude","placement":"session","cwd":"/srv/app"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(request.body, RequestBody::AgentStart { .. }));
+        assert!(CAPABILITIES.contains(&"agent_start_v1"));
+        let plain = serde_json::to_value(Response::ok()).unwrap();
+        assert!(plain.get("agent_start").is_none());
+    }
+
+    // WS-F: snapshot
+    #[test]
+    fn mux_snapshot_requests_decode_the_documented_shapes() {
+        let decode = |json: &str| serde_json::from_str::<Request>(json).unwrap().body;
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_list"}"#),
+            RequestBody::MuxSnapshotList
+        ));
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_save"}"#),
+            RequestBody::MuxSnapshotSave
+        ));
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_plan","id":"1790000000"}"#),
+            RequestBody::MuxSnapshotPlan { id, only_missing: true } if id == "1790000000"
+        ));
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_plan","id":"1","only_missing":false}"#),
+            RequestBody::MuxSnapshotPlan {
+                only_missing: false,
+                ..
+            }
+        ));
+        match decode(r#"{"protocol":6,"kind":"mux_snapshot_restore","id":"1790000000"}"#) {
+            RequestBody::MuxSnapshotRestore {
+                id,
+                layout_only,
+                only_missing,
+            } => {
+                assert_eq!(id, "1790000000");
+                assert!(!layout_only, "restores the commands unless asked not to");
+                assert!(
+                    only_missing,
+                    "a mux_snapshot_v1 client never fills live sessions"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_restore","id":"1","only_missing":false}"#),
+            RequestBody::MuxSnapshotRestore {
+                only_missing: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode(
+                r#"{"protocol":6,"kind":"mux_snapshot_restore_status","operation_id":"snapshot-restore-1"}"#
+            ),
+            RequestBody::MuxSnapshotRestoreStatus { .. }
+        ));
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_delete","id":"1790000000"}"#),
+            RequestBody::MuxSnapshotDelete { .. }
+        ));
+        assert!(CAPABILITIES.contains(&"mux_snapshot_v1"));
+        assert!(CAPABILITIES.contains(&"mux_snapshot_plan_v1"));
+        let plain = serde_json::to_value(Response::ok()).unwrap();
+        assert!(plain.get("mux_snapshot").is_none());
+        assert!(plain.get("mux_snapshot_operation").is_none());
+        let listed = serde_json::to_value(Response::with_mux_snapshot(
+            serde_json::json!({"snapshots": []}),
+        ))
+        .unwrap();
+        assert_eq!(listed["mux_snapshot"]["snapshots"], serde_json::json!([]));
     }
 
     #[tokio::test]

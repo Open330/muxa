@@ -7,19 +7,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **`muxa peers`, `muxa msg` and `muxa identity` speak for the right pane on
-  every host.** The CLI built its collaboration origin by reading `$TMUX_PANE`
-  and shortening `$TMUX` to a socket name, which is only correct on tmux. Hook
-  stamping and the pane scan namespace a pane by its host — `rmux:%102` — and
-  keep rmux and cmux endpoints as full paths, so on those hosts the origin
-  matched no tracked agent and every one of those commands refused with
-  "collaboration origin is not a hook-correlated tracked pane agent", naming a
-  pane whose agent was running perfectly well. The CLI now shares the MCP
-  server's origin, so the two cannot disagree again.
+## [0.8.54] - 2026-09-25
 
 ### Added
+
+- **Answer agents from their notifications.** Muxa for Mac's agent
+  notifications have Open and Mark as Read buttons, and one waiting for
+  input has Reply…: the text goes to the agent's pane through muxad's
+  `send_prompt`, and a reply that cannot be sent comes back as a
+  notification carrying the text.
+- **Side-by-side diffs and Viewed marks in Changes.** A Unified / Split
+  switch, a Viewed box per file with "N of M viewed" (a mark clears when the
+  file's diff changes), and `j` / `k` / `v` in the file list.
+- **Every host in one place.** ⌘J badges each agent with its host and ranks
+  agents across hosts (⇧⌘J follows the same order), and the usage popover
+  shows a provider account shared by several hosts once, with live-session
+  cost per host.
+- **Onboarding that ends with a running agent.** The Welcome Guide starts
+  your first agent, fixes a missing tmux or agent CLI with Copy and Run in
+  Shell, asks for notification permission with the reason, and tours the
+  workbench and its shortcuts. After an upgrade a short What's New window
+  opens instead of the whole guide, and empty Explore and Inbox views say
+  what to do next.
+- **Compare a snapshot with what runs now before restoring it.** Muxa for
+  Mac's Restore Snapshot sheet marks every session, window and pane as
+  missing now or running, lists what is new since the snapshot (a restore
+  never closes it), and sums it up — "2 sessions to recreate, 5 already
+  running, 1 new since snapshot". The Restore button says what it will do,
+  and with muxad's `mux_snapshot_plan_v1` an "Only missing sessions" switch
+  can be turned off to also fill in the windows and panes running sessions
+  lack. `muxa restore --json` adds `state`, `new_windows` and
+  `new_sessions`, and the dry-run text lists what is new since the snapshot.
+
+## [0.8.53] - 2026-09-25
+
+### Fixed
+
+- **Muxa for Mac builds with Xcode 16 again.** v0.8.52's app build failed on
+  the release runner, so v0.8.52 was never published; this release carries
+  everything listed under 0.8.52. The app now posts notifications through
+  `UNUserNotificationCenter`'s callback APIs, which are safe to call from the
+  main actor with the macOS 15 SDK, and the DMG packaging prints the compiler
+  errors when the build fails instead of only `BUILD FAILED`.
+
+## [0.8.52] - 2026-09-25
+
+### Added
+
+- **Muxa for Mac works like an editor.** The side bar's title row and the
+  editor tab strip double as the title bar, so the window chrome is one
+  compact row instead of a toolbar over a tab bar. The activity bar, side bar,
+  tabs and status bar follow VS Code's Modern themes, and a flat design system
+  replaces stock bezeled buttons, segmented controls and fields across the
+  workbench. The embedded terminal no longer claims ⌘W, ⌃Tab, ⌘1–9 or ⌘, —
+  only its own copy, paste, scroll and line-editing keys — and ⌘W closes the
+  focused editor before it closes the window. New: ⌘J jumps to an agent (the
+  ones needing you first, ⌘1–9 opens a result), ⇧⌘J goes to the next agent
+  needing attention, ⌘B toggles the side bar, ⇧⌘T reopens a closed editor, and
+  ⌘/ lists every shortcut.
+- **Muxa for Mac tells you when an agent needs you.** A macOS notification
+  when an agent starts waiting for input or a choice, errors, or finishes a
+  turn; clicking it opens that pane. An agent that finished or started waiting
+  since you last looked keeps a dot on its tab and Explore row, the Explore
+  icon counts them, and the Dock badge counts them with the agents needing
+  attention. The pane you are looking at never notifies, and permission is
+  asked the first time there is something to say. Settings › Behaviour turns
+  each kind, the sound and the Dock badge off.
+- **Start an agent from Muxa for Mac.** ⌥⌘T starts the default agent in the
+  focused pane's folder; ⌥⇧⌘T opens a sheet for the agent, folder, host
+  (control-mode fleet hosts included) and placement — split, window, session
+  or a Muxa terminal. muxad runs `muxa agent start --json` for it
+  (`agent_start_v1`). `muxa agent start` outside tmux no longer fails its own
+  `--direction` check.
+- **Usage and rate limits in Muxa for Mac.** The status bar shows the 5-hour
+  and 7-day usage of each provider that reports it (Claude, Codex), orange
+  from 80% and red from 95% or when capped, with reset times, live-session
+  cost and the capped agents one click away. Each agent shows a context-window
+  meter and, when capped, when it can continue.
+- **Review an agent's changes in Muxa for Mac.** A Changes module on panes
+  and Work (⌃⇧G) lists the repository's staged, unstaged and untracked files —
+  or everything since the branch base — with a unified diff. Comments on lines
+  or ranges collect into a review that goes back to the agent as one prompt,
+  previewed first.
+
+- **Snapshots are taken for you, and restoring one is safe to press.**
+  muxad takes an automatic workspace snapshot every 15 minutes when the
+  workspace changed, keeping the newest 10 (`[snapshot]
+  auto_interval_minutes`, `keep_auto`; `0` turns it off); snapshots taken by
+  hand or by `muxa reload` are never pruned. `muxa restore --only-missing`
+  recreates only the sessions the server lacks and never adds panes to one it
+  already has, and the dry run now says per session "will create", "exists —
+  skipped" or "exists — only missing windows and panes will be added".
+  `muxa snapshot --list`,
+  `muxa snapshot --delete <id>`, and `--json` on `snapshot` and `restore`
+  make all of it scriptable.
+- **Save and restore snapshots from Muxa for Mac.** Explore "…" → Save
+  Snapshot / Restore Snapshot…, also in the command palette. The restore
+  sheet lists snapshots (automatic ones badged), previews each as session ›
+  window › pane with what every pane will run, dry-runs the restore, and
+  shows per-pane results. It always restores only the missing sessions.
+  Needs muxad with the `mux_snapshot_v1` capability.
 
 - **`muxa reload` restarts the multiplexer and puts the workspace back.**
   Picking up a new tmux/rmux server build means restarting it, and a restart
@@ -48,6 +135,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rmux:%12` while the host's own control commands report the bare `%12`, so
   without it no pane would ever be recognised as an agent's and no
   conversation would resume.
+
+### Fixed
+
+- **A restore types into a pane only once its shell is listening, and says
+  "relaunched" only when the program is running.** A shell still working
+  through its startup files has no line editor yet; a startup that prints
+  first looked ready, and the `cd` and relaunch typed then could be swallowed
+  by anything in that startup reading the terminal — while the restore
+  reported the pane relaunched. muxa now waits for the pane's terminal to
+  leave canonical mode (the line editor reading keys), and afterwards counts a
+  pane as relaunched only once its program is seen holding it; otherwise it
+  is reported as not confirmed, with the reason.
+
+- **`muxa reload` can bring the server back it just killed, and no longer
+  doubles a workspace.** A snapshot recorded the server by the short socket
+  name muxad keeps on a pane, which resolves only against a live server —
+  so after `kill-server` every command went to `/dev/null` and the restore
+  failed on its first `new-session`. Snapshots now record the socket's
+  absolute path, and an absolute path is used as given. On macOS no pane's
+  command line was captured at all (`ps --ppid` is a GNU flag), so nothing
+  was relaunched; the BSD form is used. A restore into a server that already
+  has the sessions — a retry, or tmux-continuum rebuilding its own save on
+  server start — added every pane a second time; it now creates only what a
+  window lacks, types into idle shells only, and `reload` waits for
+  continuum to finish before filling in the rest. An agent pane whose
+  command line is unknown is reported with the `--resume` it would need
+  instead of being skipped silently, and the error for an unknown target
+  server names the actual flag, `--mux-socket`. Agents are matched to panes
+  on the snapshot's own server: every tmux server numbers panes from `%0`,
+  so a snapshot of a second server used to pick up the default server's
+  agent for the same pane number and splice its `--resume` onto whatever
+  that pane was running.
+
+- **`muxa peers`, `muxa msg` and `muxa identity` speak for the right pane on
+  every host.** The CLI built its collaboration origin by reading `$TMUX_PANE`
+  and shortening `$TMUX` to a socket name, which is only correct on tmux. Hook
+  stamping and the pane scan namespace a pane by its host — `rmux:%102` — and
+  keep rmux and cmux endpoints as full paths, so on those hosts the origin
+  matched no tracked agent and every one of those commands refused with
+  "collaboration origin is not a hook-correlated tracked pane agent", naming a
+  pane whose agent was running perfectly well. The CLI now shares the MCP
+  server's origin, so the two cannot disagree again.
+
+### Changed
+
+- **New Shell is ⌘T in Muxa for Mac** (was ⇧⌘N), as in every terminal.
 
 ## [0.8.51] - 2026-09-23
 
@@ -3769,7 +3902,10 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.51...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.54...HEAD
+[0.8.54]: https://github.com/Open330/muxa/compare/v0.8.53...v0.8.54
+[0.8.53]: https://github.com/Open330/muxa/compare/v0.8.52...v0.8.53
+[0.8.52]: https://github.com/Open330/muxa/compare/v0.8.51...v0.8.52
 [0.8.51]: https://github.com/Open330/muxa/compare/v0.8.50...v0.8.51
 [0.8.50]: https://github.com/Open330/muxa/compare/v0.8.49...v0.8.50
 [0.8.49]: https://github.com/Open330/muxa/compare/v0.8.48...v0.8.49
