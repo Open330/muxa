@@ -32,6 +32,7 @@ enum MuxaSettingsTab: String, CaseIterable, Identifiable {
     case behaviour
     case modules
     case fleet
+    case dispatch
     case runtime
     case advanced
 
@@ -86,6 +87,10 @@ struct MuxaSettingsView: View {
             MuxaFleetSettingsPane(model: model)
                 .tabItem { Label("Hosts", systemImage: "server.rack") }
                 .tag(MuxaSettingsTab.fleet.rawValue)
+
+            FleetDispatchSettingsView(model: model)
+                .tabItem { Label("Dispatch", systemImage: "network") }
+                .tag(MuxaSettingsTab.dispatch.rawValue)
 
             MuxaRuntimeSettingsPane(model: model)
                 .tabItem { Label("Runtime", systemImage: "terminal") }

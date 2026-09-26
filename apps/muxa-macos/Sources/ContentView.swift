@@ -77,6 +77,9 @@ struct ContentView: View {
         .sheet(isPresented: $showingShortcuts) {
             MuxaShortcutsSheet { showingShortcuts = false }
         }
+        .sheet(isPresented: $model.isPresentingFleetDispatch) {
+            FleetDispatchView(model: model)
+        }
         .sheet(isPresented: $model.isPresentingWorkStart) {
             WorkStartView(model: model, isPresented: $model.isPresentingWorkStart)
         }

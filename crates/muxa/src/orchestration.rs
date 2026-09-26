@@ -147,6 +147,60 @@ fn component(value: &str) -> Result<(), String> {
 }
 
 impl OrchestrationConfig {
+    pub fn validate_settings(&self) -> Result<(), String> {
+        if self
+            .coordinator
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty())
+        {
+            return Err("coordinator must be a Fleet alias or omitted".into());
+        }
+        let defaults_name = "validation".to_string();
+        let defaults = WorkspacePolicy {
+            repo: "validation".into(),
+            url: "validation".into(),
+            pipeline: "validation".into(),
+            ..Default::default()
+        };
+        for (workspace, policy) in
+            std::iter::once((&defaults_name, &defaults)).chain(self.workspaces.iter())
+        {
+            component(workspace)?;
+            component(&policy.repo)?;
+            if policy.url.trim().is_empty() || policy.pipeline.trim().is_empty() {
+                return Err("workspace requires repository URL and pipeline".into());
+            }
+            let _: LabelSelector = policy.selector.parse()?;
+            for overrides in std::iter::once(None).chain(policy.nodes.values().map(Some)) {
+                let mut paths = self.paths.clone();
+                paths.overlay(&policy.paths);
+                if let Some(overrides) = overrides {
+                    paths.overlay(overrides);
+                }
+                DispatchPlan {
+                    request: DispatchRequest {
+                        dispatch_id: uuid::Uuid::nil().to_string(),
+                        workspace: workspace.clone(),
+                        work: "validation".into(),
+                        commit: "a".repeat(40),
+                        body: "validate".into(),
+                        selector: None,
+                        host: None,
+                    },
+                    node_id: NodeId::generate(),
+                    host: "local".into(),
+                    repo: policy.repo.clone(),
+                    url: policy.url.clone(),
+                    pipeline: policy.pipeline.clone(),
+                    paths,
+                    reason: String::new(),
+                }
+                .resolve_paths(Path::new("/placeholder-home"))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn plan(
         &self,
         request: DispatchRequest,

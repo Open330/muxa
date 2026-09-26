@@ -973,6 +973,19 @@ pipeline = "solo"
         root.display().to_string()
     );
     let daemon = Daemon::spawn_with(Some(&config));
+    let options = daemon
+        .cli()
+        .args(["work", "dispatch-options"])
+        .output()
+        .unwrap();
+    assert!(
+        options.status.success(),
+        "{}",
+        String::from_utf8_lossy(&options.stderr)
+    );
+    let options: serde_json::Value = serde_json::from_slice(&options.stdout).unwrap();
+    assert_eq!(options["workspaces"]["muxa"]["pipeline"], "solo");
+    assert_eq!(options["paths"]["root"], root.display().to_string());
     let input = dir.path().join("request.json");
     std::fs::write(
         &input,
