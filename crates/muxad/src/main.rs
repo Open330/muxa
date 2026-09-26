@@ -1620,12 +1620,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
                 "direct wake body contains terminal control characters; using mailbox notice",
             );
         }
-        let prompt = format!(
-            "[muxa:{}] New {:?} request {}. Claim/read it with muxa_inbox (MCP) or `muxa msg inbox --json`; honor kind/work_mode/paths, then respond with muxa_reply or `muxa msg reply`.",
-            request.id,
-            request.kind,
-            collaboration_request_source(&request),
-        );
+        let prompt = mailbox_collaboration_request_prompt(&request);
         let (sent, submitted) = send_collaboration_wake(recipient, &prompt, backends).await;
         if submitted {
             wake_inflight.insert(wake_key);
@@ -1776,6 +1771,27 @@ async fn mark_collaboration_request_notified(collaboration: &CollaborationStore,
     }
 }
 
+fn collaboration_reply_instruction(request: &CollaborationRequest) -> String {
+    if request.expects_reply {
+        format!(
+            "When finished, respond with muxa_reply for request {} or `muxa msg reply {0} <body>`.",
+            request.id
+        )
+    } else {
+        "No reply is expected; do not send an acknowledgement solely for this delivery.".into()
+    }
+}
+
+fn mailbox_collaboration_request_prompt(request: &CollaborationRequest) -> String {
+    format!(
+        "[muxa:{}] New {:?} request {}. Claim/read it with muxa_inbox (MCP) or `muxa msg inbox --json`; honor kind/work_mode/paths. {}",
+        request.id,
+        request.kind,
+        collaboration_request_source(request),
+        collaboration_reply_instruction(request),
+    )
+}
+
 fn full_collaboration_request_prompt(request: &CollaborationRequest) -> String {
     let paths = serde_json::to_string(&request.paths).unwrap_or_else(|_| "[]".into());
     let air_artifacts = if request.air_artifacts.is_empty() {
@@ -1786,14 +1802,7 @@ fn full_collaboration_request_prompt(request: &CollaborationRequest) -> String {
             serde_json::to_string(&request.air_artifacts).unwrap_or_else(|_| "[]".into())
         )
     };
-    let reply = if request.expects_reply {
-        format!(
-            "When finished, respond with muxa_reply for request {} or `muxa msg reply {0} <body>`.",
-            request.id
-        )
-    } else {
-        "No reply is expected; do not send an acknowledgement solely for this delivery.".into()
-    };
+    let reply = collaboration_reply_instruction(request);
     format!(
         "[muxa:{}] New {} request {}. This request is already claimed; do not call muxa_inbox for it.\nkind: {}\nwork_mode: {}\npaths: {}{}\nexpects_reply: {}\n{}\n\n--- request body ({} bytes) ---\n{}\n--- end request body ---",
         request.id,
@@ -1812,9 +1821,10 @@ fn full_collaboration_request_prompt(request: &CollaborationRequest) -> String {
 
 fn interrupted_collaboration_request_prompt(request: &CollaborationRequest) -> String {
     format!(
-        "[muxa:{}] Direct {} request delivery was interrupted after it was claimed. Read it with muxa_inbox (MCP) or `muxa msg inbox --json`; honor kind/work_mode/paths, then respond as requested.",
+        "[muxa:{}] Direct {} request delivery was interrupted after it was claimed. Read it with muxa_inbox (MCP) or `muxa msg inbox --json`; honor kind/work_mode/paths. {}",
         request.id,
         collaboration_request_kind(request.kind),
+        collaboration_reply_instruction(request),
     )
 }
 
@@ -3193,6 +3203,143 @@ mod tests {
             .await;
     }
 
+    async fn deliver_quiet_progress_burst(
+        mailbox: &CollaborationStore,
+        store: &muxa::SharedStore,
+        backends: &[muxa::SharedBackend],
+        payload: CollaborationWakePayload,
+        sender: &muxa::collaboration::Participant,
+        recipient: &muxa::collaboration::Participant,
+    ) -> Vec<String> {
+        let mut inflight = HashSet::new();
+        let mut progress_ids = Vec::new();
+        // Reproduce the reported volume and let the waker scan after each
+        // message, including fresh idle generations and periodic rescans.
+        for index in 0..39 {
+            let progress = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        kind: RequestKind::Notice,
+                        body: format!("checkpoint {index}"),
+                        expects_reply: false,
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            progress_ids.push(progress.id);
+            inflight.clear();
+            for _ in 0..2 {
+                wake_idle_collaboration_peers_with_inflight(
+                    mailbox,
+                    store,
+                    backends,
+                    payload,
+                    &mut inflight,
+                )
+                .await;
+            }
+        }
+        progress_ids
+    }
+
+    #[tokio::test]
+    async fn collaboration_waker_suppresses_progress_but_delivers_handoffs_without_ack() {
+        for payload in [
+            CollaborationWakePayload::Notice,
+            CollaborationWakePayload::OperatorFull,
+            CollaborationWakePayload::Full,
+        ] {
+            let store = muxa::Store::shared();
+            add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+            add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+            let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+            let participants =
+                muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+            let sender = participants
+                .iter()
+                .find(|p| p.pane == "%1")
+                .unwrap()
+                .clone();
+            let recipient = participants
+                .iter()
+                .find(|p| p.pane == "%2")
+                .unwrap()
+                .clone();
+            let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+            let sends = Arc::new(Mutex::new(Vec::new()));
+            let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+                panes,
+                sends: sends.clone(),
+            });
+            let backends = vec![backend];
+            let mut inflight = HashSet::new();
+            let progress_ids = deliver_quiet_progress_burst(
+                &mailbox, &store, &backends, payload, &sender, &recipient,
+            )
+            .await;
+            assert!(
+                sends.lock().unwrap().is_empty(),
+                "39 quiet notices must cause zero terminal writes"
+            );
+            let handoff = mailbox
+                .create(
+                    sender,
+                    recipient.clone(),
+                    NewRequest {
+                        kind: RequestKind::Notice,
+                        body: "device released".into(),
+                        expects_reply: false,
+                        notify: Some(true),
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            for prompt in [
+                mailbox_collaboration_request_prompt(&handoff),
+                full_collaboration_request_prompt(&handoff),
+                interrupted_collaboration_request_prompt(&handoff),
+            ] {
+                assert!(prompt.contains("No reply is expected"));
+                assert!(!prompt.contains("respond with muxa_reply"));
+            }
+            for _ in 0..2 {
+                wake_idle_collaboration_peers_with_inflight(
+                    &mailbox,
+                    &store,
+                    &backends,
+                    payload,
+                    &mut inflight,
+                )
+                .await;
+            }
+            {
+                let delivered = sends.lock().unwrap();
+                assert_eq!(
+                    delivered.len(),
+                    2,
+                    "one prompt and one submit, no duplicate wake"
+                );
+                assert!(delivered[0].1.contains(&handoff.id));
+                assert!(progress_ids.iter().all(|id| !delivered[0].1.contains(id)));
+                assert!(delivered[0].1.contains("No reply is expected"));
+            }
+            let inbox = mailbox.claim_for(&recipient).await.unwrap();
+            assert_eq!(
+                inbox
+                    .iter()
+                    .filter(|request| progress_ids.contains(&request.id))
+                    .count(),
+                39,
+                "all quiet notices must remain readable at the checkpoint"
+            );
+            assert!(mailbox.pending_reply_unnotified().await.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn collaboration_waker_reacts_to_mailbox_revision() {
         let store = muxa::Store::shared();
@@ -3241,6 +3388,7 @@ mod tests {
                     kind: RequestKind::Question,
                     body: "wake from revision".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::ReadOnly,
                     thread_id: None,
                     parent_request_id: None,
@@ -3387,6 +3535,7 @@ mod tests {
                     kind: RequestKind::Review,
                     body: "review the pending diff".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::ReadOnly,
                     thread_id: None,
                     parent_request_id: None,
@@ -3467,6 +3616,7 @@ mod tests {
                     kind: RequestKind::Task,
                     body: "change only the authorized file".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::Execute,
                     thread_id: None,
                     parent_request_id: None,
@@ -3523,6 +3673,7 @@ mod tests {
                     kind: RequestKind::Task,
                     body: "unsafe\u{1b}[201~\rsubmit".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::Execute,
                     thread_id: None,
                     parent_request_id: None,
@@ -3587,6 +3738,7 @@ mod tests {
                     kind: RequestKind::Task,
                     body: "operator request body".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::Execute,
                     thread_id: None,
                     parent_request_id: None,
@@ -3672,6 +3824,7 @@ mod tests {
                     kind: RequestKind::Task,
                     body: "agent delegated body".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::Execute,
                     thread_id: None,
                     parent_request_id: None,
@@ -3745,6 +3898,7 @@ mod tests {
                         kind: RequestKind::Task,
                         body: body.into(),
                         expects_reply: true,
+                        notify: None,
                         work_mode: WorkMode::Execute,
                         thread_id: None,
                         parent_request_id: None,
@@ -3829,23 +3983,10 @@ mod tests {
                 sender.clone(),
                 recipient.clone(),
                 NewRequest {
-                    dispatch_id: None,
-                    source_node_id: None,
-                    delegation_parent: None,
-                    initiator: None,
                     kind: RequestKind::Task,
                     body: "do not inject this twice".into(),
-                    expects_reply: true,
                     work_mode: WorkMode::Execute,
-                    thread_id: None,
-                    parent_request_id: None,
-                    workspace_id: None,
-                    work_id: None,
-                    run_id: None,
-                    paths: Vec::new(),
-                    artifacts: Vec::new(),
-                    links: Vec::new(),
-                    air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -3889,6 +4030,7 @@ mod tests {
                     kind: RequestKind::Task,
                     body: "the prompt text is already buffered".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::Execute,
                     thread_id: None,
                     parent_request_id: None,
@@ -3951,6 +4093,7 @@ mod tests {
                     kind: RequestKind::Review,
                     body: "secret request body".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::ReadOnly,
                     thread_id: None,
                     parent_request_id: None,
@@ -4072,6 +4215,7 @@ mod tests {
                     kind: RequestKind::Task,
                     body: "dispatched by a human".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::ReadOnly,
                     thread_id: None,
                     parent_request_id: None,

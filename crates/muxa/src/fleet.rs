@@ -1501,6 +1501,7 @@ mod tests {
                 kind: crate::collaboration::RequestKind::Review,
                 body: "review this change".into(),
                 expects_reply: true,
+                notify: None,
                 work_mode: crate::collaboration::WorkMode::ReadOnly,
                 thread_id: None,
                 parent_request_id: None,

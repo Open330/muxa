@@ -599,6 +599,7 @@ mod tests {
             kind: RequestKind::Question,
             body: body.into(),
             expects_reply: true,
+            notify: None,
             work_mode: WorkMode::ReadOnly,
             thread_id: None,
             parent_request_id: None,

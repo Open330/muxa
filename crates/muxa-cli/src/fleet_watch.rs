@@ -1372,6 +1372,7 @@ fn handle_key(
                             kind: app.message_kind,
                             body: text,
                             expects_reply: app.message_kind != RequestKind::Notice,
+                            notify: None,
                             work_mode: match mode {
                                 WatchCollaborationMode::Execute => WorkMode::Execute,
                                 WatchCollaborationMode::ReadOnly
@@ -4838,6 +4839,7 @@ mod tests {
             kind: RequestKind::Question,
             body: "coordinate this change".into(),
             expects_reply: true,
+            notify: None,
             work_mode: WorkMode::ReadOnly,
             thread_id: None,
             parent_request_id: None,
