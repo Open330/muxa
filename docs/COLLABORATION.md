@@ -119,6 +119,46 @@ across active backends. muxad validates the resolved origin against its live
 agent and pane registries; collaboration tools do not accept an arbitrary
 sender pane.
 
+## Quiet progress and actionable notifications
+
+A one-way `notice` (`expects_reply=false`) is stored in the mailbox without
+waking its recipient. It remains unread until retrieved; it is not discarded
+or marked delivered by suppression. Questions, reviews, tasks, and notices that
+explicitly require a reply retain automatic wake delivery. Terminal replies
+still wake their requester independently of the original request's setting.
+
+MCP `muxa_send_message` accepts an optional `notify` boolean. CLI examples:
+
+```sh
+# Consolidated progress: read with the next checkpoint inbox pull.
+muxa msg send @reviewer "Build passed; two findings remain" --kind notice --parent REQUEST_ID
+# Resource handoff: wake the recipient without asking for acknowledgement.
+muxa msg send @reviewer "Device released; your verification can start" --kind notice --notify true
+# Explicit pull-only request: reply is still required once claimed.
+muxa msg send @reviewer "Review at the agreed checkpoint" --kind review --notify false
+```
+
+`notify=true` respects `wake="never"` and idle-only delivery; it does not type
+into a busy agent. `notify=false` suppresses recipient wakes without changing
+the reply contract. Omitted `notify` uses the defaults above, including for
+stored legacy messages. An already prepared direct delivery is recovered normally.
+This policy requires the updated daemon; older daemons do not enforce `notify`.
+`wake_payload="notice"` only selects prompt formatting and is unrelated to
+message `kind="notice"` or whether a wake is sent.
+
+Agree on checkpoints at dispatch. Omit acknowledgements and unchanged status;
+record progress on the original request where `muxa_update_request` is available,
+or use one consolidated quiet child notice with `--parent`. Read notices as a
+batch with `muxa_inbox` / `muxa msg inbox` at build/test or review checkpoints.
+Urgent blockers, decisions, edit conflicts, and handoffs use explicit notification.
+Completion uses the original request's terminal reply, with no duplicate notice.
+
+For before/after evaluation, compare actual recipient wake prompts and mailbox
+handling calls over comparable work intervals, plus blocker-to-resolution time.
+Message count alone does not measure interruption cost. Existing request creation,
+claim, notification, and reply timestamps support delivery-latency inspection;
+`notified_at` alone is not proof of successful execution or useful work.
+
 ## Addressing and CLI
 
 Agents sharing `(tmux socket, stable window id)` are peers. `peer` selects the

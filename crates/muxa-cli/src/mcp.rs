@@ -66,27 +66,24 @@ const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
-const MCP_SERVER_INSTRUCTIONS: &str = "muxa coordinates same-window peers. \
-    Use muxa_guide for launch preferences, muxa_room_context for identity/peers, \
-    and muxa_collaboration_guide for details. Reserved @peer/@muxa-peer requests for new \
-    work use muxa_call_peer; requests for an existing report use muxa_peer_report. \
-    Never substitute a GitHub/PR workflow without an explicit PR number or URL. Peer \
-    calls default to review + read_only. Never set execute=true or \
-    spawn_if_missing=true without explicit user authorization. Prior authorization within \
-    scope counts; do not ask again. Keep primary ownership \
-    and verify replies. Use muxa_start_work for a configured Work pipeline, \
-    muxa_start_agent for one agent, and muxa_manage_tmux for lifecycle; never invent \
-    raw tmux commands. Prefer pane-scoped muxa_status; no-argument status is compact \
-    unless full=true. For pane work, use one muxa_wait_for_change with until=settled \
-    and include_capture instead of polling status/capture. On Codex, if a long call \
-    yields a background cell, resume that same cell with the host wait function using \
-    yield_time_ms=60000; never start a second Muxa wait. For durable peer work prefer \
-    muxa_call_peer with wait=false: muxa wakes the idle sender when the reply is ready, \
-    then read it with muxa_wait_reply. Incoming notifications require muxa_inbox and \
-    exactly one terminal muxa_reply. A /name selects a registered message skill. \
-    muxa_fleet_call_peer/muxa_fleet_wait_reply are a separate physical-host plane: \
-    name host/pane explicitly and respect observe mode. Use muxa_fleet_update_request/muxa_update_request \
-    for batched guidance/progress; read updates at checkpoints and wait with after_update.";
+const MCP_SERVER_INSTRUCTIONS: &str = "Muxa coordinates same-window peers. Use muxa_guide for \
+    launch preferences, muxa_room_context for identity/peers, and muxa_collaboration_guide \
+    for details. @peer/@muxa-peer new work uses muxa_call_peer; existing reports use \
+    muxa_peer_report. Never infer GitHub/PR work without an explicit PR number or URL. \
+    Peer calls default to review + read_only. execute=true and spawn_if_missing=true \
+    require explicit authorization; prior authorization counts. Retain ownership and \
+    verify replies. Use muxa_start_work, muxa_start_agent, and muxa_manage_tmux for \
+    lifecycle; never invent raw tmux commands. Prefer pane-scoped muxa_status. For \
+    process waits use muxa_wait_for_change until=settled with include_capture. Resume \
+    yielded tool cells with the host wait tool (yield_time_ms=60000); never duplicate waits. \
+    Prefer muxa_call_peer wait=false while independent work remains; read the result \
+    with muxa_wait_reply after its wake. Read requests with muxa_inbox unless already \
+    claimed and delivered in full. Reply once only when expects_reply=true; never \
+    acknowledge one-way notices. Batch progress at checkpoints, omit unchanged status, \
+    and reserve notify=true notices for blockers, decisions, conflicts, or handoffs. \
+    Use muxa_update_request/muxa_fleet_update_request for progress; read at checkpoints with after_update. \
+    A /name selects a registered message skill. Fleet uses muxa_fleet_call_peer and \
+    muxa_fleet_wait_reply: name host/pane explicitly and respect observe mode.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -834,7 +831,8 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "target": { "type": "string", "description": "peer, pane:%N, %N, @alias, or role:<name>" },
                     "kind": { "type": "string", "enum": ["question", "review", "task", "notice"] },
                     "body": { "type": "string" },
-                    "expects_reply": { "type": "boolean", "description": "Default true except notice." },
+                    "expects_reply": { "type": "boolean", "description": "Default true except notice. Independent of notify." },
+                    "notify": { "type": "boolean", "description": "Override recipient wake: one-way notices are quiet by default; other requests wake idle recipients. Set true only for blockers, decisions, or handoffs; false records without waking. Does not interrupt busy agents or override global wake=never." },
                     "work_mode": { "type": "string", "enum": ["read_only", "execute"], "description": "Default read_only." },
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope for execute work." },
                     "thread_id": { "type": "string", "description": "Stable id shared by one causal conversation. Omit for a root request; muxa assigns its request id. When parent_request_id is set, this must match the parent's canonical thread." },
@@ -1716,9 +1714,9 @@ fn collaboration_guide(room: RoomContext, config: &muxa::config::Config) -> Valu
             },
             "incoming_request": {
                 "steps": [
-                    "Call muxa_inbox promptly to claim and read it.",
+                    "Call muxa_inbox to claim/read unless the complete request is already claimed and delivered in the prompt.",
                     "Honor kind, work_mode, and paths; read_only never authorizes edits.",
-                    "Reply exactly once with completed, blocked, declined, or failed and include useful artifacts."
+                    "Only when expects_reply=true, reply exactly once with completed, blocked, declined, or failed and useful artifacts. Never acknowledge one-way notices."
                 ]
             }
         },
@@ -3101,6 +3099,11 @@ fn new_request_from_args(
         kind,
         body,
         expects_reply,
+        notify: match args.get("notify") {
+            None => None,
+            Some(Value::Bool(notify)) => Some(*notify),
+            Some(_) => return Err("notify must be a boolean".into()),
+        },
         work_mode,
         thread_id: optional_string(args, "thread_id")?,
         parent_request_id: optional_string(args, "parent_request_id")?,
@@ -3668,6 +3671,8 @@ fn request_ack(request: &CollaborationRequest) -> Value {
         "work_id": request.work_id,
         "run_id": request.run_id,
         "status": request.status,
+        "notify": request.should_notify(),
+        "expects_reply": request.expects_reply,
         "to": request.to,
     })
 }
@@ -4371,6 +4376,41 @@ mod tests {
             request.paths,
             ["crates/muxa/src/collaboration.rs".to_string()]
         );
+    }
+
+    #[test]
+    fn notification_override_is_typed_and_independent_of_reply_contract() {
+        for notify in [None, Some(true), Some(false)] {
+            let mut args = json!({});
+            if let Some(value) = notify {
+                args["notify"] = json!(value);
+            }
+            let request = new_request_from_args(
+                &args,
+                RequestKind::Notice,
+                "checkpoint".into(),
+                false,
+                WorkMode::ReadOnly,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(request.notify, notify);
+            assert!(!request.expects_reply);
+        }
+        for value in [json!("true"), json!(1), Value::Null] {
+            let error = new_request_from_args(
+                &json!({"notify": value}),
+                RequestKind::Notice,
+                "checkpoint".into(),
+                false,
+                WorkMode::ReadOnly,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap_err();
+            assert_eq!(error, "notify must be a boolean");
+        }
     }
 
     #[test]

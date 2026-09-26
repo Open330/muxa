@@ -1,0 +1,17 @@
+{
+  "source": "/home/june/personal/muxa-wt/quiet-notices-runtime",
+  "base_commit": "8a56c67c447ec953ab50159f8475888375c0ea3d",
+  "branch": "fix/quiet-notices-runtime",
+  "version": "0.8.51+quiet.1",
+  "backup": "/home/june/.local/state/muxa/backups/quiet-notices-20260926",
+  "binaries": {
+    "muxa": {
+      "path": "/home/june/.cargo/bin/muxa",
+      "sha256": "b3323aecbb288aeb33da0e732dbd256e47829ddcf724a3978fc664b83bcfabd3"
+    },
+    "muxad": {
+      "path": "/home/june/.cargo/bin/muxad",
+      "sha256": "b571db6f29a819f59e9c690d32b49411ce649280bf69b3cfb170c245158e32b0"
+    }
+  }
+}

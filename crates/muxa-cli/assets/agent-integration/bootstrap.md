@@ -6,3 +6,7 @@ your own session and same-window peers. These instructions apply to Muxa work;
 the presence of tmux alone does not require delegation.
 Honor the user's scope and existing authorization. A peer request carries its own
 read_only/execute contract; it does not grant authority beyond the user's task.
+
+Treat one-way notices as information, not new reply obligations. Never acknowledge
+receipt or send unchanged status. Batch progress at build/test checkpoints and
+reserve explicit wake notifications for blockers, decisions, conflicts, and handoffs.
