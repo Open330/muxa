@@ -307,6 +307,16 @@ impl PipelineRunStore {
         self.inner.lock().await.runs.values().cloned().collect()
     }
 
+    /// Check scheduling readiness without cloning persisted Run payloads.
+    pub async fn has_ready_alias(&self) -> bool {
+        self.inner
+            .lock()
+            .await
+            .runs
+            .values()
+            .any(PipelineRun::has_ready_alias)
+    }
+
     pub async fn get(&self, identity: &WorkIdentity) -> Option<PipelineRun> {
         self.inner.lock().await.runs.get(identity).cloned()
     }
@@ -1006,6 +1016,113 @@ mod tests {
             observed: Vec::new(),
             invalidate,
         }
+    }
+
+    #[tokio::test]
+    async fn readiness_query_tracks_claims_and_completion_dependencies() {
+        let store = PipelineRunStore::in_memory();
+        assert!(!store.has_ready_alias().await);
+        let run = store.register(registration(Vec::new())).await.unwrap();
+        assert!(store.has_ready_alias().await);
+        store
+            .claim_ready(&run.identity, run.generation)
+            .await
+            .unwrap();
+        assert!(!store.has_ready_alias().await);
+        store
+            .done(&run.identity, "plan", run.generation)
+            .await
+            .unwrap();
+        assert!(store.has_ready_alias().await);
+        assert_eq!(
+            store.has_ready_alias().await,
+            store.list().await.iter().any(PipelineRun::has_ready_alias)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_reconcilers_only_claim_an_alias_once() {
+        let store = PipelineRunStore::in_memory();
+        let run = store.register(registration(Vec::new())).await.unwrap();
+        let (left, right) = tokio::join!(
+            store.claim_ready(&run.identity, run.generation),
+            store.claim_ready(&run.identity, run.generation),
+        );
+        let claims: Vec<_> = left.unwrap().into_iter().chain(right.unwrap()).collect();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].agent.alias, "plan");
+    }
+
+    #[tokio::test]
+    async fn interrupted_claim_survives_restart_and_can_be_adopted_after_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipeline-runs.json");
+        let store = PipelineRunStore::load(Some(path.clone())).unwrap();
+        let run = store.register(registration(Vec::new())).await.unwrap();
+        store
+            .claim_ready(&run.identity, run.generation)
+            .await
+            .unwrap();
+        drop(store);
+        let restored = PipelineRunStore::load(Some(path.clone())).unwrap();
+        assert!(restored
+            .claim_ready(&run.identity, run.generation)
+            .await
+            .unwrap()
+            .is_empty());
+        drop(restored);
+
+        // Simulate a restart after the persisted lease expired, without a
+        // wall-clock sleep or changing the completion generation.
+        let mut file: PipelineRunFile =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file.runs[0]
+            .aliases
+            .get_mut("plan")
+            .unwrap()
+            .claim_started_at =
+            Some(OffsetDateTime::now_utc() - time::Duration::seconds(CLAIM_LEASE_SECONDS + 1));
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let restored = PipelineRunStore::load(Some(path.clone())).unwrap();
+        let claims = restored
+            .claim_ready(&run.identity, run.generation)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].agent.alias, "plan");
+        // The reconciler found the pane created before the interrupted report.
+        restored
+            .report(
+                &run.identity,
+                "plan",
+                run.generation,
+                PipelineAliasStatus::Running,
+                Some("%42".into()),
+                None,
+                Some("@1".into()),
+            )
+            .await
+            .unwrap();
+        drop(restored);
+        let restored = PipelineRunStore::load(Some(path)).unwrap();
+        let adopted = restored.get(&run.identity).await.unwrap();
+        assert_eq!(adopted.aliases["plan"].pane.as_deref(), Some("%42"));
+        assert!(!adopted.has_ready_alias());
+        assert!(restored
+            .claim_ready(&run.identity, run.generation)
+            .await
+            .unwrap()
+            .is_empty());
+        restored
+            .done(&run.identity, "plan", run.generation)
+            .await
+            .unwrap();
+        let claims = restored
+            .claim_ready(&run.identity, run.generation)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].agent.alias, "impl");
     }
 
     #[tokio::test]

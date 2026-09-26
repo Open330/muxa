@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Local Fleet mailbox notifications use in-process revisions instead of a
+  subscription to the daemon's own IPC socket. Host refreshes read only the
+  selected host, and pipeline readiness checks no longer clone every Run.
+- A saturated Fleet host command queue returns an explicit retry error without
+  blocking command routing to other hosts.
+
+### Fixed
+
+- IPC observation subscriptions now stop on daemon shutdown, including blocked
+  stream writes, without consuming the five-second request drain deadline.
+  In-flight mutation handlers retain their existing drain guarantee.
+- Pipeline reconciliation workers now have a 60-second deadline and bounded
+  output capture, stop when the daemon shuts down, and back off after failures.
+  Already-launched tmux agents remain available for the next reconciliation.
+- `muxa work reconcile` now returns a failure after trying the remaining Runs
+  when a claim or launch fails, so the daemon can apply its retry delay.
+
 ## [0.8.54] - 2026-09-25
 
 ### Added
