@@ -99,6 +99,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var isTerminatingSession = false
     @Published private(set) var isAttachingPane = false
     @Published private(set) var attachError: String?
+    @Published var isPresentingFleetDispatch = false
+    @Published private(set) var askUsesSnapshots = false
     @Published var isPresentingWorkStart = false
     /// The Save / Restore snapshot sheet, when one is up. WS-F: snapshot
     @Published var sessionSnapshotSheet: MuxaSessionSnapshotSheet?
@@ -475,6 +477,7 @@ final class AppModel: ObservableObject {
     }
 
     private func runAskSubscription(ifGeneration generation: UInt64) async {
+        askUsesSnapshots = false
         guard await client.supports(MuxaIPCClient.askSubscribeCapability) else { return }
         while !Task.isCancelled, connectionGeneration == generation {
             do {
@@ -487,6 +490,10 @@ final class AppModel: ObservableObject {
                 return
             } catch {
                 guard connectionGeneration == generation else { return }
+                if MuxaAskSubscriptionPolicy.usesSnapshots(error) {
+                    askUsesSnapshots = true
+                    return // Regular reconciliation reads shared history; do not retry an unsupported stream.
+                }
                 MuxaLog.app.warning(
                     "Ask invalidation stream reconnecting: \(error.localizedDescription, privacy: .public)"
                 )
@@ -1573,6 +1580,16 @@ final class AppModel: ObservableObject {
 
     func prepareHostRegistration() {
         hostRegistrationError = nil
+    }
+
+    func setHostLabel(host: String, key: String, value: String?) async throws {
+        let document = try await client.readDaemonConfig()
+        let change = value.map { "\(key)=\($0)" } ?? "\(key)-"
+        _ = try await Self.runBundledMuxa(
+            arguments: ["--config", document.path, "host", "label", host, change, "--overwrite"],
+            socketPath: client.socketPath
+        )
+        beginConnection(replacingExistingDaemon: false)
     }
 
     func registerHost(_ request: MuxaHostRegistrationRequest) async -> Bool {

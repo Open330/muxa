@@ -664,6 +664,11 @@ enum WorkCmd {
     Dispatch(orchestration::DispatchArgs),
     /// Read a durable dispatch, including after a lost reply.
     DispatchStatus(orchestration::StatusArgs),
+    /// Read registered workspaces from the shared coordinator.
+    DispatchOptions {
+        #[arg(long, hide = true)]
+        at_coordinator: bool,
+    },
     #[command(hide = true)]
     DispatchExecute(orchestration::ExecuteArgs),
     #[command(hide = true)]
@@ -896,6 +901,9 @@ async fn run_work_cmd(
         WorkCmd::FleetAsk => orchestration::shared_ask(cfg, client).await,
         WorkCmd::Dispatch(args) => {
             orchestration::dispatch(args, cfg, client, config_path.as_deref()).await
+        }
+        WorkCmd::DispatchOptions { at_coordinator } => {
+            orchestration::options(cfg, client, at_coordinator).await
         }
         WorkCmd::DispatchStatus(args) => orchestration::status(args, cfg, client).await,
         WorkCmd::DispatchExecute(args) => {

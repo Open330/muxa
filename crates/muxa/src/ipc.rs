@@ -472,6 +472,11 @@ enum RequestBody {
     /// Hand out the daemon's `config.toml` as text, so a client can edit
     /// the sections that have no typed request of their own.
     ConfigRead {},
+    ConfigOrchestrationRead {},
+    ConfigOrchestrationWrite {
+        expected_text: String,
+        settings: crate::orchestration::OrchestrationConfig,
+    },
     ConfigLaunchRead {},
     ConfigLaunchWrite {
         expected_text: String,
@@ -786,6 +791,7 @@ const CAPABILITIES: &[&str] = &[
     "automation_v1",
     "automation_ask_v1",
     "config_launch_v1",
+    "config_orchestration_v1",
     "config_edit_v1",
 ];
 
@@ -931,6 +937,8 @@ pub struct Response {
     pub automation_judgment: Option<crate::automation_judge::AutomationJudgment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch: Option<crate::config_file::LaunchSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<crate::orchestration::OrchestrationConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -990,6 +998,7 @@ impl Response {
             automation_test: None,
             automation_judgment: None,
             launch: None,
+            orchestration: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -2862,6 +2871,42 @@ async fn record_collaboration_audit(
     audit.append(entry).await;
 }
 
+fn orchestration_config_response(
+    path: Option<&Path>,
+    update: Option<(&str, &crate::orchestration::OrchestrationConfig)>,
+) -> Response {
+    let Some(path) = path else {
+        return Response::err(NO_CONFIG_PATH);
+    };
+    let result = match update {
+        Some((expected, settings)) => {
+            crate::config_file::write_orchestration(path, expected, settings)
+        }
+        None => crate::config_file::read(path),
+    };
+    match result {
+        Ok(document) => match toml::from_str::<crate::Config>(&document.text) {
+            Ok(config) => {
+                let mut response = Response::with_config(document);
+                response.orchestration = Some(config.orchestration);
+                response
+            }
+            Err(e) => Response::err(e.to_string()),
+        },
+        Err(crate::config_file::ConfigFileError::Conflict { current }) => {
+            let mut response =
+                Response::err("config.toml changed; reload before saving Fleet policy");
+            response.config = Some(crate::config_file::ConfigDocument {
+                path: path.into(),
+                exists: true,
+                text: current,
+            });
+            response
+        }
+        Err(e) => Response::err(e.to_string()),
+    }
+}
+
 #[tracing::instrument(
     level = "debug",
     skip(
@@ -3787,6 +3832,20 @@ async fn handle(
                         },
                         None => Response::err(NO_CONFIG_PATH.to_string()),
                     }
+                }
+                RequestBody::ConfigOrchestrationRead {} => {
+                    kind = "config_orchestration_read";
+                    orchestration_config_response(config_path.as_deref(), None)
+                }
+                RequestBody::ConfigOrchestrationWrite {
+                    expected_text,
+                    settings,
+                } => {
+                    kind = "config_orchestration_write";
+                    orchestration_config_response(
+                        config_path.as_deref(),
+                        Some((&expected_text, &settings)),
+                    )
                 }
                 RequestBody::ConfigLaunchRead {} => {
                     kind = "config_launch_read";
@@ -8634,6 +8693,39 @@ mod tests {
         assert!(ask.list().await.is_empty());
         assert_eq!(client.call(&request).await.unwrap()["ok"], false);
         assert_eq!(automation.ledger().all().await.len(), 2);
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn orchestration_settings_ipc_roundtrips_and_rejects_stale_writes() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("orchestration.sock");
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "# existing\n").unwrap();
+        let server = Server::new(socket.clone(), Store::shared()).with_config_path(Some(path));
+        let (shutdown, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(async move { server.run(receiver).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let read = client
+            .call(&serde_json::json!({"kind":"config_orchestration_read"}))
+            .await
+            .unwrap();
+        assert_eq!(read["orchestration"]["enabled"], false);
+        let mut settings = read["orchestration"].clone();
+        settings["enabled"] = serde_json::json!(true);
+        let request = serde_json::json!({"kind":"config_orchestration_write", "expected_text":"# existing\n", "settings":settings});
+        let saved = client.call(&request).await.unwrap();
+        assert_eq!(saved["orchestration"]["enabled"], true);
+        assert!(saved["config"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("# existing\n"));
+        let stale = client.call(&request).await.unwrap();
+        assert_eq!(stale["ok"], false);
+        assert_eq!(stale["config"], saved["config"]);
+        assert!(CAPABILITIES.contains(&"config_orchestration_v1"));
         shutdown.send(()).unwrap();
         task.await.unwrap();
     }

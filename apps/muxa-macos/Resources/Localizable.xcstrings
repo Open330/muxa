@@ -17055,6 +17055,646 @@
           }
         }
       }
+    },
+    "Fleet Dispatch" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fleet 작업 배치"
+          }
+        }
+      }
+    },
+    "Dispatch" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 배치"
+          }
+        }
+      }
+    },
+    "Muxa selects a host and prepares an isolated worktree. The pipeline runs in an attachable tmux session." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa가 호스트를 선택하고 격리된 worktree를 준비합니다. 파이프라인은 언제든 접속할 수 있는 tmux 세션에서 실행됩니다."
+          }
+        }
+      }
+    },
+    "Fleet dispatch requires an updated CLI and daemon. Configure the coordinator in Settings → Dispatch." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fleet 작업 배치에는 최신 CLI와 데몬이 필요합니다. 설정 → 작업 배치에서 coordinator를 지정하세요."
+          }
+        }
+      }
+    },
+    "Coordinator: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Coordinator: %@"
+          }
+        }
+      }
+    },
+    "Select workspace" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspace 선택"
+          }
+        }
+      }
+    },
+    "Work ID" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Work ID"
+          }
+        }
+      }
+    },
+    "Full commit SHA" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "전체 커밋 SHA"
+          }
+        }
+      }
+    },
+    "Node selector (optional)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드 선택 조건 (선택)"
+          }
+        }
+      }
+    },
+    "Host alias or NodeId (optional)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "호스트 별칭 또는 NodeId (선택)"
+          }
+        }
+      }
+    },
+    "Task and acceptance criteria" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 내용과 완료 기준"
+          }
+        }
+      }
+    },
+    "Placement preview" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "배치 미리보기"
+          }
+        }
+      }
+    },
+    "Assigned work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "배정된 작업"
+          }
+        }
+      }
+    },
+    "Root" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본 경로"
+          }
+        }
+      }
+    },
+    "Run" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행"
+          }
+        }
+      }
+    },
+    "Artifacts" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결과물"
+          }
+        }
+      }
+    },
+    "Placement is checked again when you dispatch." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실제 요청을 보낼 때 배치 조건을 다시 확인합니다."
+          }
+        }
+      }
+    },
+    "Result" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결과"
+          }
+        }
+      }
+    },
+    "The pipeline has started. This does not mean the work is complete." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파이프라인이 시작되었습니다. 작업이 완료된 상태는 아닙니다."
+          }
+        }
+      }
+    },
+    "Delivery is uncertain. Check status with this ID before retrying the same request." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "요청 전달 여부가 불확실합니다. 같은 요청을 재시도하기 전에 이 ID로 상태를 확인하세요."
+          }
+        }
+      }
+    },
+    "Artifact location on worker" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 호스트의 결과물 경로"
+          }
+        }
+      }
+    },
+    "Saved dispatches" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장된 배치 요청"
+          }
+        }
+      }
+    },
+    "Dispatch UUID" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "배치 요청 UUID"
+          }
+        }
+      }
+    },
+    "Check status" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "상태 확인"
+          }
+        }
+      }
+    },
+    "New Work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "새 Work"
+          }
+        }
+      }
+    },
+    "Preview placement" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "배치 미리보기"
+          }
+        }
+      }
+    },
+    "Retry same request" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "같은 요청 재시도"
+          }
+        }
+      }
+    },
+    "Dispatch Work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Work 배치"
+          }
+        }
+      }
+    },
+    "Coordinator" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Coordinator"
+          }
+        }
+      }
+    },
+    "Enable Fleet dispatch" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fleet 작업 배치 활성화"
+          }
+        }
+      }
+    },
+    "Coordinator host alias" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Coordinator 호스트 별칭"
+          }
+        }
+      }
+    },
+    "Empty means this host" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "비워 두면 현재 호스트 사용"
+          }
+        }
+      }
+    },
+    "These settings belong to the connected daemon. Other entry hosts use its Fleet alias to share placement and Ask history." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "연결된 데몬의 설정입니다. 다른 호스트에서는 이 coordinator의 Fleet 별칭을 지정해 작업 배치와 Ask 기록을 공유합니다."
+          }
+        }
+      }
+    },
+    "Default execution paths" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본 실행 경로"
+          }
+        }
+      }
+    },
+    "Workspace policy" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspace 정책"
+          }
+        }
+      }
+    },
+    "New workspace ID" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "새 Workspace ID"
+          }
+        }
+      }
+    },
+    "Add workspace" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspace 추가"
+          }
+        }
+      }
+    },
+    "Repository ID" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장소 ID"
+          }
+        }
+      }
+    },
+    "Repository URL" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장소 URL"
+          }
+        }
+      }
+    },
+    "Node selector" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드 선택 조건"
+          }
+        }
+      }
+    },
+    "Empty overrides inherit the defaults above." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "비워 둔 항목은 상위 기본값을 따릅니다."
+          }
+        }
+      }
+    },
+    "Node override" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드별 설정"
+          }
+        }
+      }
+    },
+    "Select node" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드 선택"
+          }
+        }
+      }
+    },
+    "NodeId or coordinator-local alias" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "NodeId 또는 coordinator 기준 호스트 별칭"
+          }
+        }
+      }
+    },
+    "Add node" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드 추가"
+          }
+        }
+      }
+    },
+    "Remove node override" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드별 설정 제거"
+          }
+        }
+      }
+    },
+    "Use {repo}, {workspace}, {work}, and {attempt}. Runs and artifacts must include {attempt}. Paths are expanded on the selected worker." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "{repo}, {workspace}, {work}, {attempt}를 사용할 수 있습니다. 실행·결과물 경로에는 {attempt}가 필요합니다. 실제 경로는 선택된 작업 호스트에서 결정됩니다."
+          }
+        }
+      }
+    },
+    "Edit workspace and node paths on the coordinator. This host forwards requests there." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspace와 노드 경로는 coordinator에서 설정하세요. 현재 호스트는 요청을 해당 coordinator로 전달합니다."
+          }
+        }
+      }
+    },
+    "Repository path" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장소 경로"
+          }
+        }
+      }
+    },
+    "Run path" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 경로"
+          }
+        }
+      }
+    },
+    "Artifact path" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결과물 경로"
+          }
+        }
+      }
+    },
+    "Root override" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본 경로 재정의"
+          }
+        }
+      }
+    },
+    "Repository path override" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장소 경로 재정의"
+          }
+        }
+      }
+    },
+    "Run path override" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 경로 재정의"
+          }
+        }
+      }
+    },
+    "Artifact path override" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결과물 경로 재정의"
+          }
+        }
+      }
+    },
+    "Shared Ask history refreshes periodically from the coordinator." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "공유 Ask 기록을 coordinator에서 주기적으로 가져옵니다."
+          }
+        }
+      }
+    },
+    "View worker": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "작업 호스트 보기"
+          }
+        }
+      }
+    },
+    "Node labels": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "노드 태그"
+          }
+        }
+      }
+    },
+    "Edit labels": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "태그 편집"
+          }
+        }
+      }
+    },
+    "Label key": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "태그 키"
+          }
+        }
+      }
+    },
+    "Label value": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "태그 값"
+          }
+        }
+      }
+    },
+    "Remove label": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "태그 삭제"
+          }
+        }
+      }
+    },
+    "Save label": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "태그 저장"
+          }
+        }
+      }
+    },
+    "Labels are used by workspace and request selectors. System-managed labels cannot be changed.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "태그는 workspace와 요청의 노드 선택 조건에 사용됩니다. 시스템이 관리하는 태그는 변경할 수 없습니다."
+          }
+        }
+      }
     }
   },
   "version" : "1.0"
