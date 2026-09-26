@@ -1857,8 +1857,11 @@ mod tests {
             identity_error: None,
             shutdown,
         };
-        // Changes between subscription and task startup must not be lost.
+        // No new change is required to invalidate pre-existing mailbox reads.
+        // The initial revision must be announced even if it was already seen.
         changes.send_replace(42);
+        let mut task = task;
+        task.mailbox_changes.borrow_and_update();
         let task = tokio::spawn(task.run());
         let update = tokio::time::timeout(Duration::from_secs(1), updates.recv())
             .await

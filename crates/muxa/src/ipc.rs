@@ -1954,7 +1954,10 @@ impl Server {
             // Best-effort: let the abort propagate.
             while handlers.join_next().await.is_some() {}
         } else {
-            tracing::debug!(elapsed_ms = u64::try_from(drain_started.elapsed().as_millis()).unwrap_or(u64::MAX), "ipc handlers drained cleanly");
+            tracing::debug!(
+                elapsed_ms = u64::try_from(drain_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "ipc handlers drained cleanly"
+            );
         }
 
         // Remove our own socket file so next startup is clean.
@@ -2103,6 +2106,18 @@ async fn until_server_shutdown<T>(
         _ = stopping.wait_for(|value| *value) => None,
         result = future => Some(result),
     }
+}
+
+/// The stream takeover acknowledgement is read-only too. A peer may stop
+/// reading before it arrives, so cancellation must cover this first write.
+async fn write_subscription_ack(
+    writer: &mut OwnedWriteHalf,
+    bytes: &[u8],
+    stopping: &mut watch::Receiver<bool>,
+) -> Result<bool, RuntimeError> {
+    until_server_shutdown(stopping, write_line_or_closed(writer, bytes))
+        .await
+        .unwrap_or(Ok(false))
 }
 
 /// Encode the `{"event":"lagged","dropped":N}` overflow control frame — but
@@ -3188,7 +3203,7 @@ async fn handle(
                     let changes = pipeline_runs.subscribe();
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
                     let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
-                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                    if !write_subscription_ack(&mut writer, &ack_bytes, &mut stopping).await? {
                         return Ok(());
                     }
                     return until_server_shutdown(
@@ -3422,7 +3437,7 @@ async fn handle(
                         .collect::<HashSet<_>>();
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
                     let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
-                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                    if !write_subscription_ack(&mut writer, &ack_bytes, &mut stopping).await? {
                         return Ok(());
                     }
                     tracing::debug!(
@@ -3770,7 +3785,7 @@ async fn handle(
                     let changes = ask.subscribe();
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
                     let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
-                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                    if !write_subscription_ack(&mut writer, &ack_bytes, &mut stopping).await? {
                         return Ok(());
                     }
                     return until_server_shutdown(
@@ -4139,7 +4154,7 @@ async fn handle(
                     let changes = collaboration.subscribe();
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
                     let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
-                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                    if !write_subscription_ack(&mut writer, &ack_bytes, &mut stopping).await? {
                         return Ok(());
                     }
                     tracing::debug!(
@@ -4506,7 +4521,7 @@ async fn handle(
                     let protocol = negotiated.unwrap_or(PROTOCOL_VERSION);
                     let changes = store.subscribe_changes();
                     let ack = encode_line(&Response::ok(), protocol)?;
-                    if !write_line_or_closed(&mut writer, &ack).await? {
+                    if !write_subscription_ack(&mut writer, &ack, &mut stopping).await? {
                         return Ok(());
                     }
                     return until_server_shutdown(
@@ -4529,7 +4544,7 @@ async fn handle(
                     // — this connection is now owned by the streaming
                     // pump.
                     let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
-                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                    if !write_subscription_ack(&mut writer, &ack_bytes, &mut stopping).await? {
                         return Ok(());
                     }
                     tracing::debug!(
@@ -7780,6 +7795,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_cancels_a_backpressured_subscription_ack() {
+        let (server, _client) = UnixStream::pair().unwrap();
+        let (_reader, mut writer) = server.into_split();
+        writer.writable().await.unwrap();
+        let bytes = vec![0_u8; 65536];
+        let mut written = 0;
+        loop {
+            match writer.try_write(&bytes) {
+                Ok(n) => written += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill socket: {error}"),
+            }
+        }
+        assert!(written > 0);
+        let (stop, mut stopping) = watch::channel(false);
+        let mut ack = Box::pin(write_subscription_ack(&mut writer, b"{}\n", &mut stopping));
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut ack)
+            .await
+            .is_err());
+        stop.send_replace(true);
+        assert!(!tokio::time::timeout(Duration::from_secs(1), ack)
+            .await
+            .unwrap()
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn shutdown_cancels_a_backpressured_subscription_write() {
         let (server, _client) = UnixStream::pair().unwrap();
         let (_reader, writer) = server.into_split();
@@ -7808,7 +7850,8 @@ mod tests {
         shutdown.send_replace(true);
         assert!(tokio::time::timeout(Duration::from_secs(1), pump)
             .await
-            .expect("blocked stream write must be cancellable").is_none());
+            .expect("blocked stream write must be cancellable")
+            .is_none());
     }
 
     /// `Server::run` must wait for in-flight handlers to finish before
