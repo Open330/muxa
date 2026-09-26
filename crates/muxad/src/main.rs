@@ -45,6 +45,7 @@ use tokio::sync::broadcast;
 mod binary_watch;
 mod fleet_manager;
 mod herdr_bridge;
+mod pipeline_reconciler;
 mod screen_detect;
 mod synthetic;
 
@@ -441,7 +442,7 @@ async fn main() -> Result<()> {
     // Its initial authoritative scan still catches completions committed
     // between server start and subscription.
     let pipeline_reconciler_handle =
-        spawn_pipeline_reconciler_task(pipeline_runs, socket.clone(), &shutdown_tx);
+        pipeline_reconciler::spawn(pipeline_runs, socket.clone(), &shutdown_tx);
 
     // Self-heal: if a tmux server is already running, inject our socket
     // path into its environment so that every pane — including any that
@@ -643,43 +644,6 @@ fn build_collaboration_audit(cfg: &Config) -> Arc<CollaborationAuditLog> {
     CollaborationAuditLog::in_memory()
 }
 
-/// Completion changes wake a daemon-owned reconciliation loop. The worker
-/// deliberately invokes the installed `muxa` binary instead of duplicating
-/// its allowlisted agent-launch policy inside muxad; the CLI atomically claims
-/// ready aliases over IPC before touching tmux, so a user-triggered `work up`
-/// racing this worker cannot launch a duplicate.
-fn spawn_pipeline_reconciler_task(
-    pipeline_runs: Arc<PipelineRunStore>,
-    socket: PathBuf,
-    shutdown_tx: &broadcast::Sender<()>,
-) -> tokio::task::JoinHandle<()> {
-    let mut changes = pipeline_runs.subscribe();
-    let mut shutdown = shutdown_tx.subscribe();
-    tokio::spawn(async move {
-        let mut safety_scan = tokio::time::interval(std::time::Duration::from_secs(30));
-        safety_scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            let ready = pipeline_runs
-                .list()
-                .await
-                .iter()
-                .any(muxa::pipeline_run::PipelineRun::has_ready_alias);
-            if ready {
-                run_pipeline_reconciler(&socket).await;
-            }
-            tokio::select! {
-                revision = changes.changed() => {
-                    if revision.is_err() {
-                        break;
-                    }
-                }
-                _ = safety_scan.tick() => {}
-                _ = shutdown.recv() => break,
-            }
-        }
-    })
-}
-
 // WS-F: snapshot
 /// Automatic workspace snapshots (`[snapshot]`, on by default every 15
 /// minutes). The first one waits a full interval: right after a reboot the
@@ -783,40 +747,6 @@ async fn observe_pipeline_agent(
     };
     if let Err(error) = pipeline_runs.observe_pane(pane, status).await {
         tracing::warn!(pane, %error, "could not project agent state into pipeline Run");
-    }
-}
-
-async fn run_pipeline_reconciler(socket: &Path) {
-    let program = std::env::var_os("MUXA_PIPELINE_CLI").map_or_else(
-        || {
-            std::env::current_exe()
-                .ok()
-                .map(|path| path.with_file_name("muxa"))
-                .filter(|path| path.exists())
-                .unwrap_or_else(|| PathBuf::from("muxa"))
-        },
-        PathBuf::from,
-    );
-    match tokio::process::Command::new(&program)
-        .args(["work", "reconcile", "--all"])
-        .env("MUXA_SOCKET", socket)
-        .output()
-        .await
-    {
-        Ok(output) if output.status.success() => {
-            tracing::debug!(program = %program.display(), "pipeline reconcile completed");
-        }
-        Ok(output) => {
-            tracing::warn!(
-                program = %program.display(),
-                status = %output.status,
-                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                "pipeline reconcile command failed",
-            );
-        }
-        Err(error) => {
-            tracing::warn!(program = %program.display(), %error, "could not start pipeline reconciler");
-        }
     }
 }
 
