@@ -30,14 +30,22 @@ struct ArtifactOutline: NSViewRepresentable {
         let scroll = NSScrollView(); scroll.documentView = outline
         scroll.hasVerticalScroller = true; scroll.drawsBackground = false
         context.coordinator.outline = outline
+        context.coordinator.startPolling()
         return scroll
     }
+    static func dismantleNSView(_ view: NSScrollView, coordinator: Coordinator) { coordinator.stop() }
     func updateNSView(_ view: NSScrollView, context: Context) {
         let coordinator = context.coordinator
         let changed = coordinator.owner.root != root || coordinator.owner.revision != revision || coordinator.owner.showHidden != showHidden
         if coordinator.owner.root != root { coordinator.expanded.removeAll(); coordinator.selectedLocation = nil }
         coordinator.owner = self
         if changed || !coordinator.started { coordinator.reload() }
+        let active: MuxaFileLocation? = if case .file(let location) = model.sidebarSelection { location } else { nil }
+        if active != coordinator.lastRevealed {
+            coordinator.lastRevealed = active
+            coordinator.revealTask?.cancel()
+            if let active { coordinator.revealTask = Task { await coordinator.reveal(active) } }
+        }
     }
     final class ArtifactOutlineView: NSOutlineView {
         var submit: (() -> Void)?
@@ -53,6 +61,10 @@ struct ArtifactOutline: NSViewRepresentable {
         lazy var placeholder = Node(location, directory: false, title: String(localized: "Loading…"))
         var children: [Node]?
         var loading = false
+        var entries: [MuxaFileEntry]?
+        var truncated = false
+        var failed = false
+        var task: Task<Void, Never>?
         init(_ location: MuxaFileLocation, directory: Bool, title: String? = nil) {
             self.location = location; self.directory = directory; self.title = title ?? location.name; self.isStatus = title != nil
         }
@@ -66,8 +78,77 @@ struct ArtifactOutline: NSViewRepresentable {
         var restoring = false
         var started = false
         var generation = 0
+        var lastRevealed: MuxaFileLocation?
+        var revealTask: Task<Void, Never>?
+        var polling: Task<Void, Never>?
+        var refreshOffset = 0
+        func stop() {
+            polling?.cancel(); polling = nil
+            revealTask?.cancel(); revealTask = nil
+            cancel(rootNode)
+            generation += 1
+        }
+        private func cancel(_ node: Node?) {
+            node?.task?.cancel()
+            for child in node?.children ?? [] { cancel(child) }
+        }
+        func startPolling() {
+            polling = Task { [weak self] in
+                while !Task.isCancelled {
+                    let seconds = self?.owner.root.hostAlias == "local" ? 2 : 10
+                    do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
+                    await self?.refreshVisible()
+                }
+            }
+        }
+        private func refreshVisible() async {
+            guard let rootNode, let outline, outline.window?.isVisible == true else { return }
+            let current = generation
+            var nodes = [rootNode]
+            for row in 0..<outline.numberOfRows {
+                if let node = outline.item(atRow: row) as? Node, node.directory, outline.isItemExpanded(node) { nodes.append(node) }
+            }
+            let folders = Array(nodes.dropFirst())
+            let start = folders.isEmpty ? 0 : refreshOffset % folders.count
+            let batch = [rootNode] + (0..<min(31, folders.count)).map { folders[(start + $0) % folders.count] }
+            refreshOffset = start + min(31, folders.count)
+            for node in batch {
+                guard !Task.isCancelled, current == generation else { return }
+                if node !== rootNode, outline.row(forItem: node) < 0 { continue }
+                load(node, refresh: true)
+                await node.task?.value
+            }
+        }
+        func reveal(_ location: MuxaFileLocation) async {
+            guard let rootNode, Self.contains(location, in: owner.root) else { return }
+            let current = generation
+            var node = rootNode
+            while !Task.isCancelled, current == generation {
+                load(node)
+                await node.task?.value
+                guard !Task.isCancelled, current == generation else { return }
+                guard let next = node.children?.first(where: { !$0.isStatus && ($0.location == location || ($0.directory && Self.contains(location, in: $0.location))) }) else { return }
+                if next.location == location, let outline {
+                    let row = outline.row(forItem: next)
+                    guard row >= 0 else { return }
+                    restoring = true
+                    selectedLocation = location
+                    outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                    outline.scrollRowToVisible(row)
+                    restoring = false
+                    return
+                }
+                outline?.expandItem(next)
+                node = next
+            }
+        }
+        static func contains(_ location: MuxaFileLocation, in root: MuxaFileLocation) -> Bool {
+            root.contains(location)
+        }
         init(_ owner: ArtifactOutline) { self.owner = owner }
         func reload() {
+            cancel(rootNode)
+            lastRevealed = nil
             started = true; generation += 1
             rootNode = Node(owner.root, directory: true)
             restoring = true
@@ -75,28 +156,37 @@ struct ArtifactOutline: NSViewRepresentable {
             restoring = false
             if let rootNode { load(rootNode) }
         }
-        func load(_ node: Node) {
-            guard !node.loading, node.children == nil else { return }
+        func load(_ node: Node, refresh: Bool = false) {
+            guard !node.loading, refresh || node.children == nil else { return }
             node.loading = true
             let generation = generation
-            Task {
+            node.task = Task {
+                defer { node.loading = false }
                 do {
                     let listing = try await owner.model.fileReader(for: node.location).list(node.location.path)
-                    guard generation == self.generation else { return }
+                    guard !Task.isCancelled, generation == self.generation else { return }
+                    if node === rootNode, listing.path != owner.root.path || owner.model.fileRoot == nil {
+                        owner.model.fileRoot = .init(hostAlias: node.location.hostAlias, path: listing.path)
+                    }
+                    guard node.entries != listing.entries || node.truncated != listing.truncated || node.failed else { return }
+                    node.entries = listing.entries; node.truncated = listing.truncated; node.failed = false
+                    let existing = Dictionary((node.children ?? []).filter { !$0.isStatus }.map { ($0.location, $0) }, uniquingKeysWith: { first, _ in first })
                     node.children = listing.entries.filter { owner.showHidden || !$0.name.hasPrefix(".") }.map {
-                        Node(.init(hostAlias: node.location.hostAlias, path: listing.path).appending($0.name), directory: $0.directory)
+                        let location = MuxaFileLocation(hostAlias: node.location.hostAlias, path: listing.path).appending($0.name)
+                        if let previous = existing[location], previous.directory == $0.directory { return previous }
+                        return Node(location, directory: $0.directory)
                     }
                     if node.children?.isEmpty == true { node.children = [Node(node.location, directory: false, title: String(localized: "No files in this view"))] }
                     if listing.truncated { node.children?.append(Node(node.location, directory: false, title: "Showing first 1,000 entries")) }
                     owner.model.rememberBrowsedFiles(listing, on: node.location.hostAlias)
                 } catch {
-                    guard generation == self.generation else { return }
+                    guard !Task.isCancelled, generation == self.generation else { return }
+                    node.failed = true
                     node.children = [Node(node.location, directory: false, title: error.localizedDescription)]
                 }
-                node.loading = false
                 restoring = true
                 if node === rootNode { outline?.reloadData() }
-                else { outline?.reloadItem(node, reloadChildren: true) }
+                else if let outline, outline.row(forItem: node) >= 0 { outline.reloadItem(node, reloadChildren: true) }
                 for child in node.children ?? [] {
                     if child.directory && expanded.contains(child.location) { outline?.expandItem(child) }
                     if !child.isStatus, child.location == selectedLocation, let outline {
@@ -250,6 +340,7 @@ private struct ArtifactPathField: NSViewRepresentable {
         DispatchQueue.main.async { field.window?.makeFirstResponder(field); field.selectText(nil) }
         return field
     }
+
     func updateNSView(_ field: NSTextField, context: Context) {
         context.coordinator.owner = self
         if field.stringValue != text { field.stringValue = text }

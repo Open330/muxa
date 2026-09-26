@@ -146,3 +146,114 @@ private func artifactFixture() throws -> URL {
     #expect(!html.contains("<script>"))
     #expect(!html.contains("<svg>"))
 }
+
+@Test func workspaceIndexFindsUnbrowsedFilesAndSkipsBuildTreesAndSymlinkLoops() async throws {
+    let root = try artifactFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let nested = root.appendingPathComponent("artifacts/보고서")
+    try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+    try Data("result".utf8).write(to: nested.appendingPathComponent("unvisited.md"))
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("node_modules"), withIntermediateDirectories: true)
+    try Data().write(to: root.appendingPathComponent("node_modules/ignored.txt"))
+    try FileManager.default.createSymbolicLink(at: nested.appendingPathComponent("loop"), withDestinationURL: root)
+    let index = try await MuxaFileReader(sshTarget: nil).index(root.path)
+    #expect(index.paths == [nested.appendingPathComponent("unvisited.md").standardizedFileURL.path])
+    #expect(!index.truncated)
+    let command = try MuxaFileReader.remoteCommand(path: root.path, operation: "index")
+    let output = await BoundedProcess.run(executable: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", command], limit: 4096, timeout: 10)
+    #expect(output.status == 0)
+    let remote = try JSONDecoder().decode(MuxaFileIndex.self, from: output.stdout)
+    #expect(remote.paths.map { ($0 as NSString).lastPathComponent } == ["unvisited.md"])
+    #expect(!remote.truncated)
+}
+
+@Test func workspaceIndexRejectsMissingRootsAndCancellation() async throws {
+    let root = try artifactFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    await #expect(throws: MuxaFileError.self) { try await MuxaFileReader(sshTarget: nil).index(root.appendingPathComponent("missing").path) }
+    for index in 0..<100 { try Data().write(to: root.appendingPathComponent("file-\(index)")) }
+    let task = Task { try await MuxaFileReader(sshTarget: nil).index(root.path) }
+    task.cancel()
+    await #expect(throws: CancellationError.self) { try await task.value }
+}
+
+@Test @MainActor func explorerContainmentRespectsHostAndPathBoundaries() {
+    let root = MuxaFileLocation(hostAlias: "local", path: "/work")
+    #expect(ArtifactOutline.Coordinator.contains(root.appending("nested/file.md"), in: root))
+    #expect(!ArtifactOutline.Coordinator.contains(.init(hostAlias: "local", path: "/workspace/file.md"), in: root))
+    #expect(!ArtifactOutline.Coordinator.contains(.init(hostAlias: "other", path: "/work/file.md"), in: root))
+}
+
+@Test @MainActor func explorerRefreshRetainsNodesAndRecoversFromReadFailure() async throws {
+    let root = try artifactFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let model = AppModel()
+    let location = MuxaFileLocation(hostAlias: "local", path: root.path)
+    let coordinator = ArtifactOutline.Coordinator(ArtifactOutline(model: model, root: location, showHidden: false, revision: 0, openFile: { _, _ in }))
+    defer { coordinator.stop() }
+    coordinator.reload()
+    let node = try #require(coordinator.rootNode)
+    await node.task?.value
+    try Data().write(to: root.appendingPathComponent("new.md"))
+    coordinator.load(node, refresh: true); await node.task?.value
+    let file = try #require(node.children?.first { $0.title == "new.md" })
+    coordinator.load(node, refresh: true); await node.task?.value
+    #expect(node.children?.first { $0.title == "new.md" } === file)
+    try FileManager.default.removeItem(at: root)
+    coordinator.load(node, refresh: true); await node.task?.value
+    #expect(node.failed)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try Data().write(to: root.appendingPathComponent("restored.md"))
+    coordinator.load(node, refresh: true); await node.task?.value
+    #expect(!node.failed)
+    #expect(node.children?.first?.title == "restored.md")
+}
+
+@Test @MainActor func activeFileRevealExpandsAncestorsWithoutOpeningAnotherTab() async throws {
+    let root = try artifactFixture().standardizedFileURL
+    defer { try? FileManager.default.removeItem(at: root) }
+    let folder = root.appendingPathComponent("one/two")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let file = folder.appendingPathComponent("report.md")
+    try Data().write(to: file)
+    let location = MuxaFileLocation(hostAlias: "local", path: root.path)
+    var opened = 0
+    let coordinator = ArtifactOutline.Coordinator(ArtifactOutline(model: AppModel(), root: location, showHidden: false, revision: 0, openFile: { _, _ in opened += 1 }))
+    let outline = NSOutlineView()
+    outline.addTableColumn(NSTableColumn(identifier: .init("test")))
+    outline.delegate = coordinator; outline.dataSource = coordinator; coordinator.outline = outline
+    defer { coordinator.stop() }
+    coordinator.reload()
+    await coordinator.reveal(.init(hostAlias: "local", path: file.path))
+    #expect(outline.selectedRow >= 0)
+    #expect((outline.item(atRow: outline.selectedRow) as? ArtifactOutline.Node)?.title == "report.md")
+    #expect(opened == 0)
+}
+
+@Test func fileMetadataTracksWritesWithoutReadingContents() async throws {
+    let root = try artifactFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let file = root.appendingPathComponent("artifact.txt")
+    try Data("one".utf8).write(to: file)
+    let reader = MuxaFileReader(sshTarget: nil)
+    let before = try await reader.stamp(file.path)
+    try Data("updated result".utf8).write(to: file)
+    let after = try await reader.stamp(file.path)
+    #expect(before != after)
+    let command = try MuxaFileReader.remoteCommand(path: file.path, operation: "stat")
+    let output = await BoundedProcess.run(executable: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", command], limit: 4096, timeout: 10)
+    let remote = try JSONDecoder().decode(MuxaFileStamp.self, from: output.stdout)
+    #expect(remote.size == after.size)
+}
+
+@Test @MainActor func activatingFileTabsKeepsWorkspaceOrSwitchesHostRoot() {
+    let model = AppModel()
+    let root = MuxaFileLocation(hostAlias: "local", path: "/work")
+    model.fileRoot = root
+    model.activateEditor(.file(root.appending("nested/report.md")))
+    #expect(model.fileRoot == root)
+    let remote = MuxaFileLocation(hostAlias: "remote", path: "/work/other/report.md")
+    model.activateEditor(.file(remote))
+    #expect(model.fileRoot == remote.parent)
+    #expect(model.sidebarMode == .files)
+}

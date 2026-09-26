@@ -18155,6 +18155,46 @@
           }
         }
       }
+    },
+    "Search files, sessions, work and agents": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "파일, 세션, Work, 에이전트 검색"
+          }
+        }
+      }
+    },
+    "Searching workspace files…": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "작업 폴더의 파일을 검색하는 중…"
+          }
+        }
+      }
+    },
+    "Some folders were skipped or the search limit was reached. Open a narrower folder to search further.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "읽지 못한 폴더가 있거나 검색 한도에 도달했습니다. 하위 폴더를 열어 더 검색하세요."
+          }
+        }
+      }
+    },
+    "This image could not be decoded.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이미지를 해석할 수 없습니다."
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

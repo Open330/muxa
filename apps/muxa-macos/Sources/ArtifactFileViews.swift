@@ -56,6 +56,7 @@ struct ArtifactFileSidebar: View {
             Divider()
             ArtifactOutline(model: model, root: root, showHidden: showHidden, revision: revision, openFile: openFile)
         }.buttonStyle(.borderless)
+
     }
     private func chooseFolder() {
         let panel = NSOpenPanel()
@@ -166,11 +167,10 @@ struct ArtifactPreviewView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: revision) { await load() }
         .task(id: location) {
-            guard location.hostAlias == "local" else { return }
-            var previous = await localStamp()
+            var previous = await fileStamp()
             while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(2)) } catch { return }
-                let current = await localStamp()
+                do { try await Task.sleep(for: .seconds(location.hostAlias == "local" ? 2 : 10)) } catch { return }
+                let current = await fileStamp()
                 if current != previous { previous = current; revision = UUID() }
             }
         }
@@ -238,12 +238,8 @@ struct ArtifactPreviewView: View {
               ] as CFDictionary) else { return nil }
         return NSImage(cgImage: image, size: .zero)
     }
-    private func localStamp() async -> String? {
-        let path = location.path
-        return await Task.detached {
-            guard let values = try? FileManager.default.attributesOfItem(atPath: path) else { return nil as String? }
-            return "\(values[.modificationDate] ?? ""):\(values[.size] ?? "")"
-        }.value
+    private func fileStamp() async -> MuxaFileStamp? {
+        try? await model.fileReader(for: location).stamp(location.path)
     }
     private func load() async {
         loading = contents == nil; error = nil

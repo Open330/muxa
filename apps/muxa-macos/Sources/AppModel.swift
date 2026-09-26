@@ -1787,7 +1787,9 @@ final class AppModel: ObservableObject {
         case .fleetWindow: sidebarMode = .watch
         case .shell: sidebarMode = .shells
         case .pane: sidebarMode = .watch
-        case .file: sidebarMode = .files
+        case .file(let location):
+            if fileRoot?.contains(location) != true { fileRoot = location.parent }
+            sidebarMode = .files
         }
         sidebarSelection = selection
     }
@@ -1800,7 +1802,8 @@ final class AppModel: ObservableObject {
         // execution navigator. Returning to an already-open pane tab must
         // restore its Explorer highlight as well as the editor content.
         switch selection {
-        case .file:
+        case .file(let location):
+            if fileRoot?.contains(location) != true { fileRoot = location.parent }
             sidebarMode = .files
         case .pane(let id):
             watchSelection = id

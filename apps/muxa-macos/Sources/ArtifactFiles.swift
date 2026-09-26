@@ -8,6 +8,10 @@ struct MuxaFileLocation: Codable, Hashable, Sendable, Identifiable {
     var id: String { "\(hostAlias.utf8.count):\(hostAlias):\(path)" }
     var name: String { (path as NSString).lastPathComponent }
     var parent: Self { Self(hostAlias: hostAlias, path: (path as NSString).deletingLastPathComponent) }
+    func contains(_ location: Self) -> Bool {
+        guard hostAlias == location.hostAlias else { return false }
+        return location.path.hasPrefix(path.hasSuffix("/") ? path : path + "/")
+    }
     func appending(_ name: String) -> Self {
         Self(hostAlias: hostAlias, path: (path as NSString).appendingPathComponent(name))
     }
@@ -24,6 +28,17 @@ struct MuxaFileListing: Decodable, Sendable {
     let path: String
     let entries: [MuxaFileEntry]
     let truncated: Bool
+}
+
+struct MuxaFileStamp: Codable, Equatable, Sendable {
+    let size: Int64
+    let modified: Double
+}
+
+struct MuxaFileIndex: Decodable, Sendable {
+    let paths: [String]
+    let truncated: Bool
+    let unreadable: Int
 }
 
 struct MuxaFileContents: Sendable {
@@ -80,6 +95,57 @@ struct MuxaFileReader: Sendable {
             }
             if let failure { throw MuxaFileError.message(failure) }
             return MuxaFileListing(path: url.path, entries: Self.sorted(entries), truncated: truncated)
+        }.value
+    }
+
+    /// Index names only, never file contents. Avoid dependency/build trees and
+    /// symlink traversal; bound both work and elapsed time on local and SSH hosts.
+    static let indexExclusions: Set<String> = [".git", ".build", "node_modules", "target", "vendor", "__pycache__", ".venv"]
+    func index(_ path: String) async throws -> MuxaFileIndex {
+        if sshTarget != nil {
+            return try JSONDecoder().decode(MuxaFileIndex.self, from: await remote(path, operation: "index"))
+        }
+        let task = Task.detached(priority: .utility) {
+            let root = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
+            var directory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: root.path, isDirectory: &directory), directory.boolValue else {
+                throw MuxaFileError.message(String(localized: "Folder not found."))
+            }
+            var unreadable = 0
+            guard let iterator = FileManager.default.enumerator(at: root,
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .isRegularFileKey],
+                options: [], errorHandler: { _, _ in unreadable += 1; return true }) else {
+                throw MuxaFileError.message(String(localized: "Cannot read this folder."))
+            }
+            let deadline = Date().addingTimeInterval(8)
+            var paths: [String] = [], visited = 0, truncated = false
+            while let url = iterator.nextObject() as? URL {
+                try Task.checkCancellation()
+                visited += 1
+                if visited > 20_000 || Date() >= deadline { truncated = true; break }
+                guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .isRegularFileKey]) else { unreadable += 1; continue }
+                if values.isDirectory == true {
+                    if Self.indexExclusions.contains(url.lastPathComponent) || values.isSymbolicLink == true { iterator.skipDescendants() }
+                } else if values.isRegularFile == true, values.isSymbolicLink != true {
+                    // DirectoryEnumerator can canonicalize /var to /private/var.
+                    // Keep results under the caller's root spelling for reveal.
+                    let relative = url.pathComponents.suffix(iterator.level).joined(separator: "/")
+                    paths.append(((path as NSString).expandingTildeInPath as NSString).appendingPathComponent(relative))
+                }
+            }
+            return MuxaFileIndex(paths: paths.sorted(), truncated: truncated, unreadable: unreadable)
+        }
+        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+    }
+
+    func stamp(_ path: String) async throws -> MuxaFileStamp {
+        if sshTarget != nil {
+            return try JSONDecoder().decode(MuxaFileStamp.self, from: await remote(path, operation: "stat"))
+        }
+        return try await Task.detached(priority: .utility) {
+            let attributes = try FileManager.default.attributesOfItem(atPath: (path as NSString).expandingTildeInPath)
+            return MuxaFileStamp(size: (attributes[.size] as? NSNumber)?.int64Value ?? 0,
+                                 modified: (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
         }.value
     }
 
@@ -143,7 +209,7 @@ struct MuxaFileReader: Sendable {
     // Python is used only as a read-only transport; it does not import or run
     // anything in the workspace. -c starts with a script, not a user path.
     static let remoteScript = #"""
-import os, sys, json, base64, stat
+import os, sys, json, base64, stat, time
 try:
     request = json.loads(base64.b64decode(sys.argv[1]))
     path = os.path.abspath(os.path.expanduser(request['path']))
@@ -163,6 +229,35 @@ try:
                     entries.append(dict(name=entry.name, directory=False, size=0))
         entries.sort(key=lambda e: (not e['directory'], e['name'].lower()))
         print(json.dumps(dict(path=path, entries=entries, truncated=truncated)))
+    elif request['operation'] == 'index':
+        if not os.path.isdir(path):
+            raise ValueError('Folder not found.')
+        excluded = {'.git', '.build', 'node_modules', 'target', 'vendor', '__pycache__', '.venv'}
+        paths, pending, visited, unreadable = [], [path], 0, 0
+        deadline, truncated = time.monotonic() + 8, False
+        while pending and not truncated:
+            directory = pending.pop()
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        visited += 1
+                        if visited > 20000 or time.monotonic() >= deadline:
+                            truncated = True
+                            break
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                if entry.name not in excluded:
+                                    pending.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                paths.append(entry.path)
+                        except OSError:
+                            unreadable += 1
+            except OSError:
+                unreadable += 1
+        print(json.dumps(dict(paths=sorted(paths), truncated=truncated, unreadable=unreadable)))
+    elif request['operation'] == 'stat':
+        info = os.stat(path)
+        print(json.dumps(dict(size=info.st_size, modified=info.st_mtime)))
     elif request['operation'] == 'read':
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         with os.fdopen(fd, 'rb') as f:

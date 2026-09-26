@@ -417,6 +417,15 @@ struct CommandPaletteView: View {
     @State private var query = ""
     @State private var selectedID: MuxaPaletteID?
     @State private var didFinish = false
+    @State private var indexedFiles: [MuxaFileLocation] = []
+    @State private var indexing = false
+    @State private var indexStatus: String?
+    private var fileSearchRoot: MuxaFileLocation? {
+        model.fileRoot ?? model.activeFileDirectory ?? {
+            let saved = UserDefaults.standard.string(forKey: "muxa.files.lastLocalFolder") ?? ""
+            return saved.isEmpty ? nil : MuxaFileLocation(hostAlias: "local", path: saved)
+        }()
+    }
 
     private var items: [MuxaPaletteItem] {
         let candidates: [MuxaPaletteItem]
@@ -424,7 +433,7 @@ struct CommandPaletteView: View {
         case .navigation:
             let fileLocations = recent.compactMap { selection -> MuxaFileLocation? in
                 if case .file(let location) = selection { return location }; return nil
-            } + model.browsedFiles
+            } + indexedFiles + model.browsedFiles
             var seen = Set<MuxaFileLocation>()
             let files = fileLocations.filter { seen.insert($0).inserted }.map { location in
                 MuxaPaletteItem(stableID: MuxaPaletteID(components: ["file", location.hostAlias, location.path]),
@@ -453,12 +462,12 @@ struct CommandPaletteView: View {
             )
             return MuxaPaletteSearch.results(candidates, query: query, recent: [])
         }
-        return MuxaPaletteSearch.results(candidates, query: query, recent: recent)
+        return Array(MuxaPaletteSearch.results(candidates, query: query, recent: recent).prefix(200))
     }
 
     private var placeholder: String {
         switch mode {
-        case .navigation: String(localized: "Search sessions, windows, panes, shells, work, agents")
+        case .navigation: String(localized: "Search files, sessions, work and agents")
         case .commands: String(localized: "Type a command")
         case .agents: String(localized: "Jump to an agent — the ones needing you come first")
         }
@@ -493,6 +502,14 @@ struct CommandPaletteView: View {
                     .font(.caption.monospaced()).foregroundStyle(.secondary)
             }
             .padding(16)
+            if mode == .navigation, indexing || indexStatus != nil {
+                HStack {
+                    if indexing { ProgressView().controlSize(.mini) }
+                    Text(indexing ? String(localized: "Searching workspace files…") : (indexStatus ?? ""))
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    Spacer()
+                }.padding(.horizontal, 16).padding(.bottom, 8)
+            }
             Divider()
             ScrollViewReader { proxy in
                 ScrollView {
@@ -537,6 +554,21 @@ struct CommandPaletteView: View {
         }
         .frame(width: 680, height: 430)
         .background(.regularMaterial)
+        .task(id: "\(mode.rawValue):\(fileSearchRoot?.id ?? "")") {
+            indexedFiles = []; indexStatus = nil; indexing = false
+            guard mode == .navigation, let root = fileSearchRoot else { return }
+            indexing = true
+            do {
+                let index = try await model.fileReader(for: root).index(root.path)
+                try Task.checkCancellation()
+                indexedFiles = index.paths.map { .init(hostAlias: root.hostAlias, path: $0) }
+                if index.truncated || index.unreadable > 0 {
+                    indexStatus = String(localized: "Some folders were skipped or the search limit was reached. Open a narrower folder to search further.")
+                }
+            } catch is CancellationError { return }
+            catch { if !Task.isCancelled { indexStatus = error.localizedDescription } }
+            if !Task.isCancelled { indexing = false }
+        }
         .onAppear { selectedID = MuxaPaletteSelection.retained(selectedID, in: results) }
         .onChange(of: mode) { _ in
             query = ""

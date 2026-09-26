@@ -584,7 +584,19 @@ Invalid paths leave the workspace unchanged.
 A single click keeps focus in the tree and opens a preview tab; another file replaces that preview.
 Double-click the file or pin its tab to keep it open. File tabs share the
 workbench's split groups, persistence, close/reopen history and **⌘P** search
-(recent files and files in folders already browsed).
+(recent files plus recursive filename search in the selected local or SSH folder).
+The index is rebuilt when Quick Open opens. It scans at most 20,000 entries or
+8 seconds, skips symlink directories and `.git`, `.build`, `node_modules`,
+`target`, `vendor`, `__pycache__`, `.venv`, and displays up to 200 ranked results.
+Incomplete or unreadable folders are reported in the palette; select a narrower
+folder to search further. This searches filenames/paths, not file contents.
+
+The visible tree polls locally every 2 seconds and over SSH every 10 seconds,
+refreshing at most 32 expanded folders per pass while preserving existing nodes
+and selection. Failed reads show an error row and are retried automatically.
+Activating a file tab reveals its ancestors and selects its row without taking
+keyboard focus. Files outside the current host/folder switch to their parent
+folder; hidden files still require Show Hidden Files.
 
 Markdown (`.md`, `.markdown`, `.mdown`, `.mkd`, `.mkdn`) renders headings, tables,
 lists, code blocks and links. PNG, JPEG, GIF, WebP, HEIC/HEIF, TIFF, BMP and
@@ -594,8 +606,9 @@ PDFs have native previews, and Office documents use macOS Quick Look. Markdown
 and HTML offer a Source switch; HTML is a static preview with scripts and
 network resources disabled. Relative document links and images resolve on the
 same host as the document. Embedded images are limited to the document folder.
-Text, Markdown, HTML and PDF previews support **⌘F**. Local previews refresh when
-the file changes; use Refresh for remote artifacts.
+Text, Markdown, HTML and PDF previews support **⌘F**. Visible previews poll file
+metadata every 2 seconds locally or 10 seconds over SSH, and reread contents
+only after a change. Refresh is also available manually.
 
 Preview reads are limited to 16 MB, text display to 2 MB, and each folder listing
 to 1,000 entries. Files are never modified by the viewer. Local files can also
