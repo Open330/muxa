@@ -943,7 +943,7 @@ private struct MuxaRevisionUpdate: Decodable, Sendable {
 }
 
 typealias MuxaIPCRequestHandler = @Sendable (String, Data) throws -> Data
-fileprivate typealias MuxaIPCTimedRequestHandler = @Sendable (
+typealias MuxaIPCTimedRequestHandler = @Sendable (
     String,
     Data,
     TimeInterval
@@ -968,7 +968,7 @@ final class SerializedIPCTransport: @unchecked Sendable {
         self.handler = { path, payload, _ in try handler(path, payload) }
     }
 
-    fileprivate init(label: String, timedHandler: @escaping MuxaIPCTimedRequestHandler) {
+    init(label: String, timedHandler: @escaping MuxaIPCTimedRequestHandler) {
         queue = DispatchQueue(label: label, qos: .userInitiated)
         handler = timedHandler
     }

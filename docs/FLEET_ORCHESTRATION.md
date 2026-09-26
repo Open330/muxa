@@ -160,7 +160,7 @@ not implemented by this first slice.
 The Work Command Center's **Fleet Dispatch** opens the coordinator-backed flow;
 **Start Work** retains direct, manually chosen host/pipeline execution. Dispatch
 loads registered workspaces from the coordinator, accepts an exact commit and
-optional node selector/host, and previews placement before launching. A preview
+optional node selector/host, and offers an optional placement preview before launching. A preview
 is advisory; the returned dispatch record is the authoritative assignment.
 
 The app saves the immutable request and UUID before sending, scoped to its daemon
@@ -176,7 +176,8 @@ workspace, and node path templates. Empty path overrides inherit their parent.
 Workspace and node path policy is edited on the coordinator; entry hosts configure
 its alias. Policy writes pin the original config text and refuse concurrent edits;
 reload and reapply instead of silently overwriting someone else's change. Unrelated
-config sections are preserved. These forms require `config_orchestration_v1` and a
+config sections are preserved. After editing labels, the app refreshes the config
+baseline while retaining the policy draft; concurrent policy edits still conflict. These forms require `config_orchestration_v1` and a
 matching CLI with `work dispatch-options`.
 
 On entry hosts without a shared Ask stream, the app stops retrying that unsupported

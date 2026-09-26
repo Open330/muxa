@@ -6,15 +6,17 @@ import Testing
     var request = MuxaDispatchRequest()
     request.workspace = "muxa"; request.work = "test"; request.commit = String(repeating: "a", count: 40); request.body = "verify"
     let expected = request
-    let client = MuxaDispatchClient(socketPath: "/test") { _, data in
+    let client = MuxaDispatchClient(socketPath: "/test") { _, data, timeout in
         let message = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
         #expect(message["kind"] as? String == "work_command")
         let args = try #require(message["args"] as? [String])
-        #expect(args == ["work", "dispatch", "--plan"])
+        #expect(args == ["work", "dispatch", "--plan"] || args == ["work", "dispatch"])
+        #expect(timeout == (args.contains("--plan") ? 40 : 650))
         let input = try #require(message["stdin"] as? String)
         #expect(try JSONDecoder().decode(MuxaDispatchRequest.self, from: Data(input.utf8)) == expected)
         return Data(#"{"ok":true,"work_command":{"stdout":"{}","stderr":"","exit_code":0}}"#.utf8)
     }
+    _ = try await client.dispatch(request, preview: false) // No preview prerequisite.
     _ = try await client.dispatch(request, preview: true)
     #expect(request.isValid)
     request.commit = "main"
@@ -60,8 +62,9 @@ import Testing
 @Test func orchestrationSettingsPreserveInheritedPathsAndConcurrentWriteContract() async throws {
     let settings = MuxaOrchestrationSettings()
     let encoded = try JSONEncoder().encode(settings)
-    let client = MuxaDispatchClient(socketPath: "/config") { _, data in
+    let client = MuxaDispatchClient(socketPath: "/config") { _, data, timeout in
         let message = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(timeout == 10)
         #expect(message["expected_text"] as? String == "# original")
         #expect(message["kind"] as? String == "config_orchestration_write")
         return try JSONSerialization.data(withJSONObject: ["ok":true,"config":["path":"/config","text":"new","exists":true],"orchestration":JSONSerialization.jsonObject(with: encoded)])
@@ -76,4 +79,21 @@ import Testing
     let host = try JSONDecoder().decode(MuxaFleetHost.self, from: Data(#"{"alias":"entry-alias","local":false,"mode":"control","state":"online","node_id":"stable-node"}"#.utf8))
     #expect(host.nodeID == "stable-node")
     #expect(host.alias == "entry-alias")
+}
+
+@Test func labelRefreshAdvancesBaselineButRejectsConcurrentPolicyEdits() throws {
+    func document(_ text: String, _ settings: MuxaOrchestrationSettings) throws -> MuxaOrchestrationDocument {
+        let settings = try JSONSerialization.jsonObject(with: JSONEncoder().encode(settings))
+        return try JSONDecoder().decode(MuxaOrchestrationDocument.self, from: JSONSerialization.data(withJSONObject: [
+            "config": ["path": "/config", "text": text, "exists": true], "orchestration": settings,
+        ]))
+    }
+    let original = try document("original", MuxaOrchestrationSettings())
+    let labeled = try document("new labels", original.orchestration)
+    #expect(try original.refreshedAfterLabelEdit(labeled).config.text == "new labels")
+    var concurrent = original.orchestration
+    concurrent.paths.root = "~/changed-by-another-editor"
+    #expect(throws: MuxaConfigConflict.self) {
+        try original.refreshedAfterLabelEdit(document("changed policy", concurrent))
+    }
 }
