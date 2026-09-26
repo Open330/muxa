@@ -1630,6 +1630,9 @@ impl Server {
         tracing::info!(socket = %self.socket_path.display(), "listening");
 
         let mut handlers: JoinSet<()> = JoinSet::new();
+        // Latched cancellation for observation streams, including handlers that
+        // reach stream takeover after the listener has already stopped.
+        let (stream_shutdown, stream_shutdown_rx) = watch::channel(false);
         // Fixed budget of concurrent handlers. A permit is held for the
         // lifetime of each handler and released when it ends, so live fds
         // from handlers can never exceed `MAX_INFLIGHT_HANDLERS` — keeping
@@ -1705,6 +1708,7 @@ impl Server {
                     let pipeline_runs = self.pipeline_runs.clone();
                     let work_up = self.work_up.clone();
                     let config_path = self.config_path.clone();
+                    let stream_shutdown = stream_shutdown_rx.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
@@ -1724,6 +1728,7 @@ impl Server {
                                 pipeline_runs,
                                 work_up,
                                 config_path,
+                                stream_shutdown,
                             ))
                             .await
                         {
@@ -1741,6 +1746,11 @@ impl Server {
             }
         }
 
+        // Observation streams have no mutations to drain. Cancel the entire
+        // pump, including pending writes, before waiting for admitted commands.
+        stream_shutdown.send_replace(true);
+        let drain_started = Instant::now();
+
         // Drain in-flight handlers with a bounded timeout. Closes the
         // lost-update window where a handler could call `Store::apply`
         // after the daemon's snapshotter has already exited.
@@ -1752,13 +1762,17 @@ impl Server {
             tracing::warn!(
                 timeout_secs = HANDLER_DRAIN_TIMEOUT.as_secs(),
                 remaining = handlers.len(),
+                elapsed_ms = u64::try_from(drain_started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "ipc handlers did not drain within timeout; aborting",
             );
             handlers.abort_all();
             // Best-effort: let the abort propagate.
             while handlers.join_next().await.is_some() {}
         } else {
-            tracing::debug!("ipc handlers drained cleanly");
+            tracing::debug!(
+                elapsed_ms = u64::try_from(drain_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "ipc handlers drained cleanly"
+            );
         }
 
         // Remove our own socket file so next startup is clean.
@@ -1915,6 +1929,20 @@ fn lagged_marker_bytes(
     }
     let marker = serde_json::json!({ "event": "lagged", "dropped": dropped });
     encode_line(&marker, protocol).map(Some)
+}
+
+/// Cancel only a read-only stream, never the request handler that admitted it.
+/// Watching a latched value avoids missing shutdown during stream takeover;
+/// racing the whole future also interrupts a backpressured socket write.
+async fn stream_until_shutdown(
+    mut shutdown: watch::Receiver<bool>,
+    stream: impl std::future::Future<Output = Result<(), RuntimeError>>,
+) -> Result<(), RuntimeError> {
+    tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stopped| *stopped) => Ok(()),
+        result = stream => result,
+    }
 }
 
 /// Pump every state transition from `store` to `writer` as a JSON
@@ -2594,6 +2622,7 @@ async fn handle(
     pipeline_runs: Arc<PipelineRunStore>,
     work_up: Arc<WorkUpManager>,
     config_path: Option<PathBuf>,
+    stream_shutdown: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError> {
     let mut collaboration_actor = observe_collaboration_actor(&stream);
     let (reader, mut writer) = stream.into_split();
@@ -2764,7 +2793,11 @@ async fn handle(
                     if !write_line_or_closed(&mut writer, &ack_bytes).await? {
                         return Ok(());
                     }
-                    return stream_revision_updates(writer, changes, stream_proto).await;
+                    return stream_until_shutdown(
+                        stream_shutdown,
+                        stream_revision_updates(writer, changes, stream_proto),
+                    )
+                    .await;
                 }
                 RequestBody::WorkUp { request } => {
                     kind = "work_up";
@@ -2953,13 +2986,16 @@ async fn handle(
                         kind,
                         "ipc.handle (fleet stream takeover)",
                     );
-                    return stream_fleet_updates(
-                        writer,
-                        fleet.store.clone(),
-                        updates,
-                        stream_proto,
-                        selector,
-                        visible_hosts,
+                    return stream_until_shutdown(
+                        stream_shutdown,
+                        stream_fleet_updates(
+                            writer,
+                            fleet.store.clone(),
+                            updates,
+                            stream_proto,
+                            selector,
+                            visible_hosts,
+                        ),
                     )
                     .await;
                 }
@@ -3255,7 +3291,11 @@ async fn handle(
                     if !write_line_or_closed(&mut writer, &ack_bytes).await? {
                         return Ok(());
                     }
-                    return stream_revision_updates(writer, changes, stream_proto).await;
+                    return stream_until_shutdown(
+                        stream_shutdown,
+                        stream_revision_updates(writer, changes, stream_proto),
+                    )
+                    .await;
                 }
                 RequestBody::AskStatus {} => {
                     kind = "ask_status";
@@ -3554,7 +3594,11 @@ async fn handle(
                         kind,
                         "ipc.handle (collaboration stream takeover)",
                     );
-                    return stream_revision_updates(writer, changes, stream_proto).await;
+                    return stream_until_shutdown(
+                        stream_shutdown,
+                        stream_revision_updates(writer, changes, stream_proto),
+                    )
+                    .await;
                 }
                 RequestBody::CollaborationList {
                     origin,
@@ -3864,7 +3908,11 @@ async fn handle(
                     if !write_line_or_closed(&mut writer, &ack).await? {
                         return Ok(());
                     }
-                    return stream_agent_changes(writer, changes, protocol).await;
+                    return stream_until_shutdown(
+                        stream_shutdown,
+                        stream_agent_changes(writer, changes, protocol),
+                    )
+                    .await;
                 }
                 RequestBody::Subscribe { lagged_markers } => {
                     kind = "subscribe";
@@ -3888,8 +3936,11 @@ async fn handle(
                         kind,
                         "ipc.handle (stream takeover)",
                     );
-                    return stream_transitions(writer, transitions, stream_proto, lagged_markers)
-                        .await;
+                    return stream_until_shutdown(
+                        stream_shutdown,
+                        stream_transitions(writer, transitions, stream_proto, lagged_markers),
+                    )
+                    .await;
                 }
             },
             Err(e) => {
@@ -6858,6 +6909,102 @@ mod tests {
         assert!(res.is_err());
     }
 
+    #[tokio::test]
+    async fn shutdown_cancels_all_subscription_kinds_without_drain_timeout() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("subscriptions.sock");
+        let (fleet, _commands) = FleetRuntime::new(Arc::new(crate::fleet::FleetStore::new()));
+        let server = Server::new(sock.clone(), Store::shared()).with_fleet(fleet);
+        let (shutdown, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(server.run(receiver));
+        wait_for_socket(&sock).await;
+
+        // Keep each client alive through shutdown. No state changes or
+        // keepalive writes should be necessary to release these handlers.
+        let mut clients = Vec::new();
+        for kind in [
+            "subscribe",
+            "subscribe_agent_changes",
+            "fleet_subscribe",
+            "collaboration_subscribe",
+            "ask_subscribe",
+            "pipeline_subscribe",
+        ] {
+            let mut stream = UnixStream::connect(&sock).await.unwrap();
+            let request = serde_json::json!({"protocol": PROTOCOL_VERSION, "kind": kind});
+            stream
+                .write_all(&encode_line(&request, PROTOCOL_VERSION).unwrap())
+                .await
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut ack = String::new();
+            tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut ack))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&ack).unwrap()["ok"],
+                true,
+                "{kind}: {ack}"
+            );
+            clients.push(reader);
+        }
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("subscriptions must not consume the five-second drain deadline")
+            .unwrap()
+            .unwrap();
+        for mut client in clients {
+            let mut line = String::new();
+            assert_eq!(client.read_line(&mut line).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_takeover_after_shutdown_does_not_poll_the_pump() {
+        let (shutdown, receiver) = watch::channel(false);
+        shutdown.send_replace(true);
+        stream_until_shutdown(receiver, async {
+            panic!("a stream admitted after shutdown must not start");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_backpressured_subscription_write() {
+        let (server, _client) = UnixStream::pair().unwrap();
+        let (_reader, writer) = server.into_split();
+        // Fill the send buffer while the peer deliberately reads nothing.
+        let bytes = vec![0_u8; 65536];
+        writer.writable().await.unwrap();
+        let mut written = 0;
+        loop {
+            match writer.try_write(&bytes) {
+                Ok(n) => written += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill socket: {error}"),
+            }
+        }
+        assert!(written > 0, "the test must fill the actual socket buffer");
+        let (changes, receiver) = watch::channel(0_u64);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        changes.send_replace(1);
+        let mut pump = Box::pin(stream_until_shutdown(
+            shutdown_rx,
+            stream_revision_updates(writer, receiver, PROTOCOL_VERSION),
+        ));
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut pump)
+            .await
+            .is_err());
+        shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("blocked stream write must be cancellable")
+            .unwrap();
+    }
+
     /// `Server::run` must wait for in-flight handlers to finish before
     /// returning. Otherwise, an ingest landing during shutdown could
     /// call `Store::apply` *after* the snapshotter's final flush, losing
@@ -6969,6 +7116,7 @@ mod tests {
             PipelineRunStore::in_memory(),
             WorkUpManager::new(PathBuf::from("/tmp/muxa-disconnect-test.sock")),
             None,
+            watch::channel(false).1,
         ));
 
         let req = serde_json::json!({
