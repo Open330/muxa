@@ -376,6 +376,12 @@ wakes remain body-free notifications in every mode.
 tmux window or session by its exact pane id.
 See [COLLABORATION.md](COLLABORATION.md).
 
+Per-message `notify` is independent of `wake_payload`: one-way `kind=notice`
+messages are quiet by default. Use MCP `notify=true` or CLI `--notify true` for
+an actionable handoff; `notify=false` is pull-only. These overrides still respect
+`collaboration.wake=never` and idle-only delivery. See
+[notification discipline](COLLABORATION.md#quiet-progress-and-actionable-notifications).
+
 ## Message skills
 
 Reusable prompt templates live in a regular TOML table. They are shared by the

@@ -28,10 +28,13 @@ so identity and lifecycle metadata stay consistent.
 
 ## Incoming work and follow-up
 
-On a Muxa notification, call `muxa_inbox` and read the complete request. A
-read-only review returns findings without changing files. An execute task edits
-only within its delegated scope and reports the checks run. Use `muxa_reply`
-once with the original request ID, terminal status, result, and artifacts.
+On a Muxa notification, call `muxa_inbox` unless the complete request was already
+claimed and delivered in the prompt. A read-only review returns findings without
+changing files. An execute task edits only within its delegated scope and reports
+the checks run. When `expects_reply=true`, use `muxa_reply` once with the original
+request ID, terminal status, result, and artifacts. For one-way notices, absorb
+the information without an acknowledgement or a new user-facing status report.
+Read quiet progress notices together at agreed build/test or review checkpoints.
 
 If prerequisites are missing, return `blocked` with the missing prerequisite.
 If asked to summarize "the peer's report", retrieve `muxa_peer_report`; do not

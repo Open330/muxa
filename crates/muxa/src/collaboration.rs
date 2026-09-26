@@ -560,6 +560,10 @@ pub struct CollaborationRequest {
     pub kind: RequestKind,
     pub body: String,
     pub expects_reply: bool,
+    /// Override recipient wake delivery. None keeps one-way notices quiet and
+    /// wakes actionable requests. This never changes the reply contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<bool>,
     pub work_mode: WorkMode,
     /// Stable id shared by every request in one causal conversation.
     ///
@@ -628,6 +632,14 @@ pub struct CollaborationRequest {
     pub reply: Option<CollaborationReply>,
 }
 
+impl CollaborationRequest {
+    /// Whether the recipient needs a wake; terminal replies use their own path.
+    pub fn should_notify(&self) -> bool {
+        self.notify
+            .unwrap_or(self.kind != RequestKind::Notice || self.expects_reply)
+    }
+}
+
 /// A handle the daemon has promised to one pane, pending the scan that will
 /// show the pane holding it.
 #[derive(Debug, Clone)]
@@ -676,6 +688,10 @@ pub struct NewRequest {
     pub kind: RequestKind,
     pub body: String,
     pub expects_reply: bool,
+    /// Override recipient wake delivery. None keeps one-way notices quiet and
+    /// wakes actionable requests. This never changes the reply contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<bool>,
     pub work_mode: WorkMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
@@ -703,6 +719,7 @@ impl Default for NewRequest {
             kind: RequestKind::Question,
             body: String::new(),
             expects_reply: true,
+            notify: None,
             work_mode: WorkMode::ReadOnly,
             thread_id: None,
             parent_request_id: None,
@@ -1922,6 +1939,7 @@ impl CollaborationStore {
             kind: input.kind,
             body,
             expects_reply: input.expects_reply,
+            notify: input.notify,
             work_mode: input.work_mode,
             thread_id,
             parent_request_id,
@@ -2457,6 +2475,8 @@ impl CollaborationStore {
             .values()
             .filter(|request| {
                 request.notified_at.is_none()
+                    // Finish an already reserved delivery even after an upgrade.
+                    && (request.should_notify() || request.wake_delivery.is_some())
                     && (request.status == RequestStatus::Queued || request.wake_delivery.is_some())
             })
             .cloned()
@@ -4165,6 +4185,92 @@ mod tests {
         );
         assert_eq!(mailbox.unread_reply_count(&sender).await, 0);
         assert!(mailbox.pending_reply_unnotified().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn notification_policy_survives_reload_and_quiet_records_remain_claimable() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CollaborationOptions {
+            path: Some(dir.path().join("collaboration.json")),
+            ..CollaborationOptions::default()
+        };
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let cases = [
+            (RequestKind::Notice, false, None, false),
+            (RequestKind::Notice, false, Some(true), true),
+            (RequestKind::Notice, true, None, true),
+            (RequestKind::Question, true, Some(false), false),
+            (RequestKind::Question, true, None, true),
+            (RequestKind::Review, true, None, true),
+            (RequestKind::Task, false, None, true),
+        ];
+        let mut created = Vec::new();
+        for (kind, expects_reply, notify, wakes) in cases {
+            let request = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        kind,
+                        body: "checkpoint result".into(),
+                        expects_reply,
+                        notify,
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(request.should_notify(), wakes);
+            // Old durable records omit the optional field, preserving auto policy.
+            if notify.is_none() {
+                let value = serde_json::to_value(&request).unwrap();
+                assert!(value.get("notify").is_none());
+                let legacy: CollaborationRequest = serde_json::from_value(value).unwrap();
+                assert_eq!(legacy.should_notify(), wakes);
+            }
+            created.push(request);
+        }
+        drop(mailbox);
+        let mailbox = CollaborationStore::load(options).await.unwrap();
+        let pending = mailbox.pending_unnotified().await;
+        for (request, (_, _, _, wakes)) in created.iter().zip(cases) {
+            assert_eq!(pending.iter().any(|entry| entry.id == request.id), wakes);
+            let stored = mailbox.get_for(&recipient, &request.id).await.unwrap();
+            assert_eq!(stored.notify, request.notify);
+            assert_eq!(stored.status, RequestStatus::Queued);
+            assert!(stored.notified_at.is_none());
+        }
+        let inbox = mailbox.claim_for(&recipient).await.unwrap();
+        assert_eq!(inbox.len(), cases.len());
+        for request in inbox {
+            assert_eq!(
+                request.status,
+                if request.expects_reply {
+                    RequestStatus::Claimed
+                } else {
+                    RequestStatus::Completed
+                }
+            );
+            assert!(request.reply.is_none());
+        }
+        assert!(mailbox.pending_unnotified().await.is_empty());
+        // Suppressing a request's wake must not suppress its completion reply.
+        mailbox
+            .reply(
+                &recipient,
+                &created[3].id,
+                RequestStatus::Completed,
+                "review complete".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let replies = mailbox.pending_reply_unnotified().await;
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].id, created[3].id);
     }
 
     #[tokio::test]

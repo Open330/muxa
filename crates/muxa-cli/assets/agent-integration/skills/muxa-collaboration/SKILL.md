@@ -40,11 +40,31 @@ schemas and returned IDs describe the currently installed capabilities.
 5. Inspect replies against the actual files and relevant checks. Apply valid
    findings, explain rejected findings when material, and integrate the result.
 
-For notifications addressed to you, claim work with `muxa_inbox`, honor its
-kind/work_mode/paths, and finish with one terminal `muxa_reply` (`completed`,
-`blocked`, `declined`, or `failed`). Include useful artifacts and verification.
+For requests addressed to you, claim/read with `muxa_inbox` unless already
+claimed and delivered in full. Honor kind/work_mode/paths. Only when
+`expects_reply=true`, finish with one terminal `muxa_reply` (`completed`,
+`blocked`, `declined`, or `failed`) with useful artifacts and verification.
+Never reply to or acknowledge a one-way notice solely to confirm receipt.
 Do not treat idle status or terminal text as a durable completion report. Use
 `muxa_wait_for_change` for process state waits and mailbox tools for peer results.
+
+## Notification discipline
+
+Agree on reporting checkpoints when dispatching work. Omit receipt confirmations,
+"in progress", and unchanged status. Consolidate intermediate findings at meaningful
+build/test or review checkpoints; check the inbox then instead of polling for notices.
+If the installed tools support `muxa_update_request`, record progress on the original
+request. Otherwise send one consolidated `kind="notice"`, `expects_reply=false`
+message with `parent_request_id` referencing the original request.
+
+One-way notices are durable but do not wake recipients by default. Use `notify=true`
+only when a blocker, decision, edit-scope conflict, or resource handoff requires the
+recipient's attention. This respects idle-only delivery and global wake settings;
+it never authorizes interrupting a busy agent. `notify=false` explicitly records a
+message without waking. Wake delivery and `expects_reply` are independent.
+Terminal replies already wake the requester; do not send a second completion notice.
+The coordinator reports meaningful outcomes and needed decisions to the user, not
+an update for every peer message. Inspect installed schemas before using `notify`.
 
 ## Authority and unavailable capabilities
 

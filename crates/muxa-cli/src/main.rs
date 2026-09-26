@@ -445,6 +445,10 @@ enum MsgCmd {
         /// Fire-and-forget message; do not expect a reply.
         #[arg(long)]
         no_reply: bool,
+        /// Override recipient wake delivery (true for urgent notices, false for quiet records).
+        /// Defaults to quiet for notice, enabled for other kinds; still respects idle-only wake.
+        #[arg(long, action = clap::ArgAction::Set)]
+        notify: Option<bool>,
         /// Print the stored request instead of a one-line receipt.
         #[arg(long)]
         json: bool,
@@ -1714,6 +1718,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             links,
             air_refs,
             no_reply,
+            notify,
             json,
         } => {
             let kind = collaboration_request_kind(&kind)?;
@@ -1727,6 +1732,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                         kind,
                         body,
                         expects_reply: !no_reply && kind != RequestKind::Notice,
+                        notify,
                         work_mode: if execute {
                             WorkMode::Execute
                         } else {
@@ -4301,6 +4307,7 @@ mod tests {
             kind,
             body: format!("body {id}"),
             expects_reply: true,
+            notify: None,
             work_mode: WorkMode::ReadOnly,
             thread_id: thread_id.map(str::to_string),
             parent_request_id: None,
@@ -4320,6 +4327,38 @@ mod tests {
             reply_read_at: None,
             reply: None,
         }
+    }
+
+    #[test]
+    fn message_notify_cli_requires_an_explicit_boolean() {
+        for (extra, expected) in [
+            (vec![], None),
+            (vec!["--notify", "true"], Some(true)),
+            (vec!["--notify", "false"], Some(false)),
+        ] {
+            let mut args = vec![
+                "muxa",
+                "msg",
+                "send",
+                "@peer",
+                "checkpoint",
+                "--kind",
+                "notice",
+            ];
+            args.extend(extra);
+            let cli = Args::try_parse_from(args).unwrap();
+            let Cmd::Msg {
+                action: MsgCmd::Send { notify, .. },
+            } = cli.cmd
+            else {
+                panic!("expected message send");
+            };
+            assert_eq!(notify, expected);
+        }
+        assert!(
+            Args::try_parse_from(["muxa", "msg", "send", "@peer", "checkpoint", "--notify"])
+                .is_err()
+        );
     }
 
     #[test]
