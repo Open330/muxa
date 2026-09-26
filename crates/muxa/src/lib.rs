@@ -54,6 +54,7 @@ pub mod history;
 pub mod ipc;
 pub mod metrics;
 pub mod notify;
+pub mod orchestration;
 pub mod paths;
 pub mod pipeline;
 pub mod pipeline_run;

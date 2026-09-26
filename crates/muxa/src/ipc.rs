@@ -755,6 +755,8 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_lifecycle",
     "collaboration_wait",
     "collaboration_subscribe",
+    "collaboration_dispatch_v1",
+    "orchestration_v1",
     "collaboration_identity",
     "collaboration_provenance",
     "collaboration_scope",
@@ -1330,6 +1332,7 @@ struct WorkUpOperations {
 
 struct WorkUpManager {
     socket_path: PathBuf,
+    config_path: Option<PathBuf>,
     /// Runs `work` argv on remote Fleet hosts. `None` while Fleet is not
     /// installed, in which case every non-local `host` is refused.
     remote: Option<Arc<dyn RemoteWorkRunner>>,
@@ -1406,6 +1409,7 @@ impl WorkUpManager {
     fn with_remote(socket_path: PathBuf, remote: Option<Arc<dyn RemoteWorkRunner>>) -> Arc<Self> {
         Arc::new(Self {
             socket_path,
+            config_path: None,
             remote,
             next_id: AtomicU64::new(1),
             operations: tokio::sync::Mutex::new(WorkUpOperations::default()),
@@ -1454,17 +1458,22 @@ impl WorkUpManager {
         let _permit = self.commands.try_acquire().map_err(|_| {
             format!("at most {MAX_CONCURRENT_WORK_COMMANDS} work commands may run at once")
         })?;
+        let limits = WorkCommandLimits::for_args(&args);
+        let mut local_args = args.clone();
+        if let Some(path) = &self.config_path {
+            local_args.splice(0..0, ["--config".into(), path.display().to_string()]);
+        }
         match remote {
             Some((host, runner)) => runner
-                .run(&host, args, stdin, WorkCommandLimits::COMMAND)
+                .run(&host, args, stdin, limits)
                 .await
                 .map_err(|error| error.to_string()),
             None => work_control::execute_work_command(
                 &work_control::resolve_muxa_binary(),
-                &args,
+                &local_args,
                 stdin.as_deref(),
                 Some(&self.socket_path),
-                WorkCommandLimits::COMMAND,
+                limits,
             )
             .await
             .map_err(|error| error.to_string()),
@@ -1692,6 +1701,9 @@ impl Server {
     /// `config_write` can serve it. Without one, both refuse.
     #[must_use]
     pub fn with_config_path(mut self, path: Option<PathBuf>) -> Self {
+        if let Some(manager) = Arc::get_mut(&mut self.work_up) {
+            manager.config_path.clone_from(&path);
+        }
         self.config_path = path;
         self
     }
@@ -1747,6 +1759,9 @@ impl Server {
                 fleet: fleet.clone(),
             })),
         );
+        if let Some(manager) = Arc::get_mut(&mut self.work_up) {
+            manager.config_path.clone_from(&self.config_path);
+        }
         self.fleet = Some(fleet);
         self
     }
@@ -2956,6 +2971,64 @@ async fn handle(
         // logs rather than mis-attributing the timing.
         #[allow(unused_assignments)]
         let mut kind: &'static str = "dispatch_unknown";
+        // Global Ask has one owner. Entry hosts forward without replaying local history.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed).and_then(|value| {
+            let request: Request = serde_json::from_value(value.clone())?;
+            if negotiated.is_none() && request.protocol != 0 && request.protocol != PROTOCOL_VERSION
+            {
+                return Err(serde::de::Error::custom("protocol mismatch"));
+            }
+            Ok(value)
+        }) {
+            let ask_kind = value["kind"].as_str().unwrap_or("");
+            if crate::orchestration::shared_ask_kind(ask_kind) || ask_kind == "ask_subscribe" {
+                let policy = if let Ok(config) = config_path
+                    .as_deref()
+                    .map(|p| crate::Config::load_or_default(Some(p)))
+                    .transpose()
+                {
+                    config.map(|c| c.orchestration)
+                } else {
+                    let response = Response::err("cannot load coordinator routing configuration; refusing to fall back to a local Ask conversation");
+                    let bytes = encode_line(&response, negotiated.unwrap_or(PROTOCOL_VERSION))?;
+                    if !write_line_or_closed(&mut writer, &bytes).await? {
+                        return Ok(());
+                    }
+                    continue;
+                };
+                if let Some(host) = policy
+                    .filter(|p| p.enabled)
+                    .and_then(|p| p.coordinator)
+                    .filter(|h| h != "local")
+                {
+                    let result = if ask_kind == "ask_subscribe" {
+                        Err("shared Ask streaming requires a direct coordinator connection; use ask_list for snapshots".to_string())
+                    } else {
+                        work_up
+                            .command(
+                                Some(host),
+                                vec!["work".into(), "fleet-ask".into()],
+                                Some(trimmed.into()),
+                            )
+                            .await
+                            .and_then(|o| {
+                                if o.exit_code == 0 {
+                                    serde_json::from_str::<serde_json::Value>(&o.stdout)
+                                        .map_err(|e| e.to_string())
+                                } else {
+                                    Err(o.stderr)
+                                }
+                            })
+                    };
+                    let response = result.unwrap_or_else(|error| serde_json::json!({"ok":false,"protocol":PROTOCOL_VERSION,"error":error}));
+                    let bytes = encode_line(&response, negotiated.unwrap_or(PROTOCOL_VERSION))?;
+                    if !write_line_or_closed(&mut writer, &bytes).await? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
+        }
         let resp = match serde_json::from_str::<Request>(trimmed) {
             // Strict-match only applies in the legacy regime, and only
             // for non-`hello` kinds. Once the client has sent `hello`,
@@ -5141,7 +5214,10 @@ impl Client {
             "stdin": stdin,
         });
         let response = self
-            .call_with_timeout(&req, WORK_COMMAND_CLIENT_TIMEOUT)
+            .call_with_timeout(
+                &req,
+                WorkCommandLimits::for_args(args).timeout + WORK_COMMAND_CLIENT_TIMEOUT,
+            )
             .await?;
         if !response["ok"].as_bool().unwrap_or(false) {
             return Err(RuntimeError::Json(serde::de::Error::custom(
@@ -6941,6 +7017,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // explicit wire-compatibility request fixtures
     async fn widening_a_listing_over_ipc_is_console_only() {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("muxa-collaboration-scope.sock");
@@ -6987,6 +7064,9 @@ mod tests {
                         &from,
                         to,
                         &NewRequest {
+                            dispatch_id: None,
+                            source_node_id: None,
+                            delegation_parent: None,
                             initiator: None,
                             kind: collaboration::RequestKind::Question,
                             body: body.into(),
@@ -7127,6 +7207,9 @@ mod tests {
                 &sender,
                 "role:review",
                 &NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: collaboration::RequestKind::Question,
                     body: "ambiguous".into(),
@@ -7151,6 +7234,9 @@ mod tests {
                 &sender,
                 "@reviewer",
                 &NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: collaboration::RequestKind::Review,
                     body: "review this".into(),
@@ -7240,6 +7326,9 @@ mod tests {
                 &sender,
                 "role:rust",
                 &NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: collaboration::RequestKind::Question,
                     body: "obsolete question".into(),
@@ -7287,6 +7376,9 @@ mod tests {
                 },
                 "pane:%1",
                 &NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
                     initiator: None,
                     kind: collaboration::RequestKind::Task,
                     body: "dispatch to launch pane".into(),
@@ -10318,6 +10410,49 @@ mod work_command_tests {
                 Ok(self.output.clone())
             })
         }
+    }
+
+    #[tokio::test]
+    async fn global_ask_uses_coordinator_response_without_touching_local_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("entry.sock");
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[orchestration]\nenabled = true\ncoordinator = \"dev\"\n",
+        )
+        .unwrap();
+        let runner = FakeRunner::new(
+            HostAccessMode::Control,
+            r#"{"ok":true,"protocol":1,"ask_entries":[]}"#,
+        );
+        let mut server =
+            Server::new(socket.clone(), crate::Store::shared()).with_config_path(Some(config));
+        server.work_up = WorkUpManager::with_remote(socket.clone(), Some(runner.clone()));
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let handle = tokio::spawn(server.run(rx));
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let response = Client::new(socket)
+            .call(&serde_json::json!({"kind":"ask_list"}))
+            .await
+            .unwrap();
+        assert_eq!(response["ask_entries"], serde_json::json!([]));
+        let sent = runner.runs();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].host, "dev");
+        assert_eq!(sent[0].args, vec!["work", "fleet-ask"]);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(sent[0].stdin.as_deref().unwrap()).unwrap()
+                ["kind"],
+            "ask_list"
+        );
+        shutdown.send(()).unwrap();
+        handle.await.unwrap().unwrap();
     }
 
     fn argv(parts: &[&str]) -> Vec<String> {

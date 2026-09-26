@@ -322,3 +322,8 @@ Use `muxa_fleet_update_request` for consolidated guidance and `muxa_update_reque
 for progress on that same durable request. `muxa_fleet_wait_reply(after_update=0)`
 can return progress before terminal completion. See [MCP.md](MCP.md) for sequence,
 retention, authority and compatibility contracts.
+
+## Work placement and personalized execution paths
+
+See [Fleet Work dispatch](FLEET_ORCHESTRATION.md) for coordinator routing,
+selector-based placement, configurable workspace paths, and durable dispatch.

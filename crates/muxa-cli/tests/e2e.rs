@@ -67,6 +67,10 @@ impl Daemon {
     /// file to a tempdir so test runs never pollute the operator's real
     /// `$XDG_DATA_HOME/muxa/prompts.ndjson`.
     fn spawn_with(extra_toml: Option<&str>) -> Self {
+        Self::spawn_with_env(extra_toml, &[])
+    }
+
+    fn spawn_with_env(extra_toml: Option<&str>, env: &[(&str, String)]) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         // Leak tempdir intentionally — it's owned by the test's lifetime.
         let dir = dir.keep();
@@ -109,6 +113,7 @@ enabled = false
         std::fs::write(&cfg_path, &toml).expect("write test config");
 
         let child = Command::new(bin("muxad"))
+            .envs(env.iter().map(|(k, v)| (*k, v)))
             .arg("--socket")
             .arg(&socket)
             .arg("--config")
@@ -948,4 +953,250 @@ fn rejects_unknown_hook_event() {
         err.contains("unknown") || err.contains("does_not_exist"),
         "unexpected stderr:\n{err}"
     );
+}
+
+#[test]
+fn fleet_dispatch_plan_uses_daemon_node_and_custom_workspace_without_creating_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("managed");
+    let config = format!(
+        r#"
+[orchestration]
+enabled = true
+[orchestration.paths]
+root = {:?}
+[orchestration.workspaces.muxa]
+repo = "muxa"
+url = "git@example.invalid:muxa.git"
+pipeline = "solo"
+"#,
+        root.display().to_string()
+    );
+    let daemon = Daemon::spawn_with(Some(&config));
+    let input = dir.path().join("request.json");
+    std::fs::write(
+        &input,
+        serde_json::json!({
+            "dispatch_id":"c0701b75-c5e1-4b25-bfa1-0ac024756402",
+            "workspace":"muxa","work":"verify","commit":"a".repeat(40),"body":"run tests"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = daemon
+        .cli()
+        .args(["work", "dispatch", "--plan", "--from-json"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["host"], "local");
+    assert!(plan["node_id"].as_str().is_some_and(|v| !v.is_empty()));
+    assert_eq!(plan["paths"]["root"], root.display().to_string());
+    assert!(!root.exists());
+}
+
+/// A real daemon, Git worktree and tmux session; only the paid provider is a stub.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::too_many_lines)] // One isolated lifecycle fixture, including retry/recovery assertions.
+fn fleet_dispatch_launch_retry_and_status_use_one_attachable_tmux_work() {
+    // RAII stops only this fixture's private tmux server, even after assertion failure.
+    struct TmuxCleanup(PathBuf);
+    impl Drop for TmuxCleanup {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["-L", "default", "kill-server"])
+                .env("TMUX_TMPDIR", &self.0)
+                .env_remove("TMUX")
+                .output();
+        }
+    }
+    use std::os::unix::fs::PermissionsExt;
+    assert!(Command::new("tmux")
+        .arg("-V")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let tools = dir.path().join("bin");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&tools).unwrap();
+    let marker = dir.path().join("launches");
+    let stub = tools.join("codex");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\necho launched >> '{}'\nexec sleep 120\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = [
+        ("HOME", home.display().to_string()),
+        (
+            "XDG_DATA_HOME",
+            dir.path().join("data").display().to_string(),
+        ),
+        (
+            "XDG_CONFIG_HOME",
+            dir.path().join("config").display().to_string(),
+        ),
+        ("PATH", format!("{}:/usr/bin:/bin", tools.display())),
+        ("SHELL", "/bin/sh".to_string()),
+    ];
+    let origin = dir.path().join("origin");
+    let git = |args: &[&str]| {
+        let out = Command::new("git").args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", origin.to_str().unwrap()]);
+    git(&[
+        "-C",
+        origin.to_str().unwrap(),
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "fixture",
+    ]);
+    let head = git(&["-C", origin.to_str().unwrap(), "rev-parse", "HEAD"]);
+    let actual_root = dir.path().join("managed");
+    std::fs::create_dir(&actual_root).unwrap();
+    let root = dir.path().join("managed-alias");
+    std::os::unix::fs::symlink(&actual_root, &root).unwrap();
+    let config = format!(
+        r#"
+[orchestration]
+enabled = true
+[orchestration.paths]
+root = {:?}
+[orchestration.workspaces.fleettest]
+repo = "fixture"
+url = {:?}
+pipeline = "solo"
+[agent.codex]
+options = []
+[pipeline.solo]
+[[pipeline.solo.agent]]
+alias = "impl"
+program = "codex"
+prompt = "Test provider"
+"#,
+        root.display().to_string(),
+        origin.display().to_string()
+    );
+    let daemon = Daemon::spawn_with_env(Some(&config), &env);
+    let _cleanup = TmuxCleanup(daemon.tmux_tmpdir.clone());
+    let input = dir.path().join("request.json");
+    let id = "c0701b75-c5e1-4b25-bfa1-0ac024756403";
+    let mut request = serde_json::json!({"dispatch_id":id,"workspace":"fleettest","work":"verify","commit":head,"body":"Test dispatch"});
+    let dispatch = |request: &serde_json::Value| {
+        std::fs::write(&input, request.to_string()).unwrap();
+        daemon
+            .cli()
+            .envs(env.iter().map(|(k, v)| (*k, v)))
+            .args(["work", "dispatch", "--from-json"])
+            .arg(&input)
+            .output()
+            .unwrap()
+    };
+    let decode = |output: std::process::Output| -> serde_json::Value {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let first = decode(dispatch(&request));
+    assert_eq!(first["state"], "launched", "{first}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(std::fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    let sessions = Command::new("tmux")
+        .args(["-L", "default", "list-sessions", "-F", "#{session_name}"])
+        .env("TMUX_TMPDIR", &daemon.tmux_tmpdir)
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&sessions.stdout)
+        .lines()
+        .any(|s| s == "fleettest"));
+    assert_eq!(decode(dispatch(&request)), first);
+    let status = decode(
+        daemon
+            .cli()
+            .envs(env.iter().map(|(k, v)| (*k, v)))
+            .args(["work", "dispatch-status", id])
+            .output()
+            .unwrap(),
+    );
+    // Lowercase input must resolve the canonical uppercase Work identity.
+    assert!(
+        status["result"]["result"]["aliases"]["impl"].is_object(),
+        "{status}"
+    );
+    // Recover a lost acknowledgement without replaying the launch, then read
+    // generation-aware completion from the daemon rather than pane idleness.
+    let journal = dir
+        .path()
+        .join(format!("data/muxa/dispatches/coordinator/{id}.json"));
+    let mut unknown: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+    unknown["state"] = "unknown".into();
+    std::fs::write(&journal, unknown.to_string()).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = muxa::ipc::Client::new(daemon.socket.clone());
+        let runs = client.pipeline_runs().await.unwrap();
+        let run = runs
+            .iter()
+            .find(|r| r.identity.workspace_id == "fleettest")
+            .unwrap();
+        client
+            .pipeline_done(&run.identity, "impl", run.generation)
+            .await
+            .unwrap();
+    });
+    let completed = decode(
+        daemon
+            .cli()
+            .envs(env.iter().map(|(k, v)| (*k, v)))
+            .args(["work", "dispatch-status", id])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(completed["state"], "completed", "{completed}");
+    let run = root.join(format!("runs/fleettest/verify/{id}"));
+    assert_eq!(
+        git(&["-C", run.to_str().unwrap(), "rev-parse", "HEAD"]),
+        head
+    );
+    request["body"] = "different payload".into();
+    assert!(!dispatch(&request).status.success());
+    request["dispatch_id"] = "c0701b75-c5e1-4b25-bfa1-0ac024756404".into();
+    request["work"] = "VERIFY".into();
+    assert_eq!(decode(dispatch(&request))["state"], "failed");
+    assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
 }
