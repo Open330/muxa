@@ -50,6 +50,9 @@ jobs:
           Scripts/build-libghostty.sh
           xcodegen generate
 
+      - name: Test AFM workspace grounding
+        run: bash apps/muxa-macos/Scripts/test-ask-helper.sh
+
       - name: Build and run MuxaTests
         working-directory: apps/muxa-macos
         run: |
