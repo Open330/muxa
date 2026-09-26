@@ -1365,6 +1365,9 @@ fn handle_key(
                             )
                         };
                         let request = NewRequest {
+                            dispatch_id: None,
+                            source_node_id: None,
+                            delegation_parent: None,
                             initiator: None,
                             kind: app.message_kind,
                             body: text,
@@ -4828,6 +4831,9 @@ mod tests {
 
     fn broadcast_request() -> NewRequest {
         NewRequest {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
             initiator: None,
             kind: RequestKind::Question,
             body: "coordinate this change".into(),

@@ -18,6 +18,7 @@ mod mcp;
 mod message_skill;
 mod mux_control;
 mod onboarding;
+mod orchestration;
 mod peek;
 mod relay;
 mod reload;
@@ -657,6 +658,16 @@ enum WindowCmd {
 
 #[derive(Debug, Subcommand)]
 enum WorkCmd {
+    #[command(hide = true)]
+    FleetAsk,
+    /// Place a Work using shared Fleet policy; accepts a bounded JSON request.
+    Dispatch(orchestration::DispatchArgs),
+    /// Read a durable dispatch, including after a lost reply.
+    DispatchStatus(orchestration::StatusArgs),
+    #[command(hide = true)]
+    DispatchExecute(orchestration::ExecuteArgs),
+    #[command(hide = true)]
+    DispatchWorkerStatus { dispatch_id: String },
     /// Describe a work pipeline in your own words and let an agent write
     /// the `[ticket]`/`[[route]]`/`[pipeline.*]` config for you. Validated
     /// and shown before anything is written.
@@ -882,6 +893,17 @@ async fn run_work_cmd(
     client: &Client,
 ) -> Result<()> {
     match action {
+        WorkCmd::FleetAsk => orchestration::shared_ask(cfg, client).await,
+        WorkCmd::Dispatch(args) => {
+            orchestration::dispatch(args, cfg, client, config_path.as_deref()).await
+        }
+        WorkCmd::DispatchStatus(args) => orchestration::status(args, cfg, client).await,
+        WorkCmd::DispatchExecute(args) => {
+            orchestration::execute(args, cfg, client, config_path.as_deref()).await
+        }
+        WorkCmd::DispatchWorkerStatus { dispatch_id } => {
+            orchestration::worker_status(&dispatch_id, client).await
+        }
         WorkCmd::Init(args) => work_init::run(args, cfg, config_path).await,
         WorkCmd::Compose(args) => work_compose::run(args, cfg).await,
         WorkCmd::Up(args) => work_up::run(args, cfg, config_path, Some(client)).await,
@@ -1719,6 +1741,9 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     &origin,
                     &target,
                     &NewRequest {
+                        dispatch_id: None,
+                        source_node_id: None,
+                        delegation_parent: None,
                         initiator: None,
                         kind,
                         body,
@@ -4350,6 +4375,9 @@ mod tests {
         status: RequestStatus,
     ) -> CollaborationRequest {
         CollaborationRequest {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
             initiator: None,
             updates: Vec::new(),
             id: id.into(),

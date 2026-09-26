@@ -40,7 +40,17 @@ pub const MAX_WORK_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 /// Combined argv + stdin bytes one `work_command` may carry.
 pub const MAX_WORK_COMMAND_INPUT_BYTES: usize = 1024 * 1024;
 /// `muxa work` subcommands the IPC `work_command` kind may run.
-pub const WORK_COMMAND_SUBCOMMANDS: &[&str] = &["options", "preset", "pipeline", "route"];
+pub const WORK_COMMAND_SUBCOMMANDS: &[&str] = &[
+    "options",
+    "preset",
+    "pipeline",
+    "route",
+    "dispatch",
+    "dispatch-status",
+    "dispatch-execute",
+    "dispatch-worker-status",
+    "fleet-ask",
+];
 /// Subcommands that only read configuration. Observe-mode hosts run these
 /// and nothing else.
 const WORK_COMMAND_READ_ONLY_SUBCOMMANDS: &[&str] = &["options"];
@@ -301,7 +311,11 @@ impl WorkCommandLimits {
     /// The budget a validated argv is entitled to.
     #[must_use]
     pub fn for_args(args: &[String]) -> Self {
-        if is_work_up(args) {
+        if is_work_up(args)
+            || args
+                .get(1)
+                .is_some_and(|s| matches!(s.as_str(), "dispatch" | "dispatch-execute"))
+        {
             Self::WORK_UP
         } else {
             Self::COMMAND
@@ -450,6 +464,26 @@ pub async fn execute_work_command(
         command.env("MUXA_SOCKET", socket_path);
     }
     run_bounded(command, args, stdin, limits).await
+}
+
+/// Fleet-managed Work always has an attachable tmux surface, independent of
+/// the coordinator's terminal backend. Detaching does not stop the agents.
+pub async fn execute_tmux_work(
+    binary: &Path,
+    args: &[String],
+    socket: &Path,
+) -> Result<WorkCommandOutput, WorkCommandError> {
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args(args)
+        .env("MUXA_SOCKET", socket)
+        .env("MUXA_HOST", "tmux")
+        .env("MUXA_HOSTS", "tmux")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env_remove("RMUX")
+        .env_remove("RMUX_PANE");
+    run_bounded(command, args, None, WorkCommandLimits::WORK_UP).await
 }
 
 pub(crate) async fn run_bounded(
@@ -642,6 +676,22 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn fleet_launch_is_attachable_tmux_independent_of_callers_terminal() {
+        let output = execute_tmux_work(
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "printf '%s/%s/%s' \"$MUXA_HOST\" \"$MUXA_HOSTS\" \"${TMUX-unset}\"".into(),
+            ],
+            Path::new("/tmp/test-dispatch.sock"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "tmux/tmux/unset");
     }
 
     fn work_request(host: Option<&str>) -> WorkUpRequest {

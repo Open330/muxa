@@ -844,7 +844,17 @@ impl AskStore {
 
         let store = Arc::clone(self);
         let id = entry.id.clone();
-        let prompt = prompt.to_string();
+        let mut prompt = prompt.to_string();
+        if resume.is_none()
+            && self
+                .opts
+                .config_path
+                .as_deref()
+                .and_then(|p| Config::load_or_default(Some(p)).ok())
+                .is_some_and(|c| c.orchestration.enabled)
+        {
+            prompt = format!("Fleet work: delegate authorized execution using muxa_dispatch_work, or `muxa work dispatch --from-json -`. Supply a UUID dispatch_id, workspace, work, full commit and body; reuse the ID on uncertain delivery. Muxa resolves placement and paths. Use --plan for a preview. Report artifacts and blockers, not routine polling. A launched pipeline is not completed work.\n\n{prompt}");
+        }
         tokio::spawn(async move {
             let api_key =
                 resolve_api_key(&provider, credential_key, |name| std::env::var(name).ok());

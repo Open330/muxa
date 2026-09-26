@@ -159,6 +159,7 @@ pub struct Config {
     /// one is written.
     #[serde(default)]
     pub automation: crate::automation::AutomationConfig,
+    pub orchestration: crate::orchestration::OrchestrationConfig,
     pub history: HistoryConfig,
     pub activity: ActivityConfig,
     pub state: StateConfig,

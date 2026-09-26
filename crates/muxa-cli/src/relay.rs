@@ -98,6 +98,10 @@ pub(crate) async fn run(client: Client) -> Result<()> {
                                     .iter()
                                     .any(|c| c == "collaboration_update"))
                     })
+                    .filter(|c| {
+                        !matches!(**c, "collaboration_dispatch_v1" | "orchestration_v1")
+                            || daemon.capabilities.iter().any(|d| d == *c)
+                    })
                     .map(|capability| (*capability).to_string())
                     .collect(),
                 daemon_generation: daemon.generation,
