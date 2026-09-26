@@ -307,6 +307,16 @@ impl PipelineRunStore {
         self.inner.lock().await.runs.values().cloned().collect()
     }
 
+    /// Check scheduling readiness without cloning persisted Run payloads.
+    pub async fn has_ready_alias(&self) -> bool {
+        self.inner
+            .lock()
+            .await
+            .runs
+            .values()
+            .any(PipelineRun::has_ready_alias)
+    }
+
     pub async fn get(&self, identity: &WorkIdentity) -> Option<PipelineRun> {
         self.inner.lock().await.runs.get(identity).cloned()
     }
@@ -1006,6 +1016,28 @@ mod tests {
             observed: Vec::new(),
             invalidate,
         }
+    }
+
+    #[tokio::test]
+    async fn readiness_query_tracks_claims_and_completion_dependencies() {
+        let store = PipelineRunStore::in_memory();
+        assert!(!store.has_ready_alias().await);
+        let run = store.register(registration(Vec::new())).await.unwrap();
+        assert!(store.has_ready_alias().await);
+        store
+            .claim_ready(&run.identity, run.generation)
+            .await
+            .unwrap();
+        assert!(!store.has_ready_alias().await);
+        store
+            .done(&run.identity, "plan", run.generation)
+            .await
+            .unwrap();
+        assert!(store.has_ready_alias().await);
+        assert_eq!(
+            store.has_ready_alias().await,
+            store.list().await.iter().any(PipelineRun::has_ready_alias)
+        );
     }
 
     #[tokio::test]

@@ -243,6 +243,7 @@ async fn main() -> Result<()> {
         backends.clone(),
         Client::new(socket.clone()),
         restart.generation(),
+        collaboration.subscribe(),
         shutdown_tx.subscribe(),
     )
     .await;

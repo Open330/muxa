@@ -49,5 +49,9 @@ tracing-subscriber = { workspace = true }
 name = "store_apply"
 harness = false
 
+[[bench]]
+name = "runtime_reads"
+harness = false
+
 [lints]
 workspace = true

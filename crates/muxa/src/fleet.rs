@@ -883,6 +883,11 @@ impl FleetStore {
         self.snapshot_selected(None).await
     }
 
+    /// Read one cached host without cloning and sorting the rest of the Fleet.
+    pub async fn host_snapshot(&self, alias: &str) -> Option<FleetHostSnapshot> {
+        self.hosts.read().await.get(alias).cloned()
+    }
+
     pub async fn snapshot_selected(&self, selector: Option<&LabelSelector>) -> FleetSnapshot {
         let mut hosts = self
             .hosts
@@ -1311,6 +1316,22 @@ mod tests {
             error: None,
             remote: None,
         }
+    }
+
+    #[tokio::test]
+    async fn single_host_snapshot_is_scoped_and_owned() {
+        let store = FleetStore::new();
+        store
+            .upsert_host(host("local", true, BTreeMap::new()))
+            .await;
+        store
+            .upsert_host(host("remote", false, BTreeMap::new()))
+            .await;
+        assert!(store.host_snapshot("missing").await.is_none());
+        let mut snapshot = store.host_snapshot("remote").await.unwrap();
+        snapshot.alias = "edited".into();
+        assert_eq!(store.host_snapshot("remote").await.unwrap().alias, "remote");
+        assert_eq!(store.snapshot().await.hosts.len(), 2);
     }
 
     #[test]

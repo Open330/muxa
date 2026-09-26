@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use muxa::pipeline_run::{PipelineRun, PipelineRunStore};
+use muxa::pipeline_run::PipelineRunStore;
 use muxa::work_control::{execute_work_command, WorkCommandError, WorkCommandLimits};
 use tokio::sync::broadcast;
 
@@ -52,7 +52,7 @@ async fn supervise(
     safety_scan.tick().await;
     loop {
         let pass = async {
-            if runs.list().await.iter().any(PipelineRun::has_ready_alias) {
+            if runs.has_ready_alias().await {
                 reconcile(&program, &socket, limits).await
             } else {
                 Ok(())
