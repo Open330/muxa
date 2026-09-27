@@ -79,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 | `muxa automation` | Rules that act on agent state — the built-in one resumes a session after its usage cap resets. |
 | BarShelf widget (macOS) | Menu-bar popover summary of active, working, waiting, and error agents. |
 | Muxa for Mac | Native session browser and menu-bar app with a locally built libghostty terminal; native PTYs remain owned by `muxad`. |
-| Dashboard | Optional loopback HTTP UI with SSE live updates, timeline, and collaboration node-edge/sequence graphs. |
+| Dashboard | Optional loopback HTTP UI with live updates, timeline, collaboration graphs, and [OIDC pane/window sharing](docs/DASHBOARD.md#invite-someone-to-a-pane) with view or prompt permissions. |
 | Notifications | Optional desktop alerts when agents need attention. |
 
 ## More install options

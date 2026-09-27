@@ -628,6 +628,43 @@ allowed. Use `auth = "public_read"` with a token to expose anonymous reads
 while keeping browser control actions PAT-gated. `auth = "none"` exposes reads
 and disables control actions entirely. See [DASHBOARD.md](DASHBOARD.md).
 
+### Authenticated pane and window sharing
+
+Optional `[dashboard.sharing]` configuration enables email invitations to local
+tmux/rmux panes or the current panes in a window. It requires dashboard
+`auth = "token"` and an operator token. Recipients use OIDC login, with view-only
+or prompt permission, expiry and revocation; do not give them the operator token.
+
+```toml
+[dashboard.sharing]
+public_url = "https://muxa.example.com"
+issuer_url = "https://login.example.com"
+client_id = "muxa-dashboard"
+# Optional: environment variable NAME, supplied to the daemon service.
+client_secret_env = "MUXA_SHARING_CLIENT_SECRET"
+# Optional: absolute path on a private local filesystem.
+# storage_path = "/absolute/path/to/shares.sqlite3"
+```
+
+`public_url` must be an origin without a path, query or fragment. Register
+`https://muxa.example.com/share/auth/callback` with the OIDC provider and enable
+verified email claims in ID tokens. Use an HTTPS reverse proxy for external
+access; HTTP is allowed only on loopback. Restart after configuration changes.
+
+Window invitations pin up to 16 existing pane processes; new panes are not
+included. Prompt permission can execute shell commands when the pane runs a shell.
+Invitations survive daemon restarts, but recipients must sign in again and the
+original pane process must still exist. Private SQLite storage defaults to
+`muxa/dashboard-sharing/shares.sqlite3` under the platform data directory. Only
+one daemon may use a given database. Browser command request IDs prevent duplicate
+delivery when checking a lost response.
+
+**Shares → Check login setup** checks provider discovery and signing keys; it
+does not validate the client secret or an actual account's claims. Test the real
+HTTPS address and recipient login before distributing links, and omit callback
+query strings from proxy access logs. See [sharing and deployment](DASHBOARD.md#invite-someone-to-a-pane)
+for limits, API details, recovery and the browser smoke test.
+
 ## External Sinks
 
 Sinks are opt-in fan-out targets. The current documented sink forwards
@@ -640,10 +677,3 @@ ordered comma-separated set, for example `MUXA_HOSTS=rmux,tmux`. rmux's native
 `RMUX` variables take precedence over the `TMUX` compatibility variables it
 also exports. See [CMUX.md](CMUX.md), [RMUX.md](RMUX.md), [HERDR.md](HERDR.md), and
 [ZELLIJ.md](ZELLIJ.md).
-
-### Authenticated pane sharing
-
-Optional `[dashboard.sharing]` settings `public_url`, `issuer_url`, `client_id`
-and `client_secret_env` enable OIDC invitations for individual tmux/rmux panes.
-Requires dashboard `auth = "token"`. See [pane sharing](DASHBOARD.md#invite-someone-to-a-pane)
-for provider setup, HTTPS, permissions, expiration and restart behavior.
