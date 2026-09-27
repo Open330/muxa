@@ -1,8 +1,9 @@
 use super::routes::{error, sharing_config};
 use super::{
-    normalize_email, random_secret, secure_url, PendingLogin, Session, Sharing, SharingConfig,
-    LOGIN_TTL, MAX_SESSIONS, SESSION_TTL,
+    normalize_email, random_secret, PendingLogin, Session, Sharing, SharingConfig, LOGIN_TTL,
+    MAX_SESSIONS, SESSION_TTL,
 };
+use crate::dashboard::oidc;
 use crate::dashboard::server::AppState;
 use axum::{
     extract::{Query, State},
@@ -10,81 +11,18 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 use openidconnect::{
-    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
-    AccessTokenHash, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
-    EndpointNotSet, EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
-    RedirectUrl, Scope, TokenResponse,
+    core::CoreAuthenticationFlow, AuthorizationCode, CsrfToken, EmptyAdditionalClaims, Nonce,
+    PkceCodeChallenge, Scope, TokenResponse,
 };
 use serde::Deserialize;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use subtle::ConstantTimeEq;
 
-type Client = CoreClient<
-    EndpointSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointMaybeSet,
-    EndpointMaybeSet,
->;
+type Client = oidc::Client<EmptyAdditionalClaims>;
 
 impl Sharing {
     pub(super) async fn client(&self) -> Result<(Client, reqwest::Client), ()> {
-        let config = self.config.as_ref().ok_or(())?;
-        let http = self
-            .http
-            .get_or_init(|| {
-                reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .timeout(Duration::from_secs(10))
-                    .build()
-                    .ok()
-            })
-            .as_ref()
-            .ok_or(())?
-            .clone();
-        let metadata = {
-            // Single flight discovery and shared connections bound provider traffic.
-            let mut cache = self.metadata.lock().await;
-            if let Some((_, metadata)) = cache.as_ref().filter(|(at, _)| at.elapsed() < LOGIN_TTL) {
-                metadata.clone()
-            } else {
-                let metadata = CoreProviderMetadata::discover_async(
-                    IssuerUrl::new(config.issuer_url.clone()).map_err(|_| ())?,
-                    &http,
-                )
-                .await
-                .map_err(|_| ())?;
-                *cache = Some((Instant::now(), metadata.clone()));
-                metadata
-            }
-        };
-        if !secure_url(metadata.authorization_endpoint().url())
-            || metadata
-                .token_endpoint()
-                .is_none_or(|endpoint| !secure_url(endpoint.url()))
-        {
-            return Err(());
-        }
-        let secret = match &config.client_secret_env {
-            Some(name) => {
-                let value = std::env::var(name).map_err(|_| ())?;
-                if value.trim().is_empty() {
-                    return Err(());
-                }
-                Some(ClientSecret::new(value))
-            }
-            None => None,
-        };
-        let client = CoreClient::from_provider_metadata(
-            metadata.clone(),
-            ClientId::new(config.client_id.clone()),
-            secret,
-        )
-        .set_redirect_uri(
-            RedirectUrl::new(format!("{}/share/auth/callback", config.origin())).map_err(|_| ())?,
-        );
-        Ok((client, http))
+        self.provider.as_ref().ok_or(())?.client().await
     }
 }
 
@@ -98,19 +36,7 @@ pub(super) fn cookie_name(config: &SharingConfig, flow: bool) -> &'static str {
 }
 
 pub(super) fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    let mut values = headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .filter_map(|part| part.trim().split_once('='))
-        .filter(|(key, _)| *key == name)
-        .map(|(_, value)| value);
-    let value = values.next()?;
-    if value.len() > 128 || values.next().is_some() {
-        return None;
-    }
-    Some(value.to_owned())
+    oidc::cookie(headers, name)
 }
 
 fn with_cookie(
@@ -317,17 +243,7 @@ async fn authenticate(sharing: &Sharing, code: &str, flow: &PendingLogin) -> Res
     let token = tokens.id_token().ok_or(())?;
     let verifier = client.id_token_verifier();
     let claims = token.claims(&verifier, &flow.nonce).map_err(|_| ())?;
-    if let Some(expected) = claims.access_token_hash() {
-        let actual = AccessTokenHash::from_token(
-            tokens.access_token(),
-            token.signing_alg().map_err(|_| ())?,
-            token.signing_key(&verifier).map_err(|_| ())?,
-        )
-        .map_err(|_| ())?;
-        if actual != *expected {
-            return Err(());
-        }
-    }
+    oidc::check_access_token_hash(&tokens, token, claims.access_token_hash(), &verifier)?;
     if claims.email_verified() != Some(true) {
         return Err(());
     }

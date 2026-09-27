@@ -7,6 +7,7 @@ mod targets;
 #[cfg(test)]
 mod tests;
 
+use super::oidc::{self, random_secret};
 use crate::PaneKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -31,21 +32,12 @@ pub struct SharingConfig {
 
 impl SharingConfig {
     pub fn validate(&self) -> Result<(), String> {
-        let public = url::Url::parse(&self.public_url).map_err(|_| "invalid public_url")?;
-        let issuer = url::Url::parse(&self.issuer_url).map_err(|_| "invalid issuer_url")?;
-        for url in [&public, &issuer] {
-            if !secure_url(url)
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.query().is_some()
-                || url.fragment().is_some()
-            {
-                return Err("sharing URLs require HTTPS (HTTP is allowed only on loopback), without credentials/query/fragment".into());
-            }
-        }
-        if public.path() != "/" || self.client_id.trim().is_empty() {
-            return Err("public_url must be an origin; client_id is required".into());
-        }
+        oidc::validate_provider(
+            &self.public_url,
+            &self.issuer_url,
+            &self.client_id,
+            self.client_secret_env.as_deref(),
+        )?;
         if self
             .storage_path
             .as_ref()
@@ -53,47 +45,20 @@ impl SharingConfig {
         {
             return Err("storage_path must be an absolute file path".into());
         }
-        if self.client_secret_env.as_ref().is_some_and(|name| {
-            name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        }) {
-            return Err("client_secret_env must name an environment variable".into());
-        }
         Ok(())
     }
 
-    fn origin(&self) -> String {
-        // Validated at configuration resolution, including for test fixtures.
-        url::Url::parse(&self.public_url)
-            .expect("validated public_url")
-            .origin()
-            .ascii_serialization()
+    pub(in crate::dashboard) fn origin(&self) -> String {
+        oidc::origin(&self.public_url)
     }
 
     fn secure(&self) -> bool {
-        url::Url::parse(&self.public_url).is_ok_and(|url| url.scheme() == "https")
+        oidc::is_https(&self.public_url)
     }
 
-    pub(super) fn matches_host(&self, host: &str) -> bool {
-        let Ok(public) = url::Url::parse(&self.public_url) else {
-            return false;
-        };
-        let Ok(request) = url::Url::parse(&format!("{}://{host}", public.scheme())) else {
-            return false;
-        };
-        request.origin() == public.origin()
-            && request.path() == "/"
-            && request.username().is_empty()
-            && request.password().is_none()
+    pub(in crate::dashboard) fn matches_host(&self, host: &str) -> bool {
+        oidc::matches_host(&self.public_url, host)
     }
-}
-
-fn secure_url(url: &url::Url) -> bool {
-    url.scheme() == "https"
-        || (url.scheme() == "http"
-            && matches!(
-                url.host_str(),
-                Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
-            ))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,8 +128,7 @@ pub struct Sharing {
     storage: Option<Arc<storage::Storage>>,
     config: Option<SharingConfig>,
     registry: Mutex<Registry>,
-    http: std::sync::OnceLock<Option<reqwest::Client>>,
-    metadata: Mutex<Option<(Instant, openidconnect::core::CoreProviderMetadata)>>,
+    provider: Option<oidc::Provider>,
     login_slots: Semaphore,
     pane_slots: Arc<Semaphore>,
     execution_locks: std::sync::Mutex<ExecutionLocks>,
@@ -172,25 +136,24 @@ pub struct Sharing {
 
 impl Sharing {
     pub(super) fn new(config: Option<SharingConfig>) -> Arc<Self> {
+        let provider = config.as_ref().map(|config| {
+            oidc::Provider::new(
+                &config.issuer_url,
+                &config.client_id,
+                config.client_secret_env.as_deref(),
+                format!("{}/share/auth/callback", config.origin()),
+            )
+        });
         Arc::new(Self {
             storage: None,
             config,
             registry: Mutex::new(Registry::default()),
-            http: std::sync::OnceLock::new(),
-            metadata: Mutex::new(None),
+            provider,
             login_slots: Semaphore::new(4),
             pane_slots: Arc::new(Semaphore::new(8)),
             execution_locks: std::sync::Mutex::new(HashMap::new()),
         })
     }
-}
-
-fn random_secret() -> String {
-    format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
 }
 
 fn normalize_email(email: &str) -> Result<String, &'static str> {
