@@ -36,6 +36,7 @@ portable-pty = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
 base64 = { workspace = true }
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }

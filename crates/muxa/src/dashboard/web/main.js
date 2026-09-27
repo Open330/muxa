@@ -1,3 +1,4 @@
+import { openShareManager } from "./sharing-admin.mjs";
 import { logicalWorkKey, normalizeAgent, validateWorkSnapshot, WORK_STAGES } from "./work-model.mjs";
 import {
   collaborationSequence,
@@ -303,6 +304,7 @@ function showToast(msg) {
 function renderAccess() {
   const access = store.access;
   const editing = access.writeAuthorized;
+  document.querySelector("#manage-shares").hidden = !(editing && access.paneSharingAvailable);
   const canStartWork = editing && access.workStartAvailable;
   dom.accessMode.textContent = editing
     ? "edit unlocked"
@@ -337,6 +339,7 @@ async function fetchAccess() {
   store.access = {
     mode: data.mode || "read_only",
     readRequiresToken: Boolean(data.read_requires_token),
+    paneSharingAvailable: Boolean(data.capabilities?.pane_sharing),
     writeAvailable: Boolean(data.write_available),
     writeAuthorized: Boolean(data.write_authorized),
     workStartAvailable: Boolean(data.capabilities?.work_start),
@@ -1818,6 +1821,7 @@ function renderAgents() {
 function paneControlButtons(pane, socket = "") {
   if (!store.access.writeAuthorized || !pane) return "—";
   return `<span class="control-actions">
+    ${store.access.paneSharingAvailable && /^(%|rmux:)/.test(pane) ? `<button class="control-btn" type="button" data-pane-action="share" data-pane="${esc(pane)}" data-pane-socket="${esc(socket || "")}">share</button>` : ""}
     <button class="control-btn" type="button" data-pane-action="prompt" data-pane="${esc(pane)}" data-pane-socket="${esc(socket || "")}">prompt</button>
     <button class="control-btn danger" type="button" data-pane-action="abort" data-pane="${esc(pane)}" data-pane-socket="${esc(socket || "")}">abort</button>
   </span>`;
@@ -1980,6 +1984,8 @@ async function runPaneControl(button) {
   const pane = button.getAttribute("data-pane");
   const socket = button.getAttribute("data-pane-socket") || null;
   if (!action || !pane) return;
+
+  if (action === "share") { openShareManager({ pane, socket }, controlFetch); return; }
 
   if (action === "prompt") {
     const text = window.prompt(`Send prompt to ${pane}`);
@@ -3409,3 +3415,5 @@ async function pollCollaboration() {
 }
 
 main();
+
+document.querySelector("#manage-shares")?.addEventListener("click", () => openShareManager(null, controlFetch));

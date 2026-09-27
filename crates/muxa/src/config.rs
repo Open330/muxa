@@ -981,6 +981,8 @@ pub struct WebhookToml {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DashboardTomlConfig {
+    /// Optional authenticated, pane-scoped browser sharing.
+    pub sharing: Option<Box<crate::dashboard::sharing::SharingConfig>>,
     pub enabled: Option<bool>,
     /// Socket address as `ip:port`. Default `127.0.0.1:7878`.
     pub bind: Option<String>,

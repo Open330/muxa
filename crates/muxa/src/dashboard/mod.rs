@@ -24,6 +24,7 @@ pub mod assets;
 pub mod auth;
 pub mod config;
 pub mod server;
+pub mod sharing;
 /// Durable operator annotations for work items. Public so read-only
 /// consumers (the CLI's `work list`/`work show`) can show the stage the
 /// dashboard records without a second copy of the schema.

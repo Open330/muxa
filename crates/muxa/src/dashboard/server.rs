@@ -114,6 +114,7 @@ pub struct AppState {
     pub config: Arc<DashboardConfig>,
     pub pane_cache: Arc<PaneCache>,
     pub sessions: SharedSessionBackend,
+    pub(super) sharing: Arc<super::sharing::Sharing>,
     /// Primary pane backend retained for compatibility with callers that
     /// inspect it directly. Pane scans use `backends` below so every active
     /// host contributes to one dashboard inventory.
@@ -181,6 +182,7 @@ impl AppState {
         Self {
             store,
             collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
+            sharing: super::sharing::Sharing::new(config.sharing.clone()),
             config,
             pane_cache,
             sessions,
@@ -385,7 +387,7 @@ pub fn router(state: AppState) -> Router {
     } else {
         read_api
     };
-    let write_api = Router::new()
+    let write_api = super::sharing::admin_routes()
         .route("/api/panes/{pane}/prompt", post(pane_prompt_handler))
         .route("/api/fleet/{host}/command", post(fleet_command_handler))
         .route("/api/panes/{pane}/abort", post(pane_abort_handler))
@@ -403,7 +405,10 @@ pub fn router(state: AppState) -> Router {
         )
         .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES))
         .layer(write_auth_layer);
-    let api = read_api.merge(write_api).with_state(state.clone());
+    let api = read_api
+        .merge(write_api)
+        .merge(super::sharing::recipient_routes(state.clone()))
+        .with_state(state.clone());
     // Static assets sit OUTSIDE the auth layer — see assets.rs for the
     // rationale (token bootstrap in the browser). The DNS-rebinding host
     // guard, by contrast, wraps *everything* (API + assets). The
@@ -428,7 +433,7 @@ fn make_request_span<B>(req: &Request<B>) -> tracing::Span {
     )
 }
 
-/// Render `uri` as `path[?query]` with any `token` query-parameter value
+/// Render `uri` with operator tokens and OIDC code/state query values
 /// replaced by `REDACTED`. Other parameters are preserved verbatim.
 fn scrub_token_from_uri(uri: &axum::http::Uri) -> String {
     let path = uri.path();
@@ -438,7 +443,15 @@ fn scrub_token_from_uri(uri: &axum::http::Uri) -> String {
             let scrubbed = query
                 .split('&')
                 .map(|pair| match pair.split_once('=') {
-                    Some((k, _)) if k.eq_ignore_ascii_case("token") => format!("{k}=REDACTED"),
+                    Some((k, _))
+                        if ["token", "code", "state"].iter().any(|sensitive| {
+                            url::form_urlencoded::parse(pair.as_bytes())
+                                .next()
+                                .is_some_and(|(key, _)| key.eq_ignore_ascii_case(sensitive))
+                        }) =>
+                    {
+                        format!("{k}=REDACTED")
+                    }
                     _ => pair.to_string(),
                 })
                 .collect::<Vec<_>>()
@@ -509,7 +522,15 @@ async fn host_guard_middleware(
             .headers()
             .get(header::HOST)
             .and_then(|h| h.to_str().ok());
-        if !host_is_loopback(host, state.config.bind.ip()) {
+        if !host_is_loopback(host, state.config.bind.ip())
+            && !host.is_some_and(|host| {
+                state
+                    .config
+                    .sharing
+                    .as_ref()
+                    .is_some_and(|sharing| sharing.matches_host(host))
+            })
+        {
             return Err(StatusCode::FORBIDDEN);
         }
     }
@@ -638,6 +659,7 @@ struct AccessResponse {
 #[derive(Debug, Serialize)]
 struct AccessCapabilities {
     work_start: bool,
+    pane_sharing: bool,
 }
 
 async fn access_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -661,6 +683,7 @@ async fn access_handler(State(state): State<AppState>, headers: HeaderMap) -> im
         write_authorized,
         capabilities: AccessCapabilities {
             work_start: state.config.allow_work_start,
+            pane_sharing: state.config.sharing.is_some(),
         },
     })
 }
@@ -4120,6 +4143,11 @@ mod tests {
         assert!(scrubbed.contains("since=24h"), "scrubbed: {scrubbed}");
 
         // No query → untouched path.
+        let encoded: axum::http::Uri =
+            "/share/auth/callback?co%64e=secret&sta%74e=secret&to%6ben=secret"
+                .parse()
+                .unwrap();
+        assert!(!scrub_token_from_uri(&encoded).contains("secret"));
         let plain: axum::http::Uri = "/api/health".parse().unwrap();
         assert_eq!(scrub_token_from_uri(&plain), "/api/health");
     }

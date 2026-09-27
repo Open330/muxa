@@ -398,3 +398,66 @@ that strips the carve-out (or use mTLS).
 These are deliberate v1 cuts; the [`dashboard::router`](../crates/muxa/src/dashboard/server.rs)
 function is `pub` so a future PR can `.merge()` extra routes without a
 rewrite.
+
+## Invite someone to a pane
+
+Optional pane sharing gives an invited, signed-in account access to one local
+**tmux or rmux pane**. Choose **share** on a pane, enter the recipient's email,
+choose **View output** or **View and send prompts**, then copy the generated link.
+The dashboard's **Shares** button lists and revokes invitations. The recipient
+signs in on a separate page; the operator bearer token must not be sent to them.
+
+Configure an OIDC application that supports authorization code flow with PKCE
+and returns `email` and `email_verified = true` in its ID token. Register the exact
+redirect URI `https://muxa.example.com/share/auth/callback` with that provider.
+Example configuration (replace the example host and issuer):
+
+```toml
+[dashboard]
+enabled = true
+bind = "127.0.0.1:7878"
+auth = "token"
+# Supply the operator token through MUXA_DASHBOARD_TOKEN or dashboard.token.
+
+[dashboard.sharing]
+public_url = "https://muxa.example.com"
+issuer_url = "https://login.example.com"
+client_id = "muxa-dashboard"
+# Optional for confidential clients; this is the environment variable NAME.
+client_secret_env = "MUXA_SHARING_CLIENT_SECRET"
+```
+
+Terminate HTTPS at a reverse proxy forwarding to the loopback dashboard, preserve
+its public `Host`, and forward `/share/*` and the dashboard static assets. The
+configured `public_url` must be an origin without a path, query or fragment.
+HTTP is accepted only for loopback development. Sharing requires private
+`auth = "token"`; `public_read` and `none` are incompatible. Set the client secret
+in the daemon's environment when `client_secret_env` is specified. Restart after
+configuration changes. No login provider or public listener is enabled automatically.
+
+Invitations expire after 1 minute to 24 hours (the UI offers 1, 4 or 24 hours).
+Sessions last at most 8 hours. Grants and sessions are held in memory: **daemon
+restart ends all shares and requires new invitations**. The first successful
+login binds the verified invited email to the provider's subject identifier.
+Other accounts cannot use the link, and recipient cookies grant no operator API
+access. Logging out ends that browser session; use **Revoke** to end the invitation.
+Revocation waits for an already accepted prompt to finish and rejects subsequent
+prompts. It cannot undo commands already executed.
+
+Prompt access submits literal text followed by Enter to the existing process.
+A shell pane therefore permits shell commands; share only with someone who should
+have that authority and may see the pane's output. This is not a command sandbox.
+The socket, session, window, pane and process identity are checked again before
+operations; replacing the pane requires a new invitation. Remote panes, entire
+windows, terminal resizing and raw keyboard streaming are not included.
+
+The recipient page polls visible output every 2 seconds and pauses while hidden.
+Output capture has a 1-second cache, a 32,768-character limit and a bounded pool
+of eight concurrent pane operations. Prompt requests are limited to 16 KiB and
+one per 500 ms per share; failed submissions are never retried automatically.
+
+Operator API: `GET/POST /api/shares`, `POST /api/shares/{id}/revoke` (bearer token).
+Create body: `{"pane":"%1","socket":"/path/to/tmux/socket","email":"guest@example.com","permission":"prompt","ttl_seconds":3600}`.
+Recipient API: `GET /share/api/{id}`, `POST /share/api/{id}/prompt` with
+`{"text":"..."}`. Recipient writes require the session cookie, the configured
+origin and `X-Muxa-Share: 1`.

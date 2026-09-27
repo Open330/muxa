@@ -1,0 +1,322 @@
+use super::routes::{error, sharing_config};
+use super::{
+    normalize_email, random_secret, secure_url, PendingLogin, Session, Sharing, SharingConfig,
+    LOGIN_TTL, MAX_SESSIONS, SESSION_TTL,
+};
+use crate::dashboard::server::AppState;
+use axum::{
+    extract::{Query, State},
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Redirect, Response},
+};
+use openidconnect::{
+    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
+    AccessTokenHash, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
+    EndpointNotSet, EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
+    RedirectUrl, Scope, TokenResponse,
+};
+use serde::Deserialize;
+use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
+
+type Client = CoreClient<
+    EndpointSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointMaybeSet,
+    EndpointMaybeSet,
+>;
+
+impl Sharing {
+    async fn client(&self) -> Result<(Client, reqwest::Client), ()> {
+        let config = self.config.as_ref().ok_or(())?;
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| ())?;
+        let cached = self
+            .metadata
+            .lock()
+            .await
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < LOGIN_TTL)
+            .map(|(_, metadata)| metadata.clone());
+        let metadata = if let Some(metadata) = cached {
+            metadata
+        } else {
+            let metadata = CoreProviderMetadata::discover_async(
+                IssuerUrl::new(config.issuer_url.clone()).map_err(|_| ())?,
+                &http,
+            )
+            .await
+            .map_err(|_| ())?;
+            *self.metadata.lock().await = Some((Instant::now(), metadata.clone()));
+            metadata
+        };
+        if !secure_url(metadata.authorization_endpoint().url())
+            || metadata
+                .token_endpoint()
+                .is_none_or(|endpoint| !secure_url(endpoint.url()))
+        {
+            return Err(());
+        }
+        let secret = match &config.client_secret_env {
+            Some(name) => Some(ClientSecret::new(std::env::var(name).map_err(|_| ())?)),
+            None => None,
+        };
+        let client = CoreClient::from_provider_metadata(
+            metadata.clone(),
+            ClientId::new(config.client_id.clone()),
+            secret,
+        )
+        .set_redirect_uri(
+            RedirectUrl::new(format!("{}/share/auth/callback", config.origin())).map_err(|_| ())?,
+        );
+        Ok((client, http))
+    }
+}
+
+pub(super) fn cookie_name(config: &SharingConfig, flow: bool) -> &'static str {
+    match (config.secure(), flow) {
+        (true, false) => "__Host-muxa-share",
+        (true, true) => "__Host-muxa-login",
+        (false, false) => "muxa-share-dev",
+        (false, true) => "muxa-login-dev",
+    }
+}
+
+pub(super) fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    let mut values = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|part| part.trim().split_once('='))
+        .filter(|(key, _)| *key == name)
+        .map(|(_, value)| value);
+    let value = values.next()?;
+    if value.len() > 128 || values.next().is_some() {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn with_cookie(
+    mut response: Response,
+    config: &SharingConfig,
+    flow: bool,
+    value: &str,
+    max_age: u64,
+) -> Response {
+    let secure = if config.secure() { "; Secure" } else { "" };
+    let text = format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}",
+        cookie_name(config, flow)
+    );
+    response
+        .headers_mut()
+        .append(header::SET_COOKIE, text.parse().expect("generated cookie"));
+    response
+}
+
+#[derive(Deserialize)]
+pub(super) struct LoginQuery {
+    share: String,
+}
+
+pub(super) async fn begin(
+    State(state): State<AppState>,
+    Query(query): Query<LoginQuery>,
+) -> Response {
+    let config = match sharing_config(&state) {
+        Ok(config) => config,
+        Err((status, message)) => return error(status, message),
+    };
+    let Ok(_permit) = state.sharing.login_slots.try_acquire() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "login is busy; try again");
+    };
+    {
+        let grant = state
+            .sharing
+            .registry
+            .lock()
+            .await
+            .grants
+            .get(&query.share)
+            .cloned();
+        let Some(grant) = grant else {
+            return error(StatusCode::NOT_FOUND, "share unavailable");
+        };
+        let grant = grant.lock().await;
+        if grant.revoked || grant.expires <= Instant::now() {
+            return error(StatusCode::NOT_FOUND, "share unavailable");
+        }
+    }
+    let Ok((client, _http)) = state.sharing.client().await else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "login provider unavailable or not configured",
+        );
+    };
+    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    let (url, csrf, nonce) = client
+        .authorize_url(
+            CoreAuthenticationFlow::AuthorizationCode,
+            CsrfToken::new_random,
+            Nonce::new_random,
+        )
+        .add_scope(Scope::new("email".into()))
+        .set_pkce_challenge(challenge)
+        .url();
+    let browser = random_secret();
+    let mut registry = state.sharing.registry.lock().await;
+    registry
+        .logins
+        .retain(|_, flow| flow.expires > Instant::now());
+    if registry.logins.len() >= 128 {
+        return error(StatusCode::TOO_MANY_REQUESTS, "too many pending logins");
+    }
+    registry.logins.insert(
+        csrf.secret().clone(),
+        PendingLogin {
+            browser: browser.clone(),
+            share: query.share,
+            nonce,
+            verifier,
+            expires: Instant::now() + LOGIN_TTL,
+        },
+    );
+    with_cookie(
+        Redirect::to(url.as_str()).into_response(),
+        config,
+        true,
+        &browser,
+        LOGIN_TTL.as_secs(),
+    )
+}
+
+#[derive(Deserialize)]
+pub(super) struct CallbackQuery {
+    code: String,
+    state: String,
+}
+
+pub(super) async fn callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CallbackQuery>,
+) -> Response {
+    let config = match sharing_config(&state) {
+        Ok(config) => config,
+        Err((status, message)) => return error(status, message),
+    };
+    if query.code.len() > 4096 || query.state.len() > 256 {
+        return error(StatusCode::BAD_REQUEST, "invalid login response");
+    }
+    let Some(browser) = cookie(&headers, cookie_name(config, true)) else {
+        return error(StatusCode::UNAUTHORIZED, "login expired; start again");
+    };
+    let Ok(_permit) = state.sharing.login_slots.try_acquire() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "login is busy; try again");
+    };
+    let pending = {
+        let mut registry = state.sharing.registry.lock().await;
+        let valid = registry.logins.get(&query.state).is_some_and(|flow| {
+            flow.expires > Instant::now()
+                && bool::from(flow.browser.as_bytes().ct_eq(browser.as_bytes()))
+        });
+        if !valid {
+            return error(StatusCode::UNAUTHORIZED, "invalid login state");
+        }
+        registry.logins.remove(&query.state).expect("checked flow")
+    };
+    let Ok(session) = authenticate(&state.sharing, &query.code, &pending).await else {
+        return error(StatusCode::UNAUTHORIZED, "login verification failed");
+    };
+    let grant = state
+        .sharing
+        .registry
+        .lock()
+        .await
+        .grants
+        .get(&pending.share)
+        .cloned();
+    let Some(grant) = grant else {
+        return error(StatusCode::NOT_FOUND, "share unavailable");
+    };
+    if let Err((status, message)) =
+        super::routes::authorize(&mut *grant.lock().await, &session, false)
+    {
+        return error(status, message);
+    }
+    let mut registry = state.sharing.registry.lock().await;
+    registry
+        .sessions
+        .retain(|_, session| session.expires > Instant::now());
+    if registry.sessions.len() >= MAX_SESSIONS {
+        return error(StatusCode::TOO_MANY_REQUESTS, "too many active sessions");
+    }
+    // Replace the browser's previous session, rather than retaining a fixation target.
+    if let Some(previous) = cookie(&headers, cookie_name(config, false)) {
+        registry.sessions.remove(&previous);
+    }
+    let secret = random_secret();
+    registry.sessions.insert(secret.clone(), session);
+    let response = Redirect::to(&format!("/share/{}", pending.share)).into_response();
+    with_cookie(
+        with_cookie(response, config, true, "", 0),
+        config,
+        false,
+        &secret,
+        SESSION_TTL.as_secs(),
+    )
+}
+
+async fn authenticate(sharing: &Sharing, code: &str, flow: &PendingLogin) -> Result<Session, ()> {
+    let (client, http) = sharing.client().await?;
+    let tokens = client
+        .exchange_code(AuthorizationCode::new(code.to_owned()))
+        .map_err(|_| ())?
+        .set_pkce_verifier(openidconnect::PkceCodeVerifier::new(
+            flow.verifier.secret().clone(),
+        ))
+        .request_async(&http)
+        .await
+        .map_err(|_| ())?;
+    let token = tokens.id_token().ok_or(())?;
+    let verifier = client.id_token_verifier();
+    let claims = token.claims(&verifier, &flow.nonce).map_err(|_| ())?;
+    if let Some(expected) = claims.access_token_hash() {
+        let actual = AccessTokenHash::from_token(
+            tokens.access_token(),
+            token.signing_alg().map_err(|_| ())?,
+            token.signing_key(&verifier).map_err(|_| ())?,
+        )
+        .map_err(|_| ())?;
+        if actual != *expected {
+            return Err(());
+        }
+    }
+    if claims.email_verified() != Some(true) {
+        return Err(());
+    }
+    let email = normalize_email(claims.email().ok_or(())?.as_str()).map_err(|_| ())?;
+    Ok(Session {
+        subject: claims.subject().as_str().to_owned(),
+        email,
+        expires: Instant::now() + SESSION_TTL,
+    })
+}
+
+pub(super) async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let config = match sharing_config(&state) {
+        Ok(config) => config,
+        Err((status, message)) => return error(status, message),
+    };
+    if let Some(secret) = cookie(&headers, cookie_name(config, false)) {
+        state.sharing.registry.lock().await.sessions.remove(&secret);
+    }
+    with_cookie(StatusCode::NO_CONTENT.into_response(), config, false, "", 0)
+}
