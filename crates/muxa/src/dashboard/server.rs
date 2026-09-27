@@ -7,6 +7,12 @@
 //! sent in `Authorization`, never cookies, so cross-site forms cannot trigger
 //! a control action and browser clients can treat the token like a PAT.
 //!
+//! The one cookie that authorizes operator APIs is the optional OIDC operator
+//! session (`[dashboard.login]`, see [`super::operator`]). Because a browser
+//! attaches it ambiently, a cookie-authorized request that changes state must
+//! also carry `Origin: <public_url>` and `X-Muxa-Operator: 1`; reads and SSE
+//! need no extra proof. Bearer-authorized requests are unaffected.
+//!
 //! [`serve`] composes the router with the lifecycle plumbing the daemon
 //! needs: TCP bind, graceful shutdown wired to the daemon's existing
 //! shutdown channel, structured logging on bind failure.
@@ -46,7 +52,7 @@ use crate::collaboration::{
 };
 use crate::config::{DashboardAuthMode, StatsConfig};
 use crate::dashboard::work_store::WorkStore;
-use crate::dashboard::{assets, auth, DashboardConfig};
+use crate::dashboard::{assets, DashboardConfig};
 use crate::event::{AgentKind, AgentState, PROTOCOL_VERSION};
 use crate::fleet::{FleetOperation, FleetRuntime, LabelSelector};
 use crate::metrics::Metrics;
@@ -115,6 +121,9 @@ pub struct AppState {
     pub pane_cache: Arc<PaneCache>,
     pub sessions: SharedSessionBackend,
     pub(super) sharing: Arc<super::sharing::Sharing>,
+    /// OIDC operator sessions. Separate from `sharing` so a recipient
+    /// session can never be mistaken for operator access.
+    pub(super) operator: Arc<super::operator::OperatorLogin>,
     /// Primary pane backend retained for compatibility with callers that
     /// inspect it directly. Pane scans use `backends` below so every active
     /// host contributes to one dashboard inventory.
@@ -183,6 +192,7 @@ impl AppState {
             store,
             collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
             sharing: super::sharing::Sharing::new(config.sharing.clone()),
+            operator: super::operator::OperatorLogin::new(config.login.clone()),
             config,
             pane_cache,
             sessions,
@@ -408,6 +418,7 @@ pub fn router(state: AppState) -> Router {
     let api = read_api
         .merge(write_api)
         .merge(super::sharing::recipient_routes(state.clone()))
+        .merge(super::operator::routes())
         .with_state(state.clone());
     // Static assets sit OUTSIDE the auth layer — see assets.rs for the
     // rationale (token bootstrap in the browser). The DNS-rebinding host
@@ -525,18 +536,25 @@ async fn host_guard_middleware(
             .get(header::HOST)
             .and_then(|h| h.to_str().ok());
         if !host_is_loopback(host, state.config.bind.ip())
-            && !host.is_some_and(|host| {
-                state
-                    .config
-                    .sharing
-                    .as_ref()
-                    .is_some_and(|sharing| sharing.matches_host(host))
-            })
+            && !host.is_some_and(|host| public_host(&state.config, host))
         {
             return Err(StatusCode::FORBIDDEN);
         }
     }
     Ok(next.run(req).await)
+}
+
+/// Does `host` name a configured public origin? A reverse proxy or tunnel
+/// that forwards the browser's `Host` reaches a loopback bind with it.
+fn public_host(config: &DashboardConfig, host: &str) -> bool {
+    config
+        .sharing
+        .as_ref()
+        .is_some_and(|sharing| sharing.matches_host(host))
+        || config
+            .login
+            .as_ref()
+            .is_some_and(|login| login.matches_host(host))
 }
 
 /// Is `host` (a raw `Host` header value, optionally `host:port` or
@@ -599,6 +617,30 @@ fn log_access_url(config: &DashboardConfig, local: SocketAddr) {
     }
 }
 
+/// Authenticate an operator request: the bearer token, or else an OIDC
+/// operator session. Every operator gate goes through this one function so
+/// reads, writes, `/api/access` and detail redaction cannot disagree.
+fn operator_auth(state: &AppState, headers: &HeaderMap) -> Option<super::operator::OperatorAuth> {
+    super::operator::authenticate(state.config.token.as_deref(), &state.operator, headers)
+}
+
+/// Is this request authorized to act as the operator? Session-authorized
+/// state changes additionally need the CSRF proof described at the top of
+/// this module.
+fn operator_authorized(state: &AppState, req: &Request<Body>) -> Result<(), StatusCode> {
+    match operator_auth(state, req.headers()) {
+        Some(super::operator::OperatorAuth::Bearer) => Ok(()),
+        Some(super::operator::OperatorAuth::Session) => {
+            if state.operator.csrf_ok(req.method(), req.headers()) {
+                Ok(())
+            } else {
+                Err(StatusCode::FORBIDDEN)
+            }
+        }
+        None => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
 /// Read authentication for `auth = "token"`. Public-read and none modes do
 /// not install this layer on their GET/SSE router.
 async fn read_auth_middleware(
@@ -606,18 +648,11 @@ async fn read_auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let Some(expected) = state.config.token.as_deref() else {
+    if state.config.token.is_none() {
         return Ok(next.run(req).await);
-    };
-    let header_value = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
-    if auth::check_bearer(header_value, expected) {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
     }
+    operator_authorized(&state, &req)?;
+    Ok(next.run(req).await)
 }
 
 /// Control authentication. This layer always wraps mutation routes. A
@@ -628,18 +663,11 @@ async fn write_auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let Some(expected) = state.config.token.as_deref() else {
+    if state.config.token.is_none() {
         return Err(StatusCode::FORBIDDEN);
-    };
-    let header_value = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
-    if auth::check_bearer(header_value, expected) {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
     }
+    operator_authorized(&state, &req)?;
+    Ok(next.run(req).await)
 }
 
 #[derive(Debug, Serialize)]
@@ -656,6 +684,30 @@ struct AccessResponse {
     write_available: bool,
     write_authorized: bool,
     capabilities: AccessCapabilities,
+    login: LoginStatus,
+}
+
+/// Operator sign-in state, also served unauthenticated at `/auth/session` so
+/// a signed-out browser can offer "Sign in" instead of a token prompt.
+#[derive(Debug, Serialize)]
+pub(super) struct LoginStatus {
+    available: bool,
+    signed_in: bool,
+    email: Option<String>,
+    /// Absolute, so a browser on another origin (e.g. `localhost`) starts
+    /// the flow on the public origin its callback and cookie belong to.
+    login_url: Option<String>,
+}
+
+pub(super) fn login_status(state: &AppState, headers: &HeaderMap) -> LoginStatus {
+    let config = state.operator.config();
+    let (signed_in, email) = state.operator.signed_in(headers);
+    LoginStatus {
+        available: config.is_some(),
+        signed_in,
+        email,
+        login_url: config.map(|config| format!("{}/auth/login", config.origin())),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -665,14 +717,7 @@ struct AccessCapabilities {
 }
 
 async fn access_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let header_value = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
-    let write_authorized = state
-        .config
-        .token
-        .as_deref()
-        .is_some_and(|expected| auth::check_bearer(header_value, expected));
+    let write_authorized = operator_auth(&state, &headers).is_some();
     let mode = match state.config.auth {
         DashboardAuthMode::Token => "token",
         DashboardAuthMode::PublicRead => "public_read",
@@ -687,6 +732,7 @@ async fn access_handler(State(state): State<AppState>, headers: HeaderMap) -> im
             work_start: state.config.allow_work_start,
             pane_sharing: state.config.sharing.is_some(),
         },
+        login: login_status(&state, &headers),
     })
 }
 
@@ -954,16 +1000,7 @@ fn parse_collaboration_cursor(raw: &str) -> Result<CollaborationCursor, String> 
 }
 
 fn dashboard_details_authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    if !matches!(state.config.auth, DashboardAuthMode::Token) {
-        return false;
-    }
-    let Some(expected) = state.config.token.as_deref() else {
-        return false;
-    };
-    let header_value = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    auth::check_bearer(header_value, expected)
+    matches!(state.config.auth, DashboardAuthMode::Token) && operator_auth(state, headers).is_some()
 }
 
 fn redact_collaboration_details(request: &mut serde_json::Value) {

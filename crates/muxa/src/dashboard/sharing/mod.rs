@@ -26,7 +26,7 @@ pub struct SharingConfig {
     pub client_id: String,
     /// Environment variable name; the secret itself is never serialized.
     pub client_secret_env: Option<String>,
-    /// Optional private SQLite file; defaults to the XDG data directory.
+    /// Optional private `SQLite` file; defaults to the XDG data directory.
     pub storage_path: Option<std::path::PathBuf>,
 }
 

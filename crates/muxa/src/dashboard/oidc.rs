@@ -1,4 +1,4 @@
-//! OpenID Connect plumbing shared by pane-sharing recipient login and
+//! `OpenID` Connect plumbing shared by pane-sharing recipient login and
 //! operator sign-in: origin/URL validation, provider discovery, client
 //! construction and cookie parsing. Each caller keeps its own session store
 //! and authorization rule; nothing here decides who may do what.
@@ -265,5 +265,80 @@ pub(super) fn check_access_token_hash<AC: AdditionalClaims>(
         Ok(())
     } else {
         Err(())
+    }
+}
+
+/// A mock OIDC provider for flow tests: discovery and JWKS for a fixed
+/// Ed25519 test key. Each test mounts its own `/token` response.
+#[cfg(test)]
+pub(super) mod testing {
+    use serde_json::{json, Value};
+
+    // A publicly known test-only Ed25519 seed encoded as PKCS#8, never a provider key.
+    pub(in crate::dashboard) fn test_key() -> openidconnect::core::CoreEdDsaPrivateSigningKey {
+        use base64::Engine;
+        let mut der = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        der.extend_from_slice(&[42; 32]);
+        let pem = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            base64::engine::general_purpose::STANDARD.encode(der)
+        );
+        openidconnect::core::CoreEdDsaPrivateSigningKey::from_ed25519_pem(
+            &pem,
+            Some(openidconnect::JsonWebKeyId::new("test".into())),
+        )
+        .unwrap()
+    }
+
+    pub(in crate::dashboard) fn signed_token(claims: &Value) -> String {
+        use base64::Engine;
+        use openidconnect::PrivateSigningKey;
+        let encode = |data: Vec<u8>| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data);
+        let input = format!(
+            "{}.{}",
+            encode(serde_json::to_vec(&json!({"alg":"EdDSA","kid":"test"})).unwrap()),
+            encode(serde_json::to_vec(claims).unwrap())
+        );
+        let signature = test_key()
+            .sign(
+                &openidconnect::core::CoreJwsSigningAlgorithm::EdDsa,
+                input.as_bytes(),
+            )
+            .unwrap();
+        format!("{input}.{}", encode(signature))
+    }
+
+    pub(in crate::dashboard) async fn provider() -> wiremock::MockServer {
+        use openidconnect::PrivateSigningKey;
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let provider = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": provider.uri(),
+                "authorization_endpoint": format!("{}/authorize", provider.uri()),
+                "token_endpoint": format!("{}/token", provider.uri()),
+                "jwks_uri": format!("{}/jwks", provider.uri()),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["EdDSA"],
+            })))
+            .mount(&provider)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"keys": [test_key().as_verification_key()]})),
+            )
+            .mount(&provider)
+            .await;
+        provider
     }
 }

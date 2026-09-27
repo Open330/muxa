@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Dashboard operator sign-in through any OpenID Connect provider
+  (`[dashboard.login]`). Access requires membership in `required_group` from
+  the ID token's group claim; the bearer token keeps working for API clients
+  and as the fallback. Cookie-authorized writes require the public `Origin`
+  and `X-Muxa-Operator: 1`.
+
 ### Changed
 
 - Local Fleet mailbox notifications use in-process revisions instead of a

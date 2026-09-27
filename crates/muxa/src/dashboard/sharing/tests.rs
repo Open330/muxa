@@ -466,63 +466,14 @@ fn sharing_config_requires_safe_origins_and_private_dashboard() {
     );
 }
 
-// A publicly known test-only Ed25519 seed encoded as PKCS#8, never a provider key.
-fn test_key() -> openidconnect::core::CoreEdDsaPrivateSigningKey {
-    use base64::Engine;
-    let mut der = vec![
-        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
-        0x20,
-    ];
-    der.extend_from_slice(&[42; 32]);
-    let pem = format!(
-        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-        base64::engine::general_purpose::STANDARD.encode(der)
-    );
-    openidconnect::core::CoreEdDsaPrivateSigningKey::from_ed25519_pem(
-        &pem,
-        Some(openidconnect::JsonWebKeyId::new("test".into())),
-    )
-    .unwrap()
-}
-
-fn signed_token(claims: &Value) -> String {
-    use base64::Engine;
-    use openidconnect::PrivateSigningKey;
-    let encode = |data: Vec<u8>| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data);
-    let input = format!(
-        "{}.{}",
-        encode(serde_json::to_vec(&json!({"alg":"EdDSA","kid":"test"})).unwrap()),
-        encode(serde_json::to_vec(claims).unwrap())
-    );
-    let signature = test_key()
-        .sign(
-            &openidconnect::core::CoreJwsSigningAlgorithm::EdDsa,
-            input.as_bytes(),
-        )
-        .unwrap();
-    format!("{input}.{}", encode(signature))
-}
-
 #[allow(clippy::too_many_lines)] // Provider fixture and complete authorization-code exchange.
 async fn oidc_flow(invalid: Option<&str>) {
-    use openidconnect::PrivateSigningKey;
+    use crate::dashboard::oidc::testing::signed_token;
     use wiremock::{
         matchers::{method, path},
-        Mock, MockServer, ResponseTemplate,
+        Mock, ResponseTemplate,
     };
-    let provider = MockServer::start().await;
-    Mock::given(method("GET")).and(path("/.well-known/openid-configuration")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
-        "issuer":provider.uri(), "authorization_endpoint":format!("{}/authorize",provider.uri()), "token_endpoint":format!("{}/token",provider.uri()), "jwks_uri":format!("{}/jwks",provider.uri()),
-        "response_types_supported":["code"], "subject_types_supported":["public"], "id_token_signing_alg_values_supported":["EdDSA"]
-    }))).mount(&provider).await;
-    Mock::given(method("GET"))
-        .and(path("/jwks"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"keys":[test_key().as_verification_key()]})),
-        )
-        .mount(&provider)
-        .await;
+    let provider = crate::dashboard::oidc::testing::provider().await;
     let (mut state, _) = state();
     let mut config = state.config.sharing.clone().unwrap();
     config.issuer_url = provider.uri();
@@ -1345,4 +1296,89 @@ async fn cancelled_creation_keeps_the_committed_invitation_registered() {
     drop(state);
     let (state, _) = durable_state(&path).await;
     assert!(state.sharing.registry.lock().await.grants.contains_key(&id));
+}
+
+#[tokio::test]
+async fn recipient_and_operator_sessions_never_cross() {
+    let (mut state, _) = state();
+    let mut config = (*state.config).clone();
+    let login = crate::dashboard::operator::LoginConfig {
+        public_url: "https://share.example.com".into(),
+        issuer_url: "https://issuer.example.com".into(),
+        client_id: "muxa".into(),
+        client_secret_env: None,
+        required_group: "operator".into(),
+        groups_claim: None,
+        scopes: Vec::new(),
+    };
+    config.login = Some(login.clone());
+    state.config = Arc::new(config);
+    state.operator = crate::dashboard::operator::OperatorLogin::new(Some(login));
+    let id = create(&state, "prompt").await;
+    let recipient = session(&state, "guest@example.com", "guest").await;
+    let secret = recipient.split_once('=').unwrap().1;
+    // A recipient session, under its own name or the operator's, is not
+    // operator access.
+    for cookie in [recipient.clone(), format!("__Host-muxa-op={secret}")] {
+        for (method, path) in [("GET", "/api/agents"), ("POST", "/api/shares")] {
+            assert_eq!(
+                call(
+                    &state,
+                    method,
+                    path,
+                    json!({}),
+                    Some(&cookie),
+                    false,
+                    Some("https://share.example.com")
+                )
+                .await
+                .status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} {cookie}"
+            );
+        }
+        let status = body(
+            call(
+                &state,
+                "GET",
+                "/auth/session",
+                json!(null),
+                Some(&cookie),
+                false,
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status["signed_in"], false);
+    }
+    // And the recipient view still works with its own cookie only.
+    assert_eq!(
+        call(
+            &state,
+            "GET",
+            &format!("/share/api/{id}"),
+            json!(null),
+            Some(&recipient),
+            false,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &state,
+            "GET",
+            &format!("/share/api/{id}"),
+            json!(null),
+            Some(&format!("__Host-muxa-op={secret}")),
+            false,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
 }

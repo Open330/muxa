@@ -24,6 +24,7 @@ pub mod assets;
 pub mod auth;
 pub mod config;
 mod oidc;
+pub mod operator;
 pub mod server;
 pub mod sharing;
 /// Durable operator annotations for work items. Public so read-only
