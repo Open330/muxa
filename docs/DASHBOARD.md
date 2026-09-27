@@ -408,10 +408,16 @@ public for embedding and integration tests.
 
 Instead of pasting the bearer token into every browser, the dashboard owner can
 sign in through any standards-compliant OpenID Connect provider (Keycloak,
-Authentik, Dex, and similar). Muxa authorizes by **group membership**: the ID
-token must carry a group claim containing `required_group`. Signing in grants
-the same authority as the bearer token, so restrict that group to the people
-who should operate this machine's agents.
+Authentik, Dex, and similar). A signed-in account is an operator when either:
+
+- its ID token carries a group claim containing `required_group`, or
+- it was **enrolled**: someone holding the dashboard token linked that account
+  (its issuer and subject) as an operator. See
+  [Enrolling an account with the token](#enrolling-an-account-with-the-token).
+
+Signing in grants the same authority as the bearer token, so restrict the group
+to the people who should operate this machine's agents. Enrollment lets the
+token holder add their own account without editing the provider's groups.
 
 ```toml
 [dashboard]
@@ -425,7 +431,8 @@ auth = "token"
 public_url = "https://muxa.example.com"      # origin only; HTTP only on loopback
 issuer_url = "https://login.example.com/realms/example"
 client_id = "muxa-dashboard"
-required_group = "muxa-operators"            # required
+# required_group = "muxa-operators"          # optional while enrollment is on
+# enrollment = true                          # default; false = group-only sign-in
 # groups_claim = "groups"                    # default "groups"
 # scopes = ["groups"]                        # requested in addition to "openid email"
 # client_secret_env = "MUXA_LOGIN_CLIENT_SECRET"  # confidential clients: env var NAME
@@ -445,26 +452,37 @@ Provider requirements:
   dashboard when present but is not used for authorization and need not be
   verified.
 
-Rules checked at startup: `required_group` is non-empty, `auth = "token"` with a
-token is configured, and when `[dashboard.sharing]` is also set, both sections
-use the same `public_url`. Restart the daemon after changes.
+Rules checked at startup: `required_group`, when set, is a non-empty group
+name; `required_group` is set when `enrollment = false`; `auth = "token"` with
+a token is configured; and when `[dashboard.sharing]` is also set, both
+sections use the same `public_url`. Restart the daemon after changes.
+
+Without `required_group`, the provider only proves who someone is: nobody is an
+operator until the token holder enrolls them.
 
 Flow and session contract:
 
 | Route | Purpose |
 | ----- | ------- |
 | `GET /auth/login?return_to=/path` | Starts the flow (PKCE S256, state, nonce, `prompt=select_account`). `return_to` must be a same-origin path beginning with a single `/`. |
-| `GET /auth/callback` | Verifies the ID token (signature, issuer, audience, expiry, nonce, `at_hash`) and group, then redirects to `return_to`. |
+| `GET /auth/callback` | Verifies the ID token (signature, issuer, audience, expiry, nonce, `at_hash`), then redirects to `return_to` if the account is an operator, or to `/auth/enroll` if it is not and enrollment is on. |
+| `GET /auth/enroll` | Enrollment page for this browser's pending enrollment. |
+| `POST /auth/enroll` | JSON `{"token": "..."}`; enrolls the pending account and signs it in. |
+| `GET /auth/enroll/cancel` | Discards this browser's pending enrollment. |
 | `POST /auth/logout` | Ends the session. |
-| `GET /auth/session` | Unauthenticated `{available, signed_in, email, login_url}` so a signed-out page can offer sign-in. `/api/access` includes the same object as `login`. |
+| `GET /auth/session` | Unauthenticated `{available, signed_in, email, via, enrollment, login_url}` so a signed-out page can offer sign-in. `via` is `group`, `enrollment` or `null`. `/api/access` includes the same object as `login`. |
+| `GET /api/operators` | Operator only: enrolled accounts `{id, email, subject, issuer, created_at, last_seen_at, current, active}`. |
+| `POST /api/operators/{id}/remove` | Operator only: removes the account and ends its sessions. |
 
 - The session cookie is `__Host-muxa-op` (`muxa-op-dev` over loopback HTTP),
   `HttpOnly; Secure; SameSite=Strict; Path=/`, lasting 8 hours. A short-lived
   `__Host-muxa-op-login` cookie (`SameSite=Lax`) binds the pending login to the
   browser that started it.
 - Group membership is checked at sign-in. Removing someone from the group takes
-  effect when their session expires, they sign out, or the daemon restarts;
-  sessions are in memory only and never written to disk.
+  effect when their session expires, they sign out, or the daemon restarts.
+  Enrollment is checked on every request, so removing an enrolled account ends
+  its sessions immediately. Sessions are in memory only and never written to
+  disk.
 - Every read route, SSE included, accepts either the bearer token or the
   session cookie. A **state-changing request authorized by the cookie** must also
   send `Origin: <public_url>` and `X-Muxa-Operator: 1`, or it is refused with
@@ -482,6 +500,60 @@ authorization code. Muxa's own logs redact `code`, `state` and `token`.
 Opening the dashboard on another origin (for example `http://127.0.0.1:7878`)
 still works with the token; its **sign in** button sends the browser to the
 public origin, because the callback and cookie belong there.
+
+### Enrolling an account with the token
+
+With `enrollment` on (the default), an account the provider verifies but that is
+not an operator is not turned away:
+
+1. The callback holds the verified issuer, subject and email for five minutes in
+   a pending enrollment bound to this browser by an `HttpOnly; SameSite=Lax`
+   cookie, `__Host-muxa-op-enroll` (`muxa-op-enroll-dev` over loopback HTTP),
+   and redirects to `/auth/enroll`.
+2. That page shows the signed-in account and asks for the dashboard's access
+   token. Its script sends the token once, as JSON, to `POST /auth/enroll`.
+3. With the right token the account is enrolled, the pending cookie is
+   cleared, and the browser gets a normal operator session and returns to
+   where it started. From then on the account signs in directly.
+
+**Cancel** discards the pending enrollment. To remove an enrolled account, open
+**operators** in the dashboard header (shown to an unlocked or signed-in
+operator) and choose **Remove**, or call `POST /api/operators/{id}/remove` with
+the bearer token. Removal ends that account's live sessions at once; signing in
+again leads back to the enrollment page. Group members are not listed and need
+no enrollment.
+
+Security notes:
+
+- Enrollment grants nothing beyond the token: only someone who already holds
+  the dashboard token, and so already has full operator rights, can enroll an
+  account. A pending enrollment authorizes no API route by itself.
+- `POST /auth/enroll` requires the pending cookie, `Origin: <public_url>` and
+  `X-Muxa-Operator: 1`, and a JSON body. A cross-site page can neither send the
+  `Lax` cookie on a POST nor add the header without a CORS preflight the
+  dashboard never grants. The page's CSP allows only its own same-origin script
+  and blocks native form submission, so the token cannot end up in a URL.
+- The token is compared in constant time and never logged. Each pending
+  enrollment allows five wrong tokens and is then discarded, so a new provider
+  sign-in is needed. Every wrong token also delays the next attempt from any
+  browser by one more second (up to 30 seconds). At most 16 enrollments may be
+  pending at once.
+- Enrollment is keyed on the ID token's issuer and `sub`, never the email, and
+  is pinned to the configured `issuer_url`: entries recorded for another issuer
+  are listed but never match.
+- At most 64 accounts can be enrolled. Pane-sharing recipient sessions cannot
+  enroll or reach `/api/operators`.
+- `enrollment = false` restores group-only sign-in: the refusal page returns,
+  and previously enrolled accounts stop being honored. They are kept on disk
+  and are honored again if enrollment is turned back on.
+
+Enrolled accounts are stored in SQLite at
+`$XDG_DATA_HOME/muxa/dashboard-operators/operators.sqlite3` (the platform data
+directory, next to the pane-sharing store): mode `0600` in a `0700` directory,
+held under an exclusive lock so a second daemon cannot open it, and refused if
+the file is not a muxa operator store. Each row holds the issuer, subject, the
+display email, and the enrollment and last sign-in times. Nothing is opened
+when sign-in or enrollment is off.
 
 <a id="invite-someone-to-a-pane"></a>
 

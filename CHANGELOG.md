@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the ID token's group claim; the bearer token keeps working for API clients
   and as the fallback. Cookie-authorized writes require the public `Origin`
   and `X-Muxa-Operator: 1`.
+- Operator enrollment for dashboard sign-in. A holder of the dashboard token
+  can register a signed-in account outside `required_group` as an operator on
+  `/auth/enroll`; later sign-ins go straight in. `required_group` is now
+  optional, and `[dashboard.login] enrollment = false` restores group-only
+  sign-in. Enrolled accounts are stored by issuer and subject in a private
+  SQLite file, listed and removed from the dashboard's **operators** dialog
+  (`GET /api/operators`, `POST /api/operators/{id}/remove`), and removal ends
+  their sessions immediately. Wrong tokens are limited per pending enrollment
+  and globally backed off.
 
 ### Changed
 
