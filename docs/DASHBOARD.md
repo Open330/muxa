@@ -537,3 +537,14 @@ python3 scripts/dashboard-sharing-smoke.py
 
 This harness creates only loopback listeners and fixture identities. Passing it
 does not replace the deployment's own HTTPS and real-provider login check.
+
+
+### OIDC dependency review
+
+`openidconnect` currently brings in `rsa` for ID-token signature verification.
+The dependency scanner exception for [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071.html)
+is limited to that advisory: its private-key timing disclosure does not apply to
+Muxa's public-key verification path. Muxa does not import RSA private keys, sign
+RSA client assertions or decrypt RSA messages. The upstream advisory has no
+patched version as of this review (2026-09-27). Reassess this exception before
+adding any private-key RSA operation or changing the OIDC dependency.
