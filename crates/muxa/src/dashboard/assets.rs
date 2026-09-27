@@ -92,6 +92,8 @@ mod tests {
         assert!(WebAssets::get("work-model.mjs").is_some());
         assert!(WebAssets::get("collaboration-model.mjs").is_some());
         assert!(WebAssets::get("style.css").is_some());
+        assert!(WebAssets::get("operator-enroll.mjs").is_some());
+        assert!(WebAssets::get("operators-admin.mjs").is_some());
     }
 
     #[test]

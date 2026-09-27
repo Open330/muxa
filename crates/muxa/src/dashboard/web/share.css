@@ -6,3 +6,5 @@ h1 { font-size: 24px; } a { color: #8ab4ff; } [hidden] { display: none !importan
 pre { background: #080b10; border: 1px solid #354157; border-radius: 8px; padding: 16px; min-height: 240px; max-height: 65vh; overflow: auto; font: 13px/1.5 ui-monospace, monospace; }
 textarea { display: block; box-sizing: border-box; width: 100%; padding: 12px; margin: 8px 0; background: #1c2431; color: inherit; border: 1px solid #657188; border-radius: 6px; font: inherit; }
 button { padding: 9px 16px; border: 1px solid #657188; border-radius: 6px; background: #273a5a; color: inherit; cursor: pointer; } button:disabled { opacity: .5; cursor: wait; }
+.enroll label { display: block; margin: 16px 0 8px; } .enroll code { overflow-wrap: anywhere; }
+.enroll input { display: block; box-sizing: border-box; width: 100%; max-width: 480px; padding: 10px 12px; margin-bottom: 12px; background: #1c2431; color: inherit; border: 1px solid #657188; border-radius: 6px; font: inherit; }
