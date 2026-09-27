@@ -394,11 +394,94 @@ that strips the carve-out (or use mTLS).
   Muxa-owned PTY input/terminate. There are no direct configuration/file editing
   APIs. Sending a prompt to a shell pane can execute shell commands.
 - No mobile UI. The CSS scales OK to ~600 px but isn't designed for phones.
-- Operator access uses a bearer token. Invited recipients use OIDC with access
-  limited to their shared panes; they cannot manage the dashboard.
+- Operator access uses a bearer token, or optionally
+  [OIDC sign-in](#operator-sign-in-with-oidc) restricted to one group. Invited
+  recipients use OIDC with access limited to their shared panes; they cannot
+  manage the dashboard.
 
 The [`dashboard::router`](../crates/muxa/src/dashboard/server.rs) function is
 public for embedding and integration tests.
+
+<a id="operator-sign-in-with-oidc"></a>
+
+## Operator sign-in with OIDC
+
+Instead of pasting the bearer token into every browser, the dashboard owner can
+sign in through any standards-compliant OpenID Connect provider (Keycloak,
+Authentik, Dex, and similar). Muxa authorizes by **group membership**: the ID
+token must carry a group claim containing `required_group`. Signing in grants
+the same authority as the bearer token, so restrict that group to the people
+who should operate this machine's agents.
+
+```toml
+[dashboard]
+enabled = true
+bind = "127.0.0.1:7878"
+auth = "token"
+# Keep the token (dashboard.token or MUXA_DASHBOARD_TOKEN). It remains the
+# API/CLI credential and the way in when the provider is unavailable.
+
+[dashboard.login]
+public_url = "https://muxa.example.com"      # origin only; HTTP only on loopback
+issuer_url = "https://login.example.com/realms/example"
+client_id = "muxa-dashboard"
+required_group = "muxa-operators"            # required
+# groups_claim = "groups"                    # default "groups"
+# scopes = ["groups"]                        # requested in addition to "openid email"
+# client_secret_env = "MUXA_LOGIN_CLIENT_SECRET"  # confidential clients: env var NAME
+```
+
+Provider requirements:
+
+- Discovery at `{issuer_url}/.well-known/openid-configuration` with HTTPS
+  authorization and token endpoints.
+- Authorization code flow with **PKCE S256**. A public client
+  (`token_endpoint_auth_method = none`) works; a confidential client uses
+  `client_secret_env`.
+- The exact redirect URI `https://muxa.example.com/auth/callback`.
+- A signed ID token whose `groups_claim` holds the group names, as a JSON array
+  of strings or a single string. Some providers release it only with an extra
+  scope (add it to `scopes`) or a client/claim mapper. `email` is shown in the
+  dashboard when present but is not used for authorization and need not be
+  verified.
+
+Rules checked at startup: `required_group` is non-empty, `auth = "token"` with a
+token is configured, and when `[dashboard.sharing]` is also set, both sections
+use the same `public_url`. Restart the daemon after changes.
+
+Flow and session contract:
+
+| Route | Purpose |
+| ----- | ------- |
+| `GET /auth/login?return_to=/path` | Starts the flow (PKCE S256, state, nonce, `prompt=select_account`). `return_to` must be a same-origin path beginning with a single `/`. |
+| `GET /auth/callback` | Verifies the ID token (signature, issuer, audience, expiry, nonce, `at_hash`) and group, then redirects to `return_to`. |
+| `POST /auth/logout` | Ends the session. |
+| `GET /auth/session` | Unauthenticated `{available, signed_in, email, login_url}` so a signed-out page can offer sign-in. `/api/access` includes the same object as `login`. |
+
+- The session cookie is `__Host-muxa-op` (`muxa-op-dev` over loopback HTTP),
+  `HttpOnly; Secure; SameSite=Strict; Path=/`, lasting 8 hours. A short-lived
+  `__Host-muxa-op-login` cookie (`SameSite=Lax`) binds the pending login to the
+  browser that started it.
+- Group membership is checked at sign-in. Removing someone from the group takes
+  effect when their session expires, they sign out, or the daemon restarts;
+  sessions are in memory only and never written to disk.
+- Every read route, SSE included, accepts either the bearer token or the
+  session cookie. A **state-changing request authorized by the cookie** must also
+  send `Origin: <public_url>` and `X-Muxa-Operator: 1`, or it is refused with
+  403. The dashboard's own JavaScript does this; bearer-token clients do not need
+  to. `POST /auth/logout` has the same requirement.
+- Sign-in state is separate from pane sharing: a recipient session never
+  authorizes operator APIs, and the operator cookie is not a recipient session.
+
+Behind a reverse proxy or tunnel, preserve the public `Host` header (the
+loopback-bound dashboard accepts the configured public host and rejects other
+names), forward cookies unchanged, and do not cache `/auth/*` or `/api/*`.
+Omit query strings on `/auth/callback` from access logs: they contain the
+authorization code. Muxa's own logs redact `code`, `state` and `token`.
+
+Opening the dashboard on another origin (for example `http://127.0.0.1:7878`)
+still works with the token; its **sign in** button sends the browser to the
+public origin, because the callback and cookie belong there.
 
 <a id="invite-someone-to-a-pane"></a>
 
