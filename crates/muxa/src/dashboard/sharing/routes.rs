@@ -271,15 +271,20 @@ async fn create(State(state): State<AppState>, Json(input): Json<CreateShare>) -
         );
     }
     let grant = Arc::new(Mutex::new(grant));
+    // Reserve the entry before the cancellable disk write. If the HTTP task
+    // disappears, a committed invitation still counts against the live limit.
+    registry.grants.insert(id.clone(), grant.clone());
     match state
         .sharing
         .persist(grant.clone().lock_owned().await)
         .await
     {
         Ok(guard) => drop(guard),
-        Err((status, message)) => return error(status, message),
+        Err((status, message)) => {
+            registry.grants.remove(&id);
+            return error(status, message);
+        }
     }
-    registry.grants.insert(id.clone(), grant);
     tracing::info!(share_id = %id, "pane share created");
     (StatusCode::CREATED, Json(response)).into_response()
 }

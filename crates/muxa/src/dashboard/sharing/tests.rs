@@ -1305,3 +1305,44 @@ async fn foreign_sqlite_database_is_not_modified() {
     assert!(Sharing::open(Some(config)).await.is_err());
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_creation_keeps_the_committed_invitation_registered() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shares.sqlite3");
+    let (state, _) = durable_state(&path).await;
+    let gate = state
+        .sharing
+        .storage
+        .as_ref()
+        .unwrap()
+        .test_block_next_write();
+    let request = tokio::spawn({
+        let state = state.clone();
+        async move { create(&state, "view").await }
+    });
+    let entered = gate.clone();
+    tokio::task::spawn_blocking(move || entered.0.wait())
+        .await
+        .unwrap();
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    let entries: Vec<_> = state
+        .sharing
+        .registry
+        .lock()
+        .await
+        .grants
+        .values()
+        .cloned()
+        .collect();
+    tokio::task::spawn_blocking(move || gate.1.wait())
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    let id = entries[0].lock().await.id.clone();
+    drop(entries);
+    drop(state);
+    let (state, _) = durable_state(&path).await;
+    assert!(state.sharing.registry.lock().await.grants.contains_key(&id));
+}

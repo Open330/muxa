@@ -12,9 +12,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+type WriteGate = Arc<(std::sync::Barrier, std::sync::Barrier)>;
+
 pub(super) struct Storage {
     connection: Mutex<Connection>,
     lock: File,
+    #[cfg(test)]
+    write_gate: Mutex<Option<WriteGate>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -184,12 +189,23 @@ impl Storage {
             Arc::new(Self {
                 connection: Mutex::new(connection),
                 lock,
+                #[cfg(test)]
+                write_gate: Mutex::new(None),
             }),
             registry,
         ))
     }
 
     pub(super) fn save(&self, grant: &Grant) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let gate = self.write_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.0.wait();
+                gate.1.wait();
+            }
+        }
+
         let record = serde_json::to_string(&Record::from_grant(grant)).map_err(io::Error::other)?;
         let mut connection = self
             .connection
@@ -263,6 +279,11 @@ impl Sharing {
 
 #[cfg(test)]
 impl Storage {
+    pub(super) fn test_block_next_write(&self) -> WriteGate {
+        let gate = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        *self.write_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
     pub(super) fn test_read_only(&self, read_only: bool) {
         self.connection
             .lock()
