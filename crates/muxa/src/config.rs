@@ -983,6 +983,9 @@ pub struct WebhookToml {
 pub struct DashboardTomlConfig {
     /// Optional authenticated, pane-scoped browser sharing.
     pub sharing: Option<Box<crate::dashboard::sharing::SharingConfig>>,
+    /// Optional operator sign-in through an `OpenID` Connect provider. The
+    /// bearer token stays required and keeps working alongside it.
+    pub login: Option<Box<crate::dashboard::operator::LoginConfig>>,
     pub enabled: Option<bool>,
     /// Socket address as `ip:port`. Default `127.0.0.1:7878`.
     pub bind: Option<String>,

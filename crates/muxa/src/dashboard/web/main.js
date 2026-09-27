@@ -29,6 +29,11 @@ import {
 //   * Fetch /api/health and /api/access. In `public_read` mode reads and SSE
 //     work anonymously while the same bearer token acts as a browser PAT for
 //     the separate control routes.
+//   * When `[dashboard.login]` is configured, a signed-out browser is offered
+//     OIDC sign-in instead of a token prompt. The resulting operator session
+//     is an HttpOnly cookie the browser attaches to same-origin fetches; every
+//     control request also sends `X-Muxa-Operator: 1`, which the server
+//     requires (with a matching Origin) before a cookie may change state.
 //   * Fetch /api/agents and /api/panes to paint initial tables.
 //   * Open a streaming POST-less fetch on /api/events and parse SSE
 //     manually (EventSource can't carry an Authorization header).
@@ -101,15 +106,63 @@ function authHeaders() {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+// ── Operator sign-in (OIDC) ────────────────────────────────────────
+
+function normalizeLogin(data) {
+  return {
+    available: Boolean(data?.available),
+    signedIn: Boolean(data?.signed_in),
+    email: typeof data?.email === "string" ? data.email : null,
+    loginUrl: typeof data?.login_url === "string" ? data.login_url : null,
+  };
+}
+
+// A read came back 401. If the server offers sign-in, show that instead of
+// a dead connection; the rest of boot waits for the browser to come back
+// from the provider with a session.
+async function offerSignIn() {
+  try {
+    const resp = await fetch("/auth/session", { credentials: "same-origin", cache: "no-store" });
+    if (!resp.ok) return false;
+    store.access.login = normalizeLogin(await resp.json());
+  } catch (_) {
+    return false;
+  }
+  if (!store.access.login.available) return false;
+  store.access.signInRequired = true;
+  setConnectionStatus("dead", "sign in required");
+  renderAccess();
+  return true;
+}
+
+function signIn() {
+  const here = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  const target = store.access.login.loginUrl || "/auth/login";
+  window.location.assign(`${target}?return_to=${encodeURIComponent(here)}`);
+}
+
+async function signOut() {
+  try {
+    await fetch("/auth/logout", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "X-Muxa-Operator": "1" },
+    });
+  } finally {
+    window.location.reload();
+  }
+}
+
 // ── HTTP helpers ───────────────────────────────────────────────────
 
 async function jsonFetch(path, options = {}) {
   const resp = await fetch(path, {
+    credentials: "same-origin",
     ...options,
     headers: { ...authHeaders(), ...(options.headers || {}) },
   });
   if (resp.status === 401) {
-    setConnectionStatus("dead", "401 — bad or missing token");
+    if (!(await offerSignIn())) setConnectionStatus("dead", "401 — bad or missing token");
     throw new Error("unauthorized");
   }
   if (!resp.ok) {
@@ -121,9 +174,13 @@ async function jsonFetch(path, options = {}) {
 
 async function controlFetch(path, options = {}) {
   const resp = await fetch(path, {
+    credentials: "same-origin",
     ...options,
     headers: {
       "Content-Type": "application/json",
+      // Required by the server before an operator session cookie may
+      // authorize a state change; harmless alongside a bearer token.
+      "X-Muxa-Operator": "1",
       ...authHeaders(),
       ...(options.headers || {}),
     },
@@ -153,10 +210,11 @@ async function streamEvents(onEvent, onLagged) {
     try {
       setConnectionStatus("connecting", "connecting…");
       const resp = await fetch("/api/events", {
+        credentials: "same-origin",
         headers: { ...authHeaders(), Accept: "text/event-stream" },
       });
       if (resp.status === 401) {
-        setConnectionStatus("dead", "401 — bad or missing token");
+        if (!(await offerSignIn())) setConnectionStatus("dead", "401 — bad or missing token");
         return;
       }
       if (!resp.ok || !resp.body) {
@@ -218,6 +276,7 @@ async function streamEvents(onEvent, onLagged) {
 const dom = {
   accessMode: document.getElementById("access-mode"),
   editAccess: document.getElementById("edit-access"),
+  operatorLogin: document.getElementById("operator-login"),
   conn: document.getElementById("conn"),
   connLabel: document.getElementById("conn-label"),
   counts: document.getElementById("counts"),
@@ -303,22 +362,38 @@ function showToast(msg) {
 
 function renderAccess() {
   const access = store.access;
+  const login = access.login;
   const editing = access.writeAuthorized;
+  const viaSession = editing && login.signedIn && !localStorage.getItem(TOKEN_KEY);
   document.querySelector("#manage-shares").hidden = !editing;
   const canStartWork = editing && access.workStartAvailable;
-  dom.accessMode.textContent = editing
-    ? "edit unlocked"
-    : access.mode === "public_read"
-      ? "public read-only"
-      : access.mode === "token"
-        ? "private"
-        : "read-only";
+  dom.accessMode.textContent = access.signInRequired
+    ? "signed out"
+    : viaSession
+      ? "signed in"
+      : editing
+        ? "edit unlocked"
+        : access.mode === "public_read"
+          ? "public read-only"
+          : access.mode === "token"
+            ? "private"
+            : "read-only";
+  dom.accessMode.title = viaSession && login.email ? `signed in as ${login.email}` : "";
   dom.accessMode.classList.toggle("edit", editing);
-  dom.editAccess.hidden = !access.writeAvailable;
+  // The token path stays available next to sign-in: it is the API
+  // credential and the way in when the identity provider is down.
+  dom.editAccess.hidden = !(access.writeAvailable || access.signInRequired) || viaSession;
   dom.editAccess.disabled = access.mode === "token" && editing;
-  dom.editAccess.textContent = editing
-    ? access.mode === "public_read" ? "lock edit" : "PAT active"
-    : "unlock edit";
+  dom.editAccess.textContent = access.signInRequired
+    ? "use token"
+    : editing
+      ? access.mode === "public_read" ? "lock edit" : "PAT active"
+      : "unlock edit";
+  if (dom.operatorLogin) {
+    dom.operatorLogin.hidden = !login.available || (editing && !login.signedIn);
+    dom.operatorLogin.textContent = login.signedIn ? "sign out" : "sign in";
+    dom.operatorLogin.title = login.signedIn && login.email ? `signed in as ${login.email}` : "";
+  }
   [dom.workStartId, dom.workStartExternal, dom.workStartBody, dom.workStartSubmit]
     .filter(Boolean)
     .forEach((control) => { control.disabled = !canStartWork; });
@@ -343,13 +418,27 @@ async function fetchAccess() {
     writeAvailable: Boolean(data.write_available),
     writeAuthorized: Boolean(data.write_authorized),
     workStartAvailable: Boolean(data.capabilities?.work_start),
+    signInRequired: false,
+    login: normalizeLogin(data.login),
   };
   renderAccess();
   return store.access;
 }
 
 function initAccessControl() {
+  dom.operatorLogin?.addEventListener("click", () => {
+    if (store.access.login.signedIn) signOut();
+    else signIn();
+  });
   dom.editAccess.addEventListener("click", async () => {
+    if (store.access.signInRequired) {
+      // Boot stopped at the 401; start over with the token in place.
+      const token = window.prompt("Muxa dashboard token");
+      if (!token) return;
+      localStorage.setItem(TOKEN_KEY, token.trim());
+      window.location.reload();
+      return;
+    }
     if (store.access.writeAuthorized && store.access.mode === "public_read") {
       localStorage.removeItem(TOKEN_KEY);
       await fetchAccess().catch(() => {});
@@ -420,6 +509,9 @@ const store = {
     writeAvailable: false,
     writeAuthorized: false,
     workStartAvailable: false,
+    // Set when a read was refused and sign-in is offered instead.
+    signInRequired: false,
+    login: { available: false, signedIn: false, email: null, loginUrl: null },
   },
   agents: new Map(), // session_id -> Agent
   panes: [], // PaneSummary[]
@@ -3090,7 +3182,10 @@ async function fetchCollaboration({ append = false } = {}) {
   dom.collaborationRefresh.disabled = true;
   collaborationRequest = (async () => {
     try {
-      const resp = await fetch(`/api/collaboration?${params.toString()}`, { headers: authHeaders() });
+      const resp = await fetch(`/api/collaboration?${params.toString()}`, {
+        credentials: "same-origin",
+        headers: authHeaders(),
+      });
       if (resp.status === 401) {
         setConnectionStatus("dead", "401 — bad or missing token");
         throw new Error("unauthorized");

@@ -628,6 +628,34 @@ allowed. Use `auth = "public_read"` with a token to expose anonymous reads
 while keeping browser control actions PAT-gated. `auth = "none"` exposes reads
 and disables control actions entirely. See [DASHBOARD.md](DASHBOARD.md).
 
+### Operator sign-in with OIDC
+
+Optional `[dashboard.login]` lets the dashboard owner sign in through a generic
+OpenID Connect provider instead of pasting the bearer token. Access is granted
+only when the ID token's group claim contains `required_group`. It requires
+`auth = "token"` with a token, which keeps working for API clients and as the
+fallback when the provider is unreachable.
+
+```toml
+[dashboard.login]
+public_url = "https://muxa.example.com"
+issuer_url = "https://login.example.com"
+client_id = "muxa-dashboard"
+required_group = "muxa-operators"
+# Optional: claim holding group names (default "groups").
+# groups_claim = "groups"
+# Optional: scopes requested in addition to "openid email".
+# scopes = ["groups"]
+# Optional: environment variable NAME for a confidential client's secret.
+# client_secret_env = "MUXA_LOGIN_CLIENT_SECRET"
+```
+
+Register `https://muxa.example.com/auth/callback` with the provider and enable
+authorization code flow with PKCE S256. If `[dashboard.sharing]` is also
+configured, both must use the same `public_url`. Unknown keys are rejected.
+See [operator sign-in](DASHBOARD.md#operator-sign-in-with-oidc) for the cookie,
+CSRF and reverse-proxy contract.
+
 ### Authenticated pane and window sharing
 
 Optional `[dashboard.sharing]` configuration enables email invitations to local
