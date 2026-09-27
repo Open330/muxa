@@ -74,7 +74,7 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 | `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
 | `muxa activity` | stats/report에 들어간 raw duration ledger 조회. |
 | BarShelf widget (macOS) | active/working/waiting/error agent를 메뉴바 popover에서 요약. |
-| Dashboard | optional loopback HTTP UI + SSE live update + timeline 및 collaboration node-edge/sequence graph. |
+| Dashboard | 선택적 loopback HTTP UI. 실시간 업데이트·timeline·협업 graph와 [OIDC 로그인 기반 pane/window 공유](docs/DASHBOARD.md#invite-someone-to-a-pane)(조회/프롬프트 권한)를 지원. |
 | Notifications | agent가 attention을 필요로 할 때 desktop alert. |
 
 ## 다른 설치 방법

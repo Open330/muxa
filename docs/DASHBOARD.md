@@ -18,8 +18,9 @@ into the browser like a PAT.
 
 The dashboard is **off by default** and **loopback-only when on by default**.
 Token authentication is the default auth mode, and an enabled dashboard must
-have an explicit token. There is no path that exposes data beyond your local
-machine without explicit public-bind acknowledgement.
+have an explicit token. Binding directly to a non-loopback address requires explicit public-bind
+acknowledgement. For sharing through an HTTPS reverse proxy, keep the daemon
+bound to loopback and configure the public origin as described below.
 
 ## Surfaces
 
@@ -399,7 +400,9 @@ that strips the carve-out (or use mTLS).
 The [`dashboard::router`](../crates/muxa/src/dashboard/server.rs) function is
 public for embedding and integration tests.
 
-## Invite someone to a pane
+<a id="invite-someone-to-a-pane"></a>
+
+## Invite someone to a pane or window
 
 Authenticated sharing gives an invited account access to a local **tmux or rmux
 pane**, or the current panes in its **window**. Choose the scope when creating
@@ -428,6 +431,8 @@ issuer_url = "https://login.example.com"
 client_id = "muxa-dashboard"
 # Optional for confidential clients; this is the environment variable NAME.
 client_secret_env = "MUXA_SHARING_CLIENT_SECRET"
+# Optional: absolute path on a private local filesystem.
+# storage_path = "/absolute/path/to/shares.sqlite3"
 ```
 
 Terminate HTTPS at a reverse proxy forwarding to the loopback dashboard, preserve
@@ -439,6 +444,8 @@ in the daemon's environment when `client_secret_env` is specified. Restart after
 configuration changes. No login provider or public listener is enabled automatically.
 
 Invitations expire after 1 minute to 24 hours (the UI offers 1, 4 or 24 hours).
+Up to 256 invitations are retained until expiry, including revoked invitations;
+if the limit is reached, wait for previous invitations to expire.
 Sessions last at most 8 hours. Invitations, bound identities, revocations and command
 receipts are saved in a private SQLite database under the platform data directory
 (`muxa/dashboard-sharing/shares.sqlite3`). **Daemon restarts preserve invitations;
@@ -470,14 +477,13 @@ Create body: `{"scope":"pane","pane":"%1","socket":"/path/to/tmux/socket","email
 Use `"scope":"window"` to include the current window members.
 Recipient API: `GET /share/api/{id}` (optional `?pane=%252` to select `%2`), `POST /share/api/{id}/prompt` with
 `{"text":"...","request_id":"a-unique-command-id","pane":"%2"}`.
-The pane must belong to the invitation; omitting it selects the original pane. Reuse the same ID and exact
+The pane must belong to the invitation; omitting it selects the original pane. Reuse the same ID, selected pane and exact
 text when checking an uncertain delivery. A confirmed receipt returns success
 without executing again; an interrupted/uncertain receipt returns 409 and is
 never replayed, including after restart. A changed payload under the same ID is
 rejected. IDs omitted by legacy callers cannot deduplicate separate requests.
 Recipient writes require the session cookie, the configured
 origin and `X-Muxa-Share: 1`.
-
 
 ### Deployment and recovery
 
@@ -537,7 +543,6 @@ python3 scripts/dashboard-sharing-smoke.py
 
 This harness creates only loopback listeners and fixture identities. Passing it
 does not replace the deployment's own HTTPS and real-provider login check.
-
 
 ### OIDC dependency review
 
