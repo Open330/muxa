@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 
 pub(super) use routes::{admin_routes, recipient_routes};
+pub(super) use storage::private_file;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

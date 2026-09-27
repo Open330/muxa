@@ -77,10 +77,12 @@ impl Record {
     }
 }
 
-fn private_file(path: &Path) -> io::Result<File> {
+/// Create or open an owner-only (0600) file, refusing symlinks. Shared with
+/// the enrolled-operator store.
+pub(in crate::dashboard) fn private_file(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(io::Error::other("sharing storage must not be a symlink"));
+        return Err(io::Error::other("dashboard storage must not be a symlink"));
     }
     let file = std::fs::OpenOptions::new()
         .create(true)

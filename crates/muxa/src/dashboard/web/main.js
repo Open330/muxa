@@ -1,4 +1,5 @@
 import { openShareManager } from "./sharing-admin.mjs";
+import { openOperatorManager } from "./operators-admin.mjs";
 import { logicalWorkKey, normalizeAgent, validateWorkSnapshot, WORK_STAGES } from "./work-model.mjs";
 import {
   collaborationSequence,
@@ -34,6 +35,9 @@ import {
 //     is an HttpOnly cookie the browser attaches to same-origin fetches; every
 //     control request also sends `X-Muxa-Operator: 1`, which the server
 //     requires (with a matching Origin) before a cookie may change state.
+//     An account outside the operator group can be enrolled once with the
+//     token on the server-rendered /auth/enroll page; the "operators" dialog
+//     lists and removes enrolled accounts.
 //   * Fetch /api/agents and /api/panes to paint initial tables.
 //   * Open a streaming POST-less fetch on /api/events and parse SSE
 //     manually (EventSource can't carry an Authorization header).
@@ -113,6 +117,8 @@ function normalizeLogin(data) {
     available: Boolean(data?.available),
     signedIn: Boolean(data?.signed_in),
     email: typeof data?.email === "string" ? data.email : null,
+    via: data?.via === "group" || data?.via === "enrollment" ? data.via : null,
+    enrollment: Boolean(data?.enrollment),
     loginUrl: typeof data?.login_url === "string" ? data.login_url : null,
   };
 }
@@ -366,6 +372,7 @@ function renderAccess() {
   const editing = access.writeAuthorized;
   const viaSession = editing && login.signedIn && !localStorage.getItem(TOKEN_KEY);
   document.querySelector("#manage-shares").hidden = !editing;
+  document.querySelector("#manage-operators").hidden = !(editing && login.available && login.enrollment);
   const canStartWork = editing && access.workStartAvailable;
   dom.accessMode.textContent = access.signInRequired
     ? "signed out"
@@ -378,7 +385,9 @@ function renderAccess() {
           : access.mode === "token"
             ? "private"
             : "read-only";
-  dom.accessMode.title = viaSession && login.email ? `signed in as ${login.email}` : "";
+  dom.accessMode.title = viaSession && login.email
+    ? `signed in as ${login.email}${login.via === "enrollment" ? " (registered account)" : ""}`
+    : "";
   dom.accessMode.classList.toggle("edit", editing);
   // The token path stays available next to sign-in: it is the API
   // credential and the way in when the identity provider is down.
@@ -511,7 +520,7 @@ const store = {
     workStartAvailable: false,
     // Set when a read was refused and sign-in is offered instead.
     signInRequired: false,
-    login: { available: false, signedIn: false, email: null, loginUrl: null },
+    login: { available: false, signedIn: false, email: null, via: null, enrollment: false, loginUrl: null },
   },
   agents: new Map(), // session_id -> Agent
   panes: [], // PaneSummary[]
@@ -3512,3 +3521,4 @@ async function pollCollaboration() {
 main();
 
 document.querySelector("#manage-shares")?.addEventListener("click", () => openShareManager(null, controlFetch));
+document.querySelector("#manage-operators")?.addEventListener("click", () => openOperatorManager(controlFetch));

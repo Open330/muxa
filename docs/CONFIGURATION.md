@@ -631,17 +631,21 @@ and disables control actions entirely. See [DASHBOARD.md](DASHBOARD.md).
 ### Operator sign-in with OIDC
 
 Optional `[dashboard.login]` lets the dashboard owner sign in through a generic
-OpenID Connect provider instead of pasting the bearer token. Access is granted
-only when the ID token's group claim contains `required_group`. It requires
-`auth = "token"` with a token, which keeps working for API clients and as the
-fallback when the provider is unreachable.
+OpenID Connect provider instead of pasting the bearer token. An account is an
+operator when the ID token's group claim contains `required_group`, or when a
+holder of the dashboard token enrolled it. It requires `auth = "token"` with a
+token, which keeps working for API clients and as the fallback when the
+provider is unreachable.
 
 ```toml
 [dashboard.login]
 public_url = "https://muxa.example.com"
 issuer_url = "https://login.example.com"
 client_id = "muxa-dashboard"
+# Optional while enrollment is on; required when enrollment = false.
 required_group = "muxa-operators"
+# Optional: let a token holder enroll accounts outside the group (default true).
+# enrollment = true
 # Optional: claim holding group names (default "groups").
 # groups_claim = "groups"
 # Optional: scopes requested in addition to "openid email".
@@ -653,8 +657,15 @@ required_group = "muxa-operators"
 Register `https://muxa.example.com/auth/callback` with the provider and enable
 authorization code flow with PKCE S256. If `[dashboard.sharing]` is also
 configured, both must use the same `public_url`. Unknown keys are rejected.
+
+With `enrollment` on, a verified account outside `required_group` (or any
+account when `required_group` is omitted) is sent to an enrollment page that
+asks for the dashboard token; entering it registers that account by issuer and
+subject in `$XDG_DATA_HOME/muxa/dashboard-operators/operators.sqlite3`. Remove
+accounts from the dashboard's **operators** dialog. `enrollment = false` restores
+group-only sign-in and stops honoring enrolled accounts.
 See [operator sign-in](DASHBOARD.md#operator-sign-in-with-oidc) for the cookie,
-CSRF and reverse-proxy contract.
+CSRF, enrollment and reverse-proxy contract.
 
 ### Authenticated pane and window sharing
 

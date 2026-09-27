@@ -1299,6 +1299,7 @@ async fn cancelled_creation_keeps_the_committed_invitation_registered() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Every operator surface, against both cookie names.
 async fn recipient_and_operator_sessions_never_cross() {
     let (mut state, _) = state();
     let mut config = (*state.config).clone();
@@ -1307,9 +1308,10 @@ async fn recipient_and_operator_sessions_never_cross() {
         issuer_url: "https://issuer.example.com".into(),
         client_id: "muxa".into(),
         client_secret_env: None,
-        required_group: "operator".into(),
+        required_group: Some("operator".into()),
         groups_claim: None,
         scopes: Vec::new(),
+        enrollment: None,
     };
     config.login = Some(login.clone());
     state.config = Arc::new(config);
@@ -1333,6 +1335,39 @@ async fn recipient_and_operator_sessions_never_cross() {
                 )
                 .await
                 .status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} {cookie}"
+            );
+        }
+        // Nor can it enroll or reach operator management, even with the
+        // operator header, the public Origin and the right token.
+        for (method, path) in [
+            ("POST", "/auth/enroll"),
+            ("GET", "/api/operators"),
+            (
+                "POST",
+                "/api/operators/0123456789abcdef0123456789abcdef/remove",
+            ),
+        ] {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::ORIGIN, "https://share.example.com")
+                        .header("x-muxa-operator", "1")
+                        .header(
+                            header::COOKIE,
+                            format!("{cookie}; __Host-muxa-op-enroll={secret}"),
+                        )
+                        .body(Body::from(json!({"token": "operator"}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
                 StatusCode::UNAUTHORIZED,
                 "{method} {path} {cookie}"
             );

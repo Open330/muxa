@@ -398,6 +398,7 @@ pub fn router(state: AppState) -> Router {
         read_api
     };
     let write_api = super::sharing::admin_routes()
+        .merge(super::operator::admin_routes())
         .route("/api/panes/{pane}/prompt", post(pane_prompt_handler))
         .route("/api/fleet/{host}/command", post(fleet_command_handler))
         .route("/api/panes/{pane}/abort", post(pane_abort_handler))
@@ -490,6 +491,7 @@ pub async fn serve(
         })
     });
     let sharing = super::sharing::Sharing::open(config.sharing.clone()).await?;
+    let operator = super::operator::OperatorLogin::open(config.login.clone(), None).await?;
     let mut state = AppState::new(store, config.clone(), pane_cache, sessions)
         .with_collaboration(collaboration)
         .with_backends(backends)
@@ -499,6 +501,7 @@ pub async fn serve(
         .with_message_skills(runtime.message_skills)
         .with_fleet(runtime.fleet);
     state.sharing = sharing;
+    state.operator = operator;
     let app = router(state);
     let listener = TcpListener::bind(config.bind).await?;
     let local = listener.local_addr()?;
@@ -694,6 +697,10 @@ pub(super) struct LoginStatus {
     available: bool,
     signed_in: bool,
     email: Option<String>,
+    /// Why the signed-in account is an operator: `group` or `enrollment`.
+    via: Option<super::operator::Via>,
+    /// Whether a token holder may enroll accounts outside `required_group`.
+    enrollment: bool,
     /// Absolute, so a browser on another origin (e.g. `localhost`) starts
     /// the flow on the public origin its callback and cookie belong to.
     login_url: Option<String>,
@@ -701,11 +708,16 @@ pub(super) struct LoginStatus {
 
 pub(super) fn login_status(state: &AppState, headers: &HeaderMap) -> LoginStatus {
     let config = state.operator.config();
-    let (signed_in, email) = state.operator.signed_in(headers);
+    let (signed_in, email, via) = state
+        .operator
+        .signed_in(headers)
+        .map_or((false, None, None), |(email, via)| (true, email, Some(via)));
     LoginStatus {
         available: config.is_some(),
         signed_in,
         email,
+        via,
+        enrollment: config.is_some_and(super::operator::LoginConfig::enrollment_enabled),
         login_url: config.map(|config| format!("{}/auth/login", config.origin())),
     }
 }
