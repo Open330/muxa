@@ -640,3 +640,10 @@ ordered comma-separated set, for example `MUXA_HOSTS=rmux,tmux`. rmux's native
 `RMUX` variables take precedence over the `TMUX` compatibility variables it
 also exports. See [CMUX.md](CMUX.md), [RMUX.md](RMUX.md), [HERDR.md](HERDR.md), and
 [ZELLIJ.md](ZELLIJ.md).
+
+### Authenticated pane sharing
+
+Optional `[dashboard.sharing]` settings `public_url`, `issuer_url`, `client_id`
+and `client_secret_env` enable OIDC invitations for individual tmux/rmux panes.
+Requires dashboard `auth = "token"`. See [pane sharing](DASHBOARD.md#invite-someone-to-a-pane)
+for provider setup, HTTPS, permissions, expiration and restart behavior.

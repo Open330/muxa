@@ -384,17 +384,167 @@ Three reasons:
 If this tradeoff doesn't work for you, front the daemon with a reverse proxy
 that strips the carve-out (or use mTLS).
 
-## What it doesn't do (yet)
+## Scope and limits
 
 - External issue references are captured at `muxa work up` time. Continuous
   two-way Linear/GitHub/Jira synchronization, dependencies, and estimates are
   not implemented.
 - Control is intentionally narrow: Work/pane prompt and abort plus
-  Muxa-owned PTY input/terminate. Configuration, files, and arbitrary shell
-  commands are not writable through the dashboard.
+  Muxa-owned PTY input/terminate. There are no direct configuration/file editing
+  APIs. Sending a prompt to a shell pane can execute shell commands.
 - No mobile UI. The CSS scales OK to ~600 px but isn't designed for phones.
-- No multi-user auth. One token = one bearer.
+- Operator access uses a bearer token. Invited recipients use OIDC with access
+  limited to their shared panes; they cannot manage the dashboard.
 
-These are deliberate v1 cuts; the [`dashboard::router`](../crates/muxa/src/dashboard/server.rs)
-function is `pub` so a future PR can `.merge()` extra routes without a
-rewrite.
+The [`dashboard::router`](../crates/muxa/src/dashboard/server.rs) function is
+public for embedding and integration tests.
+
+## Invite someone to a pane
+
+Authenticated sharing gives an invited account access to a local **tmux or rmux
+pane**, or the current panes in its **window**. Choose the scope when creating
+an invitation. A window invitation pins up to 16 pane processes; panes created
+later are not included. The recipient selects a pane to view or send commands.
+If one pane ends, the other original panes remain accessible. Choose **share** on a pane, enter the recipient's email,
+choose **View output** or **View and send prompts**, then copy the generated link.
+The dashboard's **Shares** button lists and revokes invitations. The recipient
+signs in on a separate page; the operator bearer token must not be sent to them.
+
+Configure an OIDC application that supports authorization code flow with PKCE
+and returns `email` and `email_verified = true` in its ID token. Register the exact
+redirect URI `https://muxa.example.com/share/auth/callback` with that provider.
+Example configuration (replace the example host and issuer):
+
+```toml
+[dashboard]
+enabled = true
+bind = "127.0.0.1:7878"
+auth = "token"
+# Supply the operator token through MUXA_DASHBOARD_TOKEN or dashboard.token.
+
+[dashboard.sharing]
+public_url = "https://muxa.example.com"
+issuer_url = "https://login.example.com"
+client_id = "muxa-dashboard"
+# Optional for confidential clients; this is the environment variable NAME.
+client_secret_env = "MUXA_SHARING_CLIENT_SECRET"
+```
+
+Terminate HTTPS at a reverse proxy forwarding to the loopback dashboard, preserve
+its public `Host`, and forward `/share/*` and the dashboard static assets. The
+configured `public_url` must be an origin without a path, query or fragment.
+HTTP is accepted only for loopback development. Sharing requires private
+`auth = "token"`; `public_read` and `none` are incompatible. Set the client secret
+in the daemon's environment when `client_secret_env` is specified. Restart after
+configuration changes. No login provider or public listener is enabled automatically.
+
+Invitations expire after 1 minute to 24 hours (the UI offers 1, 4 or 24 hours).
+Sessions last at most 8 hours. Invitations, bound identities, revocations and command
+receipts are saved in a private SQLite database under the platform data directory
+(`muxa/dashboard-sharing/shares.sqlite3`). **Daemon restarts preserve invitations;
+recipients sign in again.** The pane process must still be the original process.
+Session cookies and pending login flows remain in memory and are never saved. The first successful
+login binds the verified invited email to the provider's subject identifier.
+Other accounts cannot use the link, and recipient cookies grant no operator API
+access. Logging out ends that browser session; use **Revoke** to end the invitation.
+Revocation waits for an already accepted prompt to finish and rejects subsequent
+prompts. It cannot undo commands already executed.
+
+Prompt access submits literal text followed by Enter to the existing process.
+A shell pane therefore permits shell commands; share only with someone who should
+have that authority and may see the pane's output. This is not a command sandbox.
+The socket, session, window, pane and process identity are checked again before
+operations; replacing the pane requires a new invitation. Remote panes, terminal resizing and raw keyboard streaming are not included.
+Tmux servers with colliding short socket names must be renamed before sharing.
+
+The recipient page polls visible output every 2 seconds and pauses while hidden.
+Output capture has a 1-second cache, a 32,768-character limit and a bounded pool
+of eight concurrent pane operations. Prompt requests are limited to 16 KiB and
+one per 500 ms per share, with at most 1,024 distinct commands per invitation.
+All invitations to the same pane serialize command delivery. Failed submissions
+are never retried automatically. The page reconnects with bounded backoff after
+network failures and disables sending until it has a fresh successful read.
+
+Operator API: `GET/POST /api/shares`, `POST /api/shares/{id}/revoke` (bearer token).
+Create body: `{"scope":"pane","pane":"%1","socket":"/path/to/tmux/socket","email":"guest@example.com","permission":"prompt","ttl_seconds":3600}`.
+Use `"scope":"window"` to include the current window members.
+Recipient API: `GET /share/api/{id}` (optional `?pane=%252` to select `%2`), `POST /share/api/{id}/prompt` with
+`{"text":"...","request_id":"a-unique-command-id","pane":"%2"}`.
+The pane must belong to the invitation; omitting it selects the original pane. Reuse the same ID and exact
+text when checking an uncertain delivery. A confirmed receipt returns success
+without executing again; an interrupted/uncertain receipt returns 409 and is
+never replayed, including after restart. A changed payload under the same ID is
+rejected. IDs omitted by legacy callers cannot deduplicate separate requests.
+Recipient writes require the session cookie, the configured
+origin and `X-Muxa-Share: 1`.
+
+
+### Deployment and recovery
+
+1. Register an OIDC client with authorization code flow, PKCE S256 and the exact
+   public callback URI. The ID token must contain a verified email. Keep the
+   operator bearer token separate from the OIDC client secret.
+2. Configure `dashboard.sharing` and supply the named secret environment variable
+   to the daemon service, then restart. `storage_path` may override the database
+   location with an absolute file path on a local filesystem. Keep the database
+   and its lock file private to the daemon user; muxa creates them with mode 0600.
+3. Forward the HTTPS origin to the loopback dashboard without rewriting `Host`,
+   stripping cookies or caching `/share/*` and `/api/*` responses. Configure the
+   proxy access log to omit query strings on `/share/auth/callback`: they contain
+   authorization codes. Muxa's own HTTP logs redact code, state and operator
+   tokens, including percent-encoded parameter names.
+4. In **Shares**, choose **Check login setup**. It checks discovery and signing
+   key reachability; it cannot validate a client secret or email claim without an
+   actual login. Create a short-lived invitation and test the recipient login,
+   command, daemon restart and revocation before distributing links.
+
+`GET /api/shares/status` reports whether configuration, private storage and the
+client-secret environment variable are present. `POST /api/shares/check` checks
+provider discovery. Both require the operator bearer token. Recipients can use
+**Sign out all devices** to end their current account's browser sessions without
+revoking the invitations themselves.
+
+Muxa commits an invitation, account binding or revocation before confirming it.
+It also records command acceptance before sending input. If storage fails, the
+change is not acknowledged and a new command is not executed. If the process dies
+between acceptance and completion, the command's result is uncertain: inspect the
+pane, then explicitly start a new command if appropriate. This guarantees that
+replaying the same request ID does not intentionally execute it twice; it cannot
+make a terminal side effect transactional with the database.
+
+The database is leased to one daemon. A second daemon using the same file is
+rejected; use separate storage paths for separate instances. Corrupt data,
+unsupported storage versions, or changes to the public origin, issuer or client
+ID prevent the sharing dashboard from starting. The error is in daemon logs.
+Restore the original configuration or choose a new storage path to begin with no
+existing grants. Never silently replace a corrupt database with an empty one.
+For backups, stop the daemon before copying the database. Restoring a backup can
+restore permissions that were revoked after that backup; review invitations
+before reopening external access.
+
+The optional browser smoke test exercises an isolated daemon, test OIDC provider
+and private tmux server. It covers login, command delivery, response loss,
+reconnection, restart, recipient isolation and revocation. It needs Python's
+`cryptography`, Node's `playwright`, and a Chromium executable:
+
+```sh
+cargo build --workspace --bins
+# Configure these only if playwright/Chromium are outside their default locations.
+export MUXA_PLAYWRIGHT_PACKAGE=/path/to/playwright
+export MUXA_TEST_CHROMIUM=/path/to/chromium
+python3 scripts/dashboard-sharing-smoke.py
+```
+
+This harness creates only loopback listeners and fixture identities. Passing it
+does not replace the deployment's own HTTPS and real-provider login check.
+
+
+### OIDC dependency review
+
+`openidconnect` currently brings in `rsa` for ID-token signature verification.
+The dependency scanner exception for [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071.html)
+is limited to that advisory: its private-key timing disclosure does not apply to
+Muxa's public-key verification path. Muxa does not import RSA private keys, sign
+RSA client assertions or decrypt RSA messages. The upstream advisory has no
+patched version as of this review (2026-09-27). Reassess this exception before
+adding any private-key RSA operation or changing the OIDC dependency.

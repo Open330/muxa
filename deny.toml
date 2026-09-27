@@ -8,6 +8,17 @@ all-features = true
 [advisories]
 version = 2
 ignore = [
+    # openidconnect 4.0.1 -> rsa 0.9.10. Reviewed 2026-09-27:
+    # RUSTSEC-2023-0071 leaks PRIVATE keys from private-key timing operations.
+    # Muxa only consumes issuer JWKS and verifies ID-token signatures
+    # (CoreJsonWebKey::verify_signature -> verify_rsa_signature with n/e).
+    # It never loads an RSA private key, decrypts RSA data, or signs client
+    # assertions. OAuth client authentication uses a client secret over HTTP.
+    # Tests sign fixture tokens with Ed25519, not RSA. No patched rsa version
+    # exists. Reassess before introducing RSA signing/decryption or changing
+    # the OIDC dependency: https://rustsec.org/advisories/RUSTSEC-2023-0071.html
+    "RUSTSEC-2023-0071",
+
     # Transitive through zellij-tile 0.44.3 -> zellij-utils -> clap 3.
     # zellij-tile 0.44.3 is the latest plugin API crate as of v0.8.0, and
     # these are unmaintained advisories rather than memory-safety CVEs.

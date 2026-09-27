@@ -2488,3 +2488,11 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
     display: none;
   }
 }
+
+.share-dialog { width: min(600px, 90vw); max-height: 85vh; overflow: auto; border: 1px solid #657188; border-radius: 10px; padding: 24px; }
+.share-dialog::backdrop { background: #0009; }
+.share-dialog label { display: block; margin: 12px 0; }
+.share-dialog input, .share-dialog select { display: block; width: 100%; box-sizing: border-box; padding: 8px; }
+.share-dialog button { padding: 8px 12px; margin: 8px 0; }
+.share-dialog .share-row { padding: 8px 0; border-top: 1px solid #657188; }
+.share-dialog .share-message { overflow-wrap: anywhere; }

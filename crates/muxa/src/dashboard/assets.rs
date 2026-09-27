@@ -52,7 +52,7 @@ async fn static_handler(Path(path): Path<String>) -> Response {
     serve_asset(&path)
 }
 
-fn serve_asset(path: &str) -> Response {
+pub(super) fn serve_asset(path: &str) -> Response {
     match WebAssets::get(path) {
         Some(file) => {
             let mime = mime_for(path);

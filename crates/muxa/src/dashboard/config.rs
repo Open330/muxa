@@ -32,6 +32,7 @@ pub const DEFAULT_PANE_CACHE_TTL: Duration = Duration::from_secs(2);
 /// [`DashboardConfig::resolve`]; the HTTP server takes this by reference.
 #[derive(Debug, Clone)]
 pub struct DashboardConfig {
+    pub sharing: Option<super::sharing::SharingConfig>,
     pub enabled: bool,
     pub bind: SocketAddr,
     pub auth: DashboardAuthMode,
@@ -76,6 +77,9 @@ pub enum DashboardConfigError {
          or set dashboard.auth=\"none\" (or --dashboard-auth none) to expose reads and disable control"
     )]
     MissingToken,
+
+    #[error("invalid dashboard sharing configuration: {0}")]
+    Sharing(String),
 
     #[error(
         "dashboard.bind={addr} is non-loopback; set allow_public=true (or pass --allow-public) \
@@ -149,7 +153,16 @@ impl DashboardConfig {
             }
         }
 
+        if let Some(sharing) = &toml.sharing {
+            sharing.validate().map_err(DashboardConfigError::Sharing)?;
+            if !matches!(auth, DashboardAuthMode::Token) || token.is_none() {
+                return Err(DashboardConfigError::Sharing(
+                    "sharing requires auth = token and an operator token".into(),
+                ));
+            }
+        }
         Ok(Self {
+            sharing: toml.sharing.as_deref().cloned(),
             enabled,
             bind,
             auth,
@@ -165,6 +178,7 @@ impl DashboardConfig {
     #[must_use]
     pub fn loopback_default() -> Self {
         Self {
+            sharing: None,
             enabled: false,
             bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)),
             auth: DashboardAuthMode::Token,
