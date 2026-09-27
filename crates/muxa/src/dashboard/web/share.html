@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Shared pane · muxa</title><link rel="icon" href="/static/icon.svg"><link rel="stylesheet" href="/static/share.css"></head>
-<body><main><header><h1>Shared pane</h1><button id="logout" hidden>Sign out</button></header>
-<p id="identity"></p><p id="status" role="status">Opening share…</p><a id="login" hidden>Sign in to open this pane</a>
+<body><main><header><h1 id="share-title">Shared pane</h1><div><button id="logout" hidden>Sign out</button> <button id="logout-all" hidden>Sign out all devices</button></div></header>
+<p id="identity"></p><label id="pane-selector" hidden>Pane <select id="pane"></select></label><p id="status" role="status">Opening share…</p><a id="login" hidden>Sign in to open this pane</a>
 <pre id="output" aria-label="Pane output" tabindex="0"></pre>
-<form id="prompt-form" hidden><label for="prompt">Prompt</label><textarea id="prompt" rows="4" maxlength="16384" required></textarea><button id="send" type="submit">Send prompt</button><p>Runs in the shared pane. Check its output before retrying an uncertain send.</p></form>
+<form id="prompt-form" hidden><label for="prompt">Prompt</label><textarea id="prompt" rows="4" maxlength="16384" required></textarea><button id="send" type="submit" disabled>Send command</button> <button id="new-command" type="button" hidden>Start a new command</button><p id="command-status" role="status" aria-live="polite"></p><p>Runs in the shared pane. Check its output before retrying an uncertain send.</p></form>
 </main><script type="module" src="/static/share.mjs"></script></body></html>

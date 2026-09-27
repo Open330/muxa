@@ -17,6 +17,7 @@ struct Backend {
     panes: std::sync::Mutex<Vec<PaneInfo>>,
     sent: std::sync::Mutex<Vec<(String, String, String)>>,
     send_gate: std::sync::Mutex<Option<Arc<std::sync::Barrier>>>,
+    degraded: std::sync::atomic::AtomicBool,
 }
 impl PaneBackend for Backend {
     fn kind(&self) -> crate::HostKind {
@@ -24,6 +25,13 @@ impl PaneBackend for Backend {
     }
     fn list_panes(&self) -> Vec<PaneInfo> {
         self.panes.lock().unwrap().clone()
+    }
+    fn observe_panes(&self) -> crate::backend::PaneObservation {
+        if self.degraded.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::backend::PaneObservation::incomplete(Vec::new())
+        } else {
+            crate::backend::PaneObservation::complete(self.list_panes())
+        }
     }
     fn resolve_pane(&self, id: &str) -> Option<PaneInfo> {
         self.list_panes()
@@ -76,11 +84,13 @@ fn state() -> (AppState, Arc<Backend>) {
         issuer_url: "https://issuer.example.com".into(),
         client_id: "muxa".into(),
         client_secret_env: None,
+        storage_path: None,
     });
     let backend = Arc::new(Backend {
         panes: std::sync::Mutex::new(vec![pane("one"), pane("two")]),
         sent: std::sync::Mutex::new(Vec::new()),
         send_gate: std::sync::Mutex::new(None),
+        degraded: std::sync::atomic::AtomicBool::new(false),
     });
     let state = AppState::new(
         crate::Store::shared(),
@@ -228,7 +238,7 @@ async fn recipient_cannot_escape_share_or_escalate_to_operator() {
         )
         .await
         .status(),
-        StatusCode::UNPROCESSABLE_ENTITY
+        StatusCode::FORBIDDEN
     );
     assert!(backend.sent.lock().unwrap().is_empty());
     assert_eq!(
@@ -784,4 +794,514 @@ async fn dashboard_absolute_socket_is_pinned_and_mismatched_path_is_rejected() {
             .status(),
         StatusCode::CONFLICT
     );
+}
+
+async fn durable_state(path: &std::path::Path) -> (AppState, Arc<Backend>) {
+    let (mut state, backend) = state();
+    let mut config = state.sharing.config.clone().unwrap();
+    config.storage_path = Some(path.to_owned());
+    state.sharing = Sharing::open(Some(config)).await.unwrap();
+    (state, backend)
+}
+
+async fn submit(
+    state: &AppState,
+    id: &str,
+    cookie: &str,
+    request_id: &str,
+    text: &str,
+) -> Response {
+    call(
+        state,
+        "POST",
+        &format!("/share/api/{id}/prompt"),
+        json!({"text":text,"request_id":request_id}),
+        Some(cookie),
+        false,
+        Some("https://share.example.com"),
+    )
+    .await
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One lifecycle across two daemon restarts.
+async fn restart_keeps_identity_receipts_and_revocations_but_requires_login() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shares.sqlite3");
+    let (state, backend) = durable_state(&path).await;
+    let id = create(&state, "prompt").await;
+    let cookie = session(&state, "guest@example.com", "guest").await;
+    assert_eq!(
+        submit(&state, &id, &cookie, "receipt-1", "private-prompt-marker")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        submit(&state, &id, &cookie, "receipt-1", "private-prompt-marker")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        submit(&state, &id, &cookie, "receipt-1", "changed")
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(backend.sent.lock().unwrap().len(), 2);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("private-prompt-marker"));
+    drop(state);
+    let (state, backend) = durable_state(&path).await;
+    let route = format!("/share/api/{id}");
+    assert_eq!(
+        call(
+            &state,
+            "GET",
+            &route,
+            json!(null),
+            Some(&cookie),
+            false,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let stranger = session(&state, "guest@example.com", "recycled-account").await;
+    assert_eq!(
+        call(
+            &state,
+            "GET",
+            &route,
+            json!(null),
+            Some(&stranger),
+            false,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let cookie = session(&state, "guest@example.com", "guest").await;
+    assert_eq!(
+        call(
+            &state,
+            "GET",
+            &route,
+            json!(null),
+            Some(&cookie),
+            false,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        submit(&state, &id, &cookie, "receipt-1", "private-prompt-marker")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert!(backend.sent.lock().unwrap().is_empty());
+    assert_eq!(
+        call(
+            &state,
+            "POST",
+            &format!("/api/shares/{id}/revoke"),
+            json!(null),
+            None,
+            true,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    drop(state);
+    let (state, _) = durable_state(&path).await;
+    let cookie = session(&state, "guest@example.com", "guest").await;
+    assert_eq!(
+        call(
+            &state,
+            "GET",
+            &route,
+            json!(null),
+            Some(&cookie),
+            false,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::GONE
+    );
+}
+
+#[tokio::test]
+async fn unfinished_delivery_is_never_replayed_after_restart() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shares.sqlite3");
+    let (state, _) = durable_state(&path).await;
+    let id = create(&state, "prompt").await;
+    let grant = state.sharing.registry.lock().await.grants[&id].clone();
+    let mut guard = grant.lock_owned().await;
+    guard.deliveries.insert(
+        "interrupted".into(),
+        Delivery {
+            digest: format!("{:x}", Sha256::digest(b"%1\0command")),
+            outcome: "pending".into(),
+        },
+    );
+    drop(state.sharing.persist(guard).await.unwrap());
+    drop(state);
+    let (state, backend) = durable_state(&path).await;
+    let cookie = session(&state, "guest@example.com", "guest").await;
+    assert_eq!(
+        submit(&state, &id, &cookie, "interrupted", "command")
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert!(backend.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn storage_lock_identity_and_corruption_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shares.sqlite3");
+    let (state, _) = durable_state(&path).await;
+    let mut config = state.sharing.config.clone().unwrap();
+    assert!(Sharing::open(Some(config.clone())).await.is_err());
+    drop(state);
+    config.client_id = "another-app".into();
+    assert!(Sharing::open(Some(config.clone())).await.is_err());
+    std::fs::write(&path, "corrupt state").unwrap();
+    assert!(Sharing::open(Some(config)).await.is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "corrupt state");
+}
+
+#[tokio::test]
+async fn failed_storage_never_acknowledges_binding_or_executes_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shares.sqlite3");
+    let (state, backend) = durable_state(&path).await;
+    let id = create(&state, "prompt").await;
+    let cookie = session(&state, "guest@example.com", "guest").await;
+    state.sharing.storage.as_ref().unwrap().test_read_only(true);
+    for _ in 0..2 {
+        assert_eq!(
+            call(
+                &state,
+                "GET",
+                &format!("/share/api/{id}"),
+                json!(null),
+                Some(&cookie),
+                false,
+                None
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    assert_eq!(
+        submit(&state, &id, &cookie, "write-failed", "command")
+            .await
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(backend.sent.lock().unwrap().is_empty());
+    assert_eq!(
+        call(
+            &state,
+            "POST",
+            &format!("/api/shares/{id}/revoke"),
+            json!(null),
+            None,
+            true,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    state
+        .sharing
+        .storage
+        .as_ref()
+        .unwrap()
+        .test_read_only(false);
+    assert_eq!(
+        call(
+            &state,
+            "POST",
+            &format!("/api/shares/{id}/revoke"),
+            json!(null),
+            None,
+            true,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn logout_all_only_ends_the_authenticated_accounts_sessions() {
+    let (state, _) = state();
+    let id = create(&state, "view").await;
+    let cookie = session(&state, "guest@example.com", "guest").await;
+    let second = session(&state, "guest@example.com", "guest").await;
+    let other = session(&state, "other@example.com", "other").await;
+    assert_eq!(
+        call(
+            &state,
+            "POST",
+            "/share/auth/logout-all",
+            json!(null),
+            Some(&cookie),
+            false,
+            Some("https://share.example.com")
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    let path = format!("/share/api/{id}");
+    assert_eq!(
+        call(
+            &state,
+            "GET",
+            &path,
+            json!(null),
+            Some(&second),
+            false,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&state, "GET", &path, json!(null), Some(&other), false, None)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn separate_invitations_to_one_pane_cannot_interleave_commands() {
+    let (state, backend) = state();
+    let first = create(&state, "prompt").await;
+    let second = create(&state, "prompt").await;
+    let cookie = session(&state, "guest@example.com", "guest").await;
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    *backend.send_gate.lock().unwrap() = Some(gate.clone());
+    let send = tokio::spawn({
+        let state = state.clone();
+        let cookie = cookie.clone();
+        async move { submit(&state, &first, &cookie, "first", "first").await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while backend.sent.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut next = tokio::spawn({
+        let state = state.clone();
+        async move { submit(&state, &second, &cookie, "second", "second").await }
+    });
+    let waited = tokio::time::timeout(Duration::from_millis(50), &mut next)
+        .await
+        .is_err();
+    let count = backend.sent.lock().unwrap().len();
+    tokio::task::spawn_blocking(move || gate.wait())
+        .await
+        .unwrap();
+    assert!(waited);
+    assert_eq!(count, 1);
+    assert_eq!(send.await.unwrap().status(), StatusCode::OK);
+    assert_eq!(next.await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        backend
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, text)| text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "\r", "second", "\r"]
+    );
+}
+
+#[tokio::test]
+async fn transient_inventory_failure_is_recoverable_without_a_new_invitation() {
+    let (state, backend) = state();
+    let id = create(&state, "view").await;
+    let cookie = session(&state, "guest@example.com", "guest").await;
+    backend
+        .degraded
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let path = format!("/share/api/{id}");
+    assert_eq!(
+        call(
+            &state,
+            "GET",
+            &path,
+            json!(null),
+            Some(&cookie),
+            false,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    backend
+        .degraded
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        call(
+            &state,
+            "GET",
+            &path,
+            json!(null),
+            Some(&cookie),
+            false,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn window_shares_pin_members_and_reject_new_panes_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shares.sqlite3");
+    let (state, backend) = durable_state(&path).await;
+    let mut peer = pane("two");
+    peer.pane_id = "%2".into();
+    backend.panes.lock().unwrap().push(peer.clone());
+    let response = call(&state,"POST","/api/shares",json!({"pane":"%1","socket":"two","scope":"window","email":"guest@example.com","permission":"prompt","ttl_seconds":3600}),None,true,None).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let id = body(response).await["id"].as_str().unwrap().to_owned();
+    drop(state);
+    let (state, backend) = durable_state(&path).await;
+    let mut newer = peer.clone();
+    newer.pane_id = "%3".into();
+    backend.panes.lock().unwrap().extend([peer, newer]);
+    let cookie = session(&state, "guest@example.com", "guest").await;
+    let route = format!("/share/api/{id}");
+    let response = call(
+        &state,
+        "GET",
+        &format!("{route}?pane=%252"),
+        json!(null),
+        Some(&cookie),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let data = body(response).await;
+    assert_eq!(data["panes"], json!(["%1", "%2"]));
+    assert_eq!(data["pane"], "%2");
+    let command = json!({"text":"hello", "request_id":"one", "pane":"%2"});
+    assert_eq!(
+        call(
+            &state,
+            "POST",
+            &format!("{route}/prompt"),
+            command,
+            Some(&cookie),
+            false,
+            Some("https://share.example.com")
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(backend.sent.lock().unwrap()[0].1, "%2");
+    assert_eq!(
+        submit(&state, &id, &cookie, "one", "hello").await.status(),
+        StatusCode::CONFLICT
+    );
+    let invalid = json!({"text":"hello", "request_id":"two", "pane":"%3"});
+    assert_eq!(
+        call(
+            &state,
+            "POST",
+            &format!("{route}/prompt"),
+            invalid,
+            Some(&cookie),
+            false,
+            Some("https://share.example.com")
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(backend.sent.lock().unwrap().len(), 2);
+    backend
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|pane| pane.pane_id != "%1");
+    let response = call(
+        &state,
+        "GET",
+        &route,
+        json!(null),
+        Some(&cookie),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await["pane_available"], false);
+    assert_eq!(
+        call(
+            &state,
+            "GET",
+            &format!("{route}?pane=%252"),
+            json!(null),
+            Some(&cookie),
+            false,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn foreign_sqlite_database_is_not_modified() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("other.sqlite3");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch("CREATE TABLE unrelated(value TEXT); INSERT INTO unrelated VALUES ('keep');")
+        .unwrap();
+    drop(connection);
+    let before = std::fs::read(&path).unwrap();
+    let (state, _) = state();
+    let mut config = state.sharing.config.clone().unwrap();
+    config.storage_path = Some(path.clone());
+    assert!(Sharing::open(Some(config)).await.is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }

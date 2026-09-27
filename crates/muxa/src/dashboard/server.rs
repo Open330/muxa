@@ -478,7 +478,8 @@ pub async fn serve(
             ..CollaborationOptions::default()
         })
     });
-    let state = AppState::new(store, config.clone(), pane_cache, sessions)
+    let sharing = super::sharing::Sharing::open(config.sharing.clone()).await?;
+    let mut state = AppState::new(store, config.clone(), pane_cache, sessions)
         .with_collaboration(collaboration)
         .with_backends(backends)
         .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
@@ -486,6 +487,7 @@ pub async fn serve(
         .with_stats_config(runtime.stats_config)
         .with_message_skills(runtime.message_skills)
         .with_fleet(runtime.fleet);
+    state.sharing = sharing;
     let app = router(state);
     let listener = TcpListener::bind(config.bind).await?;
     let local = listener.local_addr()?;

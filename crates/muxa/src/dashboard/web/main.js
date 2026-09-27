@@ -304,7 +304,7 @@ function showToast(msg) {
 function renderAccess() {
   const access = store.access;
   const editing = access.writeAuthorized;
-  document.querySelector("#manage-shares").hidden = !(editing && access.paneSharingAvailable);
+  document.querySelector("#manage-shares").hidden = !editing;
   const canStartWork = editing && access.workStartAvailable;
   dom.accessMode.textContent = editing
     ? "edit unlocked"

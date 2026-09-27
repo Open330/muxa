@@ -29,31 +29,35 @@ type Client = CoreClient<
 >;
 
 impl Sharing {
-    async fn client(&self) -> Result<(Client, reqwest::Client), ()> {
+    pub(super) async fn client(&self) -> Result<(Client, reqwest::Client), ()> {
         let config = self.config.as_ref().ok_or(())?;
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|_| ())?;
-        let cached = self
-            .metadata
-            .lock()
-            .await
+        let http = self
+            .http
+            .get_or_init(|| {
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .ok()
+            })
             .as_ref()
-            .filter(|(at, _)| at.elapsed() < LOGIN_TTL)
-            .map(|(_, metadata)| metadata.clone());
-        let metadata = if let Some(metadata) = cached {
-            metadata
-        } else {
-            let metadata = CoreProviderMetadata::discover_async(
-                IssuerUrl::new(config.issuer_url.clone()).map_err(|_| ())?,
-                &http,
-            )
-            .await
-            .map_err(|_| ())?;
-            *self.metadata.lock().await = Some((Instant::now(), metadata.clone()));
-            metadata
+            .ok_or(())?
+            .clone();
+        let metadata = {
+            // Single flight discovery and shared connections bound provider traffic.
+            let mut cache = self.metadata.lock().await;
+            if let Some((_, metadata)) = cache.as_ref().filter(|(at, _)| at.elapsed() < LOGIN_TTL) {
+                metadata.clone()
+            } else {
+                let metadata = CoreProviderMetadata::discover_async(
+                    IssuerUrl::new(config.issuer_url.clone()).map_err(|_| ())?,
+                    &http,
+                )
+                .await
+                .map_err(|_| ())?;
+                *cache = Some((Instant::now(), metadata.clone()));
+                metadata
+            }
         };
         if !secure_url(metadata.authorization_endpoint().url())
             || metadata
@@ -63,7 +67,13 @@ impl Sharing {
             return Err(());
         }
         let secret = match &config.client_secret_env {
-            Some(name) => Some(ClientSecret::new(std::env::var(name).map_err(|_| ())?)),
+            Some(name) => {
+                let value = std::env::var(name).map_err(|_| ())?;
+                if value.trim().is_empty() {
+                    return Err(());
+                }
+                Some(ClientSecret::new(value))
+            }
             None => None,
         };
         let client = CoreClient::from_provider_metadata(
@@ -121,15 +131,12 @@ fn with_cookie(
     response
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub(super) struct LoginQuery {
     share: String,
 }
 
-pub(super) async fn begin(
-    State(state): State<AppState>,
-    Query(query): Query<LoginQuery>,
-) -> Response {
+async fn begin_inner(State(state): State<AppState>, Query(query): Query<LoginQuery>) -> Response {
     let config = match sharing_config(&state) {
         Ok(config) => config,
         Err((status, message)) => return error(status, message),
@@ -168,6 +175,7 @@ pub(super) async fn begin(
             Nonce::new_random,
         )
         .add_scope(Scope::new("email".into()))
+        .add_extra_param("prompt", "select_account")
         .set_pkce_challenge(challenge)
         .url();
     let browser = random_secret();
@@ -175,7 +183,14 @@ pub(super) async fn begin(
     registry
         .logins
         .retain(|_, flow| flow.expires > Instant::now());
-    if registry.logins.len() >= 128 {
+    if registry.logins.len() >= 128
+        || registry
+            .logins
+            .values()
+            .filter(|flow| flow.share == query.share)
+            .count()
+            >= 8
+    {
         return error(StatusCode::TOO_MANY_REQUESTS, "too many pending logins");
     }
     registry.logins.insert(
@@ -199,11 +214,11 @@ pub(super) async fn begin(
 
 #[derive(Deserialize)]
 pub(super) struct CallbackQuery {
-    code: String,
+    code: Option<String>,
     state: String,
 }
 
-pub(super) async fn callback(
+async fn callback_inner(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
@@ -212,7 +227,12 @@ pub(super) async fn callback(
         Ok(config) => config,
         Err((status, message)) => return error(status, message),
     };
-    if query.code.len() > 4096 || query.state.len() > 256 {
+    if query
+        .code
+        .as_ref()
+        .is_none_or(|code| code.is_empty() || code.len() > 4096)
+        || query.state.len() > 256
+    {
         return error(StatusCode::BAD_REQUEST, "invalid login response");
     }
     let Some(browser) = cookie(&headers, cookie_name(config, true)) else {
@@ -232,7 +252,13 @@ pub(super) async fn callback(
         }
         registry.logins.remove(&query.state).expect("checked flow")
     };
-    let Ok(session) = authenticate(&state.sharing, &query.code, &pending).await else {
+    let Ok(session) = authenticate(
+        &state.sharing,
+        query.code.as_deref().expect("checked code"),
+        &pending,
+    )
+    .await
+    else {
         return error(StatusCode::UNAUTHORIZED, "login verification failed");
     };
     let grant = state
@@ -246,10 +272,13 @@ pub(super) async fn callback(
     let Some(grant) = grant else {
         return error(StatusCode::NOT_FOUND, "share unavailable");
     };
-    if let Err((status, message)) =
-        super::routes::authorize(&mut *grant.lock().await, &session, false)
-    {
+    let mut grant = grant.lock_owned().await;
+    if let Err((status, message)) = super::routes::authorize(&mut grant, &session, false) {
         return error(status, message);
+    }
+    match state.sharing.persist(grant).await {
+        Ok(guard) => drop(guard),
+        Err((status, message)) => return error(status, message),
     }
     let mut registry = state.sharing.registry.lock().await;
     registry
@@ -319,4 +348,69 @@ pub(super) async fn logout(State(state): State<AppState>, headers: HeaderMap) ->
         state.sharing.registry.lock().await.sessions.remove(&secret);
     }
     with_cookie(StatusCode::NO_CONTENT.into_response(), config, false, "", 0)
+}
+
+pub(super) async fn logout_all(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let config = match sharing_config(&state) {
+        Ok(config) => config,
+        Err((status, message)) => return error(status, message),
+    };
+    let mut registry = state.sharing.registry.lock().await;
+    if let Some(secret) = cookie(&headers, cookie_name(config, false)) {
+        if let Some(current) = registry
+            .sessions
+            .get(&secret)
+            .filter(|s| s.expires > Instant::now())
+            .cloned()
+        {
+            registry
+                .sessions
+                .retain(|_, session| session.subject != current.subject);
+        }
+    }
+    with_cookie(StatusCode::NO_CONTENT.into_response(), config, false, "", 0)
+}
+
+fn browser_result(response: Response, headers: &HeaderMap, share: Option<&str>) -> Response {
+    if response.status().is_success()
+        || response.status().is_redirection()
+        || !headers
+            .get(header::ACCEPT)
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|accept| accept.contains("text/html"))
+    {
+        return response;
+    }
+    if let Some(share) = share.filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Redirect::to(&format!("/share/{share}#login-error")).into_response();
+    }
+    (response.status(), axum::response::Html("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"stylesheet\" href=\"/static/share.css\"><title>Sign-in failed · muxa</title><main><h1>Sign-in could not be completed</h1><p>The login may have expired or been cancelled. Open your invitation link again and sign in with the invited account.</p></main></html>")).into_response()
+}
+
+pub(super) async fn begin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LoginQuery>,
+) -> Response {
+    let share = query.share.clone();
+    let response = begin_inner(State(state), Query(query)).await;
+    browser_result(response, &headers, Some(&share))
+}
+
+pub(super) async fn callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CallbackQuery>,
+) -> Response {
+    let share = state
+        .sharing
+        .registry
+        .lock()
+        .await
+        .logins
+        .get(&query.state)
+        .map(|flow| flow.share.clone());
+    let response = callback_inner(State(state), headers.clone(), Query(query)).await;
+    browser_result(response, &headers, share.as_deref())
 }

@@ -1,0 +1,43 @@
+const { chromium } = require(process.env.MUXA_PLAYWRIGHT_PACKAGE || 'playwright');
+(async()=>{
+ const browser=await chromium.launch({executablePath:process.env.MUXA_TEST_CHROMIUM,headless:true,args:['--no-sandbox']});
+ try {
+  const owner=await browser.newContext();const page=await owner.newPage();const origin=process.argv[2];
+  page.on('pageerror',e=>console.error('PAGEERROR',e)); page.on('response',async r=>{if(r.url().includes('/api/shares'))console.log('SHARE',r.status(),await r.text())});
+  await page.goto(origin+'/#token=operator');
+  await page.locator('[data-collapse-target="data-panel"]').click();
+  await page.locator('[data-tab="panes"]').click();
+  await page.locator('#panes-tbody [data-pane-action="share"]').first().click();
+  await page.getByRole('button',{name:'Check login setup'}).click();
+  await page.waitForFunction(()=>document.querySelector('.share-message').textContent.includes('reachable'));
+  await page.locator('[name=email]').fill('guest@example.com');await page.locator('[name=permission]').selectOption('prompt');await page.locator('[name=scope]').selectOption('window');await page.getByRole('button',{name:'Create share',exact:true}).click();
+  const link=page.getByLabel('Share link');await link.waitFor();const url=await link.inputValue();
+  const guest=await browser.newContext();const shared=await guest.newPage();shared.on('pageerror',e=>console.error('GUESTERROR',e));
+  await shared.goto(url);await shared.locator('#login').click();await shared.waitForURL(url);await shared.locator('#prompt').waitFor();await shared.locator('#pane').selectOption('%1');await shared.waitForFunction(()=>document.querySelector('#identity').textContent.startsWith('%1'));
+  await fetch(process.argv[4]+'/test/add-pane',{method:'POST'});
+  const uninvitedPane=await shared.evaluate(async()=> (await fetch(location.pathname.replace('/share/','/share/api/')+'?pane=%252')).status);
+  if(uninvitedPane!==403)throw Error('new pane inherited permission '+uninvitedPane);
+  let firstPayload;shared.on('request',r=>{if(r.url().endsWith('/prompt')&&!firstPayload)firstPayload=r.postDataJSON()});
+  await shared.locator('#prompt').fill('muxa-browser-marker');await shared.locator('#send').click();
+  await shared.waitForFunction(()=>document.querySelector('#output').textContent.includes('muxa-browser-marker'));
+  await fetch(process.argv[4]+'/test/restart',{method:'POST'});
+  await shared.reload();await shared.locator('#login').click();await shared.waitForURL(url);await shared.locator('#prompt').waitFor();await shared.locator('#pane').selectOption('%1');await shared.waitForFunction(()=>document.querySelector('#identity').textContent.startsWith('%1'));
+  const replay=await shared.evaluate(async payload=>(await fetch(location.pathname.replace('/share/','/share/api/')+'/prompt',{method:'POST',headers:{'Content-Type':'application/json','X-Muxa-Share':'1'},body:JSON.stringify(payload)})).status,firstPayload);
+  if(replay!==200)throw Error('receipt replay failed '+replay);
+  await guest.setOffline(true);await shared.waitForFunction(()=>document.querySelector('#send').disabled);
+  await guest.setOffline(false);await shared.waitForFunction(()=>!document.querySelector('#send').disabled);
+  await shared.route('**/prompt',async route=>{await route.fetch();await route.abort('failed')});
+  await shared.locator('#prompt').fill('muxa-response-loss-marker');await shared.locator('#send').click();
+  await shared.waitForFunction(()=>document.querySelector('#command-status').textContent.includes('uncertain'));
+  await shared.unroute('**/prompt');await shared.locator('#send').click();
+  await shared.waitForFunction(()=>document.querySelector('#command-status').textContent==='Command submitted.');
+  await shared.waitForFunction(()=>document.querySelector('#output').textContent.includes('muxa-response-loss-marker'));
+  const output=await shared.locator('#output').textContent();
+  if(output.split('muxa-response-loss-marker').length!==3||output.split('muxa-browser-marker').length!==3)throw Error('command duplicated '+output);
+  await shared.screenshot({path:process.argv[3]+'/recipient.png',fullPage:true});
+  const denied=await shared.evaluate(async()=> (await fetch('/api/panes')).status);if(denied!==401)throw Error('recipient escalated '+denied);
+  await page.getByRole('button',{name:'Revoke',exact:true}).click();
+  await shared.waitForFunction(()=>document.querySelector('#output').textContent===''&&document.querySelector('#prompt-form').hidden);
+  console.log(JSON.stringify({ownerCreate:true,oidcLogin:true,tmuxPrompt:true,operatorIsolation:denied,revocation:true,restart:true,duplicatePrevention:true,lostResponseRecovery:true,offlineRecovery:true,windowSelection:true,newPaneIsolation:true}));
+ } finally {await browser.close()}
+})().catch(e=>{console.error(e);process.exit(1)});

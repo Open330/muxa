@@ -1,6 +1,9 @@
-//! Temporary pane shares. Recipient sessions never authorize operator APIs.
+//! Durable pane shares. Recipient sessions never authorize operator APIs.
+mod admin;
 mod login;
 mod routes;
+mod storage;
+mod targets;
 #[cfg(test)]
 mod tests;
 
@@ -22,6 +25,8 @@ pub struct SharingConfig {
     pub client_id: String,
     /// Environment variable name; the secret itself is never serialized.
     pub client_secret_env: Option<String>,
+    /// Optional private SQLite file; defaults to the XDG data directory.
+    pub storage_path: Option<std::path::PathBuf>,
 }
 
 impl SharingConfig {
@@ -40,6 +45,13 @@ impl SharingConfig {
         }
         if public.path() != "/" || self.client_id.trim().is_empty() {
             return Err("public_url must be an origin; client_id is required".into());
+        }
+        if self
+            .storage_path
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute() || path.file_name().is_none())
+        {
+            return Err("storage_path must be an absolute file path".into());
         }
         if self.client_secret_env.as_ref().is_some_and(|name| {
             name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
@@ -91,7 +103,7 @@ pub enum Permission {
     Prompt,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Target {
     socket: String,
     key: PaneKey,
@@ -103,6 +115,8 @@ struct Target {
 struct Grant {
     id: String,
     target: Target,
+    window: bool,
+    peers: Vec<Target>,
     email: String,
     subject: Option<String>,
     permission: Permission,
@@ -110,7 +124,9 @@ struct Grant {
     expires_at: i64,
     revoked: bool,
     last_prompt: Option<Instant>,
-    capture: Option<(Instant, String)>,
+    capture: Option<(Instant, String, String)>,
+    deliveries: HashMap<String, Delivery>,
+    dirty: bool,
 }
 
 #[derive(Clone)]
@@ -135,22 +151,36 @@ struct Registry {
     logins: HashMap<String, PendingLogin>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct Delivery {
+    digest: String,
+    outcome: String,
+}
+
+type ExecutionLocks = HashMap<(String, String), std::sync::Weak<Mutex<()>>>;
+
 pub struct Sharing {
+    storage: Option<Arc<storage::Storage>>,
     config: Option<SharingConfig>,
     registry: Mutex<Registry>,
+    http: std::sync::OnceLock<Option<reqwest::Client>>,
     metadata: Mutex<Option<(Instant, openidconnect::core::CoreProviderMetadata)>>,
     login_slots: Semaphore,
     pane_slots: Arc<Semaphore>,
+    execution_locks: std::sync::Mutex<ExecutionLocks>,
 }
 
 impl Sharing {
     pub(super) fn new(config: Option<SharingConfig>) -> Arc<Self> {
         Arc::new(Self {
+            storage: None,
             config,
             registry: Mutex::new(Registry::default()),
+            http: std::sync::OnceLock::new(),
             metadata: Mutex::new(None),
             login_slots: Semaphore::new(4),
             pane_slots: Arc::new(Semaphore::new(8)),
+            execution_locks: std::sync::Mutex::new(HashMap::new()),
         })
     }
 }
