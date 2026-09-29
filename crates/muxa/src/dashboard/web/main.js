@@ -3019,9 +3019,15 @@ function renderCollaborationGraph(projection) {
     <g class="collaboration-nodes">${nodes}</g>
   </svg>
   <div class="sr-only"><table><caption>Collaboration graph edge summary</caption><thead><tr><th>From</th><th>To</th><th>Requests</th><th>Replies</th><th>Kind</th><th>Status</th></tr></thead><tbody>${accessibleRows}</tbody></table></div>`;
+  // Center only when the layout size changes; live refreshes of the same
+  // graph must not throw away where the viewer has panned to.
   const canvas = dom.collaborationGraph;
-  canvas.scrollLeft = (canvas.scrollWidth - canvas.clientWidth) / 2;
-  canvas.scrollTop = (canvas.scrollHeight - canvas.clientHeight) / 2;
+  const size = `${width}x${height}`;
+  if (canvas.dataset.graphSize !== size) {
+    canvas.dataset.graphSize = size;
+    canvas.scrollLeft = (canvas.scrollWidth - canvas.clientWidth) / 2;
+    canvas.scrollTop = (canvas.scrollHeight - canvas.clientHeight) / 2;
+  }
 }
 
 function renderCollaborationSequence() {
