@@ -93,6 +93,15 @@ Legacy `?token=...` URLs are still accepted for compatibility and immediately
 scrubbed, but fragments are the supported bootstrap format because browsers do
 not send them in HTTP requests or `Referer` headers.
 
+A browser that can read nothing (reads return 401: no operator session and no
+working token) gets a landing page instead of an empty dashboard. It says what
+muxa is and offers the ways in: **Sign in** when
+[operator sign-in](#operator-sign-in-with-oidc) is configured, and **Use access
+token**, which stores the token like `#token=` and reloads. A stored token that
+the server rejects is reported there. `public_read` and `auth = "none"`
+dashboards never show it, since their reads succeed without credentials. The
+page is served from the daemon itself and loads nothing from other origins.
+
 ### Loopback-only without authentication (dev / single-user)
 
 Disabling auth requires an explicit opt-out:

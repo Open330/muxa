@@ -1,5 +1,6 @@
 import { openShareManager } from "./sharing-admin.mjs";
 import { openAccessManager } from "./operators-admin.mjs";
+import { renderLanding } from "./landing.mjs";
 import { logicalWorkKey, normalizeAgent, validateWorkSnapshot, WORK_STAGES } from "./work-model.mjs";
 import {
   collaborationSequence,
@@ -126,22 +127,32 @@ function normalizeLogin(data) {
   };
 }
 
-// A read came back 401. If the server offers sign-in, show that instead of
-// a dead connection; the rest of boot waits for the browser to come back
-// from the provider with a session.
-async function offerSignIn() {
+// A read came back 401: this browser has neither an operator session nor a
+// token that works. Show the landing page with the ways in (sign-in when
+// the server has a provider, and the token) instead of an empty dashboard.
+// Boot and polling stop here; signing in or entering a token reloads.
+async function showLanding() {
+  if (store.access.signInRequired) return;
+  store.access.signInRequired = true;
   try {
     const resp = await fetch("/auth/session", { credentials: "same-origin", cache: "no-store" });
-    if (!resp.ok) return false;
-    store.access.login = normalizeLogin(await resp.json());
+    if (resp.ok) store.access.login = normalizeLogin(await resp.json());
   } catch (_) {
-    return false;
+    // No session endpoint: the token is the only way in.
   }
-  if (!store.access.login.available) return false;
-  store.access.signInRequired = true;
-  setConnectionStatus("dead", "sign in required");
-  renderAccess();
-  return true;
+  document.body.dataset.view = "landing";
+  renderLanding(dom.landing, {
+    login: store.access.login,
+    tokenRejected: Boolean(localStorage.getItem(TOKEN_KEY)),
+    actions: {
+      signIn,
+      signOut,
+      useToken(token) {
+        localStorage.setItem(TOKEN_KEY, token);
+        window.location.reload();
+      },
+    },
+  });
 }
 
 function signIn() {
@@ -200,7 +211,7 @@ async function jsonFetch(path, options = {}) {
     headers: { ...authHeaders(), ...(options.headers || {}) },
   });
   if (resp.status === 401) {
-    if (!(await offerSignIn())) setConnectionStatus("dead", "401 — bad or missing token");
+    await showLanding();
     throw new Error("unauthorized");
   }
   if (!resp.ok) {
@@ -252,7 +263,7 @@ async function streamEvents(onEvent, onLagged) {
         headers: { ...authHeaders(), Accept: "text/event-stream" },
       });
       if (resp.status === 401) {
-        if (!(await offerSignIn())) setConnectionStatus("dead", "401 — bad or missing token");
+        await showLanding();
         return;
       }
       if (!resp.ok || !resp.body) {
@@ -312,6 +323,7 @@ async function streamEvents(onEvent, onLagged) {
 // ── Connection indicator ──────────────────────────────────────────
 
 const dom = {
+  landing: document.getElementById("landing"),
   accessMode: document.getElementById("access-mode"),
   editAccess: document.getElementById("edit-access"),
   operatorLogin: document.getElementById("operator-login"),
@@ -410,13 +422,11 @@ function renderAccess() {
   document.querySelector("#manage-access").hidden = !(editing && login.available);
   if (dom.upgradeAccess) dom.upgradeAccess.hidden = !canUpgrade;
   const canStartWork = editing && access.workStartAvailable;
-  dom.accessMode.textContent = access.signInRequired
-    ? "signed out"
-    : viaSession
-      ? "signed in"
-      : viewing
-        ? "signed in · view only"
-        : editing
+  dom.accessMode.textContent = viaSession
+    ? "signed in"
+    : viewing
+      ? "signed in · view only"
+      : editing
         ? "edit unlocked"
         : access.mode === "public_read"
           ? "public read-only"
@@ -429,13 +439,11 @@ function renderAccess() {
   dom.accessMode.classList.toggle("edit", editing);
   // The token path stays available next to sign-in: it is the API
   // credential and the way in when the identity provider is down.
-  dom.editAccess.hidden = !(access.writeAvailable || access.signInRequired) || viaSession || canUpgrade;
+  dom.editAccess.hidden = !access.writeAvailable || viaSession || canUpgrade;
   dom.editAccess.disabled = access.mode === "token" && editing;
-  dom.editAccess.textContent = access.signInRequired
-    ? "use token"
-    : editing
-      ? access.mode === "public_read" ? "lock edit" : "PAT active"
-      : "unlock edit";
+  dom.editAccess.textContent = editing
+    ? access.mode === "public_read" ? "lock edit" : "PAT active"
+    : "unlock edit";
   if (dom.operatorLogin) {
     dom.operatorLogin.hidden = !login.available || (editing && !login.signedIn);
     dom.operatorLogin.textContent = login.signedIn ? "sign out" : "sign in";
@@ -479,14 +487,6 @@ function initAccessControl() {
   });
   dom.upgradeAccess?.addEventListener("click", upgradeWithToken);
   dom.editAccess.addEventListener("click", async () => {
-    if (store.access.signInRequired) {
-      // Boot stopped at the 401; start over with the token in place.
-      const token = window.prompt("Muxa dashboard token");
-      if (!token) return;
-      localStorage.setItem(TOKEN_KEY, token.trim());
-      window.location.reload();
-      return;
-    }
     if (store.access.writeAuthorized && store.access.mode === "public_read") {
       localStorage.removeItem(TOKEN_KEY);
       await fetchAccess().catch(() => {});
@@ -3264,7 +3264,7 @@ async function fetchCollaboration({ append = false } = {}) {
         headers: authHeaders(),
       });
       if (resp.status === 401) {
-        setConnectionStatus("dead", "401 — bad or missing token");
+        await showLanding();
         throw new Error("unauthorized");
       }
       if (resp.status === 503) {
@@ -3515,8 +3515,12 @@ async function main() {
     await fetchHealth();
     await fetchAccess();
   } catch (_) {
-    return; // setConnectionStatus already showed the error
+    // A 401 already switched to the landing page; any other failure is a
+    // dashboard problem, shown by setConnectionStatus.
+    if (document.body.dataset.view === "boot") document.body.dataset.view = "dashboard";
+    return;
   }
+  document.body.dataset.view = "dashboard";
 
   await Promise.all([
     fetchAgentsSnapshot(),
@@ -3559,16 +3563,19 @@ async function main() {
 }
 
 async function pollPanes() {
+  if (store.access.signInRequired) return; // landing page: nothing to poll
   if (!document.hidden) await fetchPanes().catch(() => {});
   setTimeout(pollPanes, PANES_REFETCH_INTERVAL_MS);
 }
 
 async function pollWorks() {
+  if (store.access.signInRequired) return; // landing page: nothing to poll
   if (!document.hidden) await fetchWorks().catch(() => {});
   setTimeout(pollWorks, WORK_REFETCH_INTERVAL_MS);
 }
 
 async function pollTerminals() {
+  if (store.access.signInRequired) return; // landing page: nothing to poll
   if (!document.hidden && store.ui.activeTab === "terminals") {
     await fetchTerminalSessions().catch(() => {});
   }
@@ -3576,11 +3583,13 @@ async function pollTerminals() {
 }
 
 async function pollTimeline() {
+  if (store.access.signInRequired) return; // landing page: nothing to poll
   if (!document.hidden) await fetchTimeline().catch(() => {});
   setTimeout(pollTimeline, TIMELINE_REFETCH_INTERVAL_MS);
 }
 
 async function pollCollaboration() {
+  if (store.access.signInRequired) return; // landing page: nothing to poll
   const collapsed = document.getElementById("collaboration-panel")?.classList.contains("collapsed");
   if (!document.hidden && !collapsed) await fetchCollaboration().catch(() => {});
   setTimeout(pollCollaboration, COLLABORATION_REFETCH_INTERVAL_MS);
