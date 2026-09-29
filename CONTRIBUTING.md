@@ -4,6 +4,7 @@
 
 - Rust `1.89+` (workspace-pinned via `rust-version`)
 - `cargo fmt`, `cargo clippy`, `cargo test` — all three are gated in CI
+- Node.js 22+ for the dashboard's JavaScript tests (also gated in CI)
 
 ## Development
 
@@ -13,6 +14,10 @@ cargo build --workspace
 
 # run the full test suite
 cargo test --workspace
+
+# dashboard JavaScript tests (node's built-in runner; pass the files, since
+# `node --test <directory>` does not pick them up)
+node --test crates/muxa/tests-js/*.test.mjs
 
 # lint (CI-equivalent)
 cargo fmt --all -- --check
