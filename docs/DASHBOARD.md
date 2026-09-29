@@ -101,6 +101,8 @@ token**, which stores the token like `#token=` and reloads. A stored token that
 the server rejects is reported there. `public_read` and `auth = "none"`
 dashboards never show it, since their reads succeed without credentials. The
 page is served from the daemon itself and loads nothing from other origins.
+Its dashboard screenshots show a made-up fleet; regenerate them with
+`node scripts/landing-shots/capture.mjs` (Playwright, Chrome and `cwebp`).
 
 ### Loopback-only without authentication (dev / single-user)
 
