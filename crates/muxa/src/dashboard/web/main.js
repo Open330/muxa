@@ -1261,7 +1261,6 @@ function setSelectedWork(workKey) {
   store.ui.terminalCapture = null;
   renderWorkItems();
   renderInspector();
-  openWorkDrawer();
 }
 
 function toggleWorkExecution(workKey) {
@@ -3075,20 +3074,23 @@ function renderCollaborationSequence() {
   const laneWidth = 170;
   const left = 65;
   const width = Math.max(420, left * 2 + Math.max(1, participants.length - 1) * laneWidth);
-  const header = 52;
+  // Lane names live in their own SVG that sticks to the top of the scroll
+  // box, so long histories keep saying who each lifeline belongs to.
+  const headerHeight = 44;
   const rowHeight = 58;
-  const height = header + events.length * rowHeight + 20;
+  const height = 8 + events.length * rowHeight + 20;
   const laneX = (id) => left + (participantIndex.get(id) || 0) * laneWidth;
+  const laneLabels = participants.map((participant, index) => {
+    const x = left + index * laneWidth;
+    return `<text class="sequence-lane-label" text-anchor="middle" x="${x}" y="18">${esc(participant.label).slice(0, 18)}</text>
+      <text class="sequence-lane-subtitle" text-anchor="middle" x="${x}" y="34">${esc(participant.subtitle).slice(0, 20)}</text>`;
+  }).join("");
   const lanes = participants.map((participant, index) => {
     const x = left + index * laneWidth;
-    return `<g class="collaboration-sequence-lane">
-      <text class="sequence-lane-label" text-anchor="middle" x="${x}" y="18">${esc(participant.label).slice(0, 18)}</text>
-      <text class="sequence-lane-subtitle" text-anchor="middle" x="${x}" y="34">${esc(participant.subtitle).slice(0, 20)}</text>
-      <line x1="${x}" x2="${x}" y1="44" y2="${height - 8}"></line>
-    </g>`;
+    return `<g class="collaboration-sequence-lane"><line x1="${x}" x2="${x}" y1="0" y2="${height - 8}"></line></g>`;
   }).join("");
   const rows = events.map((event, index) => {
-    const y = header + index * rowHeight + 25;
+    const y = 8 + index * rowHeight + 25;
     const sx = laneX(event.from);
     const tx = laneX(event.to);
     const labelX = sx === tx ? sx + 44 : (sx + tx) / 2;
@@ -3105,7 +3107,10 @@ function renderCollaborationSequence() {
       <title>${esc(`${event.label} · ${event.request.id || "message"}`)}</title>
     </g>`;
   }).join("");
-  dom.collaborationSequence.innerHTML = `${requests.length > visibleRequests.length ? `<div class="collaboration-cap-note">showing latest ${visibleRequests.length} of ${requests.length} requests</div>` : ""}
+  dom.collaborationSequence.innerHTML = `<div class="collaboration-sequence-head">
+      ${requests.length > visibleRequests.length ? `<div class="collaboration-cap-note">showing latest ${visibleRequests.length} of ${requests.length} requests</div>` : ""}
+      <svg class="collaboration-sequence-svg" viewBox="0 0 ${width} ${headerHeight}" style="min-width:${width}px;height:${headerHeight}px" aria-hidden="true">${laneLabels}</svg>
+    </div>
     <svg class="collaboration-sequence-svg" viewBox="0 0 ${width} ${height}" style="min-width:${width}px;height:${height}px" role="img" aria-label="Chronological request and reply sequence">
       <defs>
         <marker id="sequence-request-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>

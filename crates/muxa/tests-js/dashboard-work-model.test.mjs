@@ -23,6 +23,17 @@ test("uses a stable logical Work identity instead of a tmux binding", () => {
   assert.equal(first.includes("@42"), false);
 });
 
+test("Work keys survive a round trip through an HTML attribute", () => {
+  const key = logicalWorkKey({ workspace_id: "pay/ments", work_id: "settle ment" });
+  // The HTML parser rewrites NUL and other controls, so a key that contains
+  // them no longer matches after being read back from data-* attributes.
+  assert.equal(/[\u0000-\u001f]/.test(key), false);
+  assert.notEqual(
+    logicalWorkKey({ workspace_id: "a", work_id: "b/c" }),
+    logicalWorkKey({ workspace_id: "a/b", work_id: "c" })
+  );
+});
+
 test("keeps attention out of the board-stage vocabulary", () => {
   assert.deepEqual(WORK_STAGES, ["auto", "queued", "in_progress", "review", "done"]);
   assert.equal(WORK_STAGES.includes("attention"), false);

@@ -544,9 +544,10 @@ button, select {
 .execution-pane-row {
   min-height: 32px;
   display: grid;
-  grid-template-columns: 8px minmax(82px, auto) minmax(62px, auto) minmax(80px, 1fr) auto;
+  grid-template-columns: 8px minmax(0, auto) minmax(0, 1fr);
   align-items: center;
-  gap: 7px;
+  gap: 4px 7px;
+  padding: 5px 0;
   border-top: 1px solid var(--border-soft);
   font: 10px/1.2 var(--mono);
 }
@@ -561,6 +562,20 @@ button, select {
 }
 
 .execution-pane-command { color: var(--cyan); }
+
+/* Board cards are narrow: title and controls take their own line. */
+.execution-pane-title,
+.execution-pane-row .control-actions {
+  grid-column: 2 / -1;
+}
+
+.execution-pane-row .control-actions {
+  flex-wrap: wrap;
+}
+
+.execution-pane-row .control-actions:empty {
+  display: none;
+}
 .execution-pane-title { color: var(--fg-muted); }
 
 .inspector-summary {
@@ -576,15 +591,6 @@ button, select {
   border: 0;
 }
 
-.inspector-execution .execution-pane-row {
-  grid-template-columns: 8px minmax(68px, auto) minmax(0, 1fr);
-  padding: 5px 0;
-}
-
-.inspector-execution .execution-pane-title,
-.inspector-execution .control-actions {
-  grid-column: 2 / -1;
-}
 
 .panel.collapsed > .panel-header .filters,
 .data-panel.collapsed > .panel-header .tabs {
@@ -1451,7 +1457,10 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
 
 .work-board {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  /* At most four lanes per row: each track is at least a quarter of the
+     board. The full-width unlinked list keeps auto-fit from collapsing
+     spare tracks, so the cap has to come from the track size. */
+  grid-template-columns: repeat(auto-fit, minmax(max(220px, calc((100% - 30px) / 4)), 1fr));
   align-items: stretch;
   gap: 10px;
   padding: 10px;
@@ -2017,10 +2026,17 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   font: 9px/1 var(--mono);
 }
 
-.collaboration-cap-note {
+.collaboration-sequence-head {
   position: sticky;
   top: 0;
   z-index: 2;
+  width: max-content;
+  min-width: 100%;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface);
+}
+
+.collaboration-cap-note {
   padding: 4px 8px;
   background: var(--surface-2);
   color: var(--yellow);
@@ -2176,6 +2192,13 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
 
 .work-drawer .inspector-body {
   flex: 1 1 auto;
+  overscroll-behavior: contain;
+}
+
+/* The page behind an open drawer must not scroll (narrow screens scroll
+   the document; desktop already locks it). */
+body.drawer-open {
+  overflow: hidden;
 }
 
 .drawer-work-heading {
@@ -2428,10 +2451,6 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
 
   .work-lane {
     min-height: 0;
-  }
-
-  .execution-pane-row {
-    grid-template-columns: 8px minmax(72px, auto) minmax(0, 1fr) auto;
   }
 
   .execution-pane-title {
