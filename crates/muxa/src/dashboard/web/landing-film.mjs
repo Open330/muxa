@@ -205,6 +205,12 @@ export function mountFilm(root, t) {
   observer?.observe(root);
   const onVisibility = () => resume();
   document.addEventListener("visibilitychange", onVisibility);
+  // Camera and spotlight are measured in pixels; re-aim when the stage
+  // resizes (a phone rotating, a window narrowing) mid-scene.
+  const resized = "ResizeObserver" in window
+    ? new ResizeObserver(() => { shownScene = -1; draw(); })
+    : null;
+  resized?.observe($(".film-stage"));
 
   draw();
   resume();
@@ -212,6 +218,7 @@ export function mountFilm(root, t) {
     destroy() {
       if (frame) cancelAnimationFrame(frame);
       observer?.disconnect();
+      resized?.disconnect();
       document.removeEventListener("visibilitychange", onVisibility);
     },
   };
