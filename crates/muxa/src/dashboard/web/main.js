@@ -2918,10 +2918,21 @@ function renderCollaborationRooms(rooms) {
     </button>`).join("");
 }
 
+// Nodes sit on an ellipse whose perimeter leaves roughly one node box of
+// room per participant; the canvas is sized around it so every node is on
+// screen and the SVG can be scaled to the pane.
+const GRAPH_NODE_SPACING = 125;
+const GRAPH_MARGIN_X = 90;
+const GRAPH_MARGIN_Y = 60;
+
+function graphRadii(count) {
+  const radiusX = Math.max(150, (count * GRAPH_NODE_SPACING) / (2 * Math.PI) * 1.15);
+  return { radiusX, radiusY: Math.max(90, radiusX * .62) };
+}
+
 function graphNodePositions(nodes, width, height) {
   if (nodes.length === 1) return new Map([[nodes[0].id, { x: width / 2, y: height / 2 }]]);
-  const radiusX = Math.min(width * .38, Math.max(150, nodes.length * 42));
-  const radiusY = Math.min(height * .34, Math.max(90, nodes.length * 20));
+  const { radiusX, radiusY } = graphRadii(nodes.length);
   const positions = new Map();
   nodes.forEach((node, index) => {
     const angle = -Math.PI / 2 + (index * Math.PI * 2 / nodes.length);
@@ -2952,8 +2963,12 @@ function renderCollaborationGraph(projection) {
     dom.collaborationGraph.innerHTML = `<div class="empty-block">no collaboration messages match these filters</div>`;
     return;
   }
-  const width = Math.max(640, projection.nodes.length * 145);
-  const height = Math.max(320, Math.min(520, projection.nodes.length * 65));
+  const { radiusX, radiusY } = graphRadii(projection.nodes.length);
+  const width = Math.max(560, Math.ceil(radiusX * 2 + GRAPH_MARGIN_X * 2));
+  const height = Math.max(320, Math.ceil(radiusY * 2 + GRAPH_MARGIN_Y * 2));
+  // Scale down to fit the pane, but not below ~60% or labels become unreadable;
+  // past that the pane scrolls (and starts centered, below).
+  const minWidth = Math.min(width, Math.round(width * .6));
   const positions = graphNodePositions(projection.nodes, width, height);
   const nodeById = new Map(projection.nodes.map((node) => [node.id, node]));
   const edges = projection.edges.map((edge, index) => {
@@ -2996,7 +3011,7 @@ function renderCollaborationGraph(projection) {
     <td>${esc(nodeById.get(edge.to)?.label || edge.to)}</td>
     <td>${edge.count}</td><td>${edge.replyCount}</td><td>${esc(dominantCount(edge.kinds))}</td><td>${esc(dominantCount(edge.statuses))}</td>
   </tr>`).join("");
-  dom.collaborationGraph.innerHTML = `<svg class="collaboration-graph-svg" viewBox="0 0 ${width} ${height}" style="min-width:${width}px" role="img" aria-label="Directional collaboration graph">
+  dom.collaborationGraph.innerHTML = `<svg class="collaboration-graph-svg" viewBox="0 0 ${width} ${height}" style="min-width:${minWidth}px" role="img" aria-label="Directional collaboration graph">
     <defs>
       <marker id="collab-request-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
       <marker id="collab-reply-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
@@ -3004,7 +3019,10 @@ function renderCollaborationGraph(projection) {
     <g class="collaboration-edges">${edges}</g>
     <g class="collaboration-nodes">${nodes}</g>
   </svg>
-  <table class="sr-only"><caption>Collaboration graph edge summary</caption><thead><tr><th>From</th><th>To</th><th>Requests</th><th>Replies</th><th>Kind</th><th>Status</th></tr></thead><tbody>${accessibleRows}</tbody></table>`;
+  <div class="sr-only"><table><caption>Collaboration graph edge summary</caption><thead><tr><th>From</th><th>To</th><th>Requests</th><th>Replies</th><th>Kind</th><th>Status</th></tr></thead><tbody>${accessibleRows}</tbody></table></div>`;
+  const canvas = dom.collaborationGraph;
+  canvas.scrollLeft = (canvas.scrollWidth - canvas.clientWidth) / 2;
+  canvas.scrollTop = (canvas.scrollHeight - canvas.clientHeight) / 2;
 }
 
 function renderCollaborationSequence() {
