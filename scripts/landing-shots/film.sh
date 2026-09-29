@@ -83,13 +83,21 @@ tm bind-key q display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa peek"
 cat > "$WORK/bashrc" <<'RC'
 PS1='\[\e[32m\]~/acme\[\e[0m\] $ '
 unset PROMPT_COMMAND
+# The shell under the editor has just run the tests, so the bottom of the
+# screen (where the film zooms in on the status line) is not empty.
+npm() {
+  printf '\n> acme-api@2.4.0 test\n> vitest run src/routes\n\n'
+  printf ' \e[32m✓\e[0m src/routes/orders.test.ts \e[2m(38 tests)\e[0m 412ms\n'
+  printf ' \e[32m✓\e[0m src/routes/limit.test.ts \e[2m(12 tests)\e[0m 96ms\n\n'
+  printf ' \e[1mTests\e[0m  \e[32m50 passed\e[0m (50)\n'
+}
 clear
 RC
 
 # acme:code — where you are working; acme:agents — four agents.
 tm new-session -d -s acme -n code -x "$COLS" -y "$((ROWS - 1))" "cat"
 P_EDIT=$(tm display-message -p -t acme:code.0 '#{pane_id}')
-P_SHELL=$(tm split-window -v -l 7 -d -P -F '#{pane_id}' -t acme:code "env BASH_SILENCE_DEPRECATION_WARNING=1 bash --rcfile '$WORK/bashrc' -i")
+P_SHELL=$(tm split-window -v -l 11 -d -P -F '#{pane_id}' -t acme:code "env BASH_SILENCE_DEPRECATION_WARNING=1 bash --rcfile '$WORK/bashrc' -i")
 paint "$P_EDIT" editor
 tm new-window -d -t acme: -n agents "cat"
 P_PLAN=$(tm display-message -p -t acme:agents.0 '#{pane_id}')
@@ -115,7 +123,9 @@ hook "$P_DEP" codex pre_tool_use '{"session_id":"f-dep","tool_name":"shell"}'
 "$TM_REAL" -L "$OUTER" -f /dev/null new-session -d -s film -x "$COLS" -y "$ROWS" \
   "env -u TMUX TERM=tmux-256color '$MUXA_SANDBOX_TMUX' -u -f '$MUXA_SANDBOX_TMUX_CONFIG' -S '$MUXA_TMUX_SOCKET' attach -t acme:code"
 "$TM_REAL" -L "$OUTER" set-option -g status off
-sleep 2.5
+sleep 1.5
+tm send-keys -t "$P_SHELL" "npm test" Enter
+sleep 1
 
 frames=()
 capture() { # <name>

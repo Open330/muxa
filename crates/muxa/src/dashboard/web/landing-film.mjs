@@ -10,16 +10,18 @@
 
 import { FILM_FRAMES, FILM_SIZE } from "./landing-frames.mjs";
 
-// [frame, duration ms, step, camera]. Steps are what the controls show; the
-// camera ([scale, origin x, origin y]) leans in on the part of the screen
-// the scene is about, since a whole terminal is small at hero size.
+// [frame, duration ms, step, zoom, focus, how]. Steps are what the controls
+// show. A whole terminal is small at hero size, so a scene either zooms in
+// ("zoom": centre the focus element, or the top-left corner without one) or
+// keeps the whole screen and spotlights the focus element ("spot") when it
+// sits at an edge where zooming would frame mostly empty space.
 const SCENES = [
-  ["working", 1800, 0, [1, "0%", "0%"]],
-  ["waiting", 2400, 1, [1.35, "100%", "100%"]],
-  ["typed", 1300, 2, [1.7, "0%", "100%"]],
-  ["attended", 2200, 2, [1.5, "0%", "0%"]],
-  ["peek", 2400, 3, [1, "0%", "0%"]],
-  ["board", 2600, 4, [1, "0%", "0%"]],
+  ["working", 1800, 0, 1, null, "zoom"],
+  ["waiting", 2400, 1, 1, ".film-alert", "spot"],
+  ["typed", 1300, 2, 1.7, ".film-type", "zoom"],
+  ["attended", 2200, 2, 1.5, null, "zoom"],
+  ["peek", 2400, 3, 1, null, "zoom"],
+  ["board", 2600, 4, 1, null, "zoom"],
 ];
 const STARTS = SCENES.reduce((acc, [, ms]) => [...acc, acc[acc.length - 1] + ms], [0]);
 const TOTAL = STARTS[STARTS.length - 1];
@@ -34,15 +36,16 @@ function decorate(name, html) {
     return html.replace(COMMAND, `<span class="film-type">${COMMAND}</span>`);
   }
   if (name === "waiting") {
-    return html.replace(/⚠[^<|]*/, (alert) => `<span class="film-alert">${alert}</span>`);
+    // "⚠ 2 need you": the glyph is pinned to one cell by ansi2html (<i class="c">).
+    return html.replace(/(<i class="c">⚠<\/i>|⚠)([^<|]*)/, (alert) => `<span class="film-alert">${alert.trimEnd()}</span>${alert.slice(alert.trimEnd().length)}`);
   }
   return html;
 }
 
 function markup(t) {
-  const layers = SCENES.map(([name, , , [zoom, ox, oy]], i) => name === "board"
+  const layers = SCENES.map(([name], i) => name === "board"
     ? `<div class="film-layer film-shot" data-scene="${i}"><img src="${esc(t.boardSrc)}" alt="" decoding="async"></div>`
-    : `<div class="film-layer" data-scene="${i}" style="--zoom:${zoom};--ox:${ox};--oy:${oy}"><pre class="film-term">${decorate(name, FILM_FRAMES[name])}</pre></div>`
+    : `<div class="film-layer" data-scene="${i}"><pre class="film-term">${decorate(name, FILM_FRAMES[name])}</pre></div>`
   ).join("");
   const steps = t.steps.map((label, i) => `
     <button type="button" class="film-step" data-film-step="${i}" aria-label="${esc(label)}">
@@ -56,6 +59,8 @@ function markup(t) {
     </div>
     <div class="film-stage" aria-hidden="true" style="--cols:${FILM_SIZE.cols};--rows:${FILM_SIZE.rows}">
       ${layers}
+      <div class="film-spot"></div>
+      <div class="film-callout"></div>
       <div class="film-toast"><b>muxa</b><span>${esc(t.toast)}</span></div>
     </div>
     <div class="film-caption"></div>
@@ -63,6 +68,56 @@ function markup(t) {
       <button type="button" class="film-play" aria-label="${esc(t.pause)}"></button>
       <div class="film-steps">${steps}</div>
     </div>`;
+}
+
+/**
+ * Point the camera for one scene: scale by `zoom` and move the focus
+ * element to the middle of the stage, without showing past the frame's
+ * edges. Measured from the live layout, so it holds at any width and after
+ * the frames are recaptured.
+ */
+function aim(layer, zoom, focus, how) {
+  const term = layer.querySelector(".film-term");
+  if (!term) return;
+  const stage = layer.parentElement;
+  if (how === "spot") {
+    spotlight(stage, term.querySelector(focus));
+    term.style.setProperty("--cam", "none");
+    return;
+  }
+  let x = 0;
+  let y = 0;
+  const target = focus && term.querySelector(focus);
+  if (target) {
+    // The typed command starts zero-width; aim at where it will end up.
+    const cell = term.offsetWidth / FILM_SIZE.cols;
+    const width = Math.max(target.offsetWidth, target.textContent.length * cell);
+    x = stage.clientWidth / 2 - zoom * (target.offsetLeft + width / 2);
+    y = stage.clientHeight / 2 - zoom * (target.offsetTop + target.offsetHeight / 2);
+  }
+  x = Math.min(0, Math.max(stage.clientWidth - zoom * term.offsetWidth, x));
+  y = Math.min(0, Math.max(stage.clientHeight - zoom * term.offsetHeight, y));
+  term.style.setProperty("--cam", `translate(${x}px, ${y}px) scale(${zoom})`);
+}
+
+/** Place the spotlight ring and the enlarged callout over `target`. */
+function spotlight(stage, target) {
+  if (!target) return;
+  // Unscaled layer, so offsets inside the term are stage coordinates.
+  const pad = 4;
+  const x = target.offsetLeft - pad;
+  const y = target.offsetTop - pad;
+  const w = target.offsetWidth + pad * 2;
+  const h = target.offsetHeight + pad * 2;
+  stage.style.setProperty("--spot-x", `${x}px`);
+  stage.style.setProperty("--spot-y", `${y}px`);
+  stage.style.setProperty("--spot-w", `${w}px`);
+  stage.style.setProperty("--spot-h", `${h}px`);
+  const callout = stage.querySelector(".film-callout");
+  callout.textContent = target.textContent.trim();
+  // Right-align the callout with the target, clear of the stage edge.
+  stage.style.setProperty("--callout-right", `${Math.max(8, stage.clientWidth - (x + w))}px`);
+  stage.style.setProperty("--callout-bottom", `${stage.clientHeight - y + 10}px`);
 }
 
 const PLAY_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.5v9l7-4.5z"/></svg>`;
@@ -95,7 +150,11 @@ export function mountFilm(root, t) {
     if (scene !== shownScene) {
       shownScene = scene;
       root.dataset.scene = SCENES[scene][0];
-      $$(".film-layer").forEach((layer) => layer.classList.toggle("on", Number(layer.dataset.scene) === scene));
+      $$(".film-layer").forEach((layer) => {
+        const on = Number(layer.dataset.scene) === scene;
+        if (on) aim(layer, SCENES[scene][3], SCENES[scene][4], SCENES[scene][5]);
+        layer.classList.toggle("on", on);
+      });
       $(".film-caption").innerHTML = t.captions[step];
     }
     $$(".film-step").forEach((button, i) => {
@@ -146,6 +205,12 @@ export function mountFilm(root, t) {
   observer?.observe(root);
   const onVisibility = () => resume();
   document.addEventListener("visibilitychange", onVisibility);
+  // Camera and spotlight are measured in pixels; re-aim when the stage
+  // resizes (a phone rotating, a window narrowing) mid-scene.
+  const resized = "ResizeObserver" in window
+    ? new ResizeObserver(() => { shownScene = -1; draw(); })
+    : null;
+  resized?.observe($(".film-stage"));
 
   draw();
   resume();
@@ -153,6 +218,7 @@ export function mountFilm(root, t) {
     destroy() {
       if (frame) cancelAnimationFrame(frame);
       observer?.disconnect();
+      resized?.disconnect();
       document.removeEventListener("visibilitychange", onVisibility);
     },
   };
