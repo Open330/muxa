@@ -10,7 +10,10 @@ export function openShareManager(target, request) {
     <p>The invited account can see the selected panes. Window sharing includes the panes present when you create the link. Prompt access can run commands in it. The link survives daemon restarts while this pane process remains alive.</p>
     <button type="submit">Create share</button>
     </form><p class="share-message" role="status"></p><div class="share-setup"></div><div class="share-list"></div><button type="button" class="share-close">Close</button>`;
-  dialog.querySelector(".share-target").textContent = target ? `Pane ${target.pane}` : "";
+  dialog.querySelector(".share-target").textContent = target
+    ? (target.scope === "window" ? `Window ${target.label || ""} (via pane ${target.pane})` : `Pane ${target.pane}`)
+    : "";
+  if (target?.scope === "window") dialog.querySelector("select[name=scope]").value = "window";
   dialog.querySelector("form").hidden = !target;
   const message = dialog.querySelector(".share-message");
   const list = dialog.querySelector(".share-list");

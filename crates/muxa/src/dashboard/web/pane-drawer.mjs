@@ -41,7 +41,8 @@ export function parsePaneHash(hash) {
 export function withPaneHash(hash, target) {
   const params = new URLSearchParams(String(hash || "").replace(/^#/, ""));
   params.delete("pane");
-  params.delete("socket");
+  // A navigator selection (#session/#window) shares the socket parameter.
+  if (!params.get("session") && !params.get("window")) params.delete("socket");
   if (target?.pane) {
     params.set("pane", target.pane);
     if (target.socket) params.set("socket", target.socket);

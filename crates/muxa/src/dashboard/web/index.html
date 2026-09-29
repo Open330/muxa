@@ -81,6 +81,35 @@
         </div>
       </section>
 
+      <section class="panel topology-panel" id="topology-panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <button class="collapse-btn" type="button" data-collapse-target="topology-panel" aria-expanded="true" aria-controls="topology-content" title="Collapse sessions">
+              <span aria-hidden="true">⌄</span>
+            </button>
+            <h2>Sessions</h2>
+            <span class="panel-meta" id="topology-meta"></span>
+          </div>
+          <input
+            id="topology-filter"
+            class="topology-filter"
+            type="search"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="filter: session, window, cwd, agent…"
+            aria-label="Filter sessions, windows and panes"
+          />
+        </div>
+        <div class="panel-content topology-content" id="topology-content">
+          <nav class="topology-tree-wrap" aria-label="Sessions, windows and panes">
+            <ul class="topology-tree" id="topology-tree" role="tree" aria-label="Sessions">
+              <li class="empty-block">loading…</li>
+            </ul>
+          </nav>
+          <section class="topology-detail" id="topology-detail" aria-label="Selection"></section>
+        </div>
+      </section>
+
       <section class="panel work-items-panel" id="work-items-panel">
         <div class="panel-header">
           <div class="panel-title">

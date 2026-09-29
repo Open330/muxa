@@ -39,6 +39,7 @@ bound to loopback and configure the public origin as described below.
 | `GET /api/terminal-sessions` | Muxa-owned PTY sessions.                                           |
 | `GET /api/timeline` | Timeline document from `activity.ndjson` plus currently-open agent/tmux spans. |
 | `GET /api/events`   | SSE stream: `snapshot` (initial), `transition` (live), `lagged` (backpressure)|
+| `GET /api/windows/{window}/layout?socket=` | Pane geometry (`left`/`top`/`width`/`height` in cells, `active`, `zoomed`) for one tmux window. |
 | `GET /api/panes/{pane}/output?socket=&lines=N` | Operator only: `{ pane, text, captured_at }`, the pane's newest `N` lines (default 200, max 1000; 64 KiB cap) as plain text, escapes stripped. |
 | `POST /api/panes/{pane}/prompt` | Send and optionally submit text to a pane.                       |
 | `POST /api/panes/{pane}/abort` | Send Ctrl-C to a pane.                                             |
@@ -300,11 +301,52 @@ for a useful summary graph. Use `auth = "token"` for private full-detail
 history; a PAT cannot unlock details while the server is configured as
 `public_read`.
 
+## Sessions, windows and panes
+
+muxa tracks every agent by where it runs: a tmux (or rmux) **session**, a
+**window** in it, and a **pane** in that window. The **Sessions** panel near
+the top of the page is organized the same way.
+
+- **Tree.** Sessions → windows → panes, built from `/api/panes` (which
+  carries the socket, session, window and pane ids) joined with the agents
+  list by pane id and socket. Each node shows its agent kinds, pane and agent
+  counts (`3p · 2a`) and a rolled-up state: the most urgent state below it,
+  in the order error, waiting (input or choice), working, starting, idle,
+  stopped. With more than one tmux server the top level is the socket. The
+  tree is keyboard navigable (↑/↓, → expands or enters, ← collapses or goes
+  up, Home/End, Enter selects). The filter box matches session and window
+  names, working directories, commands and agent kinds; several words must
+  all match along one session → window → pane path.
+- **Session view.** Selecting a session lists its windows with their rolled-up
+  state. With nothing selected, the panel lists the windows that need
+  attention.
+- **Window view.** Selecting a window draws its panes the way tmux lays them
+  out, from `GET /api/windows/{window}/layout` (tmux's own pane geometry; a
+  zoomed window shows only its zoomed pane, and other hosts or a geometry
+  that no longer matches the pane list fall back to a plain grid). Each tile shows the pane,
+  its agent kind and state, working directory and last prompt; operators also
+  see the pane's last 15 lines, refreshed every 3 seconds while the window is
+  shown and the tab is visible (one request per pane at a time, four at
+  most). Click a tile to open the pane drawer. **share window** invites
+  someone to every pane in the window when sharing is configured.
+- **Agents table.** Still available under Execution inventory; its pane column
+  reads `session › window › pane`, and the session and window parts jump to
+  the navigator.
+
+The selection is kept in the URL fragment: `#session=<name>`,
+`#window=<@id>` (with `&socket=<socket>` when more than one tmux server is
+running) and `#pane=<id>` for an open drawer, so a link restores all three.
+
+The layout endpoint is metadata, so viewers and `public_read` visitors can
+read it; the socket is looked up in the scanned inventory, never used as a
+caller-supplied path. Viewers see the tree and the window layout but no
+output tails and no composer.
+
 ## Talking to an agent
 
-Click an agent in **Execution inventory → Agents** (or a pane in the
-**Panes** tab, or a pane row in a Work card's execution list) to open its
-drawer. The **agents** chip in the header jumps to that table and shows how
+Click a pane tile in the Sessions panel, an agent in **Execution inventory →
+Agents** (or a pane in the **Panes** tab, or a pane row in a Work card's
+execution list) to open its drawer. The **agents** chip in the header jumps to that table and shows how
 many agents are tracked. Rows are focusable: Tab to one and press Enter.
 
 The drawer shows the pane as `session:window.pane`, the agent kind, state,

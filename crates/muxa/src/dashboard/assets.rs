@@ -95,6 +95,7 @@ mod tests {
         assert!(WebAssets::get("operator-enroll.mjs").is_some());
         assert!(WebAssets::get("operators-admin.mjs").is_some());
         assert!(WebAssets::get("pane-drawer.mjs").is_some());
+        assert!(WebAssets::get("topology-model.mjs").is_some());
     }
 
     #[test]

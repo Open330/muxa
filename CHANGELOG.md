@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dashboard **Sessions** navigator organized the way muxa tracks agents:
+  session → window → pane. A keyboard-navigable, filterable tree with
+  rolled-up state (error > waiting > working > idle) and counts; a session
+  view listing windows; and a window view that draws panes with tmux's own
+  geometry (new read route `GET /api/windows/{window}/layout`), with live
+  output tails for operators and a window-scope share button. The Agents
+  table shows `session › window › pane` breadcrumbs, and `#session=`,
+  `#window=` and `#pane=` restore the selection.
 - Dashboard pane drawer for talking to an agent. Clicking an agent or pane
   row opens a drawer with the pane's live output, a composer (Enter sends,
   Shift+Enter adds a line, IME-safe), abort and share; `#pane=<id>` links to
