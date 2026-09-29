@@ -106,6 +106,9 @@ dashboards never show it, since their reads succeed without credentials. The
 page is served from the daemon itself and loads nothing from other origins.
 Its dashboard screenshots show a made-up fleet; regenerate them with
 `node scripts/landing-shots/capture.mjs` (Playwright, Chrome and `cwebp`).
+The hero film is captured from a real muxa in the isolated sandbox (tmux,
+the status line, `muxa attend`, `muxa peek`) with
+`scripts/landing-shots/film.sh`, which writes `landing-frames.mjs`.
 
 ### Loopback-only without authentication (dev / single-user)
 
