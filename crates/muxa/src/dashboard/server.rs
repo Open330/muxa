@@ -2033,18 +2033,25 @@ struct PaneCaptureTarget {
 
 /// Shared validation for the output and output-stream routes. The pane id
 /// and socket are shape-checked before any backend sees them, and the
-/// socket is resolved against the scanned inventory.
+/// socket is resolved against the scanned inventory. The error response is
+/// boxed because `Response` is large enough to trip `result_large_err`.
 async fn resolve_pane_capture(
     state: &AppState,
     pane: &str,
     query: &PaneOutputQuery,
-) -> Result<PaneCaptureTarget, Response> {
+) -> Result<PaneCaptureTarget, Box<Response>> {
     if !valid_pane_id(pane) {
-        return Err(control_error(StatusCode::BAD_REQUEST, "invalid pane id"));
+        return Err(Box::new(control_error(
+            StatusCode::BAD_REQUEST,
+            "invalid pane id",
+        )));
     }
     let requested_socket = query.socket.as_deref().filter(|s| !s.is_empty());
     if requested_socket.is_some_and(|socket| !valid_pane_socket(socket)) {
-        return Err(control_error(StatusCode::BAD_REQUEST, "invalid socket"));
+        return Err(Box::new(control_error(
+            StatusCode::BAD_REQUEST,
+            "invalid socket",
+        )));
     }
     let lines = query
         .lines
@@ -2053,16 +2060,16 @@ async fn resolve_pane_capture(
     let backend = match control_backend(state, pane) {
         Ok(backend) if backend.caps().capture_pane => backend,
         Ok(backend) => {
-            return Err(control_error(
+            return Err(Box::new(control_error(
                 StatusCode::NOT_IMPLEMENTED,
                 format!("{} backend does not support pane capture", backend.kind()),
-            ));
+            )));
         }
-        Err(failure) => return Err(failure.into_response()),
+        Err(failure) => return Err(Box::new(failure.into_response())),
     };
     let socket = control_socket(state, &backend, pane, requested_socket)
         .await
-        .map_err(ControlFailure::into_response)?;
+        .map_err(|failure| Box::new(failure.into_response()))?;
     Ok(PaneCaptureTarget {
         backend,
         socket,
@@ -2081,7 +2088,7 @@ async fn pane_output_handler(
         lines,
     } = match resolve_pane_capture(&state, &pane, &query).await {
         Ok(target) => target,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let pane_for_capture = pane.clone();
     let captured = tokio::task::spawn_blocking(move || {
@@ -2121,7 +2128,7 @@ async fn pane_output_stream_handler(
         lines,
     } = match resolve_pane_capture(&state, &pane, &query).await {
         Ok(target) => target,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let rx = match state
         .pane_streams
