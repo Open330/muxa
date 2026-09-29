@@ -490,7 +490,6 @@ body[data-view="landing"] {
 
 /* The stage is exactly cols × rows cells: the font scales with the width. */
 .film-stage {
-  --cell: calc(100cqw / var(--cols));
   position: relative;
   container-type: inline-size;
   aspect-ratio: calc(var(--cols) * .6) / calc(var(--rows) * 1.2);
