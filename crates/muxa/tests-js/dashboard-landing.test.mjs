@@ -10,18 +10,18 @@ test("landing language: saved choice, then browser preference, then English", ()
   assert.equal(pickLanguage(null, []), "en");
 });
 
-test("landing offers sign-in first when the server has a login provider", () => {
+test("landing offers sign-in when the server has a login provider", () => {
   const access = landingAccess({ available: true, signedIn: false, role: "none" });
   assert.equal(access.signIn, true);
-  assert.equal(access.token, true);
-  assert.equal(access.tokenPrimary, false);
   assert.equal(access.signOut, false);
+  assert.equal(access.linkHint, false);
 });
 
-test("landing falls back to the token when there is no login provider", () => {
+test("without a login provider the landing points at the muxa init link, not a token field", () => {
   const access = landingAccess({ available: false, signedIn: false, role: "none" });
   assert.equal(access.signIn, false);
-  assert.equal(access.tokenPrimary, true);
+  assert.equal(access.linkHint, true);
+  assert.equal("token" in access, false);
 });
 
 test("a signed-in account without access is told so and can sign out", () => {

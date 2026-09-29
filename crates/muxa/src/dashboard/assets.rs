@@ -116,6 +116,7 @@ mod tests {
         assert!(WebAssets::get("landing.mjs").is_some());
         assert!(WebAssets::get("landing-film.mjs").is_some());
         assert!(WebAssets::get("landing-frames.mjs").is_some());
+        assert!(WebAssets::get("landing/mac-icon.webp").is_some());
         assert!(WebAssets::get("landing.css").is_some());
         assert!(WebAssets::get("fonts/LICENSE-nerd-fonts-symbols.txt").is_some());
         for shot in ["board", "collaboration", "agents"] {
