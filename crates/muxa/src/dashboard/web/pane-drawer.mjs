@@ -1,10 +1,11 @@
 // Pane drawer: talk to one agent without leaving the dashboard.
 //
 // Clicking an agent (or pane) row opens a right-side drawer with the pane's
-// live output and a composer. Operators see output (polled from the
-// operator-only /api/panes/{pane}/output) and can send a message, abort or
-// share; everyone else sees the pane's metadata and a "view only" note, and
-// the output endpoint is never called for them.
+// live output and a composer. Operators see output (streamed from the
+// operator-only /api/panes/{pane}/output/stream, or polled from
+// /api/panes/{pane}/output on a daemon without the stream route) and can send
+// a message, abort or share; everyone else sees the pane's metadata and a
+// "view only" note, and the output endpoints are never called for them.
 //
 // The pure helpers at the top carry the rules worth testing without a DOM
 // (tests-js/dashboard-pane-drawer.test.mjs); createPaneDrawer wires them to
@@ -57,13 +58,14 @@ export function isNearBottom({ scrollTop, scrollHeight, clientHeight }) {
   return scrollHeight - scrollTop - clientHeight <= NEAR_BOTTOM_PX;
 }
 
-/// "updated 3s ago" style label for the last successful refresh.
-export function updatedLabel(lastMs, nowMs) {
-  if (!lastMs) return "";
+/// "updated 3s ago" style label for the last successful refresh. With a
+/// live stream the output only arrives when it changes, so the label says
+/// the stream is live and how long ago the pane last changed.
+export function updatedLabel(lastMs, nowMs, live = false) {
+  if (!lastMs) return live ? "live" : "";
   const secs = Math.max(0, Math.floor((nowMs - lastMs) / 1000));
-  if (secs < 60) return `updated ${secs}s ago`;
-  const mins = Math.floor(secs / 60);
-  return `updated ${mins}m ago`;
+  const ago = secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m`;
+  return live ? `live · changed ${ago} ago` : `updated ${ago} ago`;
 }
 
 /// Wire the drawer. `deps` supplies everything that lives in main.js:
@@ -72,6 +74,9 @@ export function updatedLabel(lastMs, nowMs) {
 ///   canShare(target)   — show the share action for this pane?
 ///   describe(target)   — { title, kind, state, model, cwd, activity, command }
 ///   fetchOutput(url)   — GET returning a Response (auth headers attached)
+///   openStream(url, handlers) — open a live output stream (pane-stream.mjs
+///                        openPaneStream with auth headers); optional, the
+///                        drawer polls without it
 ///   controlFetch(url, options) — the dashboard's control fetch (CSRF + auth)
 ///   openShare(target)  — open the existing share dialog
 ///   showToast(msg)
@@ -89,6 +94,11 @@ export function createPaneDrawer(deps) {
   // The output endpoint refused this browser: stop polling until reopened.
   let denied = false;
   let wasOperator = false;
+  // Live stream for the open pane, and whether the daemon lacks the route
+  // (then the drawer polls, as before streams existed).
+  let stream = null;
+  let live = false;
+  let streamUnsupported = !deps.openStream;
 
   const isOpen = () => !el.drawer.hidden;
 
@@ -145,19 +155,96 @@ export function createPaneDrawer(deps) {
   }
 
   function tick() {
-    el.updated.textContent = updatedLabel(lastUpdated, Date.now());
+    el.updated.textContent = updatedLabel(lastUpdated, Date.now(), live);
   }
+
+  const wantsOutput = () => Boolean(target) && isOpen() && deps.isOperator() && !document.hidden && !denied;
 
   function schedule() {
     clearTimeout(timer);
     timer = null;
-    if (!isOpen() || !deps.isOperator() || document.hidden || denied) return;
+    if (!wantsOutput() || !streamUnsupported) return;
     timer = setTimeout(refresh, OUTPUT_REFRESH_MS);
+  }
+
+  function stopStream() {
+    stream?.close();
+    stream = null;
+    live = false;
+  }
+
+  function stopOutput() {
+    stopStream();
+    clearTimeout(timer);
+    timer = null;
+  }
+
+  // Start (or keep) whichever output source applies: the live stream, or
+  // polling when the daemon has no stream route.
+  function startOutput() {
+    if (!wantsOutput()) {
+      stopOutput();
+      return;
+    }
+    if (streamUnsupported) {
+      stopStream();
+      if (!timer && !inFlight) refresh();
+      return;
+    }
+    if (stream) return;
+    const current = generation;
+    const { pane, socket } = target;
+    const params = new URLSearchParams({ lines: String(OUTPUT_LINES) });
+    if (socket) params.set("socket", socket);
+    const handle = deps.openStream(`/api/panes/${encodeURIComponent(pane)}/output/stream?${params}`, {
+      onOutput(payload) {
+        if (current !== generation || stream !== handle) return;
+        setStatus("");
+        setOutput(typeof payload?.text === "string" ? payload.text : "");
+        lastUpdated = Date.now();
+        renderMeta();
+        tick();
+      },
+      onGone() {
+        if (current !== generation || stream !== handle) return;
+        stream = null;
+        live = false;
+        setStatus("This pane has closed.");
+        tick();
+      },
+      onState(state, info) {
+        if (current !== generation || stream !== handle) return;
+        live = state === "live";
+        if (state === "live") {
+          if (el.status.textContent.startsWith("Connection")) setStatus("");
+        } else if (state === "retrying") {
+          setStatus(info?.status === 429
+            ? "Too many live viewers right now; retrying…"
+            : "Connection interrupted; reconnecting…");
+        } else if (state === "denied") {
+          stream = null;
+          denied = true;
+          setStatus("Output needs operator access. Sign in or unlock edit.");
+        } else if (state === "unsupported") {
+          // An older daemon: poll /output instead.
+          stream = null;
+          streamUnsupported = true;
+          refreshNow();
+        }
+        tick();
+      },
+    });
+    stream = handle;
+  }
+
+  // After a send or abort: a live stream shows the result on its own.
+  function nudge() {
+    if (streamUnsupported) refreshNow();
   }
 
   async function refresh() {
     if (!target || !isOpen() || !deps.isOperator() || document.hidden) return;
-    if (inFlight) return;
+    if (inFlight || !streamUnsupported) return;
     inFlight = true;
     const current = generation;
     const { pane, socket } = target;
@@ -202,6 +289,7 @@ export function createPaneDrawer(deps) {
     target = { pane: next.pane, socket: next.socket || null };
     if (!same) {
       generation++;
+      stopOutput();
       firstPaint = true;
       lastUpdated = 0;
       el.output.textContent = "";
@@ -224,16 +312,15 @@ export function createPaneDrawer(deps) {
     (deps.isOperator() ? el.text : el.close).focus();
     if (deps.isOperator()) {
       if (!same) setStatus("Loading output…");
-      refreshNow();
+      startOutput();
     }
   }
 
   function close() {
     if (!isOpen()) return;
     generation++;
-    clearTimeout(timer);
+    stopOutput();
     clearInterval(ticker);
-    timer = null;
     ticker = null;
     const closed = target;
     target = null;
@@ -269,7 +356,7 @@ export function createPaneDrawer(deps) {
         el.text.value = "";
         el.output.scrollTop = el.output.scrollHeight;
         el.jump.hidden = true;
-        refreshNow();
+        nudge();
       }
     } catch (error) {
       el.error.textContent = error?.message || "send failed";
@@ -292,7 +379,7 @@ export function createPaneDrawer(deps) {
         body: JSON.stringify({ socket }),
       });
       deps.showToast(`abort sent to ${pane}`);
-      refreshNow();
+      nudge();
     } catch (error) {
       el.error.textContent = error?.message || "abort failed";
     }
@@ -348,12 +435,9 @@ export function createPaneDrawer(deps) {
   });
   document.addEventListener("visibilitychange", () => {
     if (!isOpen()) return;
-    if (document.hidden) {
-      clearTimeout(timer);
-      timer = null;
-    } else {
-      refreshNow();
-    }
+    // Hidden tab: close the stream (or stop polling); reopen when visible.
+    if (document.hidden) stopOutput();
+    else startOutput();
   });
 
   return {
@@ -369,11 +453,11 @@ export function createPaneDrawer(deps) {
         // Unlocked or signed in while open: start (or stop) reading output.
         wasOperator = operator;
         denied = false;
-        if (!operator) clearTimeout(timer);
+        if (!operator) stopOutput();
       }
       renderMeta();
       renderAccess();
-      if (operator && !denied && !timer && !inFlight) refreshNow();
+      if (operator && !denied) startOutput();
     },
   };
 }

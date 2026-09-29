@@ -2241,9 +2241,14 @@ fn session_via(state: &AppState, via: Via) -> String {
 
 #[tokio::test]
 async fn pane_output_is_for_operators_not_viewers() {
+    for uri in ["/api/panes/%251/output", "/api/panes/%251/output/stream"] {
+        pane_output_route_is_for_operators_not_viewers(uri).await;
+    }
+}
+
+async fn pane_output_route_is_for_operators_not_viewers(uri: &str) {
     let provider = provider().await;
     let state = state(&provider.uri());
-    let uri = "/api/panes/%251/output";
 
     // An operator session is write-authorized and passes the gate on a
     // plain GET, no CSRF proof needed. (No pane backend in this state, so

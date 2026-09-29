@@ -1,5 +1,14 @@
 /* muxa dashboard — dense observability UI, no build step. */
 
+/* Nerd Font glyphs in pane output (prompts, agent status lines). Only the
+   Private Use Areas, so normal text never touches it; see fonts/README.md. */
+@font-face {
+  font-family: "muxa-nerd-symbols";
+  src: url("/static/fonts/muxa-nerd-symbols.woff2") format("woff2");
+  unicode-range: U+E000-F8FF, U+F0000-FFFFF;
+  font-display: swap;
+}
+
 :root {
   --bg: #11110f;
   --surface: #181815;
@@ -17,7 +26,7 @@
   --red: #ff6b5f;
   --cyan: #41c7c7;
   --magenta: #d878d8;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "muxa-nerd-symbols", monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 

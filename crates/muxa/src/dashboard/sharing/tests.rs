@@ -1419,3 +1419,30 @@ async fn recipient_and_operator_sessions_never_cross() {
         StatusCode::UNAUTHORIZED
     );
 }
+
+#[tokio::test]
+async fn share_page_csp_allows_only_same_origin_fonts() {
+    let (state, _) = state();
+    let id = create(&state, "view").await;
+    let response = call(
+        &state,
+        "GET",
+        &format!("/share/{id}"),
+        json!(null),
+        None,
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let csp = response.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    // The bundled Nerd Font symbols load from /static; nothing else widens.
+    assert!(csp.contains("font-src 'self'"), "{csp}");
+    assert!(csp.contains("default-src 'self'"), "{csp}");
+    assert!(csp.contains("script-src 'self'"), "{csp}");
+    assert!(!csp.contains("unsafe"), "{csp}");
+    assert!(!csp.contains("data:"), "{csp}");
+}

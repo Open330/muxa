@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dashboard pane output is live. The drawer and window tiles subscribe to the
+  new operator-only SSE route `GET /api/panes/{pane}/output/stream` instead of
+  polling `/output` every 1.5 s / 3 s. The daemon runs one capture loop per
+  pane only while someone watches, captures every 300 ms and sends the text
+  only when it changed; `gone` reports a closed pane. Streams are bounded (32
+  panes, 8 viewers per pane, 429 beyond; 30-minute lifetime) and a window
+  streams at most six tiles, polling the rest. The client reconnects with
+  backoff, pauses while the tab is hidden, and falls back to polling against
+  a daemon without the route.
+- Dashboard pane output renders Nerd Font icons (powerlevel10k/starship
+  prompts, Claude Code and Codex status lines) instead of empty boxes. The
+  daemon embeds a Private-Use-Area subset of Symbols Nerd Font Mono v3.5.1
+  (MIT; see `crates/muxa/src/dashboard/web/fonts/`), loaded through a
+  `unicode-range` fallback so normal text is unchanged. The shared-pane page's
+  CSP now names `font-src 'self'`.
 - Dashboard **Sessions** navigator organized the way muxa tracks agents:
   session → window → pane. A keyboard-navigable, filterable tree with
   rolled-up state (error > waiting > working > idle) and counts; a session
@@ -53,6 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI runs the dashboard's JavaScript tests
+  (`node --test crates/muxa/tests-js/*.test.mjs`) on Node 22.
 - A 401/403 from a dashboard control request now re-reads `/api/access`
   instead of assuming the credential is gone, so a refused request no longer
   hides an operator's controls until the page is reloaded.

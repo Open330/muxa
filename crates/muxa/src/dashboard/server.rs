@@ -164,6 +164,8 @@ pub struct AppState {
     /// templates the CLI and `muxa_call_peer` expand. One composer, three
     /// front doors.
     message_skills: Arc<BTreeMap<String, String>>,
+    /// Shared capture loops behind `/api/panes/{pane}/output/stream`.
+    pane_streams: Arc<super::pane_stream::PaneStreamHub>,
 }
 
 #[derive(Clone, Default)]
@@ -212,7 +214,21 @@ impl AppState {
                 TimelineSummaryCache::default(),
             )),
             message_skills: Arc::new(BTreeMap::new()),
+            pane_streams: Arc::new(super::pane_stream::PaneStreamHub::new(
+                super::pane_stream::PaneStreamLimits::default(),
+            )),
         }
+    }
+
+    /// Replace the live-output limits (tests shorten the capture interval).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_pane_stream_limits(
+        mut self,
+        limits: super::pane_stream::PaneStreamLimits,
+    ) -> Self {
+        self.pane_streams = Arc::new(super::pane_stream::PaneStreamHub::new(limits));
+        self
     }
 
     #[must_use]
@@ -423,6 +439,10 @@ pub fn router(state: AppState) -> Router {
     // visitor needs the token (401). Being a GET it needs no CSRF proof.
     let operator_read_api = Router::new()
         .route("/api/panes/{pane}/output", get(pane_output_handler))
+        .route(
+            "/api/panes/{pane}/output/stream",
+            get(pane_output_stream_handler),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             write_auth_middleware,
@@ -1986,7 +2006,11 @@ fn valid_pane_socket(socket: &str) -> bool {
 /// screen's trailing blank rows dropped, the newest `lines` lines, and at
 /// most [`PANE_OUTPUT_MAX_BYTES`] bytes cut on a character boundary.
 fn pane_output_text(raw: &str, lines: usize) -> String {
-    let clean = crate::fleet::sanitize_terminal_text(raw);
+    pane_output_tail(&super::pane_stream::clean_capture(raw), lines)
+}
+
+/// The newest `lines` lines of already-sanitized output, byte-bounded.
+fn pane_output_tail(clean: &str, lines: usize) -> String {
     let rows = clean.trim_end().lines().collect::<Vec<_>>();
     let start = rows.len().saturating_sub(lines);
     let mut text = rows[start..].join("\n");
@@ -2000,35 +2024,71 @@ fn pane_output_text(raw: &str, lines: usize) -> String {
     text
 }
 
-async fn pane_output_handler(
-    State(state): State<AppState>,
-    Path(pane): Path<String>,
-    Query(query): Query<PaneOutputQuery>,
-) -> Response {
-    if !valid_pane_id(&pane) {
-        return control_error(StatusCode::BAD_REQUEST, "invalid pane id");
+/// A validated capture request: which backend, which socket, how deep.
+struct PaneCaptureTarget {
+    backend: SharedBackend,
+    socket: Option<String>,
+    lines: usize,
+}
+
+/// Shared validation for the output and output-stream routes. The pane id
+/// and socket are shape-checked before any backend sees them, and the
+/// socket is resolved against the scanned inventory. The error response is
+/// boxed because `Response` is large enough to trip `result_large_err`.
+async fn resolve_pane_capture(
+    state: &AppState,
+    pane: &str,
+    query: &PaneOutputQuery,
+) -> Result<PaneCaptureTarget, Box<Response>> {
+    if !valid_pane_id(pane) {
+        return Err(Box::new(control_error(
+            StatusCode::BAD_REQUEST,
+            "invalid pane id",
+        )));
     }
     let requested_socket = query.socket.as_deref().filter(|s| !s.is_empty());
     if requested_socket.is_some_and(|socket| !valid_pane_socket(socket)) {
-        return control_error(StatusCode::BAD_REQUEST, "invalid socket");
+        return Err(Box::new(control_error(
+            StatusCode::BAD_REQUEST,
+            "invalid socket",
+        )));
     }
     let lines = query
         .lines
         .unwrap_or(PANE_OUTPUT_DEFAULT_LINES)
         .clamp(1, PANE_OUTPUT_MAX_LINES);
-    let backend = match control_backend(&state, &pane) {
+    let backend = match control_backend(state, pane) {
         Ok(backend) if backend.caps().capture_pane => backend,
         Ok(backend) => {
-            return control_error(
+            return Err(Box::new(control_error(
                 StatusCode::NOT_IMPLEMENTED,
                 format!("{} backend does not support pane capture", backend.kind()),
-            );
+            )));
         }
-        Err(failure) => return failure.into_response(),
+        Err(failure) => return Err(Box::new(failure.into_response())),
     };
-    let socket = match control_socket(&state, &backend, &pane, requested_socket).await {
-        Ok(socket) => socket,
-        Err(failure) => return failure.into_response(),
+    let socket = control_socket(state, &backend, pane, requested_socket)
+        .await
+        .map_err(|failure| Box::new(failure.into_response()))?;
+    Ok(PaneCaptureTarget {
+        backend,
+        socket,
+        lines,
+    })
+}
+
+async fn pane_output_handler(
+    State(state): State<AppState>,
+    Path(pane): Path<String>,
+    Query(query): Query<PaneOutputQuery>,
+) -> Response {
+    let PaneCaptureTarget {
+        backend,
+        socket,
+        lines,
+    } = match resolve_pane_capture(&state, &pane, &query).await {
+        Ok(target) => target,
+        Err(response) => return *response,
     };
     let pane_for_capture = pane.clone();
     let captured = tokio::task::spawn_blocking(move || {
@@ -2043,15 +2103,126 @@ async fn pane_output_handler(
             "pane output unavailable: pane gone or backend unreachable",
         );
     };
-    let captured_at = OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
     Json(json!({
         "pane": pane,
         "text": pane_output_text(&raw, lines),
-        "captured_at": captured_at,
+        "captured_at": super::pane_stream::now_rfc3339(),
     }))
     .into_response()
+}
+
+/// Live pane output over SSE, for the drawer and window tiles. Same gate
+/// and validation as [`pane_output_handler`]. The first `output` event is
+/// the current snapshot; later ones are sent only when the text changed,
+/// each carrying the full (bounded) text. `gone` means the pane closed and
+/// is the last event. The stream ends after the configured lifetime and the
+/// client reconnects.
+async fn pane_output_stream_handler(
+    State(state): State<AppState>,
+    Path(pane): Path<String>,
+    Query(query): Query<PaneOutputQuery>,
+) -> Response {
+    let PaneCaptureTarget {
+        backend,
+        socket,
+        lines,
+    } = match resolve_pane_capture(&state, &pane, &query).await {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let rx = match state
+        .pane_streams
+        .subscribe(backend, socket, pane.clone(), lines)
+    {
+        Ok(rx) => rx,
+        Err(error) => return control_error(StatusCode::TOO_MANY_REQUESTS, error.message()),
+    };
+    let lifetime = tokio::time::sleep(state.pane_streams.limits().lifetime);
+    let events = pane_output_events(rx, pane, lines)
+        .take_until(lifetime)
+        .map(Ok::<_, Infallible>);
+    Sse::new(events)
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
+        .into_response()
+}
+
+/// One subscriber's view of a pane channel: its own tail of each capture,
+/// deduplicated so an unchanged tail sends nothing.
+struct PaneOutputSubscriber {
+    rx: tokio::sync::watch::Receiver<super::pane_stream::PaneFrame>,
+    pane: String,
+    lines: usize,
+    last: Option<String>,
+    done: bool,
+}
+
+impl PaneOutputSubscriber {
+    fn event_for(&mut self, frame: super::pane_stream::PaneFrame) -> Option<SseEvent> {
+        use super::pane_stream::PaneFrame;
+        match frame {
+            PaneFrame::Pending => None,
+            PaneFrame::Output { text, captured_at } => {
+                let text = pane_output_tail(&text, self.lines);
+                if self.last.as_deref() == Some(text.as_str()) {
+                    return None;
+                }
+                let event = SseEvent::default()
+                    .event("output")
+                    .json_data(json!({
+                        "pane": self.pane,
+                        "text": text,
+                        "captured_at": &*captured_at,
+                    }))
+                    .ok()?;
+                self.last = Some(text);
+                Some(event)
+            }
+            PaneFrame::Gone => {
+                self.done = true;
+                Some(
+                    SseEvent::default()
+                        .event("gone")
+                        .json_data(json!({ "pane": self.pane }))
+                        .unwrap_or_else(|_| SseEvent::default().event("gone").data("{}")),
+                )
+            }
+        }
+    }
+}
+
+fn pane_output_events(
+    rx: tokio::sync::watch::Receiver<super::pane_stream::PaneFrame>,
+    pane: String,
+    lines: usize,
+) -> impl Stream<Item = SseEvent> + Send {
+    let subscriber = PaneOutputSubscriber {
+        rx,
+        pane,
+        lines,
+        last: None,
+        done: false,
+    };
+    stream::unfold(subscriber, |mut sub| async move {
+        if sub.done {
+            return None;
+        }
+        loop {
+            let frame = sub.rx.borrow_and_update().clone();
+            if let Some(event) = sub.event_for(frame) {
+                return Some((event, sub));
+            }
+            if sub.rx.changed().await.is_err() {
+                // The capture loop ended; report a final `gone` not yet seen.
+                let frame = sub.rx.borrow().clone();
+                return match frame {
+                    super::pane_stream::PaneFrame::Gone => {
+                        sub.event_for(frame).map(|event| (event, sub))
+                    }
+                    _ => None,
+                };
+            }
+        }
+    })
 }
 
 async fn terminal_input_handler(
@@ -5012,9 +5183,10 @@ mod tests {
     }
 
     /// A herdr-kind backend whose capture is canned, recording the history
-    /// depth each capture asked for.
+    /// depth each capture asked for. Tests can change the canned text (or
+    /// set it to `None`, a closed pane) while streams are open.
     struct CaptureBackend {
-        output: String,
+        output: Arc<Mutex<Option<String>>>,
         history: Arc<Mutex<Vec<usize>>>,
     }
 
@@ -5032,7 +5204,7 @@ mod tests {
         }
 
         fn capture_pane(&self, _pane_id: &str) -> Option<String> {
-            Some(self.output.clone())
+            self.output.lock().unwrap().clone()
         }
 
         fn capture_pane_history_on(
@@ -5063,12 +5235,36 @@ mod tests {
     }
 
     fn capture_state(state: AppState, output: &str) -> (AppState, Arc<Mutex<Vec<usize>>>) {
-        let history = Arc::new(Mutex::new(Vec::new()));
+        let (state, live) = live_capture_state(state, output);
+        (state, live.history)
+    }
+
+    /// Handles onto a [`CaptureBackend`]'s canned text and capture log.
+    struct LiveCapture {
+        output: Arc<Mutex<Option<String>>>,
+        history: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl LiveCapture {
+        fn set(&self, text: Option<&str>) {
+            *self.output.lock().unwrap() = text.map(str::to_string);
+        }
+
+        fn captures(&self) -> usize {
+            self.history.lock().unwrap().len()
+        }
+    }
+
+    fn live_capture_state(state: AppState, output: &str) -> (AppState, LiveCapture) {
+        let live = LiveCapture {
+            output: Arc::new(Mutex::new(Some(output.to_string()))),
+            history: Arc::new(Mutex::new(Vec::new())),
+        };
         let backend: SharedBackend = Arc::new(CaptureBackend {
-            output: output.to_string(),
-            history: history.clone(),
+            output: live.output.clone(),
+            history: live.history.clone(),
         });
-        (state.with_backend(backend), history)
+        (state.with_backend(backend), live)
     }
 
     async fn get_output(state: &AppState, uri: &str, bearer: Option<&str>) -> Response {
@@ -5280,5 +5476,293 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Live pane output (SSE) ─────────────────────────────────────────
+
+    use crate::dashboard::pane_stream::PaneStreamLimits;
+
+    const STREAM_URI: &str = "/api/panes/herdr%3Ap1/output/stream";
+
+    fn fast_limits() -> PaneStreamLimits {
+        PaneStreamLimits {
+            interval: Duration::from_millis(15),
+            max_tasks: 2,
+            max_subscribers_per_pane: 2,
+            lifetime: Duration::from_secs(60),
+            gone_after_failures: 2,
+        }
+    }
+
+    fn stream_state(output: &str) -> (AppState, LiveCapture) {
+        live_capture_state(
+            state_with_token("op").with_pane_stream_limits(fast_limits()),
+            output,
+        )
+    }
+
+    /// Reads SSE events off a streaming response body one at a time.
+    struct SseReader {
+        body: Body,
+        buf: String,
+    }
+
+    impl SseReader {
+        fn new(response: Response) -> Self {
+            Self {
+                body: response.into_body(),
+                buf: String::new(),
+            }
+        }
+
+        /// The next named event and its JSON data, skipping keep-alive
+        /// comments; `None` if nothing arrives within `wait` or the stream
+        /// ended.
+        async fn next(&mut self, wait: Duration) -> Option<(String, Value)> {
+            let deadline = tokio::time::Instant::now() + wait;
+            loop {
+                if let Some(end) = self.buf.find("\n\n") {
+                    let block = self.buf[..end].to_string();
+                    self.buf.drain(..end + 2);
+                    let mut event = String::new();
+                    let mut data = String::new();
+                    for line in block.lines() {
+                        if let Some(value) = line.strip_prefix("event:") {
+                            event = value.trim_start().to_string();
+                        } else if let Some(value) = line.strip_prefix("data:") {
+                            data.push_str(value.trim_start());
+                        }
+                    }
+                    if event.is_empty() {
+                        continue;
+                    }
+                    return Some((event, serde_json::from_str(&data).unwrap()));
+                }
+                match tokio::time::timeout_at(deadline, self.body.frame()).await {
+                    Ok(Some(Ok(frame))) => {
+                        if let Ok(bytes) = frame.into_data() {
+                            self.buf.push_str(&String::from_utf8_lossy(&bytes));
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+
+    /// Poll `check` until it holds or two seconds pass.
+    async fn eventually(mut check: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        check()
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_needs_the_token_in_every_auth_mode() {
+        let (state, live) = live_capture_state(state_with_token("op"), "secret");
+        assert_eq!(
+            get_output(&state, STREAM_URI, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_output(&state, STREAM_URI, Some("nope")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let ok = get_output(&state, STREAM_URI, Some("op")).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(ok.headers()[header::CONTENT_TYPE], "text/event-stream");
+        assert_eq!(ok.headers()[header::CACHE_CONTROL], "no-store");
+        drop(ok);
+
+        // public_read: reads are anonymous, pane output is not.
+        let (state, _) = live_capture_state(public_read_state("op"), "secret");
+        let anonymous = get_output(&state, STREAM_URI, None).await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(anonymous.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            get_output(&state, STREAM_URI, Some("op")).await.status(),
+            StatusCode::OK
+        );
+
+        // auth = "none": nobody is an operator, so nobody streams output.
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = DashboardAuthMode::None;
+        let (state, none_live) = live_capture_state(state_from(cfg), "secret");
+        assert_eq!(
+            get_output(&state, STREAM_URI, None).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        // A refused request never starts a capture loop.
+        assert_eq!(state.pane_streams.active_tasks(), 0);
+        assert_eq!(none_live.captures(), 0);
+        let _ = live;
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_validates_like_the_output_route() {
+        let (state, live) = stream_state("x");
+        for uri in [
+            "/api/panes/abc/output/stream",
+            "/api/panes/%251%3Bkill/output/stream",
+            "/api/panes/herdr%3Ap1/output/stream?socket=a%0Ab",
+        ] {
+            let response = get_output(&state, uri, Some("op")).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert_eq!(state.pane_streams.active_tasks(), 0);
+        assert_eq!(live.captures(), 0);
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_sends_a_snapshot_then_only_changes() {
+        let (state, live) = stream_state("\u{1b}[1;32mready\u{1b}[0m\nline two\n\n\n");
+        let response = get_output(&state, &format!("{STREAM_URI}?lines=5"), Some("op")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut events = SseReader::new(response);
+
+        // First event: the current (sanitized, trimmed) snapshot.
+        let (event, data) = events.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(event, "output");
+        assert_eq!(data["pane"], "herdr:p1");
+        assert_eq!(data["text"], "ready\nline two");
+        assert!(data["captured_at"]
+            .as_str()
+            .is_some_and(|at| !at.is_empty()));
+
+        // Unchanged output: the loop keeps capturing but sends nothing.
+        let seen = live.captures();
+        assert!(eventually(|| live.captures() >= seen + 3).await);
+        assert!(events.next(Duration::from_millis(60)).await.is_none());
+
+        // A change produces one new full snapshot.
+        live.set(Some("ready\nline two\nline three"));
+        let (event, data) = events.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(event, "output");
+        assert_eq!(data["text"], "ready\nline two\nline three");
+        assert!(events.next(Duration::from_millis(60)).await.is_none());
+        // Every capture asked for the subscriber's depth.
+        assert!(live.history.lock().unwrap().iter().all(|lines| *lines == 5));
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_subscribers_share_one_loop_with_their_own_tail() {
+        let (state, live) = stream_state("a\nb\nc");
+        let mut short =
+            SseReader::new(get_output(&state, &format!("{STREAM_URI}?lines=1"), Some("op")).await);
+        let (_, data) = short.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(data["text"], "c");
+        let mut long =
+            SseReader::new(get_output(&state, &format!("{STREAM_URI}?lines=3"), Some("op")).await);
+        let (_, data) = long.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(data["text"], "a\nb\nc");
+        assert_eq!(state.pane_streams.active_tasks(), 1);
+        // The shared loop now captures the deepest history anyone asked for.
+        assert!(eventually(|| live.history.lock().unwrap().last() == Some(&3)).await);
+
+        // A change outside the short tail's window is not news to it.
+        live.set(Some("z\nb\nc"));
+        let (_, data) = long.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(data["text"], "z\nb\nc");
+        assert!(short.next(Duration::from_millis(60)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_loop_stops_after_the_last_subscriber() {
+        let (state, live) = stream_state("hello");
+        let mut first = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        let mut second = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        assert!(first.next(Duration::from_secs(2)).await.is_some());
+        assert!(second.next(Duration::from_secs(2)).await.is_some());
+        assert_eq!(state.pane_streams.active_tasks(), 1);
+
+        drop(first);
+        // One subscriber left: the loop keeps running.
+        let seen = live.captures();
+        assert!(eventually(|| live.captures() >= seen + 2).await);
+        assert_eq!(state.pane_streams.active_tasks(), 1);
+
+        drop(second);
+        assert!(eventually(|| state.pane_streams.active_tasks() == 0).await);
+        let stopped_at = live.captures();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(live.captures() <= stopped_at + 1, "loop kept capturing");
+
+        // A new subscriber starts a fresh loop.
+        let mut again = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        let (_, data) = again.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(data["text"], "hello");
+        assert_eq!(state.pane_streams.active_tasks(), 1);
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_limits_answer_429() {
+        let (state, _live) = stream_state("x");
+        // Two subscribers per pane.
+        let a = get_output(&state, STREAM_URI, Some("op")).await;
+        let b = get_output(&state, STREAM_URI, Some("op")).await;
+        assert_eq!(a.status(), StatusCode::OK);
+        assert_eq!(b.status(), StatusCode::OK);
+        let refused = get_output(&state, STREAM_URI, Some("op")).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(body_json(refused).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("too many"));
+
+        // Two panes streaming at once.
+        let other = get_output(&state, "/api/panes/herdr%3Ap2/output/stream", Some("op")).await;
+        assert_eq!(other.status(), StatusCode::OK);
+        assert_eq!(state.pane_streams.active_tasks(), 2);
+        let third_pane =
+            get_output(&state, "/api/panes/herdr%3Ap3/output/stream", Some("op")).await;
+        assert_eq!(third_pane.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Capacity comes back when subscribers leave.
+        drop((a, b));
+        assert!(eventually(|| state.pane_streams.active_tasks() == 1).await);
+        let retry = get_output(&state, "/api/panes/herdr%3Ap3/output/stream", Some("op")).await;
+        assert_eq!(retry.status(), StatusCode::OK);
+        drop(other);
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_reports_a_closed_pane_and_ends() {
+        let (state, live) = stream_state("still here");
+        let mut events = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        assert_eq!(
+            events.next(Duration::from_secs(2)).await.unwrap().0,
+            "output"
+        );
+        live.set(None);
+        let (event, data) = events.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(event, "gone");
+        assert_eq!(data["pane"], "herdr:p1");
+        // `gone` is the last event: the stream closes and the loop is gone.
+        assert!(events.next(Duration::from_millis(200)).await.is_none());
+        assert_eq!(state.pane_streams.active_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_ends_after_its_lifetime() {
+        let limits = PaneStreamLimits {
+            lifetime: Duration::from_millis(100),
+            ..fast_limits()
+        };
+        let (state, _live) =
+            live_capture_state(state_with_token("op").with_pane_stream_limits(limits), "x");
+        let started = std::time::Instant::now();
+        let mut events = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        assert!(events.next(Duration::from_secs(2)).await.is_some());
+        assert!(events.next(Duration::from_secs(2)).await.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // The server drops a finished body, releasing the subscription.
+        drop(events);
+        assert!(eventually(|| state.pane_streams.active_tasks() == 0).await);
     }
 }

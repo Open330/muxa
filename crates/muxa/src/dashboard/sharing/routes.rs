@@ -86,7 +86,7 @@ async fn boundary(State(state): State<AppState>, request: Request, next: Next) -
     for (name, value) in [
         ("cache-control", "no-store"), ("referrer-policy", "no-referrer"),
         ("x-content-type-options", "nosniff"),
-        ("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"),
+        ("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"),
     ] { response.headers_mut().insert(axum::http::HeaderName::from_static(name), value.parse().expect("static header")); }
     response
 }
