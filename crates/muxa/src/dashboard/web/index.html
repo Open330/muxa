@@ -7,7 +7,8 @@
   <title>muxa dashboard</title>
   <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
   <link rel="stylesheet" href="/static/style.css">
-  <link rel="stylesheet" href="/static/landing.css">
+  <!-- ?v=2: evicts a landing.css that edge caches kept from before assets were sent with no-cache. -->
+  <link rel="stylesheet" href="/static/landing.css?v=2">
 </head>
 <body data-view="boot">
   <div class="landing" id="landing" hidden></div>
