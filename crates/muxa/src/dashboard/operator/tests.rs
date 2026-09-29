@@ -2220,3 +2220,74 @@ async fn operators_list_reports_the_current_account() {
     assert_eq!(status["role"], "operator");
     assert_eq!(status["signed_in"], false);
 }
+
+/// A live session of the given kind, injected without the provider.
+fn session_via(state: &AppState, via: Via) -> String {
+    let secret = oidc::random_secret();
+    state.operator.registry().sessions.insert(
+        secret.clone(),
+        Session {
+            issuer: "https://issuer.example.com".into(),
+            subject: "someone".into(),
+            email: Some("someone@example.com".into()),
+            email_verified: true,
+            via,
+            attempts: 0,
+            expires: Instant::now() + SESSION_TTL,
+        },
+    );
+    format!("__Host-muxa-op={secret}")
+}
+
+#[tokio::test]
+async fn pane_output_is_for_operators_not_viewers() {
+    let provider = provider().await;
+    let state = state(&provider.uri());
+    let uri = "/api/panes/%251/output";
+
+    // An operator session is write-authorized and passes the gate on a
+    // plain GET, no CSRF proof needed. (No pane backend in this state, so
+    // the handler itself answers 503.)
+    let operator = session_via(&state, Via::Group);
+    let (write, login) = access_of(&state, &operator).await;
+    assert!(write);
+    assert_eq!(login["role"], "operator");
+    let response = call(
+        &state,
+        "GET",
+        uri,
+        Req {
+            cookie: Some(&operator),
+            ..Req::default()
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+
+    // A viewer reads the dashboard but never pane output, proof or not.
+    let viewer = session_via(&state, Via::ViewerGroup);
+    assert_eq!(
+        status_of(&state, "/api/agents", &viewer).await,
+        StatusCode::OK
+    );
+    for proof in [false, true] {
+        let response = call(
+            &state,
+            "GET",
+            uri,
+            Req {
+                cookie: Some(&viewer),
+                origin: proof.then_some(PUBLIC),
+                operator_header: proof,
+                ..Req::default()
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    // Signed out: 401.
+    let response = call(&state, "GET", uri, Req::default()).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}

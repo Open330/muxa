@@ -416,8 +416,20 @@ pub fn router(state: AppState) -> Router {
         )
         .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES))
         .layer(write_auth_layer);
+    // Operator-only reads. Pane output can hold secrets the redacted read
+    // views never expose, so it sits behind the control gate even though it
+    // is a GET: a viewer session gets 403, and in `public_read` an anonymous
+    // visitor needs the token (401). Being a GET it needs no CSRF proof.
+    let operator_read_api = Router::new()
+        .route("/api/panes/{pane}/output", get(pane_output_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            write_auth_middleware,
+        ))
+        .layer(middleware::map_response(no_store));
     let api = read_api
         .merge(write_api)
+        .merge(operator_read_api)
         .merge(super::sharing::recipient_routes(state.clone()))
         .merge(super::operator::routes())
         .with_state(state.clone());
@@ -1826,6 +1838,126 @@ async fn pane_abort_handler(
         );
     }
     Json(json!({ "ok": true, "pane": pane, "aborted": true })).into_response()
+}
+
+/// Default and maximum number of lines `/api/panes/{pane}/output` returns.
+const PANE_OUTPUT_DEFAULT_LINES: usize = 200;
+const PANE_OUTPUT_MAX_LINES: usize = 1000;
+/// Byte bound on the returned text; the newest output is kept.
+const PANE_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+const PANE_ID_MAX_LEN: usize = 128;
+const PANE_SOCKET_MAX_LEN: usize = 1024;
+
+#[derive(Debug, Deserialize)]
+struct PaneOutputQuery {
+    socket: Option<String>,
+    lines: Option<usize>,
+}
+
+async fn no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// Shape check for a pane id taken from a URL: a tmux `%N`, or a known
+/// host-prefixed id (`rmux:…`, `herdr:…`, …). Anything else never reaches a
+/// backend command line.
+fn valid_pane_id(pane: &str) -> bool {
+    if pane.is_empty()
+        || pane.len() > PANE_ID_MAX_LEN
+        || !pane.chars().all(|c| c.is_ascii_graphic())
+    {
+        return false;
+    }
+    if let Some(digits) = pane.strip_prefix('%') {
+        return !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+    }
+    crate::backend::pane_id_host_kind(pane).is_some()
+        && pane
+            .split_once(':')
+            .is_some_and(|(_, rest)| !rest.is_empty())
+}
+
+fn valid_pane_socket(socket: &str) -> bool {
+    !socket.trim().is_empty()
+        && socket.len() <= PANE_SOCKET_MAX_LEN
+        && !socket.chars().any(char::is_control)
+}
+
+/// Turn a raw capture into what the drawer shows: escapes and control bytes
+/// stripped (the same sanitizer the share view and fleet captures use), the
+/// screen's trailing blank rows dropped, the newest `lines` lines, and at
+/// most [`PANE_OUTPUT_MAX_BYTES`] bytes cut on a character boundary.
+fn pane_output_text(raw: &str, lines: usize) -> String {
+    let clean = crate::fleet::sanitize_terminal_text(raw);
+    let rows = clean.trim_end().lines().collect::<Vec<_>>();
+    let start = rows.len().saturating_sub(lines);
+    let mut text = rows[start..].join("\n");
+    if text.len() > PANE_OUTPUT_MAX_BYTES {
+        let mut cut = text.len() - PANE_OUTPUT_MAX_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        text.drain(..cut);
+    }
+    text
+}
+
+async fn pane_output_handler(
+    State(state): State<AppState>,
+    Path(pane): Path<String>,
+    Query(query): Query<PaneOutputQuery>,
+) -> Response {
+    if !valid_pane_id(&pane) {
+        return control_error(StatusCode::BAD_REQUEST, "invalid pane id");
+    }
+    let requested_socket = query.socket.as_deref().filter(|s| !s.is_empty());
+    if requested_socket.is_some_and(|socket| !valid_pane_socket(socket)) {
+        return control_error(StatusCode::BAD_REQUEST, "invalid socket");
+    }
+    let lines = query
+        .lines
+        .unwrap_or(PANE_OUTPUT_DEFAULT_LINES)
+        .clamp(1, PANE_OUTPUT_MAX_LINES);
+    let backend = match control_backend(&state, &pane) {
+        Ok(backend) if backend.caps().capture_pane => backend,
+        Ok(backend) => {
+            return control_error(
+                StatusCode::NOT_IMPLEMENTED,
+                format!("{} backend does not support pane capture", backend.kind()),
+            );
+        }
+        Err(failure) => return failure.into_response(),
+    };
+    let socket = match control_socket(&state, &backend, &pane, requested_socket).await {
+        Ok(socket) => socket,
+        Err(failure) => return failure.into_response(),
+    };
+    let pane_for_capture = pane.clone();
+    let captured = tokio::task::spawn_blocking(move || {
+        backend.capture_pane_history_on(socket.as_deref(), &pane_for_capture, lines)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(raw) = captured else {
+        return control_error(
+            StatusCode::BAD_GATEWAY,
+            "pane output unavailable: pane gone or backend unreachable",
+        );
+    };
+    let captured_at = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    Json(json!({
+        "pane": pane,
+        "text": pane_output_text(&raw, lines),
+        "captured_at": captured_at,
+    }))
+    .into_response()
 }
 
 async fn terminal_input_handler(
@@ -4783,5 +4915,183 @@ mod tests {
         // Give the runtime a yield so the drop-side decrement settles.
         tokio::task::yield_now().await;
         assert_eq!(metrics.snapshot().sse_subscribers_current, 0);
+    }
+
+    /// A herdr-kind backend whose capture is canned, recording the history
+    /// depth each capture asked for.
+    struct CaptureBackend {
+        output: String,
+        history: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl PaneBackend for CaptureBackend {
+        fn kind(&self) -> HostKind {
+            HostKind::Herdr
+        }
+
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            Vec::new()
+        }
+
+        fn resolve_pane(&self, _pane_id: &str) -> Option<PaneInfo> {
+            None
+        }
+
+        fn capture_pane(&self, _pane_id: &str) -> Option<String> {
+            Some(self.output.clone())
+        }
+
+        fn capture_pane_history_on(
+            &self,
+            _socket: Option<&str>,
+            pane_id: &str,
+            history: usize,
+        ) -> Option<String> {
+            self.history.lock().unwrap().push(history);
+            self.capture_pane(pane_id)
+        }
+
+        fn pane_pid_map(&self) -> HashMap<u32, String> {
+            HashMap::new()
+        }
+
+        fn current_pane(&self) -> Option<String> {
+            None
+        }
+
+        fn focus_pane(&self, _pane_id: &str) -> bool {
+            false
+        }
+
+        fn send_text(&self, _pane_id: &str, _text: &str) -> bool {
+            false
+        }
+    }
+
+    fn capture_state(state: AppState, output: &str) -> (AppState, Arc<Mutex<Vec<usize>>>) {
+        let history = Arc::new(Mutex::new(Vec::new()));
+        let backend: SharedBackend = Arc::new(CaptureBackend {
+            output: output.to_string(),
+            history: history.clone(),
+        });
+        (state.with_backend(backend), history)
+    }
+
+    async fn get_output(state: &AppState, uri: &str, bearer: Option<&str>) -> Response {
+        let mut request = Request::builder().uri(uri);
+        if let Some(token) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        router(state.clone())
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pane_output_returns_sanitized_text_to_the_operator() {
+        let raw = "\u{1b}[1;32mready\u{1b}[0m\r\n\u{1b}]0;title\u{7}> \u{1b}[2Kprompt\u{8}\n\n\n";
+        let (state, history) = capture_state(state_with_token("op"), raw);
+        let response = get_output(&state, "/api/panes/herdr%3Ap1/output", Some("op")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = body_json(response).await;
+        assert_eq!(body["pane"], "herdr:p1");
+        assert_eq!(body["text"], "ready\n> prompt");
+        assert!(OffsetDateTime::parse(
+            body["captured_at"].as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339
+        )
+        .is_ok());
+        assert_eq!(*history.lock().unwrap(), vec![PANE_OUTPUT_DEFAULT_LINES]);
+    }
+
+    #[tokio::test]
+    async fn pane_output_clamps_the_requested_line_count() {
+        let (state, history) = capture_state(state_with_token("op"), "a\nb\nc\nd");
+        let body =
+            body_json(get_output(&state, "/api/panes/herdr%3Ap1/output?lines=2", Some("op")).await)
+                .await;
+        assert_eq!(body["text"], "c\nd");
+        get_output(
+            &state,
+            "/api/panes/herdr%3Ap1/output?lines=50000",
+            Some("op"),
+        )
+        .await;
+        get_output(&state, "/api/panes/herdr%3Ap1/output?lines=0", Some("op")).await;
+        assert_eq!(*history.lock().unwrap(), vec![2, PANE_OUTPUT_MAX_LINES, 1]);
+        let response = get_output(
+            &state,
+            "/api/panes/herdr%3Ap1/output?lines=lots",
+            Some("op"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pane_output_needs_the_token_in_every_auth_mode() {
+        // Private dashboard: no credentials is 401, a wrong token too.
+        let (state, _) = capture_state(state_with_token("op"), "secret");
+        let uri = "/api/panes/herdr%3Ap1/output";
+        assert_eq!(
+            get_output(&state, uri, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_output(&state, uri, Some("nope")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // public_read: reads are anonymous, pane output is not.
+        let (state, _) = capture_state(public_read_state("op"), "secret");
+        let anonymous = get_output(&state, uri, None).await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(anonymous.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            get_output(&state, uri, Some("op")).await.status(),
+            StatusCode::OK
+        );
+
+        // auth = "none": nobody is an operator, so nobody reads output.
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = DashboardAuthMode::None;
+        let (state, _) = capture_state(state_from(cfg), "secret");
+        assert_eq!(
+            get_output(&state, uri, None).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_output_rejects_malformed_pane_ids_and_sockets() {
+        let (state, history) = capture_state(state_with_token("op"), "x");
+        for uri in [
+            "/api/panes/abc/output",
+            "/api/panes/%25/output",
+            "/api/panes/%251x/output",
+            "/api/panes/%251%3Bkill/output",
+            "/api/panes/herdr%3A/output",
+            "/api/panes/herdr%3Ap%201/output",
+            "/api/panes/herdr%3Ap1/output?socket=a%0Ab",
+        ] {
+            let response = get_output(&state, uri, Some("op")).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert!(history.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pane_output_text_keeps_the_newest_bounded_tail() {
+        assert_eq!(pane_output_text("one\ntwo\nthree\n\n", 2), "two\nthree");
+        assert_eq!(pane_output_text("", 10), "");
+        // Byte bound: the newest bytes survive, cut on a char boundary.
+        let line = "é".repeat(100);
+        let raw = vec![line.as_str(); 1000].join("\n");
+        let text = pane_output_text(&raw, PANE_OUTPUT_MAX_LINES);
+        assert!(text.len() <= PANE_OUTPUT_MAX_BYTES);
+        assert!(text.len() > PANE_OUTPUT_MAX_BYTES - 4);
+        assert!(text.ends_with(&line));
     }
 }

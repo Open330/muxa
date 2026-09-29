@@ -526,6 +526,21 @@ pub trait PaneBackend: Send + Sync + 'static {
         self.capture_pane(pane_id)
     }
 
+    /// Like [`Self::capture_pane_on`] but also asks for up to `history` lines
+    /// of scrollback above the visible screen, so a dashboard reader sees
+    /// what an agent printed a moment ago, not only what still fits on
+    /// screen. The default impl ignores `history` and returns the visible
+    /// screen; tmux overrides it.
+    fn capture_pane_history_on(
+        &self,
+        socket: Option<&str>,
+        pane_id: &str,
+        history: usize,
+    ) -> Option<String> {
+        let _ = history;
+        self.capture_pane_on(socket, pane_id)
+    }
+
     /// Static capability descriptor. Default impl returns "everything
     /// supported" because that's the tmux shape and most backends
     /// model their gaps as exceptions to that baseline.
@@ -589,6 +604,14 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
     }
     fn capture_pane_on(&self, socket: Option<&str>, pane_id: &str) -> Option<String> {
         (**self).capture_pane_on(socket, pane_id)
+    }
+    fn capture_pane_history_on(
+        &self,
+        socket: Option<&str>,
+        pane_id: &str,
+        history: usize,
+    ) -> Option<String> {
+        (**self).capture_pane_history_on(socket, pane_id, history)
     }
     fn caps(&self) -> BackendCaps {
         (**self).caps()
