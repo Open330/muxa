@@ -20,14 +20,12 @@ const COPY = {
     lead: "Muxa watches the coding agents you already run in tmux, tells you the moment one stops for input, a choice, or an error, and takes you straight to its pane. No wrapper, no new terminal.",
     how: "How it works",
     private: "<b>{host}</b> is a private muxa dashboard.",
-    privateSignIn: "Sign in, or use its access token.",
-    privateToken: "Open it with its access token.",
+    privateSignIn: "Sign in to open it.",
+    privateLink: "Open it with the dashboard link <code>muxa init</code> printed on that machine.",
     signedInNoAccess: "Signed in as <b>{email}</b>, but this account has no access here.",
-    tokenRejected: "The saved access token was not accepted.",
+    tokenRejected: "The saved access token was not accepted. Open the dashboard link from <code>muxa init</code> again.",
     signIn: "Sign in",
     signOut: "Sign out",
-    useToken: "Use access token",
-    tokenPrompt: "Muxa dashboard token",
     film: {
       steps: ["Working", "Someone waits", "Jump there", "Peek", "See it all"],
       captions: [
@@ -58,6 +56,19 @@ const COPY = {
       ["collaboration", "Collaboration", "Who asked whom for what: requests and replies between agents, as a graph and a timeline."],
       ["agents", "Agents", "Every agent with its state, model, context, limits, last prompt, and prompt or abort controls."],
     ],
+    mac: {
+      title: "Muxa for Mac",
+      lede: "A native app for the same fleet: a real terminal, your Work, and every host in one window. muxad owns the shells, so closing the app stops nothing.",
+      install: "Notarized. Updates through Homebrew.",
+      features: [
+        ["Work, Explore, Inbox, Ask, Shells", "One sidebar per context, the way VS Code's activity bar works, while the editor area stays put."],
+        ["A real terminal", "libghostty renders every session. muxad owns the PTY, so a closed window leaves the shell and its agent running."],
+        ["An inbox for what needs you", "Commands you sent, their replies, and agents waiting on you, deduplicated across hosts."],
+        ["Every host at once", "Live Watch across this Mac and the SSH machines one muxad controls."],
+        ["Snapshots", "Save a whole workspace and restore it later; the preview shows what would change first."],
+        ["In the menu bar", "What is working, waiting, or failing, one click away."],
+      ],
+    },
     principlesTitle: "Three principles",
     principles: [
       ["Your setup, unchanged", "No wrapper, no new terminal, no new multiplexer. tmux, rmux, and herdr can be watched at the same time."],
@@ -109,14 +120,12 @@ const COPY = {
     lead: "muxa는 tmux에서 이미 돌리고 있는 코딩 에이전트를 지켜보다가, 입력이나 선택을 기다리거나 오류로 멈추는 순간 알려 주고 그 pane으로 바로 데려다 줍니다. 래퍼도, 새 터미널도 필요 없습니다.",
     how: "어떻게 동작하나",
     private: "<b>{host}</b>는 비공개 muxa 대시보드입니다.",
-    privateSignIn: "로그인하거나 접근 토큰을 사용하세요.",
-    privateToken: "접근 토큰으로 열 수 있습니다.",
+    privateSignIn: "로그인하면 열 수 있습니다.",
+    privateLink: "해당 머신에서 <code>muxa init</code>이 출력한 대시보드 링크로 열 수 있습니다.",
     signedInNoAccess: "<b>{email}</b>(으)로 로그인했지만 이 계정에는 접근 권한이 없습니다.",
-    tokenRejected: "저장된 접근 토큰이 거부되었습니다.",
+    tokenRejected: "저장된 접근 토큰이 거부되었습니다. <code>muxa init</code>의 대시보드 링크로 다시 여세요.",
     signIn: "로그인",
     signOut: "로그아웃",
-    useToken: "접근 토큰 사용",
-    tokenPrompt: "Muxa 대시보드 토큰",
     film: {
       steps: ["작업 중", "누군가 멈춤", "바로 이동", "훑어보기", "한눈에 보기"],
       captions: [
@@ -147,6 +156,19 @@ const COPY = {
       ["collaboration", "협업", "누가 누구에게 무엇을 요청했는지. 에이전트 사이의 요청과 답장을 그래프와 시간순으로 봅니다."],
       ["agents", "에이전트", "모든 에이전트의 상태, 모델, 컨텍스트, 사용량 한도, 마지막 프롬프트와 프롬프트·중단 버튼."],
     ],
+    mac: {
+      title: "Muxa for Mac",
+      lede: "같은 에이전트들을 위한 네이티브 앱입니다. 실제 터미널, Work, 모든 호스트를 한 창에서 봅니다. 셸은 muxad가 들고 있어서 앱을 닫아도 아무것도 멈추지 않습니다.",
+      install: "공증된 앱이며 Homebrew로 업데이트합니다.",
+      features: [
+        ["Work, Explore, Inbox, Ask, Shells", "VS Code의 액티비티 바처럼 맥락마다 사이드바가 바뀌고, 편집 영역은 그대로 남습니다."],
+        ["진짜 터미널", "모든 세션을 libghostty가 그립니다. PTY는 muxad 소유라서 창을 닫아도 셸과 에이전트는 계속 돕니다."],
+        ["나를 기다리는 것만 모은 Inbox", "보낸 명령, 받은 답장, 나를 기다리는 에이전트를 호스트를 가로질러 중복 없이 모아 줍니다."],
+        ["모든 호스트를 한 번에", "이 Mac과 muxad 하나가 관리하는 SSH 머신들을 Live Watch로 함께 봅니다."],
+        ["스냅샷", "작업 공간 전체를 저장했다가 나중에 되돌립니다. 되돌리기 전에 무엇이 바뀌는지 미리 보여 줍니다."],
+        ["메뉴 막대에서", "작업 중, 대기, 실패 중인 에이전트를 클릭 한 번으로 확인합니다."],
+      ],
+    },
     principlesTitle: "세 가지 원칙",
     principles: [
       ["지금 환경 그대로", "래퍼도, 새 터미널도, 새 멀티플렉서도 없습니다. tmux, rmux, herdr를 동시에 볼 수 있습니다."],
@@ -212,15 +234,17 @@ export function pickLanguage(saved, preferred = []) {
 /**
  * Which ways in to offer. `login` is the dashboard's normalized login state;
  * `tokenRejected` is true when a stored token was sent and refused.
+ *
+ * The page offers sign-in only. The token still works, but through the
+ * dashboard link `muxa init` prints (`#token=…`), not a field on a public
+ * page; without a login provider the page just points at that link.
  */
 export function landingAccess(login, { tokenRejected = false } = {}) {
   const signedIn = Boolean(login?.signedIn);
   return {
     signIn: Boolean(login?.available) && !signedIn,
     signOut: signedIn,
-    token: true,
-    // With a provider, sign-in is the main door and the token the fallback.
-    tokenPrimary: !login?.available,
+    linkHint: !login?.available && !signedIn,
     signedInNoAccess: signedIn && login?.role === "none",
     tokenRejected,
   };
@@ -245,10 +269,13 @@ const codeSpans = (text) => escapeText(text).replace(/`([^`]+)`/g, "<code>$1</co
 function accessButtons(t, access, size = "") {
   return [
     access.signIn ? `<button class="l-btn primary ${size}" type="button" data-landing-action="sign-in">${escapeText(t.signIn)}</button>` : "",
-    `<button class="l-btn ${access.tokenPrimary ? "primary" : "ghost"} ${size}" type="button" data-landing-action="token">${escapeText(t.useToken)}</button>`,
     access.signOut ? `<button class="l-btn ghost ${size}" type="button" data-landing-action="sign-out">${escapeText(t.signOut)}</button>` : "",
   ].join("");
 }
+
+/** The line under the hero and in the closing section of the dashboard page. */
+const privateLine = (t, access, host) =>
+  `${fill(t.private, { host })} ${access.signIn ? escapeText(t.privateSignIn) : access.linkHint ? t.privateLink : ""}`;
 
 // Where icon.svg, landing/*.webp and demo.gif live: the daemon serves them
 // under /static/, the GitHub Pages site next to its index.html.
@@ -274,7 +301,7 @@ const shotsFor = (t) => (view.mode === "site" ? [t.site.watchShot, ...t.shots] :
 function markup(t, access, { host, email, shot }) {
   const notices = [
     access.signedInNoAccess ? `<p class="l-notice">${fill(t.signedInNoAccess, { email: email || "" })}</p>` : "",
-    access.tokenRejected ? `<p class="l-notice">${escapeText(t.tokenRejected)}</p>` : "",
+    access.tokenRejected ? `<p class="l-notice">${t.tokenRejected}</p>` : "",
   ].join("");
   const langs = LANDING_LANGUAGES.map((lang) =>
     `<button type="button" data-landing-lang="${lang}" aria-pressed="${t === COPY[lang]}">${lang === "ko" ? "한국어" : "EN"}</button>`
@@ -308,7 +335,7 @@ function markup(t, access, { host, email, shot }) {
             ? `<a class="l-btn dark sm" href="#install">${escapeText(t.site.install)}</a>`
             : access.signIn
               ? `<button class="l-btn dark sm" type="button" data-landing-action="sign-in">${escapeText(t.signIn)}</button>`
-              : `<button class="l-btn dark sm" type="button" data-landing-action="token">${escapeText(t.useToken)}</button>`}
+              : ""}
         </nav>
       </div>
     </header>
@@ -324,11 +351,11 @@ function markup(t, access, { host, email, shot }) {
               ? `<a class="l-btn primary lg" href="#install">${escapeText(t.site.install)}</a>
                  <a class="l-btn ghost lg" href="${GITHUB}" rel="noopener">${GITHUB_ICON}<span>${escapeText(t.github)}</span></a>`
               : accessButtons(t, access, "lg")}
-            <a class="l-btn ghost lg" href="#how">${escapeText(t.how)} ↓</a>
+            <a class="l-btn ${site || access.signIn ? "ghost" : "primary"} lg" href="#how">${escapeText(t.how)} ↓</a>
           </div>
           ${site ? "" : `<div class="l-private">
             ${LOCK_ICON}
-            <p>${fill(t.private, { host })} ${escapeText(access.signIn || access.signOut ? t.privateSignIn : t.privateToken)}</p>
+            <p>${privateLine(t, access, host)}</p>
           </div>
           ${notices}`}
         </div>
@@ -354,6 +381,18 @@ function markup(t, access, { host, email, shot }) {
             <figcaption>${escapeText(shotCaption)}</figcaption>
           </figure>
         </div>
+      </section>
+
+      <section class="l-section l-wrap l-mac" id="mac" data-reveal>
+        <div class="l-mac-intro">
+          <img class="l-mac-icon" src="${asset("landing/mac-icon.webp")}" width="96" height="96" alt="">
+          <h2>${escapeText(t.mac.title)}</h2>
+          <p class="l-lede">${escapeText(t.mac.lede)}</p>
+<pre class="l-code sm"><code><span class="p">$</span> brew install --cask open330/tap/muxa-app</code></pre>
+          <p class="l-mac-note">${escapeText(t.mac.install)}</p>
+        </div>
+        <div class="l-mac-features">${t.mac.features.map(([heading, body]) =>
+          `<div class="l-mac-feature"><h3>${escapeText(heading)}</h3><p>${escapeText(body)}</p></div>`).join("")}</div>
       </section>
 
       <section class="l-section l-wrap" data-reveal>
@@ -397,7 +436,7 @@ function markup(t, access, { host, email, shot }) {
           <a class="l-btn ghost" href="${GITHUB}/tree/main/docs" rel="noopener">${escapeText(t.docs)}</a>
         </div>` : `<div>
           <h2>${escapeText(t.ctaTitle)}</h2>
-          <p>${fill(t.private, { host })}</p>
+          <p>${privateLine(t, access, host)}</p>
         </div>
         <div class="l-actions">${accessButtons(t, access)}</div>`}
       </section>
@@ -473,15 +512,11 @@ function onLandingClick(event) {
   const action = event.target.closest("[data-landing-action]")?.getAttribute("data-landing-action");
   if (action === "sign-in") view.actions.signIn();
   else if (action === "sign-out") view.actions.signOut();
-  else if (action === "token") {
-    const token = window.prompt(COPY[view.lang].tokenPrompt);
-    if (token && token.trim()) view.actions.useToken(token.trim());
-  }
 }
 
 /**
  * Render the landing view into `root` and wire its buttons. `actions` holds
- * `signIn`, `signOut` and `useToken(token)` callbacks owned by the dashboard.
+ * `signIn` and `signOut` callbacks owned by the dashboard.
  * `mode: "site"` is the public project page (site/index.html): no access
  * prompts, install and GitHub instead; `assetBase` is where its files live.
  */

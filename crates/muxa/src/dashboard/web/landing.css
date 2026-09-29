@@ -376,6 +376,34 @@ body[data-view="landing"] {
 .l-shot img { display: block; width: 100%; height: auto; animation: l-fade .45s ease both; }
 .l-shot figcaption { padding: 14px 18px 16px; border-top: 1px solid var(--l-line); color: var(--l-muted); font-size: 14px; }
 
+/* Muxa for Mac */
+.l-mac {
+  display: grid;
+  grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr);
+  align-items: start;
+  gap: 40px;
+}
+.l-mac-icon {
+  display: block;
+  width: 88px;
+  height: 88px;
+  margin-bottom: 16px;
+  filter: drop-shadow(0 12px 24px rgba(30, 28, 90, .25));
+}
+.l-mac .l-code.sm { max-width: 440px; margin: 0 0 10px; }
+.l-mac-note { margin: 0; color: var(--l-muted); font-size: 13.5px; }
+.l-mac-features { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.l-mac-feature {
+  padding: 18px;
+  border: 1px solid var(--l-line);
+  border-radius: 14px;
+  background: var(--l-surface);
+  transition: transform .25s ease, border-color .25s ease;
+}
+.l-mac-feature:hover { transform: translateY(-2px); border-color: color-mix(in srgb, var(--l-accent) 55%, var(--l-line)); }
+.l-mac-feature h3 { margin: 0 0 6px; font-size: 15.5px; }
+.l-mac-feature p { margin: 0; color: var(--l-ink-2); font-size: 14px; }
+
 /* principles, surfaces */
 .l-three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .l-card {
@@ -653,7 +681,7 @@ body[data-view="landing"] {
 @media (max-width: 980px) {
   .l-hero { grid-template-columns: minmax(0, 1fr); gap: 40px; padding-top: 32px; padding-bottom: 56px; }
   .l-flow, .l-three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .l-install, .l-ways { grid-template-columns: minmax(0, 1fr); }
+  .l-install, .l-ways, .l-mac { grid-template-columns: minmax(0, 1fr); }
   .l-surfaces { grid-template-columns: minmax(0, 1fr); }
 }
 
@@ -664,7 +692,7 @@ body[data-view="landing"] {
   .l-hero h1 { font-size: 34px; }
   .l-lead { font-size: 16.5px; }
   .l-actions .l-btn { flex: 1 1 100%; }
-  .l-flow, .l-three { grid-template-columns: minmax(0, 1fr); }
+  .l-flow, .l-three, .l-mac-features { grid-template-columns: minmax(0, 1fr); }
   .l-section { padding-top: 64px; }
   .l-surface { grid-template-columns: minmax(0, 1fr); gap: 2px; padding: 10px 0; }
   .l-support { grid-template-columns: minmax(0, 1fr); }

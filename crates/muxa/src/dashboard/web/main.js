@@ -149,20 +149,13 @@ async function showLanding() {
     const resp = await fetch("/auth/session", { credentials: "same-origin", cache: "no-store" });
     if (resp.ok) store.access.login = normalizeLogin(await resp.json());
   } catch (_) {
-    // No session endpoint: the token is the only way in.
+    // No session endpoint: the dashboard link from `muxa init` is the way in.
   }
   document.body.dataset.view = "landing";
   renderLanding(dom.landing, {
     login: store.access.login,
     tokenRejected: Boolean(localStorage.getItem(TOKEN_KEY)),
-    actions: {
-      signIn,
-      signOut,
-      useToken(token) {
-        localStorage.setItem(TOKEN_KEY, token);
-        window.location.reload();
-      },
-    },
+    actions: { signIn, signOut },
   });
 }
 
