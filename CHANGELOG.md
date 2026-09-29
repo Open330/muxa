@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dashboard pane drawer for talking to an agent. Clicking an agent or pane
+  row opens a drawer with the pane's live output, a composer (Enter sends,
+  Shift+Enter adds a line, IME-safe), abort and share; `#pane=<id>` links to
+  it, and a header **agents** chip jumps to the Agents table. It replaces the
+  per-row prompt/abort/share buttons and the `window.prompt()` box. Backed by
+  the new operator-only `GET /api/panes/{pane}/output` (plain text, escapes
+  stripped, newest lines with tmux scrollback, bounded); viewers and anonymous
+  `public_read` visitors cannot read it.
+
 - Dashboard operator sign-in through any OpenID Connect provider
   (`[dashboard.login]`). Access requires membership in `required_group` from
   the ID token's group claim; the bearer token keeps working for API clients
@@ -35,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing still get no access. `/api/access` and `/auth/session` report `role`.
 
 ### Changed
+
+- A 401/403 from a dashboard control request now re-reads `/api/access`
+  instead of assuming the credential is gone, so a refused request no longer
+  hides an operator's controls until the page is reloaded.
 
 - Local Fleet mailbox notifications use in-process revisions instead of a
   subscription to the daemon's own IPC socket. Host refreshes read only the

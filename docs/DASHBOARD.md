@@ -39,6 +39,7 @@ bound to loopback and configure the public origin as described below.
 | `GET /api/terminal-sessions` | Muxa-owned PTY sessions.                                           |
 | `GET /api/timeline` | Timeline document from `activity.ndjson` plus currently-open agent/tmux spans. |
 | `GET /api/events`   | SSE stream: `snapshot` (initial), `transition` (live), `lagged` (backpressure)|
+| `GET /api/panes/{pane}/output?socket=&lines=N` | Operator only: `{ pane, text, captured_at }`, the pane's newest `N` lines (default 200, max 1000; 64 KiB cap) as plain text, escapes stripped. |
 | `POST /api/panes/{pane}/prompt` | Send and optionally submit text to a pane.                       |
 | `POST /api/panes/{pane}/abort` | Send Ctrl-C to a pane.                                             |
 | `POST /api/fleet/{host}/command` | Execute a serialized Fleet operation; host mode is rechecked.   |
@@ -298,6 +299,34 @@ thread/parent, Work/Run, kind, status, timestamps, and counts remain available
 for a useful summary graph. Use `auth = "token"` for private full-detail
 history; a PAT cannot unlock details while the server is configured as
 `public_read`.
+
+## Talking to an agent
+
+Click an agent in **Execution inventory → Agents** (or a pane in the
+**Panes** tab, or a pane row in a Work card's execution list) to open its
+drawer. The **agents** chip in the header jumps to that table and shows how
+many agents are tracked. Rows are focusable: Tab to one and press Enter.
+
+The drawer shows the pane as `session:window.pane`, the agent kind, state,
+model, working directory and last activity, and below that the pane's live
+output, refreshed every 1.5 seconds while the drawer is open and the tab is
+visible. Output stays pinned to the newest line unless you scroll up; then a
+**jump to latest** chip appears. Type in **Message this agent…** and press
+Enter to send it (Shift+Enter for a new line; Enter that confirms an IME
+candidate never sends). **abort (Ctrl-C)** asks first; **share** opens the
+pane-sharing dialog when [sharing](#invite-someone-to-a-pane-or-window) is
+configured. Esc or × closes the drawer.
+
+`#pane=<id>` (plus `&socket=<socket>` when the id exists on several tmux
+servers) links straight to a drawer; closing it removes the fragment.
+
+Output and sending are for operators (the token, or an operator sign-in).
+Pane output can contain anything the agent printed, including secrets, so
+`GET /api/panes/{pane}/output` is gated like a write even though it is a GET:
+a viewer gets 403, and in `public_read` an anonymous visitor needs the token.
+Viewers and signed-out visitors can still open the drawer, but it shows only
+the metadata above and never requests output. With `auth = "none"` nobody
+can read output.
 
 ## Starting work from the board
 

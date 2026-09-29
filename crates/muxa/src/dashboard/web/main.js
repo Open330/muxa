@@ -1,6 +1,7 @@
 import { openShareManager } from "./sharing-admin.mjs";
 import { openAccessManager } from "./operators-admin.mjs";
 import { renderLanding } from "./landing.mjs";
+import { createPaneDrawer, parsePaneHash, withPaneHash } from "./pane-drawer.mjs";
 import { logicalWorkKey, normalizeAgent, validateWorkSnapshot, WORK_STAGES } from "./work-model.mjs";
 import {
   collaborationSequence,
@@ -241,8 +242,14 @@ async function controlFetch(path, options = {}) {
     // Status-only middleware rejections have an empty body.
   }
   if (resp.status === 401 || resp.status === 403) {
-    store.access.writeAuthorized = false;
-    renderAccess();
+    // Ask the server what this browser may do instead of assuming the
+    // credential is gone: a 403 is also what a signed-in operator gets when
+    // the request's Origin is not the configured public URL, and flipping
+    // writeAuthorized off here used to hide every control until a reload.
+    await fetchAccess().catch(() => {});
+    if (store.access.writeAuthorized) {
+      throw new Error(payload?.error || "request refused — open the dashboard at its public address and try again");
+    }
     throw new Error(resp.status === 401 ? "invalid or missing edit PAT" : "dashboard is read-only");
   }
   if (!resp.ok) {
@@ -394,6 +401,8 @@ const dom = {
   closeWorkDrawer: document.getElementById("close-work-drawer"),
   drawerBackdrop: document.getElementById("drawer-backdrop"),
   toast: document.getElementById("toast"),
+  jumpAgents: document.getElementById("jump-agents"),
+  jumpAgentsCount: document.getElementById("jump-agents-count"),
 };
 
 function setConnectionStatus(cls, label) {
@@ -462,6 +471,13 @@ function renderAccess() {
   if (store.terminalSessions.length > 0) renderTerminals();
   renderWorkItems();
   renderInspector();
+  const hint = document.getElementById("agents-hint");
+  if (hint) {
+    hint.textContent = editing
+      ? "Click an agent to see its output and send it a message."
+      : "Click an agent for details. Operators can see output and send messages.";
+  }
+  paneDrawer?.refreshAccess();
 }
 
 async function fetchAccess() {
@@ -1170,12 +1186,12 @@ function renderWorkExecution(work) {
       const attach = pane.attach_command
         ? `<button class="attach-btn" type="button" data-cmd="${esc(pane.attach_command)}">copy attach</button>`
         : "";
-      return `<div class="execution-pane-row">
+      return `<div${paneRowAttrs(pane.pane_id, run.execution?.socket, identity, "execution-pane-row pane-row")}>
         <span class="state-dot ${esc(state)}"></span>
         <span class="execution-pane-id" title="${esc(pane.pane_id)}">${esc(identity)}</span>
         <span class="execution-pane-command">${esc(agent?.kind || pane.current_command || "shell")}</span>
         <span class="execution-pane-title">${esc(agent?.ai_title || agent?.last_prompt || pane.title || "")}</span>
-        <span class="control-actions">${attach}${paneControlButtons(pane.pane_id, socket)}</span>
+        <span class="control-actions">${attach}${paneOpenButton(pane.pane_id, run.execution?.socket)}</span>
       </div>`;
     }).join("");
     return `<section class="execution-run">
@@ -1921,6 +1937,8 @@ function renderAgents() {
       store.filters.agentKinds.has(a.kind)
   );
   rows.sort((x, y) => (y.last_activity_at || "").localeCompare(x.last_activity_at || ""));
+  if (dom.jumpAgentsCount) dom.jumpAgentsCount.textContent = String(store.agents.size);
+  paneDrawer?.refreshAccess();
   dom.agentsMeta.textContent = selectedSession()
     ? `${rows.length} in ${selectedSession()}`
     : `${rows.length} shown · ${store.agents.size} tracked`;
@@ -1940,8 +1958,8 @@ function renderAgents() {
       const limits = renderLimitsCell(a, now);
       const prompt = (a.last_prompt || "—").split("\n")[0].slice(0, 120);
       const activity = relTime(a.last_activity_at);
-      return `<tr>
-        <td>${esc(pane)}</td>
+      return `<tr${paneRowAttrs(a.pane, a.tmux_socket, pane)}>
+        <td class="pane-cell">${esc(pane)}</td>
         <td>${esc(a.kind)}</td>
         <td><span class="state-pill ${esc(a.state)}">${esc(a.state)}</span></td>
         <td>${esc(a.model || "—")}</td>
@@ -1950,20 +1968,23 @@ function renderAgents() {
         <td class="${limits.cls}" title="${esc(limits.title)}">${esc(limits.text)}</td>
         <td>${esc(prompt)}</td>
         <td>${esc(activity)}</td>
-        <td>${paneControlButtons(a.pane, a.tmux_socket)}</td>
+        <td>${paneOpenButton(a.pane, a.tmux_socket)}</td>
       </tr>`;
     })
     .join("");
   dom.agentsBody.innerHTML = html;
 }
 
-function paneControlButtons(pane, socket = "") {
-  if (!store.access.writeAuthorized || !pane) return "—";
-  return `<span class="control-actions">
-    ${store.access.paneSharingAvailable && /^(%|rmux:)/.test(pane) ? `<button class="control-btn" type="button" data-pane-action="share" data-pane="${esc(pane)}" data-pane-socket="${esc(socket || "")}">share</button>` : ""}
-    <button class="control-btn" type="button" data-pane-action="prompt" data-pane="${esc(pane)}" data-pane-socket="${esc(socket || "")}">prompt</button>
-    <button class="control-btn danger" type="button" data-pane-action="abort" data-pane="${esc(pane)}" data-pane-socket="${esc(socket || "")}">abort</button>
-  </span>`;
+// Rows that open the pane drawer: focusable, Enter/Space/click opens.
+function paneRowAttrs(pane, socket, label = pane, cls = "pane-row") {
+  if (!pane) return "";
+  return ` class="${cls}" tabindex="0" aria-haspopup="dialog" aria-label="Open ${esc(label)}" data-open-pane="${esc(pane)}" data-open-socket="${esc(socket || "")}"`;
+}
+
+// The one per-row action: open the drawer (output, message, abort, share).
+function paneOpenButton(pane, socket = "") {
+  if (!pane) return "—";
+  return `<button class="control-btn open-btn" type="button" aria-haspopup="dialog" data-open-pane="${esc(pane)}" data-open-socket="${esc(socket || "")}">open</button>`;
 }
 
 /// Build the LIMITS cell for one agent row. Mirrors the CLI watch
@@ -2061,7 +2082,7 @@ function renderPanes() {
   const html = rows
     .map((p) => {
       const sockShort = p.socket.split("/").pop() || p.socket;
-      return `<tr>
+      return `<tr${paneRowAttrs(p.pane_id, p.socket, `${p.session}:${p.window_index}.${p.pane_id}`)}>
         <td title="${esc(p.socket)}">${esc(sockShort)}</td>
         <td>${esc(p.session)}</td>
         <td>${esc(p.window_index)}</td>
@@ -2070,7 +2091,7 @@ function renderPanes() {
         <td>${esc(p.title)}</td>
         <td><span class="control-actions">
           <button class="attach-btn" data-cmd="${esc(p.attach_command)}">copy attach</button>
-          ${paneControlButtons(p.pane_id, p.socket)}
+          ${paneOpenButton(p.pane_id, p.socket)}
         </span></td>
       </tr>`;
     })
@@ -2118,33 +2139,135 @@ async function showTerminalCapture(id) {
   renderInspector();
 }
 
-async function runPaneControl(button) {
-  const action = button.getAttribute("data-pane-action");
-  const pane = button.getAttribute("data-pane");
-  const socket = button.getAttribute("data-pane-socket") || null;
-  if (!action || !pane) return;
+// ── Pane drawer ───────────────────────────────────────────────────
 
-  if (action === "share") { openShareManager({ pane, socket }, controlFetch); return; }
+let paneDrawer = null;
 
-  if (action === "prompt") {
-    const text = window.prompt(`Send prompt to ${pane}`);
-    if (!text) return;
-    await controlFetch(`/api/panes/${encodeURIComponent(pane)}/prompt`, {
-      method: "POST",
-      body: JSON.stringify({ text, submit: true, socket }),
-    });
-    showToast(`prompt sent to ${pane}`);
-    return;
+function agentForPane(paneId, socket) {
+  const matches = [...store.agents.values()].filter((a) => a.pane === paneId);
+  if (socket) {
+    const exact = matches.find((a) => a.tmux_socket && socketShortName(a.tmux_socket) === socketShortName(socket));
+    if (exact) return exact;
   }
+  matches.sort((x, y) => (y.last_activity_at || "").localeCompare(x.last_activity_at || ""));
+  return matches[0] || null;
+}
 
-  if (action === "abort") {
-    if (!window.confirm(`Send Ctrl-C to ${pane}?`)) return;
-    await controlFetch(`/api/panes/${encodeURIComponent(pane)}/abort`, {
-      method: "POST",
-      body: JSON.stringify({ socket }),
-    });
-    showToast(`abort sent to ${pane}`);
-  }
+function paneSummaryFor(paneId, socket) {
+  const exact = socket ? store.indexes.paneBySocketAndId.get(paneLookupKey(socket, paneId)) : null;
+  if (exact) return exact;
+  const candidates = store.indexes.panesById.get(paneId) || [];
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+function describePane(target) {
+  const agent = agentForPane(target.pane, target.socket);
+  const socket = target.socket || agent?.tmux_socket || null;
+  const pane = paneSummaryFor(target.pane, socket);
+  return {
+    title: resolvePaneLabel(target.pane, socket),
+    kind: agent?.kind || "",
+    state: agent?.state || "",
+    model: agent?.model || "",
+    cwd: agent?.cwd || pane?.current_path || "",
+    activity: agent?.last_activity_at ? relTime(agent.last_activity_at) : "",
+    command: pane?.current_command || "",
+  };
+}
+
+function initPaneDrawer() {
+  const byId = (id) => document.getElementById(id);
+  paneDrawer = createPaneDrawer({
+    elements: {
+      drawer: byId("pane-drawer"),
+      backdrop: byId("pane-drawer-backdrop"),
+      title: byId("pane-drawer-title"),
+      meta: byId("pane-drawer-meta"),
+      cwd: byId("pane-drawer-cwd"),
+      close: byId("close-pane-drawer"),
+      share: byId("pane-drawer-share"),
+      abort: byId("pane-drawer-abort"),
+      updated: byId("pane-drawer-updated"),
+      viewOnly: byId("pane-drawer-view-only"),
+      outputWrap: byId("pane-output-wrap"),
+      status: byId("pane-output-status"),
+      output: byId("pane-output"),
+      jump: byId("pane-jump"),
+      composer: byId("pane-composer"),
+      text: byId("pane-composer-text"),
+      error: byId("pane-composer-error"),
+      send: byId("pane-composer-send"),
+    },
+    isOperator: () => store.access.writeAuthorized,
+    canShare: (target) => Boolean(target && store.access.paneSharingAvailable && /^(%|rmux:)/.test(target.pane)),
+    describe: describePane,
+    // Plain fetch, not jsonFetch: a refused output read must not swap the
+    // whole dashboard for the landing page.
+    fetchOutput: (url) => fetch(url, {
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: authHeaders(),
+    }),
+    controlFetch,
+    openShare: (target) => openShareManager(target, controlFetch),
+    showToast,
+    onHashChange(target) {
+      const url = new URL(window.location.href);
+      url.hash = withPaneHash(url.hash, target);
+      window.history.replaceState(window.history.state, "", url.toString());
+    },
+    findOpener(target) {
+      if (!target) return null;
+      return [...document.querySelectorAll("[data-open-pane]")]
+        .find((node) => node.getAttribute("data-open-pane") === target.pane) || null;
+    },
+  });
+
+  document.addEventListener("click", (event) => {
+    const opener = event.target.closest?.("[data-open-pane]");
+    if (!opener) return;
+    // Another control inside the row (copy attach, …) keeps its own job.
+    const control = event.target.closest("button, a, input, select, textarea, label");
+    if (control && control !== opener) return;
+    // Selecting text in a row is not a request to open it.
+    if (!opener.matches("button") && String(window.getSelection?.() || "")) return;
+    openPaneFrom(opener);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const row = event.target;
+    if (!row?.matches?.("[data-open-pane]:not(button)")) return;
+    event.preventDefault();
+    openPaneFrom(row);
+  });
+  window.addEventListener("hashchange", openPaneFromHash);
+}
+
+function openPaneFrom(node) {
+  const pane = node.getAttribute("data-open-pane");
+  if (!pane) return;
+  if (!dom.workDrawer.hidden) closeWorkDrawer();
+  paneDrawer.open({ pane, socket: node.getAttribute("data-open-socket") || null }, node);
+}
+
+function openPaneFromHash() {
+  const target = parsePaneHash(window.location.hash);
+  if (target) paneDrawer.open(target);
+  else paneDrawer.close();
+}
+
+// Header shortcut: the Agents table lives in a collapsible panel at the
+// bottom of the page; bring it into view (expanded, on the Agents tab).
+function initAgentsJump() {
+  dom.jumpAgents?.addEventListener("click", () => {
+    const panel = document.getElementById("data-panel");
+    if (panel?.classList.contains("collapsed")) {
+      panel.querySelector('[data-collapse-target="data-panel"]')?.click();
+    }
+    dom.dataTabs.querySelector('[data-tab="agents"]')?.click();
+    panel?.scrollIntoView({ behavior: "smooth", block: "start" });
+    dom.agentsBody.querySelector("[data-open-pane]")?.focus({ preventScroll: true });
+  });
 }
 
 async function saveWorkMetadata(form) {
@@ -2478,11 +2601,6 @@ function initDynamicEventDelegation() {
   });
 
   dom.workItemsContent.addEventListener("click", async (event) => {
-    const control = event.target.closest("[data-pane-action]");
-    if (control) {
-      await runPaneControl(control).catch((error) => showToast(error.message));
-      return;
-    }
     const copy = event.target.closest("[data-cmd]");
     if (copy) {
       const ok = await copyToClipboard(copy.getAttribute("data-cmd") || "");
@@ -2533,17 +2651,7 @@ function initDynamicEventDelegation() {
     renderTimeline();
   });
 
-  dom.agentsBody.addEventListener("click", (event) => {
-    const button = event.target.closest("[data-pane-action]");
-    if (button) runPaneControl(button).catch((error) => showToast(error.message));
-  });
-
   dom.panesBody.addEventListener("click", async (event) => {
-    const control = event.target.closest("[data-pane-action]");
-    if (control) {
-      await runPaneControl(control).catch((error) => showToast(error.message));
-      return;
-    }
     const copy = event.target.closest("[data-cmd]");
     if (!copy) return;
     const ok = await copyToClipboard(copy.getAttribute("data-cmd") || "");
@@ -2573,11 +2681,6 @@ function initDynamicEventDelegation() {
     if (workAction) {
       await runWorkAction(workAction.getAttribute("data-work-action") || "")
         .catch((error) => showToast(error.message));
-      return;
-    }
-    const control = event.target.closest("[data-pane-action]");
-    if (control) {
-      await runPaneControl(control).catch((error) => showToast(error.message));
       return;
     }
     const copy = event.target.closest("[data-cmd]");
@@ -3508,6 +3611,8 @@ async function main() {
   initSessionControls();
   initCollaborationControls();
   initDynamicEventDelegation();
+  initPaneDrawer();
+  initAgentsJump();
   renderStaticChips();
   setConnectionStatus("connecting", "loading…");
 
@@ -3530,6 +3635,8 @@ async function main() {
     store.ui.activeTab === "terminals" ? fetchTerminalSessions() : Promise.resolve(),
     fetchTimeline({ force: true }),
   ]);
+  // Deep link: #pane=<id>[&socket=<socket>] opens that agent's drawer.
+  if (parsePaneHash(window.location.hash)) openPaneFromHash();
 
   setTimeout(pollPanes, PANES_REFETCH_INTERVAL_MS);
   setTimeout(pollWorks, WORK_REFETCH_INTERVAL_MS);
