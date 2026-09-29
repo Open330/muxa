@@ -21,10 +21,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 SANDBOX="$REPO/scripts/muxa-sandbox.sh"
 NAME=muxa-film
-OUTER=muxa-film-outer
+# The outer tmux lives on a socket in the private work dir, not under
+# /tmp/tmux-$UID/: a running muxad scans that directory and would list the
+# capture session next to the operator's real ones.
+OUTER_NAME=outer.sock
 COLS=100
 ROWS=30
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/muxa-film.XXXXXX")
+OUTER="$WORK/$OUTER_NAME"
 OUT="$REPO/crates/muxa/src/dashboard/web/landing-frames.mjs"
 
 TM_REAL="${MUXA_FILM_TMUX:-$(command -v tmux)}"
@@ -32,12 +36,12 @@ BIN_DIR="$REPO/target/release"
 [ -x "$BIN_DIR/muxad" ] || BIN_DIR="$(dirname "$(command -v muxad)")"
 
 cleanup() {
-  "$TM_REAL" -L "$OUTER" kill-server 2>/dev/null || true
+  "$TM_REAL" -S "$OUTER" kill-server 2>/dev/null || true
   bash "$SANDBOX" down --name "$NAME" --tmux "$TM_REAL" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
-cleanup_before() { "$TM_REAL" -L "$OUTER" kill-server 2>/dev/null || true; bash "$SANDBOX" down --name "$NAME" --tmux "$TM_REAL" >/dev/null 2>&1 || true; }
+cleanup_before() { "$TM_REAL" -S "$OUTER" kill-server 2>/dev/null || true; bash "$SANDBOX" down --name "$NAME" --tmux "$TM_REAL" >/dev/null 2>&1 || true; }
 cleanup_before
 
 cat > "$WORK/config.toml" <<'TOML'
@@ -120,9 +124,9 @@ hook "$P_DEP" codex pre_tool_use '{"session_id":"f-dep","tool_name":"shell"}'
 
 # A real client of a fixed size, attached from inside a private outer tmux so
 # its whole screen — status line and popups included — can be captured.
-"$TM_REAL" -L "$OUTER" -f /dev/null new-session -d -s film -x "$COLS" -y "$ROWS" \
+"$TM_REAL" -S "$OUTER" -f /dev/null new-session -d -s film -x "$COLS" -y "$ROWS" \
   "env -u TMUX TERM=tmux-256color '$MUXA_SANDBOX_TMUX' -u -f '$MUXA_SANDBOX_TMUX_CONFIG' -S '$MUXA_TMUX_SOCKET' attach -t acme:code"
-"$TM_REAL" -L "$OUTER" set-option -g status off
+"$TM_REAL" -S "$OUTER" set-option -g status off
 sleep 1.5
 tm send-keys -t "$P_SHELL" "npm test" Enter
 sleep 1
@@ -130,7 +134,7 @@ sleep 1
 frames=()
 capture() { # <name>
   sleep "${2:-1.6}"
-  "$TM_REAL" -L "$OUTER" capture-pane -e -p -t film > "$WORK/$1.cap"
+  "$TM_REAL" -S "$OUTER" capture-pane -e -p -t film > "$WORK/$1.cap"
   frames+=("$1")
 }
 
@@ -147,7 +151,7 @@ tm send-keys -t "$P_SHELL" "muxa attend"
 capture typed 0.8
 tm send-keys -t "$P_SHELL" Enter
 capture attended 2
-"$TM_REAL" -L "$OUTER" send-keys -t film C-b q
+"$TM_REAL" -S "$OUTER" send-keys -t film C-b q
 capture peek 2.5
 
 {

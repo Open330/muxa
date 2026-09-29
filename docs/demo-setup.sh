@@ -136,6 +136,9 @@ bash "$SANDBOX" up \
 # MUXA_SOCKET, MUXA_CONFIG, XDG_DATA_HOME, MUXA_TMUX_SOCKET and the shimmed
 # PATH all arrive here. Nothing below may reach a real muxa surface.
 eval "$(bash "$SANDBOX" env --name "$TMUX_LBL")"
+# The sandbox addresses its tmux server by socket path (and its own config),
+# not by `-L` label; every call below goes through this.
+tm() { "$MUXA_SANDBOX_TMUX" -u -f "$MUXA_SANDBOX_TMUX_CONFIG" -S "$MUXA_TMUX_SOCKET" "$@"; }
 SHIM_DIR=$MUXA_SANDBOX_SHIM
 
 # Ask stand-ins. `muxa watch`'s `a` shells out to the real agent CLI, which
@@ -265,11 +268,11 @@ frame() { # <slug> <agent> <state> <prompt> [tool]... → echoes the pane comman
 # which reads as a bug. It is still seeded as an agent further down, because
 # the collaboration mailbox is scoped to its origin pane and `b`/`m` need
 # one.
-"$TM" -u -L "$TMUX_LBL" new-session -d -s ctl -x 220 -y 46 \
+tm new-session -d -s ctl -x 220 -y 46 \
   -n fleet \
   "bash --rcfile /tmp/muxa-demo-bashrc"
 
-"$TM" -u -L "$TMUX_LBL" new-session -d -s main -x 220 -y 46 \
+tm new-session -d -s main -x 220 -y 46 \
   -n ipc \
   "$(frame main claude working 'continue with protocol compatibility tests and update the watch work summary docs' \
       'editing  crates/muxa/src/ipc.rs' 'Task ×3  Explore, general-purpose, code-reviewer')"
@@ -278,22 +281,22 @@ frame() { # <slug> <agent> <state> <prompt> [tool]... → echoes the pane comman
 # the painted pane.
 # `review` hosts codex mid-approval — this is where `muxa attend` lands, so it
 # paints a believable approval prompt instead of an empty shell.
-"$TM" -u -L "$TMUX_LBL" new-window -d -t main: -n review \
+tm new-window -d -t main: -n review \
   "$(frame review codex approval 'audit the legacy auth middleware for raw bearer tokens' \
       'ran  rg -n "bearer" src/            18 matches' \
       'ran  cat src/auth/middleware.rs')"
-"$TM" -u -L "$TMUX_LBL" new-window -d -t main: -n vim cat
+tm new-window -d -t main: -n vim cat
 
 mk() { # <session> [command] → echoes the pane id
-  "$TM" -u -L "$TMUX_LBL" new-session -d -s "$1" -n "$1" -x 220 -y 46 "${2:-cat}"
-  "$TM" -u -L "$TMUX_LBL" display-message -p -t "$1:0.0" '#{pane_id}'
+  tm new-session -d -s "$1" -n "$1" -x 220 -y 46 "${2:-cat}"
+  tm display-message -p -t "$1:0.0" '#{pane_id}'
 }
 mkwin() { # <session> <window> [command] → echoes the pane id
-  "$TM" -u -L "$TMUX_LBL" new-window -d -t "$1:" -n "$2" "${3:-cat}"
-  "$TM" -u -L "$TMUX_LBL" display-message -p -t "$1:$2.0" '#{pane_id}'
+  tm new-window -d -t "$1:" -n "$2" "${3:-cat}"
+  tm display-message -p -t "$1:$2.0" '#{pane_id}'
 }
 mkpane() { # <session> <window> [command] → echoes the new pane id
-  "$TM" -u -L "$TMUX_LBL" split-window -h -d -P -F '#{pane_id}' \
+  tm split-window -h -d -P -F '#{pane_id}' \
     -t "$1:$2" "${3:-cat}"
 }
 
@@ -338,14 +341,14 @@ P_WEB_E2E=$(mkpane web 0 "$(frame web-e2e claude done 're-record the playwright 
 # should attach to.
 # The sandbox's placeholder kept the server alive until the demo had sessions
 # of its own; it would otherwise show up as an empty row in the recording.
-"$TM" -u -L "$TMUX_LBL" kill-session -t "$MUXA_SANDBOX_HOLDER"
-"$TM" -u -L "$TMUX_LBL" select-window -t ctl:0
+tm kill-session -t "$MUXA_SANDBOX_HOLDER"
+tm select-window -t ctl:0
 
 # The operator's pane: where the recording types, and the origin the
 # collaboration mailbox is scoped to.
-PCTL=$("$TM" -u -L "$TMUX_LBL" display-message -p -t ctl:0.0 '#{pane_id}')
-PA=$("$TM" -u -L "$TMUX_LBL" display-message -p -t main:0.0 '#{pane_id}')
-PB=$("$TM" -u -L "$TMUX_LBL" display-message -p -t main:1.0 '#{pane_id}')
+PCTL=$(tm display-message -p -t ctl:0.0 '#{pane_id}')
+PA=$(tm display-message -p -t main:0.0 '#{pane_id}')
+PB=$(tm display-message -p -t main:1.0 '#{pane_id}')
 
 # ---------------------------------------------------------------------------
 # 3) muxad, scoped to the demo server
@@ -562,18 +565,18 @@ EOF
 # ---------------------------------------------------------------------------
 # 7) Wire muxa into the demo server so the recording shows the integration
 # ---------------------------------------------------------------------------
-"$TM" -u -L "$TMUX_LBL" set-option -g status-interval 1
+tm set-option -g status-interval 1
 # Status bar at the top — much more legible in a GIF than the default bottom
 # bar squeezed against the recording's edge.
-"$TM" -u -L "$TMUX_LBL" set-option -g status-position top
-"$TM" -u -L "$TMUX_LBL" set-option -g status-style "bg=#0d1117,fg=#f0f6fc"
-"$TM" -u -L "$TMUX_LBL" set-option -g status-left  "#[bg=#58a6ff,fg=#0d1117,bold] muxa-demo #[default] "
-"$TM" -u -L "$TMUX_LBL" set-option -g status-left-length 20
-"$TM" -u -L "$TMUX_LBL" set-option -g status-right \
+tm set-option -g status-position top
+tm set-option -g status-style "bg=#0d1117,fg=#f0f6fc"
+tm set-option -g status-left  "#[bg=#58a6ff,fg=#0d1117,bold] muxa-demo #[default] "
+tm set-option -g status-left-length 20
+tm set-option -g status-right \
   "#[fg=#f0f6fc,bold]#(muxa status-line --pane #{pane_id})#[default]   #[fg=#79c0ff,bold]%H:%M#[default] "
-"$TM" -u -L "$TMUX_LBL" set-option -g status-right-length 120
+tm set-option -g status-right-length 120
 
 # The real binding muxa init writes: full-client popup, caller pinned so
 # Enter attaches the terminal the popup was opened from.
-"$TM" -u -L "$TMUX_LBL" bind-key s run-shell -b \
+tm bind-key s run-shell -b \
   "tmux display-popup -c '#{client_name}' -B -E -w 100% -h 100% -x 0 -y 0 \"muxa watch --caller-client '#{client_name}' --caller-pane '#{pane_id}'\""
