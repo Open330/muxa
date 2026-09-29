@@ -20,6 +20,7 @@
       <span class="version" id="version" title="protocol version"></span>
     </div>
     <div class="status">
+      <button class="agents-jump" type="button" id="jump-agents" title="Go to the Agents table — click a row to talk to that agent">agents <b id="jump-agents-count">0</b></button>
       <span class="mode-badge" id="access-mode">checking access…</span>
       <button class="access-btn" type="button" id="operator-login" hidden>sign in</button>
       <button class="access-btn" type="button" id="edit-access" hidden>unlock edit</button>
@@ -78,6 +79,35 @@
         <div class="metric-card">
           <span>participants</span>
           <strong id="metric-participants">—</strong>
+        </div>
+      </section>
+
+      <section class="panel topology-panel" id="topology-panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <button class="collapse-btn" type="button" data-collapse-target="topology-panel" aria-expanded="true" aria-controls="topology-content" title="Collapse sessions">
+              <span aria-hidden="true">⌄</span>
+            </button>
+            <h2>Sessions</h2>
+            <span class="panel-meta" id="topology-meta"></span>
+          </div>
+          <input
+            id="topology-filter"
+            class="topology-filter"
+            type="search"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="filter: session, window, cwd, agent…"
+            aria-label="Filter sessions, windows and panes"
+          />
+        </div>
+        <div class="panel-content topology-content" id="topology-content">
+          <nav class="topology-tree-wrap" aria-label="Sessions, windows and panes">
+            <ul class="topology-tree" id="topology-tree" role="tree" aria-label="Sessions">
+              <li class="empty-block">loading…</li>
+            </ul>
+          </nav>
+          <section class="topology-detail" id="topology-detail" aria-label="Selection"></section>
         </div>
       </section>
 
@@ -280,6 +310,7 @@
             </div>
             <span class="panel-meta" id="agents-meta"></span>
           </div>
+          <p class="table-hint" id="agents-hint">Click an agent to see its output and send it a message.</p>
           <div class="table-wrap" id="agents-content">
             <table class="data">
               <thead>
@@ -293,7 +324,7 @@
                   <th>LIMITS</th>
                   <th>LAST PROMPT</th>
                   <th>ACTIVITY</th>
-                  <th>CONTROL</th>
+                  <th><span class="sr-only">Open</span></th>
                 </tr>
               </thead>
               <tbody id="agents-tbody">
@@ -371,9 +402,40 @@
         <div class="empty-block">loading…</div>
       </div>
     </aside>
+
+    <aside class="panel pane-drawer" id="pane-drawer" role="dialog" aria-modal="true" aria-labelledby="pane-drawer-title" aria-describedby="pane-drawer-meta" hidden>
+      <div class="pane-drawer-header">
+        <div class="pane-drawer-heading">
+          <h2 id="pane-drawer-title">pane</h2>
+          <div class="pane-drawer-meta" id="pane-drawer-meta"></div>
+          <div class="pane-drawer-cwd" id="pane-drawer-cwd" hidden></div>
+        </div>
+        <button class="icon-btn" type="button" id="close-pane-drawer" aria-label="Close" title="Close (Esc)">×</button>
+      </div>
+      <div class="pane-drawer-actions">
+        <button class="control-btn" type="button" id="pane-drawer-share" hidden>share</button>
+        <button class="control-btn danger" type="button" id="pane-drawer-abort" hidden>abort (Ctrl-C)</button>
+        <span class="pane-drawer-updated" id="pane-drawer-updated"></span>
+      </div>
+      <p class="pane-drawer-view-only" id="pane-drawer-view-only" hidden>View only — operators can see output and send messages.</p>
+      <div class="pane-output-wrap" id="pane-output-wrap">
+        <p class="pane-output-status" id="pane-output-status" role="status" hidden></p>
+        <pre class="pane-output" id="pane-output" tabindex="0" aria-label="Agent output"></pre>
+        <button class="pane-jump" type="button" id="pane-jump" hidden>jump to latest ↓</button>
+      </div>
+      <form class="pane-composer" id="pane-composer">
+        <textarea id="pane-composer-text" rows="3" placeholder="Message this agent…" aria-label="Message this agent" aria-describedby="pane-composer-hint pane-composer-error"></textarea>
+        <div class="pane-composer-row">
+          <small class="pane-composer-hint" id="pane-composer-hint">Enter to send · Shift+Enter for a new line</small>
+          <span class="pane-composer-error" id="pane-composer-error" role="alert"></span>
+          <button class="control-btn primary" type="submit" id="pane-composer-send">Send</button>
+        </div>
+      </form>
+    </aside>
   </main>
 
   <button class="drawer-backdrop" type="button" id="drawer-backdrop" aria-label="Close work details" hidden></button>
+  <button class="drawer-backdrop" type="button" id="pane-drawer-backdrop" aria-label="Close agent" tabindex="-1" hidden></button>
 
   <div id="toast" class="toast" hidden></div>
 

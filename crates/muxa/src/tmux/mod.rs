@@ -1060,6 +1060,31 @@ pub fn capture_pane_on(socket: Option<&str>, pane_id: &str) -> Result<String, Tm
     String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))
 }
 
+/// Like [`capture_pane_on`] but starting `history` lines above the visible
+/// screen (`-S -N`), with wrapped lines joined (`-J`) so a reader that wraps
+/// text itself sees whole lines. Plain text (no `-e`): the only consumer is
+/// the dashboard's pane drawer, which strips escapes anyway.
+pub fn capture_pane_history_on(
+    socket: Option<&str>,
+    pane_id: &str,
+    history: usize,
+) -> Result<String, TmuxError> {
+    let start = format!("-{history}");
+    let mut cmd = tmux_command_targeting(socket);
+    cmd.args(["capture-pane", "-p", "-J", "-S", &start, "-t", pane_id]);
+    let out = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux capture-pane -S {start} -t {pane_id}"),
+    )?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).into(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Best-effort resolution of the user's active pane.
 ///
 /// `$TMUX_PANE` covers the common case (a shell running inside that pane).

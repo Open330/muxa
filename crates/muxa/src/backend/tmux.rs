@@ -100,6 +100,15 @@ impl PaneBackend for TmuxBackend {
         crate::tmux::capture_pane_on(socket, pane_id).ok()
     }
 
+    fn capture_pane_history_on(
+        &self,
+        socket: Option<&str>,
+        pane_id: &str,
+        history: usize,
+    ) -> Option<String> {
+        crate::tmux::capture_pane_history_on(socket, pane_id, history).ok()
+    }
+
     // `caps()` uses the default impl from the trait — tmux supports
     // every method the trait exposes (including `send_text`), so spelling
     // out the table here would just be noise.
