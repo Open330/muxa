@@ -2,6 +2,7 @@ import { openShareManager } from "./sharing-admin.mjs";
 import { openAccessManager } from "./operators-admin.mjs";
 import { renderLanding } from "./landing.mjs";
 import { createPaneDrawer, parsePaneHash, withPaneHash } from "./pane-drawer.mjs";
+import { TILE_STREAM_BUDGET, openPaneStream, planTileStreams } from "./pane-stream.mjs";
 import {
   buildTopology,
   filterTopology,
@@ -2225,6 +2226,7 @@ function initPaneDrawer() {
       cache: "no-store",
       headers: authHeaders(),
     }),
+    openStream: (url, handlers) => openPaneStream({ url, headers: authHeaders, ...handlers }),
     controlFetch,
     openShare: (target) => openShareManager(target, controlFetch),
     showToast,
@@ -2308,6 +2310,9 @@ const topologyState = {
   tailInFlight: new Set(),
   tailsDenied: false,
   tailTimer: null,
+  tailStreams: new Map(), // pane key -> live stream handle (TILE_STREAM_BUDGET at most)
+  tailStreamsUnsupported: false, // older daemon without /output/stream: poll every tile
+
   lastTreeHtml: "",
   lastDetailHtml: "",
 };
@@ -2608,22 +2613,94 @@ function renderTopologyDetail(topology) {
   }
 }
 
-// Live tails for the selected window's panes (operators only): at most one
-// request in flight per pane and TAIL_CONCURRENCY overall, every
-// TAIL_REFRESH_MS while the window is shown and the tab is visible.
+// Live tails for the selected window's panes (operators only). Up to
+// TILE_STREAM_BUDGET tiles (agent panes first) hold a live output stream;
+// the rest poll every TAIL_REFRESH_MS with at most one request in flight per
+// pane and TAIL_CONCURRENCY overall. Everything stops while the window is not
+// shown, the panel is collapsed or the tab is hidden.
 function tailsActive() {
   const selection = topologyState.selection;
   return Boolean(selection?.type === "window" && store.access.writeAuthorized && !topologyState.tailsDenied
     && !document.hidden && !dom.topologyPanel?.classList.contains("collapsed"));
 }
 
+function setTail(key, text) {
+  if (topologyState.tails.get(key) === text) return;
+  topologyState.tails.set(key, text);
+  const node = [...dom.topologyDetail.querySelectorAll("[data-tail]")]
+    .find((el) => el.getAttribute("data-tail") === key);
+  if (node) node.textContent = text;
+}
+
+function closeTailStream(key) {
+  topologyState.tailStreams.get(key)?.close();
+  topologyState.tailStreams.delete(key);
+}
+
+function closeTailStreams() {
+  for (const key of [...topologyState.tailStreams.keys()]) closeTailStream(key);
+}
+
+function denyTails() {
+  topologyState.tailsDenied = true;
+  closeTailStreams();
+  renderTopology();
+}
+
+function openTailStream(pane) {
+  const params = new URLSearchParams({ lines: String(TAIL_LINES) });
+  if (pane.socket) params.set("socket", pane.socket);
+  const key = pane.key;
+  const handle = openPaneStream({
+    url: `/api/panes/${encodeURIComponent(pane.id)}/output/stream?${params}`,
+    headers: authHeaders,
+    onOutput(payload) {
+      if (topologyState.tailStreams.get(key) !== handle) return;
+      setTail(key, typeof payload?.text === "string" ? payload.text : "");
+    },
+    onGone() {
+      if (topologyState.tailStreams.get(key) === handle) topologyState.tailStreams.delete(key);
+    },
+    onState(state) {
+      if (topologyState.tailStreams.get(key) !== handle) return;
+      if (state === "denied") {
+        denyTails();
+      } else if (state === "unsupported") {
+        topologyState.tailStreamsUnsupported = true;
+        closeTailStreams();
+        pollTails();
+      }
+    },
+  });
+  topologyState.tailStreams.set(key, handle);
+}
+
 async function pollTails() {
   clearTimeout(topologyState.tailTimer);
   topologyState.tailTimer = null;
-  if (!tailsActive()) return;
+  if (!tailsActive()) {
+    closeTailStreams();
+    return;
+  }
   const window = currentTopology().nodes.get(topologyState.selection.key);
-  const panes = (window?.panes || []).filter((pane) => !topologyState.tailInFlight.has(pane.key));
-  const queue = [...panes];
+  const panes = window?.panes || [];
+  const byKey = new Map(panes.map((pane) => [pane.key, pane]));
+  // Agent panes first: they are the ones worth watching live.
+  const ordered = [...panes.filter((pane) => pane.agent), ...panes.filter((pane) => !pane.agent)]
+    .map((pane) => pane.key);
+  const plan = topologyState.tailStreamsUnsupported
+    ? { stream: [], poll: ordered }
+    : planTileStreams(ordered, TILE_STREAM_BUDGET, new Set(topologyState.tailStreams.keys()));
+  const streamed = new Set(plan.stream);
+  for (const key of [...topologyState.tailStreams.keys()]) {
+    if (!streamed.has(key)) closeTailStream(key);
+  }
+  for (const key of plan.stream) {
+    if (!topologyState.tailStreams.has(key)) openTailStream(byKey.get(key));
+  }
+
+  const queue = plan.poll.map((key) => byKey.get(key))
+    .filter((pane) => !topologyState.tailInFlight.has(pane.key));
   const worker = async () => {
     for (let pane = queue.shift(); pane; pane = queue.shift()) {
       topologyState.tailInFlight.add(pane.key);
@@ -2636,20 +2713,13 @@ async function pollTails() {
           headers: authHeaders(),
         });
         if (resp.status === 401 || resp.status === 403) {
-          topologyState.tailsDenied = true;
           queue.length = 0;
-          renderTopology();
+          denyTails();
           return;
         }
         if (!resp.ok) continue;
         const data = await resp.json();
-        const text = typeof data.text === "string" ? data.text : "";
-        if (topologyState.tails.get(pane.key) !== text) {
-          topologyState.tails.set(pane.key, text);
-          const node = [...dom.topologyDetail.querySelectorAll("[data-tail]")]
-            .find((el) => el.getAttribute("data-tail") === pane.key);
-          if (node) node.textContent = text;
-        }
+        setTail(pane.key, typeof data.text === "string" ? data.text : "");
       } catch (_) {
         // Next round retries.
       } finally {
@@ -2658,7 +2728,10 @@ async function pollTails() {
     }
   };
   await Promise.all(Array.from({ length: Math.min(TAIL_CONCURRENCY, queue.length) }, worker));
+  // Keep a slow loop even when every tile streams: it re-plans streams as
+  // panes come and go.
   if (tailsActive()) topologyState.tailTimer = setTimeout(pollTails, TAIL_REFRESH_MS);
+  else closeTailStreams();
 }
 
 function moveTreeFocus(from, to) {
@@ -2751,8 +2824,9 @@ function initTopology() {
       }
     }
   });
+  // Hidden tab: pollTails() closes the tile streams; visible: reopens them.
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) pollTails();
+    pollTails();
   });
   dom.topologyPanel?.querySelector("[data-collapse-target]")?.addEventListener("click", () => {
     setTimeout(pollTails, 0);

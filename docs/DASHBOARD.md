@@ -41,6 +41,7 @@ bound to loopback and configure the public origin as described below.
 | `GET /api/events`   | SSE stream: `snapshot` (initial), `transition` (live), `lagged` (backpressure)|
 | `GET /api/windows/{window}/layout?socket=` | Pane geometry (`left`/`top`/`width`/`height` in cells, `active`, `zoomed`) for one tmux window. |
 | `GET /api/panes/{pane}/output?socket=&lines=N` | Operator only: `{ pane, text, captured_at }`, the pane's newest `N` lines (default 200, max 1000; 64 KiB cap) as plain text, escapes stripped. |
+| `GET /api/panes/{pane}/output/stream?socket=&lines=N` | Operator only, SSE: `output` events (`{ pane, text, captured_at }`, the full bounded text) on connect and whenever it changes; `gone` when the pane closes. See [Live pane output](#live-pane-output). |
 | `POST /api/panes/{pane}/prompt` | Send and optionally submit text to a pane.                       |
 | `POST /api/panes/{pane}/abort` | Send Ctrl-C to a pane.                                             |
 | `POST /api/fleet/{host}/command` | Execute a serialized Fleet operation; host mode is rechecked.   |
@@ -327,9 +328,10 @@ the top of the page is organized the same way.
   zoomed window shows only its zoomed pane, and other hosts or a geometry
   that no longer matches the pane list fall back to a plain grid). Each tile shows the pane,
   its agent kind and state, working directory and last prompt; operators also
-  see the pane's last 15 lines, refreshed every 3 seconds while the window is
-  shown and the tab is visible (one request per pane at a time, four at
-  most). Click a tile to open the pane drawer. **share window** invites
+  see the pane's last 15 lines while the window is shown and the tab is
+  visible: up to six tiles (agent panes first) stream live, and any others
+  are polled every 3 seconds (one request per pane at a time, four at most).
+  Click a tile to open the pane drawer. **share window** invites
   someone to every pane in the window when sharing is configured.
 - **Agents table.** Still available under Execution inventory; its pane column
   reads `session › window › pane`, and the session and window parts jump to
@@ -353,8 +355,8 @@ many agents are tracked. Rows are focusable: Tab to one and press Enter.
 
 The drawer shows the pane as `session:window.pane`, the agent kind, state,
 model, working directory and last activity, and below that the pane's live
-output, refreshed every 1.5 seconds while the drawer is open and the tab is
-visible. Output stays pinned to the newest line unless you scroll up; then a
+output, streamed live while the drawer is open and the tab is visible (the
+header reads `live · changed 5s ago`). Output stays pinned to the newest line unless you scroll up; then a
 **jump to latest** chip appears. Type in **Message this agent…** and press
 Enter to send it (Shift+Enter for a new line; Enter that confirms an IME
 candidate never sends). **abort (Ctrl-C)** asks first; **share** opens the
@@ -370,7 +372,38 @@ Pane output can contain anything the agent printed, including secrets, so
 a viewer gets 403, and in `public_read` an anonymous visitor needs the token.
 Viewers and signed-out visitors can still open the drawer, but it shows only
 the metadata above and never requests output. With `auth = "none"` nobody
-can read output.
+can read output. The live stream (below) is gated the same way.
+
+### Live pane output
+
+The drawer and the window tiles read
+`GET /api/panes/{pane}/output/stream?socket=&lines=N`, a server-sent event
+stream with the same access rules, validation and `Cache-Control: no-store` as
+`/output`.
+
+- **One capture loop per pane.** Every viewer of a pane (both tabs, the drawer
+  and a tile) shares one loop in the daemon. It runs only while someone is
+  connected: it captures the pane every 300 ms, strips escapes with the same
+  sanitizer as `/output`, and publishes only when the text changed. It stops
+  within one tick after the last viewer leaves. A capture still running when
+  the next tick comes skips that tick, so tmux calls never pile up.
+- **Events.** `event: output` carries `{ pane, text, captured_at }` with the
+  whole bounded text (newest `N` lines, 64 KiB cap), first as a snapshot on
+  connect and then on every change to that viewer's lines; an unchanged pane
+  sends nothing but a keep-alive comment every 15 seconds. `event: gone`
+  (`{ pane }`) means two captures in a row failed, usually because the pane
+  closed; it is the last event.
+- **Limits.** At most 32 panes stream at once across all clients, and 8
+  viewers per pane; beyond that the request gets `429`. A stream closes after
+  30 minutes and the client reconnects, so a revoked credential cannot hold a
+  stream open.
+- **Client.** The dashboard reads the stream with `fetch()` (like
+  `/api/events`), so bearer tokens and sign-in cookies both work. It
+  reconnects with exponential backoff (0.5 s doubling to 15 s, jittered),
+  closes streams while the tab is hidden or the drawer or window is closed,
+  and caps a window at six streaming tiles. Against an older daemon that
+  answers `404`, it falls back to polling `/output` (1.5 s in the drawer, 3 s
+  for tiles).
 
 ### Nerd Font glyphs
 
@@ -461,6 +494,9 @@ Three event types appear on the wire:
 
 (`EventSource` can't carry `Authorization` headers, so the frontend uses
 `fetch()` and parses SSE frames manually. ~30 lines of JS.)
+
+Pane output has its own per-pane stream; see
+[Live pane output](#live-pane-output).
 
 ## Why the HTML is public
 
