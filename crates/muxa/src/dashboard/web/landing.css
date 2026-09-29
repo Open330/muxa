@@ -437,6 +437,10 @@ body[data-view="landing"] {
 }
 .landing .l-code code { padding: 0; background: none; color: inherit; white-space: pre; font-size: 1em; }
 .l-code .p { color: var(--l-accent-2); user-select: none; }
+.l-code.sm { margin: 12px 0; padding: 12px 14px; font-size: 12.5px; line-height: 1.7; box-shadow: none; }
+
+.l-ways { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 28px; }
+.l-ways .l-card p { font-size: 14px; }
 .l-code .c { color: var(--l-term-muted); }
 
 .l-cta {
@@ -629,7 +633,7 @@ body[data-view="landing"] {
 @media (max-width: 980px) {
   .l-hero { grid-template-columns: minmax(0, 1fr); gap: 40px; padding-top: 32px; padding-bottom: 56px; }
   .l-flow, .l-three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .l-install { grid-template-columns: minmax(0, 1fr); }
+  .l-install, .l-ways { grid-template-columns: minmax(0, 1fr); }
   .l-surfaces { grid-template-columns: minmax(0, 1fr); }
 }
 

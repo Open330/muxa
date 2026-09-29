@@ -92,6 +92,22 @@ const COPY = {
     docs: "Docs",
     ctaTitle: "Is this your dashboard?",
     footer: "Part of <a href=\"https://github.com/Open330\">Open330</a> · open source tools for AI-agent workflows",
+    site: {
+      install: "Install",
+      watchShot: ["watch", "muxa watch", "The TUI: the whole fleet, the inspector, the swarm view, and muxa attend jumping to who needs you."],
+      installTitle: "Install",
+      installBody: "Needs tmux 3.x (or herdr) on macOS or Linux. Homebrew is the main path; the others are for the Mac app, a look before installing, and building from source.",
+      ways: [
+        ["Homebrew", "brew install open330/tap/muxa\nmuxa init\nmuxa doctor", "<code>muxa init</code> wires tmux and the agent hooks and starts the daemon; <code>muxa doctor</code> checks the result."],
+        ["Muxa for Mac", "brew install --cask open330/tap/muxa-app", "Notarized. Updates through Homebrew; the app has no built-in updater."],
+        ["Try it without installing", "curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh", "Runs the real <code>muxa onboard</code> in a throwaway tmux server and deletes it on exit. Your tmux server is never touched."],
+        ["From source", "git clone https://github.com/Open330/muxa.git\ncd muxa && scripts/install.sh", "Rust 1.89 or newer. Builds and installs <code>muxad</code> and <code>muxa</code>, then runs <code>muxa init</code>."],
+      ],
+      ctaTitle: "Stop hunting through tmux windows.",
+      ctaBody: "<strong>Beta.</strong> The daemon, CLI, TUIs, notifications, dashboard, stats, and reports work end to end; APIs may still change before 1.0.",
+      changelog: "Changelog",
+      releases: "Releases",
+    },
   },
   ko: {
     badge: "tmux · Claude Code · Codex · Gemini CLI",
@@ -171,6 +187,22 @@ const COPY = {
     docs: "문서",
     ctaTitle: "내 대시보드인가요?",
     footer: "<a href=\"https://github.com/Open330\">Open330</a>의 프로젝트 · AI 에이전트 워크플로를 위한 오픈소스 도구",
+    site: {
+      install: "설치",
+      watchShot: ["watch", "muxa watch", "TUI 화면: 전체 에이전트, inspector, swarm 뷰, 그리고 나를 기다리는 곳으로 가는 muxa attend."],
+      installTitle: "설치",
+      installBody: "macOS나 Linux에서 tmux 3.x(또는 herdr)가 필요합니다. Homebrew가 기본 경로이고, 나머지는 Mac 앱, 설치 전 체험, 소스 빌드용입니다.",
+      ways: [
+        ["Homebrew", "brew install open330/tap/muxa\nmuxa init\nmuxa doctor", "<code>muxa init</code>이 tmux와 에이전트 hook을 연결하고 데몬을 시작하며, <code>muxa doctor</code>가 결과를 점검합니다."],
+        ["Muxa for Mac", "brew install --cask open330/tap/muxa-app", "공증된 앱입니다. 앱 안에 업데이트 기능이 없으므로 Homebrew로 갱신합니다."],
+        ["설치 없이 체험", "curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh", "일회용 tmux 서버에서 진짜 <code>muxa onboard</code>를 실행하고 끝나면 지웁니다. 기존 tmux 서버는 건드리지 않습니다."],
+        ["소스에서", "git clone https://github.com/Open330/muxa.git\ncd muxa && scripts/install.sh", "Rust 1.89 이상이 필요합니다. <code>muxad</code>와 <code>muxa</code>를 빌드해 설치하고 <code>muxa init</code>까지 실행합니다."],
+      ],
+      ctaTitle: "tmux 창을 뒤지는 일은 이제 그만.",
+      ctaBody: "<strong>베타.</strong> 데몬, CLI, TUI, 알림, 대시보드, 통계, 리포트는 끝까지 동작하지만 1.0 전에는 API가 바뀔 수 있습니다.",
+      changelog: "변경 기록",
+      releases: "릴리스",
+    },
   },
 };
 
@@ -230,15 +262,26 @@ function accessButtons(t, access, size = "") {
   ].join("");
 }
 
+// Where icon.svg, landing/*.webp and demo.gif live: the daemon serves them
+// under /static/, the GitHub Pages site next to its index.html.
+const asset = (path) => `${view.base}${path}`;
+
 function shotPicture(name, alt) {
+  // The TUI recording (site only) is one GIF for both color schemes.
+  if (name === "watch") {
+    return `<a class="l-shot-link" href="${asset("demo.gif")}" target="_blank" rel="noopener"><img src="${asset("demo.gif")}" alt="${escapeText(alt)}" loading="lazy" decoding="async"></a>`;
+  }
   // The shot follows the page's color scheme; on a phone it is small, so it
   // links to the full-size image.
   const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-  return `<a class="l-shot-link" href="/static/landing/${name}-${dark ? "dark" : "light"}.webp" target="_blank" rel="noopener"><picture>
-    <source srcset="/static/landing/${name}-dark.webp" media="(prefers-color-scheme: dark)">
-    <img src="/static/landing/${name}-light.webp" alt="${escapeText(alt)}" loading="lazy" decoding="async">
+  return `<a class="l-shot-link" href="${asset(`landing/${name}-${dark ? "dark" : "light"}.webp`)}" target="_blank" rel="noopener"><picture>
+    <source srcset="${asset(`landing/${name}-dark.webp`)}" media="(prefers-color-scheme: dark)">
+    <img src="${asset(`landing/${name}-light.webp`)}" alt="${escapeText(alt)}" loading="lazy" decoding="async">
   </picture></a>`;
 }
+
+/** The screens tabs: the public site leads with the TUI recording. */
+const shotsFor = (t) => (view.mode === "site" ? [t.site.watchShot, ...t.shots] : t.shots);
 
 function markup(t, access, { host, email, shot }) {
   const notices = [
@@ -251,10 +294,12 @@ function markup(t, access, { host, email, shot }) {
   const flow = t.flow.map(([heading, body], i) =>
     `<li class="l-step" style="--i:${i}"><b><span>${i + 1}</span>${escapeText(heading)}</b><p>${body}</p></li>`
   ).join("");
-  const shotTabs = t.shots.map(([name, label], i) =>
+  const site = view.mode === "site";
+  const shots = shotsFor(t);
+  const shotTabs = shots.map(([name, label], i) =>
     `<button type="button" role="tab" data-landing-shot="${i}" aria-selected="${i === shot}">${escapeText(label)}</button>`
   ).join("");
-  const [shotName, shotLabel, shotCaption] = t.shots[shot];
+  const [shotName, shotLabel, shotCaption] = shots[shot];
   const principles = t.principles.map(([heading, body]) =>
     `<div class="l-card"><h3>${escapeText(heading)}</h3><p>${escapeText(body)}</p></div>`
   ).join("");
@@ -266,14 +311,16 @@ function markup(t, access, { host, email, shot }) {
   return `
     <header class="l-nav">
       <div class="l-wrap">
-        <span class="l-brand"><img src="/static/icon.svg" width="26" height="26" alt="">muxa</span>
-        <span class="l-host" title="${escapeText(host)}">${LOCK_ICON}${escapeText(host)}</span>
+        <span class="l-brand"><img src="${asset("icon.svg")}" width="26" height="26" alt="">muxa</span>
+        ${site ? "" : `<span class="l-host" title="${escapeText(host)}">${LOCK_ICON}${escapeText(host)}</span>`}
         <nav class="l-nav-actions">
           <div class="l-lang" role="group" aria-label="Language">${langs}</div>
           <a class="l-btn ghost sm l-hide-sm" href="${GITHUB}" rel="noopener">GitHub</a>
-          ${access.signIn
-            ? `<button class="l-btn dark sm" type="button" data-landing-action="sign-in">${escapeText(t.signIn)}</button>`
-            : `<button class="l-btn dark sm" type="button" data-landing-action="token">${escapeText(t.useToken)}</button>`}
+          ${site
+            ? `<a class="l-btn dark sm" href="#install">${escapeText(t.site.install)}</a>`
+            : access.signIn
+              ? `<button class="l-btn dark sm" type="button" data-landing-action="sign-in">${escapeText(t.signIn)}</button>`
+              : `<button class="l-btn dark sm" type="button" data-landing-action="token">${escapeText(t.useToken)}</button>`}
         </nav>
       </div>
     </header>
@@ -285,14 +332,17 @@ function markup(t, access, { host, email, shot }) {
           <h1>${t.title}</h1>
           <p class="l-lead">${escapeText(t.lead)}</p>
           <div class="l-actions">
-            ${accessButtons(t, access, "lg")}
+            ${site
+              ? `<a class="l-btn primary lg" href="#install">${escapeText(t.site.install)}</a>
+                 <a class="l-btn ghost lg" href="${GITHUB}" rel="noopener">${GITHUB_ICON}<span>${escapeText(t.github)}</span></a>`
+              : accessButtons(t, access, "lg")}
             <a class="l-btn ghost lg" href="#how">${escapeText(t.how)} ↓</a>
           </div>
-          <div class="l-private">
+          ${site ? "" : `<div class="l-private">
             ${LOCK_ICON}
             <p>${fill(t.private, { host })} ${escapeText(access.signIn || access.signOut ? t.privateSignIn : t.privateToken)}</p>
           </div>
-          ${notices}
+          ${notices}`}
         </div>
         <div class="l-film" data-landing-film></div>
       </section>
@@ -332,10 +382,10 @@ function markup(t, access, { host, email, shot }) {
         </div>
       </section>
 
-      <section class="l-section l-wrap l-install" data-reveal>
+      <section class="l-section l-wrap l-install" id="install" data-reveal>
         <div>
-          <h2>${escapeText(t.installTitle)}</h2>
-          <p>${t.installBody}</p>
+          <h2>${escapeText(site ? t.site.installTitle : t.installTitle)}</h2>
+          <p>${site ? t.site.installBody : t.installBody}</p>
           <div class="l-actions">
             <a class="l-btn ghost" href="${GITHUB}" rel="noopener">${GITHUB_ICON}<span>${escapeText(t.github)}</span></a>
             <a class="l-btn ghost" href="${GITHUB}/tree/main/docs" rel="noopener">${escapeText(t.docs)}</a>
@@ -345,25 +395,35 @@ function markup(t, access, { host, email, shot }) {
 <span class="p">$</span> muxa init      <span class="c">${escapeText(t.installC1)}</span>
 <span class="p">$</span> muxa attend    <span class="c">${escapeText(t.installC2)}</span></code></pre>
       </section>
+      ${site ? `<div class="l-wrap l-ways" data-reveal>${t.site.ways.map(([heading, command, body]) => `
+        <div class="l-card"><h3>${escapeText(heading)}</h3><pre class="l-code sm"><code>${escapeText(command)}</code></pre><p>${body}</p></div>`).join("")}
+      </div>` : ""}
 
       <section class="l-cta l-wrap" data-reveal>
-        <div>
+        ${site ? `<div>
+          <h2>${escapeText(t.site.ctaTitle)}</h2>
+          <p>${t.site.ctaBody}</p>
+        </div>
+        <div class="l-actions">
+          <a class="l-btn primary" href="${GITHUB}" rel="noopener">${GITHUB_ICON}<span>${escapeText(t.github)}</span></a>
+          <a class="l-btn ghost" href="${GITHUB}/tree/main/docs" rel="noopener">${escapeText(t.docs)}</a>
+        </div>` : `<div>
           <h2>${escapeText(t.ctaTitle)}</h2>
           <p>${fill(t.private, { host })}</p>
         </div>
-        <div class="l-actions">${accessButtons(t, access)}</div>
+        <div class="l-actions">${accessButtons(t, access)}</div>`}
       </section>
     </main>
 
     <footer class="l-foot"><div class="l-wrap">
-      <span class="l-brand small"><img src="/static/icon.svg" width="18" height="18" alt="">muxa</span>
-      <span>${t.footer}</span>
+      <span class="l-brand small"><img src="${asset("icon.svg")}" width="18" height="18" alt="">muxa</span>
+      <span>${t.footer}${site ? ` · <a href="${GITHUB}/blob/main/CHANGELOG.md" rel="noopener">${escapeText(t.site.changelog)}</a> · <a href="${GITHUB}/releases" rel="noopener">${escapeText(t.site.releases)}</a>` : ""}</span>
     </div></footer>`;
 }
 
 // One landing per page; the click handler reads whatever the latest render
 // set, so re-rendering with new login state never leaves stale callbacks.
-const view = { root: null, lang: "en", shot: 0, access: null, host: "", email: null, actions: null, film: null, reveal: null };
+const view = { root: null, mode: "dashboard", base: "/static/", lang: "en", shot: 0, access: null, host: "", email: null, actions: null, film: null, reveal: null };
 
 function revealOnScroll(root) {
   const items = [...root.querySelectorAll("[data-reveal]")];
@@ -398,7 +458,7 @@ function draw() {
 function showShot(index) {
   view.shot = index;
   const t = COPY[view.lang];
-  const [name, label, caption] = t.shots[index];
+  const [name, label, caption] = shotsFor(t)[index];
   const figure = view.root.querySelector(".l-shot figure");
   figure.innerHTML = `${shotPicture(name, `${label}: ${caption}`)}<figcaption>${escapeText(caption)}</figcaption>`;
   view.root.querySelectorAll("[data-landing-shot]").forEach((tab) => {
@@ -432,8 +492,12 @@ function onLandingClick(event) {
 /**
  * Render the landing view into `root` and wire its buttons. `actions` holds
  * `signIn`, `signOut` and `useToken(token)` callbacks owned by the dashboard.
+ * `mode: "site"` is the public project page (site/index.html): no access
+ * prompts, install and GitHub instead; `assetBase` is where its files live.
  */
-export function renderLanding(root, { login, tokenRejected = false, actions }) {
+export function renderLanding(root, { login, tokenRejected = false, actions, mode = "dashboard", assetBase = "/static/" } = {}) {
+  view.mode = mode;
+  view.base = assetBase;
   let saved = null;
   try { saved = localStorage.getItem(LANG_KEY); } catch (_) { /* storage blocked */ }
   if (view.root !== root) {

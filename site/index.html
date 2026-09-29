@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light dark" />
+<title>Muxa — know which coding agent is waiting on you</title>
+<meta name="description" content="Muxa watches the Claude Code, Codex, and Gemini CLI sessions you already run in tmux, tells you which one needs you, and takes you there. No wrapper, no new terminal." />
+<meta property="og:title" content="Muxa — know which coding agent is waiting on you" />
+<meta property="og:description" content="Know which tmux coding agent is waiting on you — and jump to it. Works with Claude Code, Codex, and Gemini CLI." />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://open330.github.io/muxa/" />
+<meta property="og:image" content="https://open330.github.io/muxa/landing/board-light.webp" />
+<link rel="icon" href="icon.svg" type="image/svg+xml" />
+<!--
+  The page is the dashboard's landing view in "site" mode, so the project
+  page and the page a daemon shows to visitors without access share one
+  design and one copy. The pages workflow copies landing.mjs,
+  landing-film.mjs, landing.css and the screens in from
+  crates/muxa/src/dashboard/web at deploy time.
+-->
+<link rel="stylesheet" href="landing.css" />
+<style>
+  body { margin: 0; }
+  .fallback { max-width: 640px; margin: 64px auto; padding: 0 20px; font: 16px/1.6 system-ui, sans-serif; }
+</style>
+</head>
+<body data-view="landing">
+<div class="landing" id="landing">
+  <div class="fallback">
+    <h1>Muxa</h1>
+    <p>Know which coding agent is waiting on you — and jump to it. Muxa watches the Claude Code, Codex, and Gemini CLI sessions you already run in tmux, tells you the moment one stops for input, a choice, or an error, and takes you straight to its pane. No wrapper, no new terminal.</p>
+    <pre>brew install open330/tap/muxa
+muxa init
+muxa attend</pre>
+    <p><a href="https://github.com/Open330/muxa">github.com/Open330/muxa</a></p>
+  </div>
+</div>
+<script type="module">
+  import { renderLanding } from "./landing.mjs";
+  renderLanding(document.getElementById("landing"), { mode: "site", assetBase: "./" });
+</script>
+</body>
+</html>
