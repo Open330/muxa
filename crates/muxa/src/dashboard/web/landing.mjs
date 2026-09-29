@@ -1,83 +1,181 @@
 // Landing view for visitors who can read nothing here: no operator session
-// and no dashboard token. It says what muxa is and offers the two ways in
-// (sign-in when the daemon has a login provider, and the dashboard token),
-// instead of an empty dashboard stuck on "sign in required".
+// and no dashboard token. It explains muxa up front (a problem-first hero,
+// a short film of the product, how it works, real screens from a demo
+// fleet) and keeps the ways in close by: Sign in when the daemon has a
+// login provider, and the dashboard token.
 //
-// Copy follows the project landing page (site/index.html). Everything is
-// local: a self-hosted daemon should not load fonts or images from elsewhere.
+// Everything is local: a self-hosted daemon should not load fonts, images
+// or scripts from elsewhere. Screens are regenerated with
+// scripts/landing-shots/capture.mjs from made-up data.
+
+import { mountFilm } from "./landing-film.mjs";
 
 const LANG_KEY = "muxa.landing.lang";
+const GITHUB = "https://github.com/Open330/muxa";
 
 const COPY = {
   en: {
     badge: "tmux · Claude Code · Codex · Gemini CLI",
-    title: "Know which coding agent is <em>waiting on you</em> — and jump to it.",
-    lead: "No wrapper, no new terminal. Muxa watches the Claude Code, Codex, and Gemini CLI sessions you already run in tmux, tells you which one needs you, and takes you there.",
-    accessTitle: "This dashboard is private",
-    accessBody: "It shows the live agents, panes, and Work on <b>{host}</b>. Sign in, or use this dashboard's access token.",
-    accessBodyToken: "It shows the live agents, panes, and Work on <b>{host}</b>. Open it with this dashboard's access token.",
-    signedInNoAccess: "Signed in as <b>{email}</b>, but this account has no access to this dashboard.",
+    title: "Six agents running.<br>Which one is <em>waiting on you</em>?",
+    lead: "Muxa watches the coding agents you already run in tmux, tells you the moment one stops for input, a choice, or an error, and takes you straight to its pane. No wrapper, no new terminal.",
+    how: "How it works",
+    private: "<b>{host}</b> is a private muxa dashboard.",
+    privateSignIn: "Sign in, or use its access token.",
+    privateToken: "Open it with its access token.",
+    signedInNoAccess: "Signed in as <b>{email}</b>, but this account has no access here.",
     tokenRejected: "The saved access token was not accepted.",
     signIn: "Sign in",
     signOut: "Sign out",
     useToken: "Use access token",
     tokenPrompt: "Muxa dashboard token",
-    tokenHint: "Operators find the token under <code>[dashboard]</code> in muxa's <code>config.toml</code> on that machine.",
-    previewLabel: "What an operator sees",
-    previewWaiting: "waiting for input · 4m",
-    previewChoice: "asking a choice · 1m",
-    previewWorking: "working",
-    previewError: "error · 12m",
-    whyTitle: "Why muxa",
-    why: [
-      ["Keeps your setup", "Agent state comes from Claude Code, Codex, and Gemini CLI hooks, with screen detection for hook-less agents. You don't launch agents through muxa and you don't switch multiplexers."],
-      ["Tells you who is waiting", "The tmux status line, the <code>muxa watch</code> TUI, desktop notifications, this dashboard, and the Mac app all show which agent is blocked on input, a choice, or an error."],
-      ["Takes you there", "<code>muxa attend</code> focuses the pane blocked longest; <code>--cycle</code> tabs through every agent that needs you."],
-      ["Lets one agent drive the rest", "<code>muxa mcp</code> gives a coding agent the same view, plus send-prompt and wait-for-change tools, so an orchestrator can prompt peers and wait on them."],
+    film: {
+      steps: ["Working", "Someone waits", "Jump there", "See it all"],
+      captions: [
+        "Six agents, six panes. You're busy in one of them.",
+        "Two stop and wait. The status line and a notification say who, and for how long.",
+        "`muxa attend` jumps to the agent that has waited longest.",
+        "The dashboard groups the fleet into Work, with what needs you on top.",
+      ],
+      states: { working: "working", input: "waiting", choice: "waiting" },
+      statusWorking: "● 6 working",
+      statusWaiting: "⚠ 2 waiting · planner 4m",
+      toast: "planner is waiting for input",
+      boardTitle: "Work board",
+      boardMeta: "acme · 5 works · 2 need you",
+      attention: "needs you",
+      stages: { queued: "Queued", in_progress: "In progress", review: "Review", done: "Done" },
+      play: "Play",
+      pause: "Pause",
+    },
+    howTitle: "How it works",
+    howLede: "Muxa doesn't launch or wrap your agents. It reads the state they already report and maps it onto the panes you already have.",
+    flow: [
+      ["Observe", "Claude Code, Codex, and Gemini CLI hooks report state; screen detection covers agents without hooks."],
+      ["Model", "One daemon keeps every agent's state: working, waiting for input or a choice, error, idle."],
+      ["Notify", "The tmux status line, desktop notifications, this dashboard, and the Mac app show who is waiting."],
+      ["Jump", "<code>muxa attend</code> focuses the pane that has waited longest; <code>--cycle</code> goes through the rest."],
+      ["Group", "Panes and runs roll up into Work, linked to GitHub or Linear issues, on one board."],
+      ["Delegate", "<code>muxa mcp</code> and <code>muxa msg</code> let one agent prompt its peers and wait for replies."],
     ],
+    shotsTitle: "The dashboard",
+    shotsLede: "Real screens with a made-up fleet: three services, ten agents, eight Works.",
+    shots: [
+      ["board", "Work board", "Work grouped by stage. Cards that need you carry a signal; each lists its agents and their state."],
+      ["collaboration", "Collaboration", "Who asked whom for what: requests and replies between agents, as a graph and a timeline."],
+      ["agents", "Agents", "Every agent with its state, model, context, limits, last prompt, and prompt or abort controls."],
+    ],
+    principlesTitle: "Three principles",
+    principles: [
+      ["Your setup, unchanged", "No wrapper, no new terminal, no new multiplexer. tmux, rmux, and herdr can be watched at the same time."],
+      ["Local first", "State lives in a daemon on your machine. The dashboard is served by that daemon and loads nothing from elsewhere."],
+      ["Control stays explicit", "Prompting or aborting an agent takes an operator token or sign-in; automation rules run inside guards they can't opt out of."],
+    ],
+    surfacesTitle: "One state, everywhere",
+    surfaces: [
+      ["muxa attend", "Jump to the agent that needs you"],
+      ["muxa watch", "The whole fleet in one TUI"],
+      ["muxa peek", "Overlay on the current tmux window"],
+      ["status line", "Your pane's agent, in tmux"],
+      ["dashboard", "Work board, timeline, collaboration"],
+      ["Muxa for Mac", "Native app with notifications"],
+      ["muxa mcp", "Let an agent orchestrate the rest"],
+      ["muxa automation", "Rules on agent state, with guards"],
+    ],
+    supportTitle: "Works with",
+    agentsLabel: "Agents",
+    hostsLabel: "Multiplexers",
     installTitle: "Run your own",
-    installBody: "Requires tmux 3.x (or herdr) and a Unix-like OS. <code>muxa init</code> wires tmux and the agent hooks and starts the daemon, dashboard included.",
+    installBody: "Needs tmux 3.x (or herdr) on macOS or Linux. <code>muxa init</code> wires tmux and the agent hooks and starts the daemon, dashboard included.",
     installC1: "# wires tmux and agent hooks, starts the daemon",
     installC2: "# jump to the agent that has waited longest",
     github: "View on GitHub",
     docs: "Docs",
+    ctaTitle: "Is this your dashboard?",
     footer: "Part of <a href=\"https://github.com/Open330\">Open330</a> · open source tools for AI-agent workflows",
   },
   ko: {
     badge: "tmux · Claude Code · Codex · Gemini CLI",
-    title: "지금 <em>나를 기다리는</em> 코딩 에이전트를 알려 주고, 바로 데려다 줍니다.",
-    lead: "래퍼도, 새 터미널도 필요 없습니다. 이미 tmux에서 돌리고 있는 Claude Code, Codex, Gemini CLI 세션을 지켜보다가 어느 에이전트가 나를 기다리는지 알려 주고 그 pane으로 옮겨 줍니다.",
-    accessTitle: "비공개 대시보드입니다",
-    accessBody: "<b>{host}</b>의 실시간 에이전트, pane, Work를 보여 줍니다. 로그인하거나 이 대시보드의 접근 토큰을 사용하세요.",
-    accessBodyToken: "<b>{host}</b>의 실시간 에이전트, pane, Work를 보여 줍니다. 이 대시보드의 접근 토큰으로 열 수 있습니다.",
-    signedInNoAccess: "<b>{email}</b>(으)로 로그인했지만 이 계정에는 대시보드 접근 권한이 없습니다.",
+    title: "에이전트는 여섯 개.<br><em>누가 나를 기다리는지</em> 아시나요?",
+    lead: "muxa는 tmux에서 이미 돌리고 있는 코딩 에이전트를 지켜보다가, 입력이나 선택을 기다리거나 오류로 멈추는 순간 알려 주고 그 pane으로 바로 데려다 줍니다. 래퍼도, 새 터미널도 필요 없습니다.",
+    how: "어떻게 동작하나",
+    private: "<b>{host}</b>는 비공개 muxa 대시보드입니다.",
+    privateSignIn: "로그인하거나 접근 토큰을 사용하세요.",
+    privateToken: "접근 토큰으로 열 수 있습니다.",
+    signedInNoAccess: "<b>{email}</b>(으)로 로그인했지만 이 계정에는 접근 권한이 없습니다.",
     tokenRejected: "저장된 접근 토큰이 거부되었습니다.",
     signIn: "로그인",
     signOut: "로그아웃",
     useToken: "접근 토큰 사용",
     tokenPrompt: "Muxa 대시보드 토큰",
-    tokenHint: "토큰은 해당 머신의 muxa <code>config.toml</code> 중 <code>[dashboard]</code>에 있습니다.",
-    previewLabel: "운영자에게 보이는 화면",
-    previewWaiting: "입력 대기 · 4분",
-    previewChoice: "선택 요청 · 1분",
-    previewWorking: "작업 중",
-    previewError: "오류 · 12분",
-    whyTitle: "왜 muxa인가",
-    why: [
-      ["지금 쓰는 환경을 그대로", "에이전트 상태는 Claude Code, Codex, Gemini CLI의 hook에서 오고, hook이 없는 에이전트는 화면 감지로 읽습니다. muxa로 에이전트를 띄우지도, 멀티플렉서를 바꾸지도 않습니다."],
-      ["누가 기다리는지 알려 줍니다", "tmux status line, <code>muxa watch</code> TUI, 데스크톱 알림, 이 대시보드, Mac 앱 모두 어느 에이전트가 입력, 선택, 오류로 멈춰 있는지 보여 줍니다."],
-      ["그 자리로 데려다 줍니다", "<code>muxa attend</code>는 가장 오래 멈춰 있는 pane으로 포커스를 옮기고, <code>--cycle</code>은 나를 기다리는 에이전트를 차례로 돕니다."],
-      ["에이전트 하나가 나머지를 지휘", "<code>muxa mcp</code>는 코딩 에이전트에게 같은 시야와 프롬프트 전송, 상태 변화 대기 도구를 줍니다. 오케스트레이터가 동료 에이전트에게 지시하고 결과를 기다릴 수 있습니다."],
+    film: {
+      steps: ["작업 중", "누군가 멈춤", "바로 이동", "한눈에 보기"],
+      captions: [
+        "에이전트 여섯, pane 여섯. 나는 그중 하나에서 일하는 중입니다.",
+        "둘이 멈춰서 기다립니다. status line과 알림이 누가, 얼마나 기다렸는지 알려 줍니다.",
+        "`muxa attend` 한 번이면 가장 오래 기다린 에이전트로 이동합니다.",
+        "대시보드는 전체를 Work 단위로 묶고, 내가 봐야 할 것을 위에 올립니다.",
+      ],
+      states: { working: "작업 중", input: "대기 중", choice: "대기 중" },
+      statusWorking: "● 6 작업 중",
+      statusWaiting: "⚠ 2 대기 · planner 4분",
+      toast: "planner가 입력을 기다립니다",
+      boardTitle: "Work 보드",
+      boardMeta: "acme · Work 5개 · 2개 확인 필요",
+      attention: "확인 필요",
+      stages: { queued: "대기", in_progress: "진행 중", review: "리뷰", done: "완료" },
+      play: "재생",
+      pause: "일시정지",
+    },
+    howTitle: "어떻게 동작하나",
+    howLede: "muxa는 에이전트를 띄우거나 감싸지 않습니다. 에이전트가 이미 내보내는 상태를 읽어서, 이미 쓰고 있는 pane 위에 얹습니다.",
+    flow: [
+      ["관찰", "Claude Code, Codex, Gemini CLI의 hook이 상태를 보내고, hook이 없는 에이전트는 화면 감지로 읽습니다."],
+      ["상태 모델", "데몬 하나가 모든 에이전트의 상태를 들고 있습니다. 작업 중, 입력·선택 대기, 오류, 유휴."],
+      ["알림", "tmux status line, 데스크톱 알림, 이 대시보드, Mac 앱이 누가 기다리는지 보여 줍니다."],
+      ["이동", "<code>muxa attend</code>는 가장 오래 기다린 pane으로 포커스를 옮기고, <code>--cycle</code>은 나머지를 차례로 돕니다."],
+      ["묶기", "pane과 실행은 Work로 묶이고, GitHub·Linear 이슈와 연결되어 한 보드에 모입니다."],
+      ["위임", "<code>muxa mcp</code>와 <code>muxa msg</code>로 에이전트 하나가 동료에게 지시하고 답을 기다립니다."],
     ],
+    shotsTitle: "대시보드",
+    shotsLede: "가상의 팀(서비스 셋, 에이전트 열, Work 여덟)으로 채운 실제 화면입니다.",
+    shots: [
+      ["board", "Work 보드", "단계별로 모인 Work. 내가 봐야 할 카드에는 신호가 붙고, 각 카드에 에이전트와 상태가 보입니다."],
+      ["collaboration", "협업", "누가 누구에게 무엇을 요청했는지. 에이전트 사이의 요청과 답장을 그래프와 시간순으로 봅니다."],
+      ["agents", "에이전트", "모든 에이전트의 상태, 모델, 컨텍스트, 사용량 한도, 마지막 프롬프트와 프롬프트·중단 버튼."],
+    ],
+    principlesTitle: "세 가지 원칙",
+    principles: [
+      ["지금 환경 그대로", "래퍼도, 새 터미널도, 새 멀티플렉서도 없습니다. tmux, rmux, herdr를 동시에 볼 수 있습니다."],
+      ["로컬 우선", "상태는 내 머신의 데몬에 있습니다. 대시보드도 그 데몬이 제공하고, 외부에서 아무것도 불러오지 않습니다."],
+      ["제어는 명시적으로", "에이전트에게 프롬프트를 보내거나 중단하려면 운영자 토큰이나 로그인이 필요하고, 자동화 규칙은 끌 수 없는 안전장치 안에서 돕니다."],
+    ],
+    surfacesTitle: "어디서 보든 같은 상태",
+    surfaces: [
+      ["muxa attend", "나를 기다리는 에이전트로 이동"],
+      ["muxa watch", "전체 에이전트를 한 TUI에서"],
+      ["muxa peek", "현재 tmux 창 위 오버레이"],
+      ["status line", "지금 pane의 에이전트를 tmux에"],
+      ["대시보드", "Work 보드, 타임라인, 협업"],
+      ["Muxa for Mac", "알림이 있는 네이티브 앱"],
+      ["muxa mcp", "에이전트 하나가 나머지를 지휘"],
+      ["muxa automation", "안전장치가 있는 상태 규칙"],
+    ],
+    supportTitle: "지원",
+    agentsLabel: "에이전트",
+    hostsLabel: "멀티플렉서",
     installTitle: "직접 운영하기",
-    installBody: "tmux 3.x(또는 herdr)와 Unix-like OS가 필요합니다. <code>muxa init</code>이 tmux와 에이전트 hook을 연결하고 대시보드를 포함한 데몬을 시작합니다.",
-    installC1: "# tmux와 에이전트 hook을 연결하고 데몬을 시작합니다",
-    installC2: "# 가장 오래 기다린 에이전트로 이동합니다",
+    installBody: "macOS나 Linux에서 tmux 3.x(또는 herdr)가 필요합니다. <code>muxa init</code>이 tmux와 에이전트 hook을 연결하고 대시보드를 포함한 데몬을 시작합니다.",
+    installC1: "# tmux와 에이전트 hook 연결, 데몬 시작",
+    installC2: "# 가장 오래 기다린 에이전트로 이동",
     github: "GitHub에서 보기",
     docs: "문서",
+    ctaTitle: "내 대시보드인가요?",
     footer: "<a href=\"https://github.com/Open330\">Open330</a>의 프로젝트 · AI 에이전트 워크플로를 위한 오픈소스 도구",
   },
 };
+
+const AGENTS = ["Claude Code", "Codex", "Gemini CLI", "Antigravity", "opencode"];
+const HOSTS = ["tmux", "rmux", "herdr"];
 
 export const LANDING_LANGUAGES = Object.keys(COPY);
 
@@ -119,86 +217,193 @@ function fill(template, values) {
 }
 
 const GITHUB_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>`;
+const LOCK_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 7V5a4 4 0 1 1 8 0v2h.5A1.5 1.5 0 0 1 14 8.5v5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 13.5v-5A1.5 1.5 0 0 1 3.5 7H4zm1.5 0h5V5a2.5 2.5 0 0 0-5 0v2z"/></svg>`;
 
-function markup(t, access, { host, email }) {
+// Backticks in film captions mark inline code.
+const codeSpans = (text) => escapeText(text).replace(/`([^`]+)`/g, "<code>$1</code>");
+
+function accessButtons(t, access, size = "") {
+  return [
+    access.signIn ? `<button class="l-btn primary ${size}" type="button" data-landing-action="sign-in">${escapeText(t.signIn)}</button>` : "",
+    `<button class="l-btn ${access.tokenPrimary ? "primary" : "ghost"} ${size}" type="button" data-landing-action="token">${escapeText(t.useToken)}</button>`,
+    access.signOut ? `<button class="l-btn ghost ${size}" type="button" data-landing-action="sign-out">${escapeText(t.signOut)}</button>` : "",
+  ].join("");
+}
+
+function shotPicture(name, alt) {
+  // The shot follows the page's color scheme; on a phone it is small, so it
+  // links to the full-size image.
+  const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+  return `<a class="l-shot-link" href="/static/landing/${name}-${dark ? "dark" : "light"}.webp" target="_blank" rel="noopener"><picture>
+    <source srcset="/static/landing/${name}-dark.webp" media="(prefers-color-scheme: dark)">
+    <img src="/static/landing/${name}-light.webp" alt="${escapeText(alt)}" loading="lazy" decoding="async">
+  </picture></a>`;
+}
+
+function markup(t, access, { host, email, shot }) {
   const notices = [
-    access.signedInNoAccess ? `<p class="landing-notice">${fill(t.signedInNoAccess, { email: email || "" })}</p>` : "",
-    access.tokenRejected ? `<p class="landing-notice">${escapeText(t.tokenRejected)}</p>` : "",
+    access.signedInNoAccess ? `<p class="l-notice">${fill(t.signedInNoAccess, { email: email || "" })}</p>` : "",
+    access.tokenRejected ? `<p class="l-notice">${escapeText(t.tokenRejected)}</p>` : "",
   ].join("");
-  const buttons = [
-    access.signIn ? `<button class="landing-btn primary" type="button" data-landing-action="sign-in">${escapeText(t.signIn)}</button>` : "",
-    `<button class="landing-btn${access.tokenPrimary ? " primary" : ""}" type="button" data-landing-action="token">${escapeText(t.useToken)}</button>`,
-    access.signOut ? `<button class="landing-btn" type="button" data-landing-action="sign-out">${escapeText(t.signOut)}</button>` : "",
-  ].join("");
-  const preview = [
-    ["waiting_input", "claude", t.previewWaiting],
-    ["waiting_choice", "codex", t.previewChoice],
-    ["working", "gemini", t.previewWorking],
-    ["error", "claude", t.previewError],
-  ].map(([state, agent, label]) => `<li><span class="state-dot ${state}"></span><b>${agent}</b><span>${escapeText(label)}</span></li>`).join("");
-  const why = t.why.map(([heading, body]) => `<div class="landing-card"><h3>${escapeText(heading)}</h3><p>${body}</p></div>`).join("");
   const langs = LANDING_LANGUAGES.map((lang) =>
     `<button type="button" data-landing-lang="${lang}" aria-pressed="${t === COPY[lang]}">${lang === "ko" ? "한국어" : "EN"}</button>`
   ).join("");
+  const flow = t.flow.map(([heading, body], i) =>
+    `<li class="l-step" style="--i:${i}"><b><span>${i + 1}</span>${escapeText(heading)}</b><p>${body}</p></li>`
+  ).join("");
+  const shotTabs = t.shots.map(([name, label], i) =>
+    `<button type="button" role="tab" data-landing-shot="${i}" aria-selected="${i === shot}">${escapeText(label)}</button>`
+  ).join("");
+  const [shotName, shotLabel, shotCaption] = t.shots[shot];
+  const principles = t.principles.map(([heading, body]) =>
+    `<div class="l-card"><h3>${escapeText(heading)}</h3><p>${escapeText(body)}</p></div>`
+  ).join("");
+  const surfaces = t.surfaces.map(([name, body]) =>
+    `<div class="l-surface"><code>${escapeText(name)}</code><span>${escapeText(body)}</span></div>`
+  ).join("");
+  const chips = (items) => items.map((item) => `<span class="l-chip">${escapeText(item)}</span>`).join("");
 
   return `
-    <header class="landing-nav">
-      <div class="landing-wrap">
-        <span class="landing-brand"><img src="/static/icon.svg" width="24" height="24" alt="">muxa</span>
-        <span class="landing-host" title="${escapeText(host)}">${escapeText(host)}</span>
-        <nav class="landing-links">
-          <a href="https://github.com/Open330/muxa" rel="noopener">GitHub</a>
-          <div class="landing-lang" role="group" aria-label="Language">${langs}</div>
+    <header class="l-nav">
+      <div class="l-wrap">
+        <span class="l-brand"><img src="/static/icon.svg" width="26" height="26" alt="">muxa</span>
+        <span class="l-host" title="${escapeText(host)}">${LOCK_ICON}${escapeText(host)}</span>
+        <nav class="l-nav-actions">
+          <div class="l-lang" role="group" aria-label="Language">${langs}</div>
+          <a class="l-btn ghost sm l-hide-sm" href="${GITHUB}" rel="noopener">GitHub</a>
+          ${access.signIn
+            ? `<button class="l-btn dark sm" type="button" data-landing-action="sign-in">${escapeText(t.signIn)}</button>`
+            : `<button class="l-btn dark sm" type="button" data-landing-action="token">${escapeText(t.useToken)}</button>`}
         </nav>
       </div>
     </header>
-    <main class="landing-main">
-      <section class="landing-hero landing-wrap">
-        <div class="landing-intro">
-          <span class="landing-badge">${escapeText(t.badge)}</span>
+
+    <main>
+      <section class="l-hero l-wrap">
+        <div class="l-hero-copy">
+          <span class="l-badge">${escapeText(t.badge)}</span>
           <h1>${t.title}</h1>
-          <p class="landing-lead">${escapeText(t.lead)}</p>
-        </div>
-        <aside class="landing-access" aria-labelledby="landing-access-title">
-          <h2 id="landing-access-title">${escapeText(t.accessTitle)}</h2>
-          <p>${fill(access.signIn || access.signOut ? t.accessBody : t.accessBodyToken, { host })}</p>
+          <p class="l-lead">${escapeText(t.lead)}</p>
+          <div class="l-actions">
+            ${accessButtons(t, access, "lg")}
+            <a class="l-btn ghost lg" href="#how">${escapeText(t.how)} ↓</a>
+          </div>
+          <div class="l-private">
+            ${LOCK_ICON}
+            <p>${fill(t.private, { host })} ${escapeText(access.signIn || access.signOut ? t.privateSignIn : t.privateToken)}</p>
+          </div>
           ${notices}
-          <div class="landing-actions">${buttons}</div>
-          <p class="landing-hint">${t.tokenHint}</p>
-          <figure class="landing-preview" aria-label="${escapeText(t.previewLabel)}">
-            <figcaption>${escapeText(t.previewLabel)}</figcaption>
-            <ul>${preview}</ul>
+        </div>
+        <div class="l-film" data-landing-film></div>
+      </section>
+
+      <section class="l-section l-wrap" id="how" data-reveal>
+        <h2>${escapeText(t.howTitle)}</h2>
+        <p class="l-lede">${escapeText(t.howLede)}</p>
+        <ol class="l-flow">${flow}</ol>
+      </section>
+
+      <section class="l-section l-wrap" id="screens" data-reveal>
+        <h2>${escapeText(t.shotsTitle)}</h2>
+        <p class="l-lede">${escapeText(t.shotsLede)}</p>
+        <div class="l-shot">
+          <div class="l-shot-bar">
+            <span class="l-shot-lights" aria-hidden="true"><i></i><i></i><i></i></span>
+            <div class="l-shot-tabs" role="tablist" aria-label="${escapeText(t.shotsTitle)}">${shotTabs}</div>
+          </div>
+          <figure>
+            ${shotPicture(shotName, `${shotLabel}: ${shotCaption}`)}
+            <figcaption>${escapeText(shotCaption)}</figcaption>
           </figure>
-        </aside>
+        </div>
       </section>
-      <section class="landing-section landing-wrap">
-        <h2>${escapeText(t.whyTitle)}</h2>
-        <div class="landing-grid">${why}</div>
+
+      <section class="l-section l-wrap" data-reveal>
+        <h2>${escapeText(t.principlesTitle)}</h2>
+        <div class="l-three">${principles}</div>
       </section>
-      <section class="landing-section landing-wrap landing-install">
+
+      <section class="l-section l-wrap" data-reveal>
+        <h2>${escapeText(t.surfacesTitle)}</h2>
+        <div class="l-surfaces">${surfaces}</div>
+        <div class="l-support">
+          <span>${escapeText(t.agentsLabel)}</span><div>${chips(AGENTS)}</div>
+          <span>${escapeText(t.hostsLabel)}</span><div>${chips(HOSTS)}</div>
+        </div>
+      </section>
+
+      <section class="l-section l-wrap l-install" data-reveal>
         <div>
           <h2>${escapeText(t.installTitle)}</h2>
           <p>${t.installBody}</p>
-          <div class="landing-actions">
-            <a class="landing-btn" href="https://github.com/Open330/muxa" rel="noopener">${GITHUB_ICON}<span>${escapeText(t.github)}</span></a>
-            <a class="landing-btn" href="https://github.com/Open330/muxa/tree/main/docs" rel="noopener">${escapeText(t.docs)}</a>
+          <div class="l-actions">
+            <a class="l-btn ghost" href="${GITHUB}" rel="noopener">${GITHUB_ICON}<span>${escapeText(t.github)}</span></a>
+            <a class="l-btn ghost" href="${GITHUB}/tree/main/docs" rel="noopener">${escapeText(t.docs)}</a>
           </div>
         </div>
-<pre><code>brew install open330/tap/muxa
-muxa init      <span class="c">${escapeText(t.installC1)}</span>
-muxa attend    <span class="c">${escapeText(t.installC2)}</span></code></pre>
+<pre class="l-code"><code><span class="p">$</span> brew install open330/tap/muxa
+<span class="p">$</span> muxa init      <span class="c">${escapeText(t.installC1)}</span>
+<span class="p">$</span> muxa attend    <span class="c">${escapeText(t.installC2)}</span></code></pre>
+      </section>
+
+      <section class="l-cta l-wrap" data-reveal>
+        <div>
+          <h2>${escapeText(t.ctaTitle)}</h2>
+          <p>${fill(t.private, { host })}</p>
+        </div>
+        <div class="l-actions">${accessButtons(t, access)}</div>
       </section>
     </main>
-    <footer class="landing-footer"><div class="landing-wrap">${t.footer}</div></footer>`;
+
+    <footer class="l-foot"><div class="l-wrap">
+      <span class="l-brand small"><img src="/static/icon.svg" width="18" height="18" alt="">muxa</span>
+      <span>${t.footer}</span>
+    </div></footer>`;
 }
 
 // One landing per page; the click handler reads whatever the latest render
 // set, so re-rendering with new login state never leaves stale callbacks.
-const view = { root: null, lang: "en", access: null, host: "", email: null, actions: null };
+const view = { root: null, lang: "en", shot: 0, access: null, host: "", email: null, actions: null, film: null, reveal: null };
+
+function revealOnScroll(root) {
+  const items = [...root.querySelectorAll("[data-reveal]")];
+  if (!("IntersectionObserver" in window) || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    items.forEach((el) => el.classList.add("in"));
+    return null;
+  }
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      entry.target.classList.add("in");
+      observer.unobserve(entry.target);
+    }
+  }, { rootMargin: "0px 0px -8% 0px", threshold: 0.12 });
+  items.forEach((el) => { el.classList.add("pending"); observer.observe(el); });
+  return observer;
+}
 
 function draw() {
+  const t = COPY[view.lang];
+  view.film?.destroy();
+  view.reveal?.disconnect();
   document.documentElement.lang = view.lang;
-  view.root.innerHTML = markup(COPY[view.lang], view.access, { host: view.host, email: view.email });
+  view.root.innerHTML = markup(t, view.access, { host: view.host, email: view.email, shot: view.shot });
+  view.film = mountFilm(view.root.querySelector("[data-landing-film]"), {
+    ...t.film,
+    captions: t.film.captions.map(codeSpans),
+  });
+  view.reveal = revealOnScroll(view.root);
+}
+
+function showShot(index) {
+  view.shot = index;
+  const t = COPY[view.lang];
+  const [name, label, caption] = t.shots[index];
+  const figure = view.root.querySelector(".l-shot figure");
+  figure.innerHTML = `${shotPicture(name, `${label}: ${caption}`)}<figcaption>${escapeText(caption)}</figcaption>`;
+  view.root.querySelectorAll("[data-landing-shot]").forEach((tab) => {
+    tab.setAttribute("aria-selected", String(Number(tab.dataset.landingShot) === index));
+  });
 }
 
 function onLandingClick(event) {
@@ -207,6 +412,12 @@ function onLandingClick(event) {
     view.lang = langButton.getAttribute("data-landing-lang");
     try { localStorage.setItem(LANG_KEY, view.lang); } catch (_) { /* storage blocked */ }
     draw();
+    view.root.querySelectorAll("[data-reveal]").forEach((el) => el.classList.add("in"));
+    return;
+  }
+  const shotTab = event.target.closest("[data-landing-shot]");
+  if (shotTab) {
+    showShot(Number(shotTab.dataset.landingShot));
     return;
   }
   const action = event.target.closest("[data-landing-action]")?.getAttribute("data-landing-action");
@@ -234,6 +445,6 @@ export function renderLanding(root, { login, tokenRejected = false, actions }) {
   view.host = window.location.host;
   view.email = login?.email || null;
   view.actions = actions;
-  draw();
   root.hidden = false;
+  draw();
 }

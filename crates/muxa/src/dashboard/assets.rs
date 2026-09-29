@@ -63,7 +63,7 @@ pub(super) fn serve_asset(path: &str) -> Response {
 }
 
 /// Tiny extension → MIME map. Avoids pulling in the `mime_guess` crate
-/// for the four content types we actually serve.
+/// for the handful of content types we actually serve.
 fn mime_for(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("");
     match ext {
@@ -74,6 +74,8 @@ fn mime_for(path: &str) -> &'static str {
         "svg" => "image/svg+xml",
         "ico" => "image/x-icon",
         "png" => "image/png",
+        "webp" => "image/webp",
+        "jpg" | "jpeg" => "image/jpeg",
         _ => "application/octet-stream",
     }
 }
@@ -94,6 +96,15 @@ mod tests {
         assert!(WebAssets::get("style.css").is_some());
         assert!(WebAssets::get("operator-enroll.mjs").is_some());
         assert!(WebAssets::get("operators-admin.mjs").is_some());
+        assert!(WebAssets::get("landing.mjs").is_some());
+        assert!(WebAssets::get("landing-film.mjs").is_some());
+        assert!(WebAssets::get("landing.css").is_some());
+        for shot in ["board", "collaboration", "agents"] {
+            for scheme in ["light", "dark"] {
+                let path = format!("landing/{shot}-{scheme}.webp");
+                assert!(WebAssets::get(&path).is_some(), "missing {path}");
+            }
+        }
     }
 
     #[test]
@@ -102,6 +113,8 @@ mod tests {
         assert_eq!(mime_for("foo.js"), "application/javascript; charset=utf-8");
         assert_eq!(mime_for("foo.mjs"), "application/javascript; charset=utf-8");
         assert_eq!(mime_for("foo.css"), "text/css; charset=utf-8");
+        assert_eq!(mime_for("landing/shot.webp"), "image/webp");
+        assert_eq!(mime_for("foo.jpg"), "image/jpeg");
         assert_eq!(mime_for("foo.unknown"), "application/octet-stream");
     }
 }
