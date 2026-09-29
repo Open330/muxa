@@ -76,7 +76,7 @@ function markup(t) {
         <div class="film-lanes">${board}</div>
       </div>
     </div>
-    <div class="film-caption" aria-live="polite"></div>
+    <div class="film-caption"></div>
     <div class="film-controls">
       <button type="button" class="film-play" aria-label="${esc(t.pause)}"></button>
       <div class="film-steps">${steps}</div>
