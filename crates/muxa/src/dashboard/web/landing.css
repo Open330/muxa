@@ -402,6 +402,11 @@ body[data-view="landing"] {
 }
 .l-mac-feature:hover { transform: translateY(-2px); border-color: color-mix(in srgb, var(--l-accent) 55%, var(--l-line)); }
 .l-mac-feature h3 { margin: 0 0 6px; font-size: 15.5px; }
+/* Real app windows captured with the QA helper against the demo fleet. */
+.l-mac-shots { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin-top: 8px; }
+.l-mac-shots figure { margin: 0; }
+.l-mac-shots img { display: block; width: 100%; height: auto; border: 1px solid var(--l-line); border-radius: 12px; box-shadow: var(--l-shadow-lg); background: var(--l-surface); }
+.l-mac-shots figcaption { margin-top: 10px; color: var(--l-muted); font-size: 13.5px; }
 .l-mac-feature p { margin: 0; color: var(--l-ink-2); font-size: 14px; }
 
 /* principles, surfaces */
@@ -692,7 +697,7 @@ body[data-view="landing"] {
   .l-hero h1 { font-size: 34px; }
   .l-lead { font-size: 16.5px; }
   .l-actions .l-btn { flex: 1 1 100%; }
-  .l-flow, .l-three, .l-mac-features { grid-template-columns: minmax(0, 1fr); }
+  .l-flow, .l-three, .l-mac-features, .l-mac-shots { grid-template-columns: minmax(0, 1fr); }
   .l-section { padding-top: 64px; }
   .l-surface { grid-template-columns: minmax(0, 1fr); gap: 2px; padding: 10px 0; }
   .l-support { grid-template-columns: minmax(0, 1fr); }

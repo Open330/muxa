@@ -16,7 +16,7 @@ const GITHUB = "https://github.com/Open330/muxa";
 const COPY = {
   en: {
     badge: "tmux · Claude Code · Codex · Gemini CLI",
-    title: "Six agents running.<br>Which one is <em>waiting on you</em>?",
+    title: "Four agents.<br>Which one is <em>waiting on you</em>?",
     lead: "Muxa watches the coding agents you already run in tmux, tells you the moment one stops for input, a choice, or an error, and takes you straight to its pane. No wrapper, no new terminal.",
     how: "How it works",
     private: "<b>{host}</b> is a private muxa dashboard.",
@@ -68,6 +68,10 @@ const COPY = {
         ["Snapshots", "Save a whole workspace and restore it later; the preview shows what would change first."],
         ["In the menu bar", "What is working, waiting, or failing, one click away."],
       ],
+      shots: [
+        ["mac-watch", "Live Watch: every pane on the host, with the selected agent's own screen and a prompt box."],
+        ["mac-inbox", "Inbox: the agents waiting on you, what they asked, and where they run."],
+      ],
     },
     principlesTitle: "Three principles",
     principles: [
@@ -116,7 +120,7 @@ const COPY = {
   },
   ko: {
     badge: "tmux · Claude Code · Codex · Gemini CLI",
-    title: "에이전트는 여섯 개.<br><em>누가 나를 기다리는지</em> 아시나요?",
+    title: "에이전트 넷.<br><em>누가 나를 기다리는지</em> 아시나요?",
     lead: "muxa는 tmux에서 이미 돌리고 있는 코딩 에이전트를 지켜보다가, 입력이나 선택을 기다리거나 오류로 멈추는 순간 알려 주고 그 pane으로 바로 데려다 줍니다. 래퍼도, 새 터미널도 필요 없습니다.",
     how: "어떻게 동작하나",
     private: "<b>{host}</b>는 비공개 muxa 대시보드입니다.",
@@ -167,6 +171,10 @@ const COPY = {
         ["모든 호스트를 한 번에", "이 Mac과 muxad 하나가 관리하는 SSH 머신들을 Live Watch로 함께 봅니다."],
         ["스냅샷", "작업 공간 전체를 저장했다가 나중에 되돌립니다. 되돌리기 전에 무엇이 바뀌는지 미리 보여 줍니다."],
         ["메뉴 막대에서", "작업 중, 대기, 실패 중인 에이전트를 클릭 한 번으로 확인합니다."],
+      ],
+      shots: [
+        ["mac-watch", "Live Watch: 호스트의 모든 pane과, 선택한 에이전트의 실제 화면과 프롬프트 입력창."],
+        ["mac-inbox", "Inbox: 나를 기다리는 에이전트, 무엇을 물었는지, 어디서 돌고 있는지."],
       ],
     },
     principlesTitle: "세 가지 원칙",
@@ -393,6 +401,11 @@ function markup(t, access, { host, email, shot }) {
         </div>
         <div class="l-mac-features">${t.mac.features.map(([heading, body]) =>
           `<div class="l-mac-feature"><h3>${escapeText(heading)}</h3><p>${escapeText(body)}</p></div>`).join("")}</div>
+        <div class="l-mac-shots">${t.mac.shots.map(([name, caption]) => `
+          <figure>
+            <a class="l-shot-link" href="${asset(`landing/${name}.webp`)}" target="_blank" rel="noopener"><img src="${asset(`landing/${name}.webp`)}" alt="${escapeText(caption)}" loading="lazy" decoding="async" width="1600" height="954"></a>
+            <figcaption>${escapeText(caption)}</figcaption>
+          </figure>`).join("")}</div>
       </section>
 
       <section class="l-section l-wrap" data-reveal>
