@@ -381,6 +381,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents", get(agents_handler))
         .route("/api/fleet", get(fleet_handler))
         .route("/api/panes", get(panes_handler))
+        .route("/api/windows/{window}/layout", get(window_layout_handler))
         .route("/api/works", get(works_handler))
         .route("/api/work-metadata", get(work_metadata_handler))
         .route("/api/terminal-sessions", get(terminal_sessions_handler))
@@ -1838,6 +1839,99 @@ async fn pane_abort_handler(
         );
     }
     Json(json!({ "ok": true, "pane": pane, "aborted": true })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct WindowLayoutQuery {
+    socket: Option<String>,
+}
+
+/// A tmux window id taken from a URL: `@` followed by digits.
+fn valid_window_id(window: &str) -> bool {
+    window.strip_prefix('@').is_some_and(|digits| {
+        !digits.is_empty() && digits.len() <= 12 && digits.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+/// Pick the tmux server a window lives on from the scanned inventory. A
+/// socket the request names is only ever matched against scanned sockets, so
+/// this read route never points tmux at a caller-chosen path.
+fn resolve_window_socket(
+    panes: &[PaneSummary],
+    window: &str,
+    requested: Option<&str>,
+) -> Result<String, (StatusCode, &'static str)> {
+    let mut sockets = panes
+        .iter()
+        .filter(|pane| pane.host == HostKind::Tmux && pane.window_id == window)
+        .map(|pane| pane.socket.to_string_lossy().into_owned())
+        .filter(|socket| {
+            requested.is_none_or(|requested| {
+                socket == requested
+                    || crate::tmux::socket_short_name(socket)
+                        == crate::tmux::socket_short_name(requested)
+            })
+        })
+        .collect::<Vec<_>>();
+    sockets.sort();
+    sockets.dedup();
+    match sockets.as_slice() {
+        [] => Err((StatusCode::NOT_FOUND, "window not found")),
+        [socket] => Ok(socket.clone()),
+        _ => Err((
+            StatusCode::CONFLICT,
+            "window exists on multiple tmux sockets; specify socket",
+        )),
+    }
+}
+
+/// Pane geometry for one tmux window, so the dashboard can lay its panes out
+/// the way tmux does. Metadata only (no output), hence a normal read route.
+async fn window_layout_handler(
+    State(state): State<AppState>,
+    Path(window): Path<String>,
+    Query(query): Query<WindowLayoutQuery>,
+) -> Response {
+    if !valid_window_id(&window) {
+        return control_error(StatusCode::BAD_REQUEST, "invalid window id");
+    }
+    let requested = query.socket.as_deref().filter(|s| !s.is_empty());
+    if requested.is_some_and(|socket| !valid_pane_socket(socket)) {
+        return control_error(StatusCode::BAD_REQUEST, "invalid socket");
+    }
+    let scan = state.refresh_pane_scan().await;
+    let socket = match resolve_window_socket(&scan.panes, &window, requested) {
+        Ok(socket) => socket,
+        Err((status, message)) => return control_error(status, message),
+    };
+    let target = window.clone();
+    let socket_for_query = socket.clone();
+    let (panes, zoomed) = tokio::task::spawn_blocking(move || {
+        crate::tmux::layout::window_panes_on(Some(&socket_for_query), &target)
+    })
+    .await
+    .unwrap_or_default();
+    let panes = panes
+        .into_iter()
+        .map(|pane| {
+            json!({
+                "pane_id": pane.pane_id,
+                "pane_index": pane.pane_index,
+                "left": pane.left,
+                "top": pane.top,
+                "width": pane.width,
+                "height": pane.height,
+                "active": pane.active,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({
+        "window": window,
+        "socket": socket,
+        "zoomed": zoomed,
+        "panes": panes,
+    }))
+    .into_response()
 }
 
 /// Default and maximum number of lines `/api/panes/{pane}/output` returns.
@@ -5093,5 +5187,98 @@ mod tests {
         assert!(text.len() <= PANE_OUTPUT_MAX_BYTES);
         assert!(text.len() > PANE_OUTPUT_MAX_BYTES - 4);
         assert!(text.ends_with(&line));
+    }
+
+    fn window_pane(pane_id: &str, window_id: &str, socket: &str, host: HostKind) -> PaneSummary {
+        PaneSummary {
+            host,
+            pane_id: pane_id.into(),
+            session_id: "$1".into(),
+            session: "main".into(),
+            window_id: window_id.into(),
+            window_name: "main".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "zsh".into(),
+            title: String::new(),
+            current_path: "/tmp".into(),
+            socket: std::path::PathBuf::from(socket),
+            muxa: MuxaPaneMetadata::default(),
+            attach_command: String::new(),
+        }
+    }
+
+    #[test]
+    fn window_layout_resolves_only_scanned_tmux_sockets() {
+        let panes = vec![
+            window_pane("%1", "@1", "/tmp/tmux-501/default", HostKind::Tmux),
+            window_pane("%2", "@1", "/tmp/tmux-501/default", HostKind::Tmux),
+            window_pane("%3", "@2", "/tmp/tmux-501/default", HostKind::Tmux),
+            window_pane("%3", "@2", "/tmp/tmux-501/work", HostKind::Tmux),
+            window_pane("rmux:%1", "@9", "/tmp/rmux.sock", HostKind::Rmux),
+        ];
+        assert_eq!(
+            resolve_window_socket(&panes, "@1", None).unwrap(),
+            "/tmp/tmux-501/default"
+        );
+        // Short names and full paths both select a scanned socket …
+        assert_eq!(
+            resolve_window_socket(&panes, "@2", Some("work")).unwrap(),
+            "/tmp/tmux-501/work"
+        );
+        // … an ambiguous window needs one, and an unscanned path is never used.
+        assert_eq!(
+            resolve_window_socket(&panes, "@2", None).unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            resolve_window_socket(&panes, "@1", Some("/etc/evil"))
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        // Geometry comes from tmux only.
+        assert_eq!(
+            resolve_window_socket(&panes, "@9", None).unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn window_ids_are_shape_checked() {
+        assert!(valid_window_id("@0"));
+        assert!(valid_window_id("@123"));
+        for bad in ["", "@", "1", "@1x", "@-1", "@1;kill", "@1234567890123"] {
+            assert!(!valid_window_id(bad), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn window_layout_is_a_read_route() {
+        // Private: reads need the token.
+        let state = state_with_token("op");
+        let uri = "/api/windows/%40x/layout";
+        assert_eq!(
+            get_output(&state, uri, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_output(&state, uri, Some("op")).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        // public_read: layout metadata is readable anonymously, like /api/panes.
+        let state = public_read_state("op");
+        assert_eq!(
+            get_output(&state, uri, None).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let response = get_output(
+            &state,
+            "/api/windows/%40987654321/layout?socket=a%0Ab",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
