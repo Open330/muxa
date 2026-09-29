@@ -52,18 +52,31 @@ async fn static_handler(Path(path): Path<String>) -> Response {
     serve_asset(&path)
 }
 
+/// Asset URLs are not versioned, so a cache in front of the daemon (a
+/// Cloudflare tunnel caches `.css`/`.js` for hours by default) would keep
+/// serving the previous build's files next to the new `index.html` after
+/// an upgrade. `no-cache` makes every cache revalidate with the daemon.
+const ASSET_CACHE_CONTROL: &str = "no-cache";
+
 pub(super) fn serve_asset(path: &str) -> Response {
     match WebAssets::get(path) {
         Some(file) => {
             let mime = mime_for(path);
-            ([(header::CONTENT_TYPE, mime)], file.data.into_owned()).into_response()
+            (
+                [
+                    (header::CONTENT_TYPE, mime),
+                    (header::CACHE_CONTROL, ASSET_CACHE_CONTROL),
+                ],
+                file.data.into_owned(),
+            )
+                .into_response()
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
 /// Tiny extension → MIME map. Avoids pulling in the `mime_guess` crate
-/// for the four content types we actually serve.
+/// for the handful of content types we actually serve.
 fn mime_for(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("");
     match ext {
@@ -74,6 +87,8 @@ fn mime_for(path: &str) -> &'static str {
         "svg" => "image/svg+xml",
         "ico" => "image/x-icon",
         "png" => "image/png",
+        "webp" => "image/webp",
+        "jpg" | "jpeg" => "image/jpeg",
         _ => "application/octet-stream",
     }
 }
@@ -96,6 +111,33 @@ mod tests {
         assert!(WebAssets::get("operators-admin.mjs").is_some());
         assert!(WebAssets::get("pane-drawer.mjs").is_some());
         assert!(WebAssets::get("topology-model.mjs").is_some());
+        assert!(WebAssets::get("landing.mjs").is_some());
+        assert!(WebAssets::get("landing-film.mjs").is_some());
+        assert!(WebAssets::get("landing.css").is_some());
+        for shot in ["board", "collaboration", "agents"] {
+            for scheme in ["light", "dark"] {
+                let path = format!("landing/{shot}-{scheme}.webp");
+                assert!(WebAssets::get(&path).is_some(), "missing {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn assets_tell_caches_to_revalidate() {
+        for path in [
+            "index.html",
+            "main.js",
+            "style.css",
+            "landing/board-light.webp",
+        ] {
+            let response = serve_asset(path);
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "no-cache",
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -104,6 +146,8 @@ mod tests {
         assert_eq!(mime_for("foo.js"), "application/javascript; charset=utf-8");
         assert_eq!(mime_for("foo.mjs"), "application/javascript; charset=utf-8");
         assert_eq!(mime_for("foo.css"), "text/css; charset=utf-8");
+        assert_eq!(mime_for("landing/shot.webp"), "image/webp");
+        assert_eq!(mime_for("foo.jpg"), "image/jpeg");
         assert_eq!(mime_for("foo.unknown"), "application/octet-stream");
     }
 }
