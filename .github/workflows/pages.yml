@@ -1,18 +1,20 @@
 name: pages
 
-# The landing page at https://open330.github.io/muxa/. `site/` holds the
-# page itself; the logo and the demo recordings are the ones the README
-# uses, copied in at deploy time so they are not kept twice in the repo.
+# The landing page at https://open330.github.io/muxa/. `site/index.html`
+# renders the dashboard's landing view in "site" mode, so its code, styles
+# and screens come from crates/muxa/src/dashboard/web; the TUI recording is
+# the one the README uses. All of it is copied in at deploy time so nothing
+# is kept twice in the repo.
 
 on:
   push:
     branches: [main]
     paths:
       - "site/**"
-      - "assets/logo.svg"
-      - "assets/icon.svg"
+      - "crates/muxa/src/dashboard/web/landing*"
+      - "crates/muxa/src/dashboard/web/landing/**"
+      - "crates/muxa/src/dashboard/web/icon.svg"
       - "docs/demo.gif"
-      - "docs/demo-collab.gif"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -37,8 +39,10 @@ jobs:
         run: |
           mkdir -p _site
           cp -r site/. _site/
-          cp assets/logo.svg assets/icon.svg _site/
-          cp docs/demo.gif docs/demo-collab.gif _site/
+          web=crates/muxa/src/dashboard/web
+          cp "$web"/landing.mjs "$web"/landing-film.mjs "$web"/landing.css "$web"/icon.svg _site/
+          cp -r "$web"/landing _site/landing
+          cp docs/demo.gif _site/
           touch _site/.nojekyll
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
