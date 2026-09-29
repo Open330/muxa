@@ -1,0 +1,52 @@
+name: pages
+
+# The landing page at https://open330.github.io/muxa/. `site/index.html`
+# renders the dashboard's landing view in "site" mode, so its code, styles
+# and screens come from crates/muxa/src/dashboard/web; the TUI recording is
+# the one the README uses. All of it is copied in at deploy time so nothing
+# is kept twice in the repo.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "crates/muxa/src/dashboard/web/landing*"
+      - "crates/muxa/src/dashboard/web/landing/**"
+      - "crates/muxa/src/dashboard/web/icon.svg"
+      - "docs/demo.gif"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cp -r site/. _site/
+          web=crates/muxa/src/dashboard/web
+          cp "$web"/landing.mjs "$web"/landing-film.mjs "$web"/landing.css "$web"/icon.svg _site/
+          cp -r "$web"/landing _site/landing
+          cp docs/demo.gif _site/
+          touch _site/.nojekyll
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
