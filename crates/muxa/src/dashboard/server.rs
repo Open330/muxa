@@ -654,7 +654,12 @@ async fn read_auth_middleware(
     if state.config.token.is_none() {
         return Ok(next.run(req).await);
     }
-    operator_authorized(&state, &req)?;
+    match operator_authorized(&state, &req) {
+        // A signed-in viewer reads what a `public_read` visitor would; the
+        // handlers redact details for anyone who is not an operator.
+        Err(StatusCode::UNAUTHORIZED) if state.operator.viewer(req.headers()) => {}
+        result => result?,
+    }
     Ok(next.run(req).await)
 }
 
@@ -669,7 +674,13 @@ async fn write_auth_middleware(
     if state.config.token.is_none() {
         return Err(StatusCode::FORBIDDEN);
     }
-    operator_authorized(&state, &req)?;
+    match operator_authorized(&state, &req) {
+        // Signed in, but only as a viewer: authenticated, not allowed.
+        Err(StatusCode::UNAUTHORIZED) if state.operator.viewer(req.headers()) => {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        result => result?,
+    }
     Ok(next.run(req).await)
 }
 
@@ -697,7 +708,11 @@ pub(super) struct LoginStatus {
     available: bool,
     signed_in: bool,
     email: Option<String>,
-    /// Why the signed-in account is an operator: `group` or `enrollment`.
+    /// What this request may do: `none`, `viewer` or `operator` (the
+    /// bearer token counts as `operator`).
+    role: super::operator::Role,
+    /// Why the signed-in account has its role: `group`, `enrollment`,
+    /// `viewer_group` or `viewer_rule`.
     via: Option<super::operator::Via>,
     /// Whether a token holder may enroll accounts outside `required_group`.
     enrollment: bool,
@@ -712,9 +727,15 @@ pub(super) fn login_status(state: &AppState, headers: &HeaderMap) -> LoginStatus
         .operator
         .signed_in(headers)
         .map_or((false, None, None), |(email, via)| (true, email, Some(via)));
+    let role = if operator_auth(state, headers).is_some() {
+        super::operator::Role::Operator
+    } else {
+        via.map_or(super::operator::Role::None, super::operator::Via::role)
+    };
     LoginStatus {
         available: config.is_some(),
         signed_in,
+        role,
         email,
         via,
         enrollment: config.is_some_and(super::operator::LoginConfig::enrollment_enabled),

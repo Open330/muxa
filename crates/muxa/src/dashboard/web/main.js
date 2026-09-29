@@ -1,5 +1,5 @@
 import { openShareManager } from "./sharing-admin.mjs";
-import { openOperatorManager } from "./operators-admin.mjs";
+import { openAccessManager } from "./operators-admin.mjs";
 import { logicalWorkKey, normalizeAgent, validateWorkSnapshot, WORK_STAGES } from "./work-model.mjs";
 import {
   collaborationSequence,
@@ -36,8 +36,10 @@ import {
 //     control request also sends `X-Muxa-Operator: 1`, which the server
 //     requires (with a matching Origin) before a cookie may change state.
 //     An account outside the operator group can be enrolled once with the
-//     token on the server-rendered /auth/enroll page; the "operators" dialog
-//     lists and removes enrolled accounts.
+//     token on the server-rendered /auth/enroll page. Accounts matching a
+//     viewer rule or `viewer_group` sign in read-only ("view only") and can
+//     upgrade themselves with the token. The "access" dialog shows the
+//     current account and manages enrolled operators and viewer rules.
 //   * Fetch /api/agents and /api/panes to paint initial tables.
 //   * Open a streaming POST-less fetch on /api/events and parse SSE
 //     manually (EventSource can't carry an Authorization header).
@@ -117,7 +119,8 @@ function normalizeLogin(data) {
     available: Boolean(data?.available),
     signedIn: Boolean(data?.signed_in),
     email: typeof data?.email === "string" ? data.email : null,
-    via: data?.via === "group" || data?.via === "enrollment" ? data.via : null,
+    role: ["none", "viewer", "operator"].includes(data?.role) ? data.role : "none",
+    via: ["group", "enrollment", "viewer_group", "viewer_rule"].includes(data?.via) ? data.via : null,
     enrollment: Boolean(data?.enrollment),
     loginUrl: typeof data?.login_url === "string" ? data.login_url : null,
   };
@@ -145,6 +148,35 @@ function signIn() {
   const here = `${window.location.pathname}${window.location.search}${window.location.hash}`;
   const target = store.access.login.loginUrl || "/auth/login";
   window.location.assign(`${target}?return_to=${encodeURIComponent(here)}`);
+}
+
+// A signed-in viewer enrolls its own account as an operator with the
+// dashboard token. The server checks the token once and replaces the
+// viewer session with an operator session; nothing is stored here.
+async function upgradeWithToken() {
+  const token = window.prompt("Dashboard access token (makes this account an operator)");
+  if (!token) return;
+  let payload = null;
+  try {
+    const resp = await fetch("/auth/enroll", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Muxa-Operator": "1" },
+      body: JSON.stringify({ token: token.trim() }),
+    });
+    payload = await resp.json().catch(() => null);
+    if (resp.ok) {
+      window.location.reload();
+      return;
+    }
+    if (payload?.restart) {
+      window.location.reload();
+      return;
+    }
+  } catch (_) {
+    // Reported below.
+  }
+  showToast(payload?.error || "upgrade failed");
 }
 
 async function signOut() {
@@ -283,6 +315,7 @@ const dom = {
   accessMode: document.getElementById("access-mode"),
   editAccess: document.getElementById("edit-access"),
   operatorLogin: document.getElementById("operator-login"),
+  upgradeAccess: document.getElementById("upgrade-access"),
   conn: document.getElementById("conn"),
   connLabel: document.getElementById("conn-label"),
   counts: document.getElementById("counts"),
@@ -371,27 +404,32 @@ function renderAccess() {
   const login = access.login;
   const editing = access.writeAuthorized;
   const viaSession = editing && login.signedIn && !localStorage.getItem(TOKEN_KEY);
+  const viewing = !editing && login.signedIn && login.role === "viewer";
+  const canUpgrade = viewing && login.enrollment && access.writeAvailable;
   document.querySelector("#manage-shares").hidden = !editing;
-  document.querySelector("#manage-operators").hidden = !(editing && login.available && login.enrollment);
+  document.querySelector("#manage-access").hidden = !(editing && login.available);
+  if (dom.upgradeAccess) dom.upgradeAccess.hidden = !canUpgrade;
   const canStartWork = editing && access.workStartAvailable;
   dom.accessMode.textContent = access.signInRequired
     ? "signed out"
     : viaSession
       ? "signed in"
-      : editing
+      : viewing
+        ? "signed in · view only"
+        : editing
         ? "edit unlocked"
         : access.mode === "public_read"
           ? "public read-only"
           : access.mode === "token"
             ? "private"
             : "read-only";
-  dom.accessMode.title = viaSession && login.email
-    ? `signed in as ${login.email}${login.via === "enrollment" ? " (registered account)" : ""}`
+  dom.accessMode.title = (viaSession || viewing) && login.email
+    ? `signed in as ${login.email}${login.via === "enrollment" ? " (registered account)" : ""}${viewing ? " (view only)" : ""}`
     : "";
   dom.accessMode.classList.toggle("edit", editing);
   // The token path stays available next to sign-in: it is the API
   // credential and the way in when the identity provider is down.
-  dom.editAccess.hidden = !(access.writeAvailable || access.signInRequired) || viaSession;
+  dom.editAccess.hidden = !(access.writeAvailable || access.signInRequired) || viaSession || canUpgrade;
   dom.editAccess.disabled = access.mode === "token" && editing;
   dom.editAccess.textContent = access.signInRequired
     ? "use token"
@@ -439,6 +477,7 @@ function initAccessControl() {
     if (store.access.login.signedIn) signOut();
     else signIn();
   });
+  dom.upgradeAccess?.addEventListener("click", upgradeWithToken);
   dom.editAccess.addEventListener("click", async () => {
     if (store.access.signInRequired) {
       // Boot stopped at the 401; start over with the token in place.
@@ -520,7 +559,7 @@ const store = {
     workStartAvailable: false,
     // Set when a read was refused and sign-in is offered instead.
     signInRequired: false,
-    login: { available: false, signedIn: false, email: null, via: null, enrollment: false, loginUrl: null },
+    login: { available: false, signedIn: false, role: "none", email: null, via: null, enrollment: false, loginUrl: null },
   },
   agents: new Map(), // session_id -> Agent
   panes: [], // PaneSummary[]
@@ -3521,4 +3560,4 @@ async function pollCollaboration() {
 main();
 
 document.querySelector("#manage-shares")?.addEventListener("click", () => openShareManager(null, controlFetch));
-document.querySelector("#manage-operators")?.addEventListener("click", () => openOperatorManager(controlFetch));
+document.querySelector("#manage-access")?.addEventListener("click", () => openAccessManager(controlFetch));

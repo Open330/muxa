@@ -1312,6 +1312,8 @@ async fn recipient_and_operator_sessions_never_cross() {
         groups_claim: None,
         scopes: Vec::new(),
         enrollment: None,
+        viewer_group: None,
+        viewer_rules: Vec::new(),
     };
     config.login = Some(login.clone());
     state.config = Arc::new(config);

@@ -29,6 +29,8 @@ fn login_config(issuer: &str) -> LoginConfig {
         groups_claim: None,
         scopes: vec!["groups".into()],
         enrollment: None,
+        viewer_group: None,
+        viewer_rules: Vec::new(),
     }
 }
 
@@ -115,7 +117,9 @@ fn session(state: &AppState) -> String {
             issuer: "https://issuer.example.com".into(),
             subject: "owner".into(),
             email: Some("owner@example.com".into()),
+            email_verified: false,
             via: Via::Group,
+            attempts: 0,
             expires: Instant::now() + SESSION_TTL,
         },
     );
@@ -1416,7 +1420,9 @@ async fn entries_for_another_issuer_never_match() {
             issuer: foreign.issuer.clone(),
             subject: foreign.subject.clone(),
             email: None,
+            email_verified: false,
             via: Via::Enrollment,
+            attempts: 0,
             expires: Instant::now() + SESSION_TTL,
         },
     );
@@ -1540,11 +1546,17 @@ async fn enrollments_are_durable_private_and_exclusive() {
     assert!(reopened.registry().enrolled.is_empty());
     drop(reopened);
 
-    // With enrollment off nothing is opened or created.
+    // With enrollment off the store still holds viewer rules, but enrolled
+    // accounts are not honored; with sign-in off nothing is opened.
     let mut disabled = config;
     disabled.enrollment = Some(false);
+    let login = OperatorLogin::open(Some(disabled), Some(path.clone()))
+        .await
+        .unwrap();
+    assert!(login.storage.is_some());
+    drop(login);
     let other = dir.path().join("disabled/operators.sqlite3");
-    let login = OperatorLogin::open(Some(disabled), Some(other.clone()))
+    let login = OperatorLogin::open(None, Some(other.clone()))
         .await
         .unwrap();
     assert!(login.storage.is_none() && !other.exists());
@@ -1559,4 +1571,652 @@ async fn enrollments_are_durable_private_and_exclusive() {
             .await
             .is_err()
     );
+}
+
+// ── Viewers ────────────────────────────────────────────────────────
+
+use super::viewers::{Account, StoredRule, ViewerRule};
+
+/// Sign in as `owner-subject` after `edit` adjusts the ID token claims.
+async fn sign_in_with(
+    state: &AppState,
+    provider: &MockServer,
+    edit: impl FnOnce(&mut Value),
+) -> Response {
+    let flow = begin(state, "/?tab=work").await;
+    let mut claims = claims(provider, &flow.nonce, None);
+    edit(&mut claims);
+    mount_token(provider, &claims).await;
+    complete(state, &flow).await
+}
+
+/// A sign-in that must end in a viewer session; returns its cookie.
+async fn viewer_session(
+    state: &AppState,
+    provider: &MockServer,
+    edit: impl FnOnce(&mut Value),
+) -> String {
+    let response = sign_in_with(state, provider, edit).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()[header::LOCATION], "/?tab=work");
+    assert!(set_cookie(&response, ENROLL_COOKIE).is_none());
+    cookie_pair(set_cookie(&response, "__Host-muxa-op").unwrap())
+}
+
+fn verified(claims: &mut Value) {
+    claims["email_verified"] = json!(true);
+}
+
+fn bearer_req() -> Req<'static> {
+    Req {
+        bearer: true,
+        ..Req::default()
+    }
+}
+
+fn csrf_req(cookie: &str) -> Req<'_> {
+    Req {
+        cookie: Some(cookie),
+        origin: Some(PUBLIC),
+        operator_header: true,
+        ..Req::default()
+    }
+}
+
+async fn add_rule(state: &AppState, req: Req<'_>, rule: &str) -> Response {
+    call(
+        state,
+        "POST",
+        "/api/viewers",
+        Req {
+            body: Some(json!({ "rule": rule })),
+            ..req
+        },
+    )
+    .await
+}
+
+/// `/api/access` for this cookie: `(write_authorized, login)`.
+async fn access_of(state: &AppState, cookie: &str) -> (bool, Value) {
+    let access = json_body(
+        call(
+            state,
+            "GET",
+            "/api/access",
+            Req {
+                cookie: Some(cookie),
+                ..Req::default()
+            },
+        )
+        .await,
+    )
+    .await;
+    (
+        access["write_authorized"].as_bool().unwrap(),
+        access["login"].clone(),
+    )
+}
+
+#[test]
+fn viewer_rules_parse_strictly() {
+    for (text, canonical) in [
+        ("email:Ann@Example.com", "email:ann@example.com"),
+        ("email:*@Example.COM", "email:*@example.com"),
+        ("email:a.b+c@sub.example.com", "email:a.b+c@sub.example.com"),
+        ("sub:Case-Kept 1", "sub:Case-Kept 1"),
+    ] {
+        assert_eq!(ViewerRule::parse(text).unwrap().text(), canonical, "{text}");
+    }
+    for text in [
+        "",
+        "ann@example.com",
+        "*@example.com",
+        "email:",
+        "email:*@",
+        "email:*@*.example.com",
+        "email:*.example.com",
+        "email:ann@*",
+        "email:a*@example.com",
+        "email:@example.com",
+        "email:ann@example",
+        "email:ann@example..com",
+        "email:ann@-example.com",
+        "email:ann@exa_mple.com",
+        "email:ann@@example.com",
+        "email:ann smith@example.com",
+        "email:*@example.com ",
+        "sub:",
+        "sub: padded",
+        "sub:line\nbreak",
+        "group:operators",
+        "EMAIL:ann@example.com",
+    ] {
+        assert!(ViewerRule::parse(text).is_err(), "{text:?}");
+    }
+    assert!(ViewerRule::parse(&format!("sub:{}", "x".repeat(256))).is_err());
+}
+
+#[test]
+fn viewer_rules_match_verified_email_exact_domain_and_pinned_subject() {
+    let config = login_config("https://issuer.example.com");
+    let account = |email: Option<&'static str>, email_verified: bool| Account {
+        issuer: "https://issuer.example.com",
+        subject: "someone",
+        email,
+        email_verified,
+    };
+    let rule = |text: &str| vec![ViewerRule::parse(text).unwrap()];
+    let domain = rule("email:*@example.com");
+    for (email, verified, expected) in [
+        ("ann@example.com", true, true),
+        ("Ann@EXAMPLE.com", true, true),
+        ("ann@example.com", false, false),
+        ("ann@sub.example.com", true, false),
+        ("ann@example.com.evil.test", true, false),
+        ("ann@notexample.com", true, false),
+    ] {
+        assert_eq!(
+            viewers::matches(&domain, &[], &config, account(Some(email), verified)),
+            expected,
+            "{email} {verified}"
+        );
+    }
+    assert!(!viewers::matches(
+        &domain,
+        &[],
+        &config,
+        account(None, true)
+    ));
+    let exact = rule("email:ann@example.com");
+    assert!(viewers::matches(
+        &exact,
+        &[],
+        &config,
+        account(Some("ANN@example.com"), true)
+    ));
+    assert!(!viewers::matches(
+        &exact,
+        &[],
+        &config,
+        account(Some("ann@example.com"), false)
+    ));
+    assert!(!viewers::matches(
+        &exact,
+        &[],
+        &config,
+        account(Some("bob@example.com"), true)
+    ));
+    // Subjects are exact and need no email at all.
+    let subject = rule("sub:someone");
+    assert!(viewers::matches(
+        &subject,
+        &[],
+        &config,
+        account(None, false)
+    ));
+    assert!(!viewers::matches(
+        &rule("sub:Someone"),
+        &[],
+        &config,
+        account(None, false)
+    ));
+    // Pinned to the configured issuer, for the account and for stored rules.
+    let foreign = Account {
+        issuer: "https://other.example.com",
+        ..account(None, false)
+    };
+    assert!(!viewers::matches(&subject, &[], &config, foreign));
+    let stored = |issuer: &str| StoredRule {
+        id: "0".repeat(32),
+        issuer: issuer.into(),
+        rule: ViewerRule::parse("sub:someone").unwrap(),
+        created_at: 1,
+    };
+    assert!(viewers::matches(
+        &[],
+        &[stored("https://issuer.example.com")],
+        &config,
+        account(None, false)
+    ));
+    assert!(!viewers::matches(
+        &[],
+        &[stored("https://other.example.com")],
+        &config,
+        account(None, false)
+    ));
+}
+
+#[test]
+fn viewer_config_is_validated() {
+    let mut config = login_config("https://issuer.example.com");
+    config.viewer_group = Some("muxa viewers".into());
+    assert!(config.validate().is_err());
+    config.viewer_group = Some("muxa-viewers".into());
+    config.viewer_rules = vec!["email:*@example.com".into(), "sub:abc".into()];
+    config.validate().unwrap();
+    config.viewer_rules.push("*@example.com".into());
+    assert!(config.validate().unwrap_err().contains("*@example.com"));
+    config.viewer_rules = vec!["sub:x".into(); MAX_VIEWER_RULES + 1];
+    assert!(config.validate().is_err());
+    let parsed: LoginConfig = toml::from_str(
+        r#"
+        public_url = "https://dash.example.com"
+        issuer_url = "https://issuer.example.com"
+        client_id = "muxa"
+        viewer_group = "muxa-viewers"
+        viewer_rules = ["email:*@example.com"]
+        "#,
+    )
+    .unwrap();
+    assert_eq!(parsed.viewer_rules, ["email:*@example.com"]);
+    assert!(toml::from_str::<LoginConfig>(
+        r#"
+        public_url = "https://dash.example.com"
+        issuer_url = "https://issuer.example.com"
+        client_id = "muxa"
+        viewer_emails = ["ann@example.com"]
+        "#,
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn accounts_matching_nothing_get_no_access_at_all() {
+    let provider = provider().await;
+    let state = state(&provider.uri());
+    add_rule(&state, bearer_req(), "email:*@other.example.com").await;
+    let cookie = pending(&state, &provider, "/").await;
+    for uri in ["/api/access", "/api/agents", "/api/events", "/api/panes"] {
+        assert_eq!(
+            status_of(&state, uri, &cookie).await,
+            StatusCode::UNAUTHORIZED,
+            "{uri}"
+        );
+    }
+    let status = json_body(call(&state, "GET", "/auth/session", Req::default()).await).await;
+    assert_eq!(status["role"], "none");
+    assert!(state.operator.registry().sessions.is_empty());
+    // With enrollment off there is not even a token page.
+    let mut config = login_config(&provider.uri());
+    config.enrollment = Some(false);
+    let state = state_with(config);
+    let response = sign_in_with(&state, &provider, verified).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One viewer lifecycle: read, refused writes, revoked.
+async fn rule_viewer_reads_cannot_write_and_is_revoked_with_its_rule() {
+    let provider = provider().await;
+    let state = state(&provider.uri());
+    let response = add_rule(&state, bearer_req(), "email:*@EXAMPLE.com").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let rule = json_body(response).await;
+    assert_eq!(rule["rule"], "email:*@example.com");
+    let id = rule["id"].as_str().unwrap().to_owned();
+
+    let viewer = viewer_session(&state, &provider, verified).await;
+    for uri in ["/api/agents", "/api/events", "/api/panes", "/api/works"] {
+        assert_eq!(
+            status_of(&state, uri, &viewer).await,
+            StatusCode::OK,
+            "{uri}"
+        );
+    }
+    let (write, login) = access_of(&state, &viewer).await;
+    assert!(!write);
+    assert_eq!(login["role"], "viewer");
+    assert_eq!(login["via"], "viewer_rule");
+    assert_eq!(login["signed_in"], true);
+    assert_eq!(login["email"], "owner@example.com");
+
+    // Every write and every management read is refused, with or without
+    // the CSRF proof: authenticated, but not allowed.
+    let remove = format!("/api/viewers/{id}/remove");
+    for (method, uri) in [
+        ("POST", "/api/shares/check"),
+        ("GET", "/api/operators"),
+        ("GET", "/api/viewers"),
+        ("POST", "/api/viewers"),
+        ("POST", remove.as_str()),
+        ("POST", "/api/panes/%251/prompt"),
+        ("POST", "/api/panes/%251/abort"),
+        ("PUT", "/api/work-metadata"),
+        ("POST", "/api/work-control/up"),
+        ("POST", "/api/work-control/prompt"),
+        ("POST", "/api/terminal-sessions/x/input"),
+    ] {
+        for proof in [false, true] {
+            let response = call(
+                &state,
+                method,
+                uri,
+                Req {
+                    cookie: Some(&viewer),
+                    origin: proof.then_some(PUBLIC),
+                    operator_header: proof,
+                    ..Req::default()
+                },
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+    }
+    assert_eq!(state.operator.registry().viewer_rules.len(), 1);
+
+    // The operator sees the rule; removing it ends the live session.
+    let list = json_body(call(&state, "GET", "/api/viewers", bearer_req()).await).await;
+    assert_eq!(list["rules"][0]["source"], "dashboard");
+    assert_eq!(list["rules"][0]["active"], true);
+    let response = call(&state, "POST", &remove, bearer_req()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["sessions_ended"], 1);
+    assert_eq!(
+        status_of(&state, "/api/agents", &viewer).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // Even without the eager sweep, the next request re-checks the rules.
+    add_rule(&state, bearer_req(), "sub:owner-subject").await;
+    let viewer = viewer_session(&state, &provider, |_| {}).await;
+    state.operator.registry().viewer_rules.clear();
+    assert_eq!(
+        status_of(&state, "/api/agents", &viewer).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn email_rules_need_email_verified_and_subject_rules_the_issuer() {
+    let provider = provider().await;
+    let state = state(&provider.uri());
+    add_rule(&state, bearer_req(), "email:owner@example.com").await;
+    // email_verified is false in the default claims.
+    pending(&state, &provider, "/").await;
+    let response = sign_in_with(&state, &provider, |claims| {
+        claims.as_object_mut().unwrap().remove("email_verified");
+    })
+    .await;
+    assert_eq!(response.headers()[header::LOCATION], "/auth/enroll");
+    viewer_session(&state, &provider, verified).await;
+
+    // A subject rule recorded under another issuer is listed but inert.
+    let state = self::state(&provider.uri());
+    state.operator.registry().viewer_rules.push(StoredRule {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        issuer: "https://other.example.com".into(),
+        rule: ViewerRule::parse("sub:owner-subject").unwrap(),
+        created_at: 1,
+    });
+    pending(&state, &provider, "/").await;
+    let list = json_body(call(&state, "GET", "/api/viewers", bearer_req()).await).await;
+    assert_eq!(list["rules"][0]["active"], false);
+    // The same rule for the configured issuer matches.
+    assert_eq!(
+        add_rule(&state, bearer_req(), "sub:owner-subject")
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    viewer_session(&state, &provider, |_| {}).await;
+}
+
+#[tokio::test]
+async fn viewer_group_grants_view_only_and_operator_group_wins() {
+    let provider = provider().await;
+    let mut config = login_config(&provider.uri());
+    config.viewer_group = Some("viewers".into());
+    let state = state_with(config);
+    let viewer = viewer_session(&state, &provider, |claims| {
+        claims["groups"] = json!(["viewers"]);
+    })
+    .await;
+    let (write, login) = access_of(&state, &viewer).await;
+    assert!(!write);
+    assert_eq!(login["role"], "viewer");
+    assert_eq!(login["via"], "viewer_group");
+    assert_eq!(
+        call(&state, "POST", "/api/shares/check", csrf_req(&viewer))
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = sign_in_with(&state, &provider, |claims| {
+        claims["groups"] = json!(["viewers", "operator"]);
+    })
+    .await;
+    let operator = cookie_pair(set_cookie(&response, "__Host-muxa-op").unwrap());
+    let (write, login) = access_of(&state, &operator).await;
+    assert!(write);
+    assert_eq!(login["role"], "operator");
+    assert_eq!(login["via"], "group");
+}
+
+#[tokio::test]
+async fn configured_viewer_rules_apply_and_are_read_only() {
+    let provider = provider().await;
+    let mut config = login_config(&provider.uri());
+    config.viewer_rules = vec!["email:*@example.com".into()];
+    let state = state_with(config);
+    viewer_session(&state, &provider, verified).await;
+    let list = json_body(call(&state, "GET", "/api/viewers", bearer_req()).await).await;
+    assert_eq!(list["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(list["rules"][0]["source"], "config");
+    assert_eq!(list["rules"][0]["id"], Value::Null);
+    assert_eq!(list["max"], MAX_VIEWER_RULES);
+    // Neither duplicated nor removable from the dashboard.
+    assert_eq!(
+        add_rule(&state, bearer_req(), "email:*@Example.com")
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(
+            &state,
+            "POST",
+            &format!("/api/viewers/{}/remove", "0".repeat(32)),
+            bearer_req()
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn viewer_rule_management_needs_an_operator_and_csrf_proof() {
+    let state = state("https://issuer.example.com");
+    assert_eq!(
+        add_rule(&state, Req::default(), "sub:x").await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let owner = session(&state);
+    for (origin, operator_header) in [(None, true), (Some(PUBLIC), false)] {
+        let response = add_rule(
+            &state,
+            Req {
+                cookie: Some(&owner),
+                origin,
+                operator_header,
+                ..Req::default()
+            },
+            "sub:x",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    assert!(state.operator.registry().viewer_rules.is_empty());
+    for bad in ["x", "email:*@*", "sub:"] {
+        assert_eq!(
+            add_rule(&state, csrf_req(&owner), bad).await.status(),
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+    let response = add_rule(&state, csrf_req(&owner), "sub:x").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let id = json_body(response).await["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        add_rule(&state, csrf_req(&owner), "sub:x").await.status(),
+        StatusCode::CONFLICT
+    );
+    let remove = format!("/api/viewers/{id}/remove");
+    let response = call(
+        &state,
+        "POST",
+        &remove,
+        Req {
+            cookie: Some(&owner),
+            ..Req::default()
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = call(&state, "POST", &remove, csrf_req(&owner)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        call(&state, "POST", &remove, csrf_req(&owner))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Refused, wrong and right tokens for one viewer.
+async fn viewer_upgrades_to_operator_with_the_token() {
+    let provider = provider().await;
+    let state = state(&provider.uri());
+    add_rule(&state, bearer_req(), "sub:owner-subject").await;
+    let viewer = viewer_session(&state, &provider, |_| {}).await;
+    // Same CSRF proof as the enrollment page.
+    let response = call(
+        &state,
+        "POST",
+        "/auth/enroll",
+        Req {
+            cookie: Some(&viewer),
+            body: Some(json!({"token": "operator-token"})),
+            ..Req::default()
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = submit(&state, Some(&viewer), "wrong").await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(response).await["restart"], false);
+    state.operator.registry().backoff = super::Backoff::default();
+
+    let response = submit(&state, Some(&viewer), "operator-token").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let operator = cookie_pair(set_cookie(&response, "__Host-muxa-op").unwrap());
+    assert_eq!(json_body(response).await["redirect"], "/");
+    assert_ne!(operator, viewer);
+    assert_eq!(
+        status_of(&state, "/api/agents", &viewer).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let (write, login) = access_of(&state, &operator).await;
+    assert!(write);
+    assert_eq!(login["role"], "operator");
+    assert_eq!(login["via"], "enrollment");
+    assert_eq!(state.operator.registry().enrolled.len(), 1);
+    // The next sign-in is an operator's, rules or not.
+    state.operator.registry().viewer_rules.clear();
+    let response = sign_in(&state, &provider, "/", None).await;
+    assert_eq!(response.headers()[header::LOCATION], "/");
+    // An operator session has nothing to upgrade.
+    assert_eq!(
+        submit(&state, Some(&operator), "operator-token")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Too many wrong tokens end the viewer session.
+    let state = self::state(&provider.uri());
+    add_rule(&state, bearer_req(), "sub:owner-subject").await;
+    let viewer = viewer_session(&state, &provider, |_| {}).await;
+    for attempt in 1..=MAX_ENROLL_ATTEMPTS {
+        state.operator.registry().backoff = super::Backoff::default();
+        let response = submit(&state, Some(&viewer), "wrong").await;
+        let last = attempt == MAX_ENROLL_ATTEMPTS;
+        if last {
+            assert!(set_cookie(&response, "__Host-muxa-op")
+                .unwrap()
+                .contains("Max-Age=0"));
+        }
+        assert_eq!(json_body(response).await["restart"], last);
+    }
+    assert_eq!(
+        status_of(&state, "/api/agents", &viewer).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(state.operator.registry().enrolled.is_empty());
+}
+
+#[tokio::test]
+async fn viewer_and_share_sessions_are_independent() {
+    let provider = provider().await;
+    let state = state(&provider.uri());
+    add_rule(&state, bearer_req(), "sub:owner-subject").await;
+    let viewer = viewer_session(&state, &provider, |_| {}).await;
+    let secret = viewer.split_once('=').unwrap().1;
+    // The viewer secret under the recipient cookie name is nothing.
+    assert_eq!(
+        status_of(
+            &state,
+            "/api/agents",
+            &format!("__Host-muxa-share={secret}")
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    // And the viewer cookie grants nothing on recipient routes.
+    assert_eq!(
+        status_of(
+            &state,
+            "/share/api/0123456789abcdef0123456789abcdef",
+            &viewer
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn operators_list_reports_the_current_account() {
+    let state = state("https://issuer.example.com");
+    let account = |req: Req<'static>| {
+        let state = state.clone();
+        async move {
+            json_body(call(&state, "GET", "/api/operators", req).await).await["account"].clone()
+        }
+    };
+    assert_eq!(
+        account(bearer_req()).await,
+        json!({"role": "operator", "via": "token", "email": null, "subject": null})
+    );
+    let group: &'static str = Box::leak(session(&state).into_boxed_str());
+    assert_eq!(
+        account(Req {
+            cookie: Some(group),
+            ..Req::default()
+        })
+        .await,
+        json!({"role": "operator", "via": "group", "email": "owner@example.com", "subject": "owner"})
+    );
+    // The bearer token wins when both are sent, as in `authenticate`.
+    assert_eq!(
+        account(Req {
+            cookie: Some(group),
+            bearer: true,
+            ..Req::default()
+        })
+        .await["via"],
+        "token"
+    );
+    let status = json_body(call(&state, "GET", "/auth/session", bearer_req()).await).await;
+    assert_eq!(status["role"], "operator");
+    assert_eq!(status["signed_in"], false);
 }
