@@ -6,8 +6,10 @@ import {
   edgeIdentity,
   normalizeCollaborationPayload,
   participantIdentity,
+  participantSession,
   projectCollaboration,
   requestRoomKey,
+  scopeCollaborationRequests,
 } from "../src/dashboard/web/collaboration-model.mjs";
 
 const room = { host: "tmux", socket: "/tmp/tmux-1000/default", window_id: "@9" };
@@ -107,4 +109,68 @@ test("anchors console-origin messages on the recipient room", () => {
   const dispatched = { ...request("dispatch", "2026-08-30T03:00:00Z"), from: console };
   assert.equal(requestRoomKey(dispatched), requestRoomKey(request("peer", "2026-08-30T03:01:00Z")));
   assert.notEqual(requestRoomKey(dispatched), "dashboard\u001fdefault\u001fconsole");
+});
+
+test("a session scope keeps messages touching a pane in that session", () => {
+  const livePanes = new Map([
+    ["default %1", { session: "youtube", socket: "default" }],
+    ["default %2", { session: "youtube", socket: "default" }],
+    ["default %3", { session: "somun", socket: "default" }],
+  ]);
+  const resolvePane = (pane, socket) => livePanes.get(`${String(socket || "default").split("/").pop()} ${pane}`) || null;
+  const at = (pane, alias) => ({ ...participant(`s-${alias}`, alias, pane), socket: "default" });
+  const editor = at("%1", "editor");
+  const uploader = at("%2", "uploader");
+  const writer = at("%3", "writer");
+  const console = { console: true };
+  const artist = { agent_kind: "codex", agent_session_id: "arena-art", alias: "implementer" }; // no pane
+  const closed = { ...at("%99", "old"), tmux_session_name: "youtube" }; // pane gone from the scan
+  const requests = [
+    request("r1", "2026-08-30T01:00:00Z", { from: editor, to: uploader }),
+    request("r2", "2026-08-30T02:00:00Z", { from: console, to: editor }),
+    request("r3", "2026-08-30T03:00:00Z", { from: writer, to: artist }),
+    request("r4", "2026-08-30T04:00:00Z", { from: artist, to: uploader }),
+    request("r5", "2026-08-30T05:00:00Z", { from: console, to: writer }),
+    request("r6", "2026-08-30T06:00:00Z", { from: writer, to: editor }),
+    request("r7", "2026-08-30T07:00:00Z", { from: closed, to: console }),
+  ];
+
+  assert.equal(scopeCollaborationRequests(requests, null, resolvePane), requests);
+  const youtube = scopeCollaborationRequests(requests, { session: "youtube", socket: "default", workspace: "" }, resolvePane);
+  assert.deepEqual(youtube.map((r) => r.id), ["r1", "r2", "r4", "r6", "r7"]);
+  const projection = projectCollaboration(youtube);
+  // console and the pane-less implementer stay because they exchanged a
+  // message with youtube; somun's writer stays as r6's sender.
+  assert.deepEqual(projection.nodes.map((node) => node.label).sort(),
+    ["console", "editor", "implementer", "old", "uploader", "writer"]);
+  assert.equal(projection.edges.reduce((sum, edge) => sum + edge.count, 0), 5);
+
+  const somun = scopeCollaborationRequests(requests, { session: "somun", socket: "", workspace: "" }, resolvePane);
+  assert.deepEqual(somun.map((r) => r.id), ["r3", "r5", "r6"]);
+  // The same session name on another server is out of scope.
+  assert.deepEqual(scopeCollaborationRequests(requests, { session: "somun", socket: "work" }, resolvePane), []);
+});
+
+test("participantSession prefers the live pane scan and ignores the console", () => {
+  const resolvePane = (pane) => (pane === "%1" ? { session: "live", socket: "default" } : null);
+  assert.deepEqual(participantSession({ ...implementer, tmux_session_name: "stale" }, resolvePane),
+    { session: "live", socket: "default" });
+  assert.deepEqual(participantSession({ ...reviewer, tmux_session_name: "recorded" }, resolvePane),
+    { session: "recorded", socket: "default" });
+  assert.equal(participantSession(reviewer, resolvePane), null);
+  assert.equal(participantSession({ console: true }, resolvePane), null);
+  assert.equal(participantSession({ agent_session_id: "x", tmux_session_name: "s" }, resolvePane), null);
+});
+
+test("a managed-only workspace scope keeps the requests filed under its Work", () => {
+  const requests = [
+    request("a", "2026-08-30T01:00:00Z", { workspace_id: "billing" }),
+    request("b", "2026-08-30T02:00:00Z", { work: { workspace_id: "billing", work_id: "B-1" } }),
+    request("c", "2026-08-30T03:00:00Z", { workspace_id: "other" }),
+  ];
+  assert.deepEqual(
+    scopeCollaborationRequests(requests, { session: "", socket: "", workspace: "billing" }).map((r) => r.id),
+    ["a", "b"],
+  );
+  assert.deepEqual(scopeCollaborationRequests(requests, { session: "", socket: "", workspace: "" }), []);
 });

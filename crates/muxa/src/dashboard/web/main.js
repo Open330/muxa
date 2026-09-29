@@ -7,7 +7,9 @@ import {
   buildTopology,
   filterTopology,
   layoutTiles,
+  paneSessionResolver,
   parseTopologyHash,
+  sessionsInScope,
   socketShort,
   stateRank,
   withTopologyHash,
@@ -16,11 +18,17 @@ import { logicalWorkKey, normalizeAgent, validateWorkSnapshot, WORK_STAGES } fro
 import {
   buildRailEntries,
   findRailEntry,
+  findScopeEntry,
   inRailScope,
+  migrateLegacyScopeHash,
+  parseScopeHash,
+  railEntryScopeRef,
   railScope,
   railStateClass,
   sortRailEntries,
-  unlinkedInScope,
+  untrackedExpanded,
+  untrackedWindowRows,
+  withScopeHash,
   worksInScope,
 } from "./workspace-rail.mjs";
 import {
@@ -34,6 +42,7 @@ import {
   requestThreadId,
   requestWorkId,
   roomLabel,
+  scopeCollaborationRequests,
   sequenceParticipants,
 } from "./collaboration-model.mjs";
 
@@ -79,6 +88,7 @@ const COLLAPSED_TIMELINE_GROUPS_KEY = "muxa.dashboard.collapsedTimelineGroups";
 const EXPANDED_WORKS_KEY = "muxa.dashboard.expandedWorks";
 const DATA_TAB_KEY = "muxa.dashboard.dataTab";
 const SESSION_SORT_KEY = "muxa.dashboard.sessionSort";
+const UNTRACKED_EXPANDED_KEY = "muxa.dashboard.untrackedExpanded";
 const PANES_REFETCH_INTERVAL_MS = 5000;
 const WORK_REFETCH_INTERVAL_MS = 5000;
 const TERMINALS_REFETCH_INTERVAL_MS = 2000;
@@ -354,6 +364,7 @@ const dom = {
   version: document.getElementById("version"),
   sessionList: document.getElementById("session-list"),
   sessionsMeta: document.getElementById("sessions-meta"),
+  sessionsMetaLabel: document.getElementById("sessions-meta-label"),
   sessionSort: document.getElementById("session-sort"),
   showAllSessions: document.getElementById("show-all-sessions"),
   workStartForm: document.getElementById("work-start-form"),
@@ -380,6 +391,9 @@ const dom = {
   timelineSession: document.getElementById("timeline-session"),
   timelineMeta: document.getElementById("timeline-meta"),
   collaborationMeta: document.getElementById("collaboration-meta"),
+  collaborationScope: document.getElementById("collaboration-scope"),
+  collaborationScopeName: document.getElementById("collaboration-scope-name"),
+  collaborationScopeClear: document.getElementById("collaboration-scope-clear"),
   collaborationRefresh: document.getElementById("collaboration-refresh"),
   collaborationRange: document.getElementById("collaboration-range"),
   collaborationRoom: document.getElementById("collaboration-room"),
@@ -419,6 +433,7 @@ const dom = {
   topologyTree: document.getElementById("topology-tree"),
   topologyDetail: document.getElementById("topology-detail"),
   topologyMeta: document.getElementById("topology-meta"),
+  topologyScope: document.getElementById("topology-scope"),
   topologyFilter: document.getElementById("topology-filter"),
   jumpAgentsCount: document.getElementById("jump-agents-count"),
   workbench: document.querySelector(".workbench"),
@@ -629,6 +644,8 @@ const store = {
     terminalFingerprint: "",
     collaborationFingerprint: "",
     collaborationProjection: null,
+    collaborationScopeKey: "",
+    collaborationScoped: [],
     sessionSummariesKey: "",
     sessionSummaries: [],
     workProjectionKey: "",
@@ -648,6 +665,7 @@ const store = {
     selectedTimelineDay: "",
     selectedWorkKey: "",
     selectedWorkspaceKey: "",
+    pendingScope: null, // #workspace= reference not yet in the rail
     selectedCollaborationEdge: "",
     selectedCollaborationRoom: "",
     selectedCollaborationRequest: "",
@@ -908,33 +926,26 @@ function setSelectedSession(session) {
   fetchTimeline({ force: true }).catch(() => {});
 }
 
-// Select a rail entry (a tmux session, a managed workspace, or both). The
-// session scopes the Agents/Panes tables and the Timeline, the managed
-// workspace scopes the Work board, and the Sessions navigator selects the
-// session. `#session=` (shared with the navigator) keeps the selection.
-function setSelectedWorkspace(workspaceKey, { updateHash = true, syncNavigator = true } = {}) {
+// Select a rail entry (a tmux session, a managed workspace, or both): the
+// page *scope*. The session scopes the Agents/Panes tables, the Timeline and
+// the Collaboration view, the managed workspace scopes the Work board, and
+// the Sessions navigator tree shows only that session. The scope lives in
+// `#workspace=<name>` (`&wsocket=` when the name exists on several tmux
+// servers), separate from the navigator's detail selection
+// (`#session=`/`#window=`/`#pane=`), so selecting something in the navigator
+// never rescopes the page.
+function setSelectedWorkspace(workspaceKey, { updateHash = true } = {}) {
   const entry = railEntries().find((candidate) => candidate.key === workspaceKey) || null;
   const nextKey = entry?.key || "";
-  if (store.ui.selectedWorkspaceKey !== nextKey) {
+  const changed = store.ui.selectedWorkspaceKey !== nextKey;
+  if (changed) {
     store.ui.selectedWorkKey = "";
     closeWorkDrawer();
   }
   store.ui.selectedWorkspaceKey = nextKey;
-  if (syncNavigator) {
-    if (entry?.sessionKey && currentTopology().nodes.has(entry.sessionKey)) {
-      selectTopology(entry.sessionKey, { updateHash: false, syncRail: false });
-    } else if (topologyState.selection) {
-      topologyState.selection = null;
-      renderTopology();
-    }
-  }
-  if (updateHash) {
-    const url = new URL(window.location.href);
-    url.hash = withTopologyHash(url.hash, entry
-      ? { session: entry.sessionName || entry.workspaceKey, socket: entry.sessionName ? entry.socket : null }
-      : null);
-    window.history.replaceState(window.history.state, "", url.toString());
-  }
+  store.ui.pendingScope = null;
+  if (updateHash) writeScopeHash(entry);
+  if (changed) focusNavigatorOnScope(entry, { updateHash });
   renderSessionSidebar();
   renderOverview();
   // setSelectedSession re-renders the tables, Work board and Timeline.
@@ -946,10 +957,55 @@ function setSelectedWorkspace(workspaceKey, { updateHash = true, syncNavigator =
     renderWorkItems();
     renderInspector();
   }
+  renderCollaboration();
 }
 
-// Make the rail follow a session picked elsewhere (navigator, Timeline
-// filter, deep link) without looping back into the navigator.
+function writeScopeHash(entry) {
+  const url = new URL(window.location.href);
+  url.hash = withScopeHash(url.hash, railEntryScopeRef(entry, railEntries()));
+  window.history.replaceState(window.history.state, "", url.toString());
+}
+
+// A new scope narrows the navigator tree to its session, expanded. A detail
+// selection outside the new scope falls back to the scoped session (and
+// leaves the fragment); "all workspaces" keeps whatever is selected.
+function focusNavigatorOnScope(entry, { updateHash = true } = {}) {
+  topologyState.showAll = false;
+  if (!entry) {
+    renderTopology();
+    return;
+  }
+  const topology = currentTopology();
+  const sessions = sessionsInScope(topology, railScope(entry));
+  for (const session of sessions) {
+    if (topologyState.toggled.delete(session.key)) saveSet(TOPOLOGY_TOGGLED_KEY, topologyState.toggled);
+  }
+  const selected = topologyState.selection ? topology.nodes.get(topologyState.selection.key) : null;
+  const selectedSessionKey = selected?.type === "window" ? selected.sessionKey : selected?.key;
+  if (!sessions.some((session) => session.key === selectedSessionKey)) {
+    topologyState.selection = sessions[0] ? { type: "session", key: sessions[0].key } : null;
+    if (updateHash) writeTopologyHash(null);
+  }
+  renderTopology();
+  pollTails();
+}
+
+// Resolve `#workspace=` to a rail entry. Before the pane scan has reported
+// the session the reference is kept and retried when the rail next renders.
+function applyScopeHash() {
+  const ref = parseScopeHash(window.location.hash);
+  const entry = findScopeEntry(railEntries(), ref);
+  if (ref && !entry) {
+    store.ui.pendingScope = ref;
+    return;
+  }
+  if ((entry?.key || "") !== store.ui.selectedWorkspaceKey) {
+    setSelectedWorkspace(entry?.key || "", { updateHash: false });
+  }
+}
+
+// Make the rail follow a session picked in the Timeline's workspace filter
+// (the navigator no longer rescopes the page).
 function syncRailToSession(session, socket, { updateHash = false } = {}) {
   const entry = session ? findRailEntry(railEntries(), { session, socket }) : null;
   if (!entry && session) {
@@ -959,7 +1015,7 @@ function syncRailToSession(session, socket, { updateHash = false } = {}) {
     return;
   }
   if ((entry?.key || "") === store.ui.selectedWorkspaceKey && selectedSession() === (entry?.sessionName || "")) return;
-  setSelectedWorkspace(entry?.key || "", { updateHash, syncNavigator: !entry });
+  setSelectedWorkspace(entry?.key || "", { updateHash });
 }
 
 // Copy text to clipboard. Uses the async Clipboard API when available
@@ -1025,6 +1081,13 @@ function renderOverview() {
 }
 
 function renderSessionSidebar() {
+  if (store.ui.pendingScope) {
+    const pending = findScopeEntry(railEntries(), store.ui.pendingScope);
+    if (pending) {
+      setSelectedWorkspace(pending.key, { updateHash: false });
+      return;
+    }
+  }
   const entries = railEntries();
   const sorted = sortRailEntries(entries, store.ui.sessionSort);
   const visible = sorted.slice(0, store.ui.sessionLimit);
@@ -1036,13 +1099,14 @@ function renderSessionSidebar() {
   const sessionCount = entries.filter((entry) => entry.sessionName).length;
   const managedOnly = entries.length - sessionCount;
   const allWorks = workspaces().flatMap((workspace) => workspace.works);
-  // The Work figure lives on the "all workspaces" row; the header stays short
-  // enough for the narrow rail.
-  dom.sessionsMeta.textContent = `${sessionCount} session${sessionCount === 1 ? "" : "s"}`
-    + (managedOnly ? ` +${managedOnly}` : "");
-  dom.sessionsMeta.title = `${sessionCount} tmux sessions`
-    + (managedOnly ? `, ${managedOnly} managed workspaces without a live session` : "")
-    + ` · ${allWorks.length} tracked Work`;
+  // The header is a bare count badge so it never truncates in the narrow
+  // rail; the wording is in the tooltip and the screen-reader label.
+  dom.sessionsMeta.textContent = String(entries.length);
+  const countLabel = `${sessionCount} session${sessionCount === 1 ? "" : "s"}`
+    + (managedOnly ? `, ${managedOnly} managed workspace${managedOnly === 1 ? "" : "s"} without a live session` : "")
+    + `, ${allWorks.length} work${allWorks.length === 1 ? "" : "s"}`;
+  dom.sessionsMeta.title = countLabel;
+  if (dom.sessionsMetaLabel) dom.sessionsMetaLabel.textContent = countLabel;
   if (dom.sessionSort) dom.sessionSort.value = store.ui.sessionSort;
   const allAttention = allWorks.filter((work) => work.signals.length > 0).length;
   const allState = railStateClass(entries.reduce((best, entry) =>
@@ -1324,25 +1388,51 @@ function renderExternalBadge(work) {
   return `<span class="external-badge">${esc(item.source)} · ${esc(item.display_key)}${esc(status)}</span>`;
 }
 
+// The navigator's window node for an untracked window, or null before the
+// pane scan has reported it.
+function topologyWindowFor(windowId, socket) {
+  if (!windowId) return null;
+  for (const node of currentTopology().nodes.values()) {
+    if (node.type === "window" && node.id === windowId && (!socket || socketShort(node.socket) === socket)) return node;
+  }
+  return null;
+}
+
+// tmux windows that are live but not tracked as Work, in the rail scope. A
+// compact, collapsible list (its open state is remembered per browser); each
+// row opens the window in the Sessions navigator (#window=).
 function renderUnlinkedExecutions() {
-  const runs = unlinkedInScope(store.workSnapshot.unlinked_executions || [], currentScope());
-  if (runs.length === 0) return "";
-  const visible = runs.slice(0, 20);
-  const rows = visible.map((run) => `<div class="unlinked-row">
-    <span class="state-dot ${run.state === "failed" ? "error" : run.state === "running" ? "working" : "idle"}"></span>
+  const rows = untrackedWindowRows(store.workSnapshot.unlinked_executions || [], currentScope());
+  if (rows.length === 0) return "";
+  const expanded = untrackedExpanded(loadValue(UNTRACKED_EXPANDED_KEY, ""), (store.workSnapshot.works || []).length);
+  const visible = rows.slice(0, 20);
+  const list = visible.map(({ run, session, window: windowId, socket }) => {
+    const node = topologyWindowFor(windowId, socket);
+    const cells = `<span class="state-dot ${run.state === "failed" ? "error" : run.state === "running" ? "working" : "idle"}"></span>
     <span><b>${esc(run.session_name)}:${esc(run.window_index)}</b><small>${esc(run.window_name || run.id)}</small></span>
     <span>${esc(run.state)}</span>
     <span>${(run.panes || []).length} panes</span>
-    <span title="${esc(run.cwd || "")}">${esc(run.cwd || "no cwd")}</span>
-  </div>`).join("");
-  const hidden = runs.length - visible.length;
-  return `<section class="unlinked-executions">
-    <div class="unlinked-heading">
-      <span>Unlinked executions</span>
-      <small>${runs.length} tmux windows are visible but are not tracked as Work${hidden > 0 ? ` · ${hidden} hidden` : ""}</small>
-    </div>
-    <div class="unlinked-list">${rows}</div>
+    <span title="${esc(run.cwd || "")}">${esc(run.cwd || "no cwd")}</span>`;
+    if (!node) return `<div class="unlinked-row">${cells}</div>`;
+    const href = withTopologyHash(window.location.hash, { session, window: node.id, socket });
+    return `<a class="unlinked-row" href="${esc(href)}" data-tselect="${esc(node.key)}"
+      title="Open ${esc(`${session}:${run.window_index}`)} in the Sessions navigator">${cells}</a>`;
+  }).join("");
+  const hidden = rows.length - visible.length;
+  return `<section class="unlinked-executions${expanded ? "" : " collapsed"}">
+    <button class="unlinked-heading" type="button" data-toggle-untracked aria-expanded="${expanded ? "true" : "false"}" aria-controls="unlinked-list">
+      <span class="unlinked-title"><span class="unlinked-twisty" aria-hidden="true">${expanded ? "▾" : "▸"}</span>Windows not tracked as Work (${rows.length})</span>
+      <small>live tmux windows without a managed Work${hidden > 0 ? ` · ${hidden} not shown` : ""}</small>
+    </button>
+    <div class="unlinked-list" id="unlinked-list"${expanded ? "" : " hidden"}>${list}</div>
   </section>`;
+}
+
+function toggleUntracked() {
+  const expanded = untrackedExpanded(loadValue(UNTRACKED_EXPANDED_KEY, ""), (store.workSnapshot.works || []).length);
+  saveValue(UNTRACKED_EXPANDED_KEY, expanded ? "0" : "1");
+  renderWorkItems();
+  dom.workItemsContent.querySelector("[data-toggle-untracked]")?.focus();
 }
 
 function renderWorkItems() {
@@ -1359,6 +1449,13 @@ function renderWorkItems() {
   dom.workItemsMeta.textContent = `${scope} · ${works.length} works${attention ? ` · ${attention} attention` : ""}`;
 
   const unlinked = renderUnlinkedExecutions();
+  // No Work anywhere: the board is replaced by the one-line notice, and the
+  // untracked windows stay reachable as a compact section.
+  dom.workItemsContent.hidden = noWork && !unlinked;
+  if (noWork) {
+    dom.workItemsContent.innerHTML = unlinked;
+    return;
+  }
   if (works.length === 0 && !unlinked) {
     dom.workItemsContent.innerHTML = `<div class="empty-block work-empty">
       No Work is tracked in this scope.<br>
@@ -2349,6 +2446,7 @@ function initPaneDrawer() {
     openPaneFrom(row);
   });
   window.addEventListener("hashchange", () => {
+    applyScopeHash();
     applyTopologyHash();
     openPaneFromHash();
   });
@@ -2393,6 +2491,7 @@ const topologyState = {
   toggled: loadSet(TOPOLOGY_TOGGLED_KEY),
   selection: null, // { type: "session" | "window", key }
   filter: "",
+  showAll: false, // show every session while the page is scoped to one
   cache: { key: "", topology: null },
   layouts: new Map(), // window key -> { signature, at, layout, pending }
   tails: new Map(), // pane key -> text
@@ -2481,12 +2580,34 @@ function renderTreeItem(node, level, visible, filtering) {
   </li>`;
 }
 
+// The sessions the tree shows: the rail scope's session, unless the viewer
+// asked to see every session; `null` when the tree is not scoped.
+function topologyScopedSessions(topology) {
+  const scope = currentScope();
+  if (!scope || topologyState.showAll) return null;
+  return sessionsInScope(topology, scope);
+}
+
+function renderTopologyScope() {
+  if (!dom.topologyScope) return;
+  const entry = selectedRailEntry();
+  dom.topologyScope.hidden = !entry;
+  if (!entry) return;
+  dom.topologyScope.innerHTML = topologyState.showAll
+    ? `<span>all sessions</span>
+      <button class="scope-chip-clear" type="button" data-topology-scope="only">only ${esc(entry.label)}</button>`
+    : `<span><b>${esc(entry.label)}</b> only</span>
+      <button class="scope-chip-clear" type="button" data-topology-scope="all">show all sessions</button>`;
+}
+
 function renderTopology() {
   if (!dom.topologyTree) return;
   const topology = currentTopology();
   const visible = filterTopology(topology, topologyState.filter);
   const filtering = visible !== null;
-  const sessions = topology.sockets.flatMap((socket) => socket.sessions);
+  const allSessions = topology.sockets.flatMap((socket) => socket.sessions);
+  const scopedSessions = topologyScopedSessions(topology);
+  const sessions = scopedSessions || allSessions;
   const windows = sessions.flatMap((session) => session.windows);
   const paneCount = windows.reduce((sum, window) => sum + window.panes.length, 0);
   const agentCount = windows.reduce((sum, window) => sum + window.agentCount, 0);
@@ -2498,14 +2619,16 @@ function renderTopology() {
   const selection = topologyState.selection;
   if (selection && !topology.nodes.has(selection.key)) topologyState.selection = null;
 
+  renderTopologyScope();
   let html;
   if (sessions.length === 0) {
     const empty = store.revisions.panes === 0 ? "loading…"
-      : store.paneErrors.length ? "pane scan failed — see Execution inventory → Panes"
-        : "no tmux sessions found";
-    html = `<li class="empty-block" role="none">${empty}</li>`;
+      : scopedSessions && allSessions.length ? `no live tmux session for ${selectedRailEntry()?.label || "this workspace"}`
+        : store.paneErrors.length ? "pane scan failed — see Execution inventory → Panes"
+          : "no tmux sessions found";
+    html = `<li class="empty-block" role="none">${esc(empty)}</li>`;
   } else {
-    const roots = topology.multiSocket ? topology.sockets : sessions;
+    const roots = scopedSessions || (topology.multiSocket ? topology.sockets : sessions);
     html = roots.map((node) => renderTreeItem(node, 1, visible, filtering)).join("")
       || `<li class="empty-block" role="none">nothing matches “${esc(topologyState.filter)}”</li>`;
   }
@@ -2519,15 +2642,17 @@ function renderTopology() {
     if (current) current.tabIndex = 0;
     if (focused && current) current.focus({ preventScroll: true });
   }
-  renderTopologyDetail(topology);
+  renderTopologyDetail(topology, sessions);
 }
 
-function selectTopology(key, { focusTree = false, updateHash = true, syncRail = true } = {}) {
+// Detail selection only: what the navigator's right-hand side (and the pane
+// drawer) shows. It never changes the page scope, which is the rail's.
+function selectTopology(key, { focusTree = false, updateHash = true } = {}) {
   const topology = currentTopology();
   const node = topology.nodes.get(key);
   if (!node) return;
   if (node.type === "pane") {
-    selectTopology(node.windowKey, { updateHash, syncRail });
+    selectTopology(node.windowKey, { updateHash });
     paneDrawer?.open({ pane: node.id, socket: node.socket || null });
     return;
   }
@@ -2542,10 +2667,11 @@ function selectTopology(key, { focusTree = false, updateHash = true, syncRail = 
     if (session && !topologyExpanded(session, false)) toggleTopologyNode(session.key);
   }
   if (updateHash) writeTopologyHash(node);
-  // A session is a workspace: picking one here scopes the rest of the page.
-  if (syncRail) {
-    syncRailToSession(node.type === "window" ? node.sessionName : node.name, socketShort(node.socket));
-  }
+  // Something outside the scoped session (a deep link, a link from another
+  // panel) is shown with every session in the tree rather than hidden.
+  const scoped = topologyScopedSessions(topology);
+  const sessionKey = node.type === "window" ? node.sessionKey : node.key;
+  if (scoped && !scoped.some((session) => session.key === sessionKey)) topologyState.showAll = true;
   renderTopology();
   if (focusTree) {
     dom.topologyTree.querySelector(`[data-tkey="${CSS.escape(key)}"]`)?.focus();
@@ -2575,13 +2701,7 @@ function applyTopologyHash() {
         && (!wanted.session || window.sessionName === wanted.session)) || null;
   }
   if (!node && wanted.session) node = sessions.find((session) => session.name === wanted.session) || null;
-  if (node) {
-    selectTopology(node.key, { updateHash: false });
-    return;
-  }
-  // A managed workspace with no live tmux session is still a rail entry.
-  const entry = wanted.session && !wanted.window ? findRailEntry(railEntries(), wanted) : null;
-  if (entry) setSelectedWorkspace(entry.key, { updateHash: false });
+  if (node) selectTopology(node.key, { updateHash: false });
 }
 
 function tileHtml(pane, style = "") {
@@ -2682,8 +2802,8 @@ function renderSessionDetail(session) {
     <div class="window-cards">${session.windows.map(windowCardHtml).join("")}</div>`;
 }
 
-function renderOverviewDetail(topology) {
-  const windows = topology.sockets.flatMap((socket) => socket.sessions).flatMap((session) => session.windows);
+function renderOverviewDetail(sessions) {
+  const windows = sessions.flatMap((session) => session.windows);
   const urgent = windows
     .filter((window) => stateRank(window.state) >= stateRank("waiting_input"))
     .sort((a, b) => stateRank(b.state) - stateRank(a.state));
@@ -2694,10 +2814,10 @@ function renderOverviewDetail(topology) {
       : `<p class="topology-note">No agent is waiting or failing. Pick a window to see its panes.</p>`}`;
 }
 
-function renderTopologyDetail(topology) {
+function renderTopologyDetail(topology, sessions) {
   if (!dom.topologyDetail) return;
   const node = topologyState.selection ? topology.nodes.get(topologyState.selection.key) : null;
-  const html = !node ? renderOverviewDetail(topology)
+  const html = !node ? renderOverviewDetail(sessions)
     : node.type === "window" ? renderWindowDetail(node)
       : renderSessionDetail(node);
   if (html === topologyState.lastDetailHtml) return;
@@ -2846,6 +2966,13 @@ function initTopology() {
     topologyState.filter = dom.topologyFilter.value;
     renderTopology();
   });
+  dom.topologyScope?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-topology-scope]");
+    if (!button) return;
+    topologyState.showAll = button.getAttribute("data-topology-scope") === "all";
+    renderTopology();
+    dom.topologyScope.querySelector("[data-topology-scope]")?.focus();
+  });
   dom.topologyTree.addEventListener("click", (event) => {
     const item = event.target.closest("[data-tkey]");
     if (!item) return;
@@ -2900,6 +3027,12 @@ function initTopology() {
   document.addEventListener("click", (event) => {
     const nav = event.target.closest?.("[data-tselect]");
     if (nav) {
+      // Links (untracked windows) carry an href for open-in-new-tab; a plain
+      // click selects in place and keeps the rest of the fragment.
+      if (nav.matches("a")) {
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
+        event.preventDefault();
+      }
       selectTopology(nav.getAttribute("data-tselect"));
       if (!dom.topologyPanel.contains(nav)) {
         if (dom.topologyPanel.classList.contains("collapsed")) {
@@ -3153,6 +3286,7 @@ function initDataTabs() {
 
 function initSessionControls() {
   dom.showAllSessions.addEventListener("click", () => setSelectedWorkspace(""));
+  dom.collaborationScopeClear?.addEventListener("click", () => setSelectedWorkspace(""));
   dom.closeWorkDrawer.addEventListener("click", closeWorkDrawer);
   dom.drawerBackdrop.addEventListener("click", closeWorkDrawer);
   document.addEventListener("keydown", (event) => {
@@ -3280,6 +3414,10 @@ function initDynamicEventDelegation() {
   });
 
   dom.workItemsContent.addEventListener("click", async (event) => {
+    if (event.target.closest("[data-toggle-untracked]")) {
+      toggleUntracked();
+      return;
+    }
     const copy = event.target.closest("[data-cmd]");
     if (copy) {
       const ok = await copyToClipboard(copy.getAttribute("data-cmd") || "");
@@ -3686,6 +3824,7 @@ function renderCollaboration() {
   const data = store.collaboration;
   if (data.unavailable) {
     dom.collaborationMeta.textContent = "unavailable";
+    renderCollaborationScope();
     dom.collaborationRooms.innerHTML = "";
     dom.collaborationGraph.innerHTML = `<div class="empty-block">${esc(data.unavailable)}</div>`;
     dom.collaborationSequence.innerHTML = `<div class="empty-block compact">collaboration history is unavailable</div>`;
@@ -3695,10 +3834,13 @@ function renderCollaboration() {
     return;
   }
 
-  const projection = projectCollaboration(data.requests);
+  const scoped = scopedCollaborationRequests();
+  const projection = projectCollaboration(scoped);
   store.cache.collaborationProjection = projection;
   const page = data.pagination;
-  dom.collaborationMeta.textContent = `${projection.nodes.length} participants · ${data.requests.length} messages`;
+  dom.collaborationMeta.textContent = `${projection.nodes.length} participants · ${scoped.length} messages`
+    + (scoped.length !== data.requests.length ? ` of ${data.requests.length}` : "");
+  renderCollaborationScope();
   dom.collaborationPageMeta.textContent = page.has_more
     ? `${data.requests.length} of ${page.total || "many"} loaded · graph is partial`
     : `${data.requests.length} retained messages loaded`;
@@ -3707,6 +3849,34 @@ function renderCollaboration() {
   renderCollaborationRooms(projection.rooms);
   renderCollaborationGraph(projection);
   renderCollaborationSequence();
+}
+
+// The rail scope narrows the loaded messages to those touching a pane in the
+// scoped session (see collaboration-model.mjs scopeCollaborationRequests).
+// The collaboration API has no session filter (its room filter is one
+// window), so this happens here, over the already range-bounded page.
+function scopedCollaborationRequests() {
+  const scope = currentScope();
+  const requests = store.collaboration.requests;
+  if (!scope) return requests;
+  const key = `${store.revisions.collaboration}:${store.revisions.panes}:${store.revisions.agents}:${JSON.stringify(scope)}`;
+  if (store.cache.collaborationScopeKey !== key) {
+    store.cache.collaborationScopeKey = key;
+    store.cache.collaborationScoped = scopeCollaborationRequests(requests, scope,
+      paneSessionResolver(currentTopology()));
+  }
+  return store.cache.collaborationScoped;
+}
+
+function renderCollaborationScope() {
+  if (!dom.collaborationScope) return;
+  const entry = selectedRailEntry();
+  dom.collaborationScope.hidden = !entry;
+  if (!entry) return;
+  dom.collaborationScopeName.textContent = entry.label;
+  dom.collaborationScope.title = entry.sessionName
+    ? `Only messages sent or received by a pane in tmux session ${entry.sessionName}`
+    : `Only messages filed under Work in workspace ${entry.workspaceKey}`;
 }
 
 function renderCollaborationFilterOptions(projection) {
@@ -3852,7 +4022,7 @@ function renderCollaborationGraph(projection) {
 }
 
 function renderCollaborationSequence() {
-  const requests = collaborationSequence(store.collaboration.requests, {
+  const requests = collaborationSequence(scopedCollaborationRequests(), {
     edgeKey: store.ui.selectedCollaborationEdge,
     room: store.ui.selectedCollaborationRoom,
   });
@@ -3860,7 +4030,7 @@ function renderCollaborationSequence() {
   dom.collaborationClearSelection.hidden = !selected;
   dom.collaborationSequenceMeta.textContent = selected
     ? `${requests.length} requests · chronological`
-    : `${requests.length} requests · all filtered rooms`;
+    : `${requests.length} requests · ${selectedRailEntry() ? "scoped" : "all filtered rooms"}`;
   if (!requests.length) {
     dom.collaborationSequence.innerHTML = `<div class="empty-block compact">no messages in this sequence</div>`;
     dom.collaborationDetail.hidden = true;
@@ -4316,9 +4486,18 @@ async function main() {
     store.ui.activeTab === "terminals" ? fetchTerminalSessions() : Promise.resolve(),
     fetchTimeline({ force: true }),
   ]);
-  // Deep links: #session=/#window= select in the navigator, and
-  // #pane=<id>[&socket=<socket>] opens that agent's drawer.
+  // Deep links: #workspace= scopes the page, #session=/#window= select in
+  // the navigator, and #pane=<id>[&socket=<socket>] opens that agent's
+  // drawer. A link from before the scope/selection split (#session= alone)
+  // scoped the page, so it is migrated to the same #workspace= once.
+  const migrated = migrateLegacyScopeHash(window.location.hash);
+  if (migrated !== null) {
+    const url = new URL(window.location.href);
+    url.hash = migrated;
+    window.history.replaceState(window.history.state, "", url.toString());
+  }
   renderTopology();
+  applyScopeHash();
   applyTopologyHash();
   if (parsePaneHash(window.location.hash)) openPaneFromHash();
 
