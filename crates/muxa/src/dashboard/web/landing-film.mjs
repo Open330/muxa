@@ -1,56 +1,49 @@
-// Landing hero film: what muxa does, in four scenes on a pretend tmux window.
-//   1 six agents are working in their panes
-//   2 two of them stop and wait; the status line and a notification say so
-//   3 `muxa attend` jumps to the one that has waited longest
-//   4 the dashboard's Work board shows the whole fleet
-// One clock drives everything (no video file). It pauses off screen or in a
-// hidden tab; with reduced motion it does not autoplay and rests on scene 3.
+// Landing hero film, made of real screens.
+//
+// The terminal frames are captures of a real muxa in a sandbox
+// (scripts/landing-shots/film.sh → landing-frames.mjs): tmux, the muxa
+// status line, `muxa attend` moving the client, and the `muxa peek` popup.
+// The last scene is the dashboard's Work board screenshot. This module only
+// sequences them, types the command, and adds the desktop notification.
+// It pauses off screen or in a hidden tab; with reduced motion it does not
+// autoplay and rests on the attend scene.
 
-const STEPS = [
-  { start: 0, end: 4200 },
-  { start: 4200, end: 8400 },
-  { start: 8400, end: 13600 },
-  { start: 13600, end: 18000 },
-];
-const TOTAL = 18000;
-const REST_STEP = 2;
+import { FILM_FRAMES, FILM_SIZE } from "./landing-frames.mjs";
 
-// Pane content stays in English, like a real terminal; only the chrome is
-// translated.
-const PANES = [
-  { alias: "planner", kind: "claude", lines: ["Read docs/rate-limit.md", "Read src/routes/orders.ts", "Plan: token bucket, 60/min", "Drafting the 429 response…"], waits: "input", ask: "Retry-After: seconds or HTTP date?" },
-  { alias: "impl", kind: "codex", lines: ["Edit src/middleware/limit.ts", "Edit src/routes/orders.ts", "Run npm test", "✓ 212 passed · 0 failed"] },
-  { alias: "reviewer", kind: "claude", lines: ["Reviewing diff (+184 −12)", "limit.ts:41 refill + read", "Simulating 500 req burst", "Checking bucket races…"], waits: "choice", ask: "Lua script, or accept ±1 drift?" },
-  { alias: "e2e", kind: "claude", lines: ["checkout.spec.ts", "Payment iframe: 8.2s", "Raise wait, add retry", "Re-running 50× on CI…"] },
-  { alias: "a11y", kind: "gemini", lines: ["Auditing checkout form", "✗ CVC input has no label", "✗ focus lost on coupon", "Checking error messages…"] },
-  { alias: "deploy", kind: "codex", lines: ["pipeline.yml: canary 10%", "Rollback on 5xx > 1%", "Dry run on staging", "Watching 5xx rate…"] },
+// [frame, duration ms, step, camera]. Steps are what the controls show; the
+// camera ([scale, origin x, origin y]) leans in on the part of the screen
+// the scene is about, since a whole terminal is small at hero size.
+const SCENES = [
+  ["working", 1800, 0, [1, "0%", "0%"]],
+  ["waiting", 2400, 1, [1.35, "100%", "100%"]],
+  ["typed", 1300, 2, [1.7, "0%", "100%"]],
+  ["attended", 2200, 2, [1.5, "0%", "0%"]],
+  ["peek", 2400, 3, [1, "0%", "0%"]],
+  ["board", 2600, 4, [1, "0%", "0%"]],
 ];
-
-const BOARD = [
-  ["queued", [["API-160", "Idempotency keys"]]],
-  ["in_progress", [["API-142", "Rate limit orders API", "attention"], ["OPS-19", "Canary deploys"]]],
-  ["review", [["WEB-91", "Settings page tabs"]]],
-  ["done", [["OPS-23", "Backfill order_totals"]]],
-];
+const STARTS = SCENES.reduce((acc, [, ms]) => [...acc, acc[acc.length - 1] + ms], [0]);
+const TOTAL = STARTS[STARTS.length - 1];
+const REST_SCENE = 3;
+const COMMAND = "muxa attend";
 
 const esc = (value) => String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
-const clamp01 = (x) => Math.max(0, Math.min(1, x));
-const ease = (x) => 1 - (1 - clamp01(x)) ** 3;
+
+/** Wrap the typed command so CSS can type it out; mark the status-line alert. */
+function decorate(name, html) {
+  if (name === "typed") {
+    return html.replace(COMMAND, `<span class="film-type">${COMMAND}</span>`);
+  }
+  if (name === "waiting") {
+    return html.replace(/⚠[^<|]*/, (alert) => `<span class="film-alert">${alert}</span>`);
+  }
+  return html;
+}
 
 function markup(t) {
-  const panes = PANES.map((pane, i) => `
-    <div class="film-pane" data-pane="${i}"${pane.waits ? ` data-waits="${pane.waits}"` : ""}>
-      <div class="film-pane-head"><span class="film-dot"></span><b>${esc(pane.alias)}</b><small>${esc(pane.kind)}</small><em class="film-state"></em></div>
-      <div class="film-pane-body">
-        ${pane.lines.map((line, i) => `<span${i === pane.lines.length - 1 ? ' class="film-now"' : ""}>${esc(line)}</span>`).join("")}
-        ${pane.ask ? `<span class="film-ask">? ${esc(pane.ask)}</span>` : ""}
-      </div>
-    </div>`).join("");
-  const board = BOARD.map(([stage, cards]) => `
-    <div class="film-lane">
-      <span>${esc(t.stages[stage])}</span>
-      ${cards.map(([id, title, signal]) => `<div class="film-card${signal ? " is-attention" : ""}"><b>${esc(id)}</b>${esc(title)}${signal ? `<i>${esc(t.attention)}</i>` : ""}</div>`).join("")}
-    </div>`).join("");
+  const layers = SCENES.map(([name, , , [zoom, ox, oy]], i) => name === "board"
+    ? `<div class="film-layer film-shot" data-scene="${i}"><img src="${esc(t.boardSrc)}" alt="" decoding="async"></div>`
+    : `<div class="film-layer" data-scene="${i}" style="--zoom:${zoom};--ox:${ox};--oy:${oy}"><pre class="film-term">${decorate(name, FILM_FRAMES[name])}</pre></div>`
+  ).join("");
   const steps = t.steps.map((label, i) => `
     <button type="button" class="film-step" data-film-step="${i}" aria-label="${esc(label)}">
       <span class="film-bar"><span></span></span><span class="film-step-label">${esc(label)}</span>
@@ -58,23 +51,12 @@ function markup(t) {
   return `
     <div class="film-head">
       <span class="film-lights" aria-hidden="true"><i></i><i></i><i></i></span>
-      <span class="film-title">tmux · api:orders</span>
+      <span class="film-title">~/acme — tmux</span>
       <span class="film-live"><i></i>muxa</span>
     </div>
-    <div class="film-stage" aria-hidden="true">
-      <div class="film-layer film-tmux">
-        <div class="film-grid">${panes}</div>
-        <div class="film-cmd"><span class="film-prompt">$</span> <span class="film-typed"></span><span class="film-caret"></span></div>
-        <div class="film-status">
-          <span class="film-status-left">[api] 0:orders*</span>
-          <span class="film-status-right"></span>
-        </div>
-        <div class="film-toast"><b>muxa</b><span>${esc(t.toast)}</span></div>
-      </div>
-      <div class="film-layer film-board">
-        <div class="film-board-head"><b>${esc(t.boardTitle)}</b><span>${esc(t.boardMeta)}</span></div>
-        <div class="film-lanes">${board}</div>
-      </div>
+    <div class="film-stage" aria-hidden="true" style="--cols:${FILM_SIZE.cols};--rows:${FILM_SIZE.rows}">
+      ${layers}
+      <div class="film-toast"><b>muxa</b><span>${esc(t.toast)}</span></div>
     </div>
     <div class="film-caption"></div>
     <div class="film-controls">
@@ -87,8 +69,9 @@ const PLAY_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.5v9
 const PAUSE_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 3h2.5v10H4.5zM9 3h2.5v10H9z"/></svg>`;
 
 /**
- * Mount the film into `root`. `t` holds the translated chrome (steps,
- * labels) and `captions` as trusted HTML. Returns `{ destroy }`.
+ * Mount the film into `root`. `t` holds the translated chrome (`steps`,
+ * `captions` as trusted HTML, `toast`, `play`, `pause`) and `boardSrc`.
+ * Returns `{ destroy }`.
  */
 export function mountFilm(root, t) {
   root.classList.add("film");
@@ -96,55 +79,37 @@ export function mountFilm(root, t) {
   const $ = (sel) => root.querySelector(sel);
   const $$ = (sel) => [...root.querySelectorAll(sel)];
   const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const stepStart = (step) => STARTS[SCENES.findIndex(([, , s]) => s === step)];
+  const stepEnd = (step) => STARTS[SCENES.findLastIndex(([, , s]) => s === step) + 1];
 
-  let elapsed = reduced ? STEPS[REST_STEP].end - 1 : 0;
+  let elapsed = reduced ? STARTS[REST_SCENE] + 1 : 0;
   let playing = !reduced;
   let visible = true;
   let last = 0;
   let frame = 0;
-  let shownStep = -1;
-  const command = "muxa attend";
+  let shownScene = -1;
 
   function draw() {
-    const step = STEPS.findIndex((s) => elapsed < s.end);
-    const current = step === -1 ? STEPS.length - 1 : step;
-    const { start, end } = STEPS[current];
-    const p = clamp01((elapsed - start) / (end - start));
-    root.dataset.step = String(current);
-
-    // Scene 2+: two panes wait. Scene 3: the longest waiter gets focus.
-    const waiting = current >= 1;
-    const focused = current >= 2 && p > (current === 2 ? 0.45 : 0);
-    $$(".film-pane").forEach((pane) => {
-      const waits = pane.dataset.waits;
-      const isWaiting = waiting && waits;
-      pane.classList.toggle("is-waiting", Boolean(isWaiting));
-      pane.classList.toggle("is-focused", focused && pane.dataset.pane === "0");
-      pane.classList.toggle("is-dim", focused && pane.dataset.pane !== "0");
-      pane.querySelector(".film-state").textContent = isWaiting ? t.states[waits] : t.states.working;
-    });
-    root.style.setProperty("--toast", String(current === 1 ? ease((p - 0.35) * 4) : 0));
-    $(".film-status-right").textContent = waiting ? t.statusWaiting : t.statusWorking;
-    $(".film-status-right").classList.toggle("is-waiting", waiting && !focused);
-
-    // Scene 3 types the command, then "presses enter" at 45%.
-    const typed = current === 2 ? Math.round(clamp01(p / 0.4) * command.length) : current > 2 ? command.length : 0;
-    $(".film-typed").textContent = command.slice(0, typed);
-    $(".film-cmd").classList.toggle("is-on", current === 2);
-    root.style.setProperty("--board", String(current === 3 ? ease(p * 2.5) : 0));
-
-    if (shownStep !== current) {
-      shownStep = current;
-      $(".film-caption").innerHTML = t.captions[current];
+    const scene = Math.max(0, STARTS.findIndex((start) => elapsed < start) - 1);
+    const step = SCENES[scene][2];
+    if (scene !== shownScene) {
+      shownScene = scene;
+      root.dataset.scene = SCENES[scene][0];
+      $$(".film-layer").forEach((layer) => layer.classList.toggle("on", Number(layer.dataset.scene) === scene));
+      $(".film-caption").innerHTML = t.captions[step];
     }
     $$(".film-step").forEach((button, i) => {
-      const fill = i < current ? 1 : i === current ? p : 0;
-      button.querySelector(".film-bar span").style.transform = `scaleX(${fill})`;
-      button.classList.toggle("on", i === current);
-      button.setAttribute("aria-current", i === current ? "step" : "false");
+      const p = Math.max(0, Math.min(1, (elapsed - stepStart(i)) / (stepEnd(i) - stepStart(i))));
+      button.querySelector(".film-bar span").style.transform = `scaleX(${p})`;
+      button.classList.toggle("on", i === step);
+      button.setAttribute("aria-current", i === step ? "step" : "false");
     });
     const play = $(".film-play");
-    play.innerHTML = playing ? PAUSE_ICON : PLAY_ICON;
+    const icon = playing ? PAUSE_ICON : PLAY_ICON;
+    if (play.dataset.icon !== String(playing)) {
+      play.dataset.icon = String(playing);
+      play.innerHTML = icon;
+    }
     play.setAttribute("aria-label", playing ? t.pause : t.play);
   }
 
@@ -162,8 +127,8 @@ export function mountFilm(root, t) {
     const stepButton = event.target.closest("[data-film-step]");
     if (stepButton) {
       const i = Number(stepButton.dataset.filmStep);
-      // Jump to the point where the scene has fully played out.
-      elapsed = STEPS[i].start + (STEPS[i].end - STEPS[i].start) * (playing ? 0 : 0.99);
+      // Paused: land on the step's last scene, fully played; playing: its start.
+      elapsed = playing ? stepStart(i) : stepEnd(i) - 1;
       draw();
       return;
     }

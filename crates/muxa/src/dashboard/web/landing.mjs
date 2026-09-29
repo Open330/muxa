@@ -29,21 +29,15 @@ const COPY = {
     useToken: "Use access token",
     tokenPrompt: "Muxa dashboard token",
     film: {
-      steps: ["Working", "Someone waits", "Jump there", "See it all"],
+      steps: ["Working", "Someone waits", "Jump there", "Peek", "See it all"],
       captions: [
-        "Six agents, six panes. You're busy in one of them.",
-        "Two stop and wait. The status line and a notification say who, and for how long.",
-        "`muxa attend` jumps to the agent that has waited longest.",
-        "The dashboard groups the fleet into Work, with what needs you on top.",
+        "You're coding. Four agents work in another window, and the status line is quiet.",
+        "Two of them stop: one asks a question, one needs permission. The status line and a notification say so.",
+        "`muxa attend` jumps to the one that has waited longest, in the other window.",
+        "`prefix q` peeks at every pane in the window: who it is, its state, its prompt. A digit jumps there.",
+        "The dashboard shows the whole fleet as Work, with what needs you on top.",
       ],
-      states: { working: "working", input: "waiting", choice: "waiting" },
-      statusWorking: "● 6 working",
-      statusWaiting: "⚠ 2 waiting · planner 4m",
-      toast: "planner is waiting for input",
-      boardTitle: "Work board",
-      boardMeta: "acme · 5 works · 2 need you",
-      attention: "needs you",
-      stages: { queued: "Queued", in_progress: "In progress", review: "Review", done: "Done" },
+      toast: "claude · acme:agents is asking a question",
       play: "Play",
       pause: "Pause",
     },
@@ -124,21 +118,15 @@ const COPY = {
     useToken: "접근 토큰 사용",
     tokenPrompt: "Muxa 대시보드 토큰",
     film: {
-      steps: ["작업 중", "누군가 멈춤", "바로 이동", "한눈에 보기"],
+      steps: ["작업 중", "누군가 멈춤", "바로 이동", "훑어보기", "한눈에 보기"],
       captions: [
-        "에이전트 여섯, pane 여섯. 나는 그중 하나에서 일하는 중입니다.",
-        "둘이 멈춰서 기다립니다. status line과 알림이 누가, 얼마나 기다렸는지 알려 줍니다.",
-        "`muxa attend` 한 번이면 가장 오래 기다린 에이전트로 이동합니다.",
+        "코딩하는 중입니다. 다른 창에서 에이전트 넷이 일하고, status line은 조용합니다.",
+        "둘이 멈춥니다. 하나는 질문을, 하나는 권한을 기다립니다. status line과 알림이 알려 줍니다.",
+        "`muxa attend` 한 번이면 가장 오래 기다린 에이전트가 있는 창으로 이동합니다.",
+        "`prefix q`로 창의 모든 pane을 훑어봅니다. 누구인지, 상태, 프롬프트까지. 숫자 키로 바로 이동합니다.",
         "대시보드는 전체를 Work 단위로 묶고, 내가 봐야 할 것을 위에 올립니다.",
       ],
-      states: { working: "작업 중", input: "대기 중", choice: "대기 중" },
-      statusWorking: "● 6 작업 중",
-      statusWaiting: "⚠ 2 대기 · planner 4분",
-      toast: "planner가 입력을 기다립니다",
-      boardTitle: "Work 보드",
-      boardMeta: "acme · Work 5개 · 2개 확인 필요",
-      attention: "확인 필요",
-      stages: { queued: "대기", in_progress: "진행 중", review: "리뷰", done: "완료" },
+      toast: "claude · acme:agents가 질문하고 있습니다",
       play: "재생",
       pause: "일시정지",
     },
@@ -448,9 +436,11 @@ function draw() {
   view.reveal?.disconnect();
   document.documentElement.lang = view.lang;
   view.root.innerHTML = markup(t, view.access, { host: view.host, email: view.email, shot: view.shot });
+  const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
   view.film = mountFilm(view.root.querySelector("[data-landing-film]"), {
     ...t.film,
     captions: t.film.captions.map(codeSpans),
+    boardSrc: asset(`landing/board-${dark ? "dark" : "light"}.webp`),
   });
   view.reveal = revealOnScroll(view.root);
 }

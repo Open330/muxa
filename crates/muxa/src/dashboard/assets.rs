@@ -113,6 +113,7 @@ mod tests {
         assert!(WebAssets::get("topology-model.mjs").is_some());
         assert!(WebAssets::get("landing.mjs").is_some());
         assert!(WebAssets::get("landing-film.mjs").is_some());
+        assert!(WebAssets::get("landing-frames.mjs").is_some());
         assert!(WebAssets::get("landing.css").is_some());
         for shot in ["board", "collaboration", "agents"] {
             for scheme in ["light", "dark"] {
