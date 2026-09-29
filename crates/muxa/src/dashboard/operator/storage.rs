@@ -1,7 +1,9 @@
-//! Durable enrolled operators: OIDC accounts that a holder of the dashboard
-//! token linked as operators. Only `(issuer, subject)` authorizes; the email
-//! is kept for display. Sessions are never written to disk.
-use super::{Enrolled, MAX_ENROLLED};
+//! Durable enrolled operators, OIDC accounts that a holder of the dashboard
+//! token linked as operators, and the viewer rules operators added. Only
+//! `(issuer, subject)` authorizes an enrolled operator; the email is kept for
+//! display. Sessions are never written to disk.
+use super::viewers::{StoredRule, ViewerRule};
+use super::{Enrolled, MAX_ENROLLED, MAX_VIEWER_RULES};
 use rusqlite::{params, Connection};
 use std::{fs::File, io, path::Path, sync::Mutex, time::Duration};
 
@@ -39,7 +41,7 @@ impl Storage {
     /// Open (creating if needed) the store and load every entry. Holding an
     /// exclusive lease on a sibling lock file keeps a second daemon from
     /// racing this one's view of who is enrolled.
-    pub(super) fn open(path: &Path) -> io::Result<(Self, Vec<Enrolled>)> {
+    pub(super) fn open(path: &Path) -> io::Result<(Self, Vec<Enrolled>, Vec<StoredRule>)> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             use std::os::unix::fs::DirBuilderExt;
             std::fs::DirBuilder::new()
@@ -62,7 +64,10 @@ impl Storage {
                 "PRAGMA synchronous=FULL; PRAGMA application_id=0x4D584F50; PRAGMA user_version=1; \
                  CREATE TABLE IF NOT EXISTS operators (id TEXT PRIMARY KEY, issuer TEXT NOT NULL, \
                  subject TEXT NOT NULL, email TEXT, created_at INTEGER NOT NULL, \
-                 last_seen_at INTEGER NOT NULL, UNIQUE (issuer, subject));",
+                 last_seen_at INTEGER NOT NULL, UNIQUE (issuer, subject)); \
+                 CREATE TABLE IF NOT EXISTS viewer_rules (id TEXT PRIMARY KEY, \
+                 issuer TEXT NOT NULL, rule TEXT NOT NULL, created_at INTEGER NOT NULL, \
+                 UNIQUE (issuer, rule));",
             )
             .map_err(io::Error::other)?;
         let entries = {
@@ -87,7 +92,38 @@ impl Storage {
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(io::Error::other)?
         };
-        if entries.len() > MAX_ENROLLED {
+        let rules = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, issuer, rule, created_at FROM viewer_rules ORDER BY created_at, id",
+                )
+                .map_err(io::Error::other)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(io::Error::other)?;
+            let mut rules = Vec::new();
+            for row in rows {
+                let (id, issuer, text, created_at) = row.map_err(io::Error::other)?;
+                let rule = ViewerRule::parse(&text).map_err(|_| {
+                    io::Error::other("operator storage holds an invalid viewer rule")
+                })?;
+                rules.push(StoredRule {
+                    id,
+                    issuer,
+                    rule,
+                    created_at,
+                });
+            }
+            rules
+        };
+        if entries.len() > MAX_ENROLLED || rules.len() > MAX_VIEWER_RULES {
             return Err(io::Error::other(
                 "operator storage exceeds supported limits",
             ));
@@ -98,6 +134,7 @@ impl Storage {
                 lock,
             },
             entries,
+            rules,
         ))
     }
 
@@ -120,6 +157,23 @@ impl Storage {
                     entry.last_seen_at
                 ],
             )
+            .map(drop)
+            .map_err(io::Error::other)
+    }
+
+    pub(super) fn insert_rule(&self, entry: &StoredRule) -> io::Result<()> {
+        self.connection()?
+            .execute(
+                "INSERT INTO viewer_rules VALUES (?1, ?2, ?3, ?4)",
+                params![entry.id, entry.issuer, entry.rule.text(), entry.created_at],
+            )
+            .map(drop)
+            .map_err(io::Error::other)
+    }
+
+    pub(super) fn remove_rule(&self, id: &str) -> io::Result<()> {
+        self.connection()?
+            .execute("DELETE FROM viewer_rules WHERE id = ?1", [id])
             .map(drop)
             .map_err(io::Error::other)
     }

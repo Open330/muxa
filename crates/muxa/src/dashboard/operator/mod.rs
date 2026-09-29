@@ -15,6 +15,14 @@
 //! durably. Enrollment therefore grants nothing the token did not already
 //! grant, and a pending enrollment authorizes no API by itself.
 //!
+//! Sign-in is deny-by-default and has two roles. An **operator** (group
+//! member or enrolled account) has full access. A **viewer** matches
+//! `viewer_group` or a viewer rule (an exact verified email, a verified email
+//! domain, or an issuer-pinned subject) and may only read what an anonymous
+//! `public_read` visitor could. Any other verified account gets no session at
+//! all. Operators manage viewer rules from the dashboard; rule-based viewer
+//! sessions are re-checked on every request, like enrolled operators.
+//!
 //! Operator sessions live in their own store. Pane-sharing recipient
 //! sessions never appear here, so a share invitation cannot be turned into
 //! operator access, and this cookie is never consulted by recipient routes.
@@ -22,6 +30,7 @@ mod routes;
 mod storage;
 #[cfg(test)]
 mod tests;
+mod viewers;
 
 use super::oidc;
 use axum::http::{header, HeaderMap, Method};
@@ -59,6 +68,13 @@ pub struct LoginConfig {
     /// is not in `required_group`. Defaults to `true`; `false` restores
     /// group-only sign-in and stops honoring enrolled accounts.
     pub enrollment: Option<bool>,
+    /// Group whose members may view the dashboard read-only.
+    pub viewer_group: Option<String>,
+    /// Viewer rules from configuration, shown read-only next to the rules
+    /// operators add in the dashboard: `email:<address>`,
+    /// `email:*@<domain>` or `sub:<subject>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewer_rules: Vec<String>,
 }
 
 const DEFAULT_GROUPS_CLAIM: &str = "groups";
@@ -134,6 +150,22 @@ impl LoginConfig {
         if self.scopes.len() > 16 || !self.scopes.iter().all(|scope| is_token(scope, 128)) {
             return Err("scopes must be at most 16 names without spaces".into());
         }
+        if self
+            .viewer_group
+            .as_ref()
+            .is_some_and(|group| !is_token(group, 256))
+        {
+            return Err("viewer_group must be a non-empty group name without spaces".into());
+        }
+        if self.viewer_rules.len() > MAX_VIEWER_RULES {
+            return Err(format!(
+                "viewer_rules allows at most {MAX_VIEWER_RULES} entries"
+            ));
+        }
+        for rule in &self.viewer_rules {
+            viewers::ViewerRule::parse(rule)
+                .map_err(|message| format!("viewer_rules: {rule:?}: {message}"))?;
+        }
         Ok(())
     }
 
@@ -197,16 +229,43 @@ const MAX_ENROLL_BACKOFF: Duration = Duration::from_secs(30);
 /// Quiet period after which the failure count starts over.
 const ENROLL_BACKOFF_RESET: Duration = Duration::from_secs(600);
 const MAX_ENROLLED: usize = 64;
+/// Viewer rules added from the dashboard, and separately from configuration.
+const MAX_VIEWER_RULES: usize = 128;
 
-/// Why a session is an operator session.
+/// Why a session exists, which also fixes its role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(in crate::dashboard) enum Via {
-    /// The ID token carried `required_group` at sign-in.
+    /// Operator: the ID token carried `required_group` at sign-in.
     Group,
-    /// The account is enrolled; re-checked on every request so removal
-    /// takes effect immediately.
+    /// Operator: the account is enrolled; re-checked on every request so
+    /// removal takes effect immediately.
     Enrollment,
+    /// Viewer: the ID token carried `viewer_group` at sign-in.
+    ViewerGroup,
+    /// Viewer: a viewer rule matched; re-checked on every request.
+    ViewerRule,
+}
+
+impl Via {
+    pub(in crate::dashboard) fn role(self) -> Role {
+        match self {
+            Self::Group | Self::Enrollment => Role::Operator,
+            Self::ViewerGroup | Self::ViewerRule => Role::Viewer,
+        }
+    }
+}
+
+/// What a request may do on the operator dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::dashboard) enum Role {
+    /// Nothing beyond what the deployment serves anonymously.
+    None,
+    /// Read-only, redacted like an anonymous `public_read` visitor.
+    Viewer,
+    /// Everything the bearer token allows.
+    Operator,
 }
 
 #[derive(Clone)]
@@ -214,7 +273,11 @@ struct Session {
     issuer: String,
     subject: String,
     email: Option<String>,
+    /// The provider's `email_verified`; email viewer rules need it.
+    email_verified: bool,
     via: Via,
+    /// Wrong tokens presented to upgrade this (viewer) session.
+    attempts: u32,
     expires: Instant,
 }
 
@@ -224,6 +287,7 @@ struct PendingEnrollment {
     issuer: String,
     subject: String,
     email: Option<String>,
+    email_verified: bool,
     return_to: String,
     attempts: u32,
     expires: Instant,
@@ -280,6 +344,9 @@ struct Registry {
     sessions: HashMap<String, Session>,
     logins: HashMap<String, PendingLogin>,
     enrollments: HashMap<String, PendingEnrollment>,
+    /// Viewer rules added from the dashboard, including ones for another
+    /// issuer (listed so they can be removed, but never matched).
+    viewer_rules: Vec<viewers::StoredRule>,
     /// Every stored entry, including ones for another issuer (listed so they
     /// can be removed, but never matched).
     enrolled: Vec<Enrolled>,
@@ -305,6 +372,8 @@ pub struct OperatorLogin {
     provider: Option<oidc::Provider>,
     registry: std::sync::Mutex<Registry>,
     login_slots: Semaphore,
+    /// `viewer_rules` from configuration, validated at startup.
+    config_rules: Vec<viewers::ViewerRule>,
     /// Durable enrolled operators. `None` keeps enrollments in memory only
     /// (embedding callers and tests that do not go through [`Self::open`]).
     storage: Option<Arc<storage::Storage>>,
@@ -331,43 +400,51 @@ impl OperatorLogin {
                 format!("{}/auth/callback", config.origin()),
             )
         });
+        let config_rules = config
+            .as_ref()
+            .map(|config| {
+                config
+                    .viewer_rules
+                    .iter()
+                    .filter_map(|rule| viewers::ViewerRule::parse(rule).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
         Arc::new(Self {
             config,
             provider,
             registry: std::sync::Mutex::new(Registry::default()),
             login_slots: Semaphore::new(4),
+            config_rules,
             storage: None,
             enroll_writes: tokio::sync::Mutex::new(()),
         })
     }
 
-    /// Like [`Self::new`], with enrollments persisted at `path` (default: the
-    /// XDG data directory). Nothing is opened when sign-in or enrollment is
-    /// off.
+    /// Like [`Self::new`], with enrolled operators and viewer rules persisted
+    /// at `path` (default: the XDG data directory). Nothing is opened when
+    /// sign-in is off.
     pub(in crate::dashboard) async fn open(
         config: Option<LoginConfig>,
         path: Option<std::path::PathBuf>,
     ) -> std::io::Result<Arc<Self>> {
         let mut login = Self::new(config);
-        if !login
-            .config
-            .as_ref()
-            .is_some_and(LoginConfig::enrollment_enabled)
-        {
+        if login.config.is_none() {
             return Ok(login);
         }
         let path = path
             .or_else(|| dirs::data_dir().map(|d| d.join(DEFAULT_STORAGE_PATH)))
-            .ok_or_else(|| {
-                std::io::Error::other("operator enrollment needs an XDG data directory")
-            })?;
-        let (storage, enrolled) =
+            .ok_or_else(|| std::io::Error::other("operator sign-in needs an XDG data directory"))?;
+        let (storage, enrolled, viewer_rules) =
             tokio::task::spawn_blocking(move || storage::Storage::open(&path))
                 .await
                 .map_err(std::io::Error::other)??;
         let inner = Arc::get_mut(&mut login).expect("new operator login state");
         inner.storage = Some(Arc::new(storage));
-        inner.registry().enrolled = enrolled;
+        let mut registry = inner.registry();
+        registry.enrolled = enrolled;
+        registry.viewer_rules = viewer_rules;
+        drop(registry);
         Ok(login)
     }
 
@@ -382,7 +459,23 @@ impl OperatorLogin {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The live operator session named by this request's cookie, if any.
+    /// Whether a rule-based viewer session still matches a viewer rule.
+    fn viewer_rule_matches(
+        &self,
+        registry: &Registry,
+        config: &LoginConfig,
+        session: &Session,
+    ) -> bool {
+        viewers::matches(
+            &self.config_rules,
+            &registry.viewer_rules,
+            config,
+            viewers::Account::of(session),
+        )
+    }
+
+    /// The live sign-in session (operator or viewer) named by this
+    /// request's cookie, if any.
     fn session(&self, headers: &HeaderMap) -> Option<Session> {
         let config = self.config.as_ref()?;
         let secret = oidc::cookie(headers, config.cookie_names().0)?;
@@ -390,16 +483,23 @@ impl OperatorLogin {
         let session = registry.sessions.get(&secret)?;
         let live = session.expires > Instant::now()
             && match session.via {
-                Via::Group => true,
+                Via::Group | Via::ViewerGroup => true,
                 Via::Enrollment => registry
                     .enrolled(config, &session.issuer, &session.subject)
                     .is_some(),
+                Via::ViewerRule => self.viewer_rule_matches(&registry, config, session),
             };
         if live {
             return Some(session.clone());
         }
         registry.sessions.remove(&secret);
         None
+    }
+
+    /// Does this request carry a live viewer (not operator) session?
+    pub(in crate::dashboard) fn viewer(&self, headers: &HeaderMap) -> bool {
+        self.session(headers)
+            .is_some_and(|session| session.via.role() == Role::Viewer)
     }
 
     /// `(email, via)` of the signed-in account, for display. The email may
@@ -436,7 +536,8 @@ impl OperatorLogin {
 
 /// Authenticate a dashboard operator request: the configured bearer token,
 /// or else a live operator session cookie. `None` when neither is present or
-/// no token is configured (control disabled).
+/// no token is configured (control disabled). A viewer session is never
+/// operator access.
 pub(in crate::dashboard) fn authenticate(
     token: Option<&str>,
     login: &OperatorLogin,
@@ -449,7 +550,10 @@ pub(in crate::dashboard) fn authenticate(
     if super::auth::check_bearer(bearer, expected) {
         return Some(OperatorAuth::Bearer);
     }
-    login.session(headers).map(|_| OperatorAuth::Session)
+    login
+        .session(headers)
+        .filter(|session| session.via.role() == Role::Operator)
+        .map(|_| OperatorAuth::Session)
 }
 
 /// Group names from the configured claim. Providers disagree on the shape:

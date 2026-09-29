@@ -408,12 +408,18 @@ public for embedding and integration tests.
 
 Instead of pasting the bearer token into every browser, the dashboard owner can
 sign in through any standards-compliant OpenID Connect provider (Keycloak,
-Authentik, Dex, and similar). A signed-in account is an operator when either:
+Authentik, Dex, and similar). Sign-in is deny by default; each verified account
+gets exactly one role, checked in this order:
 
-- its ID token carries a group claim containing `required_group`, or
-- it was **enrolled**: someone holding the dashboard token linked that account
-  (its issuer and subject) as an operator. See
-  [Enrolling an account with the token](#enrolling-an-account-with-the-token).
+| Role | Granted when | Can |
+| ---- | ------------ | --- |
+| operator | the ID token's group claim contains `required_group`, or the account was **enrolled** with the dashboard token ([Enrolling an account with the token](#enrolling-an-account-with-the-token)) | everything the bearer token can |
+| viewer | the group claim contains `viewer_group`, or the account matches a [viewer rule](#viewers) | read the dashboard and its event stream, redacted exactly like an anonymous `public_read` visitor; no writes, no shares, no access management |
+| none | nothing above | nothing: no session is created. With enrollment on it gets the token page, otherwise a refusal page |
+
+Pane and window share recipients (`/share/*`) are a separate feature with their
+own sessions: a viewer session is not a share session, and neither implies the
+other.
 
 Signing in grants the same authority as the bearer token, so restrict the group
 to the people who should operate this machine's agents. Enrollment lets the
@@ -433,6 +439,8 @@ issuer_url = "https://login.example.com/realms/example"
 client_id = "muxa-dashboard"
 # required_group = "muxa-operators"          # optional while enrollment is on
 # enrollment = true                          # default; false = group-only sign-in
+# viewer_group = "muxa-viewers"              # optional read-only group
+# viewer_rules = ["email:*@example.com"]     # optional read-only viewer rules
 # groups_claim = "groups"                    # default "groups"
 # scopes = ["groups"]                        # requested in addition to "openid email"
 # client_secret_env = "MUXA_LOGIN_CLIENT_SECRET"  # confidential clients: env var NAME
@@ -467,12 +475,15 @@ Flow and session contract:
 | `GET /auth/login?return_to=/path` | Starts the flow (PKCE S256, state, nonce, `prompt=select_account`). `return_to` must be a same-origin path beginning with a single `/`. |
 | `GET /auth/callback` | Verifies the ID token (signature, issuer, audience, expiry, nonce, `at_hash`), then redirects to `return_to` if the account is an operator, or to `/auth/enroll` if it is not and enrollment is on. |
 | `GET /auth/enroll` | Enrollment page for this browser's pending enrollment. |
-| `POST /auth/enroll` | JSON `{"token": "..."}`; enrolls the pending account and signs it in. |
+| `POST /auth/enroll` | JSON `{"token": "..."}`; enrolls this browser's pending account, or its signed-in viewer ("upgrade with token"), and signs it in as an operator. |
 | `GET /auth/enroll/cancel` | Discards this browser's pending enrollment. |
 | `POST /auth/logout` | Ends the session. |
-| `GET /auth/session` | Unauthenticated `{available, signed_in, email, via, enrollment, login_url}` so a signed-out page can offer sign-in. `via` is `group`, `enrollment` or `null`. `/api/access` includes the same object as `login`. |
-| `GET /api/operators` | Operator only: enrolled accounts `{id, email, subject, issuer, created_at, last_seen_at, current, active}`. |
+| `GET /auth/session` | Unauthenticated `{available, signed_in, role, email, via, enrollment, login_url}` so a signed-out page can offer sign-in. `role` is `none`, `viewer` or `operator` (the bearer token counts as `operator`); `via` is `group`, `enrollment`, `viewer_group`, `viewer_rule` or `null`. `/api/access` includes the same object as `login`. |
+| `GET /api/operators` | Operator only: `account` (the caller: `{role, via, email, subject}`, `via` is `token` for the bearer token) and enrolled accounts `{id, email, subject, issuer, created_at, last_seen_at, current, active}`. |
 | `POST /api/operators/{id}/remove` | Operator only: removes the account and ends its sessions. |
+| `GET /api/viewers` | Operator only: `{viewer_group, max, rules: [{id, rule, source, active, created_at}]}`; `source` is `config` (read-only, `id` null) or `dashboard`. |
+| `POST /api/viewers` | Operator only: JSON `{"rule": "email:*@example.com"}`; 201, 400 for an invalid rule, 409 for a duplicate or the 128-rule limit. |
+| `POST /api/viewers/{id}/remove` | Operator only: removes a dashboard rule and ends viewer sessions it no longer allows. |
 
 - The session cookie is `__Host-muxa-op` (`muxa-op-dev` over loopback HTTP),
   `HttpOnly; Secure; SameSite=Strict; Path=/`, lasting 8 hours. A short-lived
@@ -483,8 +494,9 @@ Flow and session contract:
   Enrollment is checked on every request, so removing an enrolled account ends
   its sessions immediately. Sessions are in memory only and never written to
   disk.
-- Every read route, SSE included, accepts either the bearer token or the
-  session cookie. A **state-changing request authorized by the cookie** must also
+- Every read route, SSE included, accepts either the bearer token or an
+  operator or viewer session cookie. Write and management routes answer a
+  viewer session with 403. A **state-changing request authorized by the cookie** must also
   send `Origin: <public_url>` and `X-Muxa-Operator: 1`, or it is refused with
   403. The dashboard's own JavaScript does this; bearer-token clients do not need
   to. `POST /auth/logout` has the same requirement.
@@ -516,8 +528,10 @@ not an operator is not turned away:
    cleared, and the browser gets a normal operator session and returns to
    where it started. From then on the account signs in directly.
 
-**Cancel** discards the pending enrollment. To remove an enrolled account, open
-**operators** in the dashboard header (shown to an unlocked or signed-in
+**Cancel** discards the pending enrollment. A signed-in viewer can enroll its own
+account the same way with **upgrade with token** in the header; the viewer
+session is replaced by an operator session. To remove an enrolled account, open
+**access** in the dashboard header (shown to an unlocked or signed-in
 operator) and choose **Remove**, or call `POST /api/operators/{id}/remove` with
 the bearer token. Removal ends that account's live sessions at once; signing in
 again leads back to the enrollment page. Group members are not listed and need
@@ -543,17 +557,41 @@ Security notes:
   are listed but never match.
 - At most 64 accounts can be enrolled. Pane-sharing recipient sessions cannot
   enroll or reach `/api/operators`.
+- The viewer upgrade uses the same `POST /auth/enroll` checks: the `Strict`
+  session cookie plus `Origin` and `X-Muxa-Operator: 1`, the constant-time
+  comparison, the global backoff, and five wrong tokens per viewer session,
+  after which that session is ended.
 - `enrollment = false` restores group-only sign-in: the refusal page returns,
   and previously enrolled accounts stop being honored. They are kept on disk
   and are honored again if enrollment is turned back on.
 
-Enrolled accounts are stored in SQLite at
+### Viewers
+
+Operators manage viewer rules in the **access** dialog. Type an email address
+(`ann@example.com`) or a domain pattern (`*@example.com`); the dialog stores
+them as `email:ann@example.com` and `email:*@example.com`. The API and
+`viewer_rules` also accept `sub:<subject>`.
+
+- Email rules match only when the ID token says `email_verified: true`, and
+  compare case-insensitively. A domain rule matches that exact domain:
+  `*@example.com` does not match `ann@sub.example.com`. There are no other
+  wildcards.
+- `sub:` rules match the subject exactly. Every rule is pinned to the configured
+  `issuer_url`; rules recorded under another issuer are listed but never match.
+- Rules are re-checked on every request, so removing one ends the viewer
+  sessions it allowed at once. `viewer_group` is checked at sign-in, like
+  `required_group`.
+- `viewer_rules` in the configuration are merged with the dashboard's rules and
+  shown read-only. At most 128 of each.
+- An account that is both an operator and a viewer signs in as an operator.
+
+Enrolled accounts and viewer rules are stored in SQLite at
 `$XDG_DATA_HOME/muxa/dashboard-operators/operators.sqlite3` (the platform data
 directory, next to the pane-sharing store): mode `0600` in a `0700` directory,
 held under an exclusive lock so a second daemon cannot open it, and refused if
 the file is not a muxa operator store. Each row holds the issuer, subject, the
-display email, and the enrollment and last sign-in times. Nothing is opened
-when sign-in or enrollment is off.
+display email, and the enrollment and last sign-in times; viewer rules keep the
+rule, its issuer and when it was added. Nothing is opened when sign-in is off.
 
 <a id="invite-someone-to-a-pane"></a>
 

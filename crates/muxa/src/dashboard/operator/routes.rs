@@ -1,7 +1,7 @@
 use super::{
-    claim_groups, Enrolled, ExtraClaims, LoginConfig, OperatorLogin, PendingEnrollment,
-    PendingLogin, Session, Via, ENROLL_TTL, LOGIN_TTL, MAX_ENROLLED, MAX_ENROLL_ATTEMPTS,
-    MAX_PENDING_ENROLLMENTS, MAX_PENDING_LOGINS, MAX_SESSIONS, SESSION_TTL,
+    claim_groups, viewers, Enrolled, ExtraClaims, LoginConfig, OperatorAuth, OperatorLogin,
+    PendingEnrollment, PendingLogin, Role, Session, Via, ENROLL_TTL, LOGIN_TTL, MAX_ENROLLED,
+    MAX_ENROLL_ATTEMPTS, MAX_PENDING_ENROLLMENTS, MAX_PENDING_LOGINS, MAX_SESSIONS, SESSION_TTL,
 };
 use crate::dashboard::oidc;
 use crate::dashboard::server::AppState;
@@ -50,12 +50,20 @@ pub(in crate::dashboard) fn routes() -> Router<AppState> {
         .layer(middleware::from_fn(security_headers))
 }
 
-/// `/api/operators*`. Mounted inside the operator write layer, so these need
-/// the bearer token or an operator session (plus CSRF proof for changes).
+/// `/api/operators*` and `/api/viewers*`. Mounted inside the operator write
+/// layer, so these need the bearer token or an operator session (plus CSRF
+/// proof for changes); a viewer session gets 403.
 pub(in crate::dashboard) fn admin_routes() -> Router<AppState> {
     Router::new()
         .route("/api/operators", get(list_operators))
         .route("/api/operators/{id}/remove", post(remove_operator))
+        .route(
+            "/api/viewers",
+            get(viewers::list)
+                .post(viewers::add)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
+        .route("/api/viewers/{id}/remove", post(viewers::remove))
         .layer(middleware::map_response(
             |mut response: Response| async move {
                 response
@@ -93,7 +101,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-fn error(status: StatusCode, message: &str) -> Response {
+pub(super) fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error": message}))).into_response()
 }
 
@@ -167,14 +175,14 @@ pub(super) fn safe_return_to(path: &str) -> bool {
         && path.bytes().all(|b| b.is_ascii_graphic() && b != b'\\')
 }
 
-fn login_config(state: &AppState) -> Result<&LoginConfig, Failure> {
+pub(super) fn login_config(state: &AppState) -> Result<&LoginConfig, Failure> {
     state
         .operator
         .config()
         .ok_or((StatusCode::NOT_FOUND, "operator sign-in is not configured"))
 }
 
-fn unix_now() -> i64 {
+pub(super) fn unix_now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
 }
 
@@ -320,6 +328,15 @@ async fn callback_inner(
         Via::Group
     } else if enrolled.is_some() {
         Via::Enrollment
+    } else if identity.in_viewer_group {
+        Via::ViewerGroup
+    } else if viewers::matches(
+        &login.config_rules,
+        &login.registry().viewer_rules,
+        config,
+        identity.account(),
+    ) {
+        Via::ViewerRule
     } else if config.enrollment_enabled() {
         return begin_enrollment(login, config, identity, pending.return_to);
     } else {
@@ -329,7 +346,7 @@ async fn callback_inner(
             "this account is not allowed to operate this dashboard",
         ));
     };
-    tracing::info!(subject = %identity.subject, ?via, "dashboard operator signed in");
+    tracing::info!(subject = %identity.subject, ?via, "dashboard account signed in");
     let secret = start_session(login, config, headers, identity.into_session(via));
     let response = Redirect::to(&pending.return_to).into_response();
     Ok(with_cookie(
@@ -403,16 +420,29 @@ struct Identity {
     issuer: String,
     subject: String,
     email: Option<String>,
+    email_verified: bool,
     in_group: bool,
+    in_viewer_group: bool,
 }
 
 impl Identity {
+    fn account(&self) -> viewers::Account<'_> {
+        viewers::Account {
+            issuer: &self.issuer,
+            subject: &self.subject,
+            email: self.email.as_deref(),
+            email_verified: self.email_verified,
+        }
+    }
+
     fn into_session(self, via: Via) -> Session {
         Session {
             issuer: self.issuer,
             subject: self.subject,
             email: self.email,
+            email_verified: self.email_verified,
             via,
+            attempts: 0,
             expires: Instant::now() + SESSION_TTL,
         }
     }
@@ -451,13 +481,18 @@ async fn verify(
     if subject.is_empty() || subject.len() > 255 || subject.chars().any(char::is_control) {
         return Err(INVALID);
     }
-    // Authorization is group membership or enrollment by (issuer, subject);
-    // email is only for display, so it need not be verified.
+    // Operators are authorized by group membership or enrollment by
+    // (issuer, subject), so for them the email is only for display. Viewer
+    // email rules additionally require `email_verified`.
     let groups = claim_groups(claims.additional_claims().claims.get(config.groups_claim()));
     let in_group = config
         .required_group
         .as_deref()
         .is_some_and(|required| groups.contains(&required));
+    let in_viewer_group = config
+        .viewer_group
+        .as_deref()
+        .is_some_and(|viewer| groups.contains(&viewer));
     let email = claims
         .email()
         .map(|email| email.as_str().to_owned())
@@ -466,7 +501,9 @@ async fn verify(
         issuer: claims.issuer().as_str().to_owned(),
         subject,
         email,
+        email_verified: claims.email_verified() == Some(true),
         in_group,
+        in_viewer_group,
     })
 }
 
@@ -525,6 +562,7 @@ fn begin_enrollment(
                 issuer: identity.issuer,
                 subject: identity.subject,
                 email: identity.email,
+                email_verified: identity.email_verified,
                 return_to,
                 attempts: 0,
                 expires: now + ENROLL_TTL,
@@ -591,7 +629,7 @@ async fn enroll_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
         None => format!("subject <code>{}</code>", html_escape(&subject)),
     };
     let body = format!(
-        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"stylesheet\" href=\"/static/share.css\"><title>Register operator · muxa</title><main class=\"enroll\"><h1>Register this account as an operator</h1><p>Signed in as {account}. This account is not yet allowed to operate this dashboard.</p><p>Enter this dashboard's access token to register this account as an operator. It can then sign in without the token until it is removed under <em>operators</em> in the dashboard. The token is checked once and is not stored in this browser.</p><form id=\"enroll\" method=\"post\" action=\"/auth/enroll\"><label for=\"token\">Dashboard access token</label><input id=\"token\" name=\"token\" type=\"password\" autocomplete=\"off\" maxlength=\"1024\" required autofocus><button type=\"submit\">Register and sign in</button></form><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><p><a href=\"/auth/enroll/cancel\">Cancel</a></p></main><script type=\"module\" src=\"/static/operator-enroll.mjs\"></script></html>"
+        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"stylesheet\" href=\"/static/share.css\"><title>Register operator · muxa</title><main class=\"enroll\"><h1>Register this account as an operator</h1><p>Signed in as {account}. This account is not yet allowed to operate this dashboard.</p><p>Enter this dashboard's access token to register this account as an operator. It can then sign in without the token until it is removed under <em>access</em> in the dashboard. The token is checked once and is not stored in this browser.</p><form id=\"enroll\" method=\"post\" action=\"/auth/enroll\"><label for=\"token\">Dashboard access token</label><input id=\"token\" name=\"token\" type=\"password\" autocomplete=\"off\" maxlength=\"1024\" required autofocus><button type=\"submit\">Register and sign in</button></form><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><p><a href=\"/auth/enroll/cancel\">Cancel</a></p></main><script type=\"module\" src=\"/static/operator-enroll.mjs\"></script></html>"
     );
     ([(header::CONTENT_SECURITY_POLICY, ENROLL_CSP)], Html(body)).into_response()
 }
@@ -607,14 +645,25 @@ fn enroll_error(status: StatusCode, message: &str, restart: bool) -> Response {
     (status, Json(json!({"error": message, "restart": restart}))).into_response()
 }
 
+/// Who presents the token: this browser's pending enrollment, or its
+/// signed-in viewer session upgrading itself. Each holds the secret that
+/// names it in the registry.
+enum Applicant {
+    Pending(String),
+    Viewer(String),
+}
+
 /// `POST /auth/enroll`: exchange the dashboard token plus this browser's
-/// pending enrollment for a durable enrollment and an operator session.
+/// pending enrollment, or its viewer session, for a durable enrollment and
+/// an operator session.
 ///
-/// CSRF: the pending cookie is `SameSite=Lax`, which a cross-site POST never
-/// carries, and the request must also bear the exact public `Origin` and
-/// `X-Muxa-Operator: 1` (a cross-site page cannot set the header without a
-/// preflight this server never grants). The body is JSON, never a form, so
-/// the token never lands in a URL or a form-encoded access log.
+/// CSRF: the pending cookie is `SameSite=Lax` and the session cookie
+/// `Strict`, neither of which a cross-site POST carries, and the request
+/// must also bear the exact public `Origin` and `X-Muxa-Operator: 1` (a
+/// cross-site page cannot set the header without a preflight this server
+/// never grants). The body is JSON, never a form, so the token never lands
+/// in a URL or a form-encoded access log.
+#[allow(clippy::too_many_lines)] // One lock-scoped check shared by both applicants.
 async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let config = match enrollment_config(&state) {
         Ok(config) => config,
@@ -624,24 +673,39 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     if !login.csrf_ok(&Method::POST, &headers) {
         return error(StatusCode::FORBIDDEN, "same-origin request required");
     }
-    let Some(secret) = oidc::cookie(&headers, config.enroll_cookie_name()) else {
+    let pending_secret = oidc::cookie(&headers, config.enroll_cookie_name());
+    // `session` re-checks the viewer rules, so a revoked viewer cannot
+    // upgrade.
+    let viewer_secret = login
+        .session(&headers)
+        .filter(|session| session.via.role() == Role::Viewer)
+        .and_then(|_| oidc::cookie(&headers, config.cookie_names().0));
+    if pending_secret.is_none() && viewer_secret.is_none() {
         return enroll_error(NO_PENDING.0, NO_PENDING.1, true);
-    };
+    }
     let Some(expected) = state.config.token.as_deref() else {
         return error(StatusCode::NOT_FOUND, "operator enrollment is unavailable");
     };
     let Ok(EnrollBody { token }) = serde_json::from_slice::<EnrollBody>(&body) else {
         return error(StatusCode::BAD_REQUEST, "expected {\"token\": \"...\"}");
     };
-    let pending = {
+    let (account, return_to) = {
         let mut registry = login.registry();
         let now = Instant::now();
         registry
             .enrollments
             .retain(|_, pending| pending.expires > now);
-        if !registry.enrollments.contains_key(&secret) {
+        let applicant = if let Some(secret) =
+            pending_secret.filter(|secret| registry.enrollments.contains_key(secret))
+        {
+            Applicant::Pending(secret)
+        } else if let Some(secret) =
+            viewer_secret.filter(|secret| registry.sessions.contains_key(secret))
+        {
+            Applicant::Viewer(secret)
+        } else {
             return enroll_error(NO_PENDING.0, NO_PENDING.1, true);
-        }
+        };
         if let Some(retry_at) = registry.backoff.retry_at().filter(|at| *at > now) {
             let wait = retry_at.duration_since(now).as_secs().max(1);
             return (
@@ -657,15 +721,35 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         // The same constant-time comparison as the Authorization header.
         if !crate::dashboard::auth::check_bearer(Some(&format!("Bearer {token}")), expected) {
             registry.backoff.fail();
-            let pending = registry
-                .enrollments
-                .get_mut(&secret)
-                .expect("checked enrollment");
-            pending.attempts += 1;
-            let attempts = pending.attempts;
-            tracing::warn!(subject = %pending.subject, attempts, "dashboard operator enrollment refused: wrong token");
+            let (attempts, subject) = match &applicant {
+                Applicant::Pending(secret) => {
+                    let pending = registry
+                        .enrollments
+                        .get_mut(secret)
+                        .expect("checked enrollment");
+                    pending.attempts += 1;
+                    (pending.attempts, pending.subject.clone())
+                }
+                Applicant::Viewer(secret) => {
+                    let session = registry.sessions.get_mut(secret).expect("checked session");
+                    session.attempts += 1;
+                    (session.attempts, session.subject.clone())
+                }
+            };
+            tracing::warn!(%subject, attempts, "dashboard operator enrollment refused: wrong token");
             if attempts >= MAX_ENROLL_ATTEMPTS {
-                registry.enrollments.remove(&secret);
+                // Discard what presented the token: a new provider sign-in
+                // is needed to try again.
+                let cookie = match applicant {
+                    Applicant::Pending(secret) => {
+                        registry.enrollments.remove(&secret);
+                        Cookie::Enroll
+                    }
+                    Applicant::Viewer(secret) => {
+                        registry.sessions.remove(&secret);
+                        Cookie::Session
+                    }
+                };
                 return with_cookie(
                     enroll_error(
                         StatusCode::UNAUTHORIZED,
@@ -673,7 +757,7 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
                         true,
                     ),
                     config,
-                    Cookie::Enroll,
+                    cookie,
                     "",
                     0,
                 );
@@ -685,26 +769,58 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
             );
         }
         registry.backoff = super::Backoff::default();
-        registry
-            .enrollments
-            .remove(&secret)
-            .expect("checked enrollment")
+        match applicant {
+            Applicant::Pending(secret) => {
+                let pending = registry
+                    .enrollments
+                    .remove(&secret)
+                    .expect("checked enrollment");
+                let return_to = pending.return_to;
+                (
+                    Session {
+                        issuer: pending.issuer,
+                        subject: pending.subject,
+                        email: pending.email,
+                        email_verified: pending.email_verified,
+                        via: Via::Enrollment,
+                        attempts: 0,
+                        expires: now + SESSION_TTL,
+                    },
+                    return_to,
+                )
+            }
+            // The viewer session stays until the operator session below
+            // replaces it, so a failed write leaves the viewer signed in.
+            Applicant::Viewer(secret) => {
+                let viewer = registry.sessions.get(&secret).expect("checked session");
+                (
+                    Session {
+                        via: Via::Enrollment,
+                        attempts: 0,
+                        expires: now + SESSION_TTL,
+                        ..viewer.clone()
+                    },
+                    "/".to_owned(),
+                )
+            }
+        }
     };
     let cleared = |response: Response| with_cookie(response, config, Cookie::Enroll, "", 0);
-    if let Err((status, message)) = record_enrollment(login, config, &pending).await {
+    if let Err((status, message)) = record_enrollment(
+        login,
+        config,
+        &account.issuer,
+        &account.subject,
+        account.email.as_deref(),
+    )
+    .await
+    {
         return cleared(enroll_error(status, message, true));
     }
-    tracing::info!(subject = %pending.subject, "dashboard operator enrolled");
-    let session = Session {
-        issuer: pending.issuer,
-        subject: pending.subject,
-        email: pending.email,
-        via: Via::Enrollment,
-        expires: Instant::now() + SESSION_TTL,
-    };
-    let secret = start_session(login, config, &headers, session);
+    tracing::info!(subject = %account.subject, "dashboard operator enrolled");
+    let secret = start_session(login, config, &headers, account);
     with_cookie(
-        cleared(Json(json!({"redirect": pending.return_to})).into_response()),
+        cleared(Json(json!({"redirect": return_to})).into_response()),
         config,
         Cookie::Session,
         &secret,
@@ -712,20 +828,19 @@ async fn enroll(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     )
 }
 
-/// Durably record `pending` as an enrolled operator (a no-op when it already
-/// is one). The session is created only after this succeeds.
+/// Durably record this account as an enrolled operator (a no-op when it
+/// already is one). The session is created only after this succeeds.
 async fn record_enrollment(
     login: &OperatorLogin,
     config: &LoginConfig,
-    pending: &PendingEnrollment,
+    issuer: &str,
+    subject: &str,
+    email: Option<&str>,
 ) -> Result<(), Failure> {
     let _writes = login.enroll_writes.lock().await;
     let entry = {
         let registry = login.registry();
-        if registry
-            .enrolled(config, &pending.issuer, &pending.subject)
-            .is_some()
-        {
+        if registry.enrolled(config, issuer, subject).is_some() {
             return Ok(());
         }
         if registry.enrolled.len() >= MAX_ENROLLED {
@@ -737,9 +852,9 @@ async fn record_enrollment(
         let now = unix_now();
         Enrolled {
             id: uuid::Uuid::new_v4().simple().to_string(),
-            issuer: pending.issuer.clone(),
-            subject: pending.subject.clone(),
-            email: pending.email.clone(),
+            issuer: issuer.to_owned(),
+            subject: subject.to_owned(),
+            email: email.map(str::to_owned),
             created_at: now,
             last_seen_at: now,
         }
@@ -788,9 +903,22 @@ async fn list_operators(State(state): State<AppState>, headers: HeaderMap) -> Re
         Err((status, message)) => return error(status, message),
     };
     let login = &state.operator;
-    let current = login
-        .session(&headers)
-        .map(|session| (session.issuer, session.subject));
+    // Mirror `authenticate`: the bearer token wins over a cookie when both
+    // are sent, so report what actually authorized this request.
+    let session = match super::authenticate(state.config.token.as_deref(), login, &headers) {
+        Some(OperatorAuth::Session) => login.session(&headers),
+        _ => None,
+    };
+    let account = match &session {
+        Some(session) => json!({
+            "role": session.via.role(),
+            "via": session.via,
+            "email": session.email,
+            "subject": session.subject,
+        }),
+        None => json!({"role": Role::Operator, "via": "token", "email": null, "subject": null}),
+    };
+    let current = session.map(|session| (session.issuer, session.subject));
     let registry = login.registry();
     let operators: Vec<_> = registry
         .enrolled
@@ -813,6 +941,8 @@ async fn list_operators(State(state): State<AppState>, headers: HeaderMap) -> Re
         .collect();
     Json(json!({
         "enrollment": config.enrollment_enabled(),
+        "account": account,
+        "required_group": config.required_group,
         "max": MAX_ENROLLED,
         "operators": operators,
     }))

@@ -631,10 +631,12 @@ and disables control actions entirely. See [DASHBOARD.md](DASHBOARD.md).
 ### Operator sign-in with OIDC
 
 Optional `[dashboard.login]` lets the dashboard owner sign in through a generic
-OpenID Connect provider instead of pasting the bearer token. An account is an
-operator when the ID token's group claim contains `required_group`, or when a
-holder of the dashboard token enrolled it. It requires `auth = "token"` with a
-token, which keeps working for API clients and as the fallback when the
+OpenID Connect provider instead of pasting the bearer token. Sign-in is deny by
+default. An account is an **operator** when the ID token's group claim contains
+`required_group`, or when a holder of the dashboard token enrolled it. It is a
+read-only **viewer** when its groups contain `viewer_group` or it matches a
+viewer rule. Any other account gets no access. It requires `auth = "token"` with
+a token, which keeps working for API clients and as the fallback when the
 provider is unreachable.
 
 ```toml
@@ -646,6 +648,11 @@ client_id = "muxa-dashboard"
 required_group = "muxa-operators"
 # Optional: let a token holder enroll accounts outside the group (default true).
 # enrollment = true
+# Optional: provider group whose members may view the dashboard read-only.
+# viewer_group = "muxa-viewers"
+# Optional: viewer rules, shown read-only next to the ones operators add in
+# the dashboard: "email:<address>", "email:*@<domain>" or "sub:<subject>".
+# viewer_rules = ["email:*@example.com"]
 # Optional: claim holding group names (default "groups").
 # groups_claim = "groups"
 # Optional: scopes requested in addition to "openid email".
@@ -662,8 +669,14 @@ With `enrollment` on, a verified account outside `required_group` (or any
 account when `required_group` is omitted) is sent to an enrollment page that
 asks for the dashboard token; entering it registers that account by issuer and
 subject in `$XDG_DATA_HOME/muxa/dashboard-operators/operators.sqlite3`. Remove
-accounts from the dashboard's **operators** dialog. `enrollment = false` restores
-group-only sign-in and stops honoring enrolled accounts.
+accounts from the dashboard's **access** dialog. `enrollment = false` restores
+group-only operator sign-in and stops honoring enrolled accounts.
+
+Viewer rules match an exact email address or every address at one domain
+(`*@example.com` matches `ann@example.com`, not `ann@sub.example.com`),
+case-insensitively and only when the provider sets `email_verified: true`, or an
+exact subject. Every rule is pinned to `issuer_url`. Operators add and remove
+rules in the **access** dialog; those are stored in the same SQLite file.
 See [operator sign-in](DASHBOARD.md#operator-sign-in-with-oidc) for the cookie,
 CSRF, enrollment and reverse-proxy contract.
 
