@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dashboard pane output renders Nerd Font icons (powerlevel10k/starship
+  prompts, Claude Code and Codex status lines) instead of empty boxes. The
+  daemon embeds a Private-Use-Area subset of Symbols Nerd Font Mono v3.5.1
+  (MIT; see `crates/muxa/src/dashboard/web/fonts/`), loaded through a
+  `unicode-range` fallback so normal text is unchanged. The shared-pane page's
+  CSP now names `font-src 'self'`.
 - Dashboard **Sessions** navigator organized the way muxa tracks agents:
   session → window → pane. A keyboard-navigable, filterable tree with
   rolled-up state (error > waiting > working > idle) and counts; a session

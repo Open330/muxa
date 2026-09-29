@@ -89,6 +89,7 @@ fn mime_for(path: &str) -> &'static str {
         "png" => "image/png",
         "webp" => "image/webp",
         "jpg" | "jpeg" => "image/jpeg",
+        "woff2" => "font/woff2",
         _ => "application/octet-stream",
     }
 }
@@ -114,6 +115,7 @@ mod tests {
         assert!(WebAssets::get("landing.mjs").is_some());
         assert!(WebAssets::get("landing-film.mjs").is_some());
         assert!(WebAssets::get("landing.css").is_some());
+        assert!(WebAssets::get("fonts/LICENSE-nerd-fonts-symbols.txt").is_some());
         for shot in ["board", "collaboration", "agents"] {
             for scheme in ["light", "dark"] {
                 let path = format!("landing/{shot}-{scheme}.webp");
@@ -141,6 +143,29 @@ mod tests {
     }
 
     #[test]
+    fn nerd_font_symbols_are_embedded_and_served_as_woff2() {
+        let path = "fonts/muxa-nerd-symbols.woff2";
+        let file = WebAssets::get(path).expect("bundled Nerd Font symbols");
+        assert_eq!(&file.data[..4], b"wOF2", "not a woff2 file");
+        let response = serve_asset(path);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "font/woff2");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        // Every stylesheet that renders pane output falls back to it.
+        for css in ["style.css", "share.css"] {
+            let text = String::from_utf8(WebAssets::get(css).unwrap().data.into_owned()).unwrap();
+            assert!(
+                text.contains("url(\"/static/fonts/muxa-nerd-symbols.woff2\")"),
+                "{css}"
+            );
+            assert!(
+                text.contains("unicode-range: U+E000-F8FF, U+F0000-FFFFF"),
+                "{css}"
+            );
+        }
+    }
+
+    #[test]
     fn mime_table_covers_served_extensions() {
         assert_eq!(mime_for("foo.html"), "text/html; charset=utf-8");
         assert_eq!(mime_for("foo.js"), "application/javascript; charset=utf-8");
@@ -148,6 +173,7 @@ mod tests {
         assert_eq!(mime_for("foo.css"), "text/css; charset=utf-8");
         assert_eq!(mime_for("landing/shot.webp"), "image/webp");
         assert_eq!(mime_for("foo.jpg"), "image/jpeg");
+        assert_eq!(mime_for("fonts/foo.woff2"), "font/woff2");
         assert_eq!(mime_for("foo.unknown"), "application/octet-stream");
     }
 }

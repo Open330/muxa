@@ -27,7 +27,7 @@ bound to loopback and configure the public origin as described below.
 | Path                | What it returns                                                                |
 | ------------------- | ------------------------------------------------------------------------------ |
 | `GET /`             | The dashboard HTML (loads the JS bundle).                                      |
-| `GET /static/*`     | Embedded JS/CSS assets.                                                        |
+| `GET /static/*`     | Embedded JS/CSS/font assets.                                                   |
 | `GET /api/health`   | `{ ok, version, protocol }`                                                    |
 | `GET /api/access`   | Current read/control access mode and whether the supplied PAT can edit.        |
 | `GET /api/agents`   | Current `Store` snapshot.                                                      |
@@ -372,6 +372,18 @@ Viewers and signed-out visitors can still open the drawer, but it shows only
 the metadata above and never requests output. With `auth = "none"` nobody
 can read output.
 
+### Nerd Font glyphs
+
+Shell prompts (powerlevel10k, starship) and agent status lines often print
+Nerd Font icons, which live in Unicode's Private Use Areas. The dashboard,
+including the shared-pane page, bundles a subset of **Symbols Nerd Font Mono**
+and lists it after the primary monospace font with a `unicode-range` of
+U+E000–U+F8FF and U+F0000–U+FFFFF, so ordinary text keeps your system's
+monospace font and browsers fetch the icon font (about 1.2 MB, served from
+`/static/fonts/`) only when output actually contains such a glyph. The
+shared-pane page's Content-Security-Policy allows it with `font-src 'self'`.
+See [Third-party notices](#third-party-notices).
+
 ## Starting work from the board
 
 The board could steer Work it had not started — prompt its Runs, abort them,
@@ -483,6 +495,17 @@ that strips the carve-out (or use mTLS).
 
 The [`dashboard::router`](../crates/muxa/src/dashboard/server.rs) function is
 public for embedding and integration tests.
+
+### Third-party notices
+
+The dashboard embeds `muxa-nerd-symbols.woff2`, a subset of Symbols Nerd Font
+Mono from [Nerd Fonts](https://github.com/ryanoasis/nerd-fonts) v3.5.1 (MIT,
+copyright Ryan L McIntyre). The icon sets it contains keep their own licenses
+(Font Awesome and Codicons CC BY 4.0, Material Design Apache 2.0, Pomicons and
+Weather Icons SIL OFL 1.1, the rest MIT). The license text, source URL,
+checksums and the command that produced the subset are in
+[`crates/muxa/src/dashboard/web/fonts/`](../crates/muxa/src/dashboard/web/fonts/README.md);
+the daemon also serves the license at `/static/fonts/LICENSE-nerd-fonts-symbols.txt`.
 
 <a id="operator-sign-in-with-oidc"></a>
 
