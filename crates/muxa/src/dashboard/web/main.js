@@ -1261,7 +1261,6 @@ function setSelectedWork(workKey) {
   store.ui.terminalCapture = null;
   renderWorkItems();
   renderInspector();
-  openWorkDrawer();
 }
 
 function toggleWorkExecution(workKey) {
@@ -2918,10 +2917,21 @@ function renderCollaborationRooms(rooms) {
     </button>`).join("");
 }
 
+// Nodes sit on an ellipse whose perimeter leaves roughly one node box of
+// room per participant; the canvas is sized around it so every node is on
+// screen and the SVG can be scaled to the pane.
+const GRAPH_NODE_SPACING = 125;
+const GRAPH_MARGIN_X = 90;
+const GRAPH_MARGIN_Y = 60;
+
+function graphRadii(count) {
+  const radiusX = Math.max(150, (count * GRAPH_NODE_SPACING) / (2 * Math.PI) * 1.15);
+  return { radiusX, radiusY: Math.max(90, radiusX * .62) };
+}
+
 function graphNodePositions(nodes, width, height) {
   if (nodes.length === 1) return new Map([[nodes[0].id, { x: width / 2, y: height / 2 }]]);
-  const radiusX = Math.min(width * .38, Math.max(150, nodes.length * 42));
-  const radiusY = Math.min(height * .34, Math.max(90, nodes.length * 20));
+  const { radiusX, radiusY } = graphRadii(nodes.length);
   const positions = new Map();
   nodes.forEach((node, index) => {
     const angle = -Math.PI / 2 + (index * Math.PI * 2 / nodes.length);
@@ -2952,8 +2962,12 @@ function renderCollaborationGraph(projection) {
     dom.collaborationGraph.innerHTML = `<div class="empty-block">no collaboration messages match these filters</div>`;
     return;
   }
-  const width = Math.max(640, projection.nodes.length * 145);
-  const height = Math.max(320, Math.min(520, projection.nodes.length * 65));
+  const { radiusX, radiusY } = graphRadii(projection.nodes.length);
+  const width = Math.max(560, Math.ceil(radiusX * 2 + GRAPH_MARGIN_X * 2));
+  const height = Math.max(320, Math.ceil(radiusY * 2 + GRAPH_MARGIN_Y * 2));
+  // Scale down to fit the pane, but not below ~60% or labels become unreadable;
+  // past that the pane scrolls (and starts centered, below).
+  const minWidth = Math.min(width, Math.round(width * .6));
   const positions = graphNodePositions(projection.nodes, width, height);
   const nodeById = new Map(projection.nodes.map((node) => [node.id, node]));
   const edges = projection.edges.map((edge, index) => {
@@ -2996,7 +3010,7 @@ function renderCollaborationGraph(projection) {
     <td>${esc(nodeById.get(edge.to)?.label || edge.to)}</td>
     <td>${edge.count}</td><td>${edge.replyCount}</td><td>${esc(dominantCount(edge.kinds))}</td><td>${esc(dominantCount(edge.statuses))}</td>
   </tr>`).join("");
-  dom.collaborationGraph.innerHTML = `<svg class="collaboration-graph-svg" viewBox="0 0 ${width} ${height}" style="min-width:${width}px" role="img" aria-label="Directional collaboration graph">
+  dom.collaborationGraph.innerHTML = `<svg class="collaboration-graph-svg" viewBox="0 0 ${width} ${height}" style="min-width:${minWidth}px" role="img" aria-label="Directional collaboration graph">
     <defs>
       <marker id="collab-request-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
       <marker id="collab-reply-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
@@ -3004,7 +3018,16 @@ function renderCollaborationGraph(projection) {
     <g class="collaboration-edges">${edges}</g>
     <g class="collaboration-nodes">${nodes}</g>
   </svg>
-  <table class="sr-only"><caption>Collaboration graph edge summary</caption><thead><tr><th>From</th><th>To</th><th>Requests</th><th>Replies</th><th>Kind</th><th>Status</th></tr></thead><tbody>${accessibleRows}</tbody></table>`;
+  <div class="sr-only"><table><caption>Collaboration graph edge summary</caption><thead><tr><th>From</th><th>To</th><th>Requests</th><th>Replies</th><th>Kind</th><th>Status</th></tr></thead><tbody>${accessibleRows}</tbody></table></div>`;
+  // Center only when the layout size changes; live refreshes of the same
+  // graph must not throw away where the viewer has panned to.
+  const canvas = dom.collaborationGraph;
+  const size = `${width}x${height}`;
+  if (canvas.dataset.graphSize !== size) {
+    canvas.dataset.graphSize = size;
+    canvas.scrollLeft = (canvas.scrollWidth - canvas.clientWidth) / 2;
+    canvas.scrollTop = (canvas.scrollHeight - canvas.clientHeight) / 2;
+  }
 }
 
 function renderCollaborationSequence() {
@@ -3057,20 +3080,23 @@ function renderCollaborationSequence() {
   const laneWidth = 170;
   const left = 65;
   const width = Math.max(420, left * 2 + Math.max(1, participants.length - 1) * laneWidth);
-  const header = 52;
+  // Lane names live in their own SVG that sticks to the top of the scroll
+  // box, so long histories keep saying who each lifeline belongs to.
+  const headerHeight = 44;
   const rowHeight = 58;
-  const height = header + events.length * rowHeight + 20;
+  const height = 8 + events.length * rowHeight + 20;
   const laneX = (id) => left + (participantIndex.get(id) || 0) * laneWidth;
+  const laneLabels = participants.map((participant, index) => {
+    const x = left + index * laneWidth;
+    return `<text class="sequence-lane-label" text-anchor="middle" x="${x}" y="18">${esc(participant.label).slice(0, 18)}</text>
+      <text class="sequence-lane-subtitle" text-anchor="middle" x="${x}" y="34">${esc(participant.subtitle).slice(0, 20)}</text>`;
+  }).join("");
   const lanes = participants.map((participant, index) => {
     const x = left + index * laneWidth;
-    return `<g class="collaboration-sequence-lane">
-      <text class="sequence-lane-label" text-anchor="middle" x="${x}" y="18">${esc(participant.label).slice(0, 18)}</text>
-      <text class="sequence-lane-subtitle" text-anchor="middle" x="${x}" y="34">${esc(participant.subtitle).slice(0, 20)}</text>
-      <line x1="${x}" x2="${x}" y1="44" y2="${height - 8}"></line>
-    </g>`;
+    return `<g class="collaboration-sequence-lane"><line x1="${x}" x2="${x}" y1="0" y2="${height - 8}"></line></g>`;
   }).join("");
   const rows = events.map((event, index) => {
-    const y = header + index * rowHeight + 25;
+    const y = 8 + index * rowHeight + 25;
     const sx = laneX(event.from);
     const tx = laneX(event.to);
     const labelX = sx === tx ? sx + 44 : (sx + tx) / 2;
@@ -3087,7 +3113,10 @@ function renderCollaborationSequence() {
       <title>${esc(`${event.label} · ${event.request.id || "message"}`)}</title>
     </g>`;
   }).join("");
-  dom.collaborationSequence.innerHTML = `${requests.length > visibleRequests.length ? `<div class="collaboration-cap-note">showing latest ${visibleRequests.length} of ${requests.length} requests</div>` : ""}
+  dom.collaborationSequence.innerHTML = `<div class="collaboration-sequence-head">
+      ${requests.length > visibleRequests.length ? `<div class="collaboration-cap-note">showing latest ${visibleRequests.length} of ${requests.length} requests</div>` : ""}
+      <svg class="collaboration-sequence-svg" viewBox="0 0 ${width} ${headerHeight}" style="min-width:${width}px;height:${headerHeight}px" aria-hidden="true">${laneLabels}</svg>
+    </div>
     <svg class="collaboration-sequence-svg" viewBox="0 0 ${width} ${height}" style="min-width:${width}px;height:${height}px" role="img" aria-label="Chronological request and reply sequence">
       <defs>
         <marker id="sequence-request-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>

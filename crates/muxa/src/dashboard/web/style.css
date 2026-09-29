@@ -55,11 +55,22 @@ html, body {
   line-height: 1.4;
 }
 
+/* Desktop: exactly one scroll container (the workbench). The page itself
+   never scrolls, so nothing can slide the shell out from under the header. */
+body {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
+
 button, select {
   color: inherit;
 }
 
 .topbar {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -141,20 +152,32 @@ button, select {
 .conn.dead { color: var(--red); }
 
 .dashboard-shell {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
   display: grid;
   grid-template-columns: minmax(230px, 280px) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   gap: 14px;
-  height: calc(100vh - 52px);
   padding: 14px;
   overflow: hidden;
 }
 
 .workbench {
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 14px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+/* Panels clip their content (overflow: hidden), which drops their flex
+   min-height to 0; without this they get squashed to fit the viewport
+   instead of the workbench scrolling. */
+.workbench > * {
+  flex-shrink: 0;
 }
 
 .panel {
@@ -521,9 +544,10 @@ button, select {
 .execution-pane-row {
   min-height: 32px;
   display: grid;
-  grid-template-columns: 8px minmax(82px, auto) minmax(62px, auto) minmax(80px, 1fr) auto;
+  grid-template-columns: 8px minmax(0, auto) minmax(0, 1fr);
   align-items: center;
-  gap: 7px;
+  gap: 4px 7px;
+  padding: 5px 0;
   border-top: 1px solid var(--border-soft);
   font: 10px/1.2 var(--mono);
 }
@@ -538,6 +562,20 @@ button, select {
 }
 
 .execution-pane-command { color: var(--cyan); }
+
+/* Board cards are narrow: title and controls take their own line. */
+.execution-pane-title,
+.execution-pane-row .control-actions {
+  grid-column: 2 / -1;
+}
+
+.execution-pane-row .control-actions {
+  flex-wrap: wrap;
+}
+
+.execution-pane-row .control-actions:empty {
+  display: none;
+}
 .execution-pane-title { color: var(--fg-muted); }
 
 .inspector-summary {
@@ -553,15 +591,6 @@ button, select {
   border: 0;
 }
 
-.inspector-execution .execution-pane-row {
-  grid-template-columns: 8px minmax(68px, auto) minmax(0, 1fr);
-  padding: 5px 0;
-}
-
-.inspector-execution .execution-pane-title,
-.inspector-execution .control-actions {
-  grid-column: 2 / -1;
-}
 
 .panel.collapsed > .panel-header .filters,
 .data-panel.collapsed > .panel-header .tabs {
@@ -1426,23 +1455,20 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
 
 /* Work control plane ----------------------------------------------------- */
 
-.work-items-panel {
-  min-height: 430px;
-}
-
 .work-board {
   display: grid;
-  grid-template-columns: repeat(4, minmax(235px, 1fr));
-  align-items: start;
+  /* At most four lanes per row: each track is at least a quarter of the
+     board. The full-width unlinked list keeps auto-fit from collapsing
+     spare tracks, so the cap has to come from the track size. */
+  grid-template-columns: repeat(auto-fit, minmax(max(220px, calc((100% - 30px) / 4)), 1fr));
+  align-items: stretch;
   gap: 10px;
   padding: 10px;
-  overflow-x: auto;
-  overscroll-behavior-inline: contain;
 }
 
 .work-lane {
-  min-width: 235px;
-  min-height: 348px;
+  min-width: 0;
+  min-height: 180px;
   padding: 8px;
   border: 1px solid var(--border-soft);
   border-radius: 6px;
@@ -1817,6 +1843,10 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   border-right: 1px solid var(--border);
 }
 
+.collaboration-graph-pane .collaboration-canvas {
+  flex: 1 1 auto;
+}
+
 .collaboration-subhead {
   min-height: 34px;
   display: flex;
@@ -1849,7 +1879,9 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
 
 .collaboration-canvas,
 .collaboration-sequence {
+  position: relative;
   min-height: 320px;
+  max-height: 520px;
   overflow: auto;
   background:
     linear-gradient(var(--border-soft) 1px, transparent 1px),
@@ -1860,7 +1892,6 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
 
 .collaboration-graph-svg {
   width: 100%;
-  min-width: 600px;
   height: auto;
   display: block;
 }
@@ -1995,10 +2026,17 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   font: 9px/1 var(--mono);
 }
 
-.collaboration-cap-note {
+.collaboration-sequence-head {
   position: sticky;
   top: 0;
   z-index: 2;
+  width: max-content;
+  min-width: 100%;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface);
+}
+
+.collaboration-cap-note {
   padding: 4px 8px;
   background: var(--surface-2);
   color: var(--yellow);
@@ -2117,6 +2155,9 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
 
 .sr-only {
   position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  clip-path: inset(50%) !important;
   width: 1px !important;
   height: 1px !important;
   padding: 0 !important;
@@ -2151,6 +2192,13 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
 
 .work-drawer .inspector-body {
   flex: 1 1 auto;
+  overscroll-behavior: contain;
+}
+
+/* The page behind an open drawer must not scroll (narrow screens scroll
+   the document; desktop already locks it). */
+body.drawer-open {
+  overflow: hidden;
 }
 
 .drawer-work-heading {
@@ -2354,10 +2402,6 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
     grid-template-columns: repeat(3, minmax(104px, 1fr));
   }
 
-  .work-board {
-    grid-template-columns: repeat(4, minmax(225px, 1fr));
-  }
-
   .collaboration-split {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -2379,10 +2423,16 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
     white-space: normal;
   }
 
+  /* Narrow screens: the page scrolls as one document. */
+  body {
+    display: block;
+    height: auto;
+    overflow: visible;
+  }
+
   .dashboard-shell {
     grid-template-columns: minmax(0, 1fr);
-    height: auto;
-    min-height: calc(100vh - 52px);
+    grid-template-rows: none;
     padding: 10px;
     overflow: visible;
   }
@@ -2399,12 +2449,8 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
     max-height: 260px;
   }
 
-  .work-board {
-    grid-template-columns: repeat(4, minmax(220px, 78vw));
-  }
-
-  .execution-pane-row {
-    grid-template-columns: 8px minmax(72px, auto) minmax(0, 1fr) auto;
+  .work-lane {
+    min-height: 0;
   }
 
   .execution-pane-title {
@@ -2457,12 +2503,19 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
 }
 
 .work-start-form input {
-  font: inherit;
-  padding: 0.25rem 0.5rem;
-  border-radius: 6px;
-  border: 1px solid var(--border, rgba(148, 163, 184, 0.35));
-  background: var(--input-bg, rgba(15, 23, 42, 0.35));
-  color: inherit;
+  height: 26px;
+  min-width: 0;
+  padding: 2px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  outline: none;
+  background: var(--surface-2);
+  color: var(--fg);
+  font: 11px/1.2 var(--mono);
+}
+
+.work-start-form input:focus {
+  border-color: var(--accent);
 }
 
 .work-start-id {
