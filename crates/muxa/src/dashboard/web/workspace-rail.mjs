@@ -238,3 +238,98 @@ export function worksInScope(workspaces, scope) {
   if (!scope.workspace) return [];
   return workspaces.find((workspace) => workspace.key === scope.workspace)?.works || [];
 }
+
+// ── Page scope in the URL fragment ─────────────────────────────────
+//
+// The rail's selection is the page *scope*: `#workspace=<name>` names a
+// session entry by tmux session name (or a managed-only workspace by id), and
+// `&wsocket=<socket>` pins the tmux server when that session name exists on
+// more than one. It is independent of the Sessions navigator's *detail
+// selection* (`#session=` / `#window=` / `#pane=`, which share `socket=`), so
+// picking a window there never changes what the rest of the page is scoped
+// to. The fragment form is a scope reference `{ workspace, socket }`; resolve
+// it to a rail entry with findScopeEntry.
+
+function hashParams(hash) {
+  return new URLSearchParams(String(hash || "").replace(/^#/, ""));
+}
+
+function hashString(params) {
+  const rest = params.toString();
+  return rest ? `#${rest}` : "";
+}
+
+/// `#workspace=<name>[&wsocket=<socket>]` → `{ workspace, socket }`, or null
+/// for "all workspaces".
+export function parseScopeHash(hash) {
+  const params = hashParams(hash);
+  const workspace = params.get("workspace");
+  if (!workspace) return null;
+  return { workspace, socket: params.get("wsocket") || null };
+}
+
+/// Return `hash` with the page scope set (or removed for `null`), keeping the
+/// navigator selection, an open pane and anything else in the fragment.
+export function withScopeHash(hash, ref) {
+  const params = hashParams(hash);
+  params.delete("workspace");
+  params.delete("wsocket");
+  if (ref?.workspace) {
+    params.set("workspace", ref.workspace);
+    if (ref.socket) params.set("wsocket", socketShort(ref.socket));
+  }
+  return hashString(params);
+}
+
+/// Links from before the scope/selection split (`#session=<name>[&socket=]`
+/// with no `workspace=`) scoped the whole page to that session. Returns the
+/// fragment with the equivalent `workspace=`/`wsocket=` added — `session`,
+/// `window` and `socket` stay as the navigator selection — or null when
+/// nothing needs migrating. Applied once, on load.
+export function migrateLegacyScopeHash(hash) {
+  const params = hashParams(hash);
+  if (params.has("workspace")) return null;
+  const session = params.get("session");
+  if (!session) return null;
+  params.set("workspace", session);
+  const socket = params.get("socket");
+  if (socket) params.set("wsocket", socketShort(socket));
+  return hashString(params);
+}
+
+/// The scope reference a rail entry is written to the fragment as. The
+/// socket is only spelled out when the session name exists on several tmux
+/// servers, so ordinary links stay `#workspace=<name>`.
+export function railEntryScopeRef(entry, entries = []) {
+  if (!entry) return null;
+  if (!entry.sessionName) return { workspace: entry.workspaceKey, socket: null };
+  const ambiguous = entries.some((other) => other !== entry
+    && other.sessionName === entry.sessionName && other.socket !== entry.socket);
+  return { workspace: entry.sessionName, socket: ambiguous ? entry.socket : null };
+}
+
+/// The rail entry a scope reference names, or null.
+export function findScopeEntry(entries, ref) {
+  if (!ref?.workspace) return null;
+  return findRailEntry(entries, { session: ref.workspace, socket: ref.socket });
+}
+
+/// Windows not tracked as Work inside `scope`, each with the navigator
+/// selection (`#window=` + session/socket) its row opens.
+export function untrackedWindowRows(runs, scope) {
+  return unlinkedInScope(runs || [], scope).map((run) => ({
+    run,
+    session: run.session_name || run.execution?.session_id || "",
+    window: run.execution?.window_id || "",
+    socket: run.execution?.socket ? socketShort(run.execution.socket) : "",
+  }));
+}
+
+/// Whether the "Windows not tracked as Work" section starts expanded: the
+/// remembered choice when there is one, else collapsed while no Work is
+/// tracked anywhere (the sessions navigator already lists those windows).
+export function untrackedExpanded(stored, workCount) {
+  if (stored === "1") return true;
+  if (stored === "0") return false;
+  return workCount > 0;
+}

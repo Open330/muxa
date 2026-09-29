@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workspaces merge with the session of the same name, and names repeated
   across tmux servers read `name · socket`. Selecting one scopes the Work
   board, unlinked executions, the Sessions navigator, the Agents/Panes tables
-  and the Timeline, kept in `#session=`. Presentation only: no Work is
+  and the Timeline, kept in the URL fragment. Presentation only: no Work is
   created and no window is tagged. With no managed Work at all, the summary
   cards and empty board collapse into one line pointing at `muxa work up`,
   and the Sessions navigator comes first.
@@ -79,6 +79,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Dashboard: the rail's scope and the Sessions navigator's selection are now
+  separate. The rail writes `#workspace=<name>` (plus `&wsocket=` only when the
+  session name exists on several tmux servers) and scopes the page; the
+  navigator's `#session=`/`#window=`/`#pane=` only choose what its detail side
+  and the pane drawer show, so clicking a window no longer rescopes the page
+  or the Timeline filter. Old `#session=` links are migrated to the same scope
+  once on load.
+- Dashboard: while the rail is scoped to a session, the Sessions tree shows
+  only that session, expanded, with a **show all sessions** switch; the filter
+  box works inside the scope.
+- Dashboard: the Collaboration panel follows the rail scope — only messages
+  whose sender or recipient pane is in the scoped session, with pane-less
+  participants (the console, agents outside tmux) kept only when they talked
+  to an in-scope one — and its header reads **scoped to <name> · clear**.
+- Dashboard: the Workspaces header is a count badge with the wording in its
+  tooltip, instead of text that truncated to `18 sess…` in the narrow rail.
 - CI runs the dashboard's JavaScript tests
   (`node --test crates/muxa/tests-js/*.test.mjs`) on Node 22.
 - A 401/403 from a dashboard control request now re-reads `/api/access`
@@ -93,6 +109,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Dashboard: with no managed Work, the unlinked tmux windows were hidden with
+  the empty board. They are now a compact, collapsible **Windows not tracked
+  as Work (N)** section (collapsed by default then, remembered per browser),
+  scoped by the rail, whose rows open the window in the navigator.
 - IPC observation subscriptions now stop on daemon shutdown, including blocked
   stream writes, without consuming the five-second request drain deadline.
   In-flight mutation handlers retain their existing drain guarantee.

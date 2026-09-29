@@ -265,26 +265,62 @@ counts, a rolled-up state (error > waiting > working > idle, as in the
 [Sessions navigator](#sessions-windows-and-panes), with a Work's error and
 attention signals counted too) and its Work count when it has any. A session
 name that exists on several tmux servers is shown as `name · socket`; a managed
-workspace with no live session keeps its own entry. The header counts
-sessions; the **all workspaces** row counts Works and agents. Sort by
+workspace with no live session keeps its own entry. The header shows the
+number of entries as a badge (its tooltip spells out sessions, managed
+workspaces and Works); the **all workspaces** row counts Works and agents. Sort by
 **priority** (rolled-up state), **latest** (last agent or Work activity) or
 **A-Z**.
 
 This is presentation only: an entry built from a session never creates Work
 and never tags a tmux window. Work still only comes from managed runs.
 
-Selecting an entry scopes the page to it: the Work board (that workspace's
-managed Works), unlinked executions (that session's windows), the Sessions
-navigator (selects the session), the Agents and Panes tables, and the
-Timeline's workspace filter. Picking a session in the navigator or the
-Timeline filter selects its rail entry too, and **all workspaces** (or ∅)
-clears the scope. The selection is the navigator's `#session=<name>`
-(`&socket=` for a session on a specific server), so a link restores it.
-Viewers see the same rail; it carries only metadata.
+Selecting an entry sets the page **scope**:
+
+- the Work board shows that workspace's managed Works, and **Windows not
+  tracked as Work** that session's windows;
+- the Sessions navigator tree shows only that session, expanded, with a
+  **show all sessions** switch (the filter box still works inside the scope);
+- the Agents and Panes tables and the Timeline's workspace filter follow it;
+- the Collaboration panel keeps only messages whose sender or recipient pane
+  is in that session (panes are mapped to sessions by the live pane scan, and
+  a pane that has since closed by the session name the message recorded). A
+  participant without a pane — the operator console, an agent outside tmux —
+  appears only through a message it exchanged with an in-scope participant.
+  The panel header reads **scoped to <name> · clear**. The collaboration API
+  has no session filter (its room filter is a single window), so this is done
+  in the browser over the loaded range; a managed workspace with no live
+  session keeps the messages filed under its Work.
+
+Picking a session in the Timeline filter selects its rail entry too, and **all
+workspaces** (or ∅, or **clear** in the Collaboration header) clears the scope.
+Selecting a session, window or pane in the navigator does *not* change the
+scope; it only chooses what the navigator's detail side and the pane drawer
+show. Viewers see the same rail; it carries only metadata.
+
+Scope and detail selection live in separate URL fragment parameters, so a link
+restores both:
+
+| Parameter | Set by | Meaning |
+| --- | --- | --- |
+| `workspace=<name>` | rail | Page scope: a tmux session name, or a managed workspace id with no live session. |
+| `wsocket=<socket>` | rail | The tmux server of the scoped session; only written when that session name exists on several servers. |
+| `session=<name>` | navigator | Detail selection: a session. |
+| `window=<@id>` | navigator, untracked-window rows | Detail selection: a window (with `session=`). |
+| `pane=<id>` | pane drawer | The open pane drawer. |
+| `socket=<socket>` | navigator, pane drawer | The tmux server of the selected session/window or open pane. |
+
+A link from before the split (`#session=<name>` with no `workspace=`) used to
+scope the whole page; on load it is migrated once to the same
+`workspace=<name>` (and `wsocket=` from its `socket=`), and the navigator
+selection is kept.
 
 When there is no managed Work at all, the six summary cards and the empty board
 collapse into one line (with the **start work** form when
-`allow_work_start` is on) and the Sessions navigator follows it directly.
+`allow_work_start` is on) and the Sessions navigator follows it directly. The
+live windows are still listed under a compact **Windows not tracked as Work
+(N)** section, collapsed by default in that case (the browser remembers when
+you expand it). It follows the rail scope, and each row opens that window in
+the navigator (`#window=`).
 
 ### Work board
 
@@ -377,11 +413,13 @@ the top of the page is organized the same way.
   reads `session › window › pane`, and the session and window parts jump to
   the navigator.
 
-Selecting a session or window here also selects that session in the
-[workspace rail](#workspace-rail), which scopes the rest of the page.
-The selection is kept in the URL fragment: `#session=<name>`,
-`#window=<@id>` (with `&socket=<socket>` when more than one tmux server is
-running) and `#pane=<id>` for an open drawer, so a link restores all three.
+While the [workspace rail](#workspace-rail) scopes the page to a session, the
+tree shows only that session; **show all sessions** lists every session again
+without changing the scope. Selecting a session or window here only chooses
+what this panel shows; it never rescopes the page. The selection is kept in
+the URL fragment: `#session=<name>`, `#window=<@id>` (with `&socket=<socket>`
+when more than one tmux server is running) and `#pane=<id>` for an open
+drawer, next to the rail's `#workspace=`, so a link restores all of them.
 
 The layout endpoint is metadata, so viewers and `public_read` visitors can
 read it; the socket is looked up in the scanned inventory, never used as a

@@ -5,8 +5,10 @@ import {
   buildTopology,
   filterTopology,
   layoutTiles,
+  paneSessionResolver,
   parseTopologyHash,
   rollupState,
+  sessionsInScope,
   withTopologyHash,
 } from "../src/dashboard/web/topology-model.mjs";
 import { withPaneHash } from "../src/dashboard/web/pane-drawer.mjs";
@@ -129,4 +131,34 @@ test("navigator and pane deep links share the fragment", () => {
   hash = withPaneHash(hash, null);
   assert.deepEqual(parseTopologyHash(hash), { session: "muxa", window: "@3", socket: "default" });
   assert.equal(withTopologyHash(hash, null), "");
+});
+
+test("a rail scope narrows the navigator to its session", () => {
+  const topology = buildTopology([
+    pane("%1", "youtube", "@1", 1, 0),
+    pane("%2", "somun", "@2", 1, 0),
+    pane("%3", "youtube", "@3", 1, 0, { socket: "/tmp/tmux-501/work" }),
+  ], []);
+  assert.equal(sessionsInScope(topology, null).length, 3);
+  assert.deepEqual(sessionsInScope(topology, { session: "youtube", socket: "" }).map((s) => s.socket),
+    ["/tmp/tmux-501/default", "/tmp/tmux-501/work"]);
+  assert.deepEqual(sessionsInScope(topology, { session: "youtube", socket: "work" }).map((s) => s.socket),
+    ["/tmp/tmux-501/work"]);
+  // A managed workspace without a live session has no tree.
+  assert.deepEqual(sessionsInScope(topology, { session: "", socket: "", workspace: "billing" }), []);
+});
+
+test("a pane id resolves to its session, by socket when the id repeats", () => {
+  const topology = buildTopology([
+    pane("%1", "youtube", "@1", 1, 0),
+    pane("%1", "api", "@9", 1, 0, { socket: "/tmp/tmux-501/work" }),
+    pane("%2", "somun", "@2", 1, 0),
+  ], []);
+  const resolve = paneSessionResolver(topology);
+  assert.deepEqual(resolve("%2"), { session: "somun", socket: "default" });
+  assert.deepEqual(resolve("%2", "/tmp/tmux-501/default"), { session: "somun", socket: "default" });
+  assert.equal(resolve("%2", "work"), null, "a pane on another server is not this one");
+  assert.equal(resolve("%1"), null, "ambiguous without a socket");
+  assert.deepEqual(resolve("%1", "work"), { session: "api", socket: "work" });
+  assert.equal(resolve("%404"), null);
 });

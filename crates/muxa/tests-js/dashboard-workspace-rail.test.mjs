@@ -1,15 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildTopology } from "../src/dashboard/web/topology-model.mjs";
+import { buildTopology, parseTopologyHash, withTopologyHash } from "../src/dashboard/web/topology-model.mjs";
+import { parsePaneHash, withPaneHash } from "../src/dashboard/web/pane-drawer.mjs";
 import {
   buildRailEntries,
   findRailEntry,
+  findScopeEntry,
   inRailScope,
+  migrateLegacyScopeHash,
+  parseScopeHash,
+  railEntryScopeRef,
   railScope,
   railStateClass,
   sortRailEntries,
   unlinkedInScope,
+  untrackedExpanded,
+  untrackedWindowRows,
+  withScopeHash,
   worksInScope,
 } from "../src/dashboard/web/workspace-rail.mjs";
 
@@ -224,4 +232,92 @@ test("selecting an entry scopes Work, unlinked windows, and panes by session", (
   assert.equal(unlinkedInScope(runs, billingScope).length, 0);
   assert.equal(findRailEntry(entries, { session: "nope" }), null);
   assert.equal(railScope(null), null);
+});
+
+test("scope (#workspace=) and detail selection (#session/#window/#pane) are separate", () => {
+  assert.equal(parseScopeHash(""), null);
+  assert.equal(parseScopeHash("#session=youtube"), null, "a navigator selection is not a scope");
+  assert.deepEqual(parseScopeHash("#workspace=youtube"), { workspace: "youtube", socket: null });
+  assert.deepEqual(parseScopeHash("#workspace=api&wsocket=work"), { workspace: "api", socket: "work" });
+
+  let hash = withScopeHash("", { workspace: "youtube", socket: null });
+  assert.equal(hash, "#workspace=youtube");
+  // Selecting a window in the navigator keeps the scope…
+  hash = withTopologyHash(hash, { session: "somun", window: "@3", socket: "default" });
+  assert.deepEqual(parseScopeHash(hash), { workspace: "youtube", socket: null });
+  assert.deepEqual(parseTopologyHash(hash), { session: "somun", window: "@3", socket: "default" });
+  // …and so does opening and closing a pane.
+  hash = withPaneHash(hash, { pane: "%5", socket: "default" });
+  assert.deepEqual(parsePaneHash(hash), { pane: "%5", socket: "default" });
+  hash = withPaneHash(hash, null);
+  assert.deepEqual(parseScopeHash(hash), { workspace: "youtube", socket: null });
+  // Changing the scope keeps the detail selection; clearing it removes only
+  // the scope.
+  hash = withScopeHash(hash, { workspace: "api", socket: "/tmp/tmux-501/work" });
+  assert.deepEqual(parseScopeHash(hash), { workspace: "api", socket: "work" });
+  assert.deepEqual(parseTopologyHash(hash), { session: "somun", window: "@3", socket: "default" });
+  hash = withScopeHash(hash, null);
+  assert.equal(parseScopeHash(hash), null);
+  assert.equal(new URLSearchParams(hash.slice(1)).has("wsocket"), false);
+  assert.deepEqual(parseTopologyHash(hash), { session: "somun", window: "@3", socket: "default" });
+  // Clearing the navigator selection leaves the scope alone.
+  assert.equal(withTopologyHash("#workspace=api&session=api", null), "#workspace=api");
+});
+
+test("old #session= links (before the split) migrate to the same scope once", () => {
+  assert.equal(migrateLegacyScopeHash("#session=youtube"), "#session=youtube&workspace=youtube");
+  const migrated = migrateLegacyScopeHash("#session=api&window=%407&socket=%2Ftmp%2Ftmux-501%2Fwork");
+  assert.deepEqual(parseScopeHash(migrated), { workspace: "api", socket: "work" });
+  // The navigator selection survives the migration.
+  assert.deepEqual(parseTopologyHash(migrated), { session: "api", window: "@7", socket: "/tmp/tmux-501/work" });
+  // New links already carry a scope, and a bare pane link has none.
+  assert.equal(migrateLegacyScopeHash("#workspace=web&session=api"), null);
+  assert.equal(migrateLegacyScopeHash("#pane=%255&socket=default"), null);
+  assert.equal(migrateLegacyScopeHash(""), null);
+});
+
+test("rail entries round-trip through #workspace=, with wsocket only when ambiguous", () => {
+  const topology = buildTopology(
+    [
+      pane("%1", "api", "@1"),
+      pane("%1", "api", "@1", { socket: "/tmp/tmux-501/work" }),
+      pane("%2", "web", "@2"),
+    ],
+    [],
+  );
+  const entries = buildRailEntries({ topology, workspaces: [managed("billing", [{}])] });
+  const rows = byName(entries);
+  assert.deepEqual(railEntryScopeRef(rows.web, entries), { workspace: "web", socket: null });
+  assert.deepEqual(railEntryScopeRef(rows["api · work"], entries), { workspace: "api", socket: "work" });
+  assert.deepEqual(railEntryScopeRef(rows.billing, entries), { workspace: "billing", socket: null });
+  assert.equal(railEntryScopeRef(null, entries), null);
+  for (const entry of entries) {
+    const hash = withScopeHash("#session=web", railEntryScopeRef(entry, entries));
+    assert.equal(findScopeEntry(entries, parseScopeHash(hash)), entry, entry.label);
+  }
+  assert.equal(findScopeEntry(entries, null), null);
+  assert.equal(findScopeEntry(entries, { workspace: "gone" }), null);
+});
+
+test("untracked windows are scoped and link to the navigator window", () => {
+  const topology = buildTopology([pane("%1", "api", "@1"), pane("%2", "web", "@2")], []);
+  const entries = buildRailEntries({ topology });
+  const runs = [run("api", "@1"), run("web", "@2"), run("web", "@3")];
+  const all = untrackedWindowRows(runs, null);
+  assert.equal(all.length, 3);
+  assert.deepEqual(
+    { session: all[0].session, window: all[0].window, socket: all[0].socket },
+    { session: "api", window: "@1", socket: "default" },
+  );
+  const web = untrackedWindowRows(runs, railScope(findRailEntry(entries, { session: "web" })));
+  assert.deepEqual(web.map((row) => row.window), ["@2", "@3"]);
+  assert.deepEqual(untrackedWindowRows(undefined, null), []);
+});
+
+test("the untracked section starts collapsed only while no Work is tracked", () => {
+  assert.equal(untrackedExpanded("", 0), false);
+  assert.equal(untrackedExpanded(null, 3), true);
+  // A remembered choice wins either way.
+  assert.equal(untrackedExpanded("1", 0), true);
+  assert.equal(untrackedExpanded("0", 3), false);
 });

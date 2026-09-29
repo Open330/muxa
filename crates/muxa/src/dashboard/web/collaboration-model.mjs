@@ -234,6 +234,43 @@ export function sequenceParticipants(requests) {
   }));
 }
 
+/// The tmux session a participant's pane lives in, `{ session, socket }`, or
+/// null. `resolvePane(paneId, socket)` is the live pane scan's answer
+/// (topology-model.mjs paneSessionResolver); a pane the scan no longer knows
+/// falls back to the session name the request recorded. The operator console
+/// and agents without a pane have no session.
+export function participantSession(participant, resolvePane = () => null) {
+  if (!participant || participant.console || !participant.pane) return null;
+  const socket = participant.socket || participant.room?.socket || null;
+  const live = resolvePane(participant.pane, socket);
+  if (live) return live;
+  const name = participant.tmux_session_name;
+  return name ? { session: name, socket: socket ? shortSocket(socket) : null } : null;
+}
+
+/// Requests inside a rail scope (`{ session, socket, workspace }` from
+/// workspace-rail.mjs railScope; `null` = everything). For a session scope a
+/// request is kept when its sender or recipient pane belongs to that session,
+/// so a participant without a pane (the console, an agent outside tmux)
+/// appears only through a message exchanged with an in-scope participant. A
+/// managed workspace with no live session keeps the requests filed under its
+/// Work.
+export function scopeCollaborationRequests(requests, scope, resolvePane = () => null) {
+  const all = requests || [];
+  if (!scope) return all;
+  if (!scope.session) {
+    if (!scope.workspace) return [];
+    return all.filter((request) =>
+      (request?.workspace_id || request?.work?.workspace_id || "") === scope.workspace);
+  }
+  const inScope = (participant) => {
+    const hit = participantSession(participant, resolvePane);
+    if (!hit || hit.session !== scope.session) return false;
+    return !scope.socket || !hit.socket || hit.socket === shortSocket(scope.socket);
+  };
+  return all.filter((request) => inScope(request?.from) || inScope(request?.to));
+}
+
 export function dominantCount(counts) {
   return Object.entries(counts || {}).sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0]?.[0] || "unknown";
 }

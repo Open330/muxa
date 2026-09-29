@@ -299,3 +299,36 @@ export function withTopologyHash(hash, selection) {
   const rest = params.toString();
   return rest ? `#${rest}` : "";
 }
+
+/// Session nodes inside a rail scope (`{ session, socket }`, see
+/// workspace-rail.mjs railScope). `null` scope means every session; a scope
+/// without a session (a managed workspace with no live tmux session) has
+/// none. An empty scope socket matches the session on any server.
+export function sessionsInScope(topology, scope) {
+  const sessions = (topology?.sockets || []).flatMap((socketNode) => socketNode.sessions);
+  if (!scope) return sessions;
+  if (!scope.session) return [];
+  return sessions.filter((session) => session.name === scope.session
+    && (!scope.socket || socketShort(session.socket) === socketShort(scope.socket)));
+}
+
+/// A function resolving a pane (id + optional socket) to the tmux session it
+/// lives in, `{ session, socket }`, or null when the pane scan does not know
+/// it. A pane id that exists on several servers only resolves when the
+/// socket settles it.
+export function paneSessionResolver(topology) {
+  const byId = new Map();
+  for (const node of topology?.nodes?.values() || []) {
+    if (node.type !== "pane") continue;
+    const list = byId.get(node.id) || [];
+    list.push(node);
+    byId.set(node.id, list);
+  }
+  return (paneId, socket) => {
+    let candidates = byId.get(paneId) || [];
+    if (socket) candidates = candidates.filter((pane) => socketShort(pane.socket) === socketShort(socket));
+    if (candidates.length !== 1) return null;
+    const session = topology.nodes.get(candidates[0].sessionKey);
+    return session ? { session: session.name, socket: socketShort(session.socket) } : null;
+  };
+}

@@ -38,7 +38,8 @@
       <div class="panel-header compact">
         <div class="panel-title">
           <h2>Workspaces</h2>
-          <span class="panel-meta" id="sessions-meta"></span>
+          <span class="rail-count" id="sessions-meta" aria-hidden="true"></span>
+          <span class="sr-only" id="sessions-meta-label"></span>
         </div>
         <div class="session-actions">
           <select id="session-sort" class="select compact-select" title="Sort workspaces">
@@ -103,6 +104,7 @@
         </div>
         <div class="panel-content topology-content" id="topology-content">
           <nav class="topology-tree-wrap" aria-label="Sessions, windows and panes">
+            <div class="topology-scope" id="topology-scope" hidden></div>
             <ul class="topology-tree" id="topology-tree" role="tree" aria-label="Sessions">
               <li class="empty-block">loading…</li>
             </ul>
@@ -174,6 +176,7 @@
             </button>
             <h2>Collaboration</h2>
             <span class="panel-meta" id="collaboration-meta"></span>
+            <span class="scope-chip" id="collaboration-scope" hidden>scoped to <b id="collaboration-scope-name"></b> · <button class="scope-chip-clear" type="button" id="collaboration-scope-clear" aria-label="Clear workspace scope: show all workspaces">clear</button></span>
           </div>
           <button class="control-btn" type="button" id="collaboration-refresh">refresh</button>
         </div>

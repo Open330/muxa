@@ -224,10 +224,66 @@ button, select {
   overflow: hidden;
 }
 
-.session-panel .panel-header.compact .panel-meta {
+/* Workspace count: a badge that never truncates in the narrow rail; the
+   full wording is its tooltip and a screen-reader label. */
+.rail-count {
+  flex: 0 0 auto;
+  min-width: 20px;
+  height: 18px;
+  padding: 0 6px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--fg-muted);
+  font: 600 10px/1 var(--mono);
+  cursor: default;
+}
+
+.session-panel .panel-header.compact h2 {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* "scoped to youtube · clear" in a panel header, and the navigator's
+   "youtube only · show all sessions" bar. */
+.scope-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   min-width: 0;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 46%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--fg-muted);
+  font: 11px/1 var(--mono);
+  white-space: nowrap;
+}
+.scope-chip[hidden],
+.topology-scope[hidden] { display: none; }
+.scope-chip b {
   overflow: hidden;
+  max-width: 22ch;
+  color: var(--fg);
+  font-weight: 600;
   text-overflow: ellipsis;
+}
+.scope-chip-clear {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+.scope-chip-clear:hover { text-decoration: underline; }
+.scope-chip-clear:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
 }
 
 .panel.collapsed .panel-header {
@@ -356,8 +412,10 @@ button, select {
 .workbench.no-work .work-items-panel h2,
 .workbench.no-work #work-items-meta,
 .workbench.no-work #toggle-work-execution,
-.workbench.no-work .work-items-content,
 .workbench.no-work .work-items-panel:not(.can-start) .work-start-form { display: none; }
+/* With no Work the board holds only the untracked-windows section. */
+.workbench.no-work .work-items-content { display: block; padding-top: 0; }
+.work-items-content[hidden] { display: none !important; }
 
 .work-items-content {
   display: grid;
@@ -1687,16 +1745,34 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
 }
 
 .unlinked-heading {
+  width: 100%;
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
-  padding-bottom: 8px;
+  padding: 0;
+  border: 0;
+  background: none;
   color: var(--fg-muted);
   font: 10px/1.3 var(--mono);
   letter-spacing: .05em;
+  text-align: left;
   text-transform: uppercase;
+  cursor: pointer;
 }
+.unlinked-heading:hover .unlinked-title { color: var(--fg); }
+.unlinked-heading:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+.unlinked-twisty {
+  display: inline-block;
+  width: 1.4em;
+  color: var(--fg-dim);
+}
+.unlinked-executions:not(.collapsed) .unlinked-heading { padding-bottom: 8px; }
+.unlinked-list[hidden] { display: none; }
 
 .unlinked-heading small {
   color: var(--fg-dim);
@@ -1719,6 +1795,17 @@ table.data tr.lagged td { background: color-mix(in srgb, var(--red) 12%, transpa
   border-top: 1px solid var(--border-soft);
   color: var(--fg-muted);
   font: 10px/1.2 var(--mono);
+}
+
+a.unlinked-row {
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+a.unlinked-row:hover { background: var(--row-hover); }
+a.unlinked-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .unlinked-row > span {
@@ -2831,6 +2918,23 @@ table.data td.pane-cell { font-family: var(--mono); color: var(--accent); }
   border-right: 1px solid var(--border);
   background: var(--surface-2);
 }
+.topology-scope {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface-2));
+  color: var(--fg-muted);
+  font: 11px/1.3 var(--mono);
+}
+.topology-scope b { color: var(--fg); font-weight: 600; }
+
 .topology-tree,
 .topology-tree ul {
   margin: 0;
