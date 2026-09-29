@@ -19,10 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/auth/enroll`; later sign-ins go straight in. `required_group` is now
   optional, and `[dashboard.login] enrollment = false` restores group-only
   sign-in. Enrolled accounts are stored by issuer and subject in a private
-  SQLite file, listed and removed from the dashboard's **operators** dialog
+  SQLite file, listed and removed from the dashboard's **access** dialog
   (`GET /api/operators`, `POST /api/operators/{id}/remove`), and removal ends
   their sessions immediately. Wrong tokens are limited per pending enrollment
   and globally backed off.
+- Read-only viewers for dashboard sign-in. An account matching
+  `[dashboard.login] viewer_group` or a viewer rule (`email:<address>`,
+  `email:*@<domain>` or `sub:<subject>`; email rules need `email_verified`)
+  can read the dashboard like a `public_read` visitor, and every write returns
+  403. Operators manage rules in the dashboard's new **access** dialog
+  (`GET/POST /api/viewers`, `POST /api/viewers/{id}/remove`), which also shows
+  the current account and how it is authorized; `viewer_rules` in the
+  configuration are shown read-only. Removing a rule ends its sessions. A
+  viewer can become an operator with **upgrade with token**. Accounts matching
+  nothing still get no access. `/api/access` and `/auth/session` report `role`.
 
 ### Changed
 
