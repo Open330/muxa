@@ -330,6 +330,35 @@ button, select {
   overflow: visible;
 }
 
+/* No managed Work anywhere: the six zero cards and the empty board collapse
+   into one line above the Sessions navigator. The start-work form stays
+   when the daemon allows starting Work from the dashboard. */
+.work-empty-line {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: normal;
+}
+
+.work-empty-line code {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.work-empty-line a {
+  color: var(--accent);
+}
+
+.workbench.no-work .overview-strip { display: none; }
+.workbench.no-work .work-items-panel { order: -1; }
+.workbench.no-work .work-items-panel .panel-header { border-bottom: none; min-height: 0; }
+.workbench.no-work .work-items-panel h2,
+.workbench.no-work #work-items-meta,
+.workbench.no-work #toggle-work-execution,
+.workbench.no-work .work-items-content,
+.workbench.no-work .work-items-panel:not(.can-start) .work-start-form { display: none; }
+
 .work-items-content {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));

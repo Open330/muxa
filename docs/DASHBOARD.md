@@ -253,7 +253,42 @@ session name, a ticket-shaped window name, or repository cwd.
 | Agent session | daemon agent session attached to a Run pane | Runtime state, model, prompt/response, control target. |
 | Signal | attention, blocked, error | Overlay on Work; never a board lane. |
 
-The workspace rail remains flat. Selecting a workspace filters the four local
+### Workspace rail
+
+muxa's managed layout is Workspace = tmux session, Run = window, Agent = pane,
+so the **Workspaces** rail lists every live tmux session, whether or not
+anything in it was started with `muxa work up`. It is the union of the
+sessions in `/api/panes` (plus any that only appear in `unlinked_executions`)
+and the managed workspaces in `/api/works`; a managed workspace whose id equals
+a session name is the same entry. Each entry shows its window and agent
+counts, a rolled-up state (error > waiting > working > idle, as in the
+[Sessions navigator](#sessions-windows-and-panes), with a Work's error and
+attention signals counted too) and its Work count when it has any. A session
+name that exists on several tmux servers is shown as `name · socket`; a managed
+workspace with no live session keeps its own entry. The header counts
+sessions; the **all workspaces** row counts Works and agents. Sort by
+**priority** (rolled-up state), **latest** (last agent or Work activity) or
+**A-Z**.
+
+This is presentation only: an entry built from a session never creates Work
+and never tags a tmux window. Work still only comes from managed runs.
+
+Selecting an entry scopes the page to it: the Work board (that workspace's
+managed Works), unlinked executions (that session's windows), the Sessions
+navigator (selects the session), the Agents and Panes tables, and the
+Timeline's workspace filter. Picking a session in the navigator or the
+Timeline filter selects its rail entry too, and **all workspaces** (or ∅)
+clears the scope. The selection is the navigator's `#session=<name>`
+(`&socket=` for a session on a specific server), so a link restores it.
+Viewers see the same rail; it carries only metadata.
+
+When there is no managed Work at all, the six summary cards and the empty board
+collapse into one line (with the **start work** form when
+`allow_work_start` is on) and the Sessions navigator follows it directly.
+
+### Work board
+
+Selecting a workspace filters the four local
 Work stages: **Queued**, **In progress**, **Review**, and **Done**. Attention,
 blocked, and error render as signal badges on the card so a waiting agent does
 not silently rewrite the operator's workflow stage. Selecting a Work opens a
@@ -270,6 +305,8 @@ Managed tmux options (`@muxa_workspace_id`, `@muxa_work_id`, agent role/task)
 link a Run to Work. `muxa work up` also stores optional external-source metadata
 on the window, which `/api/works` discovers and persists. Unmanaged windows stay
 in `unlinked_executions`; they are never guessed into Work from their names.
+Their sessions still appear as workspaces in the rail (see
+[Workspace rail](#workspace-rail)), but Work only comes from managed runs.
 
 ## Collaboration graph and history API
 
@@ -340,6 +377,8 @@ the top of the page is organized the same way.
   reads `session › window › pane`, and the session and window parts jump to
   the navigator.
 
+Selecting a session or window here also selects that session in the
+[workspace rail](#workspace-rail), which scopes the rest of the page.
 The selection is kept in the URL fragment: `#session=<name>`,
 `#window=<@id>` (with `&socket=<socket>` when more than one tmux server is
 running) and `#pane=<id>` for an open drawer, so a link restores all three.
