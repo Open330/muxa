@@ -14,6 +14,16 @@ import {
 } from "./topology-model.mjs";
 import { logicalWorkKey, normalizeAgent, validateWorkSnapshot, WORK_STAGES } from "./work-model.mjs";
 import {
+  buildRailEntries,
+  findRailEntry,
+  inRailScope,
+  railScope,
+  railStateClass,
+  sortRailEntries,
+  unlinkedInScope,
+  worksInScope,
+} from "./workspace-rail.mjs";
+import {
   collaborationSequence,
   dominantCount,
   normalizeCollaborationPayload,
@@ -411,6 +421,9 @@ const dom = {
   topologyMeta: document.getElementById("topology-meta"),
   topologyFilter: document.getElementById("topology-filter"),
   jumpAgentsCount: document.getElementById("jump-agents-count"),
+  workbench: document.querySelector(".workbench"),
+  workItemsPanel: document.getElementById("work-items-panel"),
+  workEmptyLine: document.getElementById("work-empty-line"),
 };
 
 function setConnectionStatus(cls, label) {
@@ -439,6 +452,7 @@ function renderAccess() {
   document.querySelector("#manage-access").hidden = !(editing && login.available);
   if (dom.upgradeAccess) dom.upgradeAccess.hidden = !canUpgrade;
   const canStartWork = editing && access.workStartAvailable;
+  dom.workItemsPanel?.classList.toggle("can-start", Boolean(access.workStartAvailable));
   dom.accessMode.textContent = viaSession
     ? "signed in"
     : viewing
@@ -619,6 +633,8 @@ const store = {
     sessionSummaries: [],
     workProjectionKey: "",
     workspaces: [],
+    railKey: "",
+    railEntries: [],
   },
   ui: {
     collapsedPanels: loadSet(COLLAPSED_PANELS_KEY, ["timeline-panel", "data-panel"]),
@@ -778,15 +794,32 @@ function adaptWork(raw) {
   };
 }
 
-function selectedWorkspace() {
+// Rail entries: every tmux session (muxa's layout makes a session a
+// workspace) merged with the managed workspaces from /api/works. Presentation
+// only — an entry never creates Work.
+function railEntries() {
+  const cacheKey = `${store.revisions.works}:${store.revisions.panes}:${store.revisions.agents}:${store.agents.size}`;
+  if (store.cache.railKey === cacheKey) return store.cache.railEntries;
+  store.cache.railKey = cacheKey;
+  store.cache.railEntries = buildRailEntries({
+    workspaces: workspaces(),
+    topology: currentTopology(),
+    unlinked: store.workSnapshot.unlinked_executions || [],
+  });
+  return store.cache.railEntries;
+}
+
+function selectedRailEntry() {
   if (!store.ui.selectedWorkspaceKey) return null;
-  return workspaces().find((workspace) => workspace.key === store.ui.selectedWorkspaceKey) || null;
+  return railEntries().find((entry) => entry.key === store.ui.selectedWorkspaceKey) || null;
+}
+
+function currentScope() {
+  return railScope(selectedRailEntry());
 }
 
 function visibleWorks() {
-  const selected = selectedWorkspace();
-  if (selected) return selected.works;
-  return workspaces().flatMap((workspace) => workspace.works);
+  return worksInScope(workspaces(), currentScope());
 }
 
 function selectedWork() {
@@ -830,15 +863,27 @@ function normalizeSessionSort(sort) {
   return SESSION_SORTS.has(sort) ? sort : "priority";
 }
 
+// The socket part of the rail scope, so a session name that exists on two
+// tmux servers only shows the selected server's agents and panes.
+function scopeSocket() {
+  const scope = currentScope();
+  return scope?.session && scope.session === selectedSession() ? scope.socket : "";
+}
+
 function agentMatchesSelectedSession(agent) {
   const session = selectedSession();
   if (!session) return true;
-  return sessionForAgent(agent) === session || agent.session_id === session;
+  if (agent.session_id === session) return true;
+  const pane = paneForAgent(agent);
+  return inRailScope({ session, socket: scopeSocket() }, {
+    session: sessionForAgent(agent),
+    socket: pane?.socket || agent.tmux_socket,
+  });
 }
 
 function paneMatchesSelectedSession(pane) {
   const session = selectedSession();
-  return !session || pane.session === session;
+  return !session || inRailScope({ session, socket: scopeSocket() }, pane);
 }
 
 function laneMatchesSelectedSession(lane) {
@@ -863,13 +908,58 @@ function setSelectedSession(session) {
   fetchTimeline({ force: true }).catch(() => {});
 }
 
-function setSelectedWorkspace(workspaceKey) {
-  store.ui.selectedWorkspaceKey = workspaceKey || "";
-  store.ui.selectedWorkKey = "";
-  closeWorkDrawer();
+// Select a rail entry (a tmux session, a managed workspace, or both). The
+// session scopes the Agents/Panes tables and the Timeline, the managed
+// workspace scopes the Work board, and the Sessions navigator selects the
+// session. `#session=` (shared with the navigator) keeps the selection.
+function setSelectedWorkspace(workspaceKey, { updateHash = true, syncNavigator = true } = {}) {
+  const entry = railEntries().find((candidate) => candidate.key === workspaceKey) || null;
+  const nextKey = entry?.key || "";
+  if (store.ui.selectedWorkspaceKey !== nextKey) {
+    store.ui.selectedWorkKey = "";
+    closeWorkDrawer();
+  }
+  store.ui.selectedWorkspaceKey = nextKey;
+  if (syncNavigator) {
+    if (entry?.sessionKey && currentTopology().nodes.has(entry.sessionKey)) {
+      selectTopology(entry.sessionKey, { updateHash: false, syncRail: false });
+    } else if (topologyState.selection) {
+      topologyState.selection = null;
+      renderTopology();
+    }
+  }
+  if (updateHash) {
+    const url = new URL(window.location.href);
+    url.hash = withTopologyHash(url.hash, entry
+      ? { session: entry.sessionName || entry.workspaceKey, socket: entry.sessionName ? entry.socket : null }
+      : null);
+    window.history.replaceState(window.history.state, "", url.toString());
+  }
   renderSessionSidebar();
   renderOverview();
-  renderWorkItems();
+  // setSelectedSession re-renders the tables, Work board and Timeline.
+  if (selectedSession() !== (entry?.sessionName || "")) {
+    setSelectedSession(entry?.sessionName || "");
+  } else {
+    renderAgents();
+    renderPanes();
+    renderWorkItems();
+    renderInspector();
+  }
+}
+
+// Make the rail follow a session picked elsewhere (navigator, Timeline
+// filter, deep link) without looping back into the navigator.
+function syncRailToSession(session, socket, { updateHash = false } = {}) {
+  const entry = session ? findRailEntry(railEntries(), { session, socket }) : null;
+  if (!entry && session) {
+    store.ui.selectedWorkspaceKey = "";
+    setSelectedSession(session);
+    renderSessionSidebar();
+    return;
+  }
+  if ((entry?.key || "") === store.ui.selectedWorkspaceKey && selectedSession() === (entry?.sessionName || "")) return;
+  setSelectedWorkspace(entry?.key || "", { updateHash, syncNavigator: !entry });
 }
 
 // Copy text to clipboard. Uses the async Clipboard API when available
@@ -935,34 +1025,52 @@ function renderOverview() {
 }
 
 function renderSessionSidebar() {
-  const sorted = [...workspaces()].sort(compareWorkspaceRows);
+  const entries = railEntries();
+  const sorted = sortRailEntries(entries, store.ui.sessionSort);
   const visible = sorted.slice(0, store.ui.sessionLimit);
-  const active = store.ui.selectedWorkspaceKey;
-  if (active && !visible.some((workspace) => workspace.key === active)) {
-    const selected = sorted.find((workspace) => workspace.key === active);
+  const active = selectedRailEntry()?.key || "";
+  if (active && !visible.some((entry) => entry.key === active)) {
+    const selected = sorted.find((entry) => entry.key === active);
     if (selected) visible.push(selected);
   }
-  dom.sessionsMeta.textContent = `${Math.min(store.ui.sessionLimit, sorted.length)}/${sorted.length}`;
+  const sessionCount = entries.filter((entry) => entry.sessionName).length;
+  const managedOnly = entries.length - sessionCount;
+  const allWorks = workspaces().flatMap((workspace) => workspace.works);
+  // The Work figure lives on the "all workspaces" row; the header stays short
+  // enough for the narrow rail.
+  dom.sessionsMeta.textContent = `${sessionCount} session${sessionCount === 1 ? "" : "s"}`
+    + (managedOnly ? ` +${managedOnly}` : "");
+  dom.sessionsMeta.title = `${sessionCount} tmux sessions`
+    + (managedOnly ? `, ${managedOnly} managed workspaces without a live session` : "")
+    + ` · ${allWorks.length} tracked Work`;
   if (dom.sessionSort) dom.sessionSort.value = store.ui.sessionSort;
-  const allWorks = sorted.flatMap((workspace) => workspace.works);
   const allAttention = allWorks.filter((work) => work.signals.length > 0).length;
+  const allState = railStateClass(entries.reduce((best, entry) =>
+    stateRank(entry.state) > stateRank(best) ? entry.state : best, ""));
   const allRow = `<button class="session-row${active ? "" : " active"}" type="button" data-workspace="">
-    <span class="session-dot ${allAttention > 0 ? "waiting" : "working"}"></span>
+    <span class="session-dot ${allState}"></span>
     <span class="session-main">
       <span class="session-name">all workspaces</span>
       <span class="session-detail">${allWorks.length} works · ${store.agents.size} agents</span>
     </span>
     <span class="session-score">${allAttention || "·"}</span>
   </button>`;
-  const rows = visible.map((workspace) => {
-    const stateClass = workspace.errors > 0 ? "error" : workspace.attention > 0 ? "waiting" : workspace.active > 0 ? "working" : "idle";
-    return `<button class="session-row${workspace.key === active ? " active" : ""}" type="button" data-workspace="${esc(workspace.key)}">
-      <span class="session-dot ${stateClass}"></span>
+  const rows = visible.map((entry) => {
+    const detail = [
+      entry.sessionName ? `${entry.windows} window${entry.windows === 1 ? "" : "s"}` : "managed",
+      `${entry.agents} agent${entry.agents === 1 ? "" : "s"}`,
+      entry.workCount > 0 ? `${entry.workCount} work${entry.workCount === 1 ? "" : "s"}` : "",
+    ].filter(Boolean).join(" · ");
+    const title = entry.sessionName
+      ? `tmux session ${entry.name} on ${entry.socket}${entry.workspaceKey ? ` · muxa workspace ${entry.workspaceKey}` : ""}`
+      : `muxa workspace ${entry.workspaceKey} (no live tmux session)`;
+    return `<button class="session-row${entry.key === active ? " active" : ""}" type="button" data-workspace="${esc(entry.key)}" title="${esc(title)}">
+      <span class="session-dot ${railStateClass(entry.state)}"></span>
       <span class="session-main">
-        <span class="session-name">${esc(workspace.name)}</span>
-        <span class="session-detail">${workspace.works.length} works · ${workspace.agents} agents</span>
+        <span class="session-name">${esc(entry.label)}</span>
+        <span class="session-detail">${esc(detail)}</span>
       </span>
-      <span class="session-score">${esc(workspaceScoreLabel(workspace))}</span>
+      <span class="session-score">${esc(railScoreLabel(entry))}</span>
     </button>`;
   }).join("");
   const remaining = Math.max(0, sorted.length - store.ui.sessionLimit);
@@ -972,26 +1080,10 @@ function renderSessionSidebar() {
   dom.sessionList.innerHTML = allRow + rows + loadMore;
 }
 
-function compareWorkspaceRows(left, right) {
-  if (store.ui.sessionSort === "name") return left.name.localeCompare(right.name);
-  if (store.ui.sessionSort === "latest") {
-    return (right.latest || "").localeCompare(left.latest || "") || left.name.localeCompare(right.name);
-  }
-  return right.errors - left.errors ||
-    right.attention - left.attention ||
-    right.active - left.active ||
-    right.review - left.review ||
-    (right.latest || "").localeCompare(left.latest || "") ||
-    left.name.localeCompare(right.name);
-}
-
-function workspaceScoreLabel(workspace) {
-  if (store.ui.sessionSort === "latest") return relTime(workspace.latest);
-  if (workspace.errors > 0) return String(workspace.errors);
-  if (workspace.attention > 0) return String(workspace.attention);
-  if (workspace.active > 0) return String(workspace.active);
-  if (workspace.review > 0) return String(workspace.review);
-  return "·";
+function railScoreLabel(entry) {
+  if (store.ui.sessionSort === "latest") return entry.latest ? relTime(entry.latest) : "·";
+  if (!entry.state || entry.state === "idle" || entry.state === "stopped") return "·";
+  return entry.state === "waiting_input" || entry.state === "waiting_choice" ? "waiting" : entry.state;
 }
 
 function buildSessionSummaries() {
@@ -1233,8 +1325,7 @@ function renderExternalBadge(work) {
 }
 
 function renderUnlinkedExecutions() {
-  if (selectedWorkspace()) return "";
-  const runs = store.workSnapshot.unlinked_executions || [];
+  const runs = unlinkedInScope(store.workSnapshot.unlinked_executions || [], currentScope());
   if (runs.length === 0) return "";
   const visible = runs.slice(0, 20);
   const rows = visible.map((run) => `<div class="unlinked-row">
@@ -1259,14 +1350,19 @@ function renderWorkItems() {
   const works = visibleWorks();
   const selected = store.ui.selectedWorkKey;
   const attention = works.filter((work) => work.signals.length > 0).length;
-  const scope = selectedWorkspace()?.name || "all workspaces";
+  // With no managed Work anywhere, the board and the six zero cards
+  // collapse into one line and the Sessions navigator leads the page.
+  const noWork = store.revisions.works > 0 && (store.workSnapshot.works || []).length === 0;
+  dom.workbench?.classList.toggle("no-work", noWork);
+  if (dom.workEmptyLine) dom.workEmptyLine.hidden = !noWork;
+  const scope = selectedRailEntry()?.label || "all workspaces";
   dom.workItemsMeta.textContent = `${scope} · ${works.length} works${attention ? ` · ${attention} attention` : ""}`;
 
   const unlinked = renderUnlinkedExecutions();
   if (works.length === 0 && !unlinked) {
     dom.workItemsContent.innerHTML = `<div class="empty-block work-empty">
       No Work is tracked in this scope.<br>
-      <small>Create one with muxa work up, or choose another workspace.</small>
+      <small>Work only comes from managed runs — start one with muxa work up, or choose another workspace.</small>
     </div>`;
     dom.toggleWorkExecution.textContent = "expand execution";
     return;
@@ -2426,12 +2522,12 @@ function renderTopology() {
   renderTopologyDetail(topology);
 }
 
-function selectTopology(key, { focusTree = false, updateHash = true } = {}) {
+function selectTopology(key, { focusTree = false, updateHash = true, syncRail = true } = {}) {
   const topology = currentTopology();
   const node = topology.nodes.get(key);
   if (!node) return;
   if (node.type === "pane") {
-    selectTopology(node.windowKey, { updateHash });
+    selectTopology(node.windowKey, { updateHash, syncRail });
     paneDrawer?.open({ pane: node.id, socket: node.socket || null });
     return;
   }
@@ -2446,6 +2542,10 @@ function selectTopology(key, { focusTree = false, updateHash = true } = {}) {
     if (session && !topologyExpanded(session, false)) toggleTopologyNode(session.key);
   }
   if (updateHash) writeTopologyHash(node);
+  // A session is a workspace: picking one here scopes the rest of the page.
+  if (syncRail) {
+    syncRailToSession(node.type === "window" ? node.sessionName : node.name, socketShort(node.socket));
+  }
   renderTopology();
   if (focusTree) {
     dom.topologyTree.querySelector(`[data-tkey="${CSS.escape(key)}"]`)?.focus();
@@ -2475,7 +2575,13 @@ function applyTopologyHash() {
         && (!wanted.session || window.sessionName === wanted.session)) || null;
   }
   if (!node && wanted.session) node = sessions.find((session) => session.name === wanted.session) || null;
-  if (node) selectTopology(node.key, { updateHash: false });
+  if (node) {
+    selectTopology(node.key, { updateHash: false });
+    return;
+  }
+  // A managed workspace with no live tmux session is still a rail entry.
+  const entry = wanted.session && !wanted.window ? findRailEntry(railEntries(), wanted) : null;
+  if (entry) setSelectedWorkspace(entry.key, { updateHash: false });
 }
 
 function tileHtml(pane, style = "") {
@@ -2964,7 +3070,7 @@ function renderStaticChips() {
     });
   });
   dom.timelineSession.addEventListener("change", () => {
-    setSelectedSession(dom.timelineSession.value);
+    syncRailToSession(dom.timelineSession.value, null, { updateHash: true });
   });
 
   dom.agentStateChips.innerHTML = AGENT_STATES.map(

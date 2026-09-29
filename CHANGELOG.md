@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dashboard **Workspaces** rail lists every tmux session, since muxa's layout
+  makes a session a workspace. It used to list only workspaces started with
+  `muxa work up`, so a fleet of unmanaged sessions read "0/0 · 0 works". Each
+  entry shows windows, agents, a rolled-up state and its Work count; managed
+  workspaces merge with the session of the same name, and names repeated
+  across tmux servers read `name · socket`. Selecting one scopes the Work
+  board, unlinked executions, the Sessions navigator, the Agents/Panes tables
+  and the Timeline, kept in `#session=`. Presentation only: no Work is
+  created and no window is tagged. With no managed Work at all, the summary
+  cards and empty board collapse into one line pointing at `muxa work up`,
+  and the Sessions navigator comes first.
 - Dashboard pane output is live. The drawer and window tiles subscribe to the
   new operator-only SSE route `GET /api/panes/{pane}/output/stream` instead of
   polling `/output` every 1.5 s / 3 s. The daemon runs one capture loop per
