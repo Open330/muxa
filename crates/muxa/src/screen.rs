@@ -410,6 +410,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn codex_current_working_footer_beats_empty_composer_placeholder() {
+        let codex = parse_manifest(include_str!("screen/agents/codex.toml")).unwrap();
+        let composer =
+            "› Ask Codex to do anything\n  GPT-6-Astra medium · ~/project · Continue task";
+        assert_eq!(codex.classify(composer), Some(ScreenState::Idle));
+        let working = format!("Working (3m 42s • esc to interrupt)\n{composer}");
+        assert_eq!(codex.classify(&working), Some(ScreenState::Working));
+        let blocked = format!("{working}\n› 1. Yes, continue\n  2. No, quit");
+        assert_eq!(codex.classify(&blocked), Some(ScreenState::Blocked));
+        assert_eq!(codex.classify("A response mentions esc to interrupt"), None);
+    }
+
     /// The tail must still be a tail: a transcript longer than `max_lines`
     /// keeps its END, which is where a scrolling agent's current state lives.
     #[test]

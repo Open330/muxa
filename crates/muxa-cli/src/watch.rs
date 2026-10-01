@@ -7094,16 +7094,18 @@ fn merge_agent_for_ui(prior: &Agent, incoming: &Agent) -> Agent {
     if merged.cost_usd.is_none() {
         merged.cost_usd = prior.cost_usd;
     }
-    if merged.rate_limit_5h_pct.is_none() {
+    // Codex rollout quota snapshots are complete: None can deliberately
+    // clear a missing window, rather than mean a partial statusline reading.
+    if merged.kind != AgentKind::Codex && merged.rate_limit_5h_pct.is_none() {
         merged.rate_limit_5h_pct = prior.rate_limit_5h_pct;
     }
-    if merged.rate_limit_5h_resets_at.is_none() {
+    if merged.kind != AgentKind::Codex && merged.rate_limit_5h_resets_at.is_none() {
         merged.rate_limit_5h_resets_at = prior.rate_limit_5h_resets_at;
     }
-    if merged.rate_limit_7d_pct.is_none() {
+    if merged.kind != AgentKind::Codex && merged.rate_limit_7d_pct.is_none() {
         merged.rate_limit_7d_pct = prior.rate_limit_7d_pct;
     }
-    if merged.rate_limit_7d_resets_at.is_none() {
+    if merged.kind != AgentKind::Codex && merged.rate_limit_7d_resets_at.is_none() {
         merged.rate_limit_7d_resets_at = prior.rate_limit_7d_resets_at;
     }
     // NOTE: rate_limited_until, rate_limit_scope, and
@@ -18598,6 +18600,61 @@ mod tests {
         });
         app.set_data(agents, panes);
         app
+    }
+
+    #[test]
+    fn latest_session_order_updates_on_same_state_activity_snapshot() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "alpha", "@1", "WORK", 0, "%1", 0),
+            fake_topology_pane("default", "$2", "beta", "@2", "WORK", 0, "%2", 0),
+        ];
+        let alpha = topology_agent(
+            "alpha-agent",
+            "%1",
+            "default",
+            AgentState::Working,
+            "alpha",
+            1,
+        );
+        let beta = topology_agent(
+            "beta-agent",
+            "%2",
+            "default",
+            AgentState::Working,
+            "beta",
+            2,
+        );
+        let mut app = topology_watch(WatchView::Session, vec![alpha.clone(), beta.clone()], panes);
+        app.apply_sort_preset(WatchSortPreset::Latest);
+        assert_eq!(app.sorted_sessions()[0].name, "beta");
+        let selected = app.sorted_sessions()[0].node_key();
+        select_tree_key(&mut app, &selected);
+
+        let mut updated = alpha;
+        updated.last_activity_at = beta.last_activity_at + time::Duration::seconds(10);
+        apply_outcome(
+            &mut app,
+            RefreshOutcome::Agents(vec![updated.clone(), beta]),
+        );
+        assert_eq!(app.sorted_sessions()[0].name, "alpha");
+        assert_eq!(app.selected_node_key(), Some(selected));
+        assert_eq!(
+            app.sorted_sessions()[0].windows[0].panes[0]
+                .agent
+                .as_ref()
+                .unwrap()
+                .state,
+            AgentState::Working
+        );
+
+        // A legitimate clearing of Codex quota fields must survive the UI merge.
+        updated.rate_limit_7d_pct = Some(100.0);
+        let mut incoming = updated.clone();
+        incoming.rate_limit_7d_pct = None;
+        assert_eq!(
+            merge_agent_for_ui(&updated, &incoming).rate_limit_7d_pct,
+            None
+        );
     }
 
     fn select_tree_key(app: &mut App, key: &TopologyNodeKey) {

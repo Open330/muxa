@@ -102,6 +102,61 @@ pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummar
     out
 }
 
+/// Recover detached Codex sessions from an explicit CLI resume id and its
+/// pane ancestry. Never guess from cwd or choose between multiple panes.
+pub(crate) fn scan_codex_resume_bindings(panes: &[PaneInfo]) -> Vec<(String, PaneInfo)> {
+    #[cfg(not(target_os = "linux"))]
+    let table = crate::process_snapshot::read_current_process_table();
+    unique_codex_resume_bindings(panes.iter().filter(|p| p.pane_pid != 0).map(|pane| {
+        #[cfg(not(target_os = "linux"))]
+        let processes = table.descendants(pane.pane_pid, MAX_DEPTH, MAX_NODES);
+        #[cfg(target_os = "linux")]
+        let processes = read_descendants(pane.pane_pid);
+        (pane, processes)
+    }))
+}
+
+fn unique_codex_resume_bindings<'a>(
+    scanned: impl Iterator<Item = (&'a PaneInfo, Vec<ProcessInfo>)>,
+) -> Vec<(String, PaneInfo)> {
+    let mut candidates: HashMap<String, Vec<PaneInfo>> = HashMap::new();
+    for (pane, processes) in scanned {
+        for process in processes {
+            let Some(sid) = codex_resume_id(&process) else {
+                continue;
+            };
+            let matches = candidates.entry(sid.to_owned()).or_default();
+            if !matches
+                .iter()
+                .any(|p| p.pane_id == pane.pane_id && p.socket == pane.socket)
+            {
+                matches.push(pane.clone());
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(sid, mut panes)| (panes.len() == 1).then(|| (sid, panes.remove(0))))
+        .collect()
+}
+
+fn codex_resume_id(process: &ProcessInfo) -> Option<&str> {
+    if agent_kind(process) != Some(AgentKind::Codex) {
+        return None;
+    }
+    let mut args = process.cmdline.split_whitespace();
+    while let Some(arg) = args.next() {
+        if matches!(arg, "exec" | "app-server" | "review" | "fork") {
+            return None;
+        }
+        if arg == "resume" {
+            let sid = args.next()?;
+            return uuid::Uuid::parse_str(sid).ok().map(|_| sid);
+        }
+    }
+    None
+}
+
 pub fn scan_pane_workload(pane: &PaneInfo) -> WorkloadSummary {
     if pane.pane_pid == 0 {
         return WorkloadSummary::default();
@@ -334,6 +389,53 @@ mod tests {
             depth,
             comm: comm.into(),
             cmdline: cmdline.into(),
+        }
+    }
+
+    #[test]
+    fn resume_binding_deduplicates_wrappers_and_rejects_multiple_endpoints() {
+        let sid = "01a0f231-262f-77a3-9d42-b36d645fefcd";
+        let mut a: PaneInfo = serde_json::from_value(serde_json::json!({
+            "pane_id":"%181", "session":"muxa", "window_index":"0", "pane_index":"0",
+            "tty":"", "current_command":"codex", "title":"", "pane_pid":10,
+            "socket":"default"
+        }))
+        .unwrap();
+        let processes = vec![
+            proc(20, 10, 1, "codex", &format!("codex resume {sid}")),
+            proc(21, 20, 2, "codex", &format!("codex resume {sid}")),
+        ];
+        let bindings = unique_codex_resume_bindings(std::iter::once((&a, processes.clone())));
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].0, sid);
+        let b = a.clone();
+        a.socket = Some("other-server".into());
+        assert!(
+            unique_codex_resume_bindings([(&a, processes.clone()), (&b, processes)].into_iter())
+                .is_empty(),
+            "same session in multiple servers must remain ambiguous"
+        );
+    }
+
+    #[test]
+    fn resume_identity_requires_codex_and_explicit_uuid() {
+        let sid = "01a0f231-262f-77a3-9d42-b36d645fefcd";
+        let cli = proc(
+            20,
+            10,
+            1,
+            "/bin/codex",
+            &format!("codex --yolo resume {sid}"),
+        );
+        assert_eq!(codex_resume_id(&cli), Some(sid));
+        for (comm, args) in [
+            ("zsh", format!("zsh -c codex resume {sid}")),
+            ("codex", "codex resume --last".into()),
+            ("codex", "codex resume session-title".into()),
+            ("codex", "codex app-server --listen unix://".into()),
+            ("codex", format!("codex exec explain resume {sid}")),
+        ] {
+            assert_eq!(codex_resume_id(&proc(20, 10, 1, comm, &args)), None);
         }
     }
 

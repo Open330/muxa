@@ -83,7 +83,7 @@ pub fn command_name(cmd: &str) -> &str {
 pub fn is_wrapper_command(cmd: &str) -> bool {
     matches!(
         command_name(cmd).to_ascii_lowercase().as_str(),
-        "node" | "deno" | "bun" | "python" | "python3" | "ruby"
+        "node" | "deno" | "bun" | "python" | "python3" | "ruby" | "aas"
     )
 }
 
@@ -487,6 +487,8 @@ mod tests {
         assert!(is_wrapper_command("/opt/homebrew/bin/node"));
         assert!(is_wrapper_command("python3"));
         assert!(is_wrapper_command("deno"));
+        assert!(is_wrapper_command("aas"));
+        assert!(is_wrapper_command("/Users/test/.local/bin/aas"));
         assert!(is_wrapper_command("BUN")); // case-insensitive
                                             // Shells aren't wrappers — pane_current_command being a shell
                                             // usually means no agent is foregrounded, not that one is

@@ -677,11 +677,13 @@ fn heartbeat_changes_metrics(agent: &Agent, ev: &AgentEvent) -> bool {
     (model.is_some() && model != &agent.model)
         || (context_used_pct.is_some() && context_used_pct != &agent.context_used_pct)
         || (cost_usd.is_some() && cost_usd != &agent.cost_usd)
-        || (rate_limit_5h_pct.is_some() && rate_limit_5h_pct != &agent.rate_limit_5h_pct)
-        || (rate_limit_5h_resets_at.is_some()
+        || ((agent.kind == AgentKind::Codex || rate_limit_5h_pct.is_some())
+            && rate_limit_5h_pct != &agent.rate_limit_5h_pct)
+        || ((agent.kind == AgentKind::Codex || rate_limit_5h_resets_at.is_some())
             && rate_limit_5h_resets_at != &agent.rate_limit_5h_resets_at)
-        || (rate_limit_7d_pct.is_some() && rate_limit_7d_pct != &agent.rate_limit_7d_pct)
-        || (rate_limit_7d_resets_at.is_some()
+        || ((agent.kind == AgentKind::Codex || rate_limit_7d_pct.is_some())
+            && rate_limit_7d_pct != &agent.rate_limit_7d_pct)
+        || ((agent.kind == AgentKind::Codex || rate_limit_7d_resets_at.is_some())
             && rate_limit_7d_resets_at != &agent.rate_limit_7d_resets_at)
 }
 
@@ -721,6 +723,41 @@ fn mutate_for_event(
     let mut prompt_record: Option<PromptRecord> = None;
     let mut history_entry: Option<HistoryEntry> = None;
     let prev_state = agent.state;
+    // A new Codex prompt or tool execution supersedes a prior quota error.
+    // Older muxa versions inferred that error from utilization alone and then
+    // ignored real work indefinitely. Preserve unrelated errors and agents.
+    if agent.kind == AgentKind::Codex
+        && matches!(
+            agent.rate_limit_source,
+            Some(RateLimitSource::CodexRollout | RateLimitSource::Statusline)
+        )
+        && matches!(
+            ev,
+            AgentEvent::PromptSubmitted { .. }
+                | AgentEvent::ToolStarted { .. }
+                | AgentEvent::ToolCompleted { success: true, .. }
+        )
+    {
+        agent.rate_limit_source = None;
+        agent.rate_limit_scope = None;
+        agent.rate_limited_until = None;
+        if agent.state == AgentState::Error {
+            agent.state = AgentState::Working;
+        }
+    }
+    // A newer rollout record proves Codex resumed despite a missed prompt
+    // hook. Ordinary tool hooks still preserve unrelated errors.
+    if agent.kind == AgentKind::Codex
+        && agent.state == AgentState::Error
+        && at > agent.last_activity_at
+        && matches!(ev, AgentEvent::ToolStarted { tool, .. } if tool == "codex rollout activity")
+    {
+        agent.state = AgentState::Working;
+        agent.last_notification = None;
+        agent.rate_limit_source = None;
+        agent.rate_limit_scope = None;
+        agent.rate_limited_until = None;
+    }
     let touches_activity = event_touches_activity(agent, ev);
 
     match ev {
@@ -844,7 +881,10 @@ fn mutate_for_event(
             // produce. `response.is_none()` doesn't qualify: the
             // adapter may simply have failed to read the transcript,
             // including the case where the turn itself was rate-limited.
-            if response.is_some() {
+            if response.is_some() || (agent.kind == AgentKind::Codex && *idle_confirmed) {
+                if agent.kind == AgentKind::Codex {
+                    agent.last_notification = None;
+                }
                 agent.rate_limit_scope = None;
                 agent.rate_limited_until = None;
                 agent.rate_limit_source = None;
@@ -959,6 +999,18 @@ fn apply_heartbeat(agent: &mut Agent, ev: &AgentEvent) {
     }
     if let Some(t) = rate_limit_7d_resets_at {
         agent.rate_limit_7d_resets_at = Some(*t);
+    }
+
+    // Codex rollout heartbeats contain complete quota snapshots. Clear
+    // missing windows too, including a formerly misclassified weekly primary
+    // that older muxa stored in the five-hour fields.
+    // Only an explicit RateLimited event can mark Codex as blocked.
+    if agent.kind == AgentKind::Codex {
+        agent.rate_limit_5h_pct = *rate_limit_5h_pct;
+        agent.rate_limit_5h_resets_at = *rate_limit_5h_resets_at;
+        agent.rate_limit_7d_pct = *rate_limit_7d_pct;
+        agent.rate_limit_7d_resets_at = *rate_limit_7d_resets_at;
+        return;
     }
 
     let five_hour_saturated = rate_limit_5h_pct.is_some_and(|p| p >= 100.0);
@@ -2014,6 +2066,34 @@ impl Store {
         let mut report = self.reconcile_hosted(live_panes, HostKind::Tmux).await;
         report.paneless_correlated = paneless_correlated;
         report
+    }
+
+    /// Repair a binding using an explicit running `codex resume <session>`
+    /// beneath a known pane. This does not manufacture user activity.
+    pub(crate) async fn rebind_codex_resumes(&self, bindings: &[(String, PaneInfo)]) -> usize {
+        let mut agents = self.agents.write().await;
+        let mut changed = 0;
+        for (sid, pane) in bindings {
+            let Some(agent) = agents.get_mut(sid) else {
+                continue;
+            };
+            if agent.kind != AgentKind::Codex || agent.surface.is_some() {
+                continue;
+            }
+            if agent.pane.as_deref() == Some(&pane.pane_id) && agent.tmux_socket == pane.socket {
+                continue;
+            }
+            agent.pane = Some(pane.pane_id.clone());
+            agent.tmux_socket.clone_from(&pane.socket);
+            agent.tmux_session = Some(pane.session.clone());
+            changed += 1;
+        }
+        if changed > 0 {
+            drop(agents);
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
+        changed
     }
 
     /// Adopt paneless codex hook rows onto the tmux/herdr pane they actually
@@ -3195,6 +3275,112 @@ mod tests {
             AgentState::Error,
             "ToolStarted must not clobber Error"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_real_work_recovers_persisted_quota_error_and_activity() {
+        let t0 = datetime!(2026-05-05 12:00:00 UTC);
+        let t1 = t0 + time::Duration::seconds(10);
+        for source in [RateLimitSource::CodexRollout, RateLimitSource::Statusline] {
+            for event_kind in ["prompt", "tool_started", "tool_completed"] {
+                let store = Store::shared();
+                let mut codex = id("codex-recovery");
+                codex.kind = AgentKind::Codex;
+                store
+                    .apply(&AgentEvent::RateLimited {
+                        id: codex.clone(),
+                        scope: RateLimitScope::FiveHour,
+                        source,
+                        resets_at: Some(t0 + time::Duration::days(7)),
+                        message: None,
+                        at: t0,
+                    })
+                    .await;
+                let event = match event_kind {
+                    "prompt" => AgentEvent::PromptSubmitted {
+                        id: codex,
+                        prompt: "continue".into(),
+                        at: t1,
+                    },
+                    "tool_started" => AgentEvent::ToolStarted {
+                        id: codex,
+                        tool: "exec_command".into(),
+                        subagent: None,
+                        at: t1,
+                    },
+                    _ => AgentEvent::ToolCompleted {
+                        id: codex,
+                        tool: "exec_command".into(),
+                        success: true,
+                        at: t1,
+                    },
+                };
+                store.apply(&event).await;
+                let agent = store.by_session("codex-recovery").await.unwrap();
+                assert_eq!(agent.state, AgentState::Working, "{event_kind}");
+                assert_eq!(agent.last_activity_at, t1, "{event_kind}");
+                assert_eq!(agent.state_entered_at, t1);
+                assert_eq!(agent.rate_limit_source, None);
+                assert_eq!(agent.rate_limit_scope, None);
+                assert_eq!(agent.rate_limited_until, None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_tool_does_not_clear_unrelated_error() {
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        let mut codex = id("codex-error");
+        codex.kind = AgentKind::Codex;
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: codex.clone(),
+                level: NotificationLevel::Error,
+                message: "failure".into(),
+                at: now,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::ToolStarted {
+                id: codex,
+                tool: "exec_command".into(),
+                subagent: None,
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("codex-error").await.unwrap().state,
+            AgentState::Error
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_weekly_snapshot_clears_old_five_hour_metrics() {
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        let mut codex = id("codex-quota");
+        codex.kind = AgentKind::Codex;
+        for (five, seven) in [(Some(100.0), None), (None, Some(100.0))] {
+            store
+                .apply(&AgentEvent::Heartbeat {
+                    id: codex.clone(),
+                    model: None,
+                    context_used_pct: None,
+                    cost_usd: None,
+                    rate_limit_5h_pct: five,
+                    rate_limit_5h_resets_at: five.map(|_| now),
+                    rate_limit_7d_pct: seven,
+                    rate_limit_7d_resets_at: seven.map(|_| now),
+                    at: now,
+                })
+                .await;
+        }
+        let agent = store.by_session("codex-quota").await.unwrap();
+        assert_eq!(agent.rate_limit_5h_pct, None);
+        assert_eq!(agent.rate_limit_5h_resets_at, None);
+        assert_eq!(agent.rate_limit_7d_pct, Some(100.0));
+        assert_eq!(agent.rate_limit_scope, None);
     }
 
     #[tokio::test]
@@ -4749,6 +4935,45 @@ mod tests {
             .unwrap()
             .pane
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_binding_repairs_wrong_pane_without_inventing_activity() {
+        let store = Store::shared();
+        let at = datetime!(2026-10-01 06:00:00 UTC);
+        let sid = "01a0f231-262f-77a3-9d42-b36d645fefcd";
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: sid.into(),
+                    surface: None,
+                    pane: Some("%183".into()),
+                    tmux_socket: None,
+                    cwd: Some("/work/muxa".into()),
+                },
+                at,
+            })
+            .await;
+        let mut changes = store.subscribe_changes();
+        let mut actual = pane("%181");
+        actual.session = "muxa".into();
+        actual.socket = Some("default".into());
+        let bindings = vec![(sid.to_owned(), actual)];
+        assert_eq!(store.rebind_codex_resumes(&bindings).await, 1);
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        let agent = store
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|a| a.session_id == sid)
+            .unwrap();
+        assert_eq!(agent.pane.as_deref(), Some("%181"));
+        assert_eq!(agent.tmux_session.as_deref(), Some("muxa"));
+        assert_eq!(agent.last_activity_at, at);
+        assert_eq!(store.rebind_codex_resumes(&bindings).await, 0);
+        assert!(!changes.has_changed().unwrap());
     }
 
     fn pane(id: &str) -> PaneInfo {
