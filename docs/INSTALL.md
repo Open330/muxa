@@ -4,7 +4,7 @@ This page keeps the detailed install and wiring notes out of the README.
 
 ## Requirements
 
-- Rust 1.89+
+- Rust 1.89+ (source builds only)
 - tmux 3.x
 - Unix-like OS
 - One supported agent CLI: Claude Code, OpenAI Codex, Google Gemini CLI, or the
@@ -95,7 +95,8 @@ its own `muxa` and `muxad` in `Contents/Helpers`, so it works without the
 formula; install both if you also want `muxa` on your `PATH`.
 
 Muxa.app has no built-in updater, which makes Homebrew its update path:
-`brew upgrade` moves an installed app to the newest release. Downloading the
+`brew update` followed by `brew upgrade --cask open330/tap/muxa-app` moves
+an installed app to the newest release. Downloading the
 DMG from the release page works too, but then updating is on you.
 
 `brew uninstall --cask muxa-app` removes the app. `--zap` additionally
@@ -225,7 +226,7 @@ hook commands without overwriting existing user hooks.
 | Agent | Config |
 | --- | --- |
 | Claude Code | Merge `examples/claude-settings.json` into `~/.claude/settings.json`. |
-| OpenAI Codex | Add the `[[hooks.*]]` blocks documented in `crates/muxa/src/adapters/codex.rs`. |
+| OpenAI Codex | Prefer `muxa init` for compatible hooks. The daemon also reads local session-rollout logs every two seconds; hook support alone is not required for lifecycle recovery. |
 | Google Gemini CLI | Merge the hooks from `crates/muxa/src/adapters/gemini.rs` into `~/.gemini/settings.json`. |
 | Google Antigravity CLI | Add the `muxa` block from `crates/muxa/src/adapters/antigravity.rs` to `~/.gemini/config/hooks.json`. Note this is agy's own `hooks.json`, **not** the Gemini CLI's `settings.json`. |
 

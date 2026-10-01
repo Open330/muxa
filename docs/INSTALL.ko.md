@@ -4,7 +4,7 @@ README를 짧게 유지하기 위해 자세한 설치와 wiring 절차는 이 �
 
 ## 필요 조건
 
-- Rust 1.89+
+- Rust 1.89+ (소스 빌드에만 필요)
 - tmux 3.x
 - Unix-like OS
 - Claude Code, OpenAI Codex, Google Gemini CLI, Google Antigravity CLI(`agy`) 중 하나
@@ -57,6 +57,40 @@ muxa init
 ```
 
 `cargo install`은 `~/.cargo/bin`에 설치합니다. 해당 경로가 `PATH`에 있어야 합니다.
+
+## Homebrew
+
+```bash
+brew install open330/tap/muxa
+muxa init
+```
+
+macOS와 Linux의 arm64/x86_64용 사전 빌드 `muxa`·`muxad`를 설치합니다.
+CLI formula와 Mac 앱 cask는 별도이며 함께 설치할 수 있습니다.
+
+### Muxa for Mac
+
+```bash
+brew install --cask open330/tap/muxa-app
+```
+
+공증된 `Muxa.app`을 `/Applications`에 설치합니다. 앱은
+`Contents/Helpers`에 `muxa`와 `muxad`를 포함하므로 CLI formula 없이도 실행할 수
+있습니다. 터미널의 `PATH`에서도 CLI를 쓰려면 formula를 함께 설치하세요.
+
+앱 자체 업데이트 기능은 없습니다. 다음 명령으로 업데이트합니다.
+
+```bash
+brew update
+brew upgrade --cask open330/tap/muxa-app
+```
+
+[릴리즈 페이지](https://github.com/Open330/muxa/releases)에서 DMG를 직접 받을
+수도 있으며 이 경우 앱을 직접 교체해야 합니다. `brew uninstall --cask muxa-app`은
+앱을 제거하고, `--zap`은 설정과 캐시도 제거합니다. 데몬·CLI가 공유하는
+`~/Library/Application Support/muxa`는 유지합니다.
+
+소스 빌드와 네이티브 터미널 구조는 [Muxa for Mac](MACOS.md)을 참고하세요.
 
 ## Pre-Built Binary
 
@@ -176,7 +210,7 @@ tmux source-file ~/.tmux.conf
 | Agent | Config |
 | --- | --- |
 | Claude Code | `examples/claude-settings.json`을 `~/.claude/settings.json`에 merge. |
-| OpenAI Codex | `crates/muxa/src/adapters/codex.rs`의 module doc에 있는 `[[hooks.*]]` block 추가. |
+| OpenAI Codex | 호환되는 hook은 `muxa init`으로 연결합니다. 데몬은 로컬 세션 rollout 로그도 2초마다 읽어 lifecycle을 복구합니다. |
 | Google Gemini CLI | `crates/muxa/src/adapters/gemini.rs`의 hook block을 `~/.gemini/settings.json`에 merge. |
 | Google Antigravity CLI | `crates/muxa/src/adapters/antigravity.rs`의 `muxa` block을 `~/.gemini/config/hooks.json`에 추가. Gemini CLI의 `settings.json`이 **아니라** agy 전용 `hooks.json`입니다. |
 

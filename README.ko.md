@@ -74,6 +74,7 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 | `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
 | `muxa activity` | stats/report에 들어간 raw duration ledger 조회. |
 | BarShelf widget (macOS) | active/working/waiting/error agent를 메뉴바 popover에서 요약. |
+| Muxa for Mac | Work·Explore·Inbox·Ask·Shells·Files를 제공하는 네이티브 작업 공간, libghostty 터미널과 알림. 네이티브 PTY는 `muxad`가 소유. |
 | Dashboard | 선택적 loopback HTTP UI. 실시간 업데이트·timeline·협업 graph와 [OIDC 로그인 기반 pane/window 공유](docs/DASHBOARD.md#invite-someone-to-a-pane)(조회/프롬프트 권한)를 지원. |
 | Notifications | agent가 attention을 필요로 할 때 desktop alert. |
 
@@ -301,10 +302,14 @@ case-sensitive이고 `*`, `?` wildcard를 지원합니다. 예:
 | OpenAI Codex | 지원 | `~/.codex/config.toml` |
 | Google Gemini CLI | 지원 | `~/.gemini/settings.json` |
 | Google Antigravity CLI (`agy`) | 지원 | `~/.gemini/config/hooks.json` — [문서](docs/ANTIGRAVITY.md) |
-| opencode | 예정 | [tracking issue](https://github.com/Open330/muxa/issues/14) |
+| opencode | 실행 지원, hook 통합 예정 | [tracking issue](https://github.com/Open330/muxa/issues/14) |
+
+데몬은 Codex 세션 rollout 로그도 2초마다 읽어 hook에서 빠진 활동과 턴 완료를
+보완합니다. 사용량 비율과 credit 정보는 통계이며, 실제 한도 오류가 있어야
+quota error로 표시합니다.
 
 **화면 감지(fallback).** 훅이 없는 에이전트는 pane 내용을 TOML 매니페스트로
-분류합니다 — `agy`, `cursor-agent`, `amp`, `copilot`, `aider`, `goose`용
+분류합니다 — `agy`, `codex`, `cursor-agent`, `amp`, `copilot`, `aider`, `goose`용
 매니페스트가 기본 번들로 제공되며 사용자가 확장 가능. 훅이 있으면 훅이 우선하되
 예외가 하나 있습니다: `agy`는 승인 프롬프트에 대한 훅이 없어서 그 신호만은
 화면 감지가 계속 담당합니다.

@@ -22,12 +22,15 @@ const { chromium } = require(process.env.MUXA_PLAYWRIGHT_PACKAGE || "playwright"
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = resolve(HERE, "../../crates/muxa/src/dashboard/web");
 const OUT = join(WEB, "landing");
+const manifest = readFileSync(resolve(HERE, "../../Cargo.toml"), "utf8");
+const version = manifest.match(/\[workspace\.package\][\s\S]*?^version = "([^"]+)"/m)?.[1];
+if (!version) throw new Error("workspace version is missing from Cargo.toml");
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".webp": "image/webp" };
 
 function serve() {
   const now = Date.now();
   const api = {
-    "/api/health": fx.healthJson,
+    "/api/health": () => ({ ...fx.healthJson(), version }),
     "/api/access": fx.accessJson,
     "/api/agents": () => fx.agentsJson(now),
     "/api/panes": () => fx.panesJson(now),

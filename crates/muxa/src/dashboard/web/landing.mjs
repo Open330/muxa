@@ -40,9 +40,9 @@ const COPY = {
       pause: "Pause",
     },
     howTitle: "How it works",
-    howLede: "Muxa doesn't launch or wrap your agents. It reads the state they already report and maps it onto the panes you already have.",
+    howLede: "Muxa observes the agents you already run. You can also start agents and pipelines from the CLI or Mac app.",
     flow: [
-      ["Observe", "Claude Code, Codex, and Gemini CLI hooks report state; screen detection covers agents without hooks."],
+      ["Observe", "Agent hooks report state; Codex session logs fill in activity and turn completion every two seconds. Screen detection covers missing signals."],
       ["Model", "One daemon keeps every agent's state: working, waiting for input or a choice, error, idle."],
       ["Notify", "The tmux status line, desktop notifications, this dashboard, and the Mac app show who is waiting."],
       ["Jump", "<code>muxa attend</code> focuses the pane that has waited longest; <code>--cycle</code> goes through the rest."],
@@ -61,7 +61,7 @@ const COPY = {
       lede: "A native app for the same fleet: a real terminal, your Work, and every host in one window. muxad owns the shells, so closing the app stops nothing.",
       install: "Notarized. Updates through Homebrew.",
       features: [
-        ["Work, Explore, Inbox, Ask, Shells", "One sidebar per context, the way VS Code's activity bar works, while the editor area stays put."],
+        ["Work, Explore, Inbox, Ask, Shells, Files", "One sidebar per context, the way VS Code's activity bar works, while the editor area stays put."],
         ["A real terminal", "libghostty renders every session. muxad owns the PTY, so a closed window leaves the shell and its agent running."],
         ["An inbox for what needs you", "Commands you sent, their replies, and agents waiting on you, deduplicated across hosts."],
         ["Every host at once", "Live Watch across this Mac and the SSH machines one muxad controls."],
@@ -144,9 +144,9 @@ const COPY = {
       pause: "일시정지",
     },
     howTitle: "어떻게 동작하나",
-    howLede: "muxa는 에이전트를 띄우거나 감싸지 않습니다. 에이전트가 이미 내보내는 상태를 읽어서, 이미 쓰고 있는 pane 위에 얹습니다.",
+    howLede: "muxa는 이미 실행 중인 에이전트를 관찰합니다. CLI나 Mac 앱에서 에이전트와 파이프라인을 시작할 수도 있습니다.",
     flow: [
-      ["관찰", "Claude Code, Codex, Gemini CLI의 hook이 상태를 보내고, hook이 없는 에이전트는 화면 감지로 읽습니다."],
+      ["관찰", "에이전트 hook으로 상태를 받고, Codex 세션 로그에서 활동과 턴 완료를 2초마다 보완합니다. 부족한 신호는 화면 감지로 읽습니다."],
       ["상태 모델", "데몬 하나가 모든 에이전트의 상태를 들고 있습니다. 작업 중, 입력·선택 대기, 오류, 유휴."],
       ["알림", "tmux status line, 데스크톱 알림, 이 대시보드, Mac 앱이 누가 기다리는지 보여 줍니다."],
       ["이동", "<code>muxa attend</code>는 가장 오래 기다린 pane으로 포커스를 옮기고, <code>--cycle</code>은 나머지를 차례로 돕니다."],
@@ -165,7 +165,7 @@ const COPY = {
       lede: "같은 에이전트들을 위한 네이티브 앱입니다. 실제 터미널, Work, 모든 호스트를 한 창에서 봅니다. 셸은 muxad가 들고 있어서 앱을 닫아도 아무것도 멈추지 않습니다.",
       install: "공증된 앱이며 Homebrew로 업데이트합니다.",
       features: [
-        ["Work, Explore, Inbox, Ask, Shells", "VS Code의 액티비티 바처럼 맥락마다 사이드바가 바뀌고, 편집 영역은 그대로 남습니다."],
+        ["Work, Explore, Inbox, Ask, Shells, Files", "VS Code의 액티비티 바처럼 맥락마다 사이드바가 바뀌고, 편집 영역은 그대로 남습니다."],
         ["진짜 터미널", "모든 세션을 libghostty가 그립니다. PTY는 muxad 소유라서 창을 닫아도 셸과 에이전트는 계속 돕니다."],
         ["나를 기다리는 것만 모은 Inbox", "보낸 명령, 받은 답장, 나를 기다리는 에이전트를 호스트를 가로질러 중복 없이 모아 줍니다."],
         ["모든 호스트를 한 번에", "이 Mac과 muxad 하나가 관리하는 SSH 머신들을 Live Watch로 함께 봅니다."],

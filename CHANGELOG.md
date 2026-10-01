@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Local Mac app builds derive their marketing version from the workspace,
+  matching the bundled CLI and daemon. Refresh Welcome, release highlights,
+  Korean install instructions, and dashboard landing screenshots; document
+  Codex rollout polling, quota evidence, and activity sorting.
+
 ## [0.8.55] - 2026-10-01
 
 ### Added

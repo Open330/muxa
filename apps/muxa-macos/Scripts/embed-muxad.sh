@@ -20,7 +20,7 @@ if [ -z "$CARGO_BIN" ] && [ -x "${HOME:-}/.cargo/bin/cargo" ]; then
     CARGO_BIN="${HOME}/.cargo/bin/cargo"
 fi
 if [ -z "$CARGO_BIN" ]; then
-    echo "cargo was not found; install Rust 1.88+ before building Muxa.app" >&2
+    echo "cargo was not found; install Rust 1.89+ before building Muxa.app" >&2
     exit 1
 fi
 RUSTUP_BIN=$(command -v rustup || true)

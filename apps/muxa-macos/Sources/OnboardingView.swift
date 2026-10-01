@@ -336,7 +336,7 @@ private struct OnboardingWelcomePage: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Welcome to Muxa")
                         .font(.title2.weight(.semibold))
-                    Text("Muxa runs your coding agents inside tmux and keeps every pane, every host, and every question they have for you in one window.")
+                    Text("Muxa watches your existing agents and can start new ones in tmux or a native terminal. Every pane, host, and question stays in one window.")
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -371,10 +371,10 @@ private struct OnboardingWelcomePage: View {
                 } detail: {
                     Text("Native terminals for the moments you want to type alongside your agents.")
                 }
-                OnboardingSurfaceCard(systemImage: "sparkles.rectangle.stack") {
-                    Text("Agents")
+                OnboardingSurfaceCard(systemImage: MuxaSidebarMode.files.systemImage) {
+                    Text("Files")
                 } detail: {
-                    Text("Start Claude, Codex, Gemini, or OpenCode in a folder; each opens as a tab.")
+                    Text("Browse files on this Mac or an SSH host and preview them without changing them.")
                 }
             }
         }
@@ -1126,7 +1126,7 @@ private struct OnboardingWorkbenchPage: View {
                 OnboardingAnatomyRow(systemImage: "sidebar.squares.left") {
                     Text("Activity bar")
                 } detail: {
-                    Text("The strip on the left edge switches between Work, Explore, Inbox, Ask, and Shells.")
+                    Text("The strip on the left edge switches between Work, Explore, Inbox, Ask, Shells, and Files.")
                 }
                 OnboardingAnatomyRow(systemImage: "sidebar.left") {
                     Text("Side bar")

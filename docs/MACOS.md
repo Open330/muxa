@@ -35,7 +35,7 @@ The native workspace follows two proven desktop navigation patterns:
 
 - VS Code's Activity Bar switches one contextual sidebar at a time while the
   editor area remains stable. Muxa applies that to **Work**, **Explore**,
-  **Inbox**, **Ask**, and **Shells**, with a filter scoped to the active
+  **Inbox**, **Ask**, **Shells**, and **Files**, with a filter scoped to the active
   context. Explore owns topology and host registration; Inbox owns the
   operator's sent commands, durable replies, and agents that require operator
   attention; Ask owns Global Ask conversations, which are questions to a
@@ -203,13 +203,18 @@ Requirements:
 - macOS 13 or newer;
 - Xcode 26 or another Xcode capable of Swift 6;
 - `xcodegen` (`brew install xcodegen`);
-- Git, curl, tar, and a Rust 1.88+ toolchain.
+- Git, curl, tar, and a Rust 1.89+ toolchain.
 
 From the repository root:
 
 ```bash
 apps/muxa-macos/Scripts/build-app.sh --open
 ```
+
+The build reads the app version from the workspace `Cargo.toml` and rebuilds
+the bundled `muxa` and `muxad`. `MUXA_SKIP_EMBED=1` is only for local UI
+iteration: it keeps the existing helpers, so it can leave their versions and
+behavior behind the app. Rebuild without it when checking runtime changes.
 
 The first build downloads source dependencies and can take a while. Zig does
 not need to be installed globally: the build downloads the exact compiler

@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 APP_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+REPO_DIR=$(cd "$APP_DIR/../.." && pwd)
 DERIVED_DATA="$APP_DIR/.build/DerivedData"
 CONFIGURATION=${CONFIGURATION:-Debug}
 
@@ -31,10 +32,12 @@ fi
 # The version the release carries lives in Cargo.toml, not in project.yml —
 # muxa the daemon and Muxa the app ship together and must not disagree about
 # which release a user is running. Callers that know the version pass it in.
-VERSION_SETTING=()
-if [ -n "${MUXA_MARKETING_VERSION:-}" ]; then
-    VERSION_SETTING=(MARKETING_VERSION="$MUXA_MARKETING_VERSION")
+APP_VERSION="${MUXA_MARKETING_VERSION:-}"
+if [ -z "$APP_VERSION" ]; then
+    APP_VERSION=$(sed -n '/^\[workspace\.package\]/,/^\[/p' "$REPO_DIR/Cargo.toml" \
+        | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
 fi
+[ -n "$APP_VERSION" ] || { echo "could not determine the app version from Cargo.toml" >&2; exit 1; }
 
 xcodebuild \
     -project "$APP_DIR/Muxa.xcodeproj" \
@@ -43,7 +46,7 @@ xcodebuild \
     -derivedDataPath "$DERIVED_DATA" \
     -destination 'platform=macOS' \
     CODE_SIGNING_ALLOWED=NO \
-    ${VERSION_SETTING[@]+"${VERSION_SETTING[@]}"} \
+    MARKETING_VERSION="${APP_VERSION#v}" \
     build
 
 APP_PATH="$DERIVED_DATA/Build/Products/$CONFIGURATION/Muxa.app"

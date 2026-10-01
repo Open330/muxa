@@ -7887,16 +7887,6 @@
         }
       }
     },
-    "Muxa runs your coding agents inside tmux and keeps every pane, every host, and every question they have for you in one window." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Muxa는 코딩 에이전트를 tmux 안에서 실행하고, 모든 페인과 호스트, 그리고 에이전트가 사용자에게 던지는 모든 질문을 한 윈도우에 모읍니다."
-          }
-        }
-      }
-    },
     "Muxa skips the pane you are looking at and repeats for the same agent within 30 seconds. An agent that finished or started waiting since you last opened it keeps a dot until you do." : {
       "localizations" : {
         "ko" : {
@@ -18192,6 +18182,116 @@
           "stringUnit": {
             "state": "translated",
             "value": "이미지를 해석할 수 없습니다."
+          }
+        }
+      }
+    },
+    "Codex activity and turn completion refresh every two seconds. Usage percentages alone no longer mark a running agent as failed." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Codex 활동과 턴 완료를 2초마다 갱신합니다. 사용량 비율만으로 실행 중인 에이전트를 오류 상태로 표시하지 않습니다."
+          }
+        }
+      }
+    },
+    "Codex status stays current" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Codex 상태를 빠르게 갱신합니다"
+          }
+        }
+      }
+    },
+    "Every workspace in the dashboard" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "대시보드에서 모든 작업 공간을 봅니다"
+          }
+        }
+      }
+    },
+    "Muxa watches your existing agents and can start new ones in tmux or a native terminal. Every pane, host, and question stays in one window." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa는 기존 에이전트를 관찰하고 tmux나 네이티브 터미널에서 새 에이전트를 시작할 수 있습니다. 모든 페인과 호스트, 질문을 한 윈도우에서 확인합니다."
+          }
+        }
+      }
+    },
+    "Share a pane or window" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "페인이나 윈도우를 공유합니다"
+          }
+        }
+      }
+    },
+    "Sign in through your configured provider and invite someone to view or prompt a specific pane or window." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정한 제공자로 로그인하고 다른 사람이 특정 페인이나 윈도우를 조회하거나 프롬프트를 보낼 수 있도록 초대합니다."
+          }
+        }
+      }
+    },
+    "The Workspaces rail includes existing tmux sessions, and the Sessions navigator opens windows and panes with live output." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspaces 목록에 기존 tmux 세션도 표시하며, Sessions 탐색기에서 윈도우와 페인의 실시간 출력을 엽니다."
+          }
+        }
+      }
+    },
+    "Browse files on this Mac or an SSH host and preview them without changing them." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 Mac이나 SSH 호스트의 파일을 탐색하고 변경 없이 미리 봅니다."
+          }
+        }
+      }
+    },
+    "The strip on the left edge switches between Work, Explore, Inbox, Ask, Shells, and Files." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "왼쪽 가장자리의 막대에서 Work, Explore, Inbox, Ask, Shells, Files를 전환합니다."
+          }
+        }
+      }
+    },
+    "Files beside your agents" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 옆에서 파일을 확인합니다"
+          }
+        }
+      }
+    },
+    "Browse local and SSH folders from Files, preview artifacts, and use Go to Anything to find a file." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Files에서 로컬·SSH 폴더와 결과물을 미리 보고 Go to Anything으로 파일을 찾습니다."
           }
         }
       }

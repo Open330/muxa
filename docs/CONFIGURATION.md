@@ -553,12 +553,21 @@ enabled = true
 interval_secs = 30
 stuck_working_timeout_secs = 0
 stuck_waiting_timeout_secs = 0
+codex_rollout_enabled = true
+paneless_stale_timeout_secs = 86400
 ```
 
 The reconciler keeps stale states from staying misleading forever. Timeout
 values of `0` disable that timeout. The same loop also runs the pid-liveness
 sweep that flips registered background tasks (see `muxa register`) to
 `stopped` once their process exits.
+
+Codex rollout polling runs every two seconds independently of the full
+`interval_secs` reconciliation. It uses original event timestamps for activity
+and recovers running/completed turns and actual errors. Used percentages and
+credit balances alone do not change state. Set `codex_rollout_enabled = false`
+to disable it. `paneless_stale_timeout_secs` stops fully orphaned registry rows
+after 24 hours by default; `0` disables that cleanup.
 
 ## Fleet
 

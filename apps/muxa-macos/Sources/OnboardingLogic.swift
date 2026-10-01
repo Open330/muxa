@@ -150,6 +150,28 @@ enum MuxaWhatsNew {
 
     static var catalog: [Release] {
         [
+            Release(version: "0.8.55", highlights: [
+                Highlight(
+                    systemImage: "folder",
+                    title: String(localized: "Files beside your agents"),
+                    detail: String(localized: "Browse local and SSH folders from Files, preview artifacts, and use Go to Anything to find a file.")
+                ),
+                Highlight(
+                    systemImage: "arrow.triangle.2.circlepath",
+                    title: String(localized: "Codex status stays current"),
+                    detail: String(localized: "Codex activity and turn completion refresh every two seconds. Usage percentages alone no longer mark a running agent as failed.")
+                ),
+                Highlight(
+                    systemImage: "sidebar.left",
+                    title: String(localized: "Every workspace in the dashboard"),
+                    detail: String(localized: "The Workspaces rail includes existing tmux sessions, and the Sessions navigator opens windows and panes with live output.")
+                ),
+                Highlight(
+                    systemImage: "person.2.badge.key",
+                    title: String(localized: "Share a pane or window"),
+                    detail: String(localized: "Sign in through your configured provider and invite someone to view or prompt a specific pane or window.")
+                ),
+            ]),
             Release(version: "0.8.54", highlights: [
                 Highlight(
                     systemImage: "arrowshape.turn.up.left",

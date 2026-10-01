@@ -543,6 +543,11 @@ full refresh still reconciles topology; older daemons use polling. A refresh or
 re-sort keeps the selected session, window, or pane selected by its stable key,
 even when another window in the same session moves ahead of it.
 
+For Codex, the daemon reads lifecycle and quota evidence from session logs
+every two seconds. `latest` uses the event timestamp, so replaying old logs or
+refreshing quota telemetry does not make a session newly active. `AGE` measures
+time in the current state; it is not the activity timestamp used for sorting.
+
 ## Detail Row
 
 ```toml

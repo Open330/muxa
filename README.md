@@ -50,7 +50,8 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 - **Keeps your setup.** Reads agent state from Claude Code, Codex, and
   Gemini CLI (and its Antigravity successor) hooks, with screen detection
   for hook-less agents, and maps it onto the tmux panes you already have.
-  You don't launch agents through muxa, and you don't switch multiplexers. tmux, [rmux](https://rmux.io),
+  You can keep launching agents yourself, or use muxa's optional agent and
+  pipeline launchers. tmux, [rmux](https://rmux.io),
   and [herdr](https://herdr.dev) can be observed at the same time; zellij
   has a CLI baseline.
 - **Tells you who is waiting.** tmux status line, the `muxa watch` TUI,
@@ -78,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 | `muxa activity` | Raw duration ledger query for debugging exactly what fed stats/report. |
 | `muxa automation` | Rules that act on agent state — the built-in one resumes a session after its usage cap resets. |
 | BarShelf widget (macOS) | Menu-bar popover summary of active, working, waiting, and error agents. |
-| Muxa for Mac | Native session browser and menu-bar app with a locally built libghostty terminal; native PTYs remain owned by `muxad`. |
+| Muxa for Mac | Native workbench for Work, Explore, Inbox, Ask, Shells, and Files, with a libghostty terminal and notifications; native PTYs remain owned by `muxad`. |
 | Dashboard | Optional loopback HTTP UI with live updates, timeline, collaboration graphs, and [OIDC pane/window sharing](docs/DASHBOARD.md#invite-someone-to-a-pane) with view or prompt permissions. |
 | Notifications | Optional desktop alerts when agents need attention. |
 
@@ -365,10 +366,14 @@ systems, so muxa gets exact state transitions:
 | OpenAI Codex | Supported | `~/.codex/config.toml` |
 | Google Gemini CLI | Supported | `~/.gemini/settings.json` |
 | Google Antigravity CLI (`agy`) | Supported | `~/.gemini/config/hooks.json` — [details](docs/ANTIGRAVITY.md) |
-| opencode | Planned | [tracking issue](https://github.com/Open330/muxa/issues/14) |
+| opencode | Launch supported; hook integration planned | [tracking issue](https://github.com/Open330/muxa/issues/14) |
+
+The daemon also reads Codex session-rollout logs every two seconds to recover activity and
+turn completion when hooks miss an update. Quota percentages and credits are
+telemetry; an actual limit failure is needed before showing a quota error.
 
 **Screen-detected (fallback).** Agents with no hooks are classified from
-their pane contents via TOML manifests — bundled for `agy`, `cursor-agent`,
+their pane contents via TOML manifests — bundled for `agy`, `codex`, `cursor-agent`,
 `amp`, `copilot`, `aider`, and `goose`, extensible per user. Hooks win when
 present, with one carve-out: `agy` fires no hook for an approval prompt, so its
 panes stay screen-inferred for that one signal. See

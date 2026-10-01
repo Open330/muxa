@@ -66,9 +66,15 @@ for the deferred stub.
 
 1. Bump `version` in the workspace `Cargo.toml`, run a build so `Cargo.lock`
    follows, and open a `## [X.Y.Z] - date` section in `CHANGELOG.md`.
+   For user-facing app changes, add highlights to `MuxaWhatsNew.catalog` in
+   `apps/muxa-macos/Sources/OnboardingLogic.swift` and their Korean translations.
+   Check Welcome, install docs, and landing copy against the release; regenerate
+   dashboard screenshots with `scripts/landing-shots/capture.mjs` after UI changes.
 2. Reinstall locally first (`cargo install --path crates/muxa-cli --force
    --locked`, same for `crates/muxad`, then restart muxad) — shipping a
-   version you have not run is how a broken release gets tagged.
+   version you have not run is how a broken release gets tagged. For Mac app
+   changes, run `apps/muxa-macos/Scripts/build-app.sh` without `MUXA_SKIP_EMBED`
+   and verify the app's bundle version and both helpers' `--version` agree.
 3. Commit as `release: vX.Y.Z`, push `main`, then push the annotated tag.
 
 Pushing the tag is the whole trigger, and everything after it is automatic.
@@ -99,18 +105,22 @@ than after.
    publishes by hand.
 
    Either way it needs the `TAP_GITHUB_TOKEN` secret (a fine-grained PAT with
-   Contents read/write on `Open330/homebrew-tap`). Without it — including when
-   the token expires — the job still *succeeds*, with a "skipping" notice, and
-   the formula quietly stays behind: if `brew` keeps offering the old version
-   after a release, suspect the token first. Recover with `scripts/bump-tap.sh
-   vX.Y.Z`, which is idempotent and prints "nothing to push" on a current tap.
+   Contents read/write on `Open330/homebrew-tap`). A missing token skips the
+   update with a notice; an expired or invalid token fails authentication.
+   In either case, check the remote formula and `muxa-app` cask versions after
+   publication. Recover the CLI formula with `scripts/bump-tap.sh vX.Y.Z`,
+   which is idempotent. That script does not update the Mac cask: update its
+   version and DMG checksum separately, or repair the secret and rerun the
+   `tap-bump` workflow for the published tag.
 
 ## Project layout
 
-- `crates/muxa-core`     — types, state, config, paths, errors (no I/O)
-- `crates/muxa-runtime`  — unix-socket IPC + tmux CLI wrapper
-- `crates/muxa-adapters` — per-agent adapters
-- `crates/muxad`         — daemon binary
-- `crates/muxa`          — CLI binary
+- `crates/muxa` — shared library: state, config, IPC, backends, agent adapters,
+  dashboard, and notifications
+- `crates/muxad` — daemon binary
+- `crates/muxa-cli` — CLI binary and terminal UIs
+- `crates/muxa-zellij-plugin` — zellij plugin
+- `apps/muxa-macos` — native Mac app and bundled runtime build scripts
+- `site` — GitHub Pages entry point using the dashboard's shared landing assets
 
 See `PROTOCOL.md` for the wire protocol spec.
