@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.55] - 2026-10-01
+
 ### Added
 
 - Dashboard **Workspaces** rail lists every tmux session, since muxa's layout
@@ -109,6 +111,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Codex lifecycle status refreshes from timestamped rollout events every two
+  seconds when hooks miss updates, including resumed sessions created on older
+  dates. Recover active or completed turns from stale errors without inventing
+  recent activity; historical quota records cannot overwrite newer work.
+- `muxa watch` corrects stale Codex pane bindings using explicit resume session
+  IDs and live process ancestry, so activity updates and latest sorting apply to
+  the actual tmux session. Discover agents launched through `aas`, recognize
+  current Codex working/composer footers, and retain deliberate quota clearing
+  in UI snapshots.
+- Codex quota windows follow their reported duration, including weekly-only
+  primary windows. Saturated utilization and credit balances no longer imply
+  a blocked turn; only explicit blocking evidence changes lifecycle state.
 - Dashboard: with no managed Work, the unlinked tmux windows were hidden with
   the empty board. They are now a compact, collapsible **Windows not tracked
   as Work (N)** section (collapsed by default then, remembered per browser),
@@ -4017,7 +4031,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.54...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.55...HEAD
+[0.8.55]: https://github.com/Open330/muxa/compare/v0.8.54...v0.8.55
 [0.8.54]: https://github.com/Open330/muxa/compare/v0.8.53...v0.8.54
 [0.8.53]: https://github.com/Open330/muxa/compare/v0.8.52...v0.8.53
 [0.8.52]: https://github.com/Open330/muxa/compare/v0.8.51...v0.8.52
