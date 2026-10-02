@@ -2689,6 +2689,24 @@ async fn enrich_from_history(
     // exact thing this pass is trying to upgrade away from.
     let snapshot = store.snapshot().await;
 
+    // A Codex prompt's recorded pane is not evidence: behind the shared
+    // app-server it was whichever pane started the server, so seeding by it
+    // resurrects a closed thread onto a stranger's pane. Seed a Codex entry
+    // only where a live `codex resume <id>` proves it; the thread's next hook
+    // re-registers it otherwise.
+    let codex_resumes: HashSet<(String, String)> = {
+        let scanned = panes.clone();
+        tokio::task::spawn_blocking(move || muxa::process_tree::scan_codex_panes(&scanned))
+            .await
+            .map(|scan| {
+                scan.resume_bindings
+                    .into_iter()
+                    .map(|(session, pane)| (session, pane.pane_id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
     let mut candidates: Vec<muxa::Agent> = Vec::new();
     for pane in &panes {
         let has_real = snapshot.iter().any(|a| {
@@ -2705,6 +2723,11 @@ async fn enrich_from_history(
         let Some(entry) = recents.into_iter().next() else {
             continue;
         };
+        if entry.kind == muxa::AgentKind::Codex
+            && !codex_resumes.contains(&(entry.session_id.clone(), pane.pane_id.clone()))
+        {
+            continue;
+        }
         candidates.push(muxa::Agent {
             kind: entry.kind,
             session_id: entry.session_id,

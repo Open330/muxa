@@ -40,16 +40,6 @@ use tokio::sync::{broadcast, watch, Notify, RwLock};
 pub const SYNTHETIC_SESSION_PREFIX: &str = "synthetic-";
 const CLAUDE_IDLE_PROMPT_NOTIFICATION: &str = "Claude is waiting for your input";
 
-/// Whether a real Codex thread is already bound to `pane`.
-fn codex_owns_pane(agents: &HashMap<String, Agent>, pane: &PaneInfo) -> bool {
-    agents.values().any(|agent| {
-        agent.kind == AgentKind::Codex
-            && !is_synthetic(&agent.session_id)
-            && agent.pane.as_deref() == Some(pane.pane_id.as_str())
-            && agent.tmux_socket == pane.socket
-    })
-}
-
 fn is_synthetic(session_id: &str) -> bool {
     session_id.starts_with(SYNTHETIC_SESSION_PREFIX)
 }
@@ -2180,10 +2170,11 @@ impl Store {
         if unbound_cwds.is_empty() {
             return Vec::new();
         }
+        // Owned panes stay in: after `/new` the unbound thread runs in a pane
+        // its predecessor still owns.
         codex_hosts
             .iter()
             .filter(|host| unbound_cwds.contains(host.current_path.trim()))
-            .filter(|host| !codex_owns_pane(&agents, host))
             .cloned()
             .collect()
     }
@@ -2211,8 +2202,33 @@ impl Store {
         let pairs = crate::codex_binding::prompt_pairs(&rows, screens);
         let mut bound = 0;
         for (session, pane) in pairs {
-            if codex_owns_pane(&agents, &pane) {
+            let Some(prompted_at) = agents.get(&session).and_then(|a| a.last_prompt_at) else {
                 continue;
+            };
+            // A pane owned by an older thread changed threads (`/new`); one
+            // owned by a thread prompted since then is not this thread's.
+            let owners: Vec<String> = agents
+                .values()
+                .filter(|agent| {
+                    agent.kind == AgentKind::Codex
+                        && !is_synthetic(&agent.session_id)
+                        && agent.pane.as_deref() == Some(pane.pane_id.as_str())
+                        && agent.tmux_socket == pane.socket
+                })
+                .map(|agent| agent.session_id.clone())
+                .collect();
+            if owners.iter().any(|owner| {
+                agents[owner]
+                    .last_prompt_at
+                    .is_some_and(|owner_at| owner_at >= prompted_at)
+            }) {
+                continue;
+            }
+            for owner in owners {
+                if let Some(previous) = agents.get_mut(&owner) {
+                    previous.pane = None;
+                    previous.state = AgentState::Stopped;
+                }
             }
             if let Some(agent) = agents.get_mut(&session) {
                 agent.pane = Some(pane.pane_id.clone());
@@ -5068,6 +5084,86 @@ mod tests {
         assert_eq!(pane_of("thread-b").as_deref(), Some("%1"));
         assert!(store.contested_codex_hosts(&hosts).await.is_empty());
         assert!(!store.is_unplaced_codex("thread-a").await);
+    }
+
+    /// `/new` inside a bound TUI: the newer thread whose prompt is on that
+    /// pane takes it over and its predecessor stops; an older unbound thread
+    /// can never take a pane from a thread prompted after it.
+    #[tokio::test]
+    async fn newer_thread_on_screen_takes_over_its_predecessors_pane() {
+        let t0 = datetime!(2026-10-02 06:00:00 UTC);
+        let store = Store::shared();
+        let prompt = |sid: &str, pane: Option<&str>, text: &str, at| {
+            let id = AgentId {
+                tmux_socket: pane.map(|_| "default".to_owned()),
+                kind: AgentKind::Codex,
+                session_id: sid.into(),
+                surface: None,
+                pane: pane.map(str::to_owned),
+                cwd: Some("/repo".into()),
+            };
+            AgentEvent::PromptSubmitted {
+                id,
+                prompt: text.into(),
+                at,
+            }
+        };
+        let first = "First thread: reply with exactly the word ready";
+        let second = "Second thread after slash new: reply ready";
+        store.apply(&prompt("old", Some("%1"), first, t0)).await;
+        store
+            .apply(&prompt(
+                "new",
+                None,
+                second,
+                t0 + time::Duration::seconds(30),
+            ))
+            .await;
+        let mut host = pane("%1");
+        host.current_path = "/repo".into();
+        host.socket = Some("default".into());
+        let hosts = [host.clone()];
+        assert_eq!(
+            store.correlate_paneless_codex_union(&hosts, &hosts).await,
+            0
+        );
+        assert_eq!(store.contested_codex_hosts(&hosts).await.len(), 1);
+
+        let screen = format!("› {second}\n• ready\n");
+        assert_eq!(
+            store
+                .correlate_paneless_codex_by_prompt(&[(host.clone(), screen)])
+                .await,
+            1
+        );
+        let snap = store.snapshot().await;
+        let row = |sid: &str| snap.iter().find(|a| a.session_id == sid).unwrap().clone();
+        assert_eq!(row("new").pane.as_deref(), Some("%1"));
+        assert_eq!(row("old").pane, None);
+        assert_eq!(row("old").state, AgentState::Stopped);
+        assert!(
+            !store.is_unplaced_codex("old").await,
+            "a stopped thread is not rebound"
+        );
+
+        // The reverse: an unbound thread older than the owner never steals.
+        let store = Store::shared();
+        store.apply(&prompt("stale", None, first, t0)).await;
+        store
+            .apply(&prompt(
+                "owner",
+                Some("%1"),
+                second,
+                t0 + time::Duration::seconds(30),
+            ))
+            .await;
+        let screen = format!("› {first}\n› {second}\n");
+        assert_eq!(
+            store
+                .correlate_paneless_codex_by_prompt(&[(host, screen)])
+                .await,
+            0
+        );
     }
 
     /// A `code_mode_host` codex splits into a synthetic pane placeholder

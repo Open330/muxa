@@ -310,6 +310,31 @@ impl PaneBackend for RmuxBackend {
     fn capture_pane_on(&self, endpoint: Option<&str>, pane_id: &str) -> Option<String> {
         self.capture_on(endpoint, pane_id)
     }
+
+    fn capture_pane_history_on(
+        &self,
+        endpoint: Option<&str>,
+        pane_id: &str,
+        history: usize,
+    ) -> Option<String> {
+        let scoped = Self {
+            endpoint: endpoint
+                .map(str::to_string)
+                .or_else(|| self.endpoint.clone()),
+        };
+        let start = format!("-{history}");
+        let command = scoped
+            .control_command(&[
+                "capture-pane",
+                "-ep",
+                "-S",
+                &start,
+                "-t",
+                strip_prefix(pane_id),
+            ])
+            .ok()?;
+        successful_stdout(command)
+    }
 }
 
 /// Whether the rmux CLI is installed and runnable.

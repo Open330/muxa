@@ -9,12 +9,20 @@
 //! 2. The one pane running an interactive Codex at the thread's cwd that no
 //!    other thread already owns (`Store::correlate_paneless_codex_union`).
 //! 3. When several such panes share that cwd, the pane whose screen shows the
-//!    thread's latest prompt — and no other unbound thread's.
+//!    thread's latest prompt — and no other unbound thread's. This also covers
+//!    `/new` inside a bound TUI: one TUI runs one thread at a time, so a
+//!    *newer* thread whose prompt is on that pane takes it over and the
+//!    previous thread is stopped (it has left every terminal).
 //!
-//! The reconciler's periodic tick runs 1–2. The daemon runs all three on demand
+//! On demand the daemon tries 1, then 3, then 2; the reconciler's periodic tick
+//! runs only the capture-free 1–2. The daemon runs the full pass
 //! when a paneless Codex hook arrives and when an unbound thread makes its
 //! first collaboration call, so threads started seconds apart in one cwd bind
 //! one at a time instead of colliding.
+//!
+//! Known gap: a `/new` thread whose prompt is too short to be evidence can
+//! still be handed an idle, never-prompted Codex pane at the same cwd by
+//! elimination (2). Any prompt of 12+ characters is bound by its screen first.
 
 use crate::backend::SharedBackend;
 use crate::event::AgentKind;
@@ -29,10 +37,13 @@ const MIN_PROMPT_EVIDENCE_CHARS: usize = 12;
 /// How much of the prompt's start is matched. The TUI wraps and may truncate a
 /// long prompt, but its opening is rendered verbatim right after submission.
 const PROMPT_NEEDLE_CHARS: usize = 48;
+/// Scrollback lines captured above the visible screen for prompt evidence.
+const SCREEN_HISTORY_LINES: usize = 500;
 
 /// Whether `agent` is a real Codex thread still waiting for a pane.
 pub(crate) fn is_unplaced_codex(agent: &Agent) -> bool {
     agent.kind == AgentKind::Codex
+        && agent.state != crate::event::AgentState::Stopped
         && agent.pane.is_none()
         && agent.surface.is_none()
         && agent.pid.is_none()
@@ -67,15 +78,25 @@ pub(crate) async fn bind_paneless_codex(
         .await
         .unwrap_or_default();
     let mut bound = store.rebind_codex_resumes(&scan.resume_bindings).await;
-    bound += store
-        .correlate_paneless_codex_union(&panes, &scan.hosts)
-        .await;
 
-    // Only an ambiguous cwd pays for screen captures.
+    // Screen evidence before elimination: after `/new` the thread runs in a
+    // pane its predecessor owns, and elimination would hand it any idle Codex
+    // pane at the cwd instead. Only a cwd with an unbound thread is captured.
     let contested = store.contested_codex_hosts(&scan.hosts).await;
-    if contested.is_empty() {
-        return bound;
+    if !contested.is_empty() {
+        bound += prompt_pass(store, backends, contested).await;
     }
+    bound
+        + store
+            .correlate_paneless_codex_union(&panes, &scan.hosts)
+            .await
+}
+
+async fn prompt_pass(
+    store: &SharedStore,
+    backends: &[SharedBackend],
+    contested: Vec<PaneInfo>,
+) -> usize {
     let capturers = backends.to_vec();
     let screens = tokio::task::spawn_blocking(move || {
         contested
@@ -83,14 +104,20 @@ pub(crate) async fn bind_paneless_codex(
             .filter_map(|pane| {
                 let host = crate::backend::pane_id_host_kind(&pane.pane_id)?;
                 let backend = capturers.iter().find(|b| b.kind() == host)?;
-                let text = backend.capture_pane_on(pane.socket.as_deref(), &pane.pane_id)?;
+                // Scrollback too: by a thread's first collaboration call its
+                // prompt has often scrolled off the visible screen.
+                let text = backend.capture_pane_history_on(
+                    pane.socket.as_deref(),
+                    &pane.pane_id,
+                    SCREEN_HISTORY_LINES,
+                )?;
                 Some((pane, text))
             })
             .collect::<Vec<_>>()
     })
     .await
     .unwrap_or_default();
-    bound + store.correlate_paneless_codex_by_prompt(&screens).await
+    store.correlate_paneless_codex_by_prompt(&screens).await
 }
 
 /// Coalesces hook-triggered binding passes: a burst of hooks runs one pass,
@@ -127,9 +154,38 @@ pub(crate) fn prompt_needle(prompt: &str) -> Option<String> {
         .then(|| compact.chars().take(PROMPT_NEEDLE_CHARS).collect())
 }
 
-/// Screen text normalized the same way as [`prompt_needle`].
+/// Screen text normalized the same way as [`prompt_needle`], with terminal
+/// escape sequences (captures keep colors, and the TUI may style part of a
+/// prompt) removed so they cannot split the needle.
 pub(crate) fn compact_screen(text: &str) -> String {
-    text.chars().filter(|c| !c.is_whitespace()).collect()
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.next() {
+                // CSI: parameters/intermediates, then one final byte @..~.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or ST (ESC \\).
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if !c.is_whitespace() {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Pair unbound threads with contested panes whose screen shows exactly that
@@ -186,6 +242,10 @@ mod tests {
             prompt_needle("배포 나가도 될지 linear 일감들과 PR 확인해서 검토해주세요").unwrap();
         let wrapped = "› 배포 나가도 될지 linear 일감들과 PR 확\n  인해서 검토해주세요\n• Working";
         assert!(compact_screen(wrapped).contains(&needle));
+        // A capture keeps colors; a styled span inside the prompt still matches.
+        let styled = "\u{1b}[1m›\u{1b}[0m 배포 나가도 될지 \u{1b}[36mlinear\u{1b}[39m 일감들과 PR \
+                      확인해서 검토해주세요\u{1b}]0;title\u{7}";
+        assert!(compact_screen(styled).contains(&needle));
     }
 
     #[test]

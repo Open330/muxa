@@ -104,7 +104,7 @@ pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummar
 
 /// Live Codex evidence from one walk of every pane's process tree.
 #[derive(Debug, Default)]
-pub(crate) struct CodexPaneScan {
+pub struct CodexPaneScan {
     /// Explicit `codex resume <id>` sessions and the one pane each runs in.
     pub resume_bindings: Vec<(String, PaneInfo)>,
     /// Panes running an interactive Codex, resumed or fresh. A thread behind
@@ -117,7 +117,7 @@ pub(crate) struct CodexPaneScan {
 /// Recover detached Codex sessions from an explicit CLI resume id and its
 /// pane ancestry, and list the panes hosting an interactive Codex. Never
 /// guesses from cwd or chooses between multiple panes itself.
-pub(crate) fn scan_codex_panes(panes: &[PaneInfo]) -> CodexPaneScan {
+pub fn scan_codex_panes(panes: &[PaneInfo]) -> CodexPaneScan {
     #[cfg(not(target_os = "linux"))]
     let table = crate::process_snapshot::read_current_process_table();
     let scanned: Vec<_> = panes
