@@ -66,9 +66,9 @@ const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
-const MCP_SERVER_INSTRUCTIONS: &str = "Muxa coordinates same-window peers. Use muxa_guide for \
-    launch preferences, muxa_room_context for identity/peers, and muxa_collaboration_guide \
-    for details. @peer/@muxa-peer new work uses muxa_call_peer; existing reports use \
+const MCP_SERVER_INSTRUCTIONS: &str = "Muxa coordinates same-window peers. Call muxa_collaboration_guide \
+    once: it returns your identity (room.self), peers, and launch preferences. Later, \
+    refresh peers with muxa_room_context. Never derive identity from TMUX_PANE or tmux. @peer/@muxa-peer new work uses muxa_call_peer; existing reports use \
     muxa_peer_report. Never infer GitHub/PR work without an explicit PR number or URL. \
     Peer calls default to review + read_only. execute=true and spawn_if_missing=true \
     require explicit authorization; prior authorization counts. Retain ownership and \
@@ -761,12 +761,12 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_collaboration_guide",
-            "description": "Discover same-window peer agents and get concrete reviewer/subagent workflows. Call near the start of substantial work and again before finalizing important changes when an independent review could improve the result.",
+            "description": "Return your identity (room.self: pane, session, window), same-window peers, the user's launch preferences, and concrete reviewer/subagent workflows in one call; it covers muxa_room_context and muxa_guide. Call once near the start of substantial work; refresh peers later with muxa_room_context.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
         json!({
             "name": "muxa_room_context",
-            "description": "Identify this agent and list collaboration peers in the same tmux window, plus unread request and reply counts. Use the returned pane, alias, role, and state to choose an appropriate reviewer or delegated subagent.",
+            "description": "Identify this agent (self) and list collaboration peers in the same tmux window, plus unread request and reply counts. A lightweight refresh after muxa_collaboration_guide; use the returned pane, alias, role, and state to choose a reviewer or delegated subagent.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
         json!({

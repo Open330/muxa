@@ -119,6 +119,20 @@ across active backends. muxad validates the resolved origin against its live
 agent and pane registries; collaboration tools do not accept an arbitrary
 sender pane.
 
+Codex 0.160+ attaches every TUI to one shared `codex app-server` (its
+`daemon_auto_start` feature). That server runs hooks, MCP servers, and shell
+commands for all attached threads with the pane variables of whichever pane
+started it, so `env_vars` cannot identify the caller there. Muxa detects the
+shared server from process ancestry and identifies the thread by its exact
+session id instead: the `_meta.threadId` Codex stamps on each MCP call, or
+`$CODEX_THREAD_ID` for `muxa msg`/`muxa peers` run from a Codex shell. The
+origin carries that id and muxad matches it before the pane. Hooks from the
+shared server report no pane; muxad binds the session from its `codex resume
+<id>` process or a pane whose cwd is unique. When neither applies, the thread
+stays unbound and collaboration tools report that rather than borrow another
+pane's identity. Start such a Codex with `codex --no-daemon` to keep its pane.
+Running `muxa mcp` processes keep their old code until the app-server restarts.
+
 ## Quiet progress and actionable notifications
 
 A one-way `notice` (`expects_reply=false`) is stored in the mailbox without

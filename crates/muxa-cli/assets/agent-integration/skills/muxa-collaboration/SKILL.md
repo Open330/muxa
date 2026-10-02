@@ -6,9 +6,12 @@ description: Coordinate coding agents through Muxa MCP and its tmux workspace, w
 # Muxa collaboration
 
 Use the connected Muxa MCP tools to coordinate bounded work and retain ownership
-of the final result. Consult `muxa_guide` for the user's launch preferences and
-`muxa_room_context` for identity, same-window peers, and unread messages. Retrieve
-`muxa_collaboration_guide` when you need the runtime's detailed contract. Tool
+of the final result. Start with one `muxa_collaboration_guide` call: it returns your
+identity (`room.self`: pane, tmux session, window), same-window peers, and the user's
+launch preferences, so separate `muxa_guide`/`muxa_room_context` calls are redundant.
+Later, refresh peers and unread counts with `muxa_room_context` only when they may
+have changed. Report your location from `self`; never derive it from `$TMUX_PANE` or
+tmux commands, which can name another pane (Codex's shared app-server). Tool
 schemas and returned IDs describe the currently installed capabilities.
 
 ## Execution layout
