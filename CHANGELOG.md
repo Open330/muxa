@@ -7,7 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `muxa upgrade` snapshots the workspace before swapping binaries. Afterwards
+  it lists the agent tool servers (`muxa mcp`) still running the old build,
+  grouped by owner. For each owner it gives the command to run:
+  `codex app-server daemon restart` (with its `CODEX_HOME`) for Codex's shared
+  server, or an agent restart / `muxa reload` for pane agents. It also prints
+  the `muxa restore <snapshot>` commands that rebuild the pre-upgrade
+  workspace. `muxa doctor` runs the same check. Killing a `muxa mcp` is no
+  refresh: agents do not respawn it.
+
 ### Fixed
+
+- Codex 0.160+ runs every TUI's hooks, MCP servers and shell commands from
+  one shared `codex app-server`. Those processes inherit the pane variables of
+  whichever pane started the server, so every Codex reported that pane's
+  session/window/pane in collaboration, and replies went to the wrong agent.
+  Muxa now detects the shared server from process ancestry and identifies a
+  thread by its exact Codex thread id (`_meta.threadId` on MCP calls,
+  `$CODEX_THREAD_ID` for `muxa msg`/`muxa peers`). Collaboration origins carry
+  that id, and muxad matches it before the pane.
+- Codex threads under the shared server are bound to their real pane:
+  - **Exact resume:** from an exact `codex resume <id>` process.
+  - **Unique cwd:** from the one free pane running Codex at the thread's cwd.
+  - **Screen prompt:** when several Codex panes share that cwd, from the pane
+    whose screen shows the thread's latest prompt.
+
+  Binding happens when the thread's first prompt hook arrives, and again on its
+  first collaboration call. `/new` inside a bound TUI hands the pane to the new
+  thread. Ambiguous evidence, such as an identical prompt in one cwd, leaves
+  the thread unbound with a clear error rather than borrowing another pane's
+  identity.
+- Daemon startup no longer re-seeds a closed Codex thread onto the pane its
+  prompt history recorded. Behind the shared server that pane belonged to a
+  different agent.
+- Agent guidance (MCP instructions, skill, bootstrap) asks for one
+  `muxa_collaboration_guide` call for identity, peers and launch preferences,
+  and says to report location from `self` rather than `$TMUX_PANE`.
+- Rust 1.99 clippy lints pass.
 
 - Local Mac app builds derive their marketing version from the workspace,
   matching the bundled CLI and daemon. Refresh Welcome, release highlights,

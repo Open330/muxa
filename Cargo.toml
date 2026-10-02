@@ -52,6 +52,8 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
 needless_pass_by_value = "allow"
+# Rust 1.99 pedantic; `assert!(x.is_empty())` is the house style in tests.
+assert_is_empty = "allow"
 
 [profile.release]
 lto = "thin"

@@ -49,6 +49,10 @@ impl ProcessTable {
         self.by_pid.get(&pid).map(|process| process.comm.as_str())
     }
 
+    pub(crate) fn get(&self, pid: u32) -> Option<&ProcessInfo> {
+        self.by_pid.get(&pid)
+    }
+
     pub(crate) fn descendants(
         &self,
         root: u32,

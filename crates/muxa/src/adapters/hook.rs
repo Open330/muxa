@@ -66,7 +66,14 @@ where
     stdin.read_to_string(&mut buf)?;
     let input: A::Input = serde_json::from_str(&buf)?;
     let surface = muxa_session_env();
-    let pane = if surface.is_some() {
+    let pane = if surface.is_some()
+        || (A::KIND == AgentKind::Codex
+            && crate::adapters::proc_ancestry::under_shared_codex_app_server(std::process::id()))
+    {
+        // A shared Codex app-server fires hooks for every attached thread
+        // with the env of whichever pane started it, so its pane names a
+        // stranger. Report paneless and let the reconciler bind the session
+        // from its `codex resume <id>` process or an unambiguous cwd.
         None
     } else {
         host_pane_env()

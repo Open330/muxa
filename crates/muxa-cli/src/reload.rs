@@ -243,6 +243,17 @@ pub async fn snapshot(client: &Client, args: SnapshotArgs) -> Result<()> {
     Ok(())
 }
 
+/// Snapshot the tracked workspace before `muxa upgrade` swaps binaries, so
+/// `muxa restore` can rebuild it if the agents have to be restarted. Returns
+/// the snapshot directory and a one-line summary.
+pub async fn snapshot_before_upgrade(client: &Client) -> Result<(PathBuf, String)> {
+    let endpoint = resolve_endpoint(client, None).await?;
+    let snapshot = capture(client, &endpoint).await?;
+    let dir = default_snapshot_dir()?;
+    write_snapshot(&snapshot, &dir)?;
+    Ok((dir, summary(&snapshot)))
+}
+
 /// What `muxa snapshot --json` (and `--auto --json`) reports.
 #[derive(Debug, Serialize)]
 struct SaveOutcome {

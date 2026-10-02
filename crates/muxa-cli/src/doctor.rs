@@ -103,6 +103,10 @@ pub async fn run(socket: PathBuf, config: Option<&Path>) -> Result<()> {
         ),
     }
 
+    // 4½. Agent tool servers (`muxa mcp`) still on a pre-upgrade binary:
+    //     their tools keep old behavior until the agent or server restarts.
+    tally(check_stale_agent_servers(), &mut issues);
+
     // 4¾. What the tmux server and client this doctor run is talking to
     //     can actually do. Read once and threaded into the tmux checks
     //     below, because a config-isolated or control-mode server changes
@@ -169,6 +173,16 @@ pub async fn run(socket: PathBuf, config: Option<&Path>) -> Result<()> {
 /// Saying so here is the cheap half: no refusal, no change to where anything
 /// lands, just the one line that turns "why is my agent over there" into a
 /// fact somebody can act on.
+fn check_stale_agent_servers() -> CheckResult {
+    let Some(binary) = crate::stale_agents::installed_muxa() else {
+        return CheckResult::Ok("agent tool servers — no installed muxa found to compare".into());
+    };
+    match crate::stale_agents::scan(&binary).guidance() {
+        None => CheckResult::Ok("agent tool servers (`muxa mcp`) run the installed muxa".into()),
+        Some(guidance) => CheckResult::Warn(guidance),
+    }
+}
+
 fn check_workspace_marks() -> CheckResult {
     match crate::tmux_work::workspace_mark_anomalies() {
         // No server, or a server with no marks, is the ordinary case.

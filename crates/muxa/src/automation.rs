@@ -680,7 +680,7 @@ impl AutomationRule {
     pub fn validate(&self) -> Result<(), String> {
         let named = |message: String| format!("automation.rule {:?}: {message}", self.name);
         if let Some(condition) = &self.ask_condition {
-            condition.validate().map_err(&named)?;
+            condition.validate().map_err(named)?;
         }
 
         if self.name.trim().is_empty() {
@@ -735,7 +735,7 @@ impl AutomationRule {
                 return Err(named("`on = \"idle_for\"` requires `for`".into()))
             }
             (AutomationEvent::IdleFor, Some(value)) => {
-                value.validate("for").map_err(&named)?;
+                value.validate("for").map_err(named)?;
                 if value.duration().is_zero() {
                     return Err(named("`for` must be greater than zero".into()));
                 }
@@ -745,7 +745,7 @@ impl AutomationRule {
         }
 
         let wait = self.wait();
-        wait.validate("wait").map_err(&named)?;
+        wait.validate("wait").map_err(named)?;
         if wait.anchor == WaitAnchor::Reset && self.on != AutomationEvent::RateLimited {
             return Err(named(
                 "a `reset` wait only applies to `on = \"rate_limited\"`; \
@@ -754,13 +754,13 @@ impl AutomationRule {
             ));
         }
         if let Some(fallback) = self.fallback {
-            fallback.validate("fallback").map_err(&named)?;
+            fallback.validate("fallback").map_err(named)?;
         }
         if let Some(jitter) = self.jitter {
-            jitter.validate("jitter").map_err(&named)?;
+            jitter.validate("jitter").map_err(named)?;
         }
         if let Some(cooldown) = self.cooldown {
-            cooldown.validate("cooldown").map_err(&named)?;
+            cooldown.validate("cooldown").map_err(named)?;
         }
         if let Some(max) = self.max_per_hour {
             if max == 0 {

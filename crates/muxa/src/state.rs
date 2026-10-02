@@ -1922,6 +1922,7 @@ impl Store {
     fn correlate_paneless_codex(
         agents: &mut HashMap<String, Agent>,
         panes_by_id: &HashMap<&str, Vec<&PaneInfo>>,
+        codex_hosts: &[PaneInfo],
     ) -> usize {
         // A pane's cwd, resolved the same way `backfill_tmux_names` picks the
         // right candidate when a pane id repeats across tmux servers.
@@ -1965,6 +1966,23 @@ impl Store {
                     .entry(path)
                     .or_default()
                     .push((pane_id, a.tmux_socket.clone()));
+            }
+        }
+
+        // Panes whose live process tree runs an interactive Codex count too:
+        // the screen detector may own the pane's placeholder as `Unknown`.
+        for host in codex_hosts {
+            let key = (host.pane_id.clone(), host.socket.clone());
+            if real_codex_panes.contains(&key) {
+                continue;
+            }
+            let path = host.current_path.trim();
+            if path.is_empty() {
+                continue;
+            }
+            let candidates = panes_by_cwd.entry(path.to_string()).or_default();
+            if !candidates.contains(&key) {
+                candidates.push(key);
             }
         }
 
@@ -2062,7 +2080,7 @@ impl Store {
     /// test) sees the exact same adopt-then-demote-in-one-pass behavior as
     /// before the correlation was lifted out of [`Self::reconcile_hosted`].
     pub async fn reconcile(&self, live_panes: &[PaneInfo]) -> ReconcileReport {
-        let paneless_correlated = self.correlate_paneless_codex_union(live_panes).await;
+        let paneless_correlated = self.correlate_paneless_codex_union(live_panes, &[]).await;
         let mut report = self.reconcile_hosted(live_panes, HostKind::Tmux).await;
         report.paneless_correlated = paneless_correlated;
         report
@@ -2110,19 +2128,120 @@ impl Store {
     /// cwd with a tmux pane. The reconciler calls this before its per-host
     /// reap/dedup passes so those passes still demote the redundant synthetic
     /// in the same tick.
-    pub async fn correlate_paneless_codex_union(&self, live_panes: &[PaneInfo]) -> usize {
+    pub async fn correlate_paneless_codex_union(
+        &self,
+        live_panes: &[PaneInfo],
+        codex_hosts: &[PaneInfo],
+    ) -> usize {
         let mut agents = self.agents.write().await;
         let mut panes_by_id: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
         for p in live_panes {
             panes_by_id.entry(p.pane_id.as_str()).or_default().push(p);
         }
-        let adopted = Self::correlate_paneless_codex(&mut agents, &panes_by_id);
+        let adopted = Self::correlate_paneless_codex(&mut agents, &panes_by_id, codex_hosts);
         if adopted > 0 {
             drop(agents);
             self.dirty.notify_one();
             self.changes.send_replace(());
         }
         adopted
+    }
+
+    /// Whether `session_id` is a real Codex thread still waiting for a pane.
+    pub(crate) async fn is_unplaced_codex(&self, session_id: &str) -> bool {
+        self.agents
+            .read()
+            .await
+            .get(session_id)
+            .is_some_and(crate::codex_binding::is_unplaced_codex)
+    }
+
+    /// Live Codex hosts at the cwd of a still-unbound Codex thread that no
+    /// other thread owns — the panes whose screens can settle an ambiguous
+    /// cwd. Empty when nothing is contested, so callers capture nothing.
+    pub(crate) async fn contested_codex_hosts(&self, codex_hosts: &[PaneInfo]) -> Vec<PaneInfo> {
+        let agents = self.agents.read().await;
+        let unbound_cwds: HashSet<&str> = agents
+            .values()
+            .filter(|agent| crate::codex_binding::is_unplaced_codex(agent))
+            .filter_map(|agent| agent.cwd.as_deref().map(str::trim))
+            .filter(|cwd| !cwd.is_empty())
+            .collect();
+        if unbound_cwds.is_empty() {
+            return Vec::new();
+        }
+        // Owned panes stay in: after `/new` the unbound thread runs in a pane
+        // its predecessor still owns.
+        codex_hosts
+            .iter()
+            .filter(|host| unbound_cwds.contains(host.current_path.trim()))
+            .cloned()
+            .collect()
+    }
+
+    /// Bind unbound Codex threads to the one contested pane whose `screens`
+    /// text shows the thread's latest prompt (see
+    /// [`crate::codex_binding::prompt_pairs`]). Returns the number bound.
+    pub(crate) async fn correlate_paneless_codex_by_prompt(
+        &self,
+        screens: &[(PaneInfo, String)],
+    ) -> usize {
+        if screens.is_empty() {
+            return 0;
+        }
+        let mut agents = self.agents.write().await;
+        let rows: Vec<(String, String, String)> = agents
+            .values()
+            .filter(|agent| crate::codex_binding::is_unplaced_codex(agent))
+            .filter_map(|agent| {
+                let cwd = agent.cwd.as_deref()?.trim();
+                let needle = crate::codex_binding::prompt_needle(agent.last_prompt.as_deref()?)?;
+                (!cwd.is_empty()).then(|| (agent.session_id.clone(), cwd.to_owned(), needle))
+            })
+            .collect();
+        let pairs = crate::codex_binding::prompt_pairs(&rows, screens);
+        let mut bound = 0;
+        for (session, pane) in pairs {
+            let Some(prompted_at) = agents.get(&session).and_then(|a| a.last_prompt_at) else {
+                continue;
+            };
+            // A pane owned by an older thread changed threads (`/new`); one
+            // owned by a thread prompted since then is not this thread's.
+            let owners: Vec<String> = agents
+                .values()
+                .filter(|agent| {
+                    agent.kind == AgentKind::Codex
+                        && !is_synthetic(&agent.session_id)
+                        && agent.pane.as_deref() == Some(pane.pane_id.as_str())
+                        && agent.tmux_socket == pane.socket
+                })
+                .map(|agent| agent.session_id.clone())
+                .collect();
+            if owners.iter().any(|owner| {
+                agents[owner]
+                    .last_prompt_at
+                    .is_some_and(|owner_at| owner_at >= prompted_at)
+            }) {
+                continue;
+            }
+            for owner in owners {
+                if let Some(previous) = agents.get_mut(&owner) {
+                    previous.pane = None;
+                    previous.state = AgentState::Stopped;
+                }
+            }
+            if let Some(agent) = agents.get_mut(&session) {
+                agent.pane = Some(pane.pane_id.clone());
+                agent.tmux_socket.clone_from(&pane.socket);
+                bound += 1;
+            }
+        }
+        if bound > 0 {
+            drop(agents);
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
+        bound
     }
 
     /// Converge against a complete pane set observed by `observing_kind`.
@@ -4839,6 +4958,212 @@ mod tests {
         // broadcast send is non-blocking) and we're on a single runtime.
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         assert!(res.is_err(), "expected no transition, got {res:?}");
+    }
+
+    /// A fresh thread behind Codex's shared app-server reports no pane, and
+    /// the screen detector may own the pane's placeholder as `Unknown`. The
+    /// live process scan's Codex host is then the only pane evidence: a
+    /// unique cwd adopts it, two Codex panes at that cwd adopt neither.
+    #[tokio::test]
+    async fn paneless_codex_adopts_a_live_codex_host_without_a_codex_placeholder() {
+        let t0 = datetime!(2026-10-02 04:00:00 UTC);
+        let started =
+            |kind, sid: &str, pane: Option<&str>, cwd: Option<&str>| AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind,
+                    session_id: sid.into(),
+                    surface: None,
+                    pane: pane.map(str::to_owned),
+                    cwd: cwd.map(str::to_owned),
+                },
+                at: t0,
+            };
+        let host = |id: &str, cwd: &str| {
+            let mut p = pane(id);
+            p.current_path = cwd.into();
+            p
+        };
+
+        let store = Store::shared();
+        store
+            .apply(&started(
+                AgentKind::Unknown,
+                "synthetic-%204",
+                Some("%204"),
+                None,
+            ))
+            .await;
+        store
+            .apply(&started(
+                AgentKind::Codex,
+                "01a0fad4",
+                None,
+                Some("/scratch/e2e"),
+            ))
+            .await;
+        let live = [host("%204", "/scratch/e2e")];
+        assert_eq!(store.correlate_paneless_codex_union(&live, &[]).await, 0);
+        assert_eq!(store.correlate_paneless_codex_union(&live, &live).await, 1);
+        let snap = store.snapshot().await;
+        let real = snap.iter().find(|a| a.session_id == "01a0fad4").unwrap();
+        assert_eq!(real.pane.as_deref(), Some("%204"));
+
+        let store = Store::shared();
+        store
+            .apply(&started(AgentKind::Codex, "fresh", None, Some("/repo")))
+            .await;
+        let live = [host("%5", "/repo"), host("%6", "/repo")];
+        assert_eq!(store.correlate_paneless_codex_union(&live, &live).await, 0);
+    }
+
+    /// Two fresh threads prompted in one cwd before either bound: the live
+    /// hosts are contested, and each pane's screen shows one thread's prompt.
+    #[tokio::test]
+    async fn contested_codex_cwd_binds_by_the_prompt_on_screen() {
+        let t0 = datetime!(2026-10-02 05:00:00 UTC);
+        let store = Store::shared();
+        for (sid, prompt) in [
+            ("thread-a", "Review the auth middleware for token leaks"),
+            ("thread-b", "Write migration tests for the billing schema"),
+        ] {
+            let id = AgentId {
+                tmux_socket: None,
+                kind: AgentKind::Codex,
+                session_id: sid.into(),
+                surface: None,
+                pane: None,
+                cwd: Some("/repo".into()),
+            };
+            store
+                .apply(&AgentEvent::Started {
+                    id: id.clone(),
+                    at: t0,
+                })
+                .await;
+            store
+                .apply(&AgentEvent::PromptSubmitted {
+                    id,
+                    prompt: prompt.into(),
+                    at: t0,
+                })
+                .await;
+            assert!(store.is_unplaced_codex(sid).await);
+        }
+        let host = |id: &str| {
+            let mut p = pane(id);
+            p.current_path = "/repo".into();
+            p
+        };
+        let hosts = [host("%1"), host("%2")];
+        assert_eq!(
+            store.correlate_paneless_codex_union(&hosts, &hosts).await,
+            0
+        );
+        let contested = store.contested_codex_hosts(&hosts).await;
+        assert_eq!(contested.len(), 2);
+
+        let screens = vec![
+            (
+                hosts[0].clone(),
+                "› Write migration tests for the\n  billing schema\n".to_string(),
+            ),
+            (
+                hosts[1].clone(),
+                "› Review the auth middleware for token leaks\n".to_string(),
+            ),
+        ];
+        assert_eq!(store.correlate_paneless_codex_by_prompt(&screens).await, 2);
+        let snap = store.snapshot().await;
+        let pane_of = |sid: &str| {
+            snap.iter()
+                .find(|a| a.session_id == sid)
+                .and_then(|a| a.pane.clone())
+        };
+        assert_eq!(pane_of("thread-a").as_deref(), Some("%2"));
+        assert_eq!(pane_of("thread-b").as_deref(), Some("%1"));
+        assert!(store.contested_codex_hosts(&hosts).await.is_empty());
+        assert!(!store.is_unplaced_codex("thread-a").await);
+    }
+
+    /// `/new` inside a bound TUI: the newer thread whose prompt is on that
+    /// pane takes it over and its predecessor stops; an older unbound thread
+    /// can never take a pane from a thread prompted after it.
+    #[tokio::test]
+    async fn newer_thread_on_screen_takes_over_its_predecessors_pane() {
+        let t0 = datetime!(2026-10-02 06:00:00 UTC);
+        let store = Store::shared();
+        let prompt = |sid: &str, pane: Option<&str>, text: &str, at| {
+            let id = AgentId {
+                tmux_socket: pane.map(|_| "default".to_owned()),
+                kind: AgentKind::Codex,
+                session_id: sid.into(),
+                surface: None,
+                pane: pane.map(str::to_owned),
+                cwd: Some("/repo".into()),
+            };
+            AgentEvent::PromptSubmitted {
+                id,
+                prompt: text.into(),
+                at,
+            }
+        };
+        let first = "First thread: reply with exactly the word ready";
+        let second = "Second thread after slash new: reply ready";
+        store.apply(&prompt("old", Some("%1"), first, t0)).await;
+        store
+            .apply(&prompt(
+                "new",
+                None,
+                second,
+                t0 + time::Duration::seconds(30),
+            ))
+            .await;
+        let mut host = pane("%1");
+        host.current_path = "/repo".into();
+        host.socket = Some("default".into());
+        let hosts = [host.clone()];
+        assert_eq!(
+            store.correlate_paneless_codex_union(&hosts, &hosts).await,
+            0
+        );
+        assert_eq!(store.contested_codex_hosts(&hosts).await.len(), 1);
+
+        let screen = format!("› {second}\n• ready\n");
+        assert_eq!(
+            store
+                .correlate_paneless_codex_by_prompt(&[(host.clone(), screen)])
+                .await,
+            1
+        );
+        let snap = store.snapshot().await;
+        let row = |sid: &str| snap.iter().find(|a| a.session_id == sid).unwrap().clone();
+        assert_eq!(row("new").pane.as_deref(), Some("%1"));
+        assert_eq!(row("old").pane, None);
+        assert_eq!(row("old").state, AgentState::Stopped);
+        assert!(
+            !store.is_unplaced_codex("old").await,
+            "a stopped thread is not rebound"
+        );
+
+        // The reverse: an unbound thread older than the owner never steals.
+        let store = Store::shared();
+        store.apply(&prompt("stale", None, first, t0)).await;
+        store
+            .apply(&prompt(
+                "owner",
+                Some("%1"),
+                second,
+                t0 + time::Duration::seconds(30),
+            ))
+            .await;
+        let screen = format!("› {first}\n› {second}\n");
+        assert_eq!(
+            store
+                .correlate_paneless_codex_by_prompt(&[(host, screen)])
+                .await,
+            0
+        );
     }
 
     /// A `code_mode_host` codex splits into a synthetic pane placeholder

@@ -222,6 +222,39 @@ muxa status-line --pane "$TMUX_PANE"
 muxa watch
 ```
 
+## 업그레이드
+
+`muxa upgrade`는 설치 채널(소스 체크아웃, Homebrew, 릴리스 바이너리)에 맞게
+제자리 업데이트하고 muxad를 다시 실행합니다. 교체 전후로 다음도 처리합니다.
+
+1. **먼저 작업 공간을 스냅샷합니다.** 경로는
+   `pre-upgrade snapshot: …/snapshots/<id>`로 출력됩니다.
+2. **아직 옛 빌드로 도는 것을 알려 줍니다.** hook은 다음 이벤트부터 새
+   `muxa`를 씁니다. 에이전트가 띄운 `muxa mcp` 서버는 그 에이전트가
+   재시작할 때까지 옛 코드로 돕니다. `muxa upgrade`가 끝날 때(그리고 나중에
+   `muxa doctor`로) 이런 서버를 소유자별로 보여 주고, 각각 실행할 명령을
+   알려 줍니다.
+   - **Codex 공유 app-server**(Codex 0.160+는 모든 스레드에 하나를 공유):
+     해당 세션들이 쉬고 있을 때
+     `CODEX_HOME=<home> codex app-server daemon restart`를 실행합니다.
+   - **pane 안의 에이전트:** 각 에이전트를 재시작하면 대화가 이어집니다.
+     모든 pane을 한 번에 재시작하려면 멀티플렉서 밖에서 `muxa reload`를
+     실행합니다. 스냅샷 → 서버 재시작 → 각 에이전트를 resume 명령으로 다시
+     실행합니다.
+
+   `muxa mcp`를 직접 종료해서 교체하려고 하지 마세요. 에이전트가 다시 띄우지
+   않아서, 그 에이전트가 재시작될 때까지 muxa 도구가 실패합니다.
+3. **작업 공간을 복원할 수 있게 합니다.** 재시작 중에 pane이 사라졌다면
+   업그레이드 전 상태로 되돌립니다.
+
+   ```bash
+   muxa restore ~/.local/share/muxa/snapshots/<id>         # 계획만 출력
+   muxa restore ~/.local/share/muxa/snapshots/<id> --run   # 없는 것만 다시 생성
+   ```
+
+   이미 있는 세션, window, pane은 그대로 두고 없는 것만 만들기 때문에, 여러
+   번 실행해도 안전합니다.
+
 ## Rollback
 
 ```bash

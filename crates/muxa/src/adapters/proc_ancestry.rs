@@ -92,9 +92,78 @@ where
     None
 }
 
+/// Whether `start_pid` runs beneath Codex's **shared** `app-server`.
+///
+/// Codex 0.160+ attaches every TUI to one background `codex app-server
+/// --managed-daemon` (`features.daemon_auto_start`). That server runs the
+/// hooks, MCP servers, and shell commands of *every* attached thread, and all
+/// of them inherit the environment of whichever pane happened to start the
+/// server first. Its `$TMUX_PANE`/`$RMUX_PANE` therefore name an unrelated
+/// pane, and trusting them makes one Codex speak as another. Callers use this
+/// to distrust the inherited pane and identify the thread by its session id.
+///
+/// An `app-server` whose parent is an ordinary `codex` invocation is private
+/// to that TUI (it lives in the TUI's pane), so its environment stays valid.
+pub fn under_shared_codex_app_server(start_pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        shared_codex_app_server_in_ancestry(start_pid, parent_pid, |pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline"))
+                .ok()
+                .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let table = crate::process_snapshot::read_current_process_table();
+        shared_codex_app_server_in_ancestry(
+            start_pid,
+            |pid| table.get(pid).map(|p| p.parent_pid),
+            |pid| table.get(pid).map(|p| p.cmdline.clone()),
+        )
+    }
+}
+
+fn shared_codex_app_server_in_ancestry<P, A>(start_pid: u32, parent_of: P, argv_of: A) -> bool
+where
+    P: Fn(u32) -> Option<u32>,
+    A: Fn(u32) -> Option<String>,
+{
+    let mut cur = start_pid;
+    for _ in 0..MAX_DEPTH {
+        let Some(parent) = parent_of(cur) else {
+            return false;
+        };
+        if parent <= 1 || parent == cur {
+            return false;
+        }
+        if argv_of(parent).is_some_and(|argv| codex_subcommand(&argv) == Some("app-server")) {
+            // Owned by a TUI (`codex`, `codex resume …`) → private server.
+            let owner = parent_of(parent).and_then(&argv_of);
+            return !owner.is_some_and(|argv| {
+                codex_subcommand(&argv).is_some_and(|sub| sub != "app-server")
+            });
+        }
+        cur = parent;
+    }
+    false
+}
+
+/// For a `codex …` command line (NUL- or space-separated), the first argument
+/// after the program, or `""` when there is none. `None` when the program is
+/// not `codex`.
+fn codex_subcommand(command_line: &str) -> Option<&str> {
+    let mut args = command_line
+        .split(|c: char| c == '\0' || c.is_whitespace())
+        .filter(|arg| !arg.is_empty());
+    let program = args.next()?;
+    (program.rsplit('/').next() == Some("codex")).then(|| args.next().unwrap_or(""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -179,5 +248,92 @@ TracerPid:\t0
         let parent_of = |pid: u32| if pid > 1 { Some(pid - 1) } else { None };
         let pids: HashSet<u32> = [0].into_iter().collect();
         assert_eq!(ancestor_in_set(10_000, &pids, parent_of), None);
+    }
+
+    fn tree(entries: &[(u32, u32, &str)]) -> (HashMap<u32, u32>, HashMap<u32, String>) {
+        (
+            entries.iter().map(|(pid, ppid, _)| (*pid, *ppid)).collect(),
+            entries
+                .iter()
+                .map(|(pid, _, argv)| (*pid, (*argv).to_string()))
+                .collect(),
+        )
+    }
+
+    fn shared(entries: &[(u32, u32, &str)], start: u32) -> bool {
+        let (parents, argv) = tree(entries);
+        shared_codex_app_server_in_ancestry(
+            start,
+            |pid| parents.get(&pid).copied(),
+            |pid| argv.get(&pid).cloned(),
+        )
+    }
+
+    /// The live layout that made every Codex speak as `%9`: the managed
+    /// daemon is a child of the daemon's update loop, not of any TUI.
+    #[test]
+    fn managed_app_server_children_are_shared() {
+        let entries = [
+            (
+                100,
+                1,
+                "/opt/codex/bin/codex\0app-server\0daemon\0pid-update-loop",
+            ),
+            (
+                200,
+                100,
+                "/opt/codex/bin/codex\0app-server\0--listen\0unix://\0--managed-daemon",
+            ),
+            (300, 200, "muxa\0mcp"),
+            (310, 200, "/bin/sh\0-c\0muxa hook codex --event Stop"),
+            (311, 310, "muxa\0hook\0codex"),
+        ];
+        assert!(shared(&entries, 300));
+        assert!(shared(&entries, 311));
+    }
+
+    #[test]
+    fn app_server_reparented_to_init_is_shared() {
+        let entries = [
+            (200, 1, "codex app-server --listen unix://"),
+            (300, 200, "muxa mcp"),
+        ];
+        assert!(shared(&entries, 300));
+    }
+
+    #[test]
+    fn tui_owned_or_pane_processes_are_not_shared() {
+        let entries = [
+            (10, 1, "-zsh"),
+            (20, 10, "node /usr/bin/codex --yolo"),
+            (
+                21,
+                20,
+                "/vendor/bin/codex --yolo resume 01a0f037-0aec-77b0-8782-647a69e14f08",
+            ),
+            (22, 21, "codex app-server"),
+            (30, 22, "muxa mcp"),
+            (40, 21, "muxa mcp"),
+            (50, 10, "claude"),
+            (51, 50, "muxa mcp"),
+        ];
+        assert!(
+            !shared(&entries, 30),
+            "a TUI's private server keeps its pane env"
+        );
+        assert!(!shared(&entries, 40));
+        assert!(!shared(&entries, 51));
+    }
+
+    #[test]
+    fn codex_subcommand_requires_the_codex_program() {
+        assert_eq!(
+            codex_subcommand("/x/bin/codex\0app-server\0--listen"),
+            Some("app-server")
+        );
+        assert_eq!(codex_subcommand("codex"), Some(""));
+        assert_eq!(codex_subcommand("muxa app-server"), None);
+        assert_eq!(codex_subcommand("/x/codex-code-mode-host app-server"), None);
+        assert_eq!(codex_subcommand(""), None);
     }
 }
