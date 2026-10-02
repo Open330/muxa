@@ -2926,6 +2926,13 @@ pub fn resolve_origin(
         {
             return Ok(participant.clone());
         }
+        if origin.pane.is_empty() {
+            return Err(CollaborationError::UnknownOrigin(format!(
+                "Codex thread {session} is not bound to a pane yet (its hooks run in the \
+                 shared Codex app-server; muxa binds it from a `codex resume <id>` process \
+                 or the one Codex pane at its cwd — use a distinct cwd or `codex --no-daemon`)"
+            )));
+        }
     }
     let matches: Vec<_> = participants
         .iter()
@@ -3591,6 +3598,8 @@ mod tests {
         assert_eq!(fallback.agent_session_id, "thread-b");
         let by_pane = resolve_origin(&origin("%9", None), &peers, &[]).unwrap();
         assert_eq!(by_pane.agent_session_id, "junia");
+        let unbound = resolve_origin(&origin("", Some("fresh")), &peers, &[]).unwrap_err();
+        assert!(unbound.to_string().contains("not bound"), "{unbound}");
     }
 
     fn pane_info(pane_id: &str) -> PaneInfo {

@@ -3063,11 +3063,15 @@ async fn session_origin(
         .await
         .map_err(|error| format!("collaboration origin lookup failed: {error}"))?;
     let origin = origin_for_session(&agents, session)?;
-    if let Ok(mut cache) = cache.lock() {
-        cache.insert(
-            session.to_owned(),
-            (std::time::Instant::now(), origin.clone()),
-        );
+    // An unbound origin is resolved by the daemon, which binds the session on
+    // demand; ask it again next time instead of caching the empty pane.
+    if !origin.pane.is_empty() {
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(
+                session.to_owned(),
+                (std::time::Instant::now(), origin.clone()),
+            );
+        }
     }
     Ok(origin)
 }
@@ -3085,14 +3089,10 @@ fn origin_for_session(
                  submit a prompt so its hooks register it, then retry"
             )
         })?;
-    let pane = agent.pane.clone().ok_or_else(|| {
-        format!(
-            "collaboration origin: Codex thread {session} is not bound to a pane yet. \
-             Its hooks run in the shared Codex app-server, so muxa binds it from a \
-             `codex resume <id>` process or a unique pane cwd; if neither applies, \
-             start Codex with `codex --no-daemon`"
-        )
-    })?;
+    // Not bound yet: send the session alone. The daemon binds it from live
+    // process evidence before resolving; an empty pane can never fall back
+    // onto another agent's pane.
+    let pane = agent.pane.clone().unwrap_or_default();
     Ok(CollaborationOrigin {
         pane,
         socket: agent.tmux_socket.clone(),
@@ -3904,8 +3904,9 @@ mod tests {
         assert_eq!(origin.socket.as_deref(), Some("default"));
         assert!(!origin.console);
         assert_eq!(origin.agent_session_id.as_deref(), Some("thread-a"));
-        let unbound = origin_for_session(&agents, "thread-b").unwrap_err();
-        assert!(unbound.contains("not bound to a pane"), "{unbound}");
+        let unbound = origin_for_session(&agents, "thread-b").unwrap();
+        assert_eq!(unbound.pane, "", "an unbound session never borrows a pane");
+        assert_eq!(unbound.agent_session_id.as_deref(), Some("thread-b"));
         let unknown = origin_for_session(&agents, "thread-c").unwrap_err();
         assert!(unknown.contains("not tracked"), "{unknown}");
     }
