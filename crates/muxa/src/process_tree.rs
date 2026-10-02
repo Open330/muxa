@@ -102,18 +102,60 @@ pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummar
     out
 }
 
+/// Live Codex evidence from one walk of every pane's process tree.
+#[derive(Debug, Default)]
+pub(crate) struct CodexPaneScan {
+    /// Explicit `codex resume <id>` sessions and the one pane each runs in.
+    pub resume_bindings: Vec<(String, PaneInfo)>,
+    /// Panes running an interactive Codex, resumed or fresh. A thread behind
+    /// the shared app-server reports no pane, and the screen detector can
+    /// claim the pane's placeholder row as `Unknown`, so this — not a registry
+    /// placeholder — is the evidence a cwd correlation needs.
+    pub hosts: Vec<PaneInfo>,
+}
+
 /// Recover detached Codex sessions from an explicit CLI resume id and its
-/// pane ancestry. Never guess from cwd or choose between multiple panes.
-pub(crate) fn scan_codex_resume_bindings(panes: &[PaneInfo]) -> Vec<(String, PaneInfo)> {
+/// pane ancestry, and list the panes hosting an interactive Codex. Never
+/// guesses from cwd or chooses between multiple panes itself.
+pub(crate) fn scan_codex_panes(panes: &[PaneInfo]) -> CodexPaneScan {
     #[cfg(not(target_os = "linux"))]
     let table = crate::process_snapshot::read_current_process_table();
-    unique_codex_resume_bindings(panes.iter().filter(|p| p.pane_pid != 0).map(|pane| {
-        #[cfg(not(target_os = "linux"))]
-        let processes = table.descendants(pane.pane_pid, MAX_DEPTH, MAX_NODES);
-        #[cfg(target_os = "linux")]
-        let processes = read_descendants(pane.pane_pid);
-        (pane, processes)
-    }))
+    let scanned: Vec<_> = panes
+        .iter()
+        .filter(|p| p.pane_pid != 0)
+        .map(|pane| {
+            #[cfg(not(target_os = "linux"))]
+            let processes = table.descendants(pane.pane_pid, MAX_DEPTH, MAX_NODES);
+            #[cfg(target_os = "linux")]
+            let processes = read_descendants(pane.pane_pid);
+            (pane, processes)
+        })
+        .collect();
+    let hosts = scanned
+        .iter()
+        .filter(|(_, processes)| processes.iter().any(is_interactive_codex))
+        .map(|(pane, _)| (*pane).clone())
+        .collect();
+    CodexPaneScan {
+        resume_bindings: unique_codex_resume_bindings(scanned.into_iter()),
+        hosts,
+    }
+}
+
+/// A Codex TUI (`codex`, `codex --yolo`, `codex resume …`) rather than a
+/// headless `exec` run or an `app-server`, which serves other panes' threads.
+fn is_interactive_codex(process: &ProcessInfo) -> bool {
+    if agent_kind(process) != Some(AgentKind::Codex) {
+        return false;
+    }
+    let mut args = process.cmdline.split_whitespace();
+    if !args.any(|arg| arg.rsplit('/').next() == Some("codex")) {
+        return false;
+    }
+    !matches!(
+        args.find(|arg| !arg.starts_with('-')),
+        Some("app-server" | "exec" | "e" | "review" | "mcp-server")
+    )
 }
 
 fn unique_codex_resume_bindings<'a>(
@@ -406,6 +448,7 @@ mod tests {
             proc(21, 20, 2, "codex", &format!("codex resume {sid}")),
         ];
         let bindings = unique_codex_resume_bindings(std::iter::once((&a, processes.clone())));
+        assert!(processes.iter().all(is_interactive_codex));
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].0, sid);
         let b = a.clone();
@@ -415,6 +458,33 @@ mod tests {
                 .is_empty(),
             "same session in multiple servers must remain ambiguous"
         );
+    }
+
+    #[test]
+    fn interactive_codex_excludes_headless_and_server_runs() {
+        for (comm, args, expected) in [
+            ("codex", "/vendor/bin/codex --yolo Do this", true),
+            (
+                "codex",
+                "codex --yolo resume 01a0f231-262f-77a3-9d42-b36d645fefcd",
+                true,
+            ),
+            ("codex", "codex", true),
+            (
+                "codex",
+                "/x/bin/codex app-server --listen unix:// --managed-daemon",
+                false,
+            ),
+            ("codex", "codex exec explain this", false),
+            ("codex", "codex --yolo e explain", false),
+            ("zsh", "zsh -c codex", false),
+        ] {
+            assert_eq!(
+                is_interactive_codex(&proc(20, 10, 1, comm, args)),
+                expected,
+                "{args}"
+            );
+        }
     }
 
     #[test]

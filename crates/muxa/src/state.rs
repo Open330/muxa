@@ -1922,6 +1922,7 @@ impl Store {
     fn correlate_paneless_codex(
         agents: &mut HashMap<String, Agent>,
         panes_by_id: &HashMap<&str, Vec<&PaneInfo>>,
+        codex_hosts: &[PaneInfo],
     ) -> usize {
         // A pane's cwd, resolved the same way `backfill_tmux_names` picks the
         // right candidate when a pane id repeats across tmux servers.
@@ -1965,6 +1966,23 @@ impl Store {
                     .entry(path)
                     .or_default()
                     .push((pane_id, a.tmux_socket.clone()));
+            }
+        }
+
+        // Panes whose live process tree runs an interactive Codex count too:
+        // the screen detector may own the pane's placeholder as `Unknown`.
+        for host in codex_hosts {
+            let key = (host.pane_id.clone(), host.socket.clone());
+            if real_codex_panes.contains(&key) {
+                continue;
+            }
+            let path = host.current_path.trim();
+            if path.is_empty() {
+                continue;
+            }
+            let candidates = panes_by_cwd.entry(path.to_string()).or_default();
+            if !candidates.contains(&key) {
+                candidates.push(key);
             }
         }
 
@@ -2062,7 +2080,7 @@ impl Store {
     /// test) sees the exact same adopt-then-demote-in-one-pass behavior as
     /// before the correlation was lifted out of [`Self::reconcile_hosted`].
     pub async fn reconcile(&self, live_panes: &[PaneInfo]) -> ReconcileReport {
-        let paneless_correlated = self.correlate_paneless_codex_union(live_panes).await;
+        let paneless_correlated = self.correlate_paneless_codex_union(live_panes, &[]).await;
         let mut report = self.reconcile_hosted(live_panes, HostKind::Tmux).await;
         report.paneless_correlated = paneless_correlated;
         report
@@ -2110,13 +2128,17 @@ impl Store {
     /// cwd with a tmux pane. The reconciler calls this before its per-host
     /// reap/dedup passes so those passes still demote the redundant synthetic
     /// in the same tick.
-    pub async fn correlate_paneless_codex_union(&self, live_panes: &[PaneInfo]) -> usize {
+    pub async fn correlate_paneless_codex_union(
+        &self,
+        live_panes: &[PaneInfo],
+        codex_hosts: &[PaneInfo],
+    ) -> usize {
         let mut agents = self.agents.write().await;
         let mut panes_by_id: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
         for p in live_panes {
             panes_by_id.entry(p.pane_id.as_str()).or_default().push(p);
         }
-        let adopted = Self::correlate_paneless_codex(&mut agents, &panes_by_id);
+        let adopted = Self::correlate_paneless_codex(&mut agents, &panes_by_id, codex_hosts);
         if adopted > 0 {
             drop(agents);
             self.dirty.notify_one();
@@ -4839,6 +4861,63 @@ mod tests {
         // broadcast send is non-blocking) and we're on a single runtime.
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         assert!(res.is_err(), "expected no transition, got {res:?}");
+    }
+
+    /// A fresh thread behind Codex's shared app-server reports no pane, and
+    /// the screen detector may own the pane's placeholder as `Unknown`. The
+    /// live process scan's Codex host is then the only pane evidence: a
+    /// unique cwd adopts it, two Codex panes at that cwd adopt neither.
+    #[tokio::test]
+    async fn paneless_codex_adopts_a_live_codex_host_without_a_codex_placeholder() {
+        let t0 = datetime!(2026-10-02 04:00:00 UTC);
+        let started =
+            |kind, sid: &str, pane: Option<&str>, cwd: Option<&str>| AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind,
+                    session_id: sid.into(),
+                    surface: None,
+                    pane: pane.map(str::to_owned),
+                    cwd: cwd.map(str::to_owned),
+                },
+                at: t0,
+            };
+        let host = |id: &str, cwd: &str| {
+            let mut p = pane(id);
+            p.current_path = cwd.into();
+            p
+        };
+
+        let store = Store::shared();
+        store
+            .apply(&started(
+                AgentKind::Unknown,
+                "synthetic-%204",
+                Some("%204"),
+                None,
+            ))
+            .await;
+        store
+            .apply(&started(
+                AgentKind::Codex,
+                "01a0fad4",
+                None,
+                Some("/scratch/e2e"),
+            ))
+            .await;
+        let live = [host("%204", "/scratch/e2e")];
+        assert_eq!(store.correlate_paneless_codex_union(&live, &[]).await, 0);
+        assert_eq!(store.correlate_paneless_codex_union(&live, &live).await, 1);
+        let snap = store.snapshot().await;
+        let real = snap.iter().find(|a| a.session_id == "01a0fad4").unwrap();
+        assert_eq!(real.pane.as_deref(), Some("%204"));
+
+        let store = Store::shared();
+        store
+            .apply(&started(AgentKind::Codex, "fresh", None, Some("/repo")))
+            .await;
+        let live = [host("%5", "/repo"), host("%6", "/repo")];
+        assert_eq!(store.correlate_paneless_codex_union(&live, &live).await, 0);
     }
 
     /// A `code_mode_host` codex splits into a synthetic pane placeholder

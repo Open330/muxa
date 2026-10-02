@@ -540,18 +540,18 @@ impl<L: LivenessSource> Reconciler<L> {
             u64::try_from(workload_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         // Detached app-server hooks can retain another terminal's pane.
         // Explicit resume ids plus live process ancestry outrank that binding.
+        let mut codex_hosts = Vec::new();
         if !union_panes.is_empty()
             && self.store.snapshot().await.iter().any(|agent| {
                 agent.kind == AgentKind::Codex && !agent.session_id.starts_with("synthetic-")
             })
         {
             let panes = union_panes.clone();
-            let bindings = tokio::task::spawn_blocking(move || {
-                process_tree::scan_codex_resume_bindings(&panes)
-            })
-            .await
-            .unwrap_or_default();
-            self.store.rebind_codex_resumes(&bindings).await;
+            let scan = tokio::task::spawn_blocking(move || process_tree::scan_codex_panes(&panes))
+                .await
+                .unwrap_or_default();
+            self.store.rebind_codex_resumes(&scan.resume_bindings).await;
+            codex_hosts = scan.hosts;
         }
         let reconcile_started = Instant::now();
         let mut report = ReconcileReport::default();
@@ -564,7 +564,7 @@ impl<L: LivenessSource> Reconciler<L> {
         if !union_panes.is_empty() {
             report.paneless_correlated = self
                 .store
-                .correlate_paneless_codex_union(&union_panes)
+                .correlate_paneless_codex_union(&union_panes, &codex_hosts)
                 .await;
         }
         // Reconcile each observation against the store sequentially, under its
