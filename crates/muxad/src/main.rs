@@ -3359,7 +3359,10 @@ mod tests {
                 39,
                 "all quiet notices must remain readable at the checkpoint"
             );
-            assert!(mailbox.pending_reply_unnotified().await.is_empty());
+            assert_eq!(
+                mailbox.pending_reply_unnotified().await,
+                [] as [muxa::collaboration::CollaborationRequest; 0]
+            );
         }
     }
 
@@ -3681,7 +3684,10 @@ mod tests {
         assert!(stored.claimed_at.is_some());
         assert!(stored.notified_at.is_some());
         assert_eq!(stored.wake_delivery, None);
-        assert!(mailbox.pending_unnotified().await.is_empty());
+        assert_eq!(
+            mailbox.pending_unnotified().await,
+            [] as [muxa::collaboration::CollaborationRequest; 0]
+        );
 
         sends.lock().unwrap().clear();
         let unsafe_request = mailbox
@@ -3979,7 +3985,10 @@ mod tests {
         )
         .await;
         assert_eq!(sends.lock().unwrap().len(), 4);
-        assert!(mailbox.pending_unnotified().await.is_empty());
+        assert_eq!(
+            mailbox.pending_unnotified().await,
+            [] as [muxa::collaboration::CollaborationRequest; 0]
+        );
     }
 
     #[tokio::test]
@@ -4039,7 +4048,10 @@ mod tests {
             assert!(!delivered[0].1.contains("do not inject this twice"));
             assert_eq!(delivered[1], ("%2".into(), "\r".into()));
         }
-        assert!(mailbox.pending_unnotified().await.is_empty());
+        assert_eq!(
+            mailbox.pending_unnotified().await,
+            [] as [muxa::collaboration::CollaborationRequest; 0]
+        );
 
         let second = mailbox
             .create(
@@ -4081,7 +4093,10 @@ mod tests {
             sends.lock().unwrap().as_slice(),
             &[("%2".into(), "\r".into())]
         );
-        assert!(mailbox.pending_unnotified().await.is_empty());
+        assert_eq!(
+            mailbox.pending_unnotified().await,
+            [] as [muxa::collaboration::CollaborationRequest; 0]
+        );
     }
 
     #[tokio::test]
@@ -4189,7 +4204,10 @@ mod tests {
             assert!(!sends[0].1.contains("secret reply body"));
             assert_eq!(sends[1], ("%1".into(), "\r".into()));
         }
-        assert!(mailbox.pending_reply_unnotified().await.is_empty());
+        assert_eq!(
+            mailbox.pending_reply_unnotified().await,
+            [] as [muxa::collaboration::CollaborationRequest; 0]
+        );
         assert_eq!(
             mailbox
                 .unread_reply_count(
@@ -4686,7 +4704,10 @@ mod tests {
         engine.fire_due().await;
 
         assert!(sends.lock().unwrap().is_empty());
-        assert!(automation.ledger().all().await.is_empty());
+        assert_eq!(
+            automation.ledger().all().await,
+            [] as [muxa::automation::AutomationLedgerEntry; 0]
+        );
     }
 
     #[tokio::test]
@@ -4702,7 +4723,10 @@ mod tests {
         engine.fire_due().await;
 
         assert!(sends.lock().unwrap().is_empty());
-        assert!(automation.ledger().all().await.is_empty());
+        assert_eq!(
+            automation.ledger().all().await,
+            [] as [muxa::automation::AutomationLedgerEntry; 0]
+        );
     }
 
     #[tokio::test]
