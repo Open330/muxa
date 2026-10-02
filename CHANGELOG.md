@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.56] - 2026-10-02
+
 ### Added
 
 - `muxa upgrade` snapshots the workspace before swapping binaries. Afterwards
@@ -4076,7 +4078,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.55...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.56...HEAD
+[0.8.56]: https://github.com/Open330/muxa/compare/v0.8.55...v0.8.56
 [0.8.55]: https://github.com/Open330/muxa/compare/v0.8.54...v0.8.55
 [0.8.54]: https://github.com/Open330/muxa/compare/v0.8.53...v0.8.54
 [0.8.53]: https://github.com/Open330/muxa/compare/v0.8.52...v0.8.53
