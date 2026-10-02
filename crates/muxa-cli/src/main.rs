@@ -22,6 +22,7 @@ mod orchestration;
 mod peek;
 mod relay;
 mod reload;
+mod stale_agents;
 mod stats;
 mod theme;
 mod time_range;

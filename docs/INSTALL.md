@@ -238,6 +238,38 @@ muxa status-line --pane "$TMUX_PANE"
 muxa watch
 ```
 
+## Upgrading
+
+`muxa upgrade` updates in place for every channel (source checkout, Homebrew,
+release binary) and re-execs muxad. Around the swap it also:
+
+1. **Snapshots the workspace first.** The path is printed as
+   `pre-upgrade snapshot: …/snapshots/<id>`.
+2. **Reports what still runs the old build.** Hooks pick up the new `muxa` on
+   their next event. The `muxa mcp` server each agent launched keeps running
+   the old code until its owner restarts. `muxa upgrade` (and later
+   `muxa doctor`) lists those servers by owner and gives the exact command for
+   each:
+   - **Codex shared app-server** (Codex 0.160+ runs one for all threads): when
+     its sessions are idle, run `CODEX_HOME=<home> codex app-server daemon restart`.
+   - **Agents in panes:** restart each agent; it resumes its conversation. To
+     restart every pane at once, run `muxa reload` from outside the
+     multiplexer. It snapshots, restarts the server, and relaunches each agent
+     with its resume command.
+
+   Do not kill a `muxa mcp` to refresh it. The agent does not respawn it, and
+   its muxa tools fail until the agent restarts.
+3. **Lets you restore the workspace.** If a restart loses panes, rebuild the
+   pre-upgrade workspace:
+
+   ```bash
+   muxa restore ~/.local/share/muxa/snapshots/<id>         # print the plan
+   muxa restore ~/.local/share/muxa/snapshots/<id> --run   # recreate what is missing
+   ```
+
+   Existing sessions, windows and panes are kept. Only missing ones are
+   created, so it is safe to rerun.
+
 ## Rollback
 
 ```bash
