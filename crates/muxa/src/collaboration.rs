@@ -219,6 +219,15 @@ pub struct CollaborationOrigin {
     /// longer supplies the identity, so the console can address that pane too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub console: bool,
+    /// The calling agent's own session id, when its host supplies one
+    /// (Codex stamps a thread id on every MCP call and shell command).
+    ///
+    /// It is the exact identity: a pane can be claimed by more than one
+    /// registry row, or by the wrong one when the caller's pane variables were
+    /// inherited from another pane (Codex's shared app-server). A participant
+    /// with this session wins over a pane match; without one, `pane` decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
 }
 
 /// Local IPC surface that initiated a collaboration call. This describes the
@@ -2910,6 +2919,14 @@ pub fn resolve_origin(
     if origin.console {
         return console_participant(origin, panes);
     }
+    if let Some(session) = origin.agent_session_id.as_deref() {
+        if let Some(participant) = participants
+            .iter()
+            .find(|participant| participant.agent_session_id == session)
+        {
+            return Ok(participant.clone());
+        }
+    }
     let matches: Vec<_> = participants
         .iter()
         .filter(|participant| {
@@ -3549,6 +3566,33 @@ mod tests {
         }
     }
 
+    /// Codex threads behind a shared app-server once all claimed `%9`. The
+    /// caller's session id must pick its own row; an unknown id falls back
+    /// to the pane, exactly as an origin without one does.
+    #[test]
+    fn origin_session_id_wins_over_a_shared_pane() {
+        let mut stale = participant("%9", "thread-a");
+        stale.socket = None;
+        let peers = [
+            participant("%9", "junia"),
+            stale,
+            participant("%24", "thread-b"),
+        ];
+        let origin = |pane: &str, session: Option<&str>| CollaborationOrigin {
+            pane: pane.into(),
+            socket: Some("default".into()),
+            console: false,
+            agent_session_id: session.map(str::to_owned),
+        };
+        let resolved = resolve_origin(&origin("%9", Some("thread-b")), &peers, &[]).unwrap();
+        assert_eq!(resolved.agent_session_id, "thread-b");
+        assert_eq!(resolved.pane, "%24");
+        let fallback = resolve_origin(&origin("%24", Some("untracked")), &peers, &[]).unwrap();
+        assert_eq!(fallback.agent_session_id, "thread-b");
+        let by_pane = resolve_origin(&origin("%9", None), &peers, &[]).unwrap();
+        assert_eq!(by_pane.agent_session_id, "junia");
+    }
+
     fn pane_info(pane_id: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
@@ -4080,6 +4124,7 @@ mod tests {
             pane: "%1".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         };
         let resolved = resolve_origin(&origin, &[], &[base, view]).expect("console resolves");
         assert!(resolved.console);
@@ -4100,6 +4145,7 @@ mod tests {
             pane: "%1".into(),
             socket: None,
             console: true,
+            agent_session_id: None,
         };
         assert!(matches!(
             resolve_origin(&origin, &[], &[here, elsewhere]),
@@ -5147,6 +5193,7 @@ mod tests {
             pane: "%1".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         };
         let console = resolve_origin(&origin, &peers, &[pane_info("%1")]).unwrap();
 
@@ -5187,6 +5234,7 @@ mod tests {
                 pane: "%77".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &peers,
             &[pane_info("%77")],
@@ -5205,6 +5253,7 @@ mod tests {
                 pane: String::new(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &peers,
             &[],
@@ -5232,6 +5281,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &[],
             &panes,
@@ -5246,6 +5296,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: Some("/tmp/tmux-1000/default".into()),
                 console: true,
+                agent_session_id: None,
             },
             &[],
             &panes,
@@ -5263,6 +5314,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: Some("/tmp/tmux-1000/default".into()),
                 console: false,
+                agent_session_id: None,
             },
             std::slice::from_ref(&agent),
             &[pane_info("%1")],
@@ -5282,6 +5334,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &[],
             &[pane_info("%1")],
@@ -5294,6 +5347,7 @@ mod tests {
                 pane: "%9".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &[],
             std::slice::from_ref(&elsewhere),
@@ -5354,6 +5408,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &[],
             &[pane_info("%1")],
@@ -5413,6 +5468,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &[],
             &[pane_info("%1")],

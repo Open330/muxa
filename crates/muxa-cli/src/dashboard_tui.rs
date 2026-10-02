@@ -1516,6 +1516,7 @@ fn dashboard_collaboration_origin_from(
         pane: pane.unwrap_or_default(),
         socket,
         console: true,
+        agent_session_id: None,
     }
 }
 
@@ -1558,6 +1559,7 @@ fn dashboard_mailbox_anchor(app: &DashboardApp) -> Option<CollaborationAnchor> {
             pane,
             socket,
             console: false,
+            agent_session_id: None,
         },
         label,
     })
@@ -5338,6 +5340,7 @@ mod tests {
                 pane: current.pane.clone(),
                 socket: None,
                 console: false,
+                agent_session_id: None,
             },
             label: current.label(),
         };
@@ -5346,6 +5349,7 @@ mod tests {
                 pane: current.pane.clone(),
                 socket: current.socket.clone(),
                 console: true,
+                agent_session_id: None,
             }),
             room: Some(RoomContext {
                 current,
@@ -5668,6 +5672,7 @@ mod tests {
                 pane: "%9".into(),
                 socket: None,
                 console: false,
+                agent_session_id: None,
             },
             label: "codex@%9".into(),
         });

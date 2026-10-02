@@ -539,6 +539,7 @@ fn collaboration_origin(pane: &PaneKey, console: bool) -> CollaborationOrigin {
         socket: matches!(endpoint.host, HostKind::Tmux | HostKind::Rmux)
             .then(|| endpoint.socket.clone()),
         console,
+        agent_session_id: None,
     }
 }
 

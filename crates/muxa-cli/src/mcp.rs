@@ -293,7 +293,13 @@ async fn dispatch_object(
         "initialize" => success(&id, initialize_result(config)),
         "ping" => success(&id, json!({})),
         "tools/list" => success(&id, json!({ "tools": tool_definitions(config) })),
-        "tools/call" => match call_tool(client, req.get("params"), config).await {
+        "tools/call" => match CALLER_SESSION
+            .scope(
+                caller_session_hint(req.get("params")),
+                call_tool(client, req.get("params"), config),
+            )
+            .await
+        {
             Ok(result) => success(&id, result),
             // A malformed `tools/call` (missing name / bad args) is a
             // protocol error; a tool that *ran* but failed reports
@@ -1299,7 +1305,7 @@ async fn call_tool(
         "muxa_fleet_wait_reply" => Ok(fleet_wait_reply(client, &args).await),
         "muxa_wait_for_change" => Ok(wait_for_change(client, &args).await),
         "muxa_collaboration_guide" => {
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
@@ -1309,7 +1315,7 @@ async fn call_tool(
             })
         }
         "muxa_room_context" => {
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
@@ -1324,7 +1330,7 @@ async fn call_tool(
         "muxa_set_identity" => {
             let alias = args.get("alias").and_then(Value::as_str);
             let roles = string_array(&args, "roles");
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
@@ -1362,7 +1368,7 @@ async fn call_tool(
                 .get("expects_reply")
                 .and_then(Value::as_bool)
                 .unwrap_or(kind != RequestKind::Notice);
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
@@ -1386,7 +1392,7 @@ async fn call_tool(
             )
         }
         "muxa_inbox" => {
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
@@ -1400,7 +1406,7 @@ async fn call_tool(
                 Ok(mailbox) => mailbox,
                 Err(error) => return Ok(error_result(error)),
             };
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
@@ -1449,7 +1455,7 @@ async fn call_tool(
                     },
                 );
             }
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
@@ -1476,7 +1482,7 @@ async fn call_tool(
                 Ok(references) => references,
                 Err(error) => return Ok(error_result(&error)),
             };
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
@@ -1504,7 +1510,7 @@ async fn call_tool(
                     "cancel_message requires a `request_id` argument",
                 ));
             };
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
@@ -1761,7 +1767,7 @@ impl PeerSelection {
 /// Listing is non-claiming; the final exact get records that the sender read
 /// the reply, matching `muxa_wait_reply` semantics.
 async fn peer_report(client: &Client, args: &Value) -> Value {
-    let origin = match current_collaboration_origin() {
+    let origin = match resolve_collaboration_origin(client).await {
         Ok(origin) => origin,
         Err(error) => return error_result(&error),
     };
@@ -1863,7 +1869,7 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
             Ok(request) => request,
             Err(error) => return error_result(&error),
         };
-    let origin = match current_collaboration_origin() {
+    let origin = match resolve_collaboration_origin(client).await {
         Ok(origin) => origin,
         Err(error) => return error_result(&error),
     };
@@ -2075,7 +2081,7 @@ async fn fleet_call_peer(
             Err(error) => return error_result(&error),
         };
 
-    if let Ok(origin) = current_collaboration_origin() {
+    if let Ok(origin) = resolve_collaboration_origin(client).await {
         if let Ok(room) = client.collaboration_context(&origin).await {
             request.initiator = Some(Box::new(room.current));
         }
@@ -2961,6 +2967,140 @@ async fn await_collaboration_reply(
     Ok(request.status.is_terminal().then_some(request))
 }
 
+tokio::task_local! {
+    /// Agent session id the MCP host stamped on the current `tools/call`.
+    static CALLER_SESSION: Option<String>;
+}
+
+/// The calling thread's session id from a `tools/call`'s `_meta`. Codex sends
+/// `threadId`/`sessionId` (and the same id inside `x-codex-turn-metadata`) on
+/// every call; other hosts send nothing and keep the pane-env identity.
+fn caller_session_hint(params: Option<&Value>) -> Option<String> {
+    let meta = params?.get("_meta")?;
+    [
+        meta.get("threadId"),
+        meta.get("sessionId"),
+        meta.pointer("/x-codex-turn-metadata/session_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_str)
+    .map(str::trim)
+    .filter(|id| !id.is_empty())
+    .map(str::to_owned)
+}
+
+/// Whether this process inherited its pane env from a shared Codex
+/// app-server. Ancestry is fixed for the life of the process, so walk once.
+fn pane_env_is_borrowed() -> bool {
+    static SHARED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SHARED.get_or_init(|| {
+        muxa::adapters::proc_ancestry::under_shared_codex_app_server(std::process::id())
+    })
+}
+
+/// How long a session-id resolution is reused. Short enough that a binding
+/// the reconciler repairs (a pane claimed before the fix, a late cwd match)
+/// takes effect promptly; long enough that a burst of calls costs one lookup.
+const SESSION_ORIGIN_TTL: Duration = Duration::from_secs(30);
+
+/// The origin this MCP call or CLI invocation speaks for.
+///
+/// Normally the pane env names the caller ([`current_collaboration_origin`]).
+/// Under a shared Codex app-server it names whichever pane started that
+/// server, so the caller is identified by its Codex session id instead — the
+/// MCP `_meta` thread id, or `$CODEX_THREAD_ID` for a shell command — and
+/// mapped to the pane the registry bound that session to. A wrong identity is
+/// worse than none: when the session is unknown or not yet bound to a pane,
+/// this fails rather than borrowing the server's pane.
+pub(crate) async fn resolve_collaboration_origin(
+    client: &Client,
+) -> std::result::Result<CollaborationOrigin, String> {
+    let session = CALLER_SESSION
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            std::env::var("CODEX_THREAD_ID")
+                .ok()
+                .filter(|id| !id.trim().is_empty())
+        });
+    if !pane_env_is_borrowed() {
+        // The pane env is trustworthy, but a pane can still carry more than
+        // one registry row; the session id lets the daemon pick the caller's.
+        let mut origin = current_collaboration_origin()?;
+        origin.agent_session_id = session;
+        return Ok(origin);
+    }
+    let session = session.ok_or_else(|| {
+        "collaboration cannot identify this Codex thread: it runs under the shared \
+             Codex app-server, whose pane variables belong to another pane, and the \
+             call carried no thread id. Upgrade Codex, or start it with `codex --no-daemon`"
+            .to_string()
+    })?;
+    session_origin(client, &session).await
+}
+
+async fn session_origin(
+    client: &Client,
+    session: &str,
+) -> std::result::Result<CollaborationOrigin, String> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, (std::time::Instant, CollaborationOrigin)>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((at, origin)) = cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(session).cloned())
+    {
+        if at.elapsed() < SESSION_ORIGIN_TTL {
+            return Ok(origin);
+        }
+    }
+    let agents = client
+        .snapshot()
+        .await
+        .map_err(|error| format!("collaboration origin lookup failed: {error}"))?;
+    let origin = origin_for_session(&agents, session)?;
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(
+            session.to_owned(),
+            (std::time::Instant::now(), origin.clone()),
+        );
+    }
+    Ok(origin)
+}
+
+fn origin_for_session(
+    agents: &[Agent],
+    session: &str,
+) -> std::result::Result<CollaborationOrigin, String> {
+    let agent = agents
+        .iter()
+        .find(|agent| agent.session_id == session)
+        .ok_or_else(|| {
+            format!(
+                "collaboration origin: Codex thread {session} is not tracked yet; \
+                 submit a prompt so its hooks register it, then retry"
+            )
+        })?;
+    let pane = agent.pane.clone().ok_or_else(|| {
+        format!(
+            "collaboration origin: Codex thread {session} is not bound to a pane yet. \
+             Its hooks run in the shared Codex app-server, so muxa binds it from a \
+             `codex resume <id>` process or a unique pane cwd; if neither applies, \
+             start Codex with `codex --no-daemon`"
+        )
+    })?;
+    Ok(CollaborationOrigin {
+        pane,
+        socket: agent.tmux_socket.clone(),
+        console: false,
+        agent_session_id: Some(session.to_owned()),
+    })
+}
+
 pub(crate) fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
     let pane = muxa::default_backend()
         .current_pane()
@@ -2988,6 +3128,7 @@ pub(crate) fn current_collaboration_origin() -> std::result::Result<Collaboratio
         pane,
         socket,
         console: false,
+        agent_session_id: None,
     })
 }
 
@@ -3144,7 +3285,7 @@ async fn wait_for_reply(client: &Client, args: &Value) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_WAIT_SECS)
         .clamp(1, MAX_WAIT_SECS);
-    let origin = match current_collaboration_origin() {
+    let origin = match resolve_collaboration_origin(client).await {
         Ok(origin) => origin,
         Err(error) => return error_result(&error),
     };
@@ -3706,6 +3847,68 @@ fn error_result(message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_session_hint_reads_codex_meta() {
+        let params = json!({
+            "name": "muxa_room_context",
+            "_meta": {
+                "x-codex-turn-metadata": { "session_id": "turn-meta-id" },
+                "threadId": "01a0fa66-913b-7242-bf6a-5b1165479643",
+                "sessionId": "01a0fa66-913b-7242-bf6a-5b1165479643"
+            }
+        });
+        assert_eq!(
+            caller_session_hint(Some(&params)).as_deref(),
+            Some("01a0fa66-913b-7242-bf6a-5b1165479643")
+        );
+        let nested_only = json!({ "_meta": { "x-codex-turn-metadata": { "session_id": "s1" } } });
+        assert_eq!(
+            caller_session_hint(Some(&nested_only)).as_deref(),
+            Some("s1")
+        );
+        assert_eq!(
+            caller_session_hint(Some(&json!({ "_meta": { "threadId": " " } }))),
+            None
+        );
+        assert_eq!(caller_session_hint(Some(&json!({ "name": "x" }))), None);
+        assert_eq!(caller_session_hint(None), None);
+    }
+
+    fn tracked(session: &str, pane: Option<&str>) -> Agent {
+        let mut agent: Agent = serde_json::from_value(json!({
+            "kind": "codex",
+            "session_id": session,
+            "state": "idle",
+            "started_at": "2026-10-02T00:00:00Z",
+            "last_activity_at": "2026-10-02T00:00:00Z",
+            "state_entered_at": "2026-10-02T00:00:00Z"
+        }))
+        .expect("minimal agent");
+        agent.pane = pane.map(str::to_owned);
+        agent.tmux_socket = pane.map(|_| "default".to_owned());
+        agent
+    }
+
+    /// Three Codex threads share one app-server whose env says `%9`; each
+    /// must resolve to the pane the registry bound *its* session to.
+    #[test]
+    fn session_origin_uses_the_threads_own_binding() {
+        let agents = [
+            tracked("thread-junia", Some("rmux:%9")),
+            tracked("thread-a", Some("rmux:%137")),
+            tracked("thread-b", None),
+        ];
+        let origin = origin_for_session(&agents, "thread-a").unwrap();
+        assert_eq!(origin.pane, "rmux:%137");
+        assert_eq!(origin.socket.as_deref(), Some("default"));
+        assert!(!origin.console);
+        assert_eq!(origin.agent_session_id.as_deref(), Some("thread-a"));
+        let unbound = origin_for_session(&agents, "thread-b").unwrap_err();
+        assert!(unbound.contains("not bound to a pane"), "{unbound}");
+        let unknown = origin_for_session(&agents, "thread-c").unwrap_err();
+        assert!(unknown.contains("not tracked"), "{unknown}");
+    }
     use muxa::backend::{BackendCaps, HostKind, PaneBackend, SharedBackend};
     use muxa::event::AgentEvent;
     use muxa::ipc::Server;
@@ -3875,6 +4078,7 @@ mod tests {
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
+            agent_session_id: None,
         };
         let waiting_client = client.clone();
         let waiter = tokio::spawn(async move {

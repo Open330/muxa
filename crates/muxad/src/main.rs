@@ -4197,6 +4197,7 @@ mod tests {
                 pane: "%2".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &participants,
             &panes,

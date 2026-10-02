@@ -2112,6 +2112,7 @@ fn fleet_watch_console_origin(pane: &PaneKey) -> CollaborationOrigin {
         socket: matches!(endpoint.host, HostKind::Tmux | HostKind::Rmux)
             .then(|| endpoint.socket.clone()),
         console: true,
+        agent_session_id: None,
     }
 }
 

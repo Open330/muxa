@@ -1282,7 +1282,15 @@ async fn main() -> Result<()> {
         Cmd::Automation(a) => automation::run(a, &client).await,
         Cmd::Config(a) => config_cmd::run(a, socket.clone()).await,
         Cmd::Host(a) => fleet_cli::run_host(a, &client, &cfg, config_path.as_deref()).await,
-        Cmd::Fleet(a) => fleet_cli::run_fleet(a, &client, &cfg, config_path.as_deref()).await,
+        Cmd::Fleet(a) => {
+            Box::pin(fleet_cli::run_fleet(
+                a,
+                &client,
+                &cfg,
+                config_path.as_deref(),
+            ))
+            .await
+        }
         Cmd::Agent { action } => run_agent_cmd(action, &client, &socket, &cfg).await,
         Cmd::Window { action } => run_window_cmd(action),
         Cmd::Work { action } => run_work_cmd(action, &cfg, config_path, &client).await,
@@ -1474,8 +1482,10 @@ async fn cmd_prune(client: &Client, older_than: &str, all: bool, yes: bool) -> R
 /// a pane by its host — `rmux:%N` — and record the endpoint the same way, so a
 /// CLI that qualified neither matched no tracked agent at all on any host but
 /// tmux. One function means the two can no longer disagree.
-fn collaboration_origin() -> Result<CollaborationOrigin> {
-    mcp::current_collaboration_origin().map_err(anyhow::Error::msg)
+async fn collaboration_origin(client: &Client) -> Result<CollaborationOrigin> {
+    mcp::resolve_collaboration_origin(client)
+        .await
+        .map_err(anyhow::Error::msg)
 }
 
 fn collaboration_request_kind(value: &str) -> Result<RequestKind> {
@@ -1545,7 +1555,7 @@ fn collaboration_mailbox(value: &str) -> Result<RequestMailbox> {
 
 async fn cmd_peers(client: &Client, json: bool) -> Result<()> {
     let room = client
-        .collaboration_context(&collaboration_origin()?)
+        .collaboration_context(&collaboration_origin(client).await?)
         .await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&room)?);
@@ -1575,7 +1585,7 @@ async fn cmd_peers(client: &Client, json: bool) -> Result<()> {
 }
 
 async fn cmd_identity(client: &Client, action: IdentityCmd) -> Result<()> {
-    let origin = collaboration_origin()?;
+    let origin = collaboration_origin(client).await?;
     let (room, json) = match action {
         IdentityCmd::Show { json } => (client.collaboration_context(&origin).await?, json),
         IdentityCmd::Set { alias, roles } => (
@@ -1727,7 +1737,7 @@ fn participant_matches_window(participant: &Participant, wanted: &str) -> bool {
 
 #[allow(clippy::too_many_lines)] // explicit message subcommand dispatch keeps output compatibility visible
 async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
-    let origin = collaboration_origin()?;
+    let origin = collaboration_origin(client).await?;
     match action {
         MsgCmd::Send {
             target,
@@ -3925,7 +3935,7 @@ mod tests {
     fn cli_collaboration_origin_preserves_rmux_identity() {
         const PROBE: &str = "MUXA_TEST_CLI_ORIGIN_PROBE";
         if std::env::var_os(PROBE).is_some() {
-            let origin = collaboration_origin().unwrap();
+            let origin = mcp::current_collaboration_origin().unwrap();
             assert_eq!(origin.pane, "rmux:%118");
             assert_eq!(
                 origin.socket.as_deref(),

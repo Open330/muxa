@@ -2833,6 +2833,16 @@ fn represented_participant(
             .find(|participant| participant.console)
             .cloned();
     }
+    let requests: Vec<_> = requests.collect();
+    if let Some(session) = origin.agent_session_id.as_deref() {
+        if let Some(participant) = requests
+            .iter()
+            .flat_map(|request| [&request.from, &request.to])
+            .find(|participant| participant.agent_session_id == session)
+        {
+            return Some(participant.clone());
+        }
+    }
     for request in requests {
         for participant in [&request.from, &request.to] {
             if participant.pane == origin.pane
@@ -6940,6 +6950,7 @@ mod tests {
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
+            agent_session_id: None,
         };
         let request = client
             .collaboration_wait(&origin, "legacy-request", 2)
@@ -6976,6 +6987,7 @@ mod tests {
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
+            agent_session_id: None,
         });
         assert_eq!(
             provenance.origin_match,
@@ -7030,6 +7042,7 @@ mod tests {
             pane: pane.into(),
             socket: Some("default".into()),
             console,
+            agent_session_id: None,
         };
         let request = client
             .collaboration_send(
@@ -7130,6 +7143,7 @@ mod tests {
             pane: pane.into(),
             socket: Some("default".into()),
             console,
+            agent_session_id: None,
         };
         let ask = |from: CollaborationOrigin, to: &'static str, body: &'static str| {
             let client = client.clone();
@@ -7240,16 +7254,19 @@ mod tests {
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
+            agent_session_id: None,
         };
         let recipient = CollaborationOrigin {
             pane: "%2".into(),
             socket: Some("default".into()),
             console: false,
+            agent_session_id: None,
         };
         let verifier = CollaborationOrigin {
             pane: "%3".into(),
             socket: Some("default".into()),
             console: false,
+            agent_session_id: None,
         };
         client
             .collaboration_set_identity(
@@ -7452,6 +7469,7 @@ mod tests {
                     pane: "%1".into(),
                     socket: Some("default".into()),
                     console: true,
+                    agent_session_id: None,
                 },
                 "pane:%1",
                 &NewRequest {

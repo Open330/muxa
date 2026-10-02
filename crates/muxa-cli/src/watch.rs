@@ -8498,6 +8498,7 @@ fn watch_collaboration_origin_from(
         pane: pane.unwrap_or_default(),
         socket,
         console: true,
+        agent_session_id: None,
     }
 }
 
@@ -8682,6 +8683,7 @@ fn mailbox_anchor_for_pane(pane: &PaneNode) -> Option<MailboxAnchor> {
             socket: matches!(endpoint.host, muxa::HostKind::Tmux | muxa::HostKind::Rmux)
                 .then(|| endpoint.socket.clone()),
             console: false,
+            agent_session_id: None,
         },
         label: format!("{}@{}", agent.kind, pane.key.pane_id),
     })
@@ -8715,6 +8717,7 @@ fn mailbox_anchor(app: &App) -> Option<MailboxAnchor> {
             pane,
             socket,
             console: false,
+            agent_session_id: None,
         },
         label,
     })
@@ -20524,6 +20527,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: Some("default".into()),
                 console: true,
+                agent_session_id: None,
             }),
             room: Some(RoomContext {
                 current,
@@ -21622,6 +21626,7 @@ mod tests {
             pane: "%1".into(),
             socket: None,
             console: true,
+            agent_session_id: None,
         });
         let pane_idx = app
             .rows
@@ -21650,6 +21655,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         let session = app.topology.sessions[0].node_key();
         let window = app.topology.sessions[0].windows[0].node_key();
@@ -21685,6 +21691,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         app.collaboration.room = Some(RoomContext {
             current: first.clone(),
@@ -21732,6 +21739,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         app.collaboration.room = Some(RoomContext {
             current: peer.clone(),
@@ -21766,6 +21774,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         app.collaboration.room = Some(RoomContext {
             current: peer.clone(),
@@ -21806,6 +21815,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         app.collaboration.room = Some(RoomContext {
             current: replacement.clone(),
@@ -21835,6 +21845,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         app.collaboration.room = Some(RoomContext {
             current: peer.clone(),
@@ -21908,6 +21919,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         app.collaboration.room = Some(RoomContext {
             current: first.clone(),
@@ -21942,6 +21954,7 @@ mod tests {
             pane: "%42".into(),
             socket: None,
             console: true,
+            agent_session_id: None,
         });
         let pane_idx = app
             .rows
@@ -22390,6 +22403,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: None,
                 console: false,
+                agent_session_id: None,
             },
             label: "codex@%1".into(),
         });
