@@ -40,6 +40,7 @@ pub mod ask;
 pub mod automation;
 pub mod automation_judge;
 pub mod backend;
+mod codex_binding;
 pub mod collaboration;
 pub mod collaboration_audit;
 pub mod config;

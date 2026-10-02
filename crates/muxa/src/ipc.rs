@@ -2612,13 +2612,13 @@ async fn automation_subjects(
     crate::automation::subjects_from(&agents, &panes)
 }
 
-/// A fresh Codex thread behind the shared app-server reports no pane; the
-/// reconciler binds it from live process evidence, but only every
-/// `reconciler.interval_secs`. Its first collaboration call usually comes
-/// sooner, so run that same binding now — only for a caller that names a
-/// paneless Codex session, so ordinary requests never scan process trees.
+/// A fresh Codex thread behind the shared app-server reports no pane, and the
+/// reconciler binds it only every `reconciler.interval_secs`. Its first
+/// collaboration call usually comes sooner, so bind now — only for a caller
+/// that names an unbound Codex session, so ordinary requests never scan.
 async fn bind_unplaced_codex_origin(
     store: &SharedStore,
+    backends: &[SharedBackend],
     agents: &[Agent],
     panes: &[PaneInfo],
     origin_session: Option<&str>,
@@ -2626,24 +2626,12 @@ async fn bind_unplaced_codex_origin(
     let Some(session) = origin_session else {
         return false;
     };
-    let unplaced = agents.iter().any(|agent| {
-        agent.session_id == session
-            && agent.kind == crate::AgentKind::Codex
-            && agent.pane.is_none()
-            && agent.surface.is_none()
-    });
-    if !unplaced || panes.is_empty() {
-        return false;
-    }
-    let scanned = panes.to_vec();
-    let scan = tokio::task::spawn_blocking(move || crate::process_tree::scan_codex_panes(&scanned))
-        .await
-        .unwrap_or_default();
-    let rebound = store.rebind_codex_resumes(&scan.resume_bindings).await;
-    let adopted = store
-        .correlate_paneless_codex_union(panes, &scan.hosts)
-        .await;
-    rebound + adopted > 0
+    let unplaced = agents
+        .iter()
+        .any(|agent| agent.session_id == session && crate::codex_binding::is_unplaced_codex(agent));
+    unplaced
+        && crate::codex_binding::bind_paneless_codex(store, backends, Some(panes.to_vec())).await
+            > 0
 }
 
 async fn collaboration_participants(
@@ -2653,16 +2641,16 @@ async fn collaboration_participants(
     origin_session: Option<&str>,
 ) -> CollaborationTopology {
     let mut agents = store.snapshot().await;
-    let backends = backends.to_vec();
+    let listed = backends.to_vec();
     let panes = tokio::task::spawn_blocking(move || {
-        backends
+        listed
             .iter()
             .flat_map(|backend| backend.list_panes())
             .collect::<Vec<_>>()
     })
     .await
     .unwrap_or_default();
-    if bind_unplaced_codex_origin(store, &agents, &panes, origin_session).await {
+    if bind_unplaced_codex_origin(store, backends, &agents, &panes, origin_session).await {
         agents = store.snapshot().await;
     }
     let mut participants = collaboration::participants_from(&agents, &panes);
@@ -3207,6 +3195,25 @@ async fn handle(
                     if in_scope {
                         tracing::debug!(?event, "ingest");
                         store.apply(&event).await;
+                        // A Codex thread behind the shared app-server arrives
+                        // paneless; bind it now, before a sibling started in
+                        // the same cwd makes the evidence ambiguous.
+                        // Only a session start or prompt can introduce or
+                        // re-evidence a thread; tool hooks would rescan per call.
+                        let id = event.id();
+                        if id.kind == crate::AgentKind::Codex
+                            && id.pane.is_none()
+                            && matches!(
+                                event,
+                                AgentEvent::Started { .. } | AgentEvent::PromptSubmitted { .. }
+                            )
+                            && store.is_unplaced_codex(&id.session_id).await
+                        {
+                            crate::codex_binding::schedule_bind_paneless_codex(
+                                store.clone(),
+                                backends.clone(),
+                            );
+                        }
                     } else {
                         tracing::debug!(
                             socket = event.id().tmux_socket.as_deref(),

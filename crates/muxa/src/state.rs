@@ -40,6 +40,16 @@ use tokio::sync::{broadcast, watch, Notify, RwLock};
 pub const SYNTHETIC_SESSION_PREFIX: &str = "synthetic-";
 const CLAUDE_IDLE_PROMPT_NOTIFICATION: &str = "Claude is waiting for your input";
 
+/// Whether a real Codex thread is already bound to `pane`.
+fn codex_owns_pane(agents: &HashMap<String, Agent>, pane: &PaneInfo) -> bool {
+    agents.values().any(|agent| {
+        agent.kind == AgentKind::Codex
+            && !is_synthetic(&agent.session_id)
+            && agent.pane.as_deref() == Some(pane.pane_id.as_str())
+            && agent.tmux_socket == pane.socket
+    })
+}
+
 fn is_synthetic(session_id: &str) -> bool {
     session_id.starts_with(SYNTHETIC_SESSION_PREFIX)
 }
@@ -2145,6 +2155,77 @@ impl Store {
             self.changes.send_replace(());
         }
         adopted
+    }
+
+    /// Whether `session_id` is a real Codex thread still waiting for a pane.
+    pub(crate) async fn is_unplaced_codex(&self, session_id: &str) -> bool {
+        self.agents
+            .read()
+            .await
+            .get(session_id)
+            .is_some_and(crate::codex_binding::is_unplaced_codex)
+    }
+
+    /// Live Codex hosts at the cwd of a still-unbound Codex thread that no
+    /// other thread owns — the panes whose screens can settle an ambiguous
+    /// cwd. Empty when nothing is contested, so callers capture nothing.
+    pub(crate) async fn contested_codex_hosts(&self, codex_hosts: &[PaneInfo]) -> Vec<PaneInfo> {
+        let agents = self.agents.read().await;
+        let unbound_cwds: HashSet<&str> = agents
+            .values()
+            .filter(|agent| crate::codex_binding::is_unplaced_codex(agent))
+            .filter_map(|agent| agent.cwd.as_deref().map(str::trim))
+            .filter(|cwd| !cwd.is_empty())
+            .collect();
+        if unbound_cwds.is_empty() {
+            return Vec::new();
+        }
+        codex_hosts
+            .iter()
+            .filter(|host| unbound_cwds.contains(host.current_path.trim()))
+            .filter(|host| !codex_owns_pane(&agents, host))
+            .cloned()
+            .collect()
+    }
+
+    /// Bind unbound Codex threads to the one contested pane whose `screens`
+    /// text shows the thread's latest prompt (see
+    /// [`crate::codex_binding::prompt_pairs`]). Returns the number bound.
+    pub(crate) async fn correlate_paneless_codex_by_prompt(
+        &self,
+        screens: &[(PaneInfo, String)],
+    ) -> usize {
+        if screens.is_empty() {
+            return 0;
+        }
+        let mut agents = self.agents.write().await;
+        let rows: Vec<(String, String, String)> = agents
+            .values()
+            .filter(|agent| crate::codex_binding::is_unplaced_codex(agent))
+            .filter_map(|agent| {
+                let cwd = agent.cwd.as_deref()?.trim();
+                let needle = crate::codex_binding::prompt_needle(agent.last_prompt.as_deref()?)?;
+                (!cwd.is_empty()).then(|| (agent.session_id.clone(), cwd.to_owned(), needle))
+            })
+            .collect();
+        let pairs = crate::codex_binding::prompt_pairs(&rows, screens);
+        let mut bound = 0;
+        for (session, pane) in pairs {
+            if codex_owns_pane(&agents, &pane) {
+                continue;
+            }
+            if let Some(agent) = agents.get_mut(&session) {
+                agent.pane = Some(pane.pane_id.clone());
+                agent.tmux_socket.clone_from(&pane.socket);
+                bound += 1;
+            }
+        }
+        if bound > 0 {
+            drop(agents);
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
+        bound
     }
 
     /// Converge against a complete pane set observed by `observing_kind`.
@@ -4918,6 +4999,75 @@ mod tests {
             .await;
         let live = [host("%5", "/repo"), host("%6", "/repo")];
         assert_eq!(store.correlate_paneless_codex_union(&live, &live).await, 0);
+    }
+
+    /// Two fresh threads prompted in one cwd before either bound: the live
+    /// hosts are contested, and each pane's screen shows one thread's prompt.
+    #[tokio::test]
+    async fn contested_codex_cwd_binds_by_the_prompt_on_screen() {
+        let t0 = datetime!(2026-10-02 05:00:00 UTC);
+        let store = Store::shared();
+        for (sid, prompt) in [
+            ("thread-a", "Review the auth middleware for token leaks"),
+            ("thread-b", "Write migration tests for the billing schema"),
+        ] {
+            let id = AgentId {
+                tmux_socket: None,
+                kind: AgentKind::Codex,
+                session_id: sid.into(),
+                surface: None,
+                pane: None,
+                cwd: Some("/repo".into()),
+            };
+            store
+                .apply(&AgentEvent::Started {
+                    id: id.clone(),
+                    at: t0,
+                })
+                .await;
+            store
+                .apply(&AgentEvent::PromptSubmitted {
+                    id,
+                    prompt: prompt.into(),
+                    at: t0,
+                })
+                .await;
+            assert!(store.is_unplaced_codex(sid).await);
+        }
+        let host = |id: &str| {
+            let mut p = pane(id);
+            p.current_path = "/repo".into();
+            p
+        };
+        let hosts = [host("%1"), host("%2")];
+        assert_eq!(
+            store.correlate_paneless_codex_union(&hosts, &hosts).await,
+            0
+        );
+        let contested = store.contested_codex_hosts(&hosts).await;
+        assert_eq!(contested.len(), 2);
+
+        let screens = vec![
+            (
+                hosts[0].clone(),
+                "› Write migration tests for the\n  billing schema\n".to_string(),
+            ),
+            (
+                hosts[1].clone(),
+                "› Review the auth middleware for token leaks\n".to_string(),
+            ),
+        ];
+        assert_eq!(store.correlate_paneless_codex_by_prompt(&screens).await, 2);
+        let snap = store.snapshot().await;
+        let pane_of = |sid: &str| {
+            snap.iter()
+                .find(|a| a.session_id == sid)
+                .and_then(|a| a.pane.clone())
+        };
+        assert_eq!(pane_of("thread-a").as_deref(), Some("%2"));
+        assert_eq!(pane_of("thread-b").as_deref(), Some("%1"));
+        assert!(store.contested_codex_hosts(&hosts).await.is_empty());
+        assert!(!store.is_unplaced_codex("thread-a").await);
     }
 
     /// A `code_mode_host` codex splits into a synthetic pane placeholder
