@@ -120,9 +120,24 @@ pub struct CodexPaneScan {
 pub fn scan_codex_panes(panes: &[PaneInfo]) -> CodexPaneScan {
     #[cfg(not(target_os = "linux"))]
     let table = crate::process_snapshot::read_current_process_table();
-    let scanned: Vec<_> = panes
-        .iter()
-        .filter(|p| p.pane_pid != 0)
+    // A grouped session lists each pane once per `~view~` client session:
+    // scan (and report) each pane once, under its base session.
+    let mut unique: Vec<&PaneInfo> = Vec::new();
+    for pane in panes.iter().filter(|p| p.pane_pid != 0) {
+        match unique
+            .iter_mut()
+            .find(|seen| seen.pane_id == pane.pane_id && seen.socket == pane.socket)
+        {
+            Some(seen) => {
+                if seen.session.contains("~view~") && !pane.session.contains("~view~") {
+                    *seen = pane;
+                }
+            }
+            None => unique.push(pane),
+        }
+    }
+    let scanned: Vec<_> = unique
+        .into_iter()
         .map(|pane| {
             #[cfg(not(target_os = "linux"))]
             let processes = table.descendants(pane.pane_pid, MAX_DEPTH, MAX_NODES);

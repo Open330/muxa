@@ -201,11 +201,20 @@ pub(crate) fn prompt_pairs(
         .collect();
     let mut pairs: Vec<(String, PaneInfo)> = Vec::new();
     for (session, cwd, needle) in rows {
-        let hits: Vec<_> = compact
-            .iter()
-            .filter(|(pane, text)| pane.current_path.trim() == cwd && text.contains(needle))
-            .collect();
-        if let [(pane, _)] = hits.as_slice() {
+        let mut hits: Vec<&PaneInfo> = Vec::new();
+        for (pane, text) in &compact {
+            // A pane in a grouped session is listed once per `~view~` client;
+            // the same pane id on the same server is one pane.
+            if pane.current_path.trim() == cwd
+                && text.contains(needle)
+                && !hits
+                    .iter()
+                    .any(|hit| hit.pane_id == pane.pane_id && hit.socket == pane.socket)
+            {
+                hits.push(pane);
+            }
+        }
+        if let [pane] = hits.as_slice() {
             pairs.push((session.clone(), (*pane).clone()));
         }
     }
@@ -282,6 +291,28 @@ mod tests {
             .collect();
         got.sort_unstable();
         assert_eq!(got, [("thread-a", "rmux:%1"), ("thread-b", "rmux:%2")]);
+
+        // A pane listed once per `~view~` session is still one pane.
+        let mut view = a.clone();
+        view.session = "callabo~view~1".into();
+        let grouped = vec![
+            (
+                a.clone(),
+                "› Review the auth middleware for token leaks\n".to_string(),
+            ),
+            (
+                view,
+                "› Review the auth middleware for token leaks\n".to_string(),
+            ),
+        ];
+        let pairs = prompt_pairs(
+            &[row(
+                "thread-a",
+                "Review the auth middleware for token leaks",
+            )],
+            &grouped,
+        );
+        assert_eq!(pairs.len(), 1, "grouped views must not look ambiguous");
 
         // The same prompt in both panes proves nothing.
         let same = vec![
