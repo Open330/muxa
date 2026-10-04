@@ -688,7 +688,7 @@ private struct WorkspaceTabBar: View {
                 selection: selection,
                 title: Self.title(for: selection, model: model),
                 systemImage: tabIcon(for: selection),
-                stateColor: agentState(for: selection).map(agentStateColor),
+                stateColor: agentStatus(for: selection)?.color,
                 unreadPane: unreadPane(for: selection), // WS-A
                 active: group?.active == selection,
                 preview: group?.preview == selection,
@@ -779,10 +779,10 @@ private struct WorkspaceTabBar: View {
 
     /// The live state of the agent a tab shows, for the dot on its icon
     /// (Orca marks agent tabs the same way).
-    private func agentState(for selection: MuxaSidebarSelection) -> String? {
+    private func agentStatus(for selection: MuxaSidebarSelection) -> MuxaAgentStatus? {
         switch selection {
-        case .pane(let id): model.executionSnapshot.watchPane(id: id)?.agent?.state
-        case .agent(let id): model.hostedAgents.first { $0.id == id }?.agent.state
+        case .pane(let id): model.executionSnapshot.watchPane(id: id)?.agent?.status
+        case .agent(let id): model.hostedAgents.first { $0.id == id }?.agent.status
         default: nil
         }
     }

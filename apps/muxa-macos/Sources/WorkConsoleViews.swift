@@ -476,24 +476,27 @@ struct WorkCommandCenterView: View {
 
     private let columns = [GridItem(.adaptive(minimum: 260, maximum: 420), spacing: 12)]
 
-    private var allPanes: [MuxaWatchPane] {
-        model.executionSnapshot.watchHosts
-            .flatMap(\.sessions)
-            .flatMap(\.windows)
-            .flatMap(\.panes)
+    /// Every agent that needs the reader, on every host, with or without a
+    /// pane or a Work, errors first: the agents the Dock badge counts as
+    /// needing attention (it also counts unread ones).
+    private var attentionAgents: [MuxaHostedAgent] {
+        model.hostedAgents
+            .filter { $0.agent.status.needsAttention }
+            .sorted { $0.agent.status.priority < $1.agent.status.priority }
     }
 
-    /// Every agent that needs the reader, on every host and whether or not
-    /// it belongs to a Work, errors first: the same set the Explore side bar
-    /// pins and the Dock badge counts.
-    private var attentionPanes: [MuxaWatchPane] {
-        allPanes.filter(\.needsAttention).sorted { $0.statusPriority < $1.statusPriority }
+    private var limitedAgents: [MuxaHostedAgent] {
+        model.hostedAgents.filter { $0.agent.status.isLimited }
     }
 
-    private var limitedPanes: [MuxaWatchPane] {
-        allPanes.filter {
-            if case .limited? = $0.agentStatus { return true }
-            return false
+    /// An agent's pane editor when it has a live pane, its agent editor
+    /// otherwise.
+    private func open(_ hosted: MuxaHostedAgent) {
+        if let pane = MuxaAgentAttentionCenter.paneIdentity(for: hosted),
+           model.executionSnapshot.watchPane(id: pane) != nil {
+            model.selectWatchPane(pane)
+        } else {
+            model.select(.agent(hosted.id))
         }
     }
 
@@ -519,16 +522,16 @@ struct WorkCommandCenterView: View {
 
                 CommandCenterStatusLine(
                     working: workingCount,
-                    attention: attentionPanes.count,
-                    limited: limitedPanes.count,
+                    attention: attentionAgents.count,
+                    limited: limitedAgents.count,
                     work: model.workGroups.count,
                     hosts: model.fleetHosts.count
                 )
 
                 CommandCenterAttentionList(
-                    attention: attentionPanes,
-                    limited: limitedPanes,
-                    select: { model.selectWatchPane($0) }
+                    attention: attentionAgents,
+                    limited: limitedAgents,
+                    open: open
                 )
 
                 VStack(alignment: .leading, spacing: 10) {
@@ -982,9 +985,9 @@ private struct CommandCenterStatusLine: View {
 /// need them, worst first, each with what it last said. Rate-limited agents
 /// follow on one line each, with when they resume.
 private struct CommandCenterAttentionList: View {
-    let attention: [MuxaWatchPane]
-    let limited: [MuxaWatchPane]
-    let select: (MuxaWatchPaneIdentity) -> Void
+    let attention: [MuxaHostedAgent]
+    let limited: [MuxaHostedAgent]
+    let open: (MuxaHostedAgent) -> Void
 
     private static let limit = 6
 
@@ -994,9 +997,9 @@ private struct CommandCenterAttentionList: View {
                 Text("Look at now")
                     .font(.system(size: 14, weight: .semibold))
                 VStack(spacing: 0) {
-                    ForEach(Array(attention.prefix(Self.limit).enumerated()), id: \.element.id) { index, pane in
+                    ForEach(Array(attention.prefix(Self.limit).enumerated()), id: \.element.id) { index, hosted in
                         if index > 0 { Divider().padding(.leading, 36) }
-                        attentionRow(pane)
+                        attentionRow(hosted)
                     }
                     if attention.count > Self.limit {
                         Divider()
@@ -1021,25 +1024,23 @@ private struct CommandCenterAttentionList: View {
         }
     }
 
-    private func attentionRow(_ pane: MuxaWatchPane) -> some View {
-        Button { select(pane.id) } label: {
+    private func attentionRow(_ hosted: MuxaHostedAgent) -> some View {
+        Button { open(hosted) } label: {
             HStack(alignment: .top, spacing: 10) {
-                HostIdentityBadge(identity: pane.host, size: 26)
+                HostIdentityBadge(identity: hosted.host, size: 26)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 8) {
-                        Text(commandCenterPaneTitle(pane))
+                        Text(commandCenterAgentTitle(hosted))
                             .font(MuxaType.body.weight(.semibold))
                             .lineLimit(1)
-                        if let status = pane.agentStatus {
-                            AgentStatusTag(status: status, detailed: true)
-                        }
+                        AgentStatusTag(status: hosted.agent.status, detailed: true)
                         Spacer(minLength: 6)
-                        Text(verbatim: "\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName)")
+                        Text(verbatim: commandCenterAgentLocation(hosted))
                             .font(MuxaType.meta)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
-                    if let activity = watchPaneActivity(pane) {
+                    if let activity = agentActivity(hosted.agent) {
                         Text(activity)
                             .font(MuxaType.detail)
                             .foregroundStyle(.secondary)
@@ -1065,7 +1066,7 @@ private struct CommandCenterAttentionList: View {
                 Text(verbatim: "\(String(localized: "Limited")) · \(limited.count)")
                     .font(MuxaType.detail.weight(.semibold))
                     .foregroundStyle(.purple)
-                FlowingPaneLinks(panes: limited, select: select)
+                LimitedAgentLinks(agents: limited, open: open)
             }
         }
         .padding(.horizontal, 12)
@@ -1074,41 +1075,46 @@ private struct CommandCenterAttentionList: View {
     }
 }
 
-/// Rate-limited agents as `@name until 15:45` links, wrapping as needed.
-private struct FlowingPaneLinks: View {
-    let panes: [MuxaWatchPane]
-    let select: (MuxaWatchPaneIdentity) -> Void
+/// Rate-limited agents as `@name → 15:45 host` links, wrapping as needed.
+private struct LimitedAgentLinks: View {
+    let agents: [MuxaHostedAgent]
+    let open: (MuxaHostedAgent) -> Void
 
     var body: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 10, alignment: .leading)], alignment: .leading, spacing: 4) {
-            ForEach(panes) { pane in
-                Button { select(pane.id) } label: {
+            ForEach(agents) { hosted in
+                Button { open(hosted) } label: {
                     HStack(spacing: 4) {
-                        Text(commandCenterPaneTitle(pane))
+                        Text(commandCenterAgentTitle(hosted))
                             .font(MuxaType.detail.weight(.medium))
-                        if case .limited(let cap)? = pane.agentStatus, let until = cap.until {
+                        if case .limited(let cap) = hosted.agent.status, let until = cap.until {
                             Text(verbatim: "→ \(MuxaUsageFormat.clock(until))")
                                 .font(MuxaType.meta.monospacedDigit())
                                 .foregroundStyle(.secondary)
                         }
-                        Text(verbatim: pane.host.alias)
+                        Text(verbatim: hosted.host.alias)
                             .font(MuxaType.meta)
                             .foregroundStyle(.secondary)
                     }
                     .lineLimit(1)
                 }
                 .buttonStyle(.plain)
-                .help(Text(verbatim: "\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName)"))
+                .help(Text(verbatim: commandCenterAgentLocation(hosted)))
             }
         }
     }
 }
 
-private func commandCenterPaneTitle(_ pane: MuxaWatchPane) -> String {
-    pane.pane.agentAlias.map { "@\($0)" }
-        ?? pane.agent?.aiTitle?.nonEmpty
-        ?? pane.pane.title.nonEmpty
-        ?? pane.pane.paneID
+private func commandCenterAgentTitle(_ hosted: MuxaHostedAgent) -> String {
+    hosted.pane?.agentAlias.map { "@\($0)" }
+        ?? hosted.agent.aiTitle?.nonEmpty
+        ?? hosted.pane?.title.nonEmpty
+        ?? hosted.agent.kind.replacingOccurrences(of: "_", with: " ")
+}
+
+private func commandCenterAgentLocation(_ hosted: MuxaHostedAgent) -> String {
+    guard let pane = hosted.pane else { return hosted.host.alias }
+    return "\(hosted.host.alias) · \(pane.session) › \(pane.windowName)"
 }
 
 private struct WorkCommandCard: View {
@@ -3547,7 +3553,11 @@ private func watchPaneHelp(_ pane: MuxaWatchPane) -> String {
 
 /// One line on what the pane's agent last did, for rows with room for it.
 func watchPaneActivity(_ pane: MuxaWatchPane) -> String? {
-    guard let agent = pane.agent else { return nil }
+    pane.agent.flatMap(agentActivity)
+}
+
+/// One line on what an agent last did.
+func agentActivity(_ agent: MuxaAgent) -> String? {
     let text = agent.recap?.nonEmpty
         ?? agent.lastNotification?.nonEmpty
         ?? agent.lastResponse?.nonEmpty
