@@ -610,7 +610,7 @@ private struct WorkspaceTabBar: View {
                         }
                     }
                     .onDrop(
-                        of: [.plainText],
+                        of: [MuxaTabDragSession.tabType],
                         delegate: TabStripDropDelegate(
                             groupID: groupID,
                             orderedFrames: orderedTabFrames,

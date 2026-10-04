@@ -38,9 +38,10 @@ final class MuxaTabDragSession: ObservableObject {
     @Published private(set) var drag: Drag?
     @Published var target: Target?
 
-    /// Marks the payload so a text drag from elsewhere is never taken for a
-    /// tab.
-    static let payloadPrefix = "muxa-tab:"
+    /// The drag's only representation: a type private to this process
+    /// (declared in AppInfo.plist), so a tab is never dropped into a text
+    /// field or another app as text, and no foreign drag reads as a tab.
+    static let tabType = UTType(exportedAs: "dev.muxa.editor-tab", conformingTo: .data)
 
     private var watcher: Timer?
     private var generation: UInt64 = 0
@@ -51,7 +52,13 @@ final class MuxaTabDragSession: ObservableObject {
         drag = Drag(selection: selection, sourceGroupID: groupID, owner: ObjectIdentifier(tabs))
         target = nil
         watchForRelease()
-        return NSItemProvider(object: "\(Self.payloadPrefix)\(selection.tabIdentifier)" as NSString)
+        let provider = NSItemProvider()
+        let payload = Data(selection.tabIdentifier.utf8)
+        provider.registerDataRepresentation(forTypeIdentifier: Self.tabType.identifier, visibility: .ownProcess) { completion in
+            completion(payload, nil)
+            return nil
+        }
+        return provider
     }
 
     func end() {
@@ -126,7 +133,7 @@ struct TabStripDropDelegate: DropDelegate {
     let didDrop: (MuxaSidebarSelection, UUID) -> Void
 
     func validateDrop(info: DropInfo) -> Bool {
-        session.drag?.belongs(to: tabs) == true && info.hasItemsConforming(to: [.plainText])
+        session.drag?.belongs(to: tabs) == true && info.hasItemsConforming(to: [MuxaTabDragSession.tabType])
     }
 
     func dropEntered(info: DropInfo) {
@@ -289,7 +296,7 @@ private struct EditorDropTarget: NSViewRepresentable {
 
     func makeNSView(context: Context) -> TargetView {
         let view = TargetView()
-        view.registerForDraggedTypes([.string])
+        view.registerForDraggedTypes([NSPasteboard.PasteboardType(MuxaTabDragSession.tabType.identifier)])
         return view
     }
 

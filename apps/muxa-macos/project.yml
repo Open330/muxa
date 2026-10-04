@@ -35,6 +35,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.muxa.mac
         PRODUCT_NAME: Muxa
+        # Merged with the generated Info.plist: exported type declarations.
+        INFOPLIST_FILE: AppInfo.plist
         MARKETING_VERSION: 0.1.0
         CURRENT_PROJECT_VERSION: 1
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
