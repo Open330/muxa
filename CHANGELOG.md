@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Muxa for Mac is easier to read. Content text no longer drops below 11pt:
+  body text is 13pt, supporting text 12pt, badges and timestamps 11pt.
+  Terminal text in the Live Pane preview and in attached panes uses one
+  high-contrast palette (bright black, red and the bright yellows were
+  1.5–3:1). Ghostty now runs with `minimum-contrast = 3` and a readable dim
+  opacity, at the same 13pt size as the preview.
+- The Live Pane preview follows the newest output unless you scroll away,
+  trims trailing blank rows, and shrinks wide panes (down to 10pt) to fit the
+  panel before it scrolls sideways.
+- An agent's status reads the same everywhere. A rate-limited agent (muxad
+  reports its stopped turn as `error`) shows **Limited** with its reset time
+  instead of **Error**, and is no longer counted, notified or badged as
+  needing attention.
+- Explore shows a status once per row and pins agents that need attention
+  above the host tree. The Work Command Center opens with a one-line summary
+  and a "Look at now" list covering every host. The agent inspector shows its
+  status once and previews long responses with Show more.
+- Editor tabs drag like VS Code's. An insertion bar marks the drop point, a
+  tab can move to the other group's strip or editor, the outer edge of an
+  editor opens a new group, and Option copies instead of moving.
+
+### Fixed
+
+- Opening an empty remote or local file showed a blank page that looked like
+  a failed load; it now says the file is empty.
+
 ## [0.8.56] - 2026-10-02
 
 ### Added
