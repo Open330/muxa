@@ -80,7 +80,7 @@ struct AutomationSettingsPane: View {
                 .foregroundStyle(.secondary)
             HStack {
                 Text("The Advanced tab opens that file.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                 Spacer()
                 MuxaDaemonReloadButton(model: model)
@@ -109,7 +109,7 @@ struct AutomationSettingsPane: View {
             }
 
             Text("Off stops every rule and is remembered in muxa configuration. Pause stops them until a time you choose.")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
 
             Divider()
@@ -184,13 +184,13 @@ struct AutomationSettingsPane: View {
                     Text("Test on a rule shows what it would do right now without firing anything.")
                         .padding(.top, 3)
                 }
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 5)
             } label: {
                 Text("What bounds this")
-                    .font(.caption.weight(.medium))
+                    .font(MuxaType.detail.weight(.medium))
             }
         }
         .padding(14)
@@ -232,7 +232,7 @@ struct AutomationSettingsPane: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("No rules yet").font(.callout.weight(.semibold))
                     Text("A fresh install ships none, so nothing fires until you add one. Add the session-limit rule to resume a capped agent when its window reopens.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -279,7 +279,7 @@ struct AutomationSettingsPane: View {
 
             if store.log.isEmpty {
                 Text("Nothing has fired yet. Every firing and every skipped firing lands here, newest first.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 6)
@@ -301,19 +301,19 @@ struct AutomationSettingsPane: View {
     private var statusLines: some View {
         if let error = store.loadError {
             Label(error, systemImage: "exclamationmark.triangle.fill")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.orange)
                 .textSelection(.enabled)
         }
         if let error = store.actionError {
             Label(error, systemImage: "xmark.octagon.fill")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.red)
                 .textSelection(.enabled)
         }
         if let error = configStore.saveError {
             Label(error, systemImage: "xmark.octagon.fill")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.red)
                 .textSelection(.enabled)
         }
@@ -369,8 +369,8 @@ private struct AutomationRuleRow: View {
                 AutomationTargetSummary(rule: rule)
                 if let condition = rule.askCondition {
                     Text(condition.observeOnly ? "Ask condition · Observe only (no action)" : "Ask condition · Fixed action on match")
-                        .font(.caption)
-                    Text(verbatim: condition.prompt).font(.caption).lineLimit(2)
+                        .font(MuxaType.detail)
+                    Text(verbatim: condition.prompt).font(MuxaType.detail).lineLimit(2)
                 }
                 AutomationGuardSummary(rule: rule)
                 AutomationActivitySummary(rule: rule)
@@ -406,7 +406,7 @@ private struct AutomationTargetSummary: View {
     var body: some View {
         if !hasFilter {
             Text("Every agent on every host")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
         } else {
             HStack(spacing: 10) {
@@ -461,7 +461,7 @@ private struct AutomationGuardSummary: View {
             }
             AutomationChip(title: "Cooldown", value: rule.cooldown)
             Text("\(rule.maxPerHour) per hour")
-                .font(.caption2)
+                .font(MuxaType.meta)
                 .foregroundStyle(.secondary)
         }
     }
@@ -501,17 +501,17 @@ private struct AutomationWaitChip: View {
     var body: some View {
         HStack(spacing: 4) {
             Text("Wait")
-                .font(.caption2)
+                .font(MuxaType.meta)
                 .foregroundStyle(.secondary)
             if MuxaAutomationWaitText.isAnchored(wait) {
                 AutomationResetChip()
                 if !offsetText.isEmpty {
                     Text(verbatim: offsetText)
-                        .font(.caption.monospaced())
+                        .font(MuxaType.detail.monospaced())
                 }
             } else {
                 Text(verbatim: wait)
-                    .font(.caption.monospaced())
+                    .font(MuxaType.detail.monospaced())
             }
         }
     }
@@ -527,7 +527,7 @@ private struct AutomationWaitChip: View {
 struct AutomationResetChip: View {
     var body: some View {
         Text("limit resets")
-            .font(.caption2.weight(.medium))
+            .font(MuxaType.meta.weight(.medium))
             .padding(.horizontal, 5)
             .padding(.vertical, 1)
             .background(Color.accentColor.opacity(0.14), in: Capsule())
@@ -545,11 +545,11 @@ private struct AutomationTokenChips: View {
     var body: some View {
         HStack(spacing: 4) {
             Text(title)
-                .font(.caption2)
+                .font(MuxaType.meta)
                 .foregroundStyle(.secondary)
             ForEach(tokens, id: \.self) { token in
                 AutomationTokenLabel(token: token, style: style)
-                    .font(.caption2.weight(.medium))
+                    .font(MuxaType.meta.weight(.medium))
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
                     .background(style.tint(for: token).opacity(0.12), in: Capsule())
@@ -565,10 +565,10 @@ private struct AutomationChip: View {
     var body: some View {
         HStack(spacing: 4) {
             Text(title)
-                .font(.caption2)
+                .font(MuxaType.meta)
                 .foregroundStyle(.secondary)
             Text(verbatim: value)
-                .font(.caption.monospaced())
+                .font(MuxaType.detail.monospaced())
         }
     }
 }
@@ -583,7 +583,7 @@ private struct AutomationBadge: View {
         } icon: {
             Image(systemName: symbol)
         }
-        .font(.caption2.weight(.semibold))
+        .font(MuxaType.meta.weight(.semibold))
         .padding(.horizontal, 6)
         .padding(.vertical, 2)
         .background(Color.accentColor.opacity(0.12), in: Capsule())
@@ -620,11 +620,11 @@ private struct AutomationLogRow: View {
                     Text(verbatim: entry.rule).font(.callout.weight(.semibold))
                     if let action = entry.action {
                         Text(verbatim: automationActionTitle(action))
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.secondary)
                     }
                     Text(automationOutcomeTitle(entry.outcome))
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(tint)
                 }
                 HStack(spacing: 10) {
@@ -647,7 +647,7 @@ private struct AutomationLogRow: View {
                     Text("Unknown time")
                 }
             }
-            .font(.caption.monospacedDigit())
+            .font(MuxaType.detail.monospacedDigit())
             .foregroundStyle(.secondary)
         }
         .padding(.vertical, 8)
@@ -659,11 +659,11 @@ private struct AutomationLogRow: View {
     private var detailLine: some View {
         if let reason = entry.skipReason, !reason.isEmpty {
             Text(verbatim: automationSkipReasonTitle(reason))
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
         } else if let detail = entry.detail, !detail.isEmpty {
             Text(verbatim: detail)
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
         }
@@ -694,7 +694,7 @@ private struct AutomationTestSheet: View {
                     }
                 }
                 Text("Free deterministic check: no Ask turn, no action, and nothing recorded. Ask conditions require the separate billed test in the rule editor.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
             .padding(20)
@@ -727,7 +727,7 @@ private struct AutomationTestSheet: View {
 
             HStack {
                 Text("\(report.firing.count) of \(report.candidates.count) agents would be acted on")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Done") { dismiss() }
@@ -759,7 +759,7 @@ private struct AutomationTestRow: View {
                 }
                 if let detail = candidate.detail, !detail.isEmpty {
                     Text(verbatim: detail)
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                 }
@@ -767,7 +767,7 @@ private struct AutomationTestRow: View {
             Spacer(minLength: 8)
             if let date = candidate.fireDate {
                 Text(date.formatted(date: .omitted, time: .shortened))
-                    .font(.caption.monospacedDigit())
+                    .font(MuxaType.detail.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
         }
@@ -848,7 +848,7 @@ struct AutomationRuleEditor: View {
                 .font(.callout.monospaced())
             HStack {
                 Text("This wait was written by hand, so muxa keeps it exactly as it is.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
                 if wait.freeformIsReadable {
@@ -900,7 +900,7 @@ struct AutomationRuleEditor: View {
                 Section("Rule") {
                     TextField("Name", text: $draft.name)
                     Text("Used in muxa configuration and in the run log. Letters, digits, hyphens, underscores and dots.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                     Toggle("Enabled", isOn: $draft.enabled)
                 }
@@ -912,7 +912,7 @@ struct AutomationRuleEditor: View {
                         }
                     }
                     Text(automationEventDetail(draft.event))
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                     if draft.event.requiresDuration {
                         TextField("Idle for", text: $draft.idleFor, prompt: Text(verbatim: "10m"))
@@ -948,7 +948,7 @@ struct AutomationRuleEditor: View {
                         }
                     }
                     Text("Leave a filter empty to match everything. All the filters you set must match.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
 
@@ -982,7 +982,7 @@ struct AutomationRuleEditor: View {
                 Section("Fixed action") {
                     if draft.askCondition != nil {
                         Text("Ask only judges the condition; it cannot choose or run an action. Observe-only logs judgments without executing this fixed action.")
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(MuxaType.detail).foregroundStyle(.secondary)
                     }
                     Picker("Does", selection: $draft.action) {
                         ForEach(MuxaAutomationAction.pickable, id: \.self) { action in
@@ -990,20 +990,20 @@ struct AutomationRuleEditor: View {
                         }
                     }
                     Text(automationActionDetail(draft.action))
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                     if draft.action.needsText {
                         TextField("Text", text: $draft.text, prompt: Text(verbatim: "continue"))
                             .font(.callout.monospaced())
                         Toggle("Press Enter after typing", isOn: $draft.submit)
                         Text("Without this the text is left on the agent's prompt for you to send.")
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.secondary)
                     }
                     if draft.action.needsMessage {
                         TextField("Message", text: $draft.message)
                         Text("Recorded in the run log and posted by muxad. The agent is not touched.")
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -1022,7 +1022,7 @@ struct AutomationRuleEditor: View {
                         }
                     }
                     Text("Cooldown applies per pane and rule. Only if still is re-checked against the live registry when the rule fires, so an agent you resumed yourself is left alone.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
 
@@ -1030,7 +1030,7 @@ struct AutomationRuleEditor: View {
                     Section {
                         ForEach(Array(issues.enumerated()), id: \.offset) { _, issue in
                             Label(issue.message, systemImage: "exclamationmark.circle")
-                                .font(.caption)
+                                .font(MuxaType.detail)
                                 .foregroundStyle(.orange)
                         }
                     }
@@ -1039,11 +1039,11 @@ struct AutomationRuleEditor: View {
                 if let error = store.actionError {
                     Section {
                         Label(error, systemImage: "xmark.octagon.fill")
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.red)
                             .textSelection(.enabled)
                         Text("If this muxad cannot write rules yet, copy the rule and paste it into muxa configuration, then reload muxad.")
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -1105,14 +1105,14 @@ private struct AutomationAskConditionPanel: View {
     var body: some View {
         TextField("API Ask provider ID", text: $condition.provider, prompt: Text(verbatim: "openai"))
         Text("Default: openai. Requires API provider configuration and a key available to muxad; this request does not forward app-only Keychain keys. Only OpenAI, Anthropic, or named API instances backed by them are supported—not Claude/Codex CLI providers.")
-            .font(.caption).foregroundStyle(.secondary)
+            .font(MuxaType.detail).foregroundStyle(.secondary)
         TextField("Natural-language condition", text: $condition.prompt, axis: .vertical)
             .lineLimit(3...8)
         Toggle("Observe only — log judgments, execute no action", isOn: $condition.observeOnly)
         Stepper("Timeout: \(condition.timeoutSecs) seconds", value: $condition.timeoutSecs, in: 5...120)
         Stepper("Maximum judgment calls per hour: \(condition.maxPerHour)", value: $condition.maxPerHour, in: 1...30)
         Text("Each judgment is one read-only, tool-free Ask turn. Only bounded recent screen text, current state, and work/workspace IDs are sent—not full goal lookup. This context leaves your machine for the selected API provider and may be billed. Judgment call limits are separate from action firing limits.")
-            .font(.caption).foregroundStyle(.secondary)
+            .font(MuxaType.detail).foregroundStyle(.secondary)
         TextField("Pane ID to try against", text: $pane, prompt: Text(verbatim: "%1"))
         Button(isTesting ? "Judging…" : "Try condition — one billed API turn…") {
             confirmsTest = true
@@ -1153,13 +1153,13 @@ private struct AutomationAskConditionPanel: View {
                 Text(verbatim: "Provider: \(judgment.provider) · Model: \(judgment.model ?? "—")")
                 Text(verbatim: "Context hash: \(judgment.contextHash)")
             }
-            .font(.caption).textSelection(.enabled)
+            .font(MuxaType.detail).textSelection(.enabled)
         }
         if let testError {
-            Text(verbatim: testError).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+            Text(verbatim: testError).font(MuxaType.detail).foregroundStyle(.red).textSelection(.enabled)
         }
         Text("Unknown is not a match and must not execute an action.")
-            .font(.caption).foregroundStyle(.secondary)
+            .font(MuxaType.detail).foregroundStyle(.secondary)
             .onChange(of: rule) { _ in testID = nil; judgment = nil; testError = nil }
             .onChange(of: pane) { _ in testID = nil; judgment = nil; testError = nil }
             .onAppear { if pane.isEmpty { pane = rule.pane ?? "" } }
@@ -1237,7 +1237,7 @@ private struct AutomationTokenPicker: View {
                     }
                 }
                 if selection.isEmpty {
-                    Text("Any").font(.caption).foregroundStyle(.secondary)
+                    Text("Any").font(MuxaType.detail).foregroundStyle(.secondary)
                 }
             }
         } label: {
@@ -1277,7 +1277,7 @@ private struct AutomationTimingPreview: View {
             }
             jitterLine
         }
-        .font(.caption)
+        .font(MuxaType.detail)
         .foregroundStyle(.secondary)
     }
 

@@ -269,7 +269,7 @@ private struct OnboardingPageIndicator: View {
                 }
             }
             Text("Step \(current.rawValue + 1) of \(OnboardingStep.allCases.count)")
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .foregroundStyle(.secondary)
         }
         .accessibilityElement(children: .combine)
@@ -395,7 +395,7 @@ private struct OnboardingSurfaceCard<Title: View, Detail: View>: View {
             title
                 .font(.headline)
             detail
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
@@ -534,7 +534,7 @@ private struct OnboardingChecklistPage: View {
                     ForEach(installs.agents) { install in
                         VStack(alignment: .leading, spacing: 3) {
                             Text(verbatim: install.displayName)
-                                .font(.caption.weight(.medium))
+                                .font(MuxaType.detail.weight(.medium))
                                 .foregroundStyle(.primary)
                             OnboardingCommandLine(model: model, command: install.command)
                         }
@@ -642,7 +642,7 @@ private struct OnboardingChecklistRow<Title: View, Detail: View, Action: View>: 
                 title
                     .fontWeight(.medium)
                 detail
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -679,16 +679,16 @@ private struct OnboardingToolLine: View {
     var body: some View {
         HStack(spacing: 6) {
             Text(verbatim: tool.name)
-                .font(.caption.weight(.medium))
+                .font(MuxaType.detail.weight(.medium))
                 .foregroundStyle(.primary)
             if let version = tool.version {
                 Text(verbatim: version)
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             } else {
                 Text("version unknown")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.detail)
+                    .foregroundStyle(.secondary)
             }
         }
         .help(Text(verbatim: tool.path))
@@ -735,7 +735,7 @@ private struct OnboardingCommandLine: View {
     var body: some View {
         HStack(spacing: 6) {
             Text(verbatim: command)
-                .font(.system(size: 11).monospaced())
+                .font(.system(size: 12).monospaced())
                 .foregroundStyle(.primary)
                 .textSelection(.enabled)
                 .lineLimit(1)
@@ -893,7 +893,7 @@ private struct OnboardingFirstAgentPage: View {
                     }
                     if !folder.isEmpty, !folderExists {
                         Text("This folder does not exist on this Mac.")
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.red)
                     }
                 }
@@ -911,16 +911,16 @@ private struct OnboardingFirstAgentPage: View {
                         HStack(spacing: 6) {
                             ProgressView().controlSize(.small)
                             Text("Looking for agent CLIs…")
-                                .font(.caption)
+                                .font(MuxaType.detail)
                                 .foregroundStyle(.secondary)
                         }
                     } else {
                         Text("No agent CLI was found on this Mac.")
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.secondary)
                     }
                     placementCaption
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -940,12 +940,12 @@ private struct OnboardingFirstAgentPage: View {
                     ProgressView().controlSize(.small)
                     if let status = launcher.status {
                         Text(status)
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.secondary)
                     }
                 } else if let blocker {
                     Label { blockerMessage(blocker) } icon: { Image(systemName: "info.circle") }
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -953,7 +953,7 @@ private struct OnboardingFirstAgentPage: View {
 
             if let error = launcher.error, !launcher.isStarting {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1051,7 +1051,7 @@ private struct OnboardingNotificationsPage: View {
                 Label("hit an error or is blocked", systemImage: "exclamationmark.octagon")
                 Label("finished a turn", systemImage: "checkmark.circle")
                 Text("Never for the pane you are looking at. An agent you have not opened since keeps a dot, and the Dock icon counts them.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1063,7 +1063,7 @@ private struct OnboardingNotificationsPage: View {
 
             HStack(spacing: 8) {
                 Text("Choose what Muxa notifies about in Settings › Behaviour.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                 OnboardingSettingsButton(tab: .behaviour)
                     .controlSize(.small)
@@ -1085,7 +1085,7 @@ private struct OnboardingNotificationsPage: View {
                 }
                 .buttonStyle(.muxaPrimary)
                 Text("macOS asks once; you can change it later in System Settings.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
         case .allowed:
@@ -1151,7 +1151,7 @@ private struct OnboardingWorkbenchPage: View {
                             .font(.system(size: 12))
                         Spacer(minLength: 12)
                         Text(verbatim: entry.keys)
-                            .font(.system(size: 11, weight: .medium).monospaced())
+                            .font(.system(size: 12, weight: .medium).monospaced())
                             .padding(.horizontal, 6)
                             .frame(minHeight: 20)
                             .background(
@@ -1162,7 +1162,7 @@ private struct OnboardingWorkbenchPage: View {
                     .frame(minHeight: 24)
                 }
                 Text("Press ⌘/ in the workbench for every shortcut.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .padding(.top, 4)
             }
@@ -1186,7 +1186,7 @@ private struct OnboardingAnatomyRow<Title: View, Detail: View>: View {
                 title
                     .font(.system(size: 12, weight: .semibold))
                 detail
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1251,7 +1251,7 @@ private struct OnboardingFlowPage: View {
                 .disabled(!model.isConnected || model.isStartingWork)
                 if !model.isConnected {
                     Text("Available once muxad is connected.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -1273,7 +1273,7 @@ private struct OnboardingFlowNode<Title: View, Detail: View>: View {
             title
                 .font(.headline)
             detail
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
@@ -1311,7 +1311,7 @@ private struct OnboardingDonePage: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Label("Show this guide again from Help › Welcome Guide.", systemImage: "questionmark.circle")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
             Toggle("Don't show this guide again", isOn: $dontShowAgain)
                 .toggleStyle(.checkbox)

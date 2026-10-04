@@ -2162,7 +2162,7 @@ private func alpha(_ color: Color?) -> Double? {
     let runs = captureRuns(rendered)
     #expect(runs.map(\.text) == ["red", " plain", "bold", "cyan", "default"])
 
-    #expect(srgb(runs[0].foreground) == [0xAC, 0x41, 0x42])
+    #expect(srgb(runs[0].foreground) == [0xD9, 0x67, 0x5F])
     #expect(runs[0].background == nil)
     #expect(runs[0].intent == nil)
 
@@ -2170,18 +2170,19 @@ private func alpha(_ color: Color?) -> Double? {
     #expect(runs[1].background == nil)
 
     #expect(runs[2].intent?.contains(.stronglyEmphasized) == true)
-    #expect(srgb(runs[2].background) == [0x7E, 0x8E, 0x50])
-    #expect(runs[2].foreground == nil)
+    #expect(srgb(runs[2].background) == [0x98, 0xA9, 0x64])
+    // The default foreground is 1.7:1 on green, below the minimum contrast.
+    #expect(srgb(runs[2].foreground) == [0, 0, 0])
 
     #expect(runs[3].intent == nil)
-    #expect(srgb(runs[3].foreground) == [0x7D, 0xD5, 0xCF])
-    #expect(srgb(runs[3].background) == [0x7E, 0x8E, 0x50])
+    #expect(srgb(runs[3].foreground) == [0, 0, 0])
+    #expect(srgb(runs[3].background) == [0x98, 0xA9, 0x64])
 
     #expect(runs[4].foreground == nil)
     #expect(runs[4].background == nil)
 
     let light = captureRuns(TerminalCaptureFormatter(palette: .light).render(text: "\u{1B}[91mbright\u{1B}[m"))
-    #expect(srgb(light[0].foreground) == [0xF0, 0x3E, 0x31])
+    #expect(srgb(light[0].foreground) == [0xC4, 0x27, 0x1B])
 }
 
 @Test func terminalCaptureFormatterSupports256AndTruecolor() {
@@ -2196,11 +2197,13 @@ private func alpha(_ color: Color?) -> Double? {
 
     #expect(srgb(runs[0].foreground) == [255, 0, 0])
     #expect(runs[0].background == nil)
-    #expect(srgb(runs[1].foreground) == [255, 0, 0])
+    // Red on mid gray falls below the minimum contrast and takes black, as
+    // Ghostty draws it; the dark truecolors below still sit on that gray.
+    #expect(srgb(runs[1].foreground) == [0, 0, 0])
     #expect(srgb(runs[1].background) == [128, 128, 128])
     #expect(srgb(runs[2].foreground) == [10, 20, 30])
     #expect(srgb(runs[3].foreground) == [40, 50, 60])
-    #expect(srgb(runs[4].foreground) == [0x6C, 0x99, 0xBB])
+    #expect(srgb(runs[4].foreground) == [0x7E, 0xA6, 0xC8])
     // Malformed extended colors leave the style untouched.
     #expect(runs[5].foreground == nil)
     #expect(runs[5].background == nil)
@@ -2217,7 +2220,7 @@ private func alpha(_ color: Color?) -> Double? {
     #expect(runs.map(\.text) == ["abcdefg", "h"])
     #expect(runs[0].foreground == nil)
     // An ESC inside a CSI aborts it and starts the next sequence.
-    #expect(srgb(runs[1].foreground) == [0x7E, 0x8E, 0x50])
+    #expect(srgb(runs[1].foreground) == [0x98, 0xA9, 0x64])
 }
 
 @Test func terminalCaptureFormatterDropsOSCAndOtherStrings() {
@@ -2249,7 +2252,7 @@ private func alpha(_ color: Color?) -> Double? {
     #expect(srgb(runs[0].background) == [0xD0, 0xD0, 0xD0])
 
     #expect(srgb(runs[1].foreground) == [0xD0, 0xD0, 0xD0])
-    #expect(alpha(runs[1].foreground).map { abs($0 - 0.6) < 0.01 } == true)
+    #expect(alpha(runs[1].foreground).map { abs($0 - TerminalCapturePalette.faintOpacity) < 0.01 } == true)
     #expect(runs[1].background == nil)
 
     #expect(runs[2].underline == .single)
@@ -2266,7 +2269,7 @@ private func alpha(_ color: Color?) -> Double? {
     #expect(runs[6].foreground == nil)
 
     #expect(srgb(runs[7].foreground) == [0x21, 0x21, 0x21])
-    #expect(srgb(runs[7].background) == [0xAC, 0x41, 0x42])
+    #expect(srgb(runs[7].background) == [0xD9, 0x67, 0x5F])
 }
 
 @Test func terminalCaptureFormatterSkipsLeadingPartialCharacter() {
@@ -2305,6 +2308,69 @@ private func alpha(_ color: Color?) -> Double? {
     #expect(srgb(TerminalCapturePalette.dark.color(for: .indexed(255))) == [238, 238, 238])
     #expect(srgb(TerminalCapturePalette.dark.color(for: .indexed(21))) == [0, 0, 255])
     #expect(srgb(TerminalCapturePalette.light.color(for: .rgb(9, 8, 7))) == [9, 8, 7])
+}
+
+/// Agent CLIs draw secondary text in bright black and accents in the other
+/// ANSI colors; every one must stay readable on its own background.
+@Test func terminalCapturePaletteKeepsAnsiColorsReadable() {
+    for palette in [TerminalCapturePalette.dark, .light] {
+        for index in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14] {
+            #expect(palette.ansi[index].contrast(with: palette.background) >= 4.5, "ANSI \(index)")
+        }
+        #expect(palette.foreground.contrast(with: palette.background) >= 7)
+    }
+}
+
+@Test func terminalRGBEnsuresContrastLikeGhostty() {
+    let dark = TerminalRGB(hex: 0x212121)
+    let light = TerminalRGB(hex: 0xF7F7F7)
+    #expect(TerminalRGB(hex: 0x303030).ensuringContrast(3, against: dark) == .white)
+    #expect(TerminalRGB(hex: 0xEEEEEE).ensuringContrast(3, against: light) == .black)
+    #expect(TerminalRGB(hex: 0x8C8C8C).ensuringContrast(3, against: dark) == TerminalRGB(hex: 0x8C8C8C))
+    #expect(abs(TerminalRGB.black.contrast(with: .white) - 21) < 0.01)
+    #expect(TerminalRGB(hex: 0x0A0B0C).hexString == "0A0B0C")
+}
+
+@Test func terminalAppearanceThemeCarriesThePalette() {
+    let rendered = MuxaTerminalAppearance.themeConfiguration(.dark).rendered
+    #expect(rendered.contains("background = 212121"))
+    #expect(rendered.contains("palette = 8=#8C8C8C"))
+    #expect(rendered.contains("palette = 15=#F5F5F5"))
+    let configuration = MuxaTerminalAppearance.configuration.rendered
+    #expect(configuration.contains("minimum-contrast = 3"))
+    #expect(configuration.contains("font-size = 13"))
+}
+
+@Test @MainActor func terminalAppearanceLoadsCleanly() {
+    #expect(MuxaTerminalAppearance.loadIssue() == nil)
+}
+
+@Test func terminalCaptureTrimsTrailingBlankRows() {
+    let trim = { (text: String) in
+        String(TerminalCaptureFormatter.trimmingTrailingBlankLines(AttributedString(text)).characters)
+    }
+    #expect(trim("$ ls\nfile  \n\n   \n\n") == "$ ls\nfile  ")
+    #expect(trim("  indented\nlast") == "  indented\nlast")
+    #expect(trim("\n\n") == "\n\n")
+}
+
+@Test func terminalPreviewCountsCellsLikeATerminal() {
+    #expect(TerminalPreviewFont.columns(in: "") == 0)
+    #expect(TerminalPreviewFont.columns(in: "abc\nabcdef\n") == 6)
+    // Hangul and CJK take two cells; a tab advances to the next stop.
+    #expect(TerminalPreviewFont.columns(in: "한글 ok") == 7)
+    #expect(TerminalPreviewFont.columns(in: "ab\tc") == 9)
+    #expect(TerminalPreviewFont.columns(in: "e\u{301}") == 1)
+}
+
+@Test @MainActor func terminalPreviewFitsWidePanesDownToAFloor() {
+    let full = TerminalPreviewFont.fitted(columns: 10, width: 2000)
+    #expect(full.pointSize == TerminalPreviewFont.pointSize)
+    let narrow = TerminalPreviewFont.fitted(columns: 400, width: 300)
+    #expect(narrow.pointSize == TerminalPreviewFont.minimumFittedPointSize)
+    let between = TerminalPreviewFont.fitted(columns: 120, width: 120 * 11 * 0.6)
+    #expect(between.pointSize > TerminalPreviewFont.minimumFittedPointSize)
+    #expect(between.pointSize < TerminalPreviewFont.pointSize)
 }
 
 // MARK: - Explore tree highlight (workbench peer)

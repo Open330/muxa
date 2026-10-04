@@ -19,14 +19,14 @@ struct ArtifactFileSidebar: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Text("EXPLORER").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+                Text("EXPLORER").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
                 Spacer()
                 Menu {
                     Button("This Mac") { model.fileRoot = .init(hostAlias: "local", path: lastLocalFolder.isEmpty ? "~" : lastLocalFolder) }
                     ForEach(model.fleetHosts.filter { !$0.local }) { host in
                         Button(host.alias) { model.fileRoot = .init(hostAlias: host.alias, path: "~") }
                     }
-                } label: { Text(root.hostAlias == "local" ? "This Mac" : root.hostAlias).font(.caption) }
+                } label: { Text(root.hostAlias == "local" ? "This Mac" : root.hostAlias).font(MuxaType.detail) }
                 .menuStyle(.borderlessButton).fixedSize()
                 Button { revision += 1 } label: { Image(systemName: "arrow.clockwise") }.help("Refresh files")
                 Menu {
@@ -117,7 +117,7 @@ struct ArtifactPreviewView: View {
             HStack(spacing: 10) {
                 Image(systemName: location.hostAlias == "local" ? "doc" : "server.rack")
                 Text("\(location.hostAlias) · \(location.path)")
-                    .font(.system(size: 11)).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                    .font(.system(size: 12)).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
                 Spacer(minLength: 0)
                 if kind == .markdown || kind == .html || kind == .svg {
                     Picker("Display", selection: $source) {
@@ -161,7 +161,7 @@ struct ArtifactPreviewView: View {
                     Spacer()
                     Text(ByteCountFormatter.string(fromByteCount: Int64(contents.data.count), countStyle: .file))
                     Text("Updated \(Date(timeIntervalSince1970: contents.modified).formatted(date: .omitted, time: .shortened))")
-                }.font(.caption2).foregroundStyle(.secondary).padding(6)
+                }.font(MuxaType.meta).foregroundStyle(.secondary).padding(6)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

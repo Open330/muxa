@@ -186,7 +186,7 @@ struct MuxaShortcutsSheet: View {
                     ForEach(sections) { section in
                         VStack(alignment: .leading, spacing: 2) {
                             Text(verbatim: section.title.uppercased())
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(.system(size: 12, weight: .semibold))
                                 .tracking(0.4)
                                 .foregroundStyle(.secondary)
                                 .padding(.bottom, 4)
@@ -196,7 +196,7 @@ struct MuxaShortcutsSheet: View {
                                         .font(.system(size: 12))
                                     Spacer(minLength: 12)
                                     Text(verbatim: entry.keys)
-                                        .font(.system(size: 11, weight: .medium).monospaced())
+                                        .font(.system(size: 12, weight: .medium).monospaced())
                                         .padding(.horizontal, 6)
                                         .frame(minHeight: 20)
                                         .background(
@@ -216,7 +216,7 @@ struct MuxaShortcutsSheet: View {
 
             HStack {
                 Text("Shortcuts act on the focused editor; a focused terminal keeps only its own copy, paste, and scroll keys.")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer()

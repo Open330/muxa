@@ -22,7 +22,7 @@ struct FleetDispatchView: View {
             if !supported {
                 Text("Fleet dispatch requires an updated CLI and daemon. Configure the coordinator in Settings → Dispatch.")
             }
-            if let options { Text("Coordinator: \(options.coordinator ?? "local")").font(.caption) }
+            if let options { Text("Coordinator: \(options.coordinator ?? "local")").font(MuxaType.detail) }
             ScrollView {
                 Form {
                     Section("Request") {
@@ -53,7 +53,7 @@ struct FleetDispatchView: View {
                             LabeledContent("Repository", value: plan.paths.repo)
                             LabeledContent("Run", value: plan.paths.run)
                             LabeledContent("Artifacts", value: plan.paths.artifacts)
-                            if store.report == nil { Text("Placement is checked again when you dispatch.").font(.caption) }
+                            if store.report == nil { Text("Placement is checked again when you dispatch.").font(MuxaType.detail) }
                         }.textSelection(.enabled)
                     }
                     if let report = store.report {
@@ -79,7 +79,7 @@ struct FleetDispatchView: View {
                 }.padding(.horizontal)
             }
             if let error = store.error { Text(verbatim: error).foregroundStyle(.orange).textSelection(.enabled) }
-            Text(verbatim: "Dispatch ID: \(store.request.dispatchID)").font(.caption).textSelection(.enabled)
+            Text(verbatim: "Dispatch ID: \(store.request.dispatchID)").font(MuxaType.detail).textSelection(.enabled)
             HStack {
                 TextField("Dispatch UUID", text: $lookupID)
                 Button("Check status") { refresh(lookupID) }.disabled(store.busy || lookupID.isEmpty || !supported)
@@ -167,7 +167,7 @@ struct FleetDispatchSettingsView: View {
                     Toggle("Enable Fleet dispatch", isOn: $settings.enabled)
                     TextField("Coordinator host alias", text: optionalText($settings.coordinator), prompt: Text("Empty means this host"))
                     Text("These settings belong to the connected daemon. Other entry hosts use its Fleet alias to share placement and Ask history.")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(MuxaType.detail).foregroundStyle(.secondary)
                 }
                 if localOwner {
                     Section("Node labels") {
@@ -176,7 +176,7 @@ struct FleetDispatchSettingsView: View {
                                 VStack(alignment: .leading) {
                                     Text(verbatim: host.alias)
                                     Text(verbatim: (host.labels ?? [:]).sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ", "))
-                                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                                        .font(MuxaType.detail).foregroundStyle(.secondary).textSelection(.enabled)
                                 }
                                 Spacer()
                                 Button("Edit labels") { labelHost = host }
@@ -203,7 +203,7 @@ struct FleetDispatchSettingsView: View {
                             TextField("Repository URL", text: policy.url)
                             TextField("Pipeline", text: policy.pipeline)
                             TextField("Node selector", text: policy.selector)
-                            Text("Empty overrides inherit the defaults above.").font(.caption)
+                            Text("Empty overrides inherit the defaults above.").font(MuxaType.detail)
                             overrides(policy.paths)
                             Picker("Node override", selection: $node) {
                                 Text("Select node").tag("")
@@ -221,7 +221,7 @@ struct FleetDispatchSettingsView: View {
                         }
                     }
                     Text("Use {repo}, {workspace}, {work}, and {attempt}. Runs and artifacts must include {attempt}. Paths are expanded on the selected worker.")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(MuxaType.detail).foregroundStyle(.secondary)
                 } else {
                     Text("Edit workspace and node paths on the coordinator. This host forwards requests there.")
                 }
@@ -306,7 +306,7 @@ private struct FleetLabelEditor: View {
             }
             TextField("Label key", text: $key)
             TextField("Label value", text: $value)
-            Text("Labels are used by workspace and request selectors. System-managed labels cannot be changed.").font(.caption)
+            Text("Labels are used by workspace and request selectors. System-managed labels cannot be changed.").font(MuxaType.detail)
             if let error { Text(verbatim: error).foregroundStyle(.orange) }
             HStack {
                 Button("Close") { dismiss() }

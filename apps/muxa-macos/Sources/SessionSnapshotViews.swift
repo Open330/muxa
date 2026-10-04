@@ -79,7 +79,7 @@ struct SessionSnapshotSaveSheet: View {
             }
             if let error = viewModel.error {
                 Text(error)
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
@@ -92,7 +92,7 @@ struct SessionSnapshotSaveSheet: View {
                 if viewModel.phase == .saving {
                     ProgressView().controlSize(.small)
                     Text("Capturing the workspace…")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -284,7 +284,7 @@ struct SessionSnapshotRestoreSheet: View {
             } else {
                 if let plan = viewModel.plan, !plan.serverReachable {
                     Text("The multiplexer is not running, so every session will be created.")
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 14)
                         .padding(.bottom, 4)
@@ -306,7 +306,7 @@ struct SessionSnapshotRestoreSheet: View {
         VStack(alignment: .leading, spacing: 8) {
             if let error = viewModel.error, viewModel.supported {
                 Text(error)
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
@@ -317,16 +317,16 @@ struct SessionSnapshotRestoreSheet: View {
                     Text(timerInterval: started...Date.distantFuture, countsDown: false)
                         .monospacedDigit()
                 }
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
             } else if let status = viewModel.statusMessage {
                 Text(status)
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             } else if let plan = viewModel.plan, !plan.run {
                 Text(SessionSnapshotTree.summaryLine(plan))
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
             HStack(spacing: 10) {
@@ -387,7 +387,7 @@ private struct SessionSnapshotListRow: View {
                             .lineLimit(1)
                         if entry.summary?.isAutomatic == true {
                             Text("Auto")
-                                .font(.system(size: 10, weight: .medium))
+                                .font(.system(size: 11, weight: .medium))
                                 .foregroundStyle(.secondary)
                                 .padding(.horizontal, 4)
                                 .background(
@@ -399,17 +399,17 @@ private struct SessionSnapshotListRow: View {
                     }
                     if let summary = entry.summary {
                         Text(verbatim: summary.serverLabel)
-                            .font(.system(size: 11))
+                            .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
                         Text(verbatim: summary.countsLabel)
-                            .font(.system(size: 11))
+                            .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     } else {
                         Text("Unreadable")
-                            .font(.system(size: 11))
+                            .font(.system(size: 12))
                             .foregroundStyle(.red)
                     }
                 }
@@ -457,7 +457,7 @@ private struct SessionSnapshotTreeRowView: View {
         VStack(alignment: .leading, spacing: 1) {
             HStack(spacing: 6) {
                 Image(systemName: row.symbol)
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .frame(width: 14)
                 Text(verbatim: row.title)
@@ -466,7 +466,7 @@ private struct SessionSnapshotTreeRowView: View {
                     .truncationMode(.middle)
                 if let detail = row.detail {
                     Text(verbatim: detail)
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -483,7 +483,7 @@ private struct SessionSnapshotTreeRowView: View {
             .frame(minHeight: MuxaTheme.rowHeight)
             if let message = row.message {
                 Text(verbatim: message)
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(row.badge == .unconfirmed ? Color.orange : Color.red)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
@@ -503,7 +503,7 @@ private struct SessionSnapshotMarkChip: View {
 
     var body: some View {
         title
-            .font(.system(size: 10, weight: .medium))
+            .font(.system(size: 11, weight: .medium))
             .foregroundStyle(color)
             .lineLimit(1)
             .fixedSize()
@@ -550,7 +550,7 @@ private struct SessionSnapshotBadge: View {
             Image(systemName: symbol)
         }
         .labelStyle(.titleAndIcon)
-        .font(.system(size: 10, weight: .medium))
+        .font(.system(size: 11, weight: .medium))
         .foregroundStyle(color)
         .lineLimit(1)
     }

@@ -126,6 +126,52 @@ enum MuxaTerminalKeybindings {
     }
 }
 
+/// How every Ghostty surface draws text. The read-only pane preview
+/// (`TerminalPreviewFont`, `PaneCaptureView`) uses the same size, padding,
+/// and palette, so switching a Live Pane from preview to Click to Type keeps
+/// each line where it was.
+enum MuxaTerminalAppearance {
+    /// Body text size. Ghostty's own default, stated so the preview can
+    /// match it and ⌘0 returns to it.
+    static let fontSize: CGFloat = 13
+    static let paddingX: CGFloat = 10
+    static let paddingY: CGFloat = 8
+
+    /// The keybindings plus the type, padding, and contrast settings.
+    static let configuration: TerminalConfiguration = MuxaTerminalKeybindings.configuration
+        .appending(.fontSize(Float(fontSize)))
+        .appending(.windowPaddingX(Int(paddingX)))
+        .appending(.windowPaddingY(Int(paddingY)))
+        .appending(.minimumContrast(TerminalCapturePalette.minimumContrast))
+        .appending(.custom(key: "faint-opacity", value: String(TerminalCapturePalette.faintOpacity)))
+
+    /// `TerminalCapturePalette` as a Ghostty theme, replacing the library's
+    /// low-contrast Afterglow/Alabaster ANSI colors.
+    static let theme = TerminalTheme(
+        light: themeConfiguration(.light),
+        dark: themeConfiguration(.dark)
+    )
+
+    static func themeConfiguration(_ palette: TerminalCapturePalette) -> TerminalConfiguration {
+        palette.ansi.enumerated().reduce(
+            TerminalConfiguration()
+                .appending(.background(palette.background.hexString))
+                .appending(.foreground(palette.foreground.hexString))
+                .appending(.cursorColor(palette.cursor.hexString))
+                .appending(.selectionBackground(palette.selection.hexString))
+        ) { configuration, entry in
+            configuration.appending(.palette(index: entry.offset, color: "#\(entry.element.hexString)"))
+        }
+    }
+
+    /// Loads the configuration and theme together, as a pane does.
+    @MainActor
+    static func loadIssue() -> String? {
+        TerminalController(configuration: configuration, theme: theme)
+            .lastConfigurationIssue
+    }
+}
+
 @main
 struct MuxaApp: App {
     @NSApplicationDelegateAdaptor(MuxaApplicationDelegate.self) private var appDelegate
@@ -402,8 +448,8 @@ private struct MenuBarContent: View {
                     .foregroundStyle(.orange)
             }
             Text("\(liveSessionCount) native shells")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
+                .font(MuxaType.detail)
+                .foregroundStyle(.secondary)
             Divider()
             Button("Start Work…") {
                 model.presentWorkStart()

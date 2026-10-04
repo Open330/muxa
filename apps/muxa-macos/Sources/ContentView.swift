@@ -790,7 +790,7 @@ private struct EditorTab: View {
             Button(action: activate) {
                 HStack(spacing: 6) {
                     Image(systemName: systemImage)
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .foregroundStyle(active ? Color.accentColor : Color.secondary)
                         .overlay(alignment: .bottomTrailing) {
                             if let stateColor {
@@ -1095,7 +1095,7 @@ private struct MuxaSidebar: View {
         MuxaSectionTitle(title: model.sidebarMode.title) {
             if model.sidebarMode != .files {
             Text(verbatim: sidebarCountLabel)
-                .font(.system(size: 10, weight: .medium).monospacedDigit())
+                .font(.system(size: 11, weight: .medium).monospacedDigit())
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 5)
                 .frame(minHeight: 16)
@@ -1650,7 +1650,7 @@ private struct MuxaSidebar: View {
             Section("Native shells") {
                 if let remoteShellError {
                     Label(remoteShellError, systemImage: "exclamationmark.triangle")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.red)
                         .lineLimit(3)
                         .listRowBackground(Color.clear)
@@ -1899,7 +1899,7 @@ private struct ShellsEmptyRow: View {
             Label("No native shells", systemImage: "terminal")
                 .foregroundStyle(.secondary)
             Text("Open a terminal on this Mac, or on an online fleet host from the network menu above.")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Button(action: create) {
@@ -1926,13 +1926,13 @@ private struct GlobalAskRow: View {
                 Text("Global Ask")
                     .fontWeight(.medium)
                 Text("@\(agent) · \(conversationCount) conversations")
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
             Image(systemName: "chevron.right")
-                .font(.caption2.weight(.semibold))
+                .font(MuxaType.meta.weight(.semibold))
                 .foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 4)
@@ -1962,7 +1962,7 @@ private struct AskConversationRow: View {
                     .lineLimit(1)
                 if let updated {
                     Text(updated, style: .relative)
-                        .font(.caption2)
+                        .font(MuxaType.meta)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -1987,13 +1987,13 @@ private struct OperatorInboxRow: View {
                 Text("Operator Inbox")
                     .fontWeight(.medium)
                 Text(attention > 0 ? "\(attention) waiting or new" : "\(commands) sent commands")
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
             Image(systemName: "chevron.right")
-                .font(.caption2.weight(.semibold))
+                .font(MuxaType.meta.weight(.semibold))
                 .foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 4)
@@ -2032,11 +2032,11 @@ private struct InboxAgentRow: View {
                         .lineLimit(1)
                     Spacer(minLength: 4)
                     Text(participant.host.alias)
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.tertiary)
+                        .font(MuxaType.meta.monospaced())
+                        .foregroundStyle(.secondary)
                 }
                 Text(summary)
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
@@ -2086,7 +2086,7 @@ private struct WorkbenchStatusBar: View {
             .padding(.trailing, 10)
             .foregroundStyle(healthy ? Color.secondary : Color.white)
         }
-        .font(.system(size: 11))
+        .font(.system(size: 12))
         .lineLimit(1)
         .frame(maxWidth: .infinity, minHeight: MuxaTheme.statusBarHeight, maxHeight: MuxaTheme.statusBarHeight)
         .background(healthy ? MuxaTheme.sideBar(colorScheme) : statusColor)
@@ -2138,7 +2138,7 @@ private struct WorkbenchStatusBar: View {
 private struct StatusBarLabelStyle: LabelStyle {
     func makeBody(configuration: Configuration) -> some View {
         HStack(spacing: 4) {
-            configuration.icon.font(.system(size: 10))
+            configuration.icon.font(.system(size: 11))
             configuration.title
         }
     }
@@ -2181,7 +2181,7 @@ private struct SidebarConnectionStatus: View {
                     .controlSize(.small)
             }
         }
-        .font(.caption)
+        .font(MuxaType.detail)
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2196,7 +2196,7 @@ private struct SidebarConnectionStatus: View {
         Label(title, systemImage: systemImage)
             .foregroundStyle(.orange)
         Text(message)
-            .font(.caption2)
+            .font(MuxaType.meta)
             .foregroundStyle(.secondary)
             .lineLimit(3)
             .fixedSize(horizontal: false, vertical: true)
@@ -2215,7 +2215,7 @@ private struct WorkBoardRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Work Command Center")
                 Text("\(workCount) work · \(agentCount) agents")
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -2239,13 +2239,13 @@ private struct NativeWatchRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Live Watch")
                 Text("\(hostCount) hosts · \(paneCount) panes")
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
             }
             Spacer()
             if attentionCount > 0 {
                 Text(verbatim: "\(attentionCount)")
-                    .font(.caption2.bold().monospacedDigit())
+                    .font(MuxaType.meta.bold().monospacedDigit())
                     .foregroundStyle(.white)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
@@ -2278,7 +2278,7 @@ private struct SessionRow: View {
                         if session.attachedClients > 0 { Text("\(session.attachedClients) attached") }
                     }
                 }
-                .font(.caption2)
+                .font(MuxaType.meta)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
             }
@@ -2307,7 +2307,7 @@ private struct WorkRow: View {
                         Text(verbatim: "· \(work.hostAliases.joined(separator: ", "))")
                     }
                 }
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -2319,7 +2319,7 @@ private struct WorkRow: View {
                     Text(verbatim: "\(work.completedCount)/\(work.totalCount)")
                 }
             }
-            .font(.caption2.monospacedDigit())
+            .font(MuxaType.meta.monospacedDigit())
             .foregroundStyle(work.attentionCount > 0 ? .orange : .secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2355,12 +2355,12 @@ private struct FleetAgentRow: View {
                         .lineLimit(1)
                 }
                 Text(verbatim: "\(participant.host.alias) · \(participant.agent.agentSessionID)")
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                 Text(executionLocation)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.meta.monospaced())
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
@@ -2405,7 +2405,7 @@ private struct WorkDetailView: View {
             VStack(alignment: .leading, spacing: 22) {
                 VStack(alignment: .leading, spacing: 5) {
                     Text(work.workspaceID.uppercased())
-                        .font(.caption.weight(.semibold))
+                        .font(MuxaType.detail.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Text(work.title)
                         .font(.system(size: 22, weight: .semibold))
@@ -2425,8 +2425,8 @@ private struct WorkDetailView: View {
                     .foregroundStyle(.secondary)
                     if let cwd = work.cwd {
                         Text(cwd)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.tertiary)
+                            .font(MuxaType.detail.monospaced())
+                            .foregroundStyle(.secondary)
                             .textSelection(.enabled)
                     }
                 }
@@ -2515,7 +2515,7 @@ private struct WorkMetric: View {
                 .font(.system(size: 18, weight: .semibold).monospacedDigit())
                 .foregroundStyle(color)
             Text(title)
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
         }
         .frame(minWidth: 90, alignment: .leading)
@@ -2549,14 +2549,14 @@ private struct WorkParticipantCard: View {
                         .font(.headline)
                         .lineLimit(1)
                     Text(verbatim: "\(participant.host.alias) · \(desired?.role ?? participant.agent.kind)")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 Spacer()
                 Label(agentStateLabel(participant.agent.state), systemImage: "circle.fill")
                     .labelStyle(.titleAndIcon)
-                    .font(.caption.weight(.medium))
+                    .font(MuxaType.detail.weight(.medium))
                     .foregroundStyle(agentStateColor(participant.agent.state))
                     .lineLimit(1)
                     .fixedSize()
@@ -2569,15 +2569,15 @@ private struct WorkParticipantCard: View {
                 } else {
                     Text("Waiting for work context")
                         .font(.subheadline)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                 }
             }
             .frame(maxHeight: 68, alignment: .topLeading)
             .clipped()
 
             Text(executionLabel)
-            .font(.caption2.monospaced())
-            .foregroundStyle(.tertiary)
+            .font(MuxaType.meta.monospaced())
+            .foregroundStyle(.secondary)
             .lineLimit(1)
             .truncationMode(.middle)
             .help(executionLabel)
@@ -2589,7 +2589,7 @@ private struct WorkParticipantCard: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.plain)
-            .font(.caption.weight(.medium))
+            .font(MuxaType.detail.weight(.medium))
             .foregroundStyle(.tint)
         }
         .padding(14)
@@ -2624,13 +2624,13 @@ private struct PipelinePlaceholderCard: View {
                         .font(.headline)
                         .lineLimit(1)
                     Text(desired.role ?? desired.program)
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 Spacer()
                 Label(agentStateLabel(state?.status ?? "pending"), systemImage: "circle.fill")
-                    .font(.caption.weight(.medium))
+                    .font(MuxaType.detail.weight(.medium))
                     .foregroundStyle(agentStateColor(state?.status ?? "pending"))
                     .lineLimit(1)
                     .fixedSize()
@@ -2642,7 +2642,7 @@ private struct PipelinePlaceholderCard: View {
                 } else {
                     Text("No live execution is currently bound.")
                         .font(.subheadline)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                 }
             }
             .frame(maxHeight: 68, alignment: .topLeading)
@@ -2650,7 +2650,7 @@ private struct PipelinePlaceholderCard: View {
             Spacer(minLength: 0)
             if let error = state?.error, !error.isEmpty {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
                     .lineLimit(1)
                     .help(error)
@@ -2671,13 +2671,13 @@ private struct MarkdownSection: View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title)
                 .textCase(.uppercase)
-                .font(.caption2.weight(.semibold))
+                .font(MuxaType.meta.weight(.semibold))
                 .foregroundStyle(.secondary)
             if let source, !source.isEmpty {
                 MarkdownContent(source: source)
             } else {
                 Text("Not available")
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2793,7 +2793,7 @@ private struct FleetAgentDetailView: View {
                             .foregroundStyle(agentStateColor(participant.agent.state))
                         MuxaRateLimitBadge(agent: participant.agent) // WS-C usage
                         Text(participant.agent.agentSessionID)
-                            .font(.caption.monospaced())
+                            .font(MuxaType.detail.monospaced())
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
                     }
@@ -2857,7 +2857,7 @@ private struct FleetAgentDetailView: View {
                     MarkdownContent(source: summary, font: .body)
                 } else {
                     Text("No retained summary")
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                 }
 
                 GroupBox("Execution location") {
@@ -3050,16 +3050,16 @@ private struct FleetSessionSummaryCard: View {
                         } icon: {
                             Image(systemName: "exclamationmark.circle.fill")
                         }
-                        .font(.caption.weight(.medium))
+                        .font(MuxaType.detail.weight(.medium))
                         .foregroundStyle(.orange)
                     }
                     Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.semibold))
+                        .font(MuxaType.meta.weight(.semibold))
                         .foregroundStyle(.tertiary)
                 }
 
                 Text("\(session.windows.count) windows · \(panes.count) panes · \(agents.count) agents")
-                    .font(.caption.monospacedDigit())
+                    .font(MuxaType.detail.monospacedDigit())
                     .foregroundStyle(.secondary)
 
                 VStack(alignment: .leading, spacing: 7) {
@@ -3068,12 +3068,12 @@ private struct FleetSessionSummaryCard: View {
                     }
                     if agents.isEmpty {
                         Text("No retained agent summary")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
+                            .font(MuxaType.detail)
+                            .foregroundStyle(.secondary)
                     } else if agents.count > 2 {
                         Text("+\(agents.count - 2) more agents")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .font(MuxaType.meta)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -3257,7 +3257,7 @@ private struct FleetWindowDetailView: View {
                         .foregroundStyle(.secondary)
                     if let workIdentity {
                         Text(verbatim: "\(workIdentity.workspaceID) / \(workIdentity.workID)")
-                            .font(.caption.weight(.semibold))
+                            .font(MuxaType.detail.weight(.semibold))
                             .foregroundStyle(Color.accentColor)
                             .padding(.horizontal, 7)
                             .padding(.vertical, 3)
@@ -3344,15 +3344,15 @@ private struct WindowAgentReportCard: View {
                         .lineLimit(1)
                     if let agent = pane.agent {
                         Text(agentStateLabel(agent.state))
-                            .font(.caption2.weight(.semibold))
+                            .font(MuxaType.meta.weight(.semibold))
                             .foregroundStyle(agentStateColor(agent.state))
                     }
                     Spacer(minLength: 4)
                     Text(pane.pane.paneID)
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.tertiary)
+                        .font(MuxaType.meta.monospaced())
+                        .foregroundStyle(.secondary)
                     Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.semibold))
+                        .font(MuxaType.meta.weight(.semibold))
                         .foregroundStyle(.tertiary)
                 }
                 .contentShape(Rectangle())
@@ -3384,7 +3384,7 @@ private struct WindowAgentReportCard: View {
                         if workload.helperCount > 0 { Text("\(workload.helperCount) helpers") }
                         if let count = agent.subagents?.count, count > 0 { Text("\(count) live subagents") }
                     }
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                 }
             }
@@ -3396,8 +3396,8 @@ private struct WindowAgentReportCard: View {
                 Text(pane.pane.currentPath)
                     .lineLimit(1)
             }
-            .font(.caption2.monospaced())
-            .foregroundStyle(.tertiary)
+            .font(MuxaType.meta.monospaced())
+            .foregroundStyle(.secondary)
         }
         .padding(14)
         .frame(maxWidth: .infinity, minHeight: 300, alignment: .topLeading)
@@ -3415,7 +3415,7 @@ private struct WindowAgentReportCard: View {
         VStack(alignment: .leading, spacing: 4) {
             Text(label)
                 .textCase(.uppercase)
-                .font(.caption2.weight(.bold))
+                .font(MuxaType.meta.weight(.bold))
                 .foregroundStyle(.secondary)
             MarkdownContent(source: source, lineLimit: lineLimit, selectable: false, font: .callout)
         }
@@ -3445,7 +3445,7 @@ private struct WindowAgentReportCard: View {
         } icon: {
             Image(systemName: systemImage)
         }
-        .font(.caption2)
+        .font(MuxaType.meta)
         .foregroundStyle(.secondary)
         .lineLimit(1)
     }
@@ -3466,17 +3466,17 @@ private struct WindowCollaborationRow: View {
                         .font(.subheadline.weight(.medium))
                         .lineLimit(2)
                     if let reply = message.request.reply {
-                        MarkdownContent(source: reply.body, lineLimit: 3, selectable: false, font: .caption)
+                        MarkdownContent(source: reply.body, lineLimit: 3, selectable: false, font: MuxaType.detail)
                             .foregroundStyle(.secondary)
                     } else {
                         Text("Waiting for \(message.request.to.label) to reply")
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.secondary)
                     }
                 }
                 Spacer(minLength: 6)
                 Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.semibold))
+                    .font(MuxaType.meta.weight(.semibold))
                     .foregroundStyle(.tertiary)
             }
             .padding(10)
@@ -3524,17 +3524,17 @@ private struct FleetWindowSummaryCard: View {
                             .lineLimit(1)
                         if let workLabel {
                             Text(workLabel)
-                                .font(.caption2.weight(.medium))
+                                .font(MuxaType.meta.weight(.medium))
                                 .foregroundStyle(Color.accentColor)
                                 .lineLimit(1)
                         }
                     }
                     Spacer(minLength: 4)
                     Text("#\(window.index) · \(window.panes.count) panes")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.tertiary)
+                        .font(MuxaType.meta.monospacedDigit())
+                        .foregroundStyle(.secondary)
                     Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.semibold))
+                        .font(MuxaType.meta.weight(.semibold))
                         .foregroundStyle(.tertiary)
                 }
                 .contentShape(Rectangle())
@@ -3551,9 +3551,9 @@ private struct FleetWindowSummaryCard: View {
                         }
                     }
                     .textCase(.uppercase)
-                    .font(.caption2.weight(.bold))
+                    .font(MuxaType.meta.weight(.bold))
                     .foregroundStyle(paneNeedsAttentionForSummary(focusPane) ? Color.orange : Color.secondary)
-                    MarkdownContent(source: summary, lineLimit: 3, selectable: false, font: .caption)
+                    MarkdownContent(source: summary, lineLimit: 3, selectable: false, font: MuxaType.detail)
                 }
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -3577,8 +3577,8 @@ private struct FleetWindowSummaryCard: View {
             }
             if window.panes.count > displayedPanes.count {
                 Text("+\(window.panes.count - displayedPanes.count) more panes")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
         }
@@ -3615,7 +3615,7 @@ private struct FleetResourceSummaryRow: View {
                         .lineLimit(1)
                     if let agent = pane.agent {
                         Text(agentStateLabel(agent.state))
-                            .font(.caption2.weight(.medium))
+                            .font(MuxaType.meta.weight(.medium))
                             .foregroundStyle(agentStateColor(agent.state))
                     }
                 }
@@ -3623,14 +3623,14 @@ private struct FleetResourceSummaryRow: View {
                     source: fleetPaneSummary(pane) ?? String(localized: "No summary reported"),
                     lineLimit: 2,
                     selectable: false,
-                    font: .caption
+                    font: MuxaType.detail
                 )
                 .foregroundStyle(.secondary)
             }
             Spacer(minLength: 4)
             if showsChevron {
                 Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.semibold))
+                    .font(MuxaType.meta.weight(.semibold))
                     .foregroundStyle(.tertiary)
                     .padding(.top, 5)
             }
@@ -3687,7 +3687,7 @@ private struct HostMetric: View {
             Text(verbatim: "\(value)\(suffix)")
                 .font(.system(size: 18, weight: .semibold).monospacedDigit())
             Text(title)
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
         }
         .frame(minWidth: 90, alignment: .leading)
@@ -3856,13 +3856,13 @@ struct TerminalPane: View {
 
             if pane.outputWasTruncated {
                 Label("Earlier output was truncated by muxad's retained buffer", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .padding(7)
                     .background(.ultraThinMaterial, in: Capsule())
                     .padding(8)
             } else if let error = pane.errorMessage {
                 Label(error, systemImage: "bolt.horizontal.circle")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .padding(7)
                     .background(.ultraThinMaterial, in: Capsule())
                     .padding(8)
@@ -3876,7 +3876,7 @@ struct TerminalPane: View {
                 } icon: {
                     Image(systemName: pane.exitStatus == 0 ? "checkmark.circle" : "stop.circle")
                 }
-                .font(.caption)
+                .font(MuxaType.detail)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 7)
                 .background(.regularMaterial, in: Capsule())
