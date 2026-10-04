@@ -74,7 +74,8 @@ impl WorkloadSummary {
 #[cfg(target_os = "linux")]
 pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummary> {
     let mut out = HashMap::new();
-    for pane in panes {
+    // Each pane once, not once per `~view~` listing of a grouped session.
+    for pane in &crate::tmux::canonical_panes(panes) {
         let summary = scan_pane_workload(pane);
         if !summary.is_empty() {
             out.insert(pane.pane_id.clone(), summary);
@@ -90,7 +91,7 @@ pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummar
     }
     let table = crate::process_snapshot::read_current_process_table();
     let mut out = HashMap::new();
-    for pane in panes {
+    for pane in &crate::tmux::canonical_panes(panes) {
         if pane.pane_pid == 0 {
             continue;
         }
@@ -120,7 +121,10 @@ pub struct CodexPaneScan {
 pub fn scan_codex_panes(panes: &[PaneInfo]) -> CodexPaneScan {
     #[cfg(not(target_os = "linux"))]
     let table = crate::process_snapshot::read_current_process_table();
-    let scanned: Vec<_> = panes
+    // A grouped session lists each pane once per `~view~` client session:
+    // scan (and report) each pane once, under its base session.
+    let unique = crate::tmux::canonical_panes(panes);
+    let scanned: Vec<_> = unique
         .iter()
         .filter(|p| p.pane_pid != 0)
         .map(|pane| {

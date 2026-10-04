@@ -36,6 +36,44 @@ echo '{"session_id":"sess-1","prompt":"hi"}' \
 cargo run --bin muxa -- status
 ```
 
+## Real-world topology: rules that keep biting
+
+Most regressions in agent identity, binding and collaboration came from code
+that was right for the simple test setup and wrong for real ones. Hold these
+invariants:
+
+- **A pane listing repeats a pane once per member of a session group.** Two
+  terminals on one workspace (`callabo` plus `callabo~view~N`) make
+  `list-panes -a` report every pane two or more times. A view row can also
+  lack session-level workspace metadata. Before you count panes, require
+  "exactly one" match, key anything by session, persist a session name, or do
+  per-pane work (process scans, captures, IPC, typing into a pane), pass the
+  listing through `muxa::tmux::canonical_panes`. Use
+  `muxa::tmux::base_session_name` for durable labels. Keep raw rows only for
+  actions taken on behalf of one client, such as moving that terminal's view.
+- **Codex 0.160+ shares one `codex app-server` across TUIs.** Its hooks, MCP
+  servers and shell commands carry the pane variables of whichever pane
+  started it, so never trust `TMUX_PANE`/`RMUX_PANE` under it. Identify a
+  thread by its thread id (`_meta.threadId`, `$CODEX_THREAD_ID`). Bind it
+  only from evidence (see `crates/muxa/src/codex_binding.rs`).
+- **Agents keep long-lived `muxa mcp` processes.** A fix to them reaches
+  running agents only after the agents restart.
+
+Before merging changes in these areas, verify them live as well as with unit
+tests. The live checks must cover:
+
+1. A grouped session with at least one `~view~` client, not only a plain
+   session.
+2. Two agents in the same cwd, `/new` inside a running TUI, and a muxad
+   restart.
+3. For each regression test: revert the fix and confirm that the test fails.
+4. A throwaway `muxad` with its own `XDG_DATA_HOME`/`XDG_STATE_HOME`/
+   `TMUX_TMPDIR`. Without them it writes the real history and scans the real
+   multiplexer.
+
+CI runs clippy on unpinned stable, so run `rustup update stable` before
+pushing. New lints otherwise appear in CI on code you did not touch.
+
 ## Adding a new agent adapter
 
 The three stdin-JSON adapters (`claude`, `codex`, `gemini`) all implement

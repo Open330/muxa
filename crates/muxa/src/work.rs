@@ -307,6 +307,11 @@ pub fn build_snapshot(
     records: &[WorkRecord],
     generated_at: OffsetDateTime,
 ) -> WorkSnapshot {
+    // A grouped session lists each window once per `~view~` member, and the
+    // execution identity includes the session: without this every view
+    // would be a duplicate run, and the index would see every pane twice.
+    let canonical = crate::tmux::canonical_panes(panes);
+    let panes = canonical.as_slice();
     let agent_index = AgentIndex::new(panes, agents);
     let mut runs = BTreeMap::<ExecutionIdentity, RunBuilder<'_>>::new();
     for pane in panes {
@@ -864,5 +869,27 @@ mod tests {
         assert_eq!(snapshot.works.len(), 1);
         assert_eq!(snapshot.works[0].stage, BoardStage::InProgress);
         assert!(snapshot.works[0].signals.contains(&WorkSignal::Attention));
+    }
+
+    /// Two terminals on one workspace: the base session plus a `~view~`
+    /// client list every pane twice, and the view lacks session-level
+    /// workspace options. That is one run with one agent, not two.
+    #[test]
+    fn a_grouped_session_view_is_not_a_second_run() {
+        let base = pane("%1", "@1", true);
+        let mut view = pane("%1", "@1", true);
+        view.session_id = "$9".into();
+        view.session = "muxa~view~4242".into();
+        view.muxa.workspace_id = None;
+        view.muxa.managed_workspace = false;
+        let agents = vec![agent("%1", AgentState::Working)];
+        for panes in [vec![view.clone(), base.clone()], vec![base, view]] {
+            let snapshot = build_snapshot(&panes, &agents, &[], OffsetDateTime::now_utc());
+            assert_eq!(snapshot.works.len(), 1);
+            let runs = &snapshot.works[0].runs;
+            assert_eq!(runs.len(), 1, "one run per window, not per view");
+            assert_eq!(runs[0].execution.session_id, "$1");
+            assert!(snapshot.unlinked_executions.is_empty());
+        }
     }
 }

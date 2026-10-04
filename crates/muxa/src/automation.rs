@@ -1058,6 +1058,9 @@ impl AutomationSubject {
 /// `automation_test`, and any future caller evaluate identical inputs.
 #[must_use]
 pub fn subjects_from(agents: &[Agent], panes: &[crate::tmux::PaneInfo]) -> Vec<AutomationSubject> {
+    // A `~view~` listing of a grouped pane can lack the workspace stamp and
+    // would fail workspace filters; match against one listing per pane.
+    let panes = crate::tmux::canonical_panes(panes);
     agents
         .iter()
         .map(|agent| {

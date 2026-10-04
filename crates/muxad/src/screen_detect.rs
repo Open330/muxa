@@ -214,7 +214,9 @@ impl ScreenDetector {
         let panes: Vec<(usize, PaneInfo, Option<AgentKind>)> = spawn_blocking(move || {
             let mut out = Vec::new();
             for (i, backend) in backends.iter().enumerate() {
-                let listed = backend.list_panes();
+                // One capture per pane per tick, not one per `~view~`
+                // listing of a grouped session's pane.
+                let listed = muxa::tmux::canonical_panes(&backend.list_panes());
                 let discovered: HashMap<String, AgentKind> =
                     muxa::discovery::discover_from_panes(&listed)
                         .into_iter()

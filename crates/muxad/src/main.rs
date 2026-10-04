@@ -2188,7 +2188,13 @@ async fn refresh_pane_session_cache(cache: &PaneSessionCache, backends: &[muxa::
     let mut entries = Vec::new();
     for handle in handles {
         let panes = handle.await.unwrap_or_default();
-        entries.extend(panes.into_iter().map(|pane| (pane.pane_id, pane.session)));
+        // This name is persisted into the activity log and history; a
+        // grouped session must be recorded as itself, not as a `~view~`.
+        entries.extend(
+            muxa::tmux::canonical_panes(&panes)
+                .into_iter()
+                .map(|pane| (pane.pane_id, pane.session)),
+        );
     }
     cache.replace(entries);
 }
@@ -2679,6 +2685,8 @@ async fn enrich_from_history(
             panes.extend(list);
         }
     }
+    // One candidate per pane, not one per `~view~` listing of it.
+    let panes = muxa::tmux::canonical_panes(&panes);
     if panes.is_empty() {
         return;
     }

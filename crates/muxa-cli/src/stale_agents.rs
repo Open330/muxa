@@ -148,13 +148,12 @@ fn classify(
     let by_pid: HashMap<u32, &Proc> = procs.iter().map(|p| (p.pid, p)).collect();
     // A pane in a grouped session is listed once per `~view~` client
     // session; name it by its base session.
-    let mut pane_of_pid: HashMap<u32, &muxa::tmux::PaneInfo> = HashMap::new();
-    for pane in panes.iter().filter(|pane| pane.pane_pid != 0) {
-        let slot = pane_of_pid.entry(pane.pane_pid).or_insert(pane);
-        if slot.session.contains("~view~") && !pane.session.contains("~view~") {
-            *slot = pane;
-        }
-    }
+    let canonical = muxa::tmux::canonical_panes(panes);
+    let pane_of_pid: HashMap<u32, &muxa::tmux::PaneInfo> = canonical
+        .iter()
+        .filter(|pane| pane.pane_pid != 0)
+        .map(|pane| (pane.pane_pid, pane))
+        .collect();
     let mut report = StaleReport::default();
     for proc in procs {
         if !is_muxa_mcp(&proc.args) || proc.age <= age_of_binary + START_SLACK {
