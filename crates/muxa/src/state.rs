@@ -40,6 +40,15 @@ use tokio::sync::{broadcast, watch, Notify, RwLock};
 pub const SYNTHETIC_SESSION_PREFIX: &str = "synthetic-";
 const CLAUDE_IDLE_PROMPT_NOTIFICATION: &str = "Claude is waiting for your input";
 
+/// The listing that names a pane: a grouped session reports one per `~view~`
+/// member; the base session represents it whatever the scan order.
+fn best_listing<'p>(listings: impl Iterator<Item = &'p PaneInfo>) -> Option<&'p PaneInfo> {
+    listings.fold(None, |kept, pane| match kept {
+        Some(kept) if !crate::tmux::prefer_listing(pane, kept) => Some(kept),
+        _ => Some(pane),
+    })
+}
+
 fn is_synthetic(session_id: &str) -> bool {
     session_id.starts_with(SYNTHETIC_SESSION_PREFIX)
 }
@@ -1882,14 +1891,24 @@ impl Store {
             let Some(cands) = panes_by_id.get(pane_id) else {
                 continue;
             };
+            // Among a grouped session's `~view~` listings of the pane, name
+            // it by the base session, whatever order the scan listed them in.
             let chosen = match a.tmux_socket.as_deref() {
-                Some(sock) => cands.iter().find(|p| p.socket.as_deref() == Some(sock)),
-                None => match cands.len() {
-                    1 => cands.first(),
-                    _ => cands
+                Some(sock) => best_listing(
+                    cands
                         .iter()
-                        .find(|p| p.socket.as_deref() == Some("default"))
-                        .or(cands.first()),
+                        .copied()
+                        .filter(|p| p.socket.as_deref() == Some(sock)),
+                ),
+                None => match cands.len() {
+                    1 => cands.first().copied(),
+                    _ => best_listing(
+                        cands
+                            .iter()
+                            .copied()
+                            .filter(|p| p.socket.as_deref() == Some("default")),
+                    )
+                    .or_else(|| best_listing(cands.iter().copied())),
                 },
             };
             if let Some(p) = chosen {

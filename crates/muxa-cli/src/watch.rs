@@ -5551,12 +5551,19 @@ impl<'a> SortContext<'a> {
             display_by_key.insert(s.name.as_str(), s.name.as_str());
             display_by_key.insert(s.session_id.as_str(), s.name.as_str());
         }
+        // One entry per pane per server: a grouped session lists each pane
+        // once per `~view~` member, which must not read as ambiguous.
         let mut pane_by_id: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
         for pane in panes {
-            pane_by_id
-                .entry(pane.pane_id.as_str())
-                .or_default()
-                .push(pane);
+            let entries = pane_by_id.entry(pane.pane_id.as_str()).or_default();
+            match entries.iter_mut().find(|kept| kept.socket == pane.socket) {
+                Some(kept) => {
+                    if muxa::tmux::prefer_listing(pane, *kept) {
+                        *kept = pane;
+                    }
+                }
+                None => entries.push(pane),
+            }
         }
         Self {
             pane_by_id,
@@ -6069,6 +6076,10 @@ fn build_work_rows(
     session_activity: &[SessionActivity],
     sort_keys: &[WatchSortKey],
 ) -> Vec<WatchRow> {
+    // One work row per window, not one per `~view~` member listing it. Jumps
+    // still land in the caller's own view (`resolve_jump_session`).
+    let canonical = muxa::tmux::canonical_panes(panes);
+    let panes = canonical.as_slice();
     let sort_context =
         SortContext::new(panes, sessions, session_activity, OffsetDateTime::now_utc());
 
@@ -6317,7 +6328,14 @@ fn pane_display_on(pane_id: Option<&str>, socket: Option<&str>, panes: &[PaneInf
         // failed to find a pane.
         return "(no pane)".into();
     };
-    let candidates: Vec<_> = panes.iter().filter(|pane| pane.pane_id == id).collect();
+    let candidates = muxa::tmux::canonical_panes(
+        &panes
+            .iter()
+            .filter(|pane| pane.pane_id == id)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let candidates: Vec<&PaneInfo> = candidates.iter().collect();
     let matched = match socket {
         Some(endpoint) => candidates.iter().copied().find(|pane| {
             let host =

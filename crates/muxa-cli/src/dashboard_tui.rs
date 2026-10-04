@@ -1589,9 +1589,10 @@ fn build_work_dashboard_data(
     sort: DashboardSort,
     mut notes: Vec<String>,
 ) -> DashboardData {
-    let pane_by_id = panes
-        .iter()
-        .map(|pane| (pane.pane_id.clone(), pane.clone()))
+    // Grouped sessions list a pane per `~view~` member; label it by the base.
+    let pane_by_id = muxa::tmux::canonical_panes(&panes)
+        .into_iter()
+        .map(|pane| (pane.pane_id.clone(), pane))
         .collect::<HashMap<_, _>>();
     let activity_by_name = session_activities
         .into_iter()
@@ -1714,9 +1715,10 @@ fn build_dashboard_data(
     host: HostKind,
     notes: Vec<String>,
 ) -> DashboardData {
-    let pane_by_id = panes
-        .iter()
-        .map(|pane| (pane.pane_id.clone(), pane.clone()))
+    // Grouped sessions list a pane per `~view~` member; label it by the base.
+    let pane_by_id = muxa::tmux::canonical_panes(&panes)
+        .into_iter()
+        .map(|pane| (pane.pane_id.clone(), pane))
         .collect::<HashMap<_, _>>();
     let pty_by_id = sessions
         .iter()

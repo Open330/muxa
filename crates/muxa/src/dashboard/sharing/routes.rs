@@ -197,6 +197,9 @@ async fn resolve_target(state: &AppState, input: &CreateShare) -> Result<Target,
                     })
             })
             .collect();
+        // One pane listed per `~view~` member of a session group is still
+        // one pane; only distinct servers are ambiguous.
+        let panes = crate::tmux::canonical_panes(&panes);
         match panes.as_slice() {
             [pane] => Ok(pane.clone()),
             [] => Err((StatusCode::NOT_FOUND, "pane not found")),

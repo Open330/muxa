@@ -1178,7 +1178,8 @@ async fn works_handler(State(state): State<AppState>) -> Json<WorkSnapshot> {
     let scan = state.refresh_pane_scan().await;
     let agents = state.store.snapshot().await;
     let mut work_store = state.work_store.lock().await;
-    for pane in &scan.panes {
+    // Once per pane, not once per `~view~` listing of it: each upsert writes.
+    for pane in &crate::tmux::canonical_panes(&scan.panes) {
         if let Some((identity, item)) = work::external_item_for_pane(pane, scan.fetched_at) {
             if let Err(error) = work_store.upsert_external_item(identity, item).await {
                 tracing::warn!(%error, "failed to persist discovered external work item");
@@ -1484,8 +1485,10 @@ async fn run_work_control(
             .find(|record| &record.identity == identity)
             .and_then(|record| record.legacy_binding.clone())
     });
-    let candidates = scan
-        .panes
+    // A grouped session lists each pane once per `~view~` member; typing
+    // into every listing would submit the prompt (or Ctrl-C) more than once.
+    let panes = crate::tmux::canonical_panes(&scan.panes);
+    let candidates = panes
         .iter()
         .filter(|pane| {
             identity.as_ref().is_some_and(|identity| {
@@ -1497,7 +1500,7 @@ async fn run_work_control(
                 .as_ref()
                 .is_some_and(|key| pane_matches_execution(pane, key))
         })
-        .filter(|pane| pane.muxa.managed_agent || pane_has_live_agent(pane, &scan.panes, &agents))
+        .filter(|pane| pane.muxa.managed_agent || pane_has_live_agent(pane, &panes, &agents))
         .filter_map(|pane| {
             let backend = state
                 .backends
@@ -2441,10 +2444,9 @@ async fn timeline_handler(
     let agents = state.store.snapshot().await;
     let prompt_entries = state.store.recent_prompts(None, 0).await;
     let pane_scan = state.refresh_pane_scan().await;
-    let pane_sessions = pane_scan
-        .panes
-        .iter()
-        .map(|pane| (pane.pane_id.clone(), pane.session.clone()))
+    let pane_sessions = crate::tmux::canonical_panes(&pane_scan.panes)
+        .into_iter()
+        .map(|pane| (pane.pane_id, pane.session))
         .collect::<HashMap<_, _>>();
 
     let built = match build_timeline_projection(TimelineProjectionInput {

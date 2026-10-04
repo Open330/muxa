@@ -7,8 +7,10 @@
 //! `$TMUX_TMPDIR` / the `default` socket points to. For the global view —
 //! every tmux server running for this user — see [`scanner`].
 
+mod canonical;
 pub mod layout;
 pub mod scanner;
+pub use canonical::{base_session_name, canonical_panes, prefer as prefer_listing, GroupedPaneRow};
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
