@@ -926,6 +926,7 @@ private struct MuxaSidebar: View {
 
     private enum ExploreStatusBucket: String, CaseIterable, Identifiable {
         case attention
+        case limited
         case active
         case idle
         case shell
@@ -935,6 +936,7 @@ private struct MuxaSidebar: View {
         var title: String {
             switch self {
             case .attention: String(localized: "Needs attention")
+            case .limited: String(localized: "Rate limited")
             case .active: String(localized: "Active")
             case .idle: String(localized: "Idle agents")
             case .shell: String(localized: "Shell panes")
@@ -1301,10 +1303,7 @@ private struct MuxaSidebar: View {
     }
 
     private var attentionAgents: [MuxaHostedAgent] {
-        model.hostedAgents.filter {
-            ["waiting_input", "waiting_choice", "blocked", "error", "failed"]
-                .contains($0.agent.state)
-        }
+        model.hostedAgents.filter { $0.agent.status.needsAttention }
     }
 
     private var filteredAttentionAgents: [MuxaHostedAgent] {
@@ -1334,8 +1333,7 @@ private struct MuxaSidebar: View {
             let sessions = hostGroup.sessions.compactMap { session -> MuxaWatchSession? in
                 let windows = session.windows.compactMap { window -> MuxaWatchWindow? in
                     let panes = window.panes.filter { pane in
-                        let state = pane.agent?.state
-                        return matchesFilter([
+                        matchesFilter([
                             pane.host.alias,
                             pane.pane.session,
                             pane.pane.windowName,
@@ -1346,11 +1344,8 @@ private struct MuxaSidebar: View {
                             pane.agent?.aiTitle,
                             pane.agent?.agentSessionID,
                         ]) && matchesScope(
-                            attention: state.map {
-                                ["waiting_input", "waiting_choice", "blocked", "error", "failed"]
-                                    .contains($0)
-                            } ?? false,
-                            active: state.map { ["working", "starting"].contains($0) } ?? false
+                            attention: pane.needsAttention,
+                            active: pane.agentStatus == .working
                         )
                     }
                     guard !panes.isEmpty else { return nil }
@@ -1397,12 +1392,13 @@ private struct MuxaSidebar: View {
     }
 
     private func statusBucket(for pane: MuxaWatchPane) -> ExploreStatusBucket {
-        guard let state = pane.agent?.state else { return .shell }
-        if ["waiting_input", "waiting_choice", "blocked", "error", "failed"].contains(state) {
-            return .attention
+        switch pane.agentStatus {
+        case nil: .shell
+        case .error?, .needsInput?: .attention
+        case .limited?: .limited
+        case .working?: .active
+        default: .idle
         }
-        if ["working", "starting"].contains(state) { return .active }
-        return .idle
     }
 
     private func sortedWatchHosts(_ hosts: [MuxaWatchHost]) -> [MuxaWatchHost] {
@@ -1714,6 +1710,9 @@ private struct MuxaSidebar: View {
         } else {
             switch exploreGrouping {
             case .host:
+                if statusScope == .all, !pinnedAttentionPanes.isEmpty {
+                    pinnedAttentionSection
+                }
                 Section("Execution topology") {
                     ForEach(filteredWatchHosts) { host in
                         WatchHostTree(
@@ -1771,6 +1770,52 @@ private struct MuxaSidebar: View {
         }
     }
 
+    /// Agents that need the reader, errors first. The topology tree
+    /// scatters them across hosts and sessions, so the host view repeats
+    /// them in one place above it. Rate-limited agents stay in the tree:
+    /// they resume on their own.
+    private var pinnedAttentionPanes: [MuxaWatchPane] {
+        filteredWatchPanes
+            .filter(\.needsAttention)
+            .sorted { $0.statusPriority < $1.statusPriority }
+    }
+
+    private static let pinnedAttentionLimit = 5
+
+    @ViewBuilder
+    private var pinnedAttentionSection: some View {
+        let panes = pinnedAttentionPanes
+        Section {
+            ForEach(panes.prefix(Self.pinnedAttentionLimit)) { pane in
+                WatchFlatPaneRow(
+                    pane: pane,
+                    highlight: watchTreeSelection.highlight(
+                        for: .pane(pane.id),
+                        containsFollowedPane: model.watchSelection == pane.id
+                    ),
+                    selectPane: model.selectWatchPane,
+                    openPinnedPane: openPinnedPane
+                )
+                .listRowInsets(EdgeInsets(top: 1, leading: 5, bottom: 1, trailing: 5))
+                .listRowBackground(Color.clear)
+            }
+            if panes.count > Self.pinnedAttentionLimit {
+                Button {
+                    exploreGrouping = .status
+                } label: {
+                    Text("Show all \(panes.count)")
+                        .font(MuxaType.detail)
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 12)
+                .listRowBackground(Color.clear)
+            }
+        } header: {
+            Text(verbatim: "\(String(localized: "Needs attention")) · \(panes.count)")
+        }
+    }
+
     private func watchWorkLabel(_ window: MuxaWatchWindow) -> String? {
         let stamped = Set(window.panes.compactMap(\.pane.workIdentity))
         if stamped.count == 1, let identity = stamped.first {
@@ -1820,10 +1865,7 @@ private struct SidebarActivityRail: View {
         case .watch:
             return attention.unreadPanes.count // WS-A
         case .inbox:
-            let agentAttention = model.hostedAgents.lazy.filter {
-                ["waiting_input", "waiting_choice", "blocked", "error", "failed"]
-                    .contains($0.agent.state)
-            }.count
+            let agentAttention = model.hostedAgents.lazy.filter { $0.agent.status.needsAttention }.count
             let commandAttention = model.operatorMessages.lazy.filter {
                 $0.needsReply || $0.hasUnreadReply
             }.count
@@ -2022,7 +2064,7 @@ private struct InboxAgentRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 9) {
             Circle()
-                .fill(agentStateColor(participant.agent.state))
+                .fill(participant.agent.status.color)
                 .frame(width: 8, height: 8)
                 .padding(.top, 5)
             VStack(alignment: .leading, spacing: 2) {
@@ -2349,7 +2391,7 @@ private struct FleetAgentRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
                     Circle()
-                        .fill(agentStateColor(participant.agent.state))
+                        .fill(participant.agent.status.color)
                         .frame(width: 7, height: 7)
                     Text(title)
                         .lineLimit(1)
@@ -2554,10 +2596,10 @@ private struct WorkParticipantCard: View {
                         .lineLimit(1)
                 }
                 Spacer()
-                Label(agentStateLabel(participant.agent.state), systemImage: "circle.fill")
+                Label(participant.agent.status.label(), systemImage: "circle.fill")
                     .labelStyle(.titleAndIcon)
                     .font(MuxaType.detail.weight(.medium))
-                    .foregroundStyle(agentStateColor(participant.agent.state))
+                    .foregroundStyle(participant.agent.status.color)
                     .lineLimit(1)
                     .fixedSize()
             }
@@ -2694,7 +2736,7 @@ struct MarkdownContent: View {
         source: String,
         lineLimit: Int? = nil,
         selectable: Bool = true,
-        font: Font = .subheadline
+        font: Font = MuxaType.detail
     ) {
         self.source = source
         self.lineLimit = lineLimit
@@ -2768,8 +2810,7 @@ private struct FleetAgentDetailView: View {
     /// on top; a working or idle agent opened from elsewhere keeps the
     /// plain summary.
     private var needsAttention: Bool {
-        ["waiting_input", "waiting_choice", "blocked", "error", "failed"]
-            .contains(participant.agent.state)
+        participant.agent.status.needsAttention
     }
 
     private var title: String {
@@ -2783,14 +2824,14 @@ private struct FleetAgentDetailView: View {
             VStack(alignment: .leading, spacing: 22) {
                 HStack(alignment: .top, spacing: 14) {
                     Circle()
-                        .fill(agentStateColor(participant.agent.state))
+                        .fill(participant.agent.status.color)
                         .frame(width: 12, height: 12)
                         .padding(.top, 9)
                     VStack(alignment: .leading, spacing: 4) {
                         Text(title)
                             .font(.system(size: 22, weight: .semibold))
-                        Text(agentStateLabel(participant.agent.state))
-                            .foregroundStyle(agentStateColor(participant.agent.state))
+                        Text(participant.agent.status.label())
+                            .foregroundStyle(participant.agent.status.color)
                         MuxaRateLimitBadge(agent: participant.agent) // WS-C usage
                         Text(participant.agent.agentSessionID)
                             .font(MuxaType.detail.monospaced())
@@ -3288,7 +3329,7 @@ private struct FleetWindowDetailView: View {
     private var metrics: some View {
         let attention = window.panes.lazy.filter(paneNeedsAttentionForSummary).count
         let working = window.panes.lazy.filter {
-            $0.agent.map { ["working", "starting"].contains($0.state) } ?? false
+            $0.agentStatus == .working
         }.count
         let subagents = window.panes.lazy.compactMap(\.agent?.subagents).reduce(0) { $0 + $1.count }
         let processes = window.panes.lazy.compactMap(\.agent?.workload?.processCount).reduce(0, +)
@@ -3309,7 +3350,7 @@ private struct FleetWindowDetailView: View {
 
     private func panePriority(_ pane: MuxaWatchPane) -> Int {
         if paneNeedsAttentionForSummary(pane) { return 0 }
-        if pane.agent.map({ ["working", "starting"].contains($0.state) }) == true { return 1 }
+        if pane.agentStatus == .working { return 1 }
         return pane.agent == nil ? 3 : 2
     }
 }
@@ -3337,15 +3378,15 @@ private struct WindowAgentReportCard: View {
             Button(action: open) {
                 HStack(spacing: 8) {
                     Circle()
-                        .fill(pane.agent.map { agentStateColor($0.state) } ?? Color.secondary)
+                        .fill(pane.agent.map { $0.status.color } ?? Color.secondary)
                         .frame(width: 8, height: 8)
                     Text(fleetPaneDisplayTitle(pane))
                         .font(.headline)
                         .lineLimit(1)
                     if let agent = pane.agent {
-                        Text(agentStateLabel(agent.state))
+                        Text(agent.status.label())
                             .font(MuxaType.meta.weight(.semibold))
-                            .foregroundStyle(agentStateColor(agent.state))
+                            .foregroundStyle(agent.status.color)
                     }
                     Spacer(minLength: 4)
                     Text(pane.pane.paneID)
@@ -3505,8 +3546,8 @@ private struct FleetWindowSummaryCard: View {
 
     private var focusPane: MuxaWatchPane? {
         window.panes.sorted { left, right in
-            let leftPriority = paneNeedsAttentionForSummary(left) ? 0 : left.agent?.state == "working" ? 1 : 2
-            let rightPriority = paneNeedsAttentionForSummary(right) ? 0 : right.agent?.state == "working" ? 1 : 2
+            let leftPriority = left.statusPriority
+            let rightPriority = right.statusPriority
             if leftPriority != rightPriority { return leftPriority < rightPriority }
             return (left.agent?.lastActivityAt ?? "") > (right.agent?.lastActivityAt ?? "")
         }.first
@@ -3605,7 +3646,7 @@ private struct FleetResourceSummaryRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             Circle()
-                .fill(pane.agent.map { agentStateColor($0.state) } ?? Color.secondary)
+                .fill(pane.agent.map { $0.status.color } ?? Color.secondary)
                 .frame(width: 7, height: 7)
                 .padding(.top, 5)
             VStack(alignment: .leading, spacing: 2) {
@@ -3614,9 +3655,9 @@ private struct FleetResourceSummaryRow: View {
                         .font(.subheadline.weight(.medium))
                         .lineLimit(1)
                     if let agent = pane.agent {
-                        Text(agentStateLabel(agent.state))
+                        Text(agent.status.label())
                             .font(MuxaType.meta.weight(.medium))
-                            .foregroundStyle(agentStateColor(agent.state))
+                            .foregroundStyle(agent.status.color)
                     }
                 }
                 MarkdownContent(
@@ -3639,9 +3680,7 @@ private struct FleetResourceSummaryRow: View {
 }
 
 private func paneNeedsAttentionForSummary(_ pane: MuxaWatchPane) -> Bool {
-    pane.agent.map {
-        ["waiting_input", "waiting_choice", "blocked", "error", "failed"].contains($0.state)
-    } ?? false
+    pane.needsAttention
 }
 
 private func fleetPaneDisplayTitle(_ pane: MuxaWatchPane) -> String {

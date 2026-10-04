@@ -324,3 +324,45 @@ private let weekly: TimeInterval = 3 * 86_400
     #expect(costs.map(\.sessionCount) == [2, 1, 1])
     #expect(costs.first?.hostIsLocal == true)
 }
+
+/// A rate-limited agent usually reports `error` (its turn stopped on a 429);
+/// it reads as limited and does not count as needing attention.
+@Test func agentStatusSeparatesRateLimitsFromErrors() throws {
+    let capped = try usageAgent([
+        "state": "error", "rate_limit_scope": "five_hour", "rate_limited_until": stamp(600),
+    ])
+    let status = MuxaAgentStatus(agent: capped, now: now)
+    #expect(status.isLimited)
+    #expect(!status.needsAttention)
+    #expect(status.priority == 2)
+
+    // Once the reset time passes, the leftover error is a real error.
+    let lifted = MuxaAgentStatus(agent: capped, now: now.addingTimeInterval(601))
+    #expect(lifted == .error)
+    #expect(lifted.needsAttention)
+
+    // A cap left on a running agent is history: muxad clears it only on restart.
+    let resumed = try usageAgent([
+        "state": "working", "rate_limit_scope": "five_hour", "rate_limited_until": stamp(600),
+    ])
+    #expect(MuxaAgentStatus(agent: resumed, now: now) == .working)
+}
+
+@Test func agentStatusMapsRawStates() {
+    #expect(MuxaAgentStatus(state: "failed") == .error)
+    #expect(MuxaAgentStatus(state: "waiting_choice") == .needsInput("waiting_choice"))
+    #expect(MuxaAgentStatus(state: "blocked").needsAttention)
+    #expect(MuxaAgentStatus(state: "starting") == .working)
+    #expect(MuxaAgentStatus(state: "idle") == .idle)
+    #expect(MuxaAgentStatus(state: "stopped") == .other("stopped"))
+    let ordered = ["idle", "working", "waiting_input", "error", "done"]
+        .map(MuxaAgentStatus.init(state:))
+        .sorted { $0.priority < $1.priority }
+    #expect(ordered == [.error, .needsInput("waiting_input"), .working, .idle, .done])
+}
+
+@Test func firstReadableLineStripsMarkdownForPreviews() {
+    #expect(firstReadableLine("\n\n**정리 완료했습니다.** 약 4GB\n- 다음 줄") == "정리 완료했습니다. 약 4GB")
+    #expect(firstReadableLine("- `cargo test` passed") == "cargo test passed")
+    #expect(firstReadableLine("   ") == "")
+}

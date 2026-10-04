@@ -9,16 +9,16 @@ enum MuxaAttention {
     static let activeStates: Set<String> = ["working", "starting"]
 
     static func needsAttention(_ pane: MuxaWatchPane) -> Bool {
-        pane.agent.map { states.contains($0.state) } ?? false
+        pane.needsAttention
     }
 
     /// Attention first, then agents that finished unseen, then working,
     /// then idle agents; plain shells last.
     static func rank(_ pane: MuxaWatchPane, unread: Bool = false) -> Int {
-        guard let state = pane.agent?.state else { return 4 }
-        if states.contains(state) { return 0 }
+        guard let status = pane.agentStatus else { return 4 }
+        if status.needsAttention { return 0 }
         if unread { return 1 } // WS-A
-        if activeStates.contains(state) { return 2 }
+        if status == .working { return 2 }
         return 3
     }
 

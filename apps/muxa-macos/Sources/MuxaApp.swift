@@ -432,9 +432,7 @@ private struct MenuBarContent: View {
     }
 
     private var attentionCount: Int {
-        model.agents.lazy.filter {
-            $0.state == "waiting_input" || $0.state == "waiting_choice" || $0.state == "error"
-        }.count
+        model.agents.lazy.filter { $0.status.needsAttention }.count
     }
 
     var body: some View {

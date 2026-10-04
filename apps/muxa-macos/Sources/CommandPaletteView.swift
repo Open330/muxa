@@ -377,7 +377,7 @@ enum MuxaPaletteItems {
         let showsHosts = panes.contains { !$0.host.local }
         return panes.map { pane in
             let window = pane.pane.windowName.isEmpty ? pane.pane.windowID : pane.pane.windowName
-            let state = pane.agent.map { agentStateLabel($0.state) } ?? ""
+            let state = pane.agent.map { $0.status.label() } ?? ""
             return MuxaPaletteItem(
                 stableID: MuxaPaletteID(components: [
                     "agent-pane", pane.host.alias, pane.pane.endpointSocket, pane.pane.paneID,
@@ -392,7 +392,7 @@ enum MuxaPaletteItems {
                     ? "exclamationmark.circle.fill"
                     : unread.contains(pane.id) ? "circle.fill" : "person.crop.circle", // WS-A
                 action: .navigate(.pane(pane.id)),
-                tint: pane.agent.map { agentStateColor($0.state) },
+                tint: pane.agent.map { $0.status.color },
                 host: showsHosts ? pane.host : nil
             )
         }

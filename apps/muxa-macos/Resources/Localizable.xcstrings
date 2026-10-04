@@ -501,6 +501,16 @@
         }
       }
     },
+    "%lld more in Explore › Needs attention" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "나머지 %lld개는 Explore › 주의 필요에서 볼 수 있습니다"
+          }
+        }
+      }
+    },
     "%lld New" : {
       "localizations" : {
         "ko" : {
@@ -3380,6 +3390,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "브랜치 비교에는 upstream, origin/HEAD, main 또는 master 중 비교 대상이 필요합니다."
+          }
+        }
+      }
+    },
+    "Browse Presets" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "프리셋 보기"
           }
         }
       }
@@ -7308,6 +7328,16 @@
         }
       }
     },
+    "Limited" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "제한됨"
+          }
+        }
+      }
+    },
     "Limited until %@" : {
       "localizations" : {
         "ko" : {
@@ -7394,6 +7424,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "로그인…"
+          }
+        }
+      }
+    },
+    "Look at now" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "지금 확인할 것"
           }
         }
       }
@@ -8108,6 +8148,16 @@
         }
       }
     },
+    "Needs input" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "입력 필요"
+          }
+        }
+      }
+    },
     "Needs your decision: %@" : {
       "localizations" : {
         "ko" : {
@@ -8395,6 +8445,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "호스트 없음"
+          }
+        }
+      }
+    },
+    "No pipelines yet. Muxa ships presets for one, two, and three agents." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 파이프라인이 없습니다. 에이전트 1~3개용 프리셋이 준비되어 있습니다."
           }
         }
       }
@@ -9135,6 +9195,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "주의가 필요한 항목 없음"
+          }
+        }
+      }
+    },
+    "Nothing needs you" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "확인할 항목 없음"
           }
         }
       }
@@ -10013,6 +10083,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Explore를 %@ 기준으로 정렬"
+          }
+        }
+      }
+    },
+    "Others in this window" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 윈도우의 다른 에이전트"
           }
         }
       }
@@ -11898,6 +11978,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "런타임 상세"
+          }
+        }
+      }
+    },
+    "Show all %lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개 모두 보기"
+          }
+        }
+      }
+    },
+    "Show less" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "접기"
+          }
+        }
+      }
+    },
+    "Show more" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "더 보기"
           }
         }
       }

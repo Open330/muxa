@@ -362,7 +362,7 @@ final class MuxaAgentAttentionCenter: ObservableObject {
             }
         }
         var needing = Set(unread.map(Self.key))
-        for hosted in snapshot.hostedAgents where MuxaAttention.states.contains(hosted.agent.state) {
+        for hosted in snapshot.hostedAgents where hosted.agent.status.needsAttention {
             needing.insert(Self.paneIdentity(for: hosted).map(Self.key) ?? "agent:\(hosted.id)")
         }
         if unreadPanes != unread { unreadPanes = unread }
