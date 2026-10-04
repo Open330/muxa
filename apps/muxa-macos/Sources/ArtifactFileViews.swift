@@ -183,7 +183,17 @@ struct ArtifactPreviewView: View {
     }
 
     @ViewBuilder private func preview(_ contents: MuxaFileContents) -> some View {
-        if kind == .image, let image = previewImage {
+        if contents.data.isEmpty {
+            // A 0-byte file (an untouched note, a log nothing wrote to) would
+            // otherwise render as a blank page that reads as a failed load.
+            VStack(spacing: 8) {
+                Image(systemName: "doc").font(.largeTitle)
+                Text("This file is empty.").font(.headline)
+                Text("It has no content yet (0 bytes).").font(MuxaType.detail)
+            }
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if kind == .image, let image = previewImage {
             VStack {
                 HStack {
                     Button { zoom = max(0.25, zoom / 1.25) } label: { Image(systemName: "minus.magnifyingglass") }
@@ -254,7 +264,7 @@ struct ArtifactPreviewView: View {
                 try value.data.write(to: url, options: .atomic)
                 cachedURL = url
             }
-            if kind == .image {
+            if kind == .image, !value.data.isEmpty {
                 guard let image = thumbnail(value.data) else {
                     throw MuxaFileError.message(String(localized: "This image could not be decoded."))
                 }

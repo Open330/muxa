@@ -24,9 +24,11 @@ enum MuxaAgentStatus: Hashable, Sendable {
 
     init(agent: MuxaAgent, now: Date = .now) {
         let state = agent.state
-        // The daemon clears the cap fields only on the agent's next start,
-        // so a cap on a running agent is history, not its status.
-        if !Self.runningStates.contains(state),
+        // A cap explains a turn that stopped: one that ended in an error (a
+        // 429) or went idle. The daemon clears the cap fields only on the
+        // agent's next start or turn end, so on a running agent, or one now
+        // waiting for input, the cap is history and must not hide it.
+        if Self.cappableStates.contains(state),
            let cap = MuxaRateLimitCap.current(for: agent, now: now) {
             self = .limited(cap)
             return
@@ -48,6 +50,7 @@ enum MuxaAgentStatus: Hashable, Sendable {
     }
 
     private static let runningStates: Set<String> = ["working", "running", "starting"]
+    private static let cappableStates: Set<String> = ["error", "failed", "idle"]
 
     var isLimited: Bool {
         if case .limited = self { return true }

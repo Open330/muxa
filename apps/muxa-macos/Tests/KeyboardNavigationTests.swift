@@ -330,6 +330,10 @@ import Testing
     #expect(tabInsertionIndex(at: 60, frames: frames) == 1)
     #expect(tabInsertionIndex(at: 190, frames: frames) == 2)
     #expect(tabInsertionIndex(at: 500, frames: frames) == 2)
+    // A tab not laid out yet keeps its slot instead of shifting the others.
+    let partial: [CGRect?] = [frames[0], nil, CGRect(x: 200, y: 0, width: 100, height: 30)]
+    #expect(tabInsertionIndex(at: 230, frames: partial) == 2)
+    #expect(tabInsertionIndex(at: 280, frames: partial) == 3)
     #expect(editorDropZone(at: 40, width: 800) == .leading)
     #expect(editorDropZone(at: 400, width: 800) == nil)
     #expect(editorDropZone(at: 790, width: 800) == .trailing)

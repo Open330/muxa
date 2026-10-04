@@ -6867,6 +6867,16 @@
         }
       }
     },
+    "It has no content yet (0 bytes)." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 내용이 없습니다 (0바이트)."
+          }
+        }
+      }
+    },
     "It runs in a Muxa terminal on this Mac and opens as a tab." : {
       "localizations" : {
         "ko" : {
@@ -14373,6 +14383,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 페인만이 아니라 이 Mac에서 새로 시작하는 모든 에이전트의 활성 계정이 바뀝니다. 이미 실행 중인 에이전트는 시작할 때의 계정을 그대로 씁니다."
+          }
+        }
+      }
+    },
+    "This file is empty." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "빈 파일입니다."
           }
         }
       }

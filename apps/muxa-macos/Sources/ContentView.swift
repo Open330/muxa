@@ -572,16 +572,17 @@ private struct WorkspaceTabBar: View {
 
     private var stripSpace: String { "tab-strip-\(groupID)" }
 
-    private var orderedTabFrames: [CGRect] {
-        (group?.tabs ?? []).compactMap { tabFrames[$0] }
+    /// Aligned with the group's tabs; nil for one not laid out yet.
+    private var orderedTabFrames: [CGRect?] {
+        (group?.tabs ?? []).map { tabFrames[$0] }
     }
 
     /// Where the insertion bar sits while a dragged tab hovers this strip.
     private var insertionX: CGFloat? {
         guard case .strip(groupID, let index)? = dragSession.target else { return nil }
         let frames = orderedTabFrames
-        if frames.indices.contains(index) { return frames[index].minX }
-        return frames.last?.maxX ?? 0
+        if frames.indices.contains(index), let frame = frames[index] { return frame.minX }
+        return frames.compactMap { $0 }.last?.maxX ?? 0
     }
 
     var body: some View {
@@ -714,7 +715,7 @@ private struct WorkspaceTabBar: View {
             }
             // The tab being dragged dims in place, as in VS Code.
             .opacity(dragSession.drag?.selection == selection && dragSession.drag?.sourceGroupID == groupID ? 0.45 : 1)
-            .onDrag { dragSession.begin(selection, from: groupID) }
+            .onDrag { dragSession.begin(selection, from: groupID, in: tabs) }
         }
     }
 

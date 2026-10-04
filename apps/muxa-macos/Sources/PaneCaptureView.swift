@@ -141,6 +141,10 @@ struct PaneCaptureView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var followsBottom = true
     @State private var followGraceEnd = Date.distantPast
+    /// The bottom anchor's frame in the viewport, and the viewport height,
+    /// as last laid out.
+    @State private var lastAnchor = CGRect.zero
+    @State private var viewportHeight: CGFloat = 0
 
     private static let bottomAnchor = "pane-capture-bottom"
     private static let viewport = "pane-capture-viewport"
@@ -205,7 +209,7 @@ struct PaneCaptureView: View {
                                     GeometryReader { anchor in
                                         Color.clear.preference(
                                             key: PaneCaptureBottomKey.self,
-                                            value: anchor.frame(in: .named(Self.viewport)).minY
+                                            value: anchor.frame(in: .named(Self.viewport))
                                         )
                                     }
                                 )
@@ -213,20 +217,23 @@ struct PaneCaptureView: View {
                         .frame(
                             minWidth: max(0, proxy.size.width - padding.x * 2),
                             minHeight: max(0, proxy.size.height - padding.y * 2),
-                            alignment: .bottomLeading
+                            // Short content starts at the top, where Ghostty
+                            // draws it after Click to Type.
+                            alignment: .topLeading
                         )
                         .padding(.horizontal, padding.x)
                         .padding(.vertical, padding.y)
                     }
                     .coordinateSpace(name: Self.viewport)
                     .frame(width: proxy.size.width, height: proxy.size.height)
-                    .onPreferenceChange(PaneCaptureBottomKey.self) { bottom in
-                        // Follow the newest line until the reader scrolls it
-                        // out of view, and again once they scroll back to it.
+                    .onPreferenceChange(PaneCaptureBottomKey.self) { anchor in
+                        lastAnchor = anchor
+                        viewportHeight = proxy.size.height
                         // Growth that a follow scroll is about to absorb is
-                        // not the reader leaving.
+                        // not the reader leaving; `followToBottom` looks
+                        // again once the grace period ends.
                         guard Date() >= followGraceEnd else { return }
-                        followsBottom = bottom <= proxy.size.height + 4
+                        updateFollowing()
                     }
                     .onAppear { scroller.scrollTo(Self.bottomAnchor, anchor: .bottomLeading) }
                     .onChange(of: model.screenContent) { _ in
@@ -272,10 +279,27 @@ struct PaneCaptureView: View {
         }
     }
 
+    /// Follow the newest line until the reader scrolls it out of view, or
+    /// scrolls sideways to read a wide pane (a follow scroll would also snap
+    /// back to the left edge), and again once they return.
+    private func updateFollowing() {
+        guard lastAnchor != .zero else { return }
+        let atBottom = lastAnchor.minY <= viewportHeight + 4
+        let atLeadingEdge = lastAnchor.minX >= MuxaTerminalAppearance.paddingX - 4
+        followsBottom = atBottom && atLeadingEdge
+    }
+
     private func followToBottom(_ scroller: ScrollViewProxy) {
         guard followsBottom else { return }
-        followGraceEnd = Date().addingTimeInterval(0.3)
+        let grace: TimeInterval = 0.3
+        followGraceEnd = Date().addingTimeInterval(grace)
         scroller.scrollTo(Self.bottomAnchor, anchor: .bottomLeading)
+        // A reader who scrolled during the grace period would otherwise be
+        // pulled back on the next refresh.
+        DispatchQueue.main.asyncAfter(deadline: .now() + grace + 0.05) {
+            guard Date() >= followGraceEnd else { return }
+            updateFollowing()
+        }
     }
 
     private var copyButton: some View {
@@ -290,11 +314,13 @@ struct PaneCaptureView: View {
     }
 }
 
-/// Where the bottom of a pane capture sits in its scroll view's viewport.
+/// Where the bottom of a pane capture sits in its scroll view's viewport:
+/// its `minY` says whether the newest line is in view, its `minX` whether
+/// the reader scrolled sideways.
 private struct PaneCaptureBottomKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
+    static let defaultValue = CGRect.zero
 
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
         value = nextValue()
     }
 }

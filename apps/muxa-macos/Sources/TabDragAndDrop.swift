@@ -17,6 +17,13 @@ final class MuxaTabDragSession: ObservableObject {
     struct Drag: Equatable {
         let selection: MuxaSidebarSelection
         let sourceGroupID: UUID
+        /// The window's tab model the tab came from. Each workbench window
+        /// has its own; a drop in another window cannot move the tab.
+        let owner: ObjectIdentifier
+
+        func belongs(to tabs: MuxaWorkbenchTabs) -> Bool {
+            owner == ObjectIdentifier(tabs)
+        }
     }
 
     enum Target: Equatable {
@@ -40,8 +47,8 @@ final class MuxaTabDragSession: ObservableObject {
 
     var isDragging: Bool { drag != nil }
 
-    func begin(_ selection: MuxaSidebarSelection, from groupID: UUID) -> NSItemProvider {
-        drag = Drag(selection: selection, sourceGroupID: groupID)
+    func begin(_ selection: MuxaSidebarSelection, from groupID: UUID, in tabs: MuxaWorkbenchTabs) -> NSItemProvider {
+        drag = Drag(selection: selection, sourceGroupID: groupID, owner: ObjectIdentifier(tabs))
         target = nil
         watchForRelease()
         return NSItemProvider(object: "\(Self.payloadPrefix)\(selection.tabIdentifier)" as NSString)
@@ -82,9 +89,11 @@ final class MuxaTabDragSession: ObservableObject {
 }
 
 /// Where a pointer at `x` in a strip of tabs would insert: before the first
-/// tab whose middle lies right of it, or at the end.
-func tabInsertionIndex(at x: CGFloat, frames: [CGRect]) -> Int {
-    frames.firstIndex { x < $0.midX } ?? frames.count
+/// tab whose middle lies right of it, or at the end. `frames` is aligned with
+/// the group's tabs; a tab not laid out yet (nil) is skipped without
+/// shifting the indexes of the others.
+func tabInsertionIndex(at x: CGFloat, frames: [CGRect?]) -> Int {
+    frames.indices.first { index in frames[index].map { x < $0.midX } ?? false } ?? frames.count
 }
 
 /// The editor zone under a pointer: the outer quarter on either side splits,
@@ -111,13 +120,13 @@ struct TabFramesKey: PreferenceKey {
 /// groups. The strip's empty tail drops at the end.
 struct TabStripDropDelegate: DropDelegate {
     let groupID: UUID
-    let orderedFrames: [CGRect]
+    let orderedFrames: [CGRect?]
     let tabs: MuxaWorkbenchTabs
     let session: MuxaTabDragSession
     let didDrop: (MuxaSidebarSelection, UUID) -> Void
 
     func validateDrop(info: DropInfo) -> Bool {
-        session.isDragging && info.hasItemsConforming(to: [.plainText])
+        session.drag?.belongs(to: tabs) == true && info.hasItemsConforming(to: [.plainText])
     }
 
     func dropEntered(info: DropInfo) {
@@ -136,7 +145,7 @@ struct TabStripDropDelegate: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        guard let drag = session.drag else { return false }
+        guard let drag = session.drag, drag.belongs(to: tabs) else { return false }
         let index = tabInsertionIndex(at: info.location.x, frames: orderedFrames)
         tabs.move(
             drag.selection,
@@ -151,6 +160,7 @@ struct TabStripDropDelegate: DropDelegate {
     }
 
     private func update(_ info: DropInfo) {
+        guard session.drag?.belongs(to: tabs) == true else { return }
         let target = MuxaTabDragSession.Target.strip(
             groupID: groupID,
             index: tabInsertionIndex(at: info.location.x, frames: orderedFrames)
@@ -222,6 +232,7 @@ struct EditorDropOverlay: View {
     }
 
     private func resolve(_ point: CGPoint, width: CGFloat, drag: MuxaTabDragSession.Drag) -> MuxaTabDragSession.Target? {
+        guard drag.belongs(to: tabs) else { return nil }
         let copy = MuxaTabDragSession.copyRequested
         if let side = editorDropZone(at: point.x, width: width),
            tabs.canSplit(drag.selection, from: drag.sourceGroupID, beside: groupID, side: side, copy: copy) {

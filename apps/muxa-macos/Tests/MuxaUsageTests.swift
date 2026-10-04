@@ -346,6 +346,14 @@ private let weekly: TimeInterval = 3 * 86_400
         "state": "working", "rate_limit_scope": "five_hour", "rate_limited_until": stamp(600),
     ])
     #expect(MuxaAgentStatus(agent: resumed, now: now) == .working)
+
+    // A 429 cap has no reset time, so it outlives the turn it stopped; an
+    // agent later waiting on a permission prompt must still ask for it.
+    let waiting = try usageAgent(["state": "waiting_input", "rate_limit_scope": "five_hour"])
+    #expect(MuxaAgentStatus(agent: waiting, now: now) == .needsInput("waiting_input"))
+    #expect(MuxaAgentStatus(agent: waiting, now: now).needsAttention)
+    let idle = try usageAgent(["state": "idle", "rate_limit_scope": "five_hour", "rate_limited_until": stamp(600)])
+    #expect(MuxaAgentStatus(agent: idle, now: now).isLimited)
 }
 
 @Test func agentStatusMapsRawStates() {
