@@ -254,3 +254,83 @@ import Testing
         #expect(listed.contains { $0.contains(shortcut) }, "\(command) \(shortcut) missing from ⌘/")
     }
 }
+
+@Test @MainActor func draggedTabReordersWithinItsGroup() {
+    let tabs = MuxaWorkbenchTabs(persistenceKey: nil)
+    tabs.openPinned(.ask)
+    tabs.openPinned(.inbox)
+    let groupID = tabs.focusedGroupID
+
+    // workBoard, ask, inbox → drop workBoard at the end.
+    tabs.move(.workBoard, from: groupID, to: groupID, at: 3)
+    #expect(tabs.group(id: groupID)?.tabs == [.ask, .inbox, .workBoard])
+    #expect(tabs.group(id: groupID)?.active == .workBoard)
+
+    // Dropping a tab just before itself or after itself changes nothing.
+    tabs.move(.inbox, from: groupID, to: groupID, at: 1)
+    tabs.move(.inbox, from: groupID, to: groupID, at: 2)
+    #expect(tabs.group(id: groupID)?.tabs == [.ask, .inbox, .workBoard])
+}
+
+@Test @MainActor func draggedTabMovesAcrossGroupsAndClosesAnEmptySource() {
+    let tabs = MuxaWorkbenchTabs(persistenceKey: nil)
+    let firstID = tabs.focusedGroupID
+    tabs.openPreview(.ask)
+    let secondID = tabs.splitRight(selection: .inbox, from: firstID)
+
+    // A preview tab placed by hand is kept open.
+    tabs.move(.ask, from: firstID, to: secondID, at: 0)
+    #expect(tabs.group(id: firstID)?.tabs == [.workBoard])
+    #expect(tabs.group(id: secondID)?.tabs == [.ask, .inbox])
+    #expect(tabs.group(id: secondID)?.preview == nil)
+    #expect(tabs.focusedGroupID == secondID)
+
+    // Option-drag copies.
+    tabs.move(.inbox, from: secondID, to: firstID, at: 1, copy: true)
+    #expect(tabs.group(id: firstID)?.tabs == [.workBoard, .inbox])
+    #expect(tabs.group(id: secondID)?.tabs == [.ask, .inbox])
+
+    // Moving the last tab out closes its group.
+    tabs.move(.workBoard, from: firstID, to: secondID, at: 3)
+    tabs.move(.inbox, from: firstID, to: secondID, at: 0)
+    #expect(tabs.groups.map(\.id) == [secondID])
+    #expect(tabs.group(id: secondID)?.tabs == [.inbox, .ask, .workBoard])
+}
+
+@Test @MainActor func draggedTabSplitsTowardAnEditorEdge() {
+    let tabs = MuxaWorkbenchTabs(persistenceKey: nil)
+    let firstID = tabs.focusedGroupID
+    tabs.openPinned(.ask)
+
+    // A lone group with one tab has nothing to split off.
+    let lone = MuxaWorkbenchTabs(persistenceKey: nil)
+    #expect(!lone.canSplit(.workBoard, from: lone.focusedGroupID, beside: lone.focusedGroupID, side: .trailing))
+
+    // Dropping on the leading edge opens a group on that side.
+    #expect(tabs.canSplit(.ask, from: firstID, beside: firstID, side: .leading))
+    tabs.split(.ask, from: firstID, beside: firstID, side: .leading)
+    #expect(tabs.groups.count == 2)
+    #expect(tabs.groups[0].tabs == [.ask])
+    #expect(tabs.groups[1].id == firstID)
+    #expect(tabs.focusedGroupID == tabs.groups[0].id)
+
+    // At the group limit an edge with a neighbour moves the tab there, and
+    // an outer edge has nowhere to go.
+    let leftID = tabs.groups[0].id
+    #expect(tabs.canSplit(.workBoard, from: firstID, beside: firstID, side: .leading) == true)
+    #expect(!tabs.canSplit(.workBoard, from: firstID, beside: firstID, side: .trailing))
+    tabs.split(.workBoard, from: firstID, beside: firstID, side: .leading)
+    #expect(tabs.groups.map(\.id) == [leftID])
+    #expect(tabs.group(id: leftID)?.tabs == [.ask, .workBoard])
+}
+
+@Test func tabDropGeometryPicksInsertionAndZones() {
+    let frames = [CGRect(x: 0, y: 0, width: 100, height: 30), CGRect(x: 100, y: 0, width: 100, height: 30)]
+    #expect(tabInsertionIndex(at: 10, frames: frames) == 0)
+    #expect(tabInsertionIndex(at: 60, frames: frames) == 1)
+    #expect(tabInsertionIndex(at: 190, frames: frames) == 2)
+    #expect(tabInsertionIndex(at: 500, frames: frames) == 2)
+    #expect(editorDropZone(at: 40, width: 800) == .leading)
+    #expect(editorDropZone(at: 400, width: 800) == nil)
+    #expect(editorDropZone(at: 790, width: 800) == .trailing)
+}

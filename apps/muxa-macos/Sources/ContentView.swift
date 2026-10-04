@@ -1,5 +1,6 @@
 import GhosttyTerminal
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
@@ -216,6 +217,14 @@ struct ContentView: View {
                             maxHeight: .infinity,
                             alignment: .topLeading
                         )
+                        .overlay {
+                            EditorDropOverlay(
+                                groupID: group.id,
+                                tabs: tabs,
+                                session: MuxaTabDragSession.shared,
+                                didDrop: { selection, _ in model.activateEditor(selection) }
+                            )
+                        }
                 }
                 .frame(
                     minWidth: tabs.groups.count > 1 ? 420 : nil,
@@ -553,9 +562,26 @@ private struct WorkspaceTabBar: View {
     let accessory: AnyView?
     var leadingInset: CGFloat = 0
     @Environment(\.openWindow) private var openWindow
+    @ObservedObject private var dragSession = MuxaTabDragSession.shared
+    /// Each tab's frame in the strip, for placing a dragged tab.
+    @State private var tabFrames: [MuxaSidebarSelection: CGRect] = [:]
 
     private var group: MuxaWorkbenchTabs.Group? {
         tabs.group(id: groupID)
+    }
+
+    private var stripSpace: String { "tab-strip-\(groupID)" }
+
+    private var orderedTabFrames: [CGRect] {
+        (group?.tabs ?? []).compactMap { tabFrames[$0] }
+    }
+
+    /// Where the insertion bar sits while a dragged tab hovers this strip.
+    private var insertionX: CGFloat? {
+        guard case .strip(groupID, let index)? = dragSession.target else { return nil }
+        let frames = orderedTabFrames
+        if frames.indices.contains(index) { return frames[index].minX }
+        return frames.last?.maxX ?? 0
     }
 
     var body: some View {
@@ -575,6 +601,23 @@ private struct WorkspaceTabBar: View {
                             .frame(minWidth: 24, maxWidth: .infinity, maxHeight: .infinity)
                     }
                     .frame(minWidth: strip.size.width, maxHeight: .infinity, alignment: .leading)
+                    .coordinateSpace(name: stripSpace)
+                    .onPreferenceChange(TabFramesKey.self) { tabFrames = $0 }
+                    .overlay(alignment: .leading) {
+                        if let insertionX {
+                            TabInsertionIndicator(x: insertionX)
+                        }
+                    }
+                    .onDrop(
+                        of: [.plainText],
+                        delegate: TabStripDropDelegate(
+                            groupID: groupID,
+                            orderedFrames: orderedTabFrames,
+                            tabs: tabs,
+                            session: dragSession,
+                            didDrop: { selection, _ in model.activateEditor(selection) }
+                        )
+                    )
                 }
                 .onChange(of: group?.active) { active in
                     if let active { proxy.scrollTo(active, anchor: .trailing) }
@@ -661,16 +704,17 @@ private struct WorkspaceTabBar: View {
                 }
             )
             .id(selection)
-            .draggable(selection.tabIdentifier)
-            .dropDestination(for: String.self) { identifiers, _ in
-                guard let identifier = identifiers.first else { return false }
-                tabs.move(
-                    tabIdentifier: identifier,
-                    before: selection,
-                    groupID: groupID
-                )
-                return true
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: TabFramesKey.self,
+                        value: [selection: proxy.frame(in: .named(stripSpace))]
+                    )
+                }
             }
+            // The tab being dragged dims in place, as in VS Code.
+            .opacity(dragSession.drag?.selection == selection && dragSession.drag?.sourceGroupID == groupID ? 0.45 : 1)
+            .onDrag { dragSession.begin(selection, from: groupID) }
         }
     }
 
