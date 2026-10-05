@@ -696,8 +696,8 @@ final class AppModel: ObservableObject {
         hostedAgents = executionSnapshot.hostedAgents
             .filter { $0.agent.state != "stopped" }
             .sorted { left, right in
-                let leftPriority = Self.agentPriority(left.agent.state)
-                let rightPriority = Self.agentPriority(right.agent.state)
+                let leftPriority = left.agent.status.priority
+                let rightPriority = right.agent.status.priority
                 if leftPriority != rightPriority { return leftPriority < rightPriority }
                 if left.host.local != right.host.local { return left.host.local }
                 if left.host.alias != right.host.alias { return left.host.alias < right.host.alias }
@@ -1880,10 +1880,7 @@ final class AppModel: ObservableObject {
             return
         }
         watchSelection = panes.first(where: { pane in
-            pane.agent.map {
-                ["waiting_input", "waiting_choice", "blocked", "error", "failed"]
-                    .contains($0.state)
-            } ?? false
+            pane.needsAttention
         })?.id ?? panes.first?.id
     }
 
@@ -1908,12 +1905,4 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private static func agentPriority(_ state: String) -> Int {
-        switch state {
-        case "waiting_input", "waiting_choice", "error", "failed", "blocked": 0
-        case "working", "starting": 1
-        case "idle": 2
-        default: 3
-        }
-    }
 }

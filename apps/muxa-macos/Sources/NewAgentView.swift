@@ -109,7 +109,7 @@ struct NewAgentView: View {
                         .overlay(alignment: .topLeading) {
                             if prompt.isEmpty {
                                 Text("First prompt (optional). Leave empty to start an interactive agent.")
-                                    .foregroundStyle(.tertiary)
+                                    .foregroundStyle(.secondary)
                                     .padding(.top, 7)
                                     .padding(.leading, 5)
                                     .allowsHitTesting(false)
@@ -124,7 +124,7 @@ struct NewAgentView: View {
                             .disabled(placement == .native)
                         if placement == .native {
                             Text("A role is recorded on tmux panes; a Muxa terminal has none.")
-                                .font(.caption)
+                                .font(MuxaType.detail)
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -139,8 +139,8 @@ struct NewAgentView: View {
 
             HStack {
                 Text("Runs the bundled `muxa agent start` through muxad.")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel") { launcher.isPresenting = false }
                     .buttonStyle(.muxaSecondary)
@@ -190,12 +190,12 @@ struct NewAgentView: View {
         VStack(alignment: .leading, spacing: 3) {
             let command = ([program.rawValue] + effectiveOptions)
             Text(verbatim: MuxaAgentLaunchOptionsText.join(command))
-                .font(.system(.caption, design: .monospaced))
+                .font(MuxaType.detail.monospaced())
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
             if isLocalHost, let installed = launcher.installedPrograms, !installed.contains(program.rawValue) {
                 Label("`\(program.rawValue)` was not found on this Mac's PATH.", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
             }
         }
@@ -219,7 +219,7 @@ struct NewAgentView: View {
             }
             if !isLocalHost {
                 Text("The agent starts in tmux on \(host) with that host's provider options.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
         }
@@ -248,7 +248,7 @@ struct NewAgentView: View {
             }
             if let problem = directoryProblem, !trimmedDirectory.isEmpty {
                 Text(problem)
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.red)
             }
         }
@@ -269,7 +269,7 @@ struct NewAgentView: View {
             case .splitPane:
                 if let pane = launcher.focus.pane {
                     Text("Splits \(pane.paneID) in \(pane.sessionName), \(guide?.direction == "down" ? String(localized: "below") : String(localized: "to the right")).")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
             case .newWindow:
@@ -281,17 +281,17 @@ struct NewAgentView: View {
                 }
             case .newSession:
                 Text("A detached tmux session named after the folder.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             case .native:
                 Text("A terminal owned by muxad on this Mac, like a Muxa shell.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
             if !availability.splitPane, placement != .splitPane {
                 Text("Split pane needs a focused tmux pane on this host.")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -300,7 +300,7 @@ struct NewAgentView: View {
     private var statusLine: some View {
         if let error = launcher.error {
             Label(error, systemImage: "exclamationmark.triangle.fill")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.red)
                 .textSelection(.enabled)
                 .padding(.horizontal, 20)
@@ -308,7 +308,7 @@ struct NewAgentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else if !model.isConnected {
             Text("Connect to muxad first.")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 20)
                 .padding(.bottom, 8)
@@ -317,7 +317,7 @@ struct NewAgentView: View {
             HStack(spacing: 8) {
                 if launcher.isStarting { ProgressView().controlSize(.small) }
                 Text(status)
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 20)

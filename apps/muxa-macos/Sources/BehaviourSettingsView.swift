@@ -33,11 +33,11 @@ struct BehaviourSettingsPane: View {
                 }
                 .disabled(!settings.notifierEnabled)
                 Text("muxad notifies when an agent starts waiting for a person, hits an error, or stops mid-turn. Repeats for the same agent are suppressed for 30 seconds.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                 if settings.notifierEnabled, settings.notifierBackend == .none {
                     Label("Choose a delivery method, or nothing is posted.", systemImage: "exclamationmark.circle")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.orange)
                 }
             }
@@ -51,7 +51,7 @@ struct BehaviourSettingsPane: View {
                         }
                     }
                     Text(collaborationWakeDetail(settings.collaborationWake))
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                     Picker("Delivered payload", selection: $settings.collaborationWakePayload) {
                         ForEach(MuxaCollaborationWakePayload.allCases) { payload in
@@ -59,7 +59,7 @@ struct BehaviourSettingsPane: View {
                         }
                     }
                     Text(collaborationPayloadDetail(settings.collaborationWakePayload))
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                     Picker("Pane scope", selection: $settings.collaborationScope) {
                         ForEach(MuxaCollaborationScope.allCases) { scope in
@@ -67,7 +67,7 @@ struct BehaviourSettingsPane: View {
                         }
                     }
                     Text(collaborationScopeDetail(settings.collaborationScope))
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
                 .disabled(!settings.collaborationEnabled)
@@ -100,7 +100,7 @@ struct BehaviourSettingsPane: View {
                                     .foregroundStyle(.secondary)
                             }
                         }
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .fixedSize(horizontal: false, vertical: true)
                         Spacer(minLength: 8)
                         if store.isSaving || store.isLoading {
@@ -133,11 +133,11 @@ struct BehaviourSettingsPane: View {
             } else {
                 Section("Not editable from here") {
                     Text("This muxad cannot write its configuration. Copy the block below into the muxa configuration file, then reload muxad.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(verbatim: snippet)
-                        .font(.caption.monospaced())
+                        .font(MuxaType.detail.monospaced())
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(8)

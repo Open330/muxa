@@ -55,7 +55,7 @@ struct PipelineEditorView: View {
                     Text(isNew ? "New pipeline" : "Edit pipeline \(target.pipeline?.name ?? "")")
                         .font(.title2.weight(.semibold))
                     Text("Saved as [pipeline.\(sectionName)] in \(configLabel) on \(target.host ?? model.localHostAlias).")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
@@ -79,14 +79,14 @@ struct PipelineEditorView: View {
                         }
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Shared prompt prefix (optional)")
-                                .font(.caption)
+                                .font(MuxaType.detail)
                                 .foregroundStyle(.secondary)
                             TextEditor(text: $definition.prompt)
                                 .font(.body)
                                 .frame(minHeight: 56, maxHeight: 120)
                             Text("Placeholders: {{work}}, {{workspace}}, {{cwd}}, {{request}}, {{ticket.title}}. Without {{request}} the operator's body is prepended automatically.")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
+                                .font(MuxaType.meta)
+                                .foregroundStyle(.secondary)
                         }
                     }
 
@@ -118,7 +118,7 @@ struct PipelineEditorView: View {
                     Text("Launch order")
                         .font(.headline)
                     Text("muxa starts every agent in a stage together and opens the next stage as its after edges report done.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     PipelineStagesView(agents: definition.optionsAgents)
@@ -128,22 +128,22 @@ struct PipelineEditorView: View {
 
                     if !routesUsingPipeline.isEmpty {
                         Text("Selected by \(routesUsingPipeline.map { String(localized: "match \($0.match)") }.joined(separator: ", "))")
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(.tertiary)
+                            .font(MuxaType.meta.monospaced())
+                            .foregroundStyle(.secondary)
                     }
 
                     if !problems.isEmpty {
                         VStack(alignment: .leading, spacing: 4) {
                             ForEach(problems, id: \.self) { problem in
                                 Label(problem, systemImage: "exclamationmark.circle")
-                                    .font(.caption)
+                                    .font(MuxaType.detail)
                                     .foregroundStyle(.orange)
                             }
                         }
                     }
                     if let error = model.pipelineEditorError {
                         Label(error, systemImage: "exclamationmark.triangle.fill")
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.red)
                             .textSelection(.enabled)
                     }
@@ -233,7 +233,7 @@ struct PipelineEditorView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
                     Text("after")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                     ForEach(others, id: \.self) { other in
                         Toggle(String(other), isOn: Binding(
@@ -265,7 +265,7 @@ struct PipelineEditorView: View {
                     .frame(minHeight: 70, maxHeight: 160)
             } label: {
                 Text(agent.wrappedValue.prompt.isEmpty ? "Prompt (optional)" : "Prompt")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
         }

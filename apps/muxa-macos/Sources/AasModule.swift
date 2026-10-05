@@ -648,7 +648,7 @@ private struct AasSettingsPane: View {
             controls
             if let error = store.error {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -674,14 +674,14 @@ private struct AasSettingsPane: View {
                 Spacer(minLength: 8)
                 if let refreshed = store.lastRefreshedAt {
                     Text("Updated \(refreshed.formatted(date: .omitted, time: .shortened))")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
             }
             .controlSize(.small)
             .disabled(store.isRefreshing)
             Text("Refresh reads the usage aas already has. Refresh live asks every provider again — one request per account — so it takes longer.")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -692,7 +692,7 @@ private struct AasSettingsPane: View {
             Text("No accounts stored yet.")
                 .font(.callout)
             Text("Add one with `aas login <provider> <name>` in a terminal — for example `aas login claude work` — then refresh.")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -734,14 +734,14 @@ private struct AasAccountRow: View {
                         .font(.body.weight(.medium))
                     if let email = account.email, !email.isEmpty {
                         Text(verbatim: email)
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.secondary)
                     }
                 }
                 Spacer(minLength: 8)
                 if let plan = account.planText {
                     Text(verbatim: plan)
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(Color.accentColor.opacity(0.12), in: Capsule())
@@ -755,7 +755,7 @@ private struct AasAccountRow: View {
             }
             if let error = account.error, !error.isEmpty {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -764,7 +764,7 @@ private struct AasAccountRow: View {
             }
             ForEach(account.notes, id: \.self) { note in
                 Text(verbatim: note)
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -786,18 +786,18 @@ private struct AasMeterRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Text(verbatim: meter.label)
-                .font(.caption.monospaced())
+                .font(MuxaType.detail.monospaced())
                 .foregroundStyle(.secondary)
                 .frame(width: 26, alignment: .leading)
             ProgressView(value: meter.fraction)
                 .progressViewStyle(.linear)
                 .tint(meter.tint)
             Text(verbatim: AasFormat.percent(meter.usedPct))
-                .font(.caption.monospacedDigit())
+                .font(MuxaType.detail.monospacedDigit())
                 .frame(width: 40, alignment: .trailing)
             if let resets = AasFormat.resets(atMilliseconds: meter.resetMs) {
                 Text(verbatim: resets)
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .frame(width: 150, alignment: .leading)
             }

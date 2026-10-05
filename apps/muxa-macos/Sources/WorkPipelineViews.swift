@@ -18,15 +18,15 @@ struct PipelineStagesView: View {
                 ForEach(Array(stages.enumerated()), id: \.offset) { index, stage in
                     if index > 0 {
                         Image(systemName: "arrow.right")
-                            .font(compact ? .caption2.weight(.semibold) : .caption.weight(.semibold))
+                            .font(compact ? MuxaType.meta.weight(.semibold) : MuxaType.detail.weight(.semibold))
                             .foregroundStyle(.tertiary)
                             .padding(.top, compact ? 9 : 14)
                     }
                     VStack(alignment: .leading, spacing: compact ? 4 : 6) {
                         if !compact, stages.count > 1 {
                             Text(index == 0 ? "Starts first" : "Stage \(index + 1)")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.tertiary)
+                                .font(MuxaType.meta.weight(.semibold))
+                                .foregroundStyle(.secondary)
                         }
                         ForEach(stage) { agent in
                             PipelineAgentChip(agent: agent, compact: compact)
@@ -57,10 +57,10 @@ struct PipelineAgentChip: View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Text(verbatim: "@\(agent.alias)")
-                    .font(compact ? .caption.weight(.semibold) : .subheadline.weight(.semibold))
+                    .font(compact ? MuxaType.meta.weight(.semibold) : MuxaType.detail.weight(.semibold))
                     .lineLimit(1)
                 Text(agent.program)
-                    .font(.caption2.weight(.medium))
+                    .font(MuxaType.meta.weight(.medium))
                     .foregroundStyle(agentProgramTint(agent.program))
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
@@ -68,14 +68,14 @@ struct PipelineAgentChip: View {
             }
             if !compact, let subtitle {
                 Text(subtitle)
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             }
             if !compact, !agent.after.isEmpty {
                 Text("after \(agent.after.map { "@\($0)" }.joined(separator: ", "))")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
         }
@@ -116,15 +116,15 @@ struct WorkPipelineCard: View {
                         .lineLimit(1)
                     if let description = pipeline.description, !description.isEmpty {
                         Text(description)
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
                     }
                 }
                 Spacer(minLength: 6)
                 Text("\(pipeline.agents.count) agents")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.meta.monospacedDigit())
+                    .foregroundStyle(.secondary)
             }
 
             PipelineStagesView(agents: pipeline.agents, compact: true)
@@ -150,13 +150,13 @@ struct WorkPipelineCard: View {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 if routes.isEmpty {
                     Text("No route selects it; choose it explicitly when starting Work.")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .font(MuxaType.meta)
+                        .foregroundStyle(.secondary)
                         .lineLimit(2)
                 } else {
                     Text(routes.map { routeSummary($0) }.joined(separator: " · "))
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.tertiary)
+                        .font(MuxaType.meta.monospaced())
+                        .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
                 Spacer(minLength: 4)
@@ -221,7 +221,7 @@ struct PipelineHostBadge: View {
 
     var body: some View {
         Label(state.host, systemImage: symbol.name)
-            .font(.caption2.weight(.medium))
+            .font(MuxaType.meta.weight(.medium))
             .foregroundStyle(symbol.tint)
             .labelStyle(.titleAndIcon)
             .lineLimit(1)
@@ -304,13 +304,13 @@ struct WorkPresetGallery: View {
                 Label("No pipeline is configured yet", systemImage: "point.3.connected.trianglepath.dotted")
                     .font(.headline)
                 Text("A pipeline is the set of agents a Work window is staffed with. Install a preset to start now, or describe your own and let an agent write the config.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if options.routes.isEmpty {
                     Text("Installing also adds a catch-all route so every Work id can use it.")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .font(MuxaType.meta)
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -322,12 +322,12 @@ struct WorkPresetGallery: View {
                                 .font(.headline)
                             Spacer(minLength: 4)
                             Text("\(preset.agents.count) agents")
-                                .font(.caption2.monospacedDigit())
-                                .foregroundStyle(.tertiary)
+                                .font(MuxaType.meta.monospacedDigit())
+                                .foregroundStyle(.secondary)
                         }
                         if let description = preset.description, !description.isEmpty {
                             Text(description)
-                                .font(.caption)
+                                .font(MuxaType.detail)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(2)
                         }
@@ -362,7 +362,7 @@ struct WorkPresetGallery: View {
                 if model.isApplyingWorkPreset {
                     ProgressView().controlSize(.small)
                     Text("Writing the preset into \(options.configPath ?? String(localized: "the muxa config"))…")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -381,7 +381,7 @@ struct WorkPresetGallery: View {
             }
             if let error = model.workOptionsError(for: host) {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
             }
@@ -413,14 +413,14 @@ struct WorkPlanView: View {
                     .font(.headline)
                 Spacer()
                 Text(planSummary)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.meta.monospaced())
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
             if steps.isEmpty {
                 Text("Nothing would change: the Work window already matches its pipeline.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
             ForEach(steps) { step in
@@ -428,8 +428,8 @@ struct WorkPlanView: View {
             }
             HStack {
                 Text("Nothing was created. Launch runs the same request without Plan only.")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.secondary)
                 Spacer()
                 Button(action: launch) {
                     Label("Launch now", systemImage: "play.fill")
@@ -496,7 +496,7 @@ private struct WorkPlanStepRow: View {
                         .font(.subheadline.weight(.medium))
                     if let detail {
                         Text(detail)
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -506,7 +506,7 @@ private struct WorkPlanStepRow: View {
                         showsPrompt.toggle()
                     }
                     .buttonStyle(.muxaGhost)
-                    .font(.caption)
+                    .font(MuxaType.detail)
                 }
             }
             if showsPrompt, let prompt = step.prompt {
@@ -548,7 +548,7 @@ struct WorkRoutesEditor: View {
                 Text("Routes")
                     .font(.headline)
                 Text("First match wins; a Work id that matches no route needs an explicit pipeline.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button {
@@ -563,8 +563,8 @@ struct WorkRoutesEditor: View {
 
             if options.routes.isEmpty, !editing {
                 Text("No routes yet. Add one with match .* to send every Work id to a pipeline.")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.detail)
+                    .foregroundStyle(.secondary)
             }
 
             ForEach(Array(options.routes.enumerated()), id: \.offset) { index, route in
@@ -594,14 +594,14 @@ struct WorkRoutesEditor: View {
     private func routeRow(_ route: MuxaWorkOptions.Route, position: Int) -> some View {
         HStack(spacing: 10) {
             Text(verbatim: "\(position + 1)")
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(.tertiary)
+                .font(MuxaType.meta.monospacedDigit())
+                .foregroundStyle(.secondary)
                 .frame(width: 18, alignment: .trailing)
             Text(route.match)
                 .font(.callout.monospaced())
                 .lineLimit(1)
             Image(systemName: "arrow.right")
-                .font(.caption2)
+                .font(MuxaType.meta)
                 .foregroundStyle(.tertiary)
             if let pipeline = route.pipeline {
                 Text(pipeline)
@@ -614,25 +614,25 @@ struct WorkRoutesEditor: View {
             }
             if let workspace = route.workspace, !workspace.isEmpty {
                 Text("workspace \(workspace)")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
             if route.worktree {
                 Text("worktree")
-                    .font(.caption2.weight(.medium))
+                    .font(MuxaType.meta.weight(.medium))
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
                     .background(Color.primary.opacity(0.07), in: Capsule())
             } else if let cwd = route.cwd, !cwd.isEmpty {
                 Text(cwd)
-                    .font(.caption.monospaced())
+                    .font(MuxaType.detail.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
             if route.prepare {
                 Text("prepare")
-                    .font(.caption2.weight(.medium))
+                    .font(MuxaType.meta.weight(.medium))
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
                     .background(Color.primary.opacity(0.07), in: Capsule())
@@ -688,7 +688,7 @@ struct WorkRoutesEditor: View {
             HStack {
                 if let error = model.workOptionsError(for: host) {
                     Text(error)
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.red)
                         .lineLimit(2)
                 }

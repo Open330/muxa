@@ -64,13 +64,13 @@ struct AdvancedSettingsPane: View {
                         Text(verbatim: store.path)
                     }
                 }
-                .font(.caption.monospaced())
+                .font(MuxaType.detail.monospaced())
                 .textSelection(.enabled)
                 .lineLimit(1)
                 .truncationMode(.middle)
                 if store.hasLoaded, store.document?.exists == false {
                     Text("(not created yet)")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -95,7 +95,7 @@ struct AdvancedSettingsPane: View {
             } else {
                 if store.isLaunchDirty {
                     Label("Save or discard launch option changes before editing Raw TOML.", systemImage: "exclamationmark.triangle")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.orange)
                         .padding(12)
                 }
@@ -126,31 +126,31 @@ struct AdvancedSettingsPane: View {
                              : "Your raw text is preserved. Reload to take the file's version, or review it before saving again.")
                             .foregroundStyle(.secondary)
                     }
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .fixedSize(horizontal: false, vertical: true)
                 } else if let error = store.saveError {
                     // muxad's own parse/validation message, verbatim.
                     Label(error, systemImage: "xmark.octagon.fill")
-                        .font(.caption.monospaced())
+                        .font(MuxaType.detail.monospaced())
                         .foregroundStyle(.red)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if let error = store.loadError {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.orange)
                         .textSelection(.enabled)
                 }
                 if let status = store.status, store.saveError == nil {
                     Label(status, systemImage: "checkmark.circle.fill")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.green)
                 }
 
                 HStack(spacing: 10) {
                     Text("Most changes apply when muxad restarts. Saving checks the file has not changed underneath and refuses a document muxa cannot parse.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 8)
@@ -200,7 +200,7 @@ struct AdvancedSettingsPane: View {
                             VStack(alignment: .leading, spacing: 6) {
                                 Text("[mcp.guide].options still supplies \(program)'s fallback. Provider defaults override it, even when empty. These legacy settings are preserved; edit them in Raw TOML if needed.")
                                 Text(verbatim: String(describing: settings.legacyGuide.options))
-                                    .font(.caption.monospaced())
+                                    .font(MuxaType.detail.monospaced())
                                     .textSelection(.enabled)
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -264,7 +264,7 @@ struct AdvancedSettingsPane: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Text("The file muxad reads is named at the top of this pane; muxa config path prints it from the command line.")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
@@ -298,7 +298,7 @@ private struct MuxaLaunchOptionsRow: View {
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
-                Text(verbatim: detail).font(.caption.monospaced()).foregroundStyle(.secondary)
+                Text(verbatim: detail).font(MuxaType.detail.monospaced()).foregroundStyle(.secondary)
                 Toggle("Override inherited options", isOn: Binding(
                     get: { options != nil },
                     set: { options = $0 ? effective : nil }
@@ -330,13 +330,13 @@ private struct MuxaLaunchOptionsRow: View {
                     }
                     if arguments.isEmpty {
                         Text("Explicit []: no extra options, even if defaults exist.")
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(MuxaType.detail).foregroundStyle(.secondary)
                     }
                 } else {
-                    Text(inheritLabel).font(.caption).foregroundStyle(.secondary)
+                    Text(inheritLabel).font(MuxaType.detail).foregroundStyle(.secondary)
                 }
                 Text("Effective options: \(String(describing: effective))")
-                    .font(.caption.monospaced())
+                    .font(MuxaType.detail.monospaced())
                     .textSelection(.enabled)
             }
             .frame(maxWidth: .infinity, alignment: .leading)

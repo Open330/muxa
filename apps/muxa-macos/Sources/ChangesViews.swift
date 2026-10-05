@@ -233,13 +233,13 @@ struct ChangesWorkspaceView: View {
                 branchSummary(snapshot)
             } else if changes.isRefreshing {
                 Text("Reading git status…")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 8)
             if sentNotice {
                 Label("Review sent", systemImage: "checkmark.circle")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.green)
                     .transition(.opacity)
             }
@@ -309,12 +309,12 @@ struct ChangesWorkspaceView: View {
             .help(snapshot.root)
             if snapshot.branch.upstream != nil {
                 Text(verbatim: "↑\(snapshot.branch.ahead) ↓\(snapshot.branch.behind)")
-                    .font(.system(size: 11).monospacedDigit())
+                    .font(.system(size: 12).monospacedDigit())
                     .foregroundStyle(.secondary)
                     .help(Text("Ahead / behind \(snapshot.branch.upstream ?? "")"))
             }
             Text("\(snapshot.fileCount) files")
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .foregroundStyle(.secondary)
             ChangeCountsLabel(added: snapshot.totalAdded, deleted: snapshot.totalDeleted, pending: !snapshot.countsLoaded)
         }
@@ -333,7 +333,7 @@ struct ChangesWorkspaceView: View {
             Button("Retry") { changes.refresh() }
                 .buttonStyle(.muxaGhost)
         }
-        .font(.system(size: 11))
+        .font(.system(size: 12))
         .padding(.horizontal, 12)
         .padding(.vertical, 5)
         .background(Color.orange.opacity(0.1))
@@ -472,7 +472,7 @@ struct ChangeCountsLabel: View {
             if isBinary {
                 Text("bin").foregroundStyle(.secondary)
             } else if pending, added == nil, deleted == nil {
-                Text(verbatim: "…").foregroundStyle(.tertiary)
+                Text(verbatim: "…").foregroundStyle(.secondary)
             } else {
                 if let added, added > 0 {
                     Text(verbatim: "+\(added)").foregroundStyle(.green)
@@ -482,7 +482,7 @@ struct ChangeCountsLabel: View {
                 }
             }
         }
-        .font(.system(size: 11, design: .monospaced))
+        .font(.system(size: 12, design: .monospaced))
         .lineLimit(1)
         .fixedSize()
     }
@@ -530,7 +530,7 @@ private struct ChangesFileList: View {
                     }
                     if snapshot.omittedCount > 0 {
                         Text("\(snapshot.omittedCount) more files not shown")
-                            .font(.system(size: 11))
+                            .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 8)
@@ -556,7 +556,7 @@ private struct ChangesFileList: View {
         let count = snapshot.files.filter(changes.isViewed).count
         return VStack(alignment: .leading, spacing: 4) {
             Text("\(count) of \(total) viewed")
-                .font(.system(size: 11).monospacedDigit())
+                .font(.system(size: 12).monospacedDigit())
                 .foregroundStyle(.secondary)
             GeometryReader { geometry in
                 ZStack(alignment: .leading) {
@@ -601,7 +601,7 @@ private struct ChangesFileList: View {
         } label: {
             HStack(spacing: 6) {
                 Text(verbatim: file.kind.rawValue)
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
                     .foregroundStyle(kindColor(file.kind))
                     .frame(width: 12)
                 if file.kind == .conflicted {
@@ -617,7 +617,7 @@ private struct ChangesFileList: View {
                 Spacer(minLength: 4)
                 if commentedPaths.contains(file.path) {
                     Image(systemName: "text.bubble")
-                        .font(.system(size: 10))
+                        .font(.system(size: 11))
                         .foregroundStyle(.tint)
                 }
                 ChangeCountsLabel(
@@ -955,7 +955,7 @@ private struct ChangesDiffPane: View {
         switch row {
         case .orphanHeader:
             Text("Comments on lines no longer in this diff")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.secondary)
                 .padding(.leading, DiffMetrics.gutterWidth)
                 .padding(.vertical, 6)
@@ -1015,8 +1015,8 @@ private struct ChangesDiffPane: View {
                 Button("Clear") { changes.selection = nil }
                     .buttonStyle(.muxaGhost)
                 Text("Shift-click to extend within the hunk")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
             }
             .padding(.leading, DiffMetrics.gutterWidth)
             .padding(.vertical, 5)
@@ -1047,7 +1047,7 @@ private struct ChangesDiffPane: View {
             .padding(.vertical, 4)
         case .truncated:
             Label("The diff was cut off: it is larger than Muxa reads at once.", systemImage: "scissors")
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .foregroundStyle(.secondary)
                 .padding(.leading, DiffMetrics.gutterWidth)
                 .padding(.vertical, 8)
@@ -1113,8 +1113,8 @@ private struct DiffHunkHeaderRow: View {
                     .fixedSize()
                 if collapsed {
                     Text("\(hunk.lines.count) lines")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
             }
@@ -1173,7 +1173,7 @@ private struct DiffLineRow: View {
 
     private func number(_ value: Int?) -> some View {
         Text(verbatim: value.map(String.init) ?? "")
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.secondary)
             .padding(.trailing, 6)
             .frame(width: DiffMetrics.numberWidth, alignment: .trailing)
             .background(gutterBackground)
@@ -1217,7 +1217,7 @@ private struct DiffSplitCell: View {
     var body: some View {
         HStack(spacing: 0) {
             Text(verbatim: number.map(String.init) ?? "")
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.secondary)
                 .padding(.trailing, 6)
                 .frame(width: DiffMetrics.numberWidth, alignment: .trailing)
                 .frame(maxHeight: .infinity)
@@ -1327,16 +1327,16 @@ private struct ReviewCommentCard: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Image(systemName: "text.bubble.fill")
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundStyle(.tint)
                 Text(verbatim: comment.location)
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.system(size: 12, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if comment.outdated {
                     Text("Outdated")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.orange)
                 }
                 Spacer()
@@ -1452,7 +1452,7 @@ private struct ReviewSendSheet: View {
 
             HStack {
                 Text("Preview")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
                 if previewEdited {
@@ -1470,7 +1470,7 @@ private struct ReviewSendSheet: View {
                     previewEdited = $0 != generated
                 }
             ))
-            .font(.system(size: 11, design: .monospaced))
+            .font(.system(size: 12, design: .monospaced))
             .scrollContentBackground(.hidden)
             .padding(6)
             .background(
@@ -1497,7 +1497,7 @@ private struct ReviewSendSheet: View {
             }
             if case .pane(let pane) = target, !pane.host.local, pane.host.mode != "control" {
                 Text("This host is registered in observe mode. Change it to control to send prompts.")
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(.orange)
             }
         }
@@ -1546,7 +1546,7 @@ private struct ReviewSendSheet: View {
                 ForEach(draft.comments) { comment in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text(verbatim: comment.location)
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(.system(size: 12, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
@@ -1556,7 +1556,7 @@ private struct ReviewSendSheet: View {
                             .lineLimit(1)
                         if comment.outdated {
                             Text("Outdated")
-                                .font(.system(size: 10, weight: .semibold))
+                                .font(.system(size: 11, weight: .semibold))
                                 .foregroundStyle(.orange)
                         }
                         Spacer()
@@ -1589,7 +1589,7 @@ private struct ReviewSendSheet: View {
                     .foregroundStyle(.orange)
             }
         }
-        .font(.system(size: 11))
+        .font(.system(size: 12))
         .lineLimit(1)
     }
 

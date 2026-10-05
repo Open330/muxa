@@ -30,10 +30,7 @@ struct MuxaWorkGroup: Identifiable, Sendable {
     }
 
     var attentionCount: Int {
-        let agentAttention = participants.lazy.filter {
-            ["waiting_input", "waiting_choice", "blocked", "error", "failed"]
-                .contains($0.agent.state)
-        }.count
+        let agentAttention = participants.lazy.filter { $0.agent.status.needsAttention }.count
         let pipelineAttention = pipelineRun?.aliases.values.lazy.filter {
             $0.status == "blocked" || $0.status == "failed"
         }.count ?? 0
@@ -278,21 +275,13 @@ extension MuxaExecutionSnapshot {
         _ left: MuxaHostedAgent,
         _ right: MuxaHostedAgent
     ) -> Bool {
-        let leftPriority = participantPriority(left.agent.state)
-        let rightPriority = participantPriority(right.agent.state)
+        let leftPriority = left.agent.status.priority
+        let rightPriority = right.agent.status.priority
         if leftPriority != rightPriority { return leftPriority < rightPriority }
         if left.host.local != right.host.local { return left.host.local }
         if left.host.alias != right.host.alias { return left.host.alias < right.host.alias }
         return left.agent.id < right.agent.id
     }
 
-    private static func participantPriority(_ state: String) -> Int {
-        switch state {
-        case "waiting_input", "waiting_choice", "error", "failed", "blocked": 0
-        case "working", "starting": 1
-        case "idle": 2
-        default: 3
-        }
-    }
 
 }
