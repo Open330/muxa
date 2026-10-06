@@ -4,6 +4,7 @@
 //! (`--socket`/`MUXA_SOCKET` -> config -> XDG default), so callers never need
 //! to know that the fallback happens to contain their uid.
 
+use crate::init::files::{launchd, systemd};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
 use muxa::ipc::{Client, Hello, RuntimeError};
@@ -169,8 +170,9 @@ fn describe(socket: &Path, hello: &Hello) -> String {
     )
 }
 
-/// Spawn the selected muxad as a background process with stdio detached from
-/// the caller. Kept crate-visible so `muxa init` and `muxa daemon start` cannot
+/// Start muxad for `socket`: through the installed `LaunchAgent` / systemd unit
+/// when that service owns the socket, otherwise as a background process with
+/// stdio detached from the caller. Kept crate-visible so `muxa init` and `muxa daemon start` cannot
 /// drift into different socket probing or process-launch behaviour.
 pub(crate) fn start_detached(
     socket: &Path,
@@ -179,6 +181,28 @@ pub(crate) fn start_detached(
 ) -> Result<bool> {
     if socket_responding(socket) {
         return Ok(false);
+    }
+
+    // A loaded LaunchAgent / enabled systemd unit owns this socket. Spawning a
+    // second, unmanaged muxad here wins the bind race at login (the shellrc
+    // hook runs before launchd's copy binds), and the KeepAlive service then
+    // crash-loops on "socket already in use" for as long as the orphan lives.
+    if let Some(manager) = ServiceManager::owning(socket, config_path) {
+        manager.start()?;
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if socket_responding(socket) {
+                return Ok(true);
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        bail!(
+            "{} did not bind {} within {}s; {}",
+            manager.describe(),
+            socket.display(),
+            timeout.as_secs(),
+            manager.hint()
+        );
     }
 
     let muxad = which::which("muxad").context("finding muxad on PATH")?;
@@ -225,6 +249,106 @@ pub(crate) fn start_detached(
         timeout.as_secs(),
         log_path.display()
     )
+}
+
+/// The per-user service `muxa init` installs, when it is the one that would
+/// serve `socket`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceManager {
+    Launchd,
+    Systemd,
+}
+
+impl ServiceManager {
+    fn owning(socket: &Path, config_path: Option<&Path>) -> Option<Self> {
+        if !Self::serves(socket, config_path) {
+            return None;
+        }
+        match std::env::consts::OS {
+            "macos" if launchd_agent_loaded() => Some(Self::Launchd),
+            "linux" if systemd_unit_enabled() => Some(Self::Systemd),
+            _ => None,
+        }
+    }
+
+    /// The service runs muxad with no `--socket`/`--config`, so it binds the
+    /// socket named by the default config file, else the XDG default. A
+    /// caller aimed anywhere else (tests, a second instance) keeps the
+    /// detached spawn.
+    fn serves(socket: &Path, config_path: Option<&Path>) -> bool {
+        let default_config = muxa::paths::default_config_file();
+        if config_path.is_some_and(|path| Some(path) != default_config.as_deref()) {
+            return false;
+        }
+        let service_socket = muxa::config::Config::load_or_default(default_config.as_deref())
+            .ok()
+            .and_then(|cfg| cfg.socket)
+            .unwrap_or_else(muxa::paths::default_socket);
+        service_socket == socket
+    }
+
+    fn start(self) -> Result<()> {
+        // Plain `kickstart` (no `-k`) is a no-op for a job that is already
+        // running and skips the throttle wait for one that is not.
+        let (program, args): (&str, Vec<String>) = match self {
+            Self::Launchd => ("launchctl", vec!["kickstart".into(), launchd_target()]),
+            Self::Systemd => (
+                "systemctl",
+                vec![
+                    "--user".into(),
+                    "start".into(),
+                    systemd::UNIT_FILENAME.into(),
+                ],
+            ),
+        };
+        let status = Command::new(program)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("running {program}"))?;
+        if !status.success() {
+            bail!("{program} {} exited with {status}", args.join(" "));
+        }
+        Ok(())
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Launchd => "the muxad LaunchAgent",
+            Self::Systemd => "muxad.service",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Launchd => {
+                "check /tmp/muxad.err and `launchctl print gui/$(id -u)/dev.open330.muxad`"
+            }
+            Self::Systemd => "check `journalctl --user -u muxad`",
+        }
+    }
+}
+
+fn launchd_target() -> String {
+    format!("gui/{}/{}", crate::init::util::uid_string(), launchd::LABEL)
+}
+
+fn launchd_agent_loaded() -> bool {
+    Command::new("launchctl")
+        .args(["print", &launchd_target()])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+fn systemd_unit_enabled() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-enabled", "--quiet", systemd::UNIT_FILENAME])
+        .stdin(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 pub(crate) fn socket_responding(socket: &Path) -> bool {
@@ -282,6 +406,17 @@ mod tests {
             crate::Args::try_parse_from(["muxa", "daemon", verb])
                 .unwrap_or_else(|error| panic!("muxa daemon {verb} did not parse: {error}"));
         }
+    }
+
+    #[test]
+    fn a_non_service_socket_keeps_the_detached_spawn() {
+        let socket = std::path::Path::new("/nonexistent/muxa-test.sock");
+        assert_eq!(super::ServiceManager::owning(socket, None), None);
+        let config = std::path::Path::new("/nonexistent/config.toml");
+        assert!(!super::ServiceManager::serves(
+            &muxa::paths::default_socket(),
+            Some(config)
+        ));
     }
 
     #[test]
