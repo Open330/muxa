@@ -96,6 +96,40 @@ thinking에서 온 경우에만 셉니다. scrollback tick은 engaged `ACT`에�
 표 마지막에는 `TOTAL` 푸터 행이 붙습니다. 모든 그룹의 총합을 담으며,
 `--limit`로 위쪽 행이 잘려도 전체 데이터를 반영합니다.
 
+## Stats 타임라인
+
+`muxa stats`에 `--timeline`을 추가하면 프로젝트마다 에이전트가 *언제*
+일했는지 실제 시계 축 위에 그려 보여줍니다.
+
+```bash
+muxa stats --timeline                          # 최근 7일, 하루에 한 블록
+muxa stats --timeline --since today --hours 9-24
+muxa stats --timeline --layout range --since month --limit 0
+muxa stats --timeline --group-by session
+```
+
+한 행은 한 프로젝트(에이전트 작업 디렉터리 이름)입니다. `--group-by session`
+또는 `agent`를 주면 tmux 세션이나 에이전트 종류별 행이 됩니다. 행은 그
+그룹의 WORK 구간을 wall-clock으로 합친 것이라, 한 프로젝트에서 에이전트 둘이
+동시에 일해도 두 번 세지 않고 막대 하나로 그립니다. 칸의 진하기(`░▒▓█`)는
+그 칸이 얼마나 채워졌는지입니다. dev 서버 같은 백그라운드 task는 며칠씩
+Working 상태로 남기 때문에 제외합니다.
+
+- `--layout day`(기본값)는 로컬 날짜마다 한 블록을 같은 시간 축에 출력하고,
+  프로젝트는 시작한 순서대로 나옵니다. `--limit`은 하루당 행 수입니다.
+- `--layout range`는 프로젝트마다 전체 범위에 걸친 한 행을 작업 시간 순으로
+  보여줘서, 한 달치 프로젝트가 한 화면에 들어갑니다.
+- `--hours START-END`는 day 레이아웃의 시간 범위를 고정합니다. 기본값은 기록된
+  작업 범위에 맞춥니다.
+- `--cell MINUTES`는 칸 하나의 분을 고정합니다. 기본값은 터미널 폭에 맞는
+  가장 촘촘한 값입니다.
+
+타임라인은 표 출력 전용이라 `--graph`, `--json`, `--markdown`과 함께 쓸 수
+없습니다.
+
+아래 `muxa timeline`은 에이전트별 인터랙티브 화면이고, `stats --timeline`은
+프로젝트별 요약입니다.
+
 ## Timeline
 
 `muxa timeline`은 같은 duration 데이터를 interactive TUI로 표시합니다.

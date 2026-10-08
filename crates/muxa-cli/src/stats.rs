@@ -19,6 +19,8 @@ use crate::theme::{self, CliTheme, TableTone, ThemeArg};
 use crate::time_range::TimeRange;
 use crate::{terminal_width, truncate_cell, use_colors};
 
+mod timeline;
+
 #[derive(Debug, clap::Args)]
 // CLI flags are independent toggles, not a state machine to fold into an enum.
 #[allow(clippy::struct_excessive_bools)]
@@ -38,6 +40,26 @@ pub struct Args {
     /// Render only the WACT time graph. Buckets adapt to the selected range.
     #[arg(long, default_value_t = false)]
     graph: bool,
+
+    /// Render a Gantt timeline of agent WORK per project (or `--group-by`
+    /// session/agent) on a real clock axis. `--limit` caps rows per day.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["graph", "json", "markdown"])]
+    timeline: bool,
+
+    /// Timeline layout: `day` stacks one block per day on an hour axis;
+    /// `range` gives each project one row across the whole range, so many
+    /// projects fit on one screen.
+    #[arg(long, value_enum, default_value = "day", requires = "timeline")]
+    layout: timeline::TimelineLayout,
+
+    /// Local hour window for the day layout, e.g. `9-18` or `9-24`.
+    /// Defaults to the span of recorded work.
+    #[arg(long, value_name = "START-END", value_parser = timeline::parse_hours, requires = "timeline")]
+    hours: Option<(u8, u8)>,
+
+    /// Timeline cell width in minutes. Defaults to the finest that fits the terminal.
+    #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(i64).range(1..=1440), requires = "timeline")]
+    cell: Option<i64>,
 
     /// Shortcut for `--format json`. Overrides `--format`.
     #[arg(long, conflicts_with = "markdown")]
@@ -202,6 +224,21 @@ impl GroupBy {
 pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
     let exclusions = ScopeExclusions::new(args.exclude_pane.clone(), args.exclude_session.clone());
     let data = load_data(client, cfg, &args.since, &exclusions).await?;
+    if args.timeline {
+        let options = timeline::TimelineOptions {
+            group_by: args.group_by,
+            layout: args.layout,
+            hours: args.hours,
+            cell_minutes: args.cell,
+            limit: args.limit,
+        };
+        let theme = theme::for_config(cfg, args.theme, use_colors());
+        print!(
+            "{}",
+            timeline::render(&data, options, terminal_width(), theme)
+        );
+        return Ok(());
+    }
     let doc = build_document(
         &data,
         args.group_by,
@@ -3158,7 +3195,7 @@ fn format_duration(total_secs: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use muxa::event::AgentKind;
     use muxa::{
@@ -3233,7 +3270,11 @@ mod tests {
         )
     }
 
-    fn live_agent(state: AgentState, state_entered_at: OffsetDateTime, cwd: Option<&str>) -> Agent {
+    pub(super) fn live_agent(
+        state: AgentState,
+        state_entered_at: OffsetDateTime,
+        cwd: Option<&str>,
+    ) -> Agent {
         Agent {
             tmux_socket: None,
             tmux_session: None,
@@ -3268,7 +3309,7 @@ mod tests {
         }
     }
 
-    fn data(prompts: Vec<HistoryEntry>) -> StatsData {
+    pub(super) fn data(prompts: Vec<HistoryEntry>) -> StatsData {
         StatsData {
             now: datetime!(2026-05-30 12:00:00 UTC),
             range: TimeRange {
