@@ -115,6 +115,43 @@ The table closes with a `TOTAL` footer row. It holds the grand total across
 every group and reflects all data even when `--limit` truncates the rows
 above it.
 
+## Stats Timeline
+
+Add `--timeline` to `muxa stats` to see *when* each project had an agent
+working, drawn on a real clock axis:
+
+```bash
+muxa stats --timeline                          # last 7 days, one block per day
+muxa stats --timeline --since today --hours 9-24
+muxa stats --timeline --layout range --since month --limit 0
+muxa stats --timeline --group-by session
+```
+
+Each row is one project (the agent's working directory name). With
+`--group-by session` or `agent`, rows are tmux sessions or agent kinds instead.
+A row is the wall-clock union of that group's WORK spans, so two agents working
+in one project at once paint one bar instead of counting twice. A cell's shade
+(`░▒▓█`) shows how much of it was covered. Background tasks such as dev
+servers are left out: they stay in Working for days. Both rules make a row's
+time differ from the `WORK` column, which sums every agent.
+
+- `--layout day` (default) prints one block per local day on a shared hour
+  axis, with projects in the order you started them. `--limit` caps rows per
+  day.
+- `--layout range` gives each project one row across the whole range, ranked
+  by work time, so a month of projects fits on one screen.
+- `--hours START-END` fixes the day layout's hour window; by default it fits
+  the recorded work.
+- `--cell MINUTES` fixes the cell width and must divide a day (5, 10, 15, 30,
+  60, 120, ...); by default it is the finest that fits the terminal. If even
+  day-wide cells do not fit, the range layout shows the most recent days.
+
+The timeline is table output only; it cannot be combined with `--graph`,
+`--format`, `--json`, `--markdown`, `--sort` or `--reverse`.
+
+`muxa timeline` (below) is the interactive per-agent view; `stats --timeline`
+is the per-project summary.
+
 ## Timeline
 
 `muxa timeline` renders the same duration source as an interactive TUI.

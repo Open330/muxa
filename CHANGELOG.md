@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `muxa stats --timeline` shows when each project had an agent working, on a
+  real clock axis: one block per day by default, or `--layout range` for one
+  row per project across the whole range so many projects fit on one screen.
+  `--hours 9-24` and `--cell 15` fix the window and the cell width, and
+  `--group-by session|agent` swaps projects for sessions or agent kinds.
+
 ### Changed
 
 - Muxa for Mac is easier to read. Content text no longer drops below 11pt:
