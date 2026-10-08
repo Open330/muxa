@@ -4,7 +4,9 @@
 //!
 //! Each row is the wall-clock union of WORK spans for one group key, so two
 //! agents working in the same project at once paint one bar rather than
-//! double-counting. Shade encodes how much of each cell was covered.
+//! double-counting, and background tasks are left out. Both differ from the
+//! WORK column, which sums every agent. Shade encodes how much of each cell
+//! was covered.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -17,8 +19,8 @@ use time::{Date, OffsetDateTime, UtcOffset};
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    agent_group_key, format_duration, format_local_seconds, local_offset,
-    state_transition_group_key, GroupBy, StatsData,
+    agent_group_key, clip_interval, format_duration, format_local_seconds, local_offset,
+    state_transition_group_key, transition_started_at, GroupBy, StatsData,
 };
 use crate::theme::{CliTheme, TableTone};
 use crate::truncate_cell;
@@ -77,18 +79,30 @@ pub(super) fn parse_hours(value: &str) -> Result<(u8, u8), String> {
     Ok((start, end))
 }
 
+/// Parse `--cell MINUTES`: a divisor of a day, so hour and midnight
+/// boundaries always fall on a cell edge.
+pub(super) fn parse_cell(value: &str) -> Result<i64, String> {
+    let minutes = value
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| format!("`{value}` is not a number of minutes"))?;
+    if minutes <= 0 || DAY_SECS / 60 % minutes != 0 {
+        return Err(format!(
+            "cell must divide a day (5, 10, 15, 20, 30, 60, 120, ...), got {minutes}"
+        ));
+    }
+    Ok(minutes)
+}
+
 /// Merged WORK spans `[start, end)` in unix seconds, keyed by group.
 fn work_lanes(data: &StatsData, group_by: GroupBy) -> Lanes {
-    let range_start = data.range.since_at.map(OffsetDateTime::unix_timestamp);
-    let range_end = data.range.effective_end(data.now).unix_timestamp();
     let mut lanes = Lanes::new();
     let mut push = |key: String, started_at: OffsetDateTime, ended_at: OffsetDateTime| {
-        let start = range_start.map_or(started_at.unix_timestamp(), |since| {
-            started_at.unix_timestamp().max(since)
-        });
-        let end = ended_at.unix_timestamp().min(range_end);
-        if end > start {
-            lanes.entry(key).or_default().push((start, end));
+        if let Some((start, end)) = clip_interval(data, started_at, ended_at) {
+            lanes
+                .entry(key)
+                .or_default()
+                .push((start.unix_timestamp(), end.unix_timestamp()));
         }
     };
 
@@ -99,13 +113,9 @@ fn work_lanes(data: &StatsData, group_by: GroupBy) -> Lanes {
         if entry.from != AgentState::Working || entry.kind == AgentKind::Task {
             continue;
         }
-        let started_at = entry.state_entered_at.unwrap_or_else(|| {
-            entry.at
-                - time::Duration::seconds(i64::try_from(entry.duration_secs).unwrap_or(i64::MAX))
-        });
         push(
             state_transition_group_key(data, entry, group_by),
-            started_at,
+            transition_started_at(entry),
             entry.at,
         );
     }
@@ -252,7 +262,9 @@ impl Grid {
         }
     }
 
-    fn table(&self, rows: Vec<Row>, theme: CliTheme) -> String {
+    /// `cells` wider than the planned bar (an explicit `--cell`, a narrow
+    /// terminal) widen the column instead of wrapping each row.
+    fn table(&self, rows: Vec<Row>, cells: usize, theme: CliTheme) -> String {
         let mut table = Table::new();
         table
             .load_preset(NOTHING)
@@ -283,7 +295,7 @@ impl Grid {
         let widths: [(usize, u16); 3] = [
             (self.label_width, 2),
             (DURATION_WIDTH, 2),
-            (self.bar_width, 0),
+            (self.bar_width.max(cells), 0),
         ];
         for (column, (width, gutter)) in table.column_iter_mut().zip(widths) {
             column.set_padding((0, gutter));
@@ -326,41 +338,54 @@ fn render_with_offset(
         .collect();
 
     let mut out = String::new();
-    let _ = writeln!(out, "muxa stats · WORK timeline by {}", group_by.as_str());
+    let _ = writeln!(
+        out,
+        "muxa stats · agent working time by {} (overlaps merged, background tasks excluded)",
+        group_by.as_str()
+    );
     let _ = write!(out, "Range: {}", data.range.label);
     if let Some(since_at) = data.range.since_at {
         let _ = write!(out, " · since {}", format_local_seconds(since_at));
     }
     out.push_str("\n\n");
-    if lanes.is_empty() {
-        out.push_str("no agent WORK recorded in this range\n");
-        return out;
-    }
-
     let grid = Grid::new(&lanes, terminal_width);
     let offset = i64::from(offset.whole_seconds());
     let body = match options.layout {
         TimelineLayout::Day => render_days(&lanes, &grid, options, offset, theme),
         TimelineLayout::Range => render_range(data, &lanes, &grid, options, offset, theme),
     };
-    out.push_str(&body);
+    out.push_str(
+        body.as_deref()
+            .unwrap_or("no agent working time recorded in this view\n"),
+    );
     out
 }
 
 /// Every lane split at local midnight: day -> key -> spans, minus noise rows.
-fn split_by_day(lanes: &Lanes, offset: i64) -> DayLanes<'_> {
+/// With an hour window, spans are clipped to it first, so a row's duration and
+/// its place under `--limit` only count work the axis can show.
+fn split_by_day(lanes: &Lanes, offset: i64, hours: Option<(i64, i64)>) -> DayLanes<'_> {
     let mut days = DayLanes::new();
     for (key, spans) in lanes {
         for &(start, end) in spans {
             let mut cursor = start;
             while cursor < end {
                 let day = local_day(cursor, offset);
-                let piece_end = end.min((day + 1) * DAY_SECS - offset);
-                days.entry(day)
-                    .or_default()
-                    .entry(key.as_str())
-                    .or_default()
-                    .push((cursor, piece_end));
+                let day_start = day * DAY_SECS - offset;
+                let piece_end = end.min(day_start + DAY_SECS);
+                let (lo, hi) = hours.map_or((cursor, piece_end), |(lo, hi)| {
+                    (
+                        cursor.max(day_start + lo * 3_600),
+                        piece_end.min(day_start + hi * 3_600),
+                    )
+                });
+                if hi > lo {
+                    days.entry(day)
+                        .or_default()
+                        .entry(key.as_str())
+                        .or_default()
+                        .push((lo, hi));
+                }
                 cursor = piece_end;
             }
         }
@@ -398,27 +423,29 @@ fn render_days(
     options: TimelineOptions,
     offset: i64,
     theme: CliTheme,
-) -> String {
-    let days = split_by_day(lanes, offset);
-    let (lo_hour, hi_hour) = options.hours.map_or_else(
-        || fit_hours(&days, offset),
-        |(start, end)| (i64::from(start), i64::from(end)),
-    );
+) -> Option<String> {
+    let hours = options
+        .hours
+        .map(|(start, end)| (i64::from(start), i64::from(end)));
+    let days = split_by_day(lanes, offset, hours);
+    if days.is_empty() {
+        return None;
+    }
+    let (lo_hour, hi_hour) = hours.unwrap_or_else(|| fit_hours(&days, offset));
     let span_minutes = (hi_hour - lo_hour) * 60;
     let cell = options
         .cell_minutes
         .unwrap_or_else(|| pick_cell(&DAY_CELLS, span_minutes, grid.bar_width));
     let cells = usize::try_from(ceil_div(span_minutes, cell)).unwrap_or(0);
-    let cells_per_hour = usize::try_from((60 / cell).max(1)).unwrap_or(1);
-    let marks: Vec<bool> = (0..cells).map(|i| i % cells_per_hour == 0).collect();
+    // Minute of day each cell starts at; a cell starting on the hour gets a
+    // grid mark and is a candidate for an hour label.
+    let cell_minute = |i: usize| lo_hour * 60 + i64::try_from(i).unwrap_or(0) * cell;
+    let marks: Vec<bool> = (0..cells).map(|i| cell_minute(i) % 60 == 0).collect();
     let axis = render_axis(
         cells,
         &(0..cells)
-            .step_by(cells_per_hour)
-            .map(|i| {
-                let hour = lo_hour + i64::try_from(i / cells_per_hour).unwrap_or(0);
-                (i, format!("{:02}", hour % 24))
-            })
+            .filter(|&i| marks[i])
+            .map(|i| (i, format!("{:02}", cell_minute(i) / 60 % 24)))
             .collect::<Vec<_>>(),
     );
 
@@ -464,9 +491,17 @@ fn render_days(
         }
         push_hidden(&mut rows, hidden);
     }
-    let mut out = grid.table(rows, theme);
-    let _ = writeln!(out, "\none cell = {cell} min");
-    out
+    let mut out = grid.table(rows, cells, theme);
+    let _ = writeln!(out, "\none cell = {}", cell_label(cell));
+    Some(out)
+}
+
+fn cell_label(cell: i64) -> String {
+    if cell % 60 == 0 {
+        format!("{}h", cell / 60)
+    } else {
+        format!("{cell} min")
+    }
 }
 
 fn render_range(
@@ -476,19 +511,33 @@ fn render_range(
     options: TimelineOptions,
     offset: i64,
     theme: CliTheme,
-) -> String {
+) -> Option<String> {
     let first = lanes
         .values()
         .filter_map(|spans| spans.first().map(|span| span.0))
-        .min()
-        .unwrap_or(0);
+        .min()?;
     let last = data.range.effective_end(data.now).unix_timestamp();
     // Start on the first active local day so empty leading days don't eat width.
-    let start = local_day(first, offset) * DAY_SECS - offset;
+    let mut start = local_day(first, offset) * DAY_SECS - offset;
+    let cell = options.cell_minutes.unwrap_or_else(|| {
+        pick_cell(
+            &RANGE_CELLS,
+            ceil_div((last - start).max(60), 60),
+            grid.bar_width,
+        )
+    });
+    // Even day-wide cells can outgrow the terminal: keep the most recent days
+    // that fit rather than wrapping every row.
+    let mut trimmed = false;
+    if options.cell_minutes.is_none() {
+        let fit_days = i64::try_from(grid.bar_width).unwrap_or(i64::MAX);
+        let earliest = (local_day(last - 1, offset) - fit_days + 1) * DAY_SECS - offset;
+        if cell == DAY_SECS / 60 && earliest > start {
+            start = earliest;
+            trimmed = true;
+        }
+    }
     let span_minutes = ceil_div((last - start).max(60), 60);
-    let cell = options
-        .cell_minutes
-        .unwrap_or_else(|| pick_cell(&RANGE_CELLS, span_minutes, grid.bar_width));
     let cells = usize::try_from(ceil_div(span_minutes, cell)).unwrap_or(0);
     let cell_secs = cell * 60;
     let cell_start = |i: usize| start + i64::try_from(i).unwrap_or(0) * cell_secs;
@@ -506,6 +555,20 @@ fn render_range(
             .collect::<Vec<_>>(),
     );
 
+    let lanes: Lanes = lanes
+        .iter()
+        .filter_map(|(key, spans)| {
+            let spans: Spans = spans
+                .iter()
+                .filter(|span| span.1 > start)
+                .map(|&(lo, hi)| (lo.max(start), hi))
+                .collect();
+            (span_secs(&spans) >= MIN_ROW_SECS).then(|| (key.clone(), spans))
+        })
+        .collect();
+    if lanes.is_empty() {
+        return None;
+    }
     let union = merge_spans(lanes.values().flatten().copied().collect());
     let mut rows = vec![Row {
         label: "all".to_string(),
@@ -514,7 +577,7 @@ fn render_range(
         tone: TableTone::Header,
     }];
     let mut ordered: Vec<_> = lanes.iter().collect();
-    ordered.sort_by_key(|(key, spans)| (std::cmp::Reverse(span_secs(spans)), *key));
+    ordered.sort_by_cached_key(|(key, spans)| (std::cmp::Reverse(span_secs(spans)), *key));
     let hidden = limit_rows(&mut ordered, options.limit);
     for (key, spans) in ordered {
         rows.push(Row {
@@ -529,14 +592,15 @@ fn render_range(
         });
     }
     push_hidden(&mut rows, hidden);
-    let mut out = grid.table(rows, theme);
-    let cell_label = if cell % 60 == 0 {
-        format!("{}h", cell / 60)
-    } else {
-        format!("{cell} min")
-    };
-    let _ = writeln!(out, "\none cell = {cell_label}");
-    out
+    let mut out = grid.table(rows, cells, theme);
+    let _ = writeln!(out, "\none cell = {}", cell_label(cell));
+    if trimmed {
+        let _ = writeln!(
+            out,
+            "showing the last {cells} days that fit; narrow --since to see earlier ones"
+        );
+    }
+    Some(out)
 }
 
 fn limit_rows<T>(rows: &mut Vec<T>, limit: usize) -> usize {
@@ -733,5 +797,94 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("05-28"), "{out}");
+    }
+
+    #[test]
+    fn parse_cell_only_accepts_divisors_of_a_day() {
+        assert_eq!(parse_cell("15"), Ok(15));
+        assert_eq!(parse_cell("120"), Ok(120));
+        for bad in ["0", "7", "100", "2880", "x"] {
+            assert!(parse_cell(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn multi_hour_cells_label_the_hour_they_start() {
+        let mut d = data(Vec::new());
+        d.activity_entries = vec![working(
+            "muxa",
+            datetime!(2026-05-30 10:00 UTC),
+            datetime!(2026-05-30 11:00 UTC),
+        )];
+        let mut opts = options(TimelineLayout::Day);
+        opts.hours = Some((0, 24));
+        opts.cell_minutes = Some(120);
+        let out = render_utc(&d, opts, 80);
+        // Cells start every two hours, so the label three cells in is 06, not 03.
+        assert!(out.contains("1h00m  00 06 12 18"), "{out}");
+        let muxa = out.lines().find(|l| l.starts_with("muxa  ")).unwrap();
+        assert!(muxa.ends_with("1h00m  ┊┊┊┊┊▒┊┊┊┊┊┊"), "{out}");
+    }
+
+    #[test]
+    fn hour_window_drops_rows_with_no_work_inside_it() {
+        let mut d = data(Vec::new());
+        d.activity_entries = vec![
+            working(
+                "inside",
+                datetime!(2026-05-30 10:00 UTC),
+                datetime!(2026-05-30 11:00 UTC),
+            ),
+            working(
+                "evening",
+                datetime!(2026-05-30 20:00 UTC),
+                datetime!(2026-05-30 22:00 UTC),
+            ),
+        ];
+        let mut opts = options(TimelineLayout::Day);
+        opts.hours = Some((9, 18));
+        opts.limit = 1;
+        let out = render_utc(&d, opts, 80);
+        assert!(out.lines().any(|l| l.starts_with("inside")), "{out}");
+        assert!(!out.contains("evening") && !out.contains("more"), "{out}");
+    }
+
+    #[test]
+    fn work_split_below_the_daily_floor_reports_no_work() {
+        let mut d = data(Vec::new());
+        d.activity_entries = vec![working(
+            "muxa",
+            datetime!(2026-05-29 23:59:15 UTC),
+            datetime!(2026-05-30 00:00:45 UTC),
+        )];
+        let out = render_utc(&d, options(TimelineLayout::Day), 80);
+        assert!(out.contains("no agent working time recorded"), "{out}");
+    }
+
+    #[test]
+    fn range_layout_keeps_the_latest_days_when_day_cells_overflow() {
+        let mut d = data(Vec::new());
+        d.range.since_at = None;
+        d.activity_entries = vec![
+            working(
+                "old",
+                datetime!(2026-01-10 09:00 UTC),
+                datetime!(2026-01-10 10:00 UTC),
+            ),
+            working(
+                "new",
+                datetime!(2026-05-30 09:00 UTC),
+                datetime!(2026-05-30 10:00 UTC),
+            ),
+        ];
+        let out = render_utc(&d, options(TimelineLayout::Range), 60);
+        assert!(out.contains("showing the last"), "{out}");
+        assert!(!out.contains("old"), "{out}");
+        let table: Vec<_> = out
+            .lines()
+            .filter(|l| l.starts_with("all") || l.starts_with("new"))
+            .collect();
+        assert_eq!(table.len(), 2, "{out}");
+        assert!(table.iter().all(|l| l.width() <= 60), "{out}");
     }
 }

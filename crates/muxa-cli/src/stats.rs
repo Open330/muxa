@@ -43,7 +43,11 @@ pub struct Args {
 
     /// Render a Gantt timeline of agent WORK per project (or `--group-by`
     /// session/agent) on a real clock axis. `--limit` caps rows per day.
-    #[arg(long, default_value_t = false, conflicts_with_all = ["graph", "json", "markdown"])]
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = ["graph", "json", "markdown", "format", "sort", "reverse"]
+    )]
     timeline: bool,
 
     /// Timeline layout: `day` stacks one block per day on an hour axis;
@@ -57,8 +61,9 @@ pub struct Args {
     #[arg(long, value_name = "START-END", value_parser = timeline::parse_hours, requires = "timeline")]
     hours: Option<(u8, u8)>,
 
-    /// Timeline cell width in minutes. Defaults to the finest that fits the terminal.
-    #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(i64).range(1..=1440), requires = "timeline")]
+    /// Timeline cell width in minutes; must divide a day (5, 10, 15, 30, 60,
+    /// 120, …). Defaults to the finest that fits the terminal.
+    #[arg(long, value_name = "MINUTES", value_parser = timeline::parse_cell, requires = "timeline")]
     cell: Option<i64>,
 
     /// Shortcut for `--format json`. Overrides `--format`.
@@ -1828,10 +1833,15 @@ fn add_open_session_foreground_rows(
 }
 
 fn state_transition_overlap_secs(data: &StatsData, entry: &StateTransitionEntry) -> u64 {
-    let started_at = entry.state_entered_at.unwrap_or_else(|| {
+    overlap_secs(data, transition_started_at(entry), entry.at)
+}
+
+/// When the state a transition left began: `state_entered_at`, or `at` minus
+/// the recorded duration for ledger rows written before that field existed.
+fn transition_started_at(entry: &StateTransitionEntry) -> OffsetDateTime {
+    entry.state_entered_at.unwrap_or_else(|| {
         entry.at - time::Duration::seconds(i64::try_from(entry.duration_secs).unwrap_or(i64::MAX))
-    });
-    overlap_secs(data, started_at, entry.at)
+    })
 }
 
 fn session_foreground_overlap_secs(data: &StatsData, entry: &SessionForegroundEntry) -> u64 {
@@ -1987,10 +1997,7 @@ fn attention_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInte
         if !is_attention_state(entry.from) {
             continue;
         }
-        let started_at = entry.state_entered_at.unwrap_or_else(|| {
-            entry.at
-                - time::Duration::seconds(i64::try_from(entry.duration_secs).unwrap_or(i64::MAX))
-        });
+        let started_at = transition_started_at(entry);
         let session_name = entry.session_name.clone().or_else(|| {
             entry
                 .pane

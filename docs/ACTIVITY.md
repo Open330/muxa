@@ -132,7 +132,8 @@ Each row is one project (the agent's working directory name). With
 A row is the wall-clock union of that group's WORK spans, so two agents working
 in one project at once paint one bar instead of counting twice. A cell's shade
 (`░▒▓█`) shows how much of it was covered. Background tasks such as dev
-servers are left out: they stay in Working for days.
+servers are left out: they stay in Working for days. Both rules make a row's
+time differ from the `WORK` column, which sums every agent.
 
 - `--layout day` (default) prints one block per local day on a shared hour
   axis, with projects in the order you started them. `--limit` caps rows per
@@ -141,11 +142,12 @@ servers are left out: they stay in Working for days.
   by work time, so a month of projects fits on one screen.
 - `--hours START-END` fixes the day layout's hour window; by default it fits
   the recorded work.
-- `--cell MINUTES` fixes the cell width; by default it is the finest that fits
-  the terminal.
+- `--cell MINUTES` fixes the cell width and must divide a day (5, 10, 15, 30,
+  60, 120, ...); by default it is the finest that fits the terminal. If even
+  day-wide cells do not fit, the range layout shows the most recent days.
 
 The timeline is table output only; it cannot be combined with `--graph`,
-`--json` or `--markdown`.
+`--format`, `--json`, `--markdown`, `--sort` or `--reverse`.
 
 `muxa timeline` (below) is the interactive per-agent view; `stats --timeline`
 is the per-project summary.
