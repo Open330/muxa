@@ -150,6 +150,7 @@ pub struct Reconciler<L: LivenessSource> {
     /// `Some`, read lifecycle and quota evidence even when hooks are missing.
     /// `None` (default) disables the poll.
     codex_sessions_root: Option<PathBuf>,
+    native_sessions: Option<crate::session::SharedSessionBackend>,
 }
 
 impl<L: LivenessSource> Reconciler<L> {
@@ -180,6 +181,7 @@ impl<L: LivenessSource> Reconciler<L> {
             stuck_waiting_timeout: Duration::ZERO,
             paneless_stale_timeout: Duration::ZERO,
             codex_sessions_root: None,
+            native_sessions: None,
         }
     }
 
@@ -188,6 +190,12 @@ impl<L: LivenessSource> Reconciler<L> {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    #[must_use]
+    pub fn with_native_sessions(mut self, sessions: crate::session::SharedSessionBackend) -> Self {
+        self.native_sessions = Some(sessions);
         self
     }
 
@@ -587,6 +595,11 @@ impl<L: LivenessSource> Reconciler<L> {
         };
         let store_update_us =
             u64::try_from(reconcile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if let Some(sessions) = &self.native_sessions {
+            self.store
+                .reconcile_native_surfaces(|id| sessions.session_liveness(id))
+                .await;
+        }
         let stuck_w = self
             .store
             .mark_stuck_idle_from(
@@ -827,6 +840,38 @@ mod tests {
         fn observe_panes(&self) -> PaneObservation {
             self.0.observe_panes()
         }
+    }
+
+    #[tokio::test]
+    async fn native_sessions_reconcile_even_when_pane_observation_fails() {
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "native-ghost".into(),
+                    surface: Some(crate::event::SurfaceRef {
+                        kind: crate::event::SurfaceKind::Pty,
+                        id: "pty:previous-daemon".into(),
+                        workspace: None,
+                    }),
+                    pane: None,
+                    tmux_socket: None,
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let runner = Reconciler::new(
+            store.clone(),
+            FakeLiveness::incomplete(Vec::new()),
+            Duration::from_secs(1),
+        )
+        .with_native_sessions(crate::session::PtySessionBackend::shared());
+        runner.reconcile_once().await;
+        let row = store.by_session("native-ghost").await.unwrap();
+        assert_eq!(row.state, AgentState::Stopped);
+        assert!(row.surface.is_none());
     }
 
     fn pane(id: &str) -> PaneInfo {

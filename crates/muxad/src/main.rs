@@ -222,6 +222,9 @@ async fn main() -> Result<()> {
     // spawns so the first save isn't a no-op overwrite of the file we
     // just read.
     hydrate_state(&cfg, &store).await;
+    store
+        .reconcile_native_surfaces(|id| sessions.session_liveness(id))
+        .await;
     // Capability-gated: enrichment classifies panes by foreground
     // command, which the zellij CLI baseline doesn't expose. The
     // function itself respects `caps()` so it's safe to always call;
@@ -259,7 +262,13 @@ async fn main() -> Result<()> {
     )
     .await;
     let gc_handle = spawn_gc_task(&store, &shutdown_tx);
-    let reconciler_handle = spawn_reconciler_task(&cfg, &store, &shutdown_tx, backends.clone());
+    let reconciler_handle = spawn_reconciler_task(
+        &cfg,
+        &store,
+        &shutdown_tx,
+        backends.clone(),
+        sessions.clone(),
+    );
     let binary_watch_handle = spawn_binary_watch_task(&cfg, &shutdown_tx, Arc::clone(&restart));
     // herdr event bridge (Phase 2): spawned when herdr ∈ the observed set.
     // Translates herdr's own agent-state detection into synthetic muxa rows so
@@ -2410,6 +2419,7 @@ fn spawn_reconciler_task(
     store: &muxa::SharedStore,
     shutdown_tx: &broadcast::Sender<()>,
     backends: Vec<muxa::SharedBackend>,
+    sessions: muxa::session::SharedSessionBackend,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.reconciler.enabled {
         tracing::info!("reconciler disabled by config");
@@ -2436,6 +2446,7 @@ fn spawn_reconciler_task(
         std::time::Duration::from_secs(cfg.reconciler.interval_secs),
     )
     .with_metrics(store.metrics())
+    .with_native_sessions(sessions)
     .with_stuck_working_timeout(std::time::Duration::from_secs(
         cfg.reconciler.stuck_working_timeout_secs,
     ))

@@ -547,6 +547,14 @@ doctor` reports a daemon whose version has drifted from the CLI's.
 
 ## Reconciler
 
+Native PTY references are checked against muxad's own session registry at
+startup and on each reconciler pass. A missing session clears the reference
+and stops the agent row; an exited session stops it while retaining its output
+surface for capture. Failed session observations leave rows unchanged. A
+surviving pid-tracked task remains governed by process liveness even if its old
+PTY was lost on daemon restart. `muxa prune` also checks missing PTY references,
+including when periodic reconciliation is disabled, and retains its age filter.
+
 ```toml
 [reconciler]
 enabled = true
