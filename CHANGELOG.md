@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.57] - 2026-10-11
+
 ### Added
 
 - `muxa stats --timeline` shows when each project had an agent working, on a
@@ -40,6 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Grouped sessions (two terminals on one workspace: `name` plus `name~view~N`)
+  list every pane once per member, and Muxa treated those listings as
+  separate panes. Codex threads in a grouped session failed to bind ("not
+  bound to a pane") although their prompt was on screen. Dashboard work
+  control typed a prompt or Ctrl-C into a grouped pane once per view. Share
+  pins on grouped panes always failed, work snapshots doubled runs, and fleet
+  doubled pane counts. View names were also persisted into the activity log
+  and history, where session exclusions missed them. Every place that counts,
+  matches, persists or scans panes now sees each physical pane once, named by
+  its base session.
 - Opening an empty remote or local file showed a blank page that looked like
   a failed load; it now says the file is empty.
 
@@ -4114,7 +4126,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.56...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.57...HEAD
+[0.8.57]: https://github.com/Open330/muxa/compare/v0.8.56...v0.8.57
 [0.8.56]: https://github.com/Open330/muxa/compare/v0.8.55...v0.8.56
 [0.8.55]: https://github.com/Open330/muxa/compare/v0.8.54...v0.8.55
 [0.8.54]: https://github.com/Open330/muxa/compare/v0.8.53...v0.8.54
