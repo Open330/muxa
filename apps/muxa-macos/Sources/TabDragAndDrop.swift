@@ -58,16 +58,13 @@ final class MuxaTabDragSession: ObservableObject {
         )
     }
 
-    /// Built outside the main actor: AppKit calls the load handler off the
-    /// main thread, and a handler formed in this `@MainActor` class inherits
-    /// that isolation, which the Release (whole-module) build rejects.
+    /// The payload is registered as data, not through a load handler: the
+    /// Release build types `registerDataRepresentation`'s completion as
+    /// main-actor isolated, so no handler body can call it from AppKit's
+    /// nonisolated loading context. The tab type is private to this app
+    /// (declared in AppInfo.plist), so the drag still never reads as text.
     private nonisolated static func itemProvider(payload: Data, typeIdentifier: String) -> NSItemProvider {
-        let provider = NSItemProvider()
-        provider.registerDataRepresentation(forTypeIdentifier: typeIdentifier, visibility: .ownProcess) { completion in
-            completion(payload, nil)
-            return nil
-        }
-        return provider
+        NSItemProvider(item: payload as NSData, typeIdentifier: typeIdentifier)
     }
 
     func end() {
