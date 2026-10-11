@@ -1512,6 +1512,62 @@ impl Store {
         removed
     }
 
+    /// Reconcile native PTY ownership with an authoritative session lookup.
+    /// `None` means the surface no longer exists; `Some(false)` means its
+    /// process exited but output is still available. A failed lookup is a no-op.
+    /// Lookups run under the registry lock, so a new hook cannot race cleanup.
+    pub async fn reconcile_native_surfaces<F>(&self, lookup: F) -> usize
+    where
+        F: Fn(&str) -> Result<Option<bool>, crate::session::SessionError> + Send,
+    {
+        let mut agents = self.agents.write().await;
+        let mut changed = 0;
+        for agent in agents.values_mut() {
+            let Some(surface) = agent.surface.as_ref() else {
+                continue;
+            };
+            if surface.kind != crate::event::SurfaceKind::Pty || agent.pane.is_some() {
+                continue;
+            }
+            let running = match lookup(&surface.id) {
+                Ok(Some(true)) | Err(_) => continue,
+                Ok(other) => other,
+            };
+            let missing = running.is_none();
+            if missing {
+                agent.surface = None;
+            }
+            // A surviving pid after daemon restart still owns its task row.
+            // Detach the stale surface, but leave pid liveness to its own sweep.
+            if missing && agent.pid.is_some_and(pid_alive) {
+                changed += 1;
+                continue;
+            }
+            let previous = agent.state;
+            if previous != AgentState::Stopped {
+                agent.state = AgentState::Stopped;
+                agent.state_entered_at = OffsetDateTime::now_utc();
+                agent.subagents.clear();
+                let _ = self.transitions.send(Transition {
+                    from: previous,
+                    to: agent.state,
+                    agent: Arc::new(agent.clone()),
+                });
+            }
+            if missing || previous != AgentState::Stopped {
+                // Reconciliation is not new agent activity: retain its age so
+                // an old ghost is immediately eligible for prune and GC.
+                changed += 1;
+            }
+        }
+        drop(agents);
+        if changed > 0 {
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
+        changed
+    }
+
     /// Immediately delete fully orphaned rows (no pane, surface, or pid)
     /// whose last activity predates `cutoff`. The on-demand analogue of the
     /// reconciler's `mark_stale_paneless_stopped` age-out — backs `muxa
@@ -2877,6 +2933,75 @@ mod tests {
             store.by_session("herdr-own").await.unwrap().state,
             AgentState::Stopped,
         );
+    }
+
+    #[tokio::test]
+    async fn native_surface_reconciliation_distinguishes_missing_exited_and_failed_lookups() {
+        let store = Store::shared();
+        let old = OffsetDateTime::now_utc() - time::Duration::days(2);
+        let mut rows = Vec::new();
+        for sid in ["missing", "exited", "running", "failed", "foreign", "paned"] {
+            let mut row = stored_agent(sid, AgentKind::Codex, AgentState::Idle, None);
+            row.last_activity_at = old;
+            row.pane = (sid == "paned").then(|| "%123".into());
+            row.surface = Some(SurfaceRef {
+                kind: if sid == "foreign" {
+                    crate::event::SurfaceKind::Tmux
+                } else {
+                    crate::event::SurfaceKind::Pty
+                },
+                id: sid.into(),
+                workspace: None,
+            });
+            rows.push(row);
+        }
+        store.hydrate(rows).await;
+        let lookup = |id: &str| match id {
+            "missing" => Ok(None),
+            "exited" => Ok(Some(false)),
+            "running" => Ok(Some(true)),
+            "failed" => Err(crate::session::SessionError::Pty("unavailable".into())),
+            other => panic!("must not observe another owner's surface: {other}"),
+        };
+        assert_eq!(store.reconcile_native_surfaces(lookup).await, 2);
+        let missing = store.by_session("missing").await.unwrap();
+        assert_eq!(missing.state, AgentState::Stopped);
+        assert!(missing.surface.is_none());
+        assert_eq!(missing.last_activity_at, old);
+        let exited = store.by_session("exited").await.unwrap();
+        assert_eq!(exited.state, AgentState::Stopped);
+        assert!(
+            exited.surface.is_some(),
+            "retained output remains accessible"
+        );
+        for sid in ["running", "failed", "foreign", "paned"] {
+            let row = store.by_session(sid).await.unwrap();
+            assert_eq!(row.state, AgentState::Idle);
+            assert!(row.surface.is_some());
+        }
+        assert_eq!(store.reconcile_native_surfaces(lookup).await, 0);
+        assert_eq!(store.prune_orphans(OffsetDateTime::now_utc()).await, 1);
+        assert!(store.by_session("missing").await.is_none());
+        assert!(store.by_session("failed").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn missing_native_surface_keeps_a_surviving_pid_task_alive() {
+        let store = Store::shared();
+        let mut row = stored_agent("survivor", AgentKind::Task, AgentState::Idle, None);
+        row.pane = None;
+        row.pid = Some(std::process::id());
+        row.surface = Some(SurfaceRef {
+            kind: crate::event::SurfaceKind::Pty,
+            id: "pty:old-daemon".into(),
+            workspace: None,
+        });
+        store.hydrate(vec![row]).await;
+        assert_eq!(store.reconcile_native_surfaces(|_| Ok(None)).await, 1);
+        let row = store.by_session("survivor").await.unwrap();
+        assert_eq!(row.state, AgentState::Idle);
+        assert!(row.surface.is_none());
+        assert_eq!(store.prune_orphans(OffsetDateTime::now_utc()).await, 0);
     }
 
     #[tokio::test]

@@ -384,7 +384,8 @@ enum Cmd {
     Upgrade(upgrade::Args),
     /// Delete accumulated "orphan" agent rows — paneless, surfaceless,
     /// pid-less ghosts left by remote/detached sessions (e.g. codex driven
-    /// through a detached `app-server`). Only registry rows are removed;
+    /// through a detached `app-server`), including references to missing
+    /// native PTY sessions. Only registry rows are removed;
     /// tmux sessions are never touched. The daemon also ages these out on
     /// its own after `[reconciler] paneless_stale_timeout_secs` (24h default).
     Prune {
@@ -1438,9 +1439,14 @@ async fn cmd_prune(client: &Client, older_than: &str, all: bool, yes: bool) -> R
         parse_duration_secs(older_than)?
     };
     let now = OffsetDateTime::now_utc();
-    let agents = client.snapshot().await.unwrap_or_default();
+    let agents = client.snapshot().await?;
+    let sessions = client.list_sessions().await?;
     let is_orphan = |a: &Agent| {
-        a.kind != AgentKind::Task && a.pane.is_none() && a.surface.is_none() && a.pid.is_none()
+        let missing_surface = a.surface.as_ref().is_none_or(|surface| {
+            surface.kind == muxa::event::SurfaceKind::Pty
+                && !sessions.iter().any(|session| session.id == surface.id)
+        });
+        a.kind != AgentKind::Task && a.pane.is_none() && missing_surface && a.pid.is_none()
     };
     let candidates = agents
         .iter()
@@ -3972,6 +3978,45 @@ mod tests {
     use muxa::AgentKind;
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
+
+    #[tokio::test]
+    async fn prune_command_includes_missing_native_session_in_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("prune-native.sock");
+        let store = muxa::Store::shared();
+        let server = muxa::ipc::Server::new(socket.clone(), store.clone());
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let client = Client::new(socket);
+        client
+            .ingest(&muxa::AgentEvent::Started {
+                id: muxa::AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "cal-7651-ghost".into(),
+                    surface: Some(muxa::SurfaceRef {
+                        kind: muxa::SurfaceKind::Pty,
+                        id: "pty:missing".into(),
+                        workspace: None,
+                    }),
+                    pane: None,
+                    tmux_socket: None,
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc() - time::Duration::days(2),
+            })
+            .await
+            .unwrap();
+        cmd_prune(&client, "1h", false, true).await.unwrap();
+        assert!(store.by_session("cal-7651-ghost").await.is_none());
+        shutdown.send(()).unwrap();
+        handle.await.unwrap();
+    }
 
     #[test]
     fn snapshot_restore_reload_and_upgrade_each_carry_their_own_help() {

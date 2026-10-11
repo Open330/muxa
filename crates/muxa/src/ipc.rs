@@ -3240,6 +3240,9 @@ async fn handle(
                 }
                 RequestBody::Prune { max_age_secs } => {
                     kind = "prune";
+                    store
+                        .reconcile_native_surfaces(|id| sessions.session_liveness(id))
+                        .await;
                     let cutoff = time::OffsetDateTime::now_utc()
                         - std::time::Duration::from_secs(max_age_secs);
                     let pruned = store.prune_orphans(cutoff).await;
@@ -4527,7 +4530,10 @@ async fn handle(
                 }
                 RequestBody::ListSessions => {
                     kind = "list_sessions";
-                    Response::with_sessions(sessions.list_sessions())
+                    match sessions.list_sessions_checked() {
+                        Ok(list) => Response::with_sessions(list),
+                        Err(error) => Response::err(error.to_string()),
+                    }
                 }
                 RequestBody::CaptureSession { session_id } => {
                     kind = "capture_session";
@@ -7615,6 +7621,63 @@ mod tests {
                     == Some(collaboration::CONSOLE_SESSION_ID)
         }));
 
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_clears_missing_native_surface_without_reconciler() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-prune-native.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let client = Client::new(sock);
+        for (sid, at) in [
+            (
+                "old-native",
+                OffsetDateTime::now_utc() - time::Duration::days(2),
+            ),
+            ("fresh-native", OffsetDateTime::now_utc()),
+        ] {
+            client
+                .ingest(&AgentEvent::Started {
+                    id: AgentId {
+                        kind: AgentKind::Codex,
+                        session_id: sid.into(),
+                        surface: Some(crate::event::SurfaceRef {
+                            kind: crate::event::SurfaceKind::Pty,
+                            id: format!("pty:{sid}"),
+                            workspace: None,
+                        }),
+                        pane: None,
+                        tmux_socket: None,
+                        cwd: None,
+                    },
+                    at,
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            client
+                .prune(std::time::Duration::from_secs(3600))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(store.by_session("old-native").await.is_none());
+        let fresh = store.by_session("fresh-native").await.unwrap();
+        assert!(fresh.surface.is_none());
+        assert_eq!(fresh.state, AgentState::Stopped);
+        assert_eq!(client.prune(std::time::Duration::ZERO).await.unwrap(), 1);
         tx.send(()).unwrap();
         handle.await.unwrap();
     }
