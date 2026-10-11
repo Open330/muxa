@@ -52,13 +52,19 @@ final class MuxaTabDragSession: ObservableObject {
         drag = Drag(selection: selection, sourceGroupID: groupID, owner: ObjectIdentifier(tabs))
         target = nil
         watchForRelease()
-        let provider = NSItemProvider()
-        let payload = Data(selection.tabIdentifier.utf8)
-        provider.registerDataRepresentation(forTypeIdentifier: Self.tabType.identifier, visibility: .ownProcess) { completion in
-            completion(payload, nil)
-            return nil
-        }
-        return provider
+        return Self.itemProvider(
+            payload: Data(selection.tabIdentifier.utf8),
+            typeIdentifier: Self.tabType.identifier
+        )
+    }
+
+    /// The payload is registered as data, not through a load handler: the
+    /// Release build types `registerDataRepresentation`'s completion as
+    /// main-actor isolated, so no handler body can call it from AppKit's
+    /// nonisolated loading context. The tab type is private to this app
+    /// (declared in AppInfo.plist), so the drag still never reads as text.
+    private nonisolated static func itemProvider(payload: Data, typeIdentifier: String) -> NSItemProvider {
+        NSItemProvider(item: payload as NSData, typeIdentifier: typeIdentifier)
     }
 
     func end() {
