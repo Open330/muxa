@@ -52,9 +52,18 @@ final class MuxaTabDragSession: ObservableObject {
         drag = Drag(selection: selection, sourceGroupID: groupID, owner: ObjectIdentifier(tabs))
         target = nil
         watchForRelease()
+        return Self.itemProvider(
+            payload: Data(selection.tabIdentifier.utf8),
+            typeIdentifier: Self.tabType.identifier
+        )
+    }
+
+    /// Built outside the main actor: AppKit calls the load handler off the
+    /// main thread, and a handler formed in this `@MainActor` class inherits
+    /// that isolation, which the Release (whole-module) build rejects.
+    private nonisolated static func itemProvider(payload: Data, typeIdentifier: String) -> NSItemProvider {
         let provider = NSItemProvider()
-        let payload = Data(selection.tabIdentifier.utf8)
-        provider.registerDataRepresentation(forTypeIdentifier: Self.tabType.identifier, visibility: .ownProcess) { completion in
+        provider.registerDataRepresentation(forTypeIdentifier: typeIdentifier, visibility: .ownProcess) { completion in
             completion(payload, nil)
             return nil
         }
