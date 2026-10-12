@@ -1645,24 +1645,19 @@ function renderAllSessionsTimelineSummary(summary, start, end) {
         return `<span class="timeline-segment ${esc(cls)}" style="left:${position.left}%;width:${position.width}%" title="${esc(title)}"></span>`;
       }).join("");
       return `<div class="timeline-lane">
-        <div class="timeline-label"><span>${esc(label)}</span><small>${esc(source ? sourceSummaryLabel(source) : "")}</small></div>
+        <div class="timeline-label"><span>${esc(label)}</span><small>${esc(source ? sourceSummaryLabel(source, lane.state) : "")}</small></div>
         <div class="timeline-track">${segments}</div>
       </div>`;
     }).join("") || `<div class="timeline-empty">no activity in this window</div>`}`;
 }
 
-function sourceSummaryLabel(source) {
+function sourceSummaryLabel(source, state) {
   const totals = source.totals || {};
   const suffix = `${source.sessions || 0} sessions · ${source.lanes || 0} lanes`;
   if (source.kind === "human") return `interact ${formatDuration(totals.human_secs || 0)} · ${suffix}`;
   if (source.kind === "tmux") return `tmux ${formatDuration(totals.foreground_secs || 0)} · ${suffix}`;
-  return [
-    totals.active_secs ? `act ${formatDuration(totals.active_secs)}` : "",
-    totals.working_secs ? `work ${formatDuration(totals.working_secs)}` : "",
-    totals.waiting_secs ? `wait ${formatDuration(totals.waiting_secs)}` : "",
-    totals.error_secs ? `err ${formatDuration(totals.error_secs)}` : "",
-    suffix,
-  ].filter(Boolean).join(" · ");
+  const key = state === "waiting_input" ? "waiting_secs" : `${state}_secs`;
+  return `${formatDuration(totals[key] || 0)} agent time · ${suffix}`;
 }
 
 function summaryDayBuckets(days) {
@@ -2029,7 +2024,8 @@ function renderTimelineAxis(start, end) {
   const html = Array.from({ length: ticks + 1 }, (_, i) => {
     const pct = (i / ticks) * 100;
     const at = new Date(start + (end - start) * (i / ticks));
-    return `<span style="left:${pct}%">${esc(timeLabel(at))}</span>`;
+    const label = end - start >= 86_400_000 ? dateTimeLabel(at) : timeLabel(at);
+    return `<span style="left:${pct}%">${esc(label)}</span>`;
   }).join("");
   dom.timelineAxis.innerHTML = `<div class="timeline-axis-spacer"></div><div class="timeline-axis-track">${html}</div>`;
 }
