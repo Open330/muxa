@@ -816,6 +816,12 @@ mod tests {
         assert_eq!(det.run_tick().await, 1, "drifted row is re-applied");
         assert_eq!(store.by_pane("%1").await[0].state, AgentState::Working);
         assert_eq!(det.run_tick().await, 0, "and then deduped again");
+
+        // The reconciler's stale sweep ends the row outright.
+        synthetic::stop_synthetic_row(&store, "%1").await;
+        assert_eq!(store.by_pane("%1").await[0].state, AgentState::Stopped);
+        assert_eq!(det.run_tick().await, 1, "stopped row is re-applied");
+        assert_eq!(store.by_pane("%1").await[0].state, AgentState::Working);
     }
 
     #[tokio::test]
