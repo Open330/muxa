@@ -1062,13 +1062,6 @@ mod tests {
         assert!(store.by_session("herdr-alive").await.is_some());
     }
 
-    /// Fix 4: the cross-host age-out keys off the COMPLETE-this-tick kinds, so a
-    /// chronically-incomplete host's stale rows age out (nothing else ever
-    /// reaps them) while a freshly-active row on the same host survives. tmux
-    /// answers complete; herdr times out (incomplete) every tick, so `Herdr` is
-    /// absent from `complete_kinds` and its rows are treated like a host outside
-    /// the set. A herdr row idle past the window flips to `Stopped`; a herdr row
-    /// with recent activity is spared by the last-activity threshold.
     /// One timed-out tmux scan under load used to stop every tmux row idle
     /// past the window — long-idle agents vanished from `muxa watch` while
     /// their panes were alive. A single incomplete tick must not do that.
@@ -1091,6 +1084,13 @@ mod tests {
         );
     }
 
+    /// Fix 4: a chronically-incomplete host's stale rows age out (nothing else
+    /// ever reaps them) once it has failed to answer for the whole inactivity
+    /// window, while a freshly-active row on the same host survives. tmux
+    /// answers complete; herdr times out (incomplete) every tick. Inside the
+    /// window herdr is still presumed present; past it, a herdr row idle past
+    /// the window flips to `Stopped` and a recently-active one is spared by the
+    /// last-activity threshold.
     #[tokio::test]
     async fn cross_host_ages_out_chronically_incomplete_host() {
         let store = Store::shared();
@@ -1102,7 +1102,7 @@ mod tests {
         let herdr = FakeLiveness::incomplete(Vec::new()).with_kind(HostKind::Herdr);
         let r =
             Reconciler::with_sources(store.clone(), vec![tmux, herdr], Duration::from_millis(10))
-                .with_paneless_stale_timeout(Duration::from_millis(200));
+                .with_paneless_stale_timeout(Duration::from_secs(1));
         // Inside the window herdr is still presumed present.
         r.reconcile_once().await;
         assert_eq!(
@@ -1110,7 +1110,7 @@ mod tests {
             Some(AgentState::Idle),
             "a host is not given up on before the window elapses",
         );
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
         store
             .apply(&started(
                 "herdr-fresh",
