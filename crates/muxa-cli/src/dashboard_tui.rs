@@ -1363,8 +1363,9 @@ async fn load_dashboard_data(
         .await
         .context("querying daemon agent snapshot")?;
 
-    let backend = muxa::default_backend();
-    let panes = backend.list_panes();
+    // Every active host, not only the one this shell runs in, so card labels
+    // resolve when the dashboard is opened from outside the agents' host.
+    let panes = crate::all_panes().await;
     let mut notes = Vec::new();
     let scan = muxa::tmux::scanner::scan().await;
     notes.extend(
