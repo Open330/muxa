@@ -92,6 +92,9 @@ enum Cmd {
         /// One-shot visual theme override.
         #[arg(long, value_enum, conflicts_with = "json")]
         theme: Option<ThemeArg>,
+        /// One row per agent instead of the session / window / pane tree.
+        #[arg(long, conflicts_with = "json")]
+        flat: bool,
         /// Emit a stable JSON snapshot for desktop widgets and other integrations.
         #[arg(long)]
         json: bool,
@@ -1245,7 +1248,7 @@ async fn main() -> Result<()> {
         .with_collaboration_client_kind(collaboration_client_kind(&args.cmd));
 
     match args.cmd {
-        Cmd::Status { theme, json } => cmd_status(&client, &cfg, theme, json).await,
+        Cmd::Status { theme, flat, json } => cmd_status(&client, &cfg, theme, flat, json).await,
         Cmd::StatusLine {
             pane,
             needs_attention,
@@ -3367,6 +3370,7 @@ async fn cmd_status(
     client: &Client,
     cfg: &Config,
     theme: Option<ThemeArg>,
+    flat: bool,
     json: bool,
 ) -> Result<()> {
     let agents = client.snapshot().await?;
@@ -3387,10 +3391,237 @@ async fn cmd_status(
     // shell) the agents live in rmux, and only the env-detected backend
     // would leave every row as a raw `rmux:%N`. One row per pane, so a
     // grouped session's `~view~` listing never names it.
-    let panes = muxa::tmux::canonical_panes(&all_panes().await);
+    let panes = all_panes().await;
     let theme = theme::for_config(cfg, theme, use_colors());
-    print_table(&agents, &panes, OffsetDateTime::now_utc(), theme);
+    let now = OffsetDateTime::now_utc();
+    if flat {
+        print_table(&agents, &muxa::tmux::canonical_panes(&panes), now, theme);
+        return Ok(());
+    }
+    // The same session / window / pane tree `status --json` and `watch`
+    // show, built from every host's panes (grouped `~view~` sessions fold
+    // onto their base). Row inputs are grouped by host like `--json`.
+    let mut by_host: std::collections::BTreeMap<
+        String,
+        (muxa::HostKind, Vec<muxa::tmux::PaneInfo>),
+    > = std::collections::BTreeMap::new();
+    for pane in panes {
+        let host = muxa::backend::pane_id_host_kind(&pane.pane_id).unwrap_or(muxa::HostKind::Tmux);
+        by_host
+            .entry(host.to_string())
+            .or_insert_with(|| (host, Vec::new()))
+            .1
+            .push(pane);
+    }
+    let inputs = by_host
+        .into_values()
+        .map(|(host, panes)| muxa::TopologyInput::new(host, panes))
+        .collect();
+    let topology = muxa::TopologySnapshot::build(now, inputs, agents);
+    println!(
+        "{}",
+        render_status_tree(&topology, now, theme, terminal_width())
+    );
     Ok(())
+}
+
+/// `muxa status` as a tree: each session, its windows, and the agents in
+/// their panes, with the flat table's state / age / prompt columns.
+/// Sessions and windows without an agent are left out; agents with no pane
+/// close the list. Single-agent sessions and windows collapse to one row.
+fn render_status_tree(
+    topology: &muxa::TopologySnapshot,
+    now: OffsetDateTime,
+    theme: CliTheme,
+    terminal_width: usize,
+) -> String {
+    let (mut table, layout, name_width, prompt_width) = status_tree_table(theme, terminal_width);
+    let rows = TreeRows {
+        layout,
+        name_width,
+        prompt_width,
+        theme,
+        now,
+    };
+    for session in &topology.sessions {
+        push_session_rows(&mut table, &rows, session);
+    }
+    if !topology.unassigned_agents.is_empty() {
+        table.add_row(rows.group("(no pane)", String::new()));
+        let count = topology.unassigned_agents.len();
+        for (at, agent) in topology.unassigned_agents.iter().enumerate() {
+            let name = if agent.kind == AgentKind::Task {
+                agent.session_id.clone()
+            } else {
+                crate::watch::agent_kind_short(agent.kind).to_string()
+            };
+            table.add_row(rows.agent(format!("{}{name}", branch(at, count)), agent));
+        }
+    }
+    format!("{table}")
+}
+
+/// Cell builders shared by every row of the status tree.
+struct TreeRows {
+    layout: StatusTableLayout,
+    name_width: usize,
+    prompt_width: usize,
+    theme: CliTheme,
+    now: OffsetDateTime,
+}
+
+impl TreeRows {
+    fn agent(&self, label: String, agent: &Agent) -> Vec<Cell> {
+        let state = status_state_label(agent.state, self.layout).to_string();
+        let prompt = agent
+            .last_prompt
+            .as_deref()
+            .unwrap_or("-")
+            .lines()
+            .next()
+            .unwrap_or("");
+        vec![
+            Cell::new(truncate_cell(&label, self.name_width)),
+            status_state_cell(&state, agent.state, self.theme),
+            self.theme.right_cell(
+                truncate_cell(&relative_time(self.now, agent.last_activity_at), 7),
+                TableTone::Dim,
+            ),
+            Cell::new(truncate_cell(prompt, self.prompt_width)),
+        ]
+    }
+
+    fn group(&self, label: &str, summary: String) -> Vec<Cell> {
+        vec![
+            self.theme
+                .cell(truncate_cell(label, self.name_width), TableTone::Header),
+            Cell::new(""),
+            Cell::new(""),
+            self.theme
+                .cell(truncate_cell(&summary, self.prompt_width), TableTone::Dim),
+        ]
+    }
+
+    fn label(&self, label: &str) -> Vec<Cell> {
+        vec![
+            Cell::new(truncate_cell(label, self.name_width)),
+            Cell::new(""),
+            Cell::new(""),
+            Cell::new(""),
+        ]
+    }
+}
+
+fn branch(at: usize, count: usize) -> &'static str {
+    if at + 1 == count {
+        "└─ "
+    } else {
+        "├─ "
+    }
+}
+
+/// One session's rows. A session with one agent is a single row; with one
+/// window its agents hang off the session; a window with one agent carries
+/// it on the window's own row.
+fn push_session_rows(table: &mut Table, rows: &TreeRows, session: &muxa::SessionNode) {
+    let kind = |agent: &Agent| crate::watch::agent_kind_short(agent.kind);
+    let windows: Vec<_> = session
+        .windows
+        .iter()
+        .filter_map(|window| {
+            let agents: Vec<_> = window
+                .panes
+                .iter()
+                .filter_map(|pane| pane.agent.as_ref().map(|agent| (pane, agent)))
+                .collect();
+            (!agents.is_empty()).then_some((window, agents))
+        })
+        .collect();
+    match windows.as_slice() {
+        [] => {}
+        [(_, agents)] if agents.len() == 1 => {
+            let agent = agents[0].1;
+            table.add_row(rows.agent(format!("{} · {}", session.name, kind(agent)), agent));
+        }
+        [(_, agents)] => {
+            table.add_row(rows.group(&session.name, state_summary(&session.states)));
+            for (at, (pane, agent)) in agents.iter().enumerate() {
+                let label = format!("{}{} {}", branch(at, agents.len()), pane.index, kind(agent));
+                table.add_row(rows.agent(label, agent));
+            }
+        }
+        _ => {
+            table.add_row(rows.group(&session.name, state_summary(&session.states)));
+            for (window_at, (window, agents)) in windows.iter().enumerate() {
+                let window_branch = branch(window_at, windows.len());
+                let window_label = format!("{window_branch}{}:{}", window.index, window.name);
+                if let [(_, agent)] = agents.as_slice() {
+                    table.add_row(rows.agent(format!("{window_label} · {}", kind(agent)), agent));
+                    continue;
+                }
+                table.add_row(rows.label(&window_label));
+                let indent = if window_at + 1 == windows.len() {
+                    "   "
+                } else {
+                    "│  "
+                };
+                for (at, (pane, agent)) in agents.iter().enumerate() {
+                    let label = format!(
+                        "{indent}{}{} {}",
+                        branch(at, agents.len()),
+                        pane.index,
+                        kind(agent)
+                    );
+                    table.add_row(rows.agent(label, agent));
+                }
+            }
+        }
+    }
+}
+
+/// The status table with NAME widened for tree prefixes: returns the table,
+/// its layout, and the NAME and prompt widths its rows must truncate to.
+fn status_tree_table(
+    theme: CliTheme,
+    terminal_width: usize,
+) -> (Table, StatusTableLayout, usize, usize) {
+    let layout = status_table_layout(terminal_width);
+    // Give the prefixes room from the prompt so window names stay readable.
+    let widen = TREE_NAME_EXTRA.min(status_prompt_width(terminal_width, layout).saturating_sub(16));
+    let prompt_width = status_prompt_width(terminal_width, layout) - widen;
+    let name_width = match layout {
+        StatusTableLayout::Full => 24,
+        StatusTableLayout::Compact => 18,
+        StatusTableLayout::Minimal => 14,
+    } + widen;
+    let mut constraints = status_table_constraints(layout, prompt_width);
+    constraints[0] =
+        ColumnConstraint::Absolute(Width::Fixed(u16::try_from(name_width).unwrap_or(u16::MAX)));
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_BORDERS_ONLY)
+        .set_content_arrangement(ContentArrangement::Disabled)
+        .set_constraints(constraints)
+        .set_header(status_table_header(layout, prompt_width, theme));
+    (table, layout, name_width, prompt_width)
+}
+
+/// Extra NAME columns in tree mode, for the `│  ├─ ` prefixes.
+const TREE_NAME_EXTRA: usize = 8;
+
+fn state_summary(states: &muxa::StateDistribution) -> String {
+    let waiting = states.waiting_input + states.waiting_choice;
+    [
+        (states.working, "working"),
+        (waiting, "waiting"),
+        (states.error, "error"),
+        (states.idle, "idle"),
+    ]
+    .iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, label)| format!("{count} {label}"))
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 fn status_json(
@@ -5362,10 +5593,18 @@ mod tests {
             args.cmd,
             Cmd::Status {
                 json: true,
-                theme: None
+                theme: None,
+                flat: false,
             }
         ));
         assert!(Args::try_parse_from(["muxa", "status", "--json", "--theme", "minimal"]).is_err());
+        assert!(matches!(
+            Args::try_parse_from(["muxa", "status", "--flat"])
+                .unwrap()
+                .cmd,
+            Cmd::Status { flat: true, .. }
+        ));
+        assert!(Args::try_parse_from(["muxa", "status", "--json", "--flat"]).is_err());
     }
 
     #[test]
@@ -5565,6 +5804,107 @@ mod tests {
         assert_eq!(truncate_cell("short", 10), "short");
         assert_eq!(truncate_cell("0123456789abc", 8), "01234...");
         assert_eq!(truncate_cell("한글테스트입니다", 6), "한...");
+    }
+
+    /// `muxa status` nests agents under their window and session, folds a
+    /// grouped `~view~` session onto its base, and lists paneless agents last.
+    #[test]
+    fn status_tree_groups_agents_by_session_and_window() {
+        let pane = |id: &str, session: &str, session_id: &str, window: &str, index: &str| {
+            serde_json::from_value::<muxa::tmux::PaneInfo>(serde_json::json!({
+                "pane_id": id, "session": session, "session_id": session_id,
+                "session_group": "callabo", "window_id": format!("@{window}"),
+                "window_name": format!("w{window}"), "window_index": window,
+                "pane_index": index, "tty": "", "current_command": "aas", "title": "",
+                "pane_pid": 0, "socket": "default"
+            }))
+            .unwrap()
+        };
+        let panes = vec![
+            pane("%1", "callabo", "$1", "0", "0"),
+            pane("%1", "callabo~view~9", "$9", "0", "0"),
+            pane("%2", "callabo", "$1", "1", "0"),
+            pane("%3", "callabo", "$1", "1", "1"),
+        ];
+        let mut agents = vec![
+            agent("a", Some("%1"), AgentState::Working, "first task"),
+            agent("b", Some("%2"), AgentState::Idle, "second"),
+            agent("c", Some("%3"), AgentState::WaitingInput, "third"),
+            agent("d", None, AgentState::Idle, "background"),
+        ];
+        for a in &mut agents {
+            a.tmux_socket = a.pane.as_ref().map(|_| "default".to_owned());
+        }
+        let now = OffsetDateTime::now_utc();
+        let topology = muxa::TopologySnapshot::build(
+            now,
+            vec![muxa::TopologyInput::new(muxa::HostKind::Tmux, panes)],
+            agents,
+        );
+        let rendered = render_status_tree(&topology, now, CliTheme::plain(), 120);
+        let lines: Vec<&str> = rendered
+            .lines()
+            .map(|line| line.strip_prefix("│ ").unwrap_or(line).trim_end())
+            .collect();
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} missing:\n{rendered}"))
+        };
+        assert!(!rendered.contains("~view~"), "{rendered}");
+        assert!(lines[at("callabo")].contains("1 working · 1 waiting · 1 idle"));
+        // A window with one agent carries it on its own line.
+        assert!(at("callabo") < at("├─ 0:w0 · claude"));
+        assert!(lines[at("├─ 0:w0 · claude")].contains("first task"));
+        assert!(at("├─ 0:w0 · claude") < at("└─ 1:w1"));
+        assert!(at("└─ 1:w1") < at("   ├─ 0 claude"));
+        assert!(at("   ├─ 0 claude") < at("   └─ 1 claude"));
+        assert!(at("└─ 1:w1") < at("(no pane)"));
+        assert!(lines[at("(no pane)") + 1].contains("background"));
+    }
+
+    /// One agent in a session is one line; one window drops its row.
+    #[test]
+    fn status_tree_collapses_single_window_and_single_agent_sessions() {
+        let pane = |id: &str, session: &str, index: &str| {
+            serde_json::from_value::<muxa::tmux::PaneInfo>(serde_json::json!({
+                "pane_id": id, "session": session, "session_id": format!("${session}"),
+                "window_id": format!("@{session}"), "window_name": "zsh",
+                "window_index": "0", "pane_index": index, "tty": "",
+                "current_command": "aas", "title": "", "pane_pid": 0, "socket": "default"
+            }))
+            .unwrap()
+        };
+        let panes = vec![
+            pane("%1", "solo", "0"),
+            pane("%2", "pair", "0"),
+            pane("%3", "pair", "1"),
+        ];
+        let mut agents = vec![
+            agent("a", Some("%1"), AgentState::Idle, "solo prompt"),
+            agent("b", Some("%2"), AgentState::Working, "left"),
+            agent("c", Some("%3"), AgentState::Idle, "right"),
+        ];
+        for a in &mut agents {
+            a.tmux_socket = Some("default".to_owned());
+        }
+        let now = OffsetDateTime::now_utc();
+        let topology = muxa::TopologySnapshot::build(
+            now,
+            vec![muxa::TopologyInput::new(muxa::HostKind::Tmux, panes)],
+            agents,
+        );
+        let rendered = render_status_tree(&topology, now, CliTheme::plain(), 120);
+        let lines: Vec<&str> = rendered.lines().collect();
+        let solo: Vec<_> = lines.iter().filter(|l| l.contains("solo")).collect();
+        assert_eq!(solo.len(), 1, "{rendered}");
+        assert!(solo[0].contains("solo · claude") && solo[0].contains("solo prompt"));
+        assert!(
+            !rendered.contains("0:zsh"),
+            "single windows drop their row:\n{rendered}"
+        );
+        assert!(rendered.contains("├─ 0 claude") && rendered.contains("└─ 1 claude"));
     }
 
     #[test]

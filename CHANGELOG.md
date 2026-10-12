@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `muxa status` shows agents as a session / window / pane tree, like
+  `muxa watch`, with each session's state counts. Grouped `~view~` sessions
+  fold onto their base, and paneless agents are listed last. `--flat` keeps
+  the previous one-row-per-agent table; `--json` is unchanged.
+
+### Fixed
+
+- Run from a plain terminal or a tmux shell, `muxa status` listed agents
+  living in rmux as raw `rmux:%N` ids. `status`, `dashboard` and `attend` now
+  name panes from every active host, matched to the agent's server. When no
+  live listing exists they fall back to the session muxad recorded. `muxa
+  sync` discovers agents on every active host.
+
 ## [0.8.57] - 2026-10-11
 
 ### Added

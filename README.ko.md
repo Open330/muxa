@@ -234,7 +234,7 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 
 | Command | 목적 |
 | --- | --- |
-| `muxa status [--json]` | 추적 중인 agent 테이블 또는 desktop integration용 versioned JSON snapshot. |
+| `muxa status [--flat\|--json]` | 추적 중인 agent를 session / window / pane 트리로 보여 줌(`--flat`: agent당 한 줄), 또는 desktop integration용 versioned JSON snapshot. |
 | `muxa watch [--view session\|window\|pane]` | workspace → work → agent live TUI picker/dashboard. |
 | `muxa dashboard [--since today]` | Run capture와 agent별/Work 일괄 prompt·abort, ACT/WACT total을 보여주는 Work-card TUI. |
 | `muxa attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |
