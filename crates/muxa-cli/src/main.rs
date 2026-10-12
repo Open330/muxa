@@ -2315,8 +2315,9 @@ fn key_to_pty_input(key: crossterm::event::KeyEvent) -> Option<String> {
 async fn cmd_attend(client: &Client, args: attend::Args) -> Result<()> {
     // Enumerate panes across every active host so a herdr agent that needs
     // a human is jumpable from a tmux-primary shell (and vice versa). The
-    // jump itself dispatches per-row in `jump_to_pane`.
-    let panes = all_panes().await;
+    // jump itself dispatches per-row in `jump_to_pane`. One row per pane, so
+    // the queue never labels a grouped pane by a `~view~` client session.
+    let panes = muxa::tmux::canonical_panes(&all_panes().await);
     if let Some(target) = attend::run(client, panes, args).await? {
         if muxa::backend::pane_id_host_kind(&target.pane) == Some(muxa::HostKind::Cmux) {
             let backend = target.endpoint.map_or_else(
