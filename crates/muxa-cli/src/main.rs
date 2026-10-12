@@ -2315,8 +2315,9 @@ fn key_to_pty_input(key: crossterm::event::KeyEvent) -> Option<String> {
 async fn cmd_attend(client: &Client, args: attend::Args) -> Result<()> {
     // Enumerate panes across every active host so a herdr agent that needs
     // a human is jumpable from a tmux-primary shell (and vice versa). The
-    // jump itself dispatches per-row in `jump_to_pane`.
-    let panes = all_panes().await;
+    // jump itself dispatches per-row in `jump_to_pane`. One row per pane, so
+    // the queue never labels a grouped pane by a `~view~` client session.
+    let panes = muxa::tmux::canonical_panes(&all_panes().await);
     if let Some(target) = attend::run(client, panes, args).await? {
         if muxa::backend::pane_id_host_kind(&target.pane) == Some(muxa::HostKind::Cmux) {
             let backend = target.endpoint.map_or_else(
@@ -2335,13 +2336,22 @@ async fn cmd_attend(client: &Client, args: attend::Args) -> Result<()> {
 async fn cmd_sync(client: &Client) -> Result<()> {
     use std::fmt::Write as _;
 
-    // Each CLI invocation builds its own backend so `MUXA_HOST` etc.
-    // resolve at the user's environment rather than the daemon's
-    // (which may have been started under a different shell).
-    let backend = muxa::default_backend();
-    let report = discovery::run_discovery(client, backend.as_ref())
-        .await
-        .context("running discovery")?;
+    // Each CLI invocation resolves hosts in the user's environment rather
+    // than the daemon's (which may have been started under a different
+    // shell) — every active host, so a sync from a plain terminal or a tmux
+    // shell still finds agents running in rmux.
+    let mut report = discovery::DiscoveryReport::default();
+    for backend in muxa::active_backends() {
+        let found = discovery::run_discovery(client, backend.as_ref())
+            .await
+            .context("running discovery")?;
+        report.claude_code += found.claude_code;
+        report.codex += found.codex;
+        report.gemini_cli += found.gemini_cli;
+        report.antigravity += found.antigravity;
+        report.skipped_known += found.skipped_known;
+        report.failed += found.failed;
+    }
 
     // Build the kind breakdown only for non-zero counts so the line stays
     // readable when only one agent kind is present.
@@ -3371,13 +3381,13 @@ async fn cmd_status(
         println!("no active agents");
         return Ok(());
     }
-    // Resolve the full pane inventory once via the active backend so
-    // `pane_display` does N lookups against a slice instead of N
-    // backend calls. Empty on backends without pane metadata (zellij
-    // CLI without the WASM plugin) — table still renders, just with
-    // raw pane ids in the location column.
-    let backend = muxa::default_backend();
-    let panes = backend.list_panes();
+    // Resolve the full pane inventory once so `pane_display` does N lookups
+    // against a slice instead of N backend calls. Every active host, not
+    // just the one this shell runs in: from a plain terminal (or a tmux
+    // shell) the agents live in rmux, and only the env-detected backend
+    // would leave every row as a raw `rmux:%N`. One row per pane, so a
+    // grouped session's `~view~` listing never names it.
+    let panes = muxa::tmux::canonical_panes(&all_panes().await);
     let theme = theme::for_config(cfg, theme, use_colors());
     print_table(&agents, &panes, OffsetDateTime::now_utc(), theme);
     Ok(())
@@ -3732,9 +3742,27 @@ pub(crate) fn pane_display(a: &Agent, panes: &[muxa::tmux::PaneInfo]) -> String 
         }
         return "-".to_string();
     };
-    match panes.iter().find(|p| p.pane_id == raw) {
-        Some(p) => format!("{}:{}.{}", p.session, p.window_index, p.pane_index),
-        None => raw.to_string(),
+    // Pane ids repeat across servers; when the row names its server, only
+    // that server's pane is this one.
+    let located = panes.iter().find(|p| {
+        p.pane_id == raw
+            && match (a.tmux_socket.as_deref(), p.socket.as_deref()) {
+                (Some(agent), Some(pane)) => {
+                    muxa::backend::pane_endpoints_match(Some(raw), agent, pane)
+                }
+                _ => true,
+            }
+    });
+    match (located, a.tmux_session.as_deref()) {
+        (Some(p), _) => format!("{}:{}.{}", p.session, p.window_index, p.pane_index),
+        // No live listing (host unreachable from this shell): the session
+        // the daemon recorded still says where the agent is.
+        (None, Some(session)) if !session.is_empty() => format!(
+            "{}:{}",
+            muxa::tmux::base_session_name(session),
+            raw.rsplit(':').next().unwrap_or(raw)
+        ),
+        (None, _) => raw.to_string(),
     }
 }
 
@@ -5548,6 +5576,33 @@ mod tests {
         // ...while other paneless agents (e.g. SDK sessions) still show "-".
         let sdk = agent("sdk-1", None, AgentState::Idle, "");
         assert_eq!(pane_display(&sdk, &[]), "-");
+    }
+
+    /// `muxa status` from a plain terminal, where the live listing lacks the
+    /// agents' host: the recorded session still names them, and a pane id
+    /// on another server is never taken for this one.
+    #[test]
+    fn pane_display_matches_the_server_and_falls_back_to_the_session() {
+        let mut agent = agent("cx", Some("rmux:%2"), AgentState::Idle, "");
+        agent.tmux_socket = Some("/tmp/rmux-1/default".into());
+        agent.tmux_session = Some("callabo~view~7".into());
+        assert_eq!(pane_display(&agent, &[]), "callabo:%2");
+
+        let pane = |socket: &str, session: &str| -> muxa::tmux::PaneInfo {
+            serde_json::from_value(serde_json::json!({
+                "pane_id": "rmux:%2", "session": session, "window_index": "2",
+                "pane_index": "0", "tty": "", "current_command": "aas", "title": "",
+                "pane_pid": 0, "socket": socket
+            }))
+            .unwrap()
+        };
+        let panes = [
+            pane("/tmp/rmux-9/other", "elsewhere"),
+            pane("/tmp/rmux-1/default", "callabo"),
+        ];
+        assert_eq!(pane_display(&agent, &panes), "callabo:2.0");
+        agent.tmux_session = None;
+        assert_eq!(pane_display(&agent, &panes[..1]), "rmux:%2");
     }
 
     #[test]
