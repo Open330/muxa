@@ -41,8 +41,11 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use muxa::screen::{AgentManifest, ManifestSet, ScreenState};
+use muxa::state::SYNTHETIC_SESSION_PREFIX;
 use muxa::tmux::PaneInfo;
-use muxa::{AgentId, AgentKind, Config, HostKind, PaneBackend, SharedBackend, SharedStore};
+use muxa::{
+    AgentId, AgentKind, AgentState, Config, HostKind, PaneBackend, SharedBackend, SharedStore,
+};
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
 use tokio::task::spawn_blocking;
@@ -86,6 +89,30 @@ fn selecting_kind(registry: Option<AgentKind>, discovered: Option<AgentKind>) ->
     registry
         .filter(|kind| *kind != AgentKind::Unknown)
         .or(discovered)
+}
+
+/// Whether a synthetic row on the pane already shows `screen`. `last_state`
+/// remembers what we last classified, not what the registry holds now: other
+/// writers move a synthetic row behind our back — the reconciler's stale sweep
+/// flips it to `Stopped`, `muxa sync` re-mints it as `Idle` — and a pane that
+/// stays on one screen would then never be re-applied.
+fn synthetic_row_shows(occupants: &[muxa::Agent], screen: ScreenState) -> bool {
+    occupants.iter().any(|agent| {
+        agent.session_id.starts_with(SYNTHETIC_SESSION_PREFIX)
+            && screen_state_matches(screen, agent.state)
+    })
+}
+
+/// Whether a stored row already reflects a screen classification, using the
+/// same mapping [`synthetic::state_events`] applies.
+fn screen_state_matches(screen: ScreenState, stored: AgentState) -> bool {
+    match screen {
+        ScreenState::Working => stored == AgentState::Working,
+        ScreenState::Blocked => {
+            matches!(stored, AgentState::WaitingInput | AgentState::WaitingChoice)
+        }
+        ScreenState::Idle => stored == AgentState::Idle,
+    }
 }
 
 /// Build the synthetic [`AgentId`] for a screen-detected pane. Uses the SAME
@@ -350,7 +377,7 @@ impl ScreenDetector {
             return recap_changed;
         };
 
-        if self.last_state.get(&pane_id) == Some(&state) {
+        if self.already_applied(&pane_id, state, &ownership, &occupants) {
             return recap_changed; // no state change since last capture
         }
         self.last_state.insert(pane_id.clone(), state);
@@ -398,6 +425,22 @@ impl ScreenDetector {
         synthetic::apply_if_unowned(&self.store, &pane_id, &events).await;
         self.tracked.insert(pane_id);
         true
+    }
+
+    /// The pane still shows what we last ingested for it. An attention-blind
+    /// hook row is deliberately not mirrored, so only our memory counts there;
+    /// a synthetic row must also still show `state` (see
+    /// [`synthetic_row_shows`]).
+    fn already_applied(
+        &self,
+        pane_id: &str,
+        state: ScreenState,
+        ownership: &synthetic::PaneOwnership,
+        occupants: &[muxa::Agent],
+    ) -> bool {
+        self.last_state.get(pane_id) == Some(&state)
+            && (matches!(ownership, synthetic::PaneOwnership::AttentionBlind { .. })
+                || synthetic_row_shows(occupants, state))
     }
 
     /// Capture one pane on the given backend, off the async runtime.
@@ -739,6 +782,40 @@ mod tests {
             AgentState::WaitingInput,
             "state unchanged by an unrecognized screen",
         );
+    }
+
+    /// The live failure: a Codex pane kept showing `Working (13m • esc to
+    /// interrupt)` while `muxa watch` said `idle`, because `muxa sync` (or the
+    /// reconciler's stale sweep) rewrote the synthetic row and the unchanged
+    /// screen was deduped against our own memory instead of the registry.
+    #[tokio::test]
+    async fn reapplies_an_unchanged_screen_after_the_row_is_rewritten() {
+        let captures = Arc::new(Mutex::new(HashMap::new()));
+        captures
+            .lock()
+            .unwrap()
+            .insert("%1".into(), "⠋ Thinking\nesc to interrupt".into());
+        let candidate = pane("%1", "cursor-agent");
+        let backend: SharedBackend =
+            Arc::new(FakeBackend::tmux(vec![candidate.clone()], captures.clone()));
+        let store = Store::shared();
+        let mut det = detector(vec![backend], store.clone());
+        assert_eq!(det.run_tick().await, 1);
+
+        for ev in synthetic::state_events(
+            synthetic_id(&candidate),
+            SyntheticState::Idle,
+            "cursor",
+            None,
+            AT,
+        ) {
+            store.apply(&ev).await;
+        }
+        assert_eq!(store.by_pane("%1").await[0].state, AgentState::Idle);
+
+        assert_eq!(det.run_tick().await, 1, "drifted row is re-applied");
+        assert_eq!(store.by_pane("%1").await[0].state, AgentState::Working);
+        assert_eq!(det.run_tick().await, 0, "and then deduped again");
     }
 
     #[tokio::test]
