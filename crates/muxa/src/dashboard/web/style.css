@@ -1054,6 +1054,11 @@ button, select {
   background: var(--border);
 }
 
+.timeline-axis-track span:first-child { transform: translateX(0); }
+.timeline-axis-track span:last-child { transform: translateX(-100%); }
+.timeline-axis-track span:first-child::after { left: 0; }
+.timeline-axis-track span:last-child::after { left: 100%; }
+
 .timeline-body {
   min-width: 860px;
   display: flex;
