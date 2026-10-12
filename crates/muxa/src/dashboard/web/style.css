@@ -3187,3 +3187,9 @@ table.data td.pane-cell .crumbs { flex-wrap: nowrap; white-space: nowrap; }
 .pane-tile-head,
 .pane-tile-cwd,
 .pane-tile-prompt { flex: 0 0 auto; }
+
+/* Collaboration history grouped by its durable tmux session. */
+.collaboration-session-group { display: grid; gap: .4rem; padding: .55rem 0; }
+.collaboration-session-select { display: flex; align-items: baseline; gap: .65rem; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.collaboration-session-select span { font-size: .75rem; opacity: .7; }
+.collaboration-session-rooms { display: flex; flex-wrap: wrap; gap: .35rem; }

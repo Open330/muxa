@@ -1,3 +1,4 @@
+import { baseSessionName } from "./session-model.mjs";
 // Pure collaboration projections used by the dashboard graph and sequence
 // views. Keeping this module DOM-free makes the identity and aggregation rules
 // independently testable without adding a frontend build step.
@@ -50,7 +51,7 @@ export function roomKey(room) {
 export function roomLabel(request) {
   const participant = requestAnchor(request);
   const room = participant.room || {};
-  const session = participant.tmux_session_name || participant.tmux_session_id || room.host || "host";
+  const session = baseSessionName(participant.tmux_session_name) || participant.tmux_session_id || room.host || "host";
   const window = participant.window_name || room.window_id || "room";
   const socket = room.socket ? ` · ${shortSocket(room.socket)}` : "";
   return `${session}:${window}${socket}`;
@@ -148,6 +149,8 @@ export function projectCollaboration(requests) {
         key: room,
         room: requestAnchor(request)?.room || null,
         label: roomLabel(request),
+        session: baseSessionName(requestAnchor(request)?.tmux_session_name),
+        socket: requestAnchor(request)?.socket || requestAnchor(request)?.room?.socket || "",
         count: 0,
         latestAt: request.created_at || "",
       });
@@ -245,7 +248,7 @@ export function participantSession(participant, resolvePane = () => null) {
   const live = resolvePane(participant.pane, socket);
   if (live) return live;
   const name = participant.tmux_session_name;
-  return name ? { session: name, socket: socket ? shortSocket(socket) : null } : null;
+  return name ? { session: baseSessionName(name), socket: socket ? shortSocket(socket) : null } : null;
 }
 
 /// Requests inside a rail scope (`{ session, socket, workspace }` from
@@ -265,7 +268,7 @@ export function scopeCollaborationRequests(requests, scope, resolvePane = () => 
   }
   const inScope = (participant) => {
     const hit = participantSession(participant, resolvePane);
-    if (!hit || hit.session !== scope.session) return false;
+    if (!hit || baseSessionName(hit.session) !== baseSessionName(scope.session)) return false;
     return !scope.socket || !hit.socket || hit.socket === shortSocket(scope.socket);
   };
   return all.filter((request) => inScope(request?.from) || inScope(request?.to));

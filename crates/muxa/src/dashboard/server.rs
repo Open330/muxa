@@ -834,6 +834,8 @@ struct CollaborationHttpQuery {
     status: Option<String>,
     /// URL-encoded JSON `RoomId`, e.g. `{"host":"tmux","window_id":"@1"}`.
     room: Option<String>,
+    session: Option<String>,
+    socket: Option<String>,
     limit: Option<String>,
     /// Opaque keyset token returned as `pagination.next_cursor`.
     cursor: Option<String>,
@@ -977,7 +979,8 @@ fn collaboration_query_from_http(
                 .transpose()?,
             room,
             tmux_session_id: None,
-            tmux_session_name: None,
+            tmux_session_name: non_empty_collaboration_filter("session", http.session)?,
+            tmux_socket: non_empty_collaboration_filter("socket", http.socket)?,
             limit: Some(limit),
             cursor: http
                 .cursor
@@ -1168,7 +1171,13 @@ struct PanesResponse {
 async fn panes_handler(State(state): State<AppState>) -> impl IntoResponse {
     let result = state.refresh_pane_scan().await;
     Json(PanesResponse {
-        panes: result.panes,
+        panes: crate::tmux::canonical_panes(&result.panes)
+            .into_iter()
+            .map(|mut pane| {
+                pane.session = crate::tmux::base_session_name(&pane.session).to_string();
+                pane
+            })
+            .collect(),
         errors: result.errors,
         fetched_at: result.fetched_at,
     })
@@ -2338,6 +2347,7 @@ struct TimelineSummary {
     days: Vec<TimelineDaySummary>,
     sources: Vec<TimelineSourceSummary>,
     human_presence_secs: u64,
+    overview: Vec<timeline::TimelineOverviewLane>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2630,6 +2640,7 @@ fn build_timeline_summary_response(
             })
             .collect(),
         human_presence_secs: projection.human_presence_secs,
+        overview: projection.overview,
     };
     TimelineSummaryResponse {
         generated_at: projection.generated_at,
