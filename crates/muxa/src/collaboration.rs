@@ -858,6 +858,8 @@ pub struct CollaborationQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_session_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_socket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<CollaborationCursor>,
@@ -1412,6 +1414,43 @@ fn request_access_clause(
     }
 }
 
+fn append_session_query_filters(
+    connection: &Connection,
+    query: &CollaborationQuery,
+    clauses: &mut Vec<String>,
+    values: &mut Vec<Value>,
+) -> Result<(), CollaborationError> {
+    if let Some(name) = &query.tmux_session_name {
+        // Include retained records made through a numeric client view, while
+        // keeping the filter before pagination/counting and index-backed.
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT anchor_tmux_session_name FROM collaboration_requests WHERE anchor_tmux_session_name IS NOT NULL",
+        )?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|candidate| {
+                crate::tmux::base_session_name(candidate) == crate::tmux::base_session_name(name)
+            })
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            clauses.push("0".to_string());
+        } else {
+            clauses.push(format!(
+                "anchor_tmux_session_name IN ({})",
+                vec!["?"; names.len()].join(",")
+            ));
+            values.extend(names.into_iter().map(Value::Text));
+        }
+    }
+    if let Some(socket) = &query.tmux_socket {
+        clauses.push("(CASE WHEN json_extract(payload, '$.from.console') THEN COALESCE(to_socket, to_room_socket) ELSE COALESCE(from_socket, from_room_socket) END) = ?".to_string());
+        values.push(Value::Text(socket.clone()));
+    }
+    Ok(())
+}
+
 fn query_database(
     path: &Path,
     caller: &Participant,
@@ -1435,13 +1474,13 @@ fn query_database(
         ("thread_id", query.thread_id.as_ref()),
         ("parent_request_id", query.parent_request_id.as_ref()),
         ("anchor_tmux_session_id", query.tmux_session_id.as_ref()),
-        ("anchor_tmux_session_name", query.tmux_session_name.as_ref()),
     ] {
         if let Some(value) = value {
             clauses.push(format!("{column} = ?"));
             values.push(Value::Text(value.clone()));
         }
     }
+    append_session_query_filters(&connection, query, &mut clauses, &mut values)?;
     if let Some(kind) = query.kind {
         clauses.push("kind = ?".to_string());
         values.push(Value::Text(request_kind_name(kind).to_string()));
@@ -1577,7 +1616,20 @@ fn request_matches_query(request: &CollaborationRequest, query: &CollaborationQu
             .as_ref()
             .is_none_or(|session_id| session_anchor.tmux_session_id.as_ref() == Some(session_id))
         && query.tmux_session_name.as_ref().is_none_or(|session_name| {
-            session_anchor.tmux_session_name.as_ref() == Some(session_name)
+            session_anchor
+                .tmux_session_name
+                .as_deref()
+                .is_some_and(|name| {
+                    crate::tmux::base_session_name(name)
+                        == crate::tmux::base_session_name(session_name)
+                })
+        })
+        && query.tmux_socket.as_ref().is_none_or(|socket| {
+            session_anchor
+                .socket
+                .as_ref()
+                .or(session_anchor.room.socket.as_ref())
+                == Some(socket)
         })
 }
 
@@ -5918,6 +5970,75 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // one scenario proves the indexed filters and cursor boundary together
+    async fn session_scope_filters_client_views_and_socket_before_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        for database in [false, true] {
+            let mailbox = CollaborationStore::load(CollaborationOptions {
+                path: database.then(|| dir.path().join("session-scope.sqlite3")),
+                ..CollaborationOptions::default()
+            })
+            .await
+            .unwrap();
+            let caller = Participant::console(participant("%0", "caller").room);
+            for (name, socket) in [
+                ("callabo", "default"),
+                ("callabo~view~123", "default"),
+                ("junia", "default"),
+                ("callabo", "other"),
+            ] {
+                let mut from = participant("%1", &format!("sender-{name}-{socket}"));
+                from.tmux_session_name = Some(name.into());
+                from.socket = Some(socket.into());
+                from.room.socket = Some(socket.into());
+                let mut to = from.clone();
+                to.pane = "%2".into();
+                to.agent_session_id = format!("receiver-{name}-{socket}");
+                mailbox
+                    .create(
+                        from,
+                        to,
+                        NewRequest {
+                            body: "scope test".into(),
+                            ..NewRequest::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let query = CollaborationQuery {
+                tmux_session_name: Some("callabo".into()),
+                tmux_socket: Some("default".into()),
+                limit: Some(1),
+                ..CollaborationQuery::default()
+            };
+            let page = mailbox
+                .query_for(&caller, RequestMailbox::All, MailboxScope::All, &query)
+                .await
+                .unwrap();
+            assert_eq!(page.total, 2);
+            assert_eq!(page.requests.len(), 1);
+            assert!(page.has_more);
+            let second = mailbox
+                .query_for(
+                    &caller,
+                    RequestMailbox::All,
+                    MailboxScope::All,
+                    &CollaborationQuery {
+                        cursor: page.next_cursor.clone(),
+                        ..query
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(second.total, 2);
+            assert_eq!(second.requests.len(), 1);
+            assert!(!second.has_more);
+            assert_ne!(page.requests[0].id, second.requests[0].id);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one scenario proves indexed filters and cursor boundaries together
     async fn sqlite_query_filters_and_keyset_pages_use_room_and_session_anchors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("collaboration.sqlite3");

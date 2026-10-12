@@ -173,6 +173,22 @@ pub struct TimelineSummaryProjection {
     pub days: Vec<TimelineDayProjection>,
     pub sources: Vec<TimelineSourceProjection>,
     pub human_presence_secs: u64,
+    pub overview: Vec<TimelineOverviewLane>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineOverviewLane {
+    pub kind: TimelineLaneKind,
+    pub state: Option<AgentState>,
+    pub intervals: Vec<TimelineOverviewInterval>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineOverviewInterval {
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub ended_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone)]
@@ -1118,8 +1134,8 @@ fn push_summary_span<'a>(
         .entry(lane_id)
         .or_insert_with(|| SummaryLaneAccumulator {
             kind,
-            session_label: session_label.to_string(),
-            day_session_label: day_session_label.to_string(),
+            session_label: crate::tmux::base_session_name(session_label).to_string(),
+            day_session_label: crate::tmux::base_session_name(day_session_label).to_string(),
             spans: Vec::new(),
         })
         .spans
@@ -1224,7 +1240,59 @@ fn finish_summary_projection(
         days,
         sources,
         human_presence_secs,
+        overview: summary_overview(&lanes),
     }
+}
+
+// Union overlapping intervals within each activity row. Keep their real
+// timestamps and gaps; totals still count agent time using the shared stats
+// projection. The overview does not duplicate per-agent identity or details.
+fn summary_overview(lanes: &[SummaryLane<'_>]) -> Vec<TimelineOverviewLane> {
+    let mut result = Vec::new();
+    for (kind, state) in [
+        (TimelineLaneKind::Agent, Some(AgentState::Working)),
+        (TimelineLaneKind::Agent, Some(AgentState::WaitingInput)),
+        (TimelineLaneKind::Agent, Some(AgentState::Error)),
+        (TimelineLaneKind::Agent, Some(AgentState::Idle)),
+        (TimelineLaneKind::Agent, Some(AgentState::Starting)),
+        (TimelineLaneKind::Human, None),
+        (TimelineLaneKind::Tmux, None),
+    ] {
+        let mut spans = lanes
+            .iter()
+            .filter(|lane| lane.kind == kind)
+            .flat_map(|lane| &lane.spans)
+            .filter(|span| {
+                state.is_none()
+                    || span.state == state
+                    || (state == Some(AgentState::WaitingInput)
+                        && span.state == Some(AgentState::WaitingChoice))
+            })
+            .map(|span| (span.started_at, span.ended_at))
+            .collect::<Vec<_>>();
+        spans.sort_unstable();
+        let mut intervals: Vec<TimelineOverviewInterval> = Vec::new();
+        for (started_at, ended_at) in spans {
+            if let Some(previous) = intervals.last_mut() {
+                if started_at <= previous.ended_at {
+                    previous.ended_at = previous.ended_at.max(ended_at);
+                    continue;
+                }
+            }
+            intervals.push(TimelineOverviewInterval {
+                started_at,
+                ended_at,
+            });
+        }
+        if !intervals.is_empty() {
+            result.push(TimelineOverviewLane {
+                kind,
+                state,
+                intervals,
+            });
+        }
+    }
+    result
 }
 
 fn aggregate_summary_lanes(
@@ -1277,7 +1345,7 @@ fn aggregate_summary_lanes(
                 .unwrap_or(&lane.day_session_label);
             add_summary_span_to_days(
                 &mut aggregation.days,
-                day_session_label,
+                crate::tmux::base_session_name(day_session_label),
                 span,
                 window_started_at,
                 window_ended_at,
@@ -2033,7 +2101,11 @@ fn matches_session_filter(
     let Some(filter) = filters.session.as_deref().filter(|s| !s.is_empty()) else {
         return true;
     };
-    session_id == Some(filter) || session_name == Some(filter) || pane == Some(filter)
+    session_id == Some(filter)
+        || session_name.is_some_and(|name| {
+            crate::tmux::base_session_name(name) == crate::tmux::base_session_name(filter)
+        })
+        || pane == Some(filter)
 }
 
 fn matches_agent_filter(filters: &TimelineFilters, kind: Option<AgentKind>) -> bool {
@@ -2504,6 +2576,74 @@ mod tests {
         assert_eq!(summary.sources[0].totals.working_secs, 1_500);
         assert_eq!(summary.sources[1].kind, TimelineLaneKind::Human);
         assert_eq!(summary.sources[2].kind, TimelineLaneKind::Tmux);
+    }
+
+    #[test]
+    fn summary_overview_keeps_real_gaps_and_unions_concurrent_work() {
+        let now = datetime!(2026-10-12 08:00:00 UTC);
+        let start = datetime!(2026-10-12 00:00:00 UTC);
+        let entries = [("a", 1, 3), ("b", 2, 4), ("a", 6, 7)].map(|(id, first, last)| {
+            ActivityEntry::StateTransition(StateTransitionEntry::new(StateTransitionInput {
+                at: start + time::Duration::hours(last),
+                kind: AgentKind::Codex,
+                session_id: id.into(),
+                pane: Some(format!("%{id}")),
+                session_name: Some("callabo".into()),
+                cwd: None,
+                from: AgentState::Working,
+                to: AgentState::Idle,
+                state_entered_at: Some(start + time::Duration::hours(first)),
+            }))
+        });
+        let summary = build_summary(
+            TimelineBuildInput {
+                now,
+                range: TimelineRange {
+                    label: "8h".into(),
+                    since_at: Some(start),
+                    until_at: None,
+                },
+                prompt_entries: &[],
+                activity_entries: &entries,
+                agents: &[],
+                session_activities: &[],
+                pane_sessions: &HashMap::new(),
+                active_lookback_secs: 60,
+                active_timeout_secs: 300,
+                active_tick_timeout_secs: 300,
+                count_tmux_input: true,
+                filters: TimelineFilters::default(),
+                notes: Vec::new(),
+            },
+            UtcOffset::UTC,
+        );
+        let overview = summary
+            .overview
+            .iter()
+            .find(|lane| lane.state == Some(AgentState::Working))
+            .unwrap();
+        assert_eq!(overview.intervals.len(), 2);
+        assert_eq!(
+            overview.intervals[0].started_at,
+            start + time::Duration::hours(1)
+        );
+        assert_eq!(
+            overview.intervals[0].ended_at,
+            start + time::Duration::hours(4)
+        );
+        assert_eq!(
+            overview.intervals[1].started_at,
+            start + time::Duration::hours(6)
+        );
+        assert_eq!(
+            overview.intervals[1].ended_at,
+            start + time::Duration::hours(7)
+        );
+        assert_eq!(
+            summary.totals.working_secs,
+            5 * 3600,
+            "totals remain summed agent time, not wall-clock width"
+        );
     }
 
     #[test]

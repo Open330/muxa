@@ -286,15 +286,16 @@ Selecting an entry sets the page **scope**:
   a pane that has since closed by the session name the message recorded). A
   participant without a pane — the operator console, an agent outside tmux —
   appears only through a message it exchanged with an in-scope participant.
-  The panel header reads **scoped to <name> · clear**. The collaboration API
-  has no session filter (its room filter is a single window), so this is done
-  in the browser over the loaded range; a managed workspace with no live
-  session keeps the messages filed under its Work.
+  The panel header reads **scoped to <name> · clear**. Session and socket
+  filters are applied by the API before counting and pagination; a managed
+  workspace with no live session keeps the messages filed under its Work.
+  Rooms are grouped under their durable session, and selecting a group scopes
+  the graph and sequence to it.
 
 Picking a session in the Timeline filter selects its rail entry too, and **all
 workspaces** (or ∅, or **clear** in the Collaboration header) clears the scope.
-Selecting a session, window or pane in the navigator does *not* change the
-scope; it only chooses what the navigator's detail side and the pane drawer
+Selecting a session in the navigator also changes the page scope. Selecting
+a window or pane only chooses what the navigator's detail side and pane drawer
 show. Viewers see the same rail; it carries only metadata.
 
 Scope and detail selection live in separate URL fragment parameters, so a link
@@ -360,10 +361,12 @@ The toolbar filters by time range, exact room, Work, thread, kind, and status.
 The API form is:
 
 ```text
-GET /api/collaboration?since=7d&workspace=callabo&work=CAL-7345&thread=thread-id&parent=req-id&kind=review&status=completed&limit=100&cursor=...
+GET /api/collaboration?since=7d&session=callabo&socket=%2Ftmp%2Frmux%2Fdefault&workspace=callabo&work=CAL-7345&thread=thread-id&parent=req-id&kind=review&status=completed&limit=100&cursor=...
 ```
 
-All supplied filters are conjunctive. `work_id`, `workspace_id`, `thread_id`,
+All supplied filters are conjunctive. `session` matches the durable tmux
+session name (including its numeric `~view~` aliases); `socket` pins its exact
+server endpoint. These filters apply before counts and pagination. `work_id`, `workspace_id`, `thread_id`,
 and `parent_request_id` are accepted as aliases for their short names. `room`
 is a URL-encoded JSON `RoomId` and matches host, socket, and window exactly.
 `limit` defaults to 100 and must be 1–500. Pagination is newest-first keyset
@@ -415,8 +418,8 @@ the top of the page is organized the same way.
 
 While the [workspace rail](#workspace-rail) scopes the page to a session, the
 tree shows only that session; **show all sessions** lists every session again
-without changing the scope. Selecting a session or window here only chooses
-what this panel shows; it never rescopes the page. The selection is kept in
+without changing the scope. Selecting a session also scopes diagnostics to
+that session; selecting a window remains a detail selection. The selection is kept in
 the URL fragment: `#session=<name>`, `#window=<@id>` (with `&socket=<socket>`
 when more than one tmux server is running) and `#pane=<id>` for an open
 drawer, next to the rail's `#workspace=`, so a link restores all of them.
@@ -528,6 +531,16 @@ remains false. This keeps provider sync and operator-authored workflow state
 independent.
 
 ## Timeline
+
+The all-session overview places activity on the same wall-clock axis as the
+selected session timeline. Overlapping agent intervals are unioned into rows
+for working, waiting, error, idle, and starting; interaction and tmux presence
+have their own rows. Gaps remain empty. Totals still report summed agent time
+and the shared `muxa stats` attribution, so simultaneous agents can accumulate
+more work time than the width of a wall-clock interval.
+
+Numeric client-view sessions are folded into their base session in the
+workspace rail, pane inventory, diagnostics, and retained session filters.
 
 The timeline panel calls `/api/timeline?since=7d` by default and can switch
 to `24h`, `today`, `last week`, `month`, `last month`, `30d`, `12w`, or a clicked `YYYY-MM-DD` calendar day in the

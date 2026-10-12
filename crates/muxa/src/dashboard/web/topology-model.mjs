@@ -1,3 +1,4 @@
+import { canonicalDashboardPanes } from "./session-model.mjs";
 // Session → window → pane topology for the dashboard's Sessions navigator.
 //
 // Pure functions only (no DOM), so the roll-up and layout rules are tested
@@ -94,6 +95,7 @@ function summarize(node, children) {
 /// Build the socket → session → window → pane tree. `nodes` maps every key
 /// to its node; `multiSocket` says whether the tree needs a socket level.
 export function buildTopology(panes = [], agents = []) {
+  panes = canonicalDashboardPanes(panes);
   const { attached, orphans } = agentsByPane(panes, agents);
   const sockets = new Map();
   const nodes = new Map();
