@@ -286,7 +286,7 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 
 | Command | Purpose |
 | --- | --- |
-| `muxa status [--json]` | Human-readable table, or a versioned JSON snapshot for desktop integrations. |
+| `muxa status [--flat\|--json]` | Agents as a session / window / pane tree (`--flat`: one row per agent), or a versioned JSON snapshot for desktop integrations. |
 | `muxa watch [--view session\|window\|pane]` | Live workspace → work → agent TUI picker/dashboard. |
 | `muxa dashboard [--since today]` | Work-card TUI with Run capture, per-agent and Work-wide prompt/abort actions, ACT/WACT totals, and collaboration controls. |
 | `muxa attend [--cycle] [--list]` | Focus or list agents needing attention. |
