@@ -55,9 +55,10 @@ bound to loopback and configure the public origin as described below.
 `auth = "token"` protects all API endpoints. `auth = "public_read"` leaves
 GET/SSE endpoints public but always requires the bearer token for write/control
 actions. `auth = "none"` leaves reads public and disables writes entirely.
-Collaboration bodies and attached details are stricter: they are returned only
-in `auth = "token"` mode with a valid bearer. `public_read` and `none` expose a
-redacted topology/status summary even if a PAT is supplied.
+Collaboration bodies and attached details require an authenticated operator
+(valid PAT or operator login) in `token` or `public_read` mode. Anonymous users
+and signed-in viewers receive a redacted topology/status summary. `none` mode
+always redacts details. History responses use `Cache-Control: private, no-store`.
 Static routes are public in every mode — see "Why the HTML is public" below.
 Fleet routes always expose the in-process `local` node. `[fleet] enabled =
 true` adds outbound SSH hosts; reads reuse the daemon's per-host cache and
@@ -376,12 +377,13 @@ it or replace it with an offset. The response contains `generated_at`,
 `pagination { total, limit, has_more, next_cursor }`. Invalid filters return
 `400`; a disabled collaboration subsystem returns `503`.
 
-When `details_included` is false, request/reply bodies, provenance, paths,
+When `details_included` is false, request/reply/update bodies, provenance, paths,
 generic artifacts, links, and AIR references are omitted. Participant, room,
 thread/parent, Work/Run, kind, status, timestamps, and counts remain available
-for a useful summary graph. Use `auth = "token"` for private full-detail
-history; a PAT cannot unlock details while the server is configured as
-`public_read`.
+for a useful summary graph. In the Sessions panel, use the Collaboration tab
+and select a session or window to filter its history. Unlock details with the
+existing dashboard PAT control or sign in as an operator to read requests,
+replies, and artifacts. Locking access immediately clears loaded details.
 
 ## Sessions, windows and panes
 

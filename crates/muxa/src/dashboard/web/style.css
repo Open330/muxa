@@ -3198,3 +3198,67 @@ table.data td.pane-cell .crumbs { flex-wrap: nowrap; white-space: nowrap; }
 .collaboration-session-select { display: flex; align-items: baseline; gap: .65rem; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
 .collaboration-session-select span { font-size: .75rem; opacity: .7; }
 .collaboration-session-rooms { display: flex; flex-wrap: wrap; gap: .35rem; }
+
+/* Session navigation and its two scoped views share one panel. */
+.session-selection {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+.session-selection > [hidden] {
+  display: none !important;
+}
+.session-view-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 12px;
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.session-view-tabs button {
+  padding: 7px 12px;
+  color: var(--fg-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+  font: inherit;
+}
+.session-view-tabs button[aria-selected="true"] {
+  color: var(--accent);
+  border-color: var(--border);
+  background: var(--surface-2);
+}
+.session-selection .collaboration-panel {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+.session-selection .collaboration-split {
+  grid-template-columns: minmax(0, 1fr);
+}
+.session-selection .collaboration-graph-pane {
+  border-right: 0;
+  border-bottom: 1px solid var(--border);
+}
+.session-selection .collaboration-detail {
+  max-height: none;
+  margin-top: 12px;
+}
+.collaboration-detail-redacted .control-btn {
+  display: block;
+  margin-top: 8px;
+}
+
+.session-selection .collaboration-canvas {
+  flex: none;
+  height: 320px;
+}
+.sequence-event:hover .sequence-event-hit,
+.sequence-event:focus-visible .sequence-event-hit {
+  fill: color-mix(in srgb, var(--accent) 8%, transparent);
+}

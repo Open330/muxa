@@ -40,6 +40,7 @@ import {
   participantLabel,
   projectCollaboration,
   requestRoomKey,
+  roomKey,
   requestThreadId,
   requestWorkId,
   roomLabel,
@@ -216,6 +217,7 @@ async function upgradeWithToken() {
 }
 
 async function signOut() {
+  clearCollaborationDetails();
   try {
     await fetch("/auth/logout", {
       method: "POST",
@@ -522,6 +524,7 @@ function renderAccess() {
 }
 
 async function fetchAccess() {
+  const wasAuthorized = store.access.writeAuthorized;
   const data = await jsonFetch("/api/access");
   store.access = {
     mode: data.mode || "read_only",
@@ -534,6 +537,10 @@ async function fetchAccess() {
     login: normalizeLogin(data.login),
   };
   renderAccess();
+  if (wasAuthorized !== store.access.writeAuthorized) {
+    clearCollaborationDetails();
+    fetchCollaboration().catch(() => {});
+  }
   return store.access;
 }
 
@@ -546,13 +553,18 @@ function initAccessControl() {
   dom.editAccess.addEventListener("click", async () => {
     if (store.access.writeAuthorized && store.access.mode === "public_read") {
       localStorage.removeItem(TOKEN_KEY);
+      clearCollaborationDetails();
+      if (store.access.login.signedIn && store.access.login.role === "operator") {
+        await signOut();
+        return;
+      }
       await fetchAccess().catch(() => {});
       showToast("edit locked · public read-only");
       return;
     }
     if (store.access.writeAuthorized) return;
 
-    const token = window.prompt("Muxa edit PAT");
+    const token = window.prompt("Muxa dashboard PAT");
     if (!token) return;
     localStorage.setItem(TOKEN_KEY, token.trim());
     try {
@@ -940,8 +952,8 @@ function setSelectedSession(session) {
 // the Sessions navigator tree shows only that session. The scope lives in
 // `#workspace=<name>` (`&wsocket=` when the name exists on several tmux
 // servers), separate from the navigator's detail selection
-// (`#session=`/`#window=`/`#pane=`), so selecting something in the navigator
-// never rescopes the page.
+// (`#session=`/`#window=`/`#pane=`). Navigator selections also synchronize
+// this scope; windows additionally narrow Collaboration to their room.
 function setSelectedWorkspace(workspaceKey, { updateHash = true } = {}) {
   const entry = railEntries().find((candidate) => candidate.key === workspaceKey) || null;
   const nextKey = entry?.key || "";
@@ -965,7 +977,7 @@ function setSelectedWorkspace(workspaceKey, { updateHash = true } = {}) {
     renderWorkItems();
     renderInspector();
   }
-  if (changed) {
+  if (changed || store.filters.collaborationRoom) {
     store.filters.collaborationRoom = "";
     store.filters.collaborationRoomObject = null;
     store.ui.selectedCollaborationRoom = "";
@@ -1021,7 +1033,7 @@ function applyScopeHash() {
 }
 
 // Make the rail follow a session picked in the Timeline's workspace filter
-// and diagnostics. Window/pane selection remains detail-only.
+// and diagnostics. Navigator windows also scope Collaboration by room.
 function syncRailToSession(session, socket, { updateHash = false } = {}) {
   const entry = session ? findRailEntry(railEntries(), { session, socket }) : null;
   if (!entry && session) {
@@ -2641,9 +2653,13 @@ function selectTopology(key, { focusTree = false, updateHash = true } = {}) {
     toggleTopologyNode(key);
     return;
   }
-  if (node.type === "session" && updateHash) {
-    const entry = findRailEntry(railEntries(), { session: node.name, socket: node.socket });
-    if (entry) setSelectedWorkspace(entry.key);
+  if (node.type === "session" || node.type === "window") {
+    const session = node.type === "window" ? topology.nodes.get(node.sessionKey) : node;
+    const entry = session && findRailEntry(railEntries(), { session: session.name, socket: session.socket });
+    if (entry) setSelectedWorkspace(entry.key, { updateHash });
+    const room = node.type === "window"
+      ? { host: node.host, socket: node.socket, window_id: node.id } : null;
+    chooseCollaborationRoom(room ? { key: roomKey(room), room } : null);
   }
   topologyState.selection = { type: node.type, key };
   // Make the selection visible in the tree.
@@ -2825,7 +2841,7 @@ function renderTopologyDetail(topology, sessions) {
 function tailsActive() {
   const selection = topologyState.selection;
   return Boolean(selection?.type === "window" && store.access.writeAuthorized && !topologyState.tailsDenied
-    && !document.hidden && !dom.topologyPanel?.classList.contains("collapsed"));
+    && !document.hidden && !dom.topologyDetail.hidden && !dom.topologyPanel?.classList.contains("collapsed"));
 }
 
 function setTail(key, text) {
@@ -3381,6 +3397,7 @@ function initDynamicEventDelegation() {
     if (!request) return;
     store.ui.selectedCollaborationRequest = id;
     renderCollaborationDetail(request);
+    dom.collaborationDetail.scrollIntoView({ block: "nearest", behavior: "smooth" });
   });
   dom.collaborationSequence?.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" && event.key !== " ") return;
@@ -3390,6 +3407,14 @@ function initDynamicEventDelegation() {
     item.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
   dom.collaborationDetail?.addEventListener("click", (event) => {
+    if (event.target.closest("[data-unlock-collaboration]")) {
+      dom.editAccess.click();
+      return;
+    }
+    if (event.target.closest("[data-login-collaboration]")) {
+      signIn();
+      return;
+    }
     if (!event.target.closest("[data-close-collaboration-detail]")) return;
     store.ui.selectedCollaborationRequest = "";
     dom.collaborationDetail.hidden = true;
@@ -4110,6 +4135,7 @@ function renderCollaborationSequence() {
       : `M ${sx} ${y} L ${tx} ${y}`;
     return `<g class="sequence-event ${event.reply ? "reply" : "request"} ${collaborationStatusClass(event.status)}"
       role="button" tabindex="0" aria-label="${esc(`${event.label}, ${time}`)}" data-collaboration-request="${esc(event.request.id)}">
+      <rect class="sequence-event-hit" x="0" y="${y - 25}" width="${width}" height="${rowHeight - 2}" fill="transparent"></rect>
       <path d="${path}" marker-end="url(#${event.reply ? "sequence-reply-arrow" : "sequence-request-arrow"})"></path>
       <circle cx="${sx}" cy="${y}" r="4"></circle>
       <text class="sequence-event-label" text-anchor="middle" x="${labelX}" y="${y - 9}">${esc(event.label)}</text>
@@ -4138,7 +4164,7 @@ function renderCollaborationDetail(request) {
   const work = requestWorkId(request);
   const thread = requestThreadId(request);
   const parent = request.parent_request_id || "";
-  const artifacts = [...(request.artifacts || []), ...(reply?.artifacts || [])];
+  const artifacts = [...(request.artifacts || []), ...(request.air_artifacts || []), ...(reply?.artifacts || []), ...(reply?.air_artifacts || [])];
   const links = (request.links || []).map((link) => typeof link === "string" ? { label: link, url: link } : link);
   const detailsIncluded = store.collaboration.details_included;
   dom.collaborationDetail.hidden = false;
@@ -4157,8 +4183,13 @@ function renderCollaborationDetail(request) {
       ${parent ? `<dt>parent</dt><dd>${esc(parent)}</dd>` : ""}
       <dt>sent</dt><dd>${esc(request.created_at ? new Date(request.created_at).toLocaleString() : "—")}</dd>
     </dl>
-    ${detailsIncluded ? `<div class="collaboration-message-body"><span>request</span><pre>${esc(request.body || "")}</pre></div>` : `<div class="collaboration-detail-redacted">Message bodies and artifacts are available only when dashboard auth mode is token.</div>`}
-    ${detailsIncluded && reply ? `<div class="collaboration-message-body reply"><span>reply · ${esc(reply.status || request.status)}</span><pre>${esc(reply.body || "")}</pre></div>` : ""}
+    ${detailsIncluded ? `<div class="collaboration-message-body"><span>request</span><pre>${esc(request.body || "")}</pre></div>` : `<div class="collaboration-detail-redacted">${store.access.mode === "read_only" ? "Message details are unavailable on this read-only dashboard." : "Sign in as an operator or unlock access to read the request, reply, and artifacts."}
+      ${store.access.writeAvailable && !store.access.writeAuthorized ? '<button class="control-btn" type="button" data-unlock-collaboration>unlock details with PAT</button>' : ""}
+      ${store.access.login.available && !store.access.login.signedIn ? '<button class="control-btn" type="button" data-login-collaboration>sign in</button>' : ""}
+      </div>`}
+    ${detailsIncluded ? (request.updates || []).map(update => `<div class="collaboration-message-body"><span>update · ${esc(participantLabel(update.author))} · ${esc(new Date(update.at).toLocaleString())}</span><pre>${esc(update.body || "")}</pre></div>`).join("") : ""}
+    ${detailsIncluded && reply ? `<div class="collaboration-message-body reply"><span>reply · ${esc(reply.status || request.status)} · ${esc(reply.at ? new Date(reply.at).toLocaleString() : "")}</span><pre>${esc(reply.body || "")}</pre></div>` : ""}
+    ${detailsIncluded && request.paths?.length ? `<div class="collaboration-detail-list"><span>paths</span>${request.paths.map(path => `<code>${esc(path)}</code>`).join("")}</div>` : ""}
     ${detailsIncluded && artifacts.length ? `<div class="collaboration-detail-list"><span>artifacts</span>${artifacts.map((artifact) => `<code>${esc(typeof artifact === "string" ? artifact : JSON.stringify(artifact))}</code>`).join("")}</div>` : ""}
     ${detailsIncluded && links.length ? `<div class="collaboration-detail-list"><span>links</span>${links.map((link) => {
       const href = safeExternalHref(link.url || link.href);
@@ -4173,6 +4204,7 @@ function chooseCollaborationRoom(room) {
   store.ui.selectedCollaborationEdge = "";
   store.ui.selectedCollaborationRequest = "";
   dom.collaborationRoom.value = store.filters.collaborationRoom;
+  renderCollaboration();
   fetchCollaboration().catch(() => {});
 }
 
@@ -4195,6 +4227,49 @@ function scheduleLiveRender({ panes = false, terminals = false } = {}) {
     renderCounts();
     renderTopology();
   });
+}
+
+function clearCollaborationDetails() {
+  collaborationRequestController?.abort();
+  collaborationRequestController = null;
+  collaborationRequest = null;
+  collaborationRequestKey = "";
+  store.collaboration.requests = [];
+  store.collaboration.details_included = false;
+  store.collaboration.pagination = { total: 0, has_more: false };
+  store.revisions.collaboration += 1;
+  dom.collaborationDetail?.replaceChildren();
+  if (dom.collaborationDetail) dom.collaborationDetail.hidden = true;
+  renderCollaboration();
+}
+
+function initSessionViews() {
+  const tabs = [...document.querySelectorAll("[data-session-view]")];
+  const select = (view, { refresh = true } = {}) => {
+    const collaboration = view === "collaboration";
+    dom.topologyDetail.hidden = collaboration;
+    document.getElementById("collaboration-panel").hidden = !collaboration;
+    for (const tab of tabs) {
+      const selected = tab.dataset.sessionView === view;
+      tab.setAttribute("aria-selected", String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+    }
+    saveValue("muxa.dashboard.sessionView", view);
+    pollTails();
+    if (collaboration && refresh) fetchCollaboration().catch(() => {});
+  };
+  for (const tab of tabs) {
+    tab.addEventListener("click", () => select(tab.dataset.sessionView));
+    tab.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === "Home" ? tabs[0] : event.key === "End" ? tabs.at(-1)
+        : tabs[(tabs.indexOf(tab) + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length];
+      next.click();
+      next.focus();
+    });
+  }
+  select(loadValue("muxa.dashboard.sessionView", "execution") === "collaboration" ? "collaboration" : "execution", { refresh: false });
 }
 
 let collaborationRequest = null;
@@ -4495,6 +4570,7 @@ async function main() {
   initDynamicEventDelegation();
   initPaneDrawer();
   initTopology();
+  initSessionViews();
   initAgentsJump();
   renderStaticChips();
   setConnectionStatus("connecting", "loading…");
@@ -4592,8 +4668,9 @@ async function pollTimeline() {
 
 async function pollCollaboration() {
   if (store.access.signInRequired) return; // landing page: nothing to poll
-  const collapsed = document.getElementById("collaboration-panel")?.classList.contains("collapsed");
-  if (!document.hidden && !collapsed) await fetchCollaboration().catch(() => {});
+  const hidden = document.getElementById("collaboration-panel")?.hidden
+    || document.getElementById("topology-panel")?.classList.contains("collapsed");
+  if (!document.hidden && !hidden) await fetchCollaboration().catch(() => {});
   setTimeout(pollCollaboration, COLLABORATION_REFETCH_INTERVAL_MS);
 }
 
