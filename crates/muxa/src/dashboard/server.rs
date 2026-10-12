@@ -20,7 +20,7 @@
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{header, HeaderMap, Request, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
@@ -924,7 +924,7 @@ async fn collaboration_handler(
             value
         })
         .collect();
-    Json(CollaborationHttpResponse {
+    let mut response = Json(CollaborationHttpResponse {
         generated_at: OffsetDateTime::now_utc(),
         details_included,
         requests,
@@ -935,7 +935,16 @@ async fn collaboration_handler(
             next_cursor: page.next_cursor.as_ref().map(encode_collaboration_cursor),
         },
     })
-    .into_response()
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::VARY,
+        HeaderValue::from_static("Authorization, Cookie"),
+    );
+    response
 }
 
 fn collaboration_query_from_http(
@@ -1069,7 +1078,10 @@ fn parse_collaboration_cursor(raw: &str) -> Result<CollaborationCursor, String> 
 }
 
 fn dashboard_details_authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    matches!(state.config.auth, DashboardAuthMode::Token) && operator_auth(state, headers).is_some()
+    matches!(
+        state.config.auth,
+        DashboardAuthMode::Token | DashboardAuthMode::PublicRead
+    ) && operator_auth(state, headers).is_some()
 }
 
 fn redact_collaboration_details(request: &mut serde_json::Value) {
@@ -1085,6 +1097,16 @@ fn redact_collaboration_details(request: &mut serde_json::Value) {
         "air_artifacts",
     ] {
         request.remove(field);
+    }
+    if let Some(updates) = request
+        .get_mut("updates")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for update in updates {
+            if let Some(update) = update.as_object_mut() {
+                update.remove("body");
+            }
+        }
     }
     if let Some(reply) = request
         .get_mut("reply")
@@ -3833,6 +3855,14 @@ mod tests {
         let requests = seed_collaboration_requests(&collaboration).await;
         let recipient = collaboration_participant("%2", "reviewer-session", "@7");
         collaboration
+            .update_request(
+                &requests[0].from,
+                &requests[0].id,
+                "progress-secret".to_string(),
+            )
+            .await
+            .unwrap();
+        collaboration
             .reply(
                 &recipient,
                 &requests[0].id,
@@ -3862,10 +3892,13 @@ mod tests {
         let request = &public["requests"][0];
         assert!(request.get("body").is_none());
         assert!(request.get("paths").is_none());
+        assert!(request["updates"][0].get("body").is_none());
+        assert_eq!(request["updates"][0]["sequence"], 1);
         assert!(request["reply"].get("body").is_none());
         assert!(request["reply"].get("artifacts").is_none());
 
         let public_with_pat = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/collaboration?status=completed")
@@ -3876,16 +3909,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(public_with_pat.status(), StatusCode::OK);
+        assert_eq!(
+            public_with_pat.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(
+            public_with_pat.headers()[header::VARY],
+            "Authorization, Cookie"
+        );
         let public_with_pat = body_json(public_with_pat).await;
-        assert_eq!(public_with_pat["details_included"], false);
-        assert!(public_with_pat["requests"][0].get("body").is_none());
-        assert!(public_with_pat["requests"][0]["reply"]
+        assert_eq!(public_with_pat["details_included"], true);
+        assert_eq!(
+            public_with_pat["requests"][0]["updates"][0]["body"],
+            "progress-secret"
+        );
+        assert!(public_with_pat["requests"][0]["body"].is_string());
+        assert_eq!(public_with_pat["requests"][0]["reply"]["body"], "approved");
+        assert_eq!(
+            public_with_pat["requests"][0]["reply"]["artifacts"][0],
+            "artifact-secret"
+        );
+
+        let invalid_pat = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?status=completed")
+                    .header(header::AUTHORIZATION, "Bearer invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let invalid_pat = body_json(invalid_pat).await;
+        assert_eq!(invalid_pat["details_included"], false);
+        assert!(invalid_pat["requests"][0].get("body").is_none());
+        assert!(invalid_pat["requests"][0]["updates"][0]
             .get("body")
             .is_none());
+        assert!(invalid_pat["requests"][0]["reply"].get("body").is_none());
     }
 
     #[tokio::test]
-    async fn collaboration_details_require_token_auth_mode() {
+    async fn collaboration_details_require_operator_enabled_auth_mode() {
         let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
         seed_collaboration_requests(&collaboration).await;
 

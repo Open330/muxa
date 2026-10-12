@@ -2296,3 +2296,32 @@ async fn pane_output_route_is_for_operators_not_viewers(uri: &str) {
     let response = call(&state, "GET", uri, Req::default()).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn collaboration_details_accept_operator_sessions_but_redact_for_viewers() {
+    for mode in [DashboardAuthMode::Token, DashboardAuthMode::PublicRead] {
+        let mut state = state("https://issuer.example.com");
+        Arc::make_mut(&mut state.config).auth = mode;
+        let state = state.with_collaboration(crate::collaboration::CollaborationStore::in_memory(
+            crate::collaboration::CollaborationOptions::default(),
+        ));
+        for (via, expected) in [(Via::Group, true), (Via::ViewerGroup, false)] {
+            let cookie = session_via(&state, via);
+            let response = call(
+                &state,
+                "GET",
+                "/api/collaboration",
+                Req {
+                    cookie: Some(&cookie),
+                    ..Req::default()
+                },
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["details_included"], expected);
+        }
+    }
+}
