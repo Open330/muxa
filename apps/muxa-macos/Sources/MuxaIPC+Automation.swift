@@ -157,15 +157,17 @@ enum MuxaAutomationAction: Hashable, Sendable, Codable {
     case sendPrompt
     case notify
     case interrupt
+    case pressEnter
     case other(String)
 
-    static let pickable: [MuxaAutomationAction] = [.sendPrompt, .notify, .interrupt]
+    static let pickable: [MuxaAutomationAction] = [.sendPrompt, .notify, .interrupt, .pressEnter]
 
     init(rawValue: String) {
         switch rawValue {
         case "send_prompt": self = .sendPrompt
         case "notify": self = .notify
         case "interrupt": self = .interrupt
+        case "press_enter": self = .pressEnter
         default: self = .other(rawValue)
         }
     }
@@ -175,6 +177,7 @@ enum MuxaAutomationAction: Hashable, Sendable, Codable {
         case .sendPrompt: "send_prompt"
         case .notify: "notify"
         case .interrupt: "interrupt"
+        case .pressEnter: "press_enter"
         case .other(let raw): raw
         }
     }

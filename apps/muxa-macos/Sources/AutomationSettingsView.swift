@@ -1375,6 +1375,7 @@ func automationActionTitle(_ action: MuxaAutomationAction) -> String {
     case .sendPrompt: String(localized: "Send prompt")
     case .notify: String(localized: "Notify")
     case .interrupt: String(localized: "Interrupt")
+    case .pressEnter: String(localized: "Confirm selected Yes")
     case .other(let raw): raw
     }
 }
@@ -1385,6 +1386,8 @@ func automationActionDetail(_ action: MuxaAutomationAction) -> String {
         String(localized: "Types the text into the agent's pane and presses Enter.")
     case .notify:
         String(localized: "Records a notice in the run log. The agent is not touched.")
+    case .pressEnter:
+        String(localized: "Presses Enter only while waiting on a selected Yes or Proceed confirmation.")
     case .interrupt:
         String(localized: "Sends the agent an interrupt, as Escape would.")
     case .other:

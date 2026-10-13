@@ -143,7 +143,18 @@ async fn main() -> Result<()> {
         .init();
 
     let config_path = args.config.clone().or_else(paths::default_config_file);
-    let cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
+    let mut cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
+    if let Some(path) = config_path.as_deref() {
+        match muxa::automation_defaults::install(path) {
+            Ok(true) => {
+                cfg =
+                    Config::load_or_default(Some(path)).context("reloading default automations")?;
+                tracing::info!("installed missing disabled default automations");
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "could not install disabled default automations"),
+        }
+    }
     // Daemon-only invariants — the dashboard wire-up and sink fan-out
     // checks the CLI deliberately skips. Failing here is preferable to
     // crashing mid-startup once we try to bind the dashboard socket.
@@ -1314,6 +1325,7 @@ impl AutomationEngine {
     /// place to read.
     async fn perform(&self, firing: &PlannedFiring) -> bool {
         match firing.action {
+            AutomationAction::PressEnter => self.confirm_selected_yes(firing).await,
             AutomationAction::SendPrompt => {
                 let Some(text) = firing.text.as_deref() else {
                     return false;
@@ -1324,10 +1336,9 @@ impl AutomationEngine {
                 if !firing.submit {
                     return true;
                 }
-                // Same grace the collaboration waker uses: codex's TUI reads
-                // an immediate trailing Enter as part of the pasted burst and
-                // leaves the prompt composed but unsubmitted.
-                tokio::time::sleep(muxa::backend::PROMPT_SUBMIT_GRACE).await;
+                // Native hosts use explicit paste boundaries; only hosts
+                // without that support need a best-effort fallback delay.
+                tokio::time::sleep(muxa::backend::prompt_submit_grace(&firing.pane)).await;
                 send_automation_text(&self.backends, firing, "\r").await
             }
             // A notice, not a keystroke: nothing is typed into the pane. The
@@ -1349,6 +1360,60 @@ impl AutomationEngine {
                 send_automation_text(&self.backends, firing, "\u{3}").await
             }
         }
+    }
+
+    /// Capture immediately before Enter; a waiting state alone cannot identify
+    /// the selected option. Recheck state/config after the blocking capture.
+    async fn confirm_selected_yes(&self, firing: &PlannedFiring) -> bool {
+        let revision = *self.automation.subscribe().borrow();
+        let Some(kind) = muxa::backend::pane_id_host_kind(&firing.pane) else {
+            return false;
+        };
+        let Some(backend) = self
+            .backends
+            .iter()
+            .find(|backend| backend.kind() == kind)
+            .cloned()
+        else {
+            return false;
+        };
+        let pane = firing.pane.clone();
+        let socket = firing.socket.clone();
+        let capture =
+            tokio::task::spawn_blocking(move || backend.capture_pane_on(socket.as_deref(), &pane));
+        let Ok(Ok(Some(screen))) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), capture).await
+        else {
+            return false;
+        };
+        if !muxa::automation_choice::affirmative_choice_visible(&screen) {
+            return false;
+        }
+        let config = self.automation.config().await;
+        let Some(rule) = config.rule_named(&firing.rule) else {
+            return false;
+        };
+        if revision != *self.automation.subscribe().borrow() {
+            return false;
+        }
+        if !config.active_at(time::OffsetDateTime::now_utc())
+            || !rule.enabled
+            || rule.action != AutomationAction::PressEnter
+        {
+            return false;
+        }
+        let Some(agent) = self.store.by_session(&firing.agent_session_id).await else {
+            return false;
+        };
+        let subject = AutomationSubject::from_agent(&agent);
+        if subject.pane.as_deref() != Some(firing.pane.as_str())
+            || subject.socket != firing.socket
+            || subject.episode() != firing.episode
+            || !subject.satisfies(muxa::automation::AutomationCondition::WaitingInput)
+        {
+            return false;
+        }
+        send_automation_text(&self.backends, firing, "\r").await
     }
 
     /// The registry row behind a firing, as the live store has it now.
@@ -1453,9 +1518,15 @@ async fn send_automation_text(
     let pane = firing.pane.clone();
     let socket = firing.socket.clone();
     let text = text.to_string();
-    tokio::task::spawn_blocking(move || backend.send_text_on(socket.as_deref(), &pane, &text))
-        .await
-        .unwrap_or(false)
+    tokio::task::spawn_blocking(move || {
+        if text == "\r" || text == "\u{3}" {
+            backend.send_text_on(socket.as_deref(), &pane, &text)
+        } else {
+            backend.send_prompt_text_on(socket.as_deref(), &pane, &text)
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 fn spawn_collaboration_waker_task(
@@ -1592,15 +1663,17 @@ async fn wake_idle_collaboration_peers_with_inflight(
     }
     let agents = store.snapshot().await;
     let listed_backends = backends.to_vec();
-    let panes = tokio::task::spawn_blocking(move || {
-        listed_backends
+    let discovery_agents = agents.clone();
+    let (panes, mut participants) = tokio::task::spawn_blocking(move || {
+        let panes = listed_backends
             .iter()
             .flat_map(|backend| backend.list_panes())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let participants = muxa::collaboration::participants_from(&discovery_agents, &panes);
+        (panes, participants)
     })
     .await
     .unwrap_or_default();
-    let mut participants = muxa::collaboration::participants_from(&agents, &panes);
     collaboration.enrich_participants(&mut participants).await;
 
     for request in requests {
@@ -1630,7 +1703,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
             );
         }
         let prompt = mailbox_collaboration_request_prompt(&request);
-        let (sent, submitted) = send_collaboration_wake(recipient, &prompt, backends).await;
+        let (sent, submitted) = send_collaboration_wake(recipient, &prompt, backends, store).await;
         if submitted {
             wake_inflight.insert(wake_key);
         }
@@ -1653,6 +1726,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
         backends,
         replies,
         wake_inflight,
+        store,
     )
     .await;
 }
@@ -1665,6 +1739,7 @@ async fn wake_senders_of_ready_replies(
     backends: &[muxa::SharedBackend],
     replies: Vec<CollaborationRequest>,
     wake_inflight: &mut HashSet<(String, Option<String>, String)>,
+    store: &muxa::Store,
 ) {
     for request in replies {
         let Some(sender) = idle_collaboration_participant(participants, &request.from) else {
@@ -1681,7 +1756,7 @@ async fn wake_senders_of_ready_replies(
             request.to.label(),
             request.id,
         );
-        let (sent, submitted) = send_collaboration_wake(sender, &prompt, backends).await;
+        let (sent, submitted) = send_collaboration_wake(sender, &prompt, backends, store).await;
         if submitted {
             wake_inflight.insert(wake_key);
         }
@@ -1747,7 +1822,7 @@ async fn deliver_full_collaboration_request(
                     "failed to persist direct wake prompt phase",
                 );
             }
-            tokio::time::sleep(muxa::backend::PROMPT_SUBMIT_GRACE).await;
+            tokio::time::sleep(muxa::backend::prompt_submit_grace(&recipient.pane)).await;
             submit_direct_collaboration_prompt(collaboration, recipient, &request.id, backends)
                 .await
         }
@@ -1978,14 +2053,33 @@ async fn send_collaboration_wake(
     participant: &muxa::collaboration::Participant,
     prompt: &str,
     backends: &[muxa::SharedBackend],
+    store: &muxa::Store,
 ) -> (bool, bool) {
+    let agents = store.by_pane(&participant.pane).await;
+    let observer = muxa::prompt_delivery::SubmissionObserver::new(
+        store,
+        &agents,
+        participant.socket.as_deref(),
+        prompt,
+    );
     let sent = send_collaboration_text(participant, prompt, backends).await;
     let submitted = if sent {
-        tokio::time::sleep(muxa::backend::PROMPT_SUBMIT_GRACE).await;
+        tokio::time::sleep(muxa::backend::prompt_submit_grace(&participant.pane)).await;
         send_collaboration_text(participant, "\r", backends).await
     } else {
         false
     };
+    if submitted {
+        // A missing hook must not delay mailbox bookkeeping, the next peer's
+        // wake, or shutdown. This bounded observer only logs evidence and
+        // never sends keys or retries the body.
+        let pane = participant.pane.clone();
+        tokio::spawn(async move {
+            let confirmed = observer.confirm().await;
+            tracing::debug!(pane, submission_confirmed = ?confirmed,
+                "collaboration Enter delivered; application acknowledgement observed separately");
+        });
+    }
     (sent, submitted)
 }
 
@@ -2007,9 +2101,15 @@ async fn send_collaboration_text(
     let pane = participant.pane.clone();
     let socket = participant.socket.clone();
     let text = text.to_string();
-    tokio::task::spawn_blocking(move || backend.send_text_on(socket.as_deref(), &pane, &text))
-        .await
-        .unwrap_or(false)
+    tokio::task::spawn_blocking(move || {
+        if text == "\r" || text == "\u{3}" {
+            backend.send_text_on(socket.as_deref(), &pane, &text)
+        } else {
+            backend.send_prompt_text_on(socket.as_deref(), &pane, &text)
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Spawn the GC task: evicts long-stopped agents on a periodic timer.
@@ -3215,6 +3315,7 @@ mod tests {
     fn collaboration_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -4639,6 +4740,63 @@ mod tests {
             assert!(sends.lock().unwrap().is_empty());
             engine.rescan().await;
             assert!(engine.pending.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn automation_enter_sends_one_key_only_for_an_affirmative_choice() {
+        for (screen, expected) in [
+            ("› 1. Yes, continue\n  2. No\nPress enter to continue", true),
+            ("  1. Yes\n› 2. No\nPress enter to continue", false),
+            ("› Type your reply", false),
+        ] {
+            let store = muxa::Store::shared();
+            add_agent(&store, "%1", "waiting", AgentKind::ClaudeCode).await;
+            store
+                .apply(&AgentEvent::NotificationFired {
+                    id: AgentId {
+                        kind: AgentKind::ClaudeCode,
+                        session_id: "waiting".into(),
+                        surface: None,
+                        pane: Some("%1".into()),
+                        tmux_socket: Some("default".into()),
+                        cwd: Some("/repo".into()),
+                    },
+                    level: muxa::event::NotificationLevel::NeedsChoice,
+                    message: "Confirm choice".into(),
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+            let sends = Arc::new(Mutex::new(Vec::new()));
+            let backend: muxa::SharedBackend = Arc::new(JudgmentBackend {
+                inner: CollaborationWakeBackend {
+                    panes: vec![collaboration_pane("%1", "0")],
+                    sends: sends.clone(),
+                },
+                screen: Arc::new(Mutex::new(screen.into())),
+            });
+            let mut rule = muxa::automation_defaults::rules()
+                .into_iter()
+                .find(|rule| rule.name == "confirm-selected-yes")
+                .unwrap();
+            rule.enabled = true;
+            rule.wait = Some(muxa::automation::parse_wait("0s").unwrap());
+            let config = muxa::automation::AutomationConfig {
+                rule: vec![rule],
+                ..Default::default()
+            };
+            let automation = AutomationStore::in_memory(config);
+            let mut engine = AutomationEngine::new(automation, store, vec![backend]);
+            for _ in 0..2 {
+                engine.rescan().await;
+                engine.fire_due().await;
+            }
+            let expected_sends = if expected {
+                vec![("%1".into(), "\r".into())]
+            } else {
+                vec![]
+            };
+            assert_eq!(*sends.lock().unwrap(), expected_sends, "{screen}");
         }
     }
 

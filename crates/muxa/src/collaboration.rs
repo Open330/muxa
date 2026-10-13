@@ -2928,6 +2928,9 @@ impl CollaborationStore {
 
 /// Correlate live agent rows with pane topology, keeping the newest live
 /// agent when adapter/synthetic rows briefly overlap on the same pane.
+/// Muxa-launched CLIs without a real hook become pending peers when process
+/// discovery confirms their provider. Wrapper discovery reads the process
+/// table, so async callers must run this on a blocking worker.
 pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participant> {
     let mut resolved: HashMap<(Option<String>, String), (OffsetDateTime, Participant)> =
         HashMap::new();
@@ -2993,6 +2996,37 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
         .into_values()
         .map(|(_, participant)| participant)
         .collect();
+    // A launcher-marked process is a peer before its first hook. Keep its
+    // recipient pane-scoped until a real session can adopt queued requests.
+    // Process evidence is required: launch marks can outlive a CLI in a pane.
+    let launched = panes
+        .iter()
+        .filter(|pane| {
+            pane.agent_program.is_some()
+                && !participants
+                    .iter()
+                    .any(|peer| peer.pane == pane.pane_id && peer.socket == pane.socket)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for discovered in crate::discovery::discover_from_panes(&launched) {
+        let pane = &discovered.pane;
+        if pane
+            .agent_program
+            .as_deref()
+            .and_then(crate::discovery::classify_command)
+            != Some(discovered.kind)
+            || participants
+                .iter()
+                .any(|peer| peer.pane == pane.pane_id && peer.socket == pane.socket)
+        {
+            continue;
+        }
+        let row = live_pane_row(&pane.pane_id, pane.socket.as_deref(), agents);
+        let mut pending = pane_participant(pane, pane.socket.clone(), row);
+        pending.agent_kind = discovered.kind;
+        participants.push(pending);
+    }
     participants.sort_by(|left, right| left.pane.cmp(&right.pane));
     participants
 }
@@ -3196,14 +3230,12 @@ fn select_target(
 
 /// Resolve an explicit `pane:%N` target whose agent has not registered yet.
 ///
-/// This is the fallback [`resolve_target`] cannot serve: `participants_from`
-/// only admits real, session-pinned rows, so a pane muxa launched a moment ago
-/// is invisible until its agent's first hook — which, for codex, never comes
-/// unaided (see [`PENDING_SESSION_PREFIX`]).
+/// Launcher-backed pending peers are normally served by [`resolve_target`].
+/// This narrower fallback covers explicitly addressed panes with role/alias
+/// marks or discovery evidence that do not yet appear in the peer topology.
 ///
 /// Deliberately narrow. It requires all of:
-/// * an **explicit pane selector** — `peer`, `@alias` and `role:` stay
-///   registered-peer concepts, so no automatic routing can land here;
+/// * an **explicit pane selector** — automatic routing uses the peer topology;
 /// * a pane muxa itself marked as an agent launch (`@muxa_agent_role` /
 ///   `@muxa_agent_alias`) or that discovery already classified as an agent
 ///   CLI, so a request can never be typed at a human's shell;
@@ -3394,7 +3426,15 @@ fn muxa_launched_agent_pane(pane: &PaneInfo, row: Option<&Agent>) -> bool {
 /// Build the pane-scoped participant a pending recipient is addressed as.
 fn pane_participant(pane: &PaneInfo, socket: Option<String>, row: Option<&Agent>) -> Participant {
     Participant {
-        agent_kind: row.map_or(AgentKind::Unknown, |row| row.kind),
+        agent_kind: row.map_or_else(
+            || {
+                pane.agent_program
+                    .as_deref()
+                    .and_then(crate::discovery::classify_command)
+                    .unwrap_or(AgentKind::Unknown)
+            },
+            |row| row.kind,
+        ),
         agent_session_id: pending_session_id(&pane.pane_id, socket.as_deref()),
         pane: pane.pane_id.clone(),
         socket: socket.clone(),
@@ -3859,6 +3899,7 @@ mod tests {
     fn pane_info(pane_id: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -3907,6 +3948,7 @@ mod tests {
 
     fn managed_pane(pane_id: &str, role: &str, alias: &str) -> PaneInfo {
         PaneInfo {
+            agent_program: None,
             agent_role: Some(role.into()),
             agent_alias: Some(alias.into()),
             ..pane_info(pane_id)
@@ -4462,6 +4504,110 @@ mod tests {
         let participants = participants_from(&store.snapshot().await, &panes);
         assert_eq!(participants.len(), 1);
         assert_eq!(participants[0].agent_session_id, "real-session");
+    }
+
+    #[tokio::test]
+    async fn launched_peers_are_visible_before_first_prompt_and_adopt_requests() {
+        for (program, kind) in [
+            ("codex", AgentKind::Codex),
+            ("claude", AgentKind::ClaudeCode),
+        ] {
+            let mut pane = pane_info("%2");
+            pane.current_command = program.into();
+            pane.agent_program = Some(program.into());
+            pane.agent_alias = Some("review".into());
+            pane.agent_role = Some("reviewer".into());
+            let panes = vec![pane.clone()];
+            let pending = participants_from(&[], &panes).remove(0);
+            assert_eq!(pending.agent_kind, kind);
+            assert_eq!(pending.state, AgentState::Starting);
+            assert!(is_pending_session(&pending.agent_session_id));
+            let sender = participant("%1", "sender");
+            for selector in ["peer", "@review", "role:reviewer", "pane:%2"] {
+                assert!(resolve_target(
+                    &sender,
+                    selector,
+                    std::slice::from_ref(&pending),
+                    CollaborationScope::Window
+                )
+                .is_ok());
+            }
+            assert!(pending_recipient_ready(&pending, &[], &panes).is_none());
+            let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+            let request = mailbox
+                .create(
+                    sender,
+                    pending.clone(),
+                    NewRequest {
+                        kind: RequestKind::Question,
+                        body: "review without an initial prompt".into(),
+                        expects_reply: true,
+                        work_mode: WorkMode::ReadOnly,
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let store = crate::Store::shared();
+            let discovered = crate::discovery::Discovered { pane, kind };
+            store
+                .apply(&crate::discovery::synthesize_started(
+                    &discovered,
+                    OffsetDateTime::now_utc(),
+                ))
+                .await;
+            let agents = store.snapshot().await;
+            let peers = participants_from(&agents, &panes);
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].agent_session_id, pending.agent_session_id);
+            assert!(pending_recipient_ready(&pending, &agents, &panes).is_some());
+            store
+                .apply(&crate::event::AgentEvent::Started {
+                    id: crate::event::AgentId {
+                        kind,
+                        session_id: "real-session".into(),
+                        surface: None,
+                        pane: Some("%2".into()),
+                        tmux_socket: Some("default".into()),
+                        cwd: None,
+                    },
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+            let real = participants_from(&store.snapshot().await, &panes);
+            assert_eq!(real.len(), 1);
+            assert_eq!(real[0].agent_session_id, "real-session");
+            assert!(addresses(&pending, &real[0]));
+            let mut other_server = real[0].clone();
+            other_server.socket = Some("other".into());
+            assert!(!addresses(&pending, &other_server));
+            assert!(mailbox.claim_for(&other_server).await.unwrap().is_empty());
+            let claimed = mailbox.claim_for(&real[0]).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].id, request.id);
+            assert_eq!(
+                mailbox
+                    .get_for(&real[0], &request.id)
+                    .await
+                    .unwrap()
+                    .to
+                    .agent_session_id,
+                "real-session"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_marks_do_not_expose_shells_or_different_processes_as_peers() {
+        let mut pane = pane_info("%2");
+        pane.agent_program = Some("codex".into());
+        for command in ["zsh", "vim", "claude"] {
+            pane.current_command = command.into();
+            assert!(participants_from(&[], &[pane.clone()]).is_empty());
+        }
+        pane.current_command = "codex".into();
+        pane.agent_program = None;
+        assert!(participants_from(&[], &[pane]).is_empty());
     }
 
     /// A reply is a terminal write, so an empty one must not spend it. This

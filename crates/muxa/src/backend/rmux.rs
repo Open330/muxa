@@ -220,6 +220,7 @@ impl RmuxBackend {
         let Ok(paste) = scoped.control_command(&[
             "paste-buffer",
             "-p",
+            "-r",
             "-b",
             &buffer,
             "-t",
@@ -305,6 +306,10 @@ impl PaneBackend for RmuxBackend {
         scoped
             .run_control(&["send-keys", "-t", strip_prefix(pane_id), "-l", "--", text])
             .is_ok()
+    }
+
+    fn send_prompt_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+        text.is_empty() || self.paste_text_on(socket, pane_id, text)
     }
 
     fn capture_pane_on(&self, endpoint: Option<&str>, pane_id: &str) -> Option<String> {
@@ -569,6 +574,7 @@ mod tests {
             "editor",
         ]);
         cols[12] = "workspace-is-not-a-socket";
+        cols[18] = "codex";
         cols[32] = "alpha-group";
         cols.push(socket);
         cols.join("\t")
@@ -596,6 +602,7 @@ mod tests {
         assert_eq!(pane.session_group.as_deref(), Some("alpha-group"));
         assert_eq!(pane.current_path, "/tmp/project");
         assert_eq!(pane.pane_pid, 4242);
+        assert_eq!(pane.agent_program.as_deref(), Some("codex"));
         assert_eq!(pane.socket.as_deref(), Some("/tmp/rmux.sock"));
     }
 
