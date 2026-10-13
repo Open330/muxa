@@ -501,16 +501,6 @@
         }
       }
     },
-    "%lld more in Explore › Needs attention" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "나머지 %lld개는 Explore › 주의 필요에서 볼 수 있습니다"
-          }
-        }
-      }
-    },
     "%lld New" : {
       "localizations" : {
         "ko" : {
@@ -1054,6 +1044,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "표시하지 않은 파일 %lld개"
+          }
+        }
+      }
+    },
+    "%lld more in Explore › Needs attention" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "나머지 %lld개는 Explore › 주의 필요에서 볼 수 있습니다"
           }
         }
       }
@@ -2369,6 +2369,16 @@
         }
       }
     },
+    "Add node" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드 추가"
+          }
+        }
+      }
+    },
     "Add one with `aas login <provider> <name>` in a terminal — for example `aas login claude work` — then refresh." : {
       "localizations" : {
         "ko" : {
@@ -2395,6 +2405,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "라이브러리에 추가"
+          }
+        }
+      }
+    },
+    "Add workspace" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspace 추가"
           }
         }
       }
@@ -2972,6 +2992,46 @@
         }
       }
     },
+    "Artifact location on worker" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 호스트의 결과물 경로"
+          }
+        }
+      }
+    },
+    "Artifact path" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결과물 경로"
+          }
+        }
+      }
+    },
+    "Artifact path override" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결과물 경로 재정의"
+          }
+        }
+      }
+    },
+    "Artifacts" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결과물"
+          }
+        }
+      }
+    },
     "Ask" : {
       "localizations" : {
         "ko" : {
@@ -3150,6 +3210,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@에게 요청하는 중…"
+          }
+        }
+      }
+    },
+    "Assigned work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "배정된 작업"
           }
         }
       }
@@ -3404,6 +3474,26 @@
         }
       }
     },
+    "Browse files on this Mac or an SSH host and preview them without changing them." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 Mac이나 SSH 호스트의 파일을 탐색하고 변경 없이 미리 봅니다."
+          }
+        }
+      }
+    },
+    "Browse local and SSH folders from Files, preview artifacts, and use Go to Anything to find a file." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Files에서 로컬·SSH 폴더와 결과물을 미리 보고 Go to Anything으로 파일을 찾습니다."
+          }
+        }
+      }
+    },
     "Build Plan" : {
       "localizations" : {
         "ko" : {
@@ -3507,6 +3597,16 @@
         }
       }
     },
+    "Cannot read this folder." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 폴더를 읽을 수 없습니다."
+          }
+        }
+      }
+    },
     "Capturing the workspace…" : {
       "localizations" : {
         "ko" : {
@@ -3583,6 +3683,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "다시 확인"
+          }
+        }
+      }
+    },
+    "Check status" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "상태 확인"
           }
         }
       }
@@ -3897,6 +4007,16 @@
         }
       }
     },
+    "Close Tab" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "탭 닫기"
+          }
+        }
+      }
+    },
     "Close Window" : {
       "localizations" : {
         "ko" : {
@@ -3907,12 +4027,42 @@
         }
       }
     },
+    "Close find" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "찾기 닫기"
+          }
+        }
+      }
+    },
     "Codex" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Codex"
+          }
+        }
+      }
+    },
+    "Codex activity and turn completion refresh every two seconds. Usage percentages alone no longer mark a running agent as failed." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Codex 활동과 턴 완료를 2초마다 갱신합니다. 사용량 비율만으로 실행 중인 에이전트를 오류 상태로 표시하지 않습니다."
+          }
+        }
+      }
+    },
+    "Codex status stays current" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Codex 상태를 빠르게 갱신합니다"
           }
         }
       }
@@ -4209,6 +4359,16 @@
         }
       }
     },
+    "Confirm selected Yes" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "선택한 Yes 확인"
+          }
+        }
+      }
+    },
     "Conflicts" : {
       "localizations" : {
         "ko" : {
@@ -4453,6 +4613,36 @@
         }
       }
     },
+    "Coordinator" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Coordinator"
+          }
+        }
+      }
+    },
+    "Coordinator host alias" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Coordinator 호스트 별칭"
+          }
+        }
+      }
+    },
+    "Coordinator: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Coordinator: %@"
+          }
+        }
+      }
+    },
     "Copied" : {
       "localizations" : {
         "ko" : {
@@ -4529,6 +4719,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "대화를 프롬프트로 복사"
+          }
+        }
+      }
+    },
+    "Copy Path" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "경로 복사"
           }
         }
       }
@@ -4749,6 +4949,16 @@
         }
       }
     },
+    "Default execution paths" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본 실행 경로"
+          }
+        }
+      }
+    },
     "Default model" : {
       "localizations" : {
         "ko" : {
@@ -4905,6 +5115,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "전달 방법"
+          }
+        }
+      }
+    },
+    "Delivery is uncertain. Check status with this ID before retrying the same request." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "요청 전달 여부가 불확실합니다. 같은 요청을 재시도하기 전에 이 ID로 상태를 확인하세요."
           }
         }
       }
@@ -5099,6 +5319,36 @@
         }
       }
     },
+    "Dispatch" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 배치"
+          }
+        }
+      }
+    },
+    "Dispatch UUID" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "배치 요청 UUID"
+          }
+        }
+      }
+    },
+    "Dispatch Work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Work 배치"
+          }
+        }
+      }
+    },
     "Does" : {
       "localizations" : {
         "ko" : {
@@ -5169,6 +5419,16 @@
         }
       }
     },
+    "EXPLORER" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "탐색기"
+          }
+        }
+      }
+    },
     "Each entry is one literal CLI argument, not a shell command. Options replace the entire inherited list; they are never appended. Changes affect future launches, not running agents." : {
       "localizations" : {
         "ko" : {
@@ -5219,6 +5479,16 @@
         }
       }
     },
+    "Edit labels" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그 편집"
+          }
+        }
+      }
+    },
     "Edit pipeline %@" : {
       "localizations" : {
         "ko" : {
@@ -5245,6 +5515,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 라우트 편집"
+          }
+        }
+      }
+    },
+    "Edit workspace and node paths on the coordinator. This host forwards requests there." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspace와 노드 경로는 coordinator에서 설정하세요. 현재 호스트는 요청을 해당 coordinator로 전달합니다."
           }
         }
       }
@@ -5369,12 +5649,42 @@
         }
       }
     },
+    "Empty means this host" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "비워 두면 현재 호스트 사용"
+          }
+        }
+      }
+    },
+    "Empty overrides inherit the defaults above." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "비워 둔 항목은 상위 기본값을 따릅니다."
+          }
+        }
+      }
+    },
     "Enable & Reload" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "활성화 후 다시 로드"
+          }
+        }
+      }
+    },
+    "Enable Fleet dispatch" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fleet 작업 배치 활성화"
           }
         }
       }
@@ -5435,6 +5745,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "muxad에 기본 포함된 엔진입니다. 추가하면 고유한 이름, 모델, API 키를 지정할 수 있고, 두 번 추가하면 계정 두 개를 쓸 수 있습니다."
+          }
+        }
+      }
+    },
+    "Enter an absolute path or a path starting with ~/." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "절대 경로나 ~/로 시작하는 경로를 입력하세요."
           }
         }
       }
@@ -5536,6 +5856,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "누가 시작했든 이 Mac과 플릿 호스트의 모든 tmux 패인이 여기에 표시됩니다."
+          }
+        }
+      }
+    },
+    "Every workspace in the dashboard" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "대시보드에서 모든 작업 공간을 봅니다"
           }
         }
       }
@@ -5806,12 +6136,52 @@
         }
       }
     },
+    "File host" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일 호스트"
+          }
+        }
+      }
+    },
     "File mode changed: %@" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "파일 모드 변경: %@"
+          }
+        }
+      }
+    },
+    "Files" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일"
+          }
+        }
+      }
+    },
+    "Files beside your agents" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 옆에서 파일을 확인합니다"
+          }
+        }
+      }
+    },
+    "Files on this Mac" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 Mac의 파일"
           }
         }
       }
@@ -5922,6 +6292,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "필터"
+          }
+        }
+      }
+    },
+    "Find in File" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일에서 찾기"
+          }
+        }
+      }
+    },
+    "Find in file" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일에서 찾기"
           }
         }
       }
@@ -6056,6 +6446,16 @@
         }
       }
     },
+    "Fit" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "화면에 맞춤"
+          }
+        }
+      }
+    },
     "Fitted · Interactive" : {
       "localizations" : {
         "ko" : {
@@ -6072,6 +6472,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "지정된 동작"
+          }
+        }
+      }
+    },
+    "Fleet Dispatch" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fleet 작업 배치"
+          }
+        }
+      }
+    },
+    "Fleet dispatch requires an updated CLI and daemon. Configure the coordinator in Settings → Dispatch." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fleet 작업 배치에는 최신 CLI와 데몬이 필요합니다. 설정 → 작업 배치에서 coordinator를 지정하세요."
           }
         }
       }
@@ -6157,12 +6577,32 @@
         }
       }
     },
+    "Folder not found." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "폴더를 찾을 수 없습니다."
+          }
+        }
+      }
+    },
     "Folder on %@" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@의 폴더"
+          }
+        }
+      }
+    },
+    "Folder path" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "폴더 경로"
           }
         }
       }
@@ -6213,6 +6653,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "무료 규칙 검사: Ask를 호출하거나 동작을 실행하지 않으며, 기록도 남기지 않습니다. Ask 조건은 규칙 편집기에서 별도의 유료 테스트로 확인해야 합니다."
+          }
+        }
+      }
+    },
+    "Full commit SHA" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "전체 커밋 SHA"
           }
         }
       }
@@ -6378,6 +6828,26 @@
         }
       }
     },
+    "Go to Folder" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "폴더로 이동"
+          }
+        }
+      }
+    },
+    "Go to Folder…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "폴더로 이동…"
+          }
+        }
+      }
+    },
     "Go: Jump to agent" : {
       "localizations" : {
         "ko" : {
@@ -6511,6 +6981,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "호스트 별칭과 SSH 대상은 필수입니다."
+          }
+        }
+      }
+    },
+    "Host alias or NodeId (optional)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "호스트 별칭 또는 NodeId (선택)"
           }
         }
       }
@@ -7098,6 +7578,36 @@
         }
       }
     },
+    "Label key" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그 키"
+          }
+        }
+      }
+    },
+    "Label value" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그 값"
+          }
+        }
+      }
+    },
+    "Labels are used by workspace and request selectors. System-managed labels cannot be changed." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그는 workspace와 요청의 노드 선택 조건에 사용됩니다. 시스템이 관리하는 태그는 변경할 수 없습니다."
+          }
+        }
+      }
+    },
     "Language" : {
       "localizations" : {
         "ko" : {
@@ -7394,6 +7904,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "호스트별 실행 중인 세션"
+          }
+        }
+      }
+    },
+    "Loading preview…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "미리보기 불러오는 중…"
+          }
+        }
+      }
+    },
+    "Loading…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "불러오는 중…"
           }
         }
       }
@@ -7937,6 +8467,16 @@
         }
       }
     },
+    "Muxa selects a host and prepares an isolated worktree. The pipeline runs in an attachable tmux session." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa가 호스트를 선택하고 격리된 worktree를 준비합니다. 파이프라인은 언제든 접속할 수 있는 tmux 세션에서 실행됩니다."
+          }
+        }
+      }
+    },
     "Muxa skips the pane you are looking at and repeats for the same agent within 30 seconds. An agent that finished or started waiting since you last opened it keeps a dot until you do." : {
       "localizations" : {
         "ko" : {
@@ -7963,6 +8503,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Muxa 터미널"
+          }
+        }
+      }
+    },
+    "Muxa watches your existing agents and can start new ones in tmux or a native terminal. Every pane, host, and question stays in one window." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa는 기존 에이전트를 관찰하고 tmux나 네이티브 터미널에서 새 에이전트를 시작할 수 있습니다. 모든 페인과 호스트, 질문을 한 윈도우에서 확인합니다."
           }
         }
       }
@@ -8329,6 +8879,16 @@
         }
       }
     },
+    "New Work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "새 Work"
+          }
+        }
+      }
+    },
     "New native shell" : {
       "localizations" : {
         "ko" : {
@@ -8419,6 +8979,16 @@
         }
       }
     },
+    "New workspace ID" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "새 Workspace ID"
+          }
+        }
+      }
+    },
     "Next / Previous Editor" : {
       "localizations" : {
         "ko" : {
@@ -8449,22 +9019,22 @@
         }
       }
     },
+    "Next match" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다음 결과"
+          }
+        }
+      }
+    },
     "No Hosts" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "호스트 없음"
-          }
-        }
-      }
-    },
-    "No pipelines yet. Muxa ships presets for one, two, and three agents." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "아직 파이프라인이 없습니다. 에이전트 1~3개용 프리셋이 준비되어 있습니다."
           }
         }
       }
@@ -8625,6 +9195,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 호스트에서 확인되는 실행 세션이 없습니다."
+          }
+        }
+      }
+    },
+    "No files in this view" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "표시할 파일이 없습니다"
           }
         }
       }
@@ -8849,6 +9429,16 @@
         }
       }
     },
+    "No pipelines yet. Muxa ships presets for one, two, and three agents." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 파이프라인이 없습니다. 에이전트 1~3개용 프리셋이 준비되어 있습니다."
+          }
+        }
+      }
+    },
     "No previous conversations" : {
       "localizations" : {
         "ko" : {
@@ -9045,6 +9635,56 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "작업 디렉터리 없음"
+          }
+        }
+      }
+    },
+    "Node labels" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드 태그"
+          }
+        }
+      }
+    },
+    "Node override" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드별 설정"
+          }
+        }
+      }
+    },
+    "Node selector" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드 선택 조건"
+          }
+        }
+      }
+    },
+    "Node selector (optional)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드 선택 조건 (선택)"
+          }
+        }
+      }
+    },
+    "NodeId or coordinator-local alias" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "NodeId 또는 coordinator 기준 호스트 별칭"
           }
         }
       }
@@ -9550,6 +10190,16 @@
         }
       }
     },
+    "Only regular files can be previewed." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "일반 파일만 미리 볼 수 있습니다."
+          }
+        }
+      }
+    },
     "Open" : {
       "localizations" : {
         "ko" : {
@@ -9607,6 +10257,56 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "컨텍스트 열기"
+          }
+        }
+      }
+    },
+    "Open File or Folder" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일 또는 폴더 열기"
+          }
+        }
+      }
+    },
+    "Open File or Folder…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일 또는 폴더 열기…"
+          }
+        }
+      }
+    },
+    "Open File…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일 열기…"
+          }
+        }
+      }
+    },
+    "Open Folder" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "폴더 열기"
+          }
+        }
+      }
+    },
+    "Open Folder…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "폴더 열기…"
           }
         }
       }
@@ -9688,6 +10388,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "고정해서 열기"
+          }
+        }
+      }
+    },
+    "Open Preview" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "미리보기 열기"
           }
         }
       }
@@ -9820,6 +10530,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "AIR Workbench에서 열기"
+          }
+        }
+      }
+    },
+    "Open in Default App" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본 앱에서 열기"
           }
         }
       }
@@ -10208,6 +10928,16 @@
         }
       }
     },
+    "Parent folder" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "상위 폴더"
+          }
+        }
+      }
+    },
     "Participants" : {
       "localizations" : {
         "ko" : {
@@ -10368,6 +11098,26 @@
         }
       }
     },
+    "Placement is checked again when you dispatch." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실제 요청을 보낼 때 배치 조건을 다시 확인합니다."
+          }
+        }
+      }
+    },
+    "Placement preview" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "배치 미리보기"
+          }
+        }
+      }
+    },
     "Plan" : {
       "localizations" : {
         "ko" : {
@@ -10449,12 +11199,42 @@
         }
       }
     },
+    "Presses Enter only while waiting on a selected Yes or Proceed confirmation." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "선택한 Yes 또는 Proceed 확인을 기다리는 동안에만 Enter를 누릅니다."
+          }
+        }
+      }
+    },
     "Preview" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "미리보기"
+          }
+        }
+      }
+    },
+    "Preview placement" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "배치 미리보기"
+          }
+        }
+      }
+    },
+    "Preview unavailable" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "미리보기를 열 수 없습니다"
           }
         }
       }
@@ -10485,6 +11265,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이전 편집기"
+          }
+        }
+      }
+    },
+    "Previous match" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이전 결과"
           }
         }
       }
@@ -10998,12 +11788,32 @@
         }
       }
     },
+    "Refresh files" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일 새로 고침"
+          }
+        }
+      }
+    },
     "Refresh live" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "실시간 새로 고침"
+          }
+        }
+      }
+    },
+    "Refresh preview" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "미리보기 새로 고침"
           }
         }
       }
@@ -11310,6 +12120,26 @@
         }
       }
     },
+    "Remove label" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그 삭제"
+          }
+        }
+      }
+    },
+    "Remove node override" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드별 설정 제거"
+          }
+        }
+      }
+    },
     "Remove this provider?" : {
       "localizations" : {
         "ko" : {
@@ -11466,6 +12296,46 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "답변…"
+          }
+        }
+      }
+    },
+    "Repository ID" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장소 ID"
+          }
+        }
+      }
+    },
+    "Repository URL" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장소 URL"
+          }
+        }
+      }
+    },
+    "Repository path" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장소 경로"
+          }
+        }
+      }
+    },
+    "Repository path override" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장소 경로 재정의"
           }
         }
       }
@@ -11662,6 +12532,16 @@
         }
       }
     },
+    "Result" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결과"
+          }
+        }
+      }
+    },
     "Resume" : {
       "localizations" : {
         "ko" : {
@@ -11688,6 +12568,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "연결 다시 시도"
+          }
+        }
+      }
+    },
+    "Retry same request" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "같은 요청 재시도"
           }
         }
       }
@@ -11768,6 +12658,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "역할, 예: reviewer (선택)"
+          }
+        }
+      }
+    },
+    "Root" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본 경로"
+          }
+        }
+      }
+    },
+    "Root override" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본 경로 재정의"
           }
         }
       }
@@ -11862,6 +12772,16 @@
         }
       }
     },
+    "Run" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행"
+          }
+        }
+      }
+    },
     "Run in Shell" : {
       "localizations" : {
         "ko" : {
@@ -11878,6 +12798,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "실행 기록"
+          }
+        }
+      }
+    },
+    "Run path" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 경로"
+          }
+        }
+      }
+    },
+    "Run path override" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 경로 재정의"
           }
         }
       }
@@ -11992,36 +12932,6 @@
         }
       }
     },
-    "Show all %lld" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%lld개 모두 보기"
-          }
-        }
-      }
-    },
-    "Show less" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "접기"
-          }
-        }
-      }
-    },
-    "Show more" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "더 보기"
-          }
-        }
-      }
-    },
     "SSH target" : {
       "localizations" : {
         "ko" : {
@@ -12132,6 +13042,16 @@
         }
       }
     },
+    "Save label" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그 저장"
+          }
+        }
+      }
+    },
     "Save or discard launch option changes before editing Raw TOML." : {
       "localizations" : {
         "ko" : {
@@ -12219,6 +13139,16 @@
         }
       }
     },
+    "Saved dispatches" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장된 배치 요청"
+          }
+        }
+      }
+    },
     "Saved into the muxa config on %@ when you save; nothing is written while drafting." : {
       "localizations" : {
         "ko" : {
@@ -12300,12 +13230,32 @@
         }
       }
     },
+    "Search files, sessions, work and agents" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일, 세션, Work, 에이전트 검색"
+          }
+        }
+      }
+    },
     "Search sessions, windows, panes, shells, work, agents" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "세션, 윈도우, 패널, 셸, 작업, 에이전트 검색"
+          }
+        }
+      }
+    },
+    "Searching workspace files…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 폴더의 파일을 검색하는 중…"
           }
         }
       }
@@ -12346,6 +13296,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "메시지를 선택하세요"
+          }
+        }
+      }
+    },
+    "Select node" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드 선택"
+          }
+        }
+      }
+    },
+    "Select workspace" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspace 선택"
           }
         }
       }
@@ -12728,6 +13698,26 @@
         }
       }
     },
+    "Share a pane or window" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "페인이나 윈도우를 공유합니다"
+          }
+        }
+      }
+    },
+    "Shared Ask history refreshes periodically from the coordinator." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "공유 Ask 기록을 coordinator에서 주기적으로 가져옵니다."
+          }
+        }
+      }
+    },
     "Shared prompt prefix (optional)" : {
       "localizations" : {
         "ko" : {
@@ -12819,12 +13809,42 @@
         }
       }
     },
+    "Show Files" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일 보기"
+          }
+        }
+      }
+    },
+    "Show Hidden Files" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "숨김 파일 표시"
+          }
+        }
+      }
+    },
     "Show Welcome Guide…" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "환영 안내 보기…"
+          }
+        }
+      }
+    },
+    "Show all %lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개 모두 보기"
           }
         }
       }
@@ -12839,12 +13859,32 @@
         }
       }
     },
+    "Show in Files" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일 목록에서 보기"
+          }
+        }
+      }
+    },
     "Show in Restore…" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "복원에서 보기…"
+          }
+        }
+      }
+    },
+    "Show less" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "접기"
           }
         }
       }
@@ -12856,6 +13896,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "관리 중인 Work 보기"
+          }
+        }
+      }
+    },
+    "Show more" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "더 보기"
           }
         }
       }
@@ -12981,6 +14031,16 @@
         }
       }
     },
+    "Sign in through your configured provider and invite someone to view or prompt a specific pane or window." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정한 제공자로 로그인하고 다른 사람이 특정 페인이나 윈도우를 조회하거나 프롬프트를 보낼 수 있도록 초대합니다."
+          }
+        }
+      }
+    },
     "Skip" : {
       "localizations" : {
         "ko" : {
@@ -13027,6 +14087,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "완료를 보고하기 전에 테스트를 실행하는 단독 Claude"
+          }
+        }
+      }
+    },
+    "Some folders were skipped or the search limit was reached. Open a narrower folder to search further." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "읽지 못한 폴더가 있거나 검색 한도에 도달했습니다. 하위 폴더를 열어 더 검색하세요."
+          }
+        }
+      }
+    },
+    "Source" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "원본"
           }
         }
       }
@@ -13687,6 +14767,16 @@
         }
       }
     },
+    "Task and acceptance criteria" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 내용과 완료 기준"
+          }
+        }
+      }
+    },
     "Terminal" : {
       "localizations" : {
         "ko" : {
@@ -13768,6 +14858,16 @@
         }
       }
     },
+    "Text preview is limited to 2 MB." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "텍스트 미리보기는 2 MB까지 지원합니다."
+          }
+        }
+      }
+    },
     "That folder has no scripts/air.mjs." : {
       "localizations" : {
         "ko" : {
@@ -13824,6 +14924,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "고급 탭에서 그 파일을 열 수 있습니다."
+          }
+        }
+      }
+    },
+    "The SSH file request timed out." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSH 파일 요청 시간이 초과됐습니다."
+          }
+        }
+      }
+    },
+    "The Workspaces rail includes existing tmux sessions, and the Sessions navigator opens windows and panes with live output." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspaces 목록에 기존 tmux 세션도 표시하며, Sessions 탐색기에서 윈도우와 페인의 실시간 출력을 엽니다."
           }
         }
       }
@@ -14167,6 +15287,16 @@
         }
       }
     },
+    "The pipeline has started. This does not mean the work is complete." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파이프라인이 시작되었습니다. 작업이 완료된 상태는 아닙니다."
+          }
+        }
+      }
+    },
     "The pipeline was saved, but the route could not be added." : {
       "localizations" : {
         "ko" : {
@@ -14277,6 +15407,16 @@
         }
       }
     },
+    "The strip on the left edge switches between Work, Explore, Inbox, Ask, Shells, and Files." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "왼쪽 가장자리의 막대에서 Work, Explore, Inbox, Ask, Shells, Files를 전환합니다."
+          }
+        }
+      }
+    },
     "The strip on the left edge switches between Work, Explore, Inbox, Ask, and Shells." : {
       "localizations" : {
         "ko" : {
@@ -14327,6 +15467,16 @@
         }
       }
     },
+    "These settings belong to the connected daemon. Other entry hosts use its Fleet alias to share placement and Ask history." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "연결된 데몬의 설정입니다. 다른 호스트에서는 이 coordinator의 Fleet 별칭을 지정해 작업 배치와 Ask 기록을 공유합니다."
+          }
+        }
+      }
+    },
     "These values are read from muxa configuration." : {
       "localizations" : {
         "ko" : {
@@ -14343,6 +15493,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "생각 중"
+          }
+        }
+      }
+    },
+    "This Fleet host is no longer registered." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "등록된 Fleet 호스트를 찾을 수 없습니다."
+          }
+        }
+      }
+    },
+    "This Mac" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 Mac"
+          }
+        }
+      }
+    },
+    "This Mac · ~ / Documents / …" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 Mac · ~ / Documents / …"
           }
         }
       }
@@ -14377,12 +15557,32 @@
         }
       }
     },
+    "This binary file has no inline preview." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 바이너리 파일은 앱 내 미리보기를 지원하지 않습니다."
+          }
+        }
+      }
+    },
     "This changes the active account for every new agent on this Mac, not only for this pane. Agents that are already running keep the account they started with." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 페인만이 아니라 이 Mac에서 새로 시작하는 모든 에이전트의 활성 계정이 바뀝니다. 이미 실행 중인 에이전트는 시작할 때의 계정을 그대로 씁니다."
+          }
+        }
+      }
+    },
+    "This file exceeds the 16 MB preview limit. Open it in another app." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "미리보기 용량 제한인 16 MB를 초과했습니다. 다른 앱에서 열어주세요."
           }
         }
       }
@@ -14483,6 +15683,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이번 시간"
+          }
+        }
+      }
+    },
+    "This image could not be decoded." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이미지를 해석할 수 없습니다."
           }
         }
       }
@@ -15044,6 +16254,16 @@
         }
       }
     },
+    "Use Active Work Folder" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "현재 작업 폴더 열기"
+          }
+        }
+      }
+    },
     "Use Bundled muxad" : {
       "localizations" : {
         "ko" : {
@@ -15135,6 +16355,16 @@
         }
       }
     },
+    "Use {repo}, {workspace}, {work}, and {attempt}. Runs and artifacts must include {attempt}. Paths are expanded on the selected worker." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "{repo}, {workspace}, {work}, {attempt}를 사용할 수 있습니다. 실행·결과물 경로에는 {attempt}가 필요합니다. 실제 경로는 선택된 작업 호스트에서 결정됩니다."
+          }
+        }
+      }
+    },
     "Used as the initial folder in Start Work. Leave empty to use route configuration." : {
       "localizations" : {
         "ko" : {
@@ -15182,6 +16412,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "버전 정보 없음"
+          }
+        }
+      }
+    },
+    "View worker" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 호스트 보기"
           }
         }
       }
@@ -15659,6 +16899,16 @@
         }
       }
     },
+    "Work ID" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Work ID"
+          }
+        }
+      }
+    },
     "Work ID, for example auth-cleanup" : {
       "localizations" : {
         "ko" : {
@@ -15786,6 +17036,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "워크스페이스 (선택)"
+          }
+        }
+      }
+    },
+    "Workspace policy" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspace 정책"
           }
         }
       }
@@ -17106,6 +18366,16 @@
         }
       }
     },
+    "↑ ↓ Select · Tab Complete · Return Open" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "↑ ↓ 선택 · Tab 자동완성 · Return 열기"
+          }
+        }
+      }
+    },
     "↑↓ / ⇧⇥ ⇥  select" : {
       "localizations" : {
         "ko" : {
@@ -17172,1256 +18442,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "⌥⌘T는 포커스된 폴더에서 기본 에이전트를 시작하고, ⌥⇧⌘T는 에이전트, 폴더, 배치를 직접 고릅니다."
-          }
-        }
-      }
-    },
-    "Fleet Dispatch" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Fleet 작업 배치"
-          }
-        }
-      }
-    },
-    "Dispatch" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "작업 배치"
-          }
-        }
-      }
-    },
-    "Muxa selects a host and prepares an isolated worktree. The pipeline runs in an attachable tmux session." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Muxa가 호스트를 선택하고 격리된 worktree를 준비합니다. 파이프라인은 언제든 접속할 수 있는 tmux 세션에서 실행됩니다."
-          }
-        }
-      }
-    },
-    "Fleet dispatch requires an updated CLI and daemon. Configure the coordinator in Settings → Dispatch." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Fleet 작업 배치에는 최신 CLI와 데몬이 필요합니다. 설정 → 작업 배치에서 coordinator를 지정하세요."
-          }
-        }
-      }
-    },
-    "Coordinator: %@" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Coordinator: %@"
-          }
-        }
-      }
-    },
-    "Select workspace" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Workspace 선택"
-          }
-        }
-      }
-    },
-    "Work ID" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Work ID"
-          }
-        }
-      }
-    },
-    "Full commit SHA" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "전체 커밋 SHA"
-          }
-        }
-      }
-    },
-    "Node selector (optional)" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "노드 선택 조건 (선택)"
-          }
-        }
-      }
-    },
-    "Host alias or NodeId (optional)" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "호스트 별칭 또는 NodeId (선택)"
-          }
-        }
-      }
-    },
-    "Task and acceptance criteria" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "작업 내용과 완료 기준"
-          }
-        }
-      }
-    },
-    "Placement preview" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "배치 미리보기"
-          }
-        }
-      }
-    },
-    "Assigned work" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "배정된 작업"
-          }
-        }
-      }
-    },
-    "Root" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "기본 경로"
-          }
-        }
-      }
-    },
-    "Run" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실행"
-          }
-        }
-      }
-    },
-    "Artifacts" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "결과물"
-          }
-        }
-      }
-    },
-    "Placement is checked again when you dispatch." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실제 요청을 보낼 때 배치 조건을 다시 확인합니다."
-          }
-        }
-      }
-    },
-    "Result" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "결과"
-          }
-        }
-      }
-    },
-    "The pipeline has started. This does not mean the work is complete." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파이프라인이 시작되었습니다. 작업이 완료된 상태는 아닙니다."
-          }
-        }
-      }
-    },
-    "Delivery is uncertain. Check status with this ID before retrying the same request." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "요청 전달 여부가 불확실합니다. 같은 요청을 재시도하기 전에 이 ID로 상태를 확인하세요."
-          }
-        }
-      }
-    },
-    "Artifact location on worker" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "작업 호스트의 결과물 경로"
-          }
-        }
-      }
-    },
-    "Saved dispatches" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "저장된 배치 요청"
-          }
-        }
-      }
-    },
-    "Dispatch UUID" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "배치 요청 UUID"
-          }
-        }
-      }
-    },
-    "Check status" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "상태 확인"
-          }
-        }
-      }
-    },
-    "New Work" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "새 Work"
-          }
-        }
-      }
-    },
-    "Preview placement" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "배치 미리보기"
-          }
-        }
-      }
-    },
-    "Retry same request" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "같은 요청 재시도"
-          }
-        }
-      }
-    },
-    "Dispatch Work" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Work 배치"
-          }
-        }
-      }
-    },
-    "Coordinator" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Coordinator"
-          }
-        }
-      }
-    },
-    "Enable Fleet dispatch" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Fleet 작업 배치 활성화"
-          }
-        }
-      }
-    },
-    "Coordinator host alias" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Coordinator 호스트 별칭"
-          }
-        }
-      }
-    },
-    "Empty means this host" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "비워 두면 현재 호스트 사용"
-          }
-        }
-      }
-    },
-    "These settings belong to the connected daemon. Other entry hosts use its Fleet alias to share placement and Ask history." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "연결된 데몬의 설정입니다. 다른 호스트에서는 이 coordinator의 Fleet 별칭을 지정해 작업 배치와 Ask 기록을 공유합니다."
-          }
-        }
-      }
-    },
-    "Default execution paths" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "기본 실행 경로"
-          }
-        }
-      }
-    },
-    "Workspace policy" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Workspace 정책"
-          }
-        }
-      }
-    },
-    "New workspace ID" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "새 Workspace ID"
-          }
-        }
-      }
-    },
-    "Add workspace" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Workspace 추가"
-          }
-        }
-      }
-    },
-    "Repository ID" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "저장소 ID"
-          }
-        }
-      }
-    },
-    "Repository URL" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "저장소 URL"
-          }
-        }
-      }
-    },
-    "Node selector" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "노드 선택 조건"
-          }
-        }
-      }
-    },
-    "Empty overrides inherit the defaults above." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "비워 둔 항목은 상위 기본값을 따릅니다."
-          }
-        }
-      }
-    },
-    "Node override" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "노드별 설정"
-          }
-        }
-      }
-    },
-    "Select node" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "노드 선택"
-          }
-        }
-      }
-    },
-    "NodeId or coordinator-local alias" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "NodeId 또는 coordinator 기준 호스트 별칭"
-          }
-        }
-      }
-    },
-    "Add node" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "노드 추가"
-          }
-        }
-      }
-    },
-    "Remove node override" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "노드별 설정 제거"
-          }
-        }
-      }
-    },
-    "Use {repo}, {workspace}, {work}, and {attempt}. Runs and artifacts must include {attempt}. Paths are expanded on the selected worker." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "{repo}, {workspace}, {work}, {attempt}를 사용할 수 있습니다. 실행·결과물 경로에는 {attempt}가 필요합니다. 실제 경로는 선택된 작업 호스트에서 결정됩니다."
-          }
-        }
-      }
-    },
-    "Edit workspace and node paths on the coordinator. This host forwards requests there." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Workspace와 노드 경로는 coordinator에서 설정하세요. 현재 호스트는 요청을 해당 coordinator로 전달합니다."
-          }
-        }
-      }
-    },
-    "Repository path" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "저장소 경로"
-          }
-        }
-      }
-    },
-    "Run path" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실행 경로"
-          }
-        }
-      }
-    },
-    "Artifact path" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "결과물 경로"
-          }
-        }
-      }
-    },
-    "Root override" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "기본 경로 재정의"
-          }
-        }
-      }
-    },
-    "Repository path override" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "저장소 경로 재정의"
-          }
-        }
-      }
-    },
-    "Run path override" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실행 경로 재정의"
-          }
-        }
-      }
-    },
-    "Artifact path override" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "결과물 경로 재정의"
-          }
-        }
-      }
-    },
-    "Shared Ask history refreshes periodically from the coordinator." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "공유 Ask 기록을 coordinator에서 주기적으로 가져옵니다."
-          }
-        }
-      }
-    },
-    "View worker": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "작업 호스트 보기"
-          }
-        }
-      }
-    },
-    "Node labels": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "노드 태그"
-          }
-        }
-      }
-    },
-    "Edit labels": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "태그 편집"
-          }
-        }
-      }
-    },
-    "Label key": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "태그 키"
-          }
-        }
-      }
-    },
-    "Label value": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "태그 값"
-          }
-        }
-      }
-    },
-    "Remove label": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "태그 삭제"
-          }
-        }
-      }
-    },
-    "Save label": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "태그 저장"
-          }
-        }
-      }
-    },
-    "Labels are used by workspace and request selectors. System-managed labels cannot be changed.": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "태그는 workspace와 요청의 노드 선택 조건에 사용됩니다. 시스템이 관리하는 태그는 변경할 수 없습니다."
-          }
-        }
-      }
-    },
-    "Cannot read this folder." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 폴더를 읽을 수 없습니다."
-          }
-        }
-      }
-    },
-    "Close Tab" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "탭 닫기"
-          }
-        }
-      }
-    },
-    "Close find" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "찾기 닫기"
-          }
-        }
-      }
-    },
-    "Copy Path" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "경로 복사"
-          }
-        }
-      }
-    },
-    "Enter an absolute path or a path starting with ~/." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "절대 경로나 ~/로 시작하는 경로를 입력하세요."
-          }
-        }
-      }
-    },
-    "File host" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파일 호스트"
-          }
-        }
-      }
-    },
-    "Files" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파일"
-          }
-        }
-      }
-    },
-    "Files on this Mac" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 Mac의 파일"
-          }
-        }
-      }
-    },
-    "Find in File" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파일에서 찾기"
-          }
-        }
-      }
-    },
-    "Find in file" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파일에서 찾기"
-          }
-        }
-      }
-    },
-    "Fit" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "화면에 맞춤"
-          }
-        }
-      }
-    },
-    "Folder not found." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "폴더를 찾을 수 없습니다."
-          }
-        }
-      }
-    },
-    "Folder path" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "폴더 경로"
-          }
-        }
-      }
-    },
-    "Loading preview…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "미리보기 불러오는 중…"
-          }
-        }
-      }
-    },
-    "Next match" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "다음 결과"
-          }
-        }
-      }
-    },
-    "No files in this view" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "표시할 파일이 없습니다"
-          }
-        }
-      }
-    },
-    "Only regular files can be previewed." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "일반 파일만 미리 볼 수 있습니다."
-          }
-        }
-      }
-    },
-    "Open File or Folder" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파일 또는 폴더 열기"
-          }
-        }
-      }
-    },
-    "Open File or Folder…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파일 또는 폴더 열기…"
-          }
-        }
-      }
-    },
-    "Open File…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파일 열기…"
-          }
-        }
-      }
-    },
-    "Open Folder" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "폴더 열기"
-          }
-        }
-      }
-    },
-    "Open Folder…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "폴더 열기…"
-          }
-        }
-      }
-    },
-    "Open Preview" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "미리보기 열기"
-          }
-        }
-      }
-    },
-    "Open in Default App" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "기본 앱에서 열기"
-          }
-        }
-      }
-    },
-    "Parent folder" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "상위 폴더"
-          }
-        }
-      }
-    },
-    "Preview unavailable" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "미리보기를 열 수 없습니다"
-          }
-        }
-      }
-    },
-    "Previous match" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이전 결과"
-          }
-        }
-      }
-    },
-    "Refresh files" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파일 새로 고침"
-          }
-        }
-      }
-    },
-    "Refresh preview" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "미리보기 새로 고침"
-          }
-        }
-      }
-    },
-    "Show Files" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파일 보기"
-          }
-        }
-      }
-    },
-    "Show Hidden Files" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "숨김 파일 표시"
-          }
-        }
-      }
-    },
-    "Show in Files" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파일 목록에서 보기"
-          }
-        }
-      }
-    },
-    "Source" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "원본"
-          }
-        }
-      }
-    },
-    "Text preview is limited to 2 MB." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "텍스트 미리보기는 2 MB까지 지원합니다."
-          }
-        }
-      }
-    },
-    "The SSH file request timed out." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "SSH 파일 요청 시간이 초과됐습니다."
-          }
-        }
-      }
-    },
-    "This Fleet host is no longer registered." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "등록된 Fleet 호스트를 찾을 수 없습니다."
-          }
-        }
-      }
-    },
-    "This Mac" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 Mac"
-          }
-        }
-      }
-    },
-    "This binary file has no inline preview." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 바이너리 파일은 앱 내 미리보기를 지원하지 않습니다."
-          }
-        }
-      }
-    },
-    "This file exceeds the 16 MB preview limit. Open it in another app." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "미리보기 용량 제한인 16 MB를 초과했습니다. 다른 앱에서 열어주세요."
-          }
-        }
-      }
-    },
-    "Use Active Work Folder" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "현재 작업 폴더 열기"
-          }
-        }
-      }
-    },
-    "EXPLORER": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "탐색기"
-          }
-        }
-      }
-    },
-    "Go to Folder…": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "폴더로 이동…"
-          }
-        }
-      }
-    },
-    "Go to Folder": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "폴더로 이동"
-          }
-        }
-      }
-    },
-    "↑ ↓ Select · Tab Complete · Return Open": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "↑ ↓ 선택 · Tab 자동완성 · Return 열기"
-          }
-        }
-      }
-    },
-    "This Mac · ~ / Documents / …": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "이 Mac · ~ / Documents / …"
-          }
-        }
-      }
-    },
-    "Loading…": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "불러오는 중…"
-          }
-        }
-      }
-    },
-    "Search files, sessions, work and agents": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "파일, 세션, Work, 에이전트 검색"
-          }
-        }
-      }
-    },
-    "Searching workspace files…": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "작업 폴더의 파일을 검색하는 중…"
-          }
-        }
-      }
-    },
-    "Some folders were skipped or the search limit was reached. Open a narrower folder to search further.": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "읽지 못한 폴더가 있거나 검색 한도에 도달했습니다. 하위 폴더를 열어 더 검색하세요."
-          }
-        }
-      }
-    },
-    "This image could not be decoded.": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "이미지를 해석할 수 없습니다."
-          }
-        }
-      }
-    },
-    "Codex activity and turn completion refresh every two seconds. Usage percentages alone no longer mark a running agent as failed." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Codex 활동과 턴 완료를 2초마다 갱신합니다. 사용량 비율만으로 실행 중인 에이전트를 오류 상태로 표시하지 않습니다."
-          }
-        }
-      }
-    },
-    "Codex status stays current" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Codex 상태를 빠르게 갱신합니다"
-          }
-        }
-      }
-    },
-    "Every workspace in the dashboard" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "대시보드에서 모든 작업 공간을 봅니다"
-          }
-        }
-      }
-    },
-    "Muxa watches your existing agents and can start new ones in tmux or a native terminal. Every pane, host, and question stays in one window." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Muxa는 기존 에이전트를 관찰하고 tmux나 네이티브 터미널에서 새 에이전트를 시작할 수 있습니다. 모든 페인과 호스트, 질문을 한 윈도우에서 확인합니다."
-          }
-        }
-      }
-    },
-    "Share a pane or window" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "페인이나 윈도우를 공유합니다"
-          }
-        }
-      }
-    },
-    "Sign in through your configured provider and invite someone to view or prompt a specific pane or window." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "설정한 제공자로 로그인하고 다른 사람이 특정 페인이나 윈도우를 조회하거나 프롬프트를 보낼 수 있도록 초대합니다."
-          }
-        }
-      }
-    },
-    "The Workspaces rail includes existing tmux sessions, and the Sessions navigator opens windows and panes with live output." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Workspaces 목록에 기존 tmux 세션도 표시하며, Sessions 탐색기에서 윈도우와 페인의 실시간 출력을 엽니다."
-          }
-        }
-      }
-    },
-    "Browse files on this Mac or an SSH host and preview them without changing them." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 Mac이나 SSH 호스트의 파일을 탐색하고 변경 없이 미리 봅니다."
-          }
-        }
-      }
-    },
-    "The strip on the left edge switches between Work, Explore, Inbox, Ask, Shells, and Files." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "왼쪽 가장자리의 막대에서 Work, Explore, Inbox, Ask, Shells, Files를 전환합니다."
-          }
-        }
-      }
-    },
-    "Files beside your agents" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "에이전트 옆에서 파일을 확인합니다"
-          }
-        }
-      }
-    },
-    "Browse local and SSH folders from Files, preview artifacts, and use Go to Anything to find a file." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Files에서 로컬·SSH 폴더와 결과물을 미리 보고 Go to Anything으로 파일을 찾습니다."
           }
         }
       }
