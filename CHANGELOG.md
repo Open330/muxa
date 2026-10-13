@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `muxa restore` / `muxa reload` relaunch agents correctly:
+  - **Wrapped agents.** A pane started with its command (as `muxa agent start`
+    does) is recorded as that command, wrapper included. Before, the snapshot
+    took its child: `node …/codex` without the `aas` wrapper, so the
+    account-specific resume failed.
+  - **Instruction-launched agents.** Resuming an agent that was launched with
+    its first instruction no longer sends that instruction again; flags and
+    their values are kept.
 - Run from a plain terminal or a tmux shell, `muxa status` listed agents
   living in rmux as raw `rmux:%N` ids. `status`, `dashboard` and `attend` now
   name panes from every active host, matched to the agent's server. When no
