@@ -1,7 +1,7 @@
 # Activity Ledger
 
 `muxa` keeps duration data in `activity.ndjson`. This is the source for
-`muxa stats`, `muxa report`, and the raw `muxa activity` query command.
+`muxa stats`, `muxa stats report`, and the raw `muxa stats activity` query command.
 
 ## Quick Views
 
@@ -10,14 +10,14 @@ muxa stats --since today
 muxa stats --since yesterday --group-by session
 muxa stats --since week --group-by project
 muxa stats --since month --exclude-session 'monitor*'
-muxa report --since week
-muxa report --since last-month --exclude-pane '%42'
+muxa stats report --since week
+muxa stats report --since last-month --exclude-pane '%42'
 muxa timeline --since today --session main
-muxa activity --since today --type human
-muxa activity --since today --type agent --format json
+muxa stats activity --since today --type human
+muxa stats activity --since today --type agent --format json
 ```
 
-Session groups in `muxa stats` and `muxa report` fold generated views such as
+Session groups in `muxa stats` and `muxa stats report` fold generated views such as
 `callabo~view~123` into `callabo`, including retained history. Grouping happens
 before sorting and limiting rows. Overlapping human-presence intervals and
 ACT/WACT time are not counted twice for those views; agent work remains additive.
@@ -80,7 +80,7 @@ triggers:
 - **tmux input** — the daemon samples each client's `client_activity` and records
   a `tmux_input` interaction whenever it advances (a keypress or scroll), so
   *reading* a session while attached is credited, not just typing. (Visible via
-  `muxa activity --type human`.)
+  `muxa stats activity --type human`.)
 - **Thinking** — time present while an agent is blocked on you
   (`WaitingInput`/`WaitingChoice`/`Error`): reading its question and deciding.
 
@@ -179,7 +179,7 @@ details, see [docs/TIMELINE.md](TIMELINE.md).
 
 ## Ledger Types
 
-`muxa activity --type ...` filters the raw ledger:
+`muxa stats activity --type ...` filters the raw ledger:
 
 | Type | Meaning |
 | ---- | ------- |

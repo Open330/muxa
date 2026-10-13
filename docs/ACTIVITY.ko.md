@@ -1,7 +1,7 @@
 # Activity Ledger
 
 `muxa`의 duration 데이터는 `activity.ndjson`에 저장됩니다. 이 파일은
-`muxa stats`, `muxa report`, raw 조회 명령인 `muxa activity`의 기준입니다.
+`muxa stats`, `muxa stats report`, raw 조회 명령인 `muxa stats activity`의 기준입니다.
 
 ## 빠른 조회
 
@@ -10,14 +10,14 @@ muxa stats --since today
 muxa stats --since yesterday --group-by session
 muxa stats --since week --group-by project
 muxa stats --since month --exclude-session 'monitor*'
-muxa report --since week
-muxa report --since last-month --exclude-pane '%42'
+muxa stats report --since week
+muxa stats report --since last-month --exclude-pane '%42'
 muxa timeline --since today --session main
-muxa activity --since today --type human
-muxa activity --since today --type agent --format json
+muxa stats activity --since today --type human
+muxa stats activity --since today --type agent --format json
 ```
 
-`muxa stats`와 `muxa report`의 세션별 집계는 `callabo~view~123` 같은 view를
+`muxa stats`와 `muxa stats report`의 세션별 집계는 `callabo~view~123` 같은 view를
 `callabo`로 합칩니다. 과거 기록에도 적용되며, 합친 뒤 정렬과 행 수 제한을
 적용합니다. view 사이에 겹치는 사용자 체류 시간과 ACT/WACT는 중복 계산하지
 않으며, agent 작업 시간은 기존처럼 합산합니다.
@@ -160,7 +160,7 @@ TUI keybinding, grouping mode, dashboard 동작, JSON export 설명은
 
 ## Ledger 타입
 
-`muxa activity --type ...` 은 raw ledger 를 타입별로 필터링합니다:
+`muxa stats activity --type ...` 은 raw ledger 를 타입별로 필터링합니다:
 
 | Type | 의미 |
 | ---- | ---- |
