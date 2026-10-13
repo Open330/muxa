@@ -3473,13 +3473,8 @@ struct TreeRows {
 impl TreeRows {
     fn agent(&self, label: String, agent: &Agent) -> Vec<Cell> {
         let state = status_state_label(agent.state, self.layout).to_string();
-        let prompt = agent
-            .last_prompt
-            .as_deref()
-            .unwrap_or("-")
-            .lines()
-            .next()
-            .unwrap_or("");
+        let headline = muxa::prompt_headline(agent.last_prompt.as_deref().unwrap_or("-"));
+        let prompt = headline.lines().next().unwrap_or("");
         vec![
             Cell::new(truncate_cell(&label, self.name_width)),
             status_state_cell(&state, agent.state, self.theme),
@@ -3794,11 +3789,7 @@ fn cmd_panes() -> Result<()> {
 
     let terminal_width = terminal_width();
     let mut out = std::io::stdout().lock();
-    for p in &all {
-        let line = format!(
-            "{:<8} {}:{}.{}  tty={}  cmd={}  title={}",
-            p.pane_id, p.session, p.window_index, p.pane_index, p.tty, p.current_command, p.title
-        );
+    for line in pane_inventory_lines(&all) {
         if let Err(error) = writeln!(out, "{}", truncate_cell(&line, terminal_width)) {
             if error.kind() == std::io::ErrorKind::BrokenPipe {
                 return Ok(());
@@ -3820,6 +3811,42 @@ fn cmd_panes() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `muxa panes` rows. A session group lists each pane once per `~view~`
+/// member: show the pane once, under its base session, with how many views
+/// share it.
+fn pane_inventory_lines(all: &[muxa::tmux::PaneInfo]) -> Vec<String> {
+    let mut listings: std::collections::HashMap<(Option<String>, String), usize> =
+        std::collections::HashMap::new();
+    for pane in all {
+        *listings
+            .entry((pane.socket.clone(), pane.pane_id.clone()))
+            .or_default() += 1;
+    }
+    muxa::tmux::canonical_panes(all)
+        .iter()
+        .map(|p| {
+            let views = match listings
+                .get(&(p.socket.clone(), p.pane_id.clone()))
+                .map_or(0, |count| count - 1)
+            {
+                0 => String::new(),
+                1 => "  +1 view".to_owned(),
+                n => format!("  +{n} views"),
+            };
+            format!(
+                "{:<8} {}:{}.{}{views}  tty={}  cmd={}  title={}",
+                p.pane_id,
+                p.session,
+                p.window_index,
+                p.pane_index,
+                p.tty,
+                p.current_command,
+                p.title
+            )
+        })
+        .collect()
 }
 
 /// The empty-state diagnostic for a host that reported no panes. Two ways
@@ -4056,7 +4083,7 @@ fn render_status_table(
         let pane = pane_display(a, panes);
         let state_txt = status_state_label(a.state, layout).to_string();
         let last_activity = relative_time(now, a.last_activity_at);
-        let prompt_raw = a.last_prompt.as_deref().unwrap_or("-");
+        let prompt_raw = muxa::prompt_headline(a.last_prompt.as_deref().unwrap_or("-"));
         let prompt = prompt_raw.lines().next().unwrap_or("");
 
         let state_cell = status_state_cell(&state_txt, a.state, theme);
@@ -5905,6 +5932,25 @@ mod tests {
             "single windows drop their row:\n{rendered}"
         );
         assert!(rendered.contains("├─ 0 claude") && rendered.contains("└─ 1 claude"));
+    }
+
+    #[test]
+    fn pane_inventory_lists_grouped_panes_once_with_their_view_count() {
+        let pane = |session: &str, session_id: &str| {
+            serde_json::from_value::<muxa::tmux::PaneInfo>(serde_json::json!({
+                "pane_id": "%2", "session": session, "session_id": session_id,
+                "window_index": "2", "pane_index": "0", "tty": "/dev/pts/9",
+                "current_command": "aas", "title": "t", "pane_pid": 0, "socket": "default"
+            }))
+            .unwrap()
+        };
+        let lines = pane_inventory_lines(&[
+            pane("callabo~view~1", "$8"),
+            pane("callabo", "$0"),
+            pane("callabo~view~2", "$9"),
+        ]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("callabo:2.0  +2 views"), "{lines:?}");
     }
 
     #[test]

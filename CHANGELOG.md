@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Status rows show what an injected prompt is instead of its markup:
+  `⟳ <task summary>` for a finished Claude background task, and
+  `↳ <Kind> request from <sender>` for a muxa peer request.
 - `muxa status` shows agents as a session / window / pane tree, like
   `muxa watch`, with each session's state counts. Grouped `~view~` sessions
   fold onto their base, and paneless agents are listed last. `--flat` keeps
@@ -16,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `muxa stats` / `report` recorded no attached or hands-on time (WACT/ACT
+  `-`) for workspaces on rmux: session activity sampled only tmux and herdr.
+  rmux is sampled now. Its session ids are kept apart from tmux's
+  (`rmux:$N`), and a client is identified by its pid, so a reattach is not
+  counted as input.
+- `muxa stats` lists day rows newest first when no `--sort` is given.
+  Previously they were ranked by prompt count, which shuffled the dates.
+- `muxa panes` lists a grouped pane once, with `+N views`.
 - `muxa restore` / `muxa reload` relaunch agents correctly:
   - **Wrapped agents.** A pane started with its command (as `muxa agent start`
     does) is recorded as that command, wrapper included. Before, the snapshot

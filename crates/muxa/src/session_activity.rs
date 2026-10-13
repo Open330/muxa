@@ -286,6 +286,9 @@ fn add_elapsed(record: &mut SessionActivity, since: OffsetDateTime, now: OffsetD
 pub enum SessionActivitySource {
     #[default]
     Tmux,
+    /// The default rmux server. Its session ids are `$N` like tmux's, so they
+    /// are recorded as `rmux:$N` to keep the two keyspaces apart.
+    Rmux,
     Herdr {
         socket_path: PathBuf,
     },
@@ -302,7 +305,10 @@ impl SessionActivitySource {
     fn owns(&self, session_id: &str) -> bool {
         match self {
             SessionActivitySource::Tmux => session_id.starts_with('$'),
-            SessionActivitySource::Herdr { .. } => !session_id.starts_with('$'),
+            SessionActivitySource::Rmux => session_id.starts_with(RMUX_KEY_PREFIX),
+            SessionActivitySource::Herdr { .. } => {
+                !session_id.starts_with('$') && !session_id.starts_with(RMUX_KEY_PREFIX)
+            }
         }
     }
 
@@ -311,7 +317,10 @@ impl SessionActivitySource {
     /// run only when the tmux source actually sampled — a failed tmux poll must
     /// leave that state untouched, exactly as the single-source path did.
     fn produces_client_inputs(&self) -> bool {
-        matches!(self, SessionActivitySource::Tmux)
+        matches!(
+            self,
+            SessionActivitySource::Tmux | SessionActivitySource::Rmux
+        )
     }
 }
 
@@ -385,6 +394,7 @@ impl SessionActivityTracker {
             .iter()
             .map(|source| match source {
                 SessionActivitySource::Tmux => tokio::task::spawn_blocking(sample_activity),
+                SessionActivitySource::Rmux => tokio::task::spawn_blocking(sample_rmux_activity),
                 SessionActivitySource::Herdr { socket_path } => {
                     let socket_path = socket_path.clone();
                     tokio::task::spawn_blocking(move || Ok(sample_herdr_activity(&socket_path)))
@@ -564,6 +574,54 @@ fn sample_activity() -> Result<ActivitySample, String> {
         sessions,
         client_inputs,
     })
+}
+
+/// Prefix for rmux session ids and client names in the ledger.
+const RMUX_KEY_PREFIX: &str = "rmux:";
+
+/// The client format for rmux. rmux leaves `#{client_created}` empty, so the
+/// attach is identified by `#{client_pid}` instead: a reattach is a new client
+/// process, which seeds rather than reads as a keypress, exactly as a new
+/// `client_created` does on tmux.
+const RMUX_CLIENT_FMT: &str =
+    "#{client_name}\t#{client_session}\t#{client_control_mode}\t#{client_activity}\t#{client_pid}\t#{pane_in_mode}";
+
+/// rmux foreground sample, the [`sample_activity`] analog. Without it, a
+/// workspace that moved from tmux to rmux recorded no hands-on or attached
+/// time at all (`muxa stats` WACT/ACT read `-`).
+fn sample_rmux_activity() -> Result<ActivitySample, String> {
+    let Some((sessions, clients)) =
+        crate::backend::rmux::activity_listing(tmux::SESSION_FMT, RMUX_CLIENT_FMT)?
+    else {
+        return Ok(ActivitySample {
+            sessions: Vec::new(),
+            client_inputs: Vec::new(),
+        });
+    };
+    Ok(rmux_sample(
+        tmux::parse_session_lines(&sessions),
+        tmux::parse_client_lines(&clients),
+    ))
+}
+
+fn rmux_sample(
+    mut sessions: Vec<SessionInfo>,
+    mut clients: Vec<tmux::ClientInfo>,
+) -> ActivitySample {
+    apply_client_counts(&mut sessions, &clients);
+    for session in &mut sessions {
+        session.session_id = format!("{RMUX_KEY_PREFIX}{}", session.session_id);
+    }
+    // Client ttys are only unique per server; keep rmux readings apart from
+    // a tmux server's in the shared seen-client state.
+    for client in &mut clients {
+        client.name = format!("{RMUX_KEY_PREFIX}{}", client.name);
+    }
+    let client_inputs = client_inputs(&sessions, &clients);
+    ActivitySample {
+        sessions,
+        client_inputs,
+    }
 }
 
 /// herdr foreground sample: the currently focused herdr *workspace*, mapped
@@ -1089,5 +1147,58 @@ mod tests {
         let inputs = client_inputs(&sessions, &[no_created, no_name]);
 
         assert!(inputs.is_empty());
+    }
+
+    /// rmux's `$0` must not collide with tmux's `$0`, its clients must not
+    /// share tmux's seen-client keys, and an rmux reattach (a new client pid
+    /// in the `created` slot) seeds instead of reading as a keypress.
+    #[test]
+    fn rmux_samples_are_namespaced_and_pid_identified() {
+        let sessions = tmux::parse_session_lines("$0\tcallabo\t1\t\n$1\tsys\t0\t\n");
+        let clients = tmux::parse_client_lines("/dev/pts/1\tcallabo\t0\t1000\t4242\t0\n");
+        let sample = rmux_sample(sessions, clients);
+        let ids: Vec<_> = sample
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        assert_eq!(ids, ["rmux:$0", "rmux:$1"]);
+        assert_eq!(sample.sessions[0].attached_clients, 1);
+        assert!(SessionActivitySource::Rmux.owns("rmux:$0"));
+        assert!(!SessionActivitySource::Tmux.owns("rmux:$0"));
+        assert!(!SessionActivitySource::Herdr {
+            socket_path: PathBuf::new()
+        }
+        .owns("rmux:$0"));
+        assert!(SessionActivitySource::Rmux.produces_client_inputs());
+
+        let [input] = sample.client_inputs.as_slice() else {
+            panic!("one interactive rmux client");
+        };
+        assert_eq!(input.name, "rmux:/dev/pts/1");
+        assert_eq!(input.session_id, "rmux:$0");
+
+        let mut seen = HashMap::new();
+        assert!(
+            detect_input_ticks(&mut seen, &sample.client_inputs).is_empty(),
+            "first poll seeds"
+        );
+        let typed = rmux_sample(
+            tmux::parse_session_lines("$0\tcallabo\t1\t\n"),
+            tmux::parse_client_lines("/dev/pts/1\tcallabo\t0\t1005\t4242\t0\n"),
+        );
+        assert_eq!(
+            detect_input_ticks(&mut seen, &typed.client_inputs).len(),
+            1,
+            "same attach, activity advanced"
+        );
+        let reattached = rmux_sample(
+            tmux::parse_session_lines("$0\tcallabo\t1\t\n"),
+            tmux::parse_client_lines("/dev/pts/1\tcallabo\t0\t1010\t5555\t0\n"),
+        );
+        assert!(
+            detect_input_ticks(&mut seen, &reattached.client_inputs).is_empty(),
+            "a new client pid is a reattach"
+        );
     }
 }

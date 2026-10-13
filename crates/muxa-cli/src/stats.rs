@@ -79,9 +79,10 @@ pub struct Args {
     limit: usize,
 
     /// Column to sort rows by: prompts, work, wait, err, tmux, human, think,
-    /// active, block, tok, words, sess, agents, last, or name.
-    #[arg(long, value_enum, default_value_t = SortKey::Prompts)]
-    sort: SortKey,
+    /// active, block, tok, words, sess, agents, last, or name. Defaults to
+    /// newest day first when grouping by day, and to prompts otherwise.
+    #[arg(long, value_enum)]
+    sort: Option<SortKey>,
 
     /// Reverse the sort order (numeric columns default to descending, name to ascending).
     #[arg(long, default_value_t = false)]
@@ -244,14 +245,8 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
         );
         return Ok(());
     }
-    let doc = build_document(
-        &data,
-        args.group_by,
-        args.limit,
-        args.sort,
-        args.reverse,
-        args.graph,
-    );
+    let (sort, reverse) = effective_sort(args.group_by, args.sort, args.reverse);
+    let doc = build_document(&data, args.group_by, args.limit, sort, reverse, args.graph);
     let format = OutputFormat::resolve(args.format, args.json, args.markdown);
     match format {
         OutputFormat::Table => render_table(
@@ -1009,6 +1004,16 @@ fn build_rows(
                 .map_or_else(|| "-".to_string(), |at| relative_time(data.now, at)),
         })
         .collect()
+}
+
+/// Day rows read as a calendar: with no `--sort`, newest day first (so
+/// `--limit` keeps the most recent days). Other groupings rank by prompts.
+fn effective_sort(group_by: GroupBy, sort: Option<SortKey>, reverse: bool) -> (SortKey, bool) {
+    match (sort, group_by) {
+        (Some(sort), _) => (sort, reverse),
+        (None, GroupBy::Day) => (SortKey::Name, !reverse),
+        (None, _) => (SortKey::Prompts, reverse),
+    }
 }
 
 fn sort_group_rows(rows: &mut [(String, GroupAccumulator)], sort: SortKey, reverse: bool) {
@@ -3209,6 +3214,26 @@ pub(crate) mod tests {
         HumanInteractionEntry, HumanInteractionInput, HumanInteractionKind, StateTransitionInput,
     };
     use time::macros::datetime;
+
+    #[test]
+    fn day_rows_default_to_newest_first_and_explicit_sorts_win() {
+        assert_eq!(
+            effective_sort(GroupBy::Day, None, false),
+            (SortKey::Name, true)
+        );
+        assert_eq!(
+            effective_sort(GroupBy::Day, None, true),
+            (SortKey::Name, false)
+        );
+        assert_eq!(
+            effective_sort(GroupBy::Project, None, false),
+            (SortKey::Prompts, false)
+        );
+        assert_eq!(
+            effective_sort(GroupBy::Day, Some(SortKey::Prompts), false),
+            (SortKey::Prompts, false)
+        );
+    }
     use unicode_width::UnicodeWidthStr;
 
     #[test]

@@ -3567,12 +3567,15 @@ impl App {
                     || agent.session_id.clone(),
                     |_| agent_pane_display(agent, &self.panes),
                 );
-                let summary = agent
-                    .last_notification
-                    .as_deref()
-                    .or(agent.last_response.as_deref())
-                    .or(agent.last_prompt.as_deref())
-                    .unwrap_or("")
+                let summary = muxa::prompt_headline(
+                    agent
+                        .last_notification
+                        .as_deref()
+                        .or(agent.last_response.as_deref())
+                        .or(agent.last_prompt.as_deref())
+                        .unwrap_or(""),
+                );
+                let summary = summary
                     .lines()
                     .next()
                     .unwrap_or("")
@@ -14893,12 +14896,14 @@ fn render_inspector(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&
             Span::styled("model ", theme.dim_style()),
             Span::raw(agent.model.as_deref().unwrap_or("—").to_string()),
         ]));
-        let summary = agent
-            .last_notification
-            .as_deref()
-            .or(agent.last_prompt.as_deref())
-            .unwrap_or("—")
-            .replace('\n', " ");
+        let summary = muxa::prompt_headline(
+            agent
+                .last_notification
+                .as_deref()
+                .or(agent.last_prompt.as_deref())
+                .unwrap_or("—"),
+        )
+        .replace('\n', " ");
         lines.push(Line::from(vec![
             Span::styled("latest ", theme.dim_style()),
             Span::raw(truncate_chars(
@@ -15000,13 +15005,15 @@ fn inspector_rule(width: u16, theme: WatchThemeSpec) -> Line<'static> {
 }
 
 fn inspector_agent_summary(agent: &Agent) -> String {
-    agent
-        .last_notification
-        .as_deref()
-        .or(agent.summary_text())
-        .or(agent.last_prompt.as_deref())
-        .unwrap_or("—")
-        .replace('\n', " ")
+    muxa::prompt_headline(
+        agent
+            .last_notification
+            .as_deref()
+            .or(agent.summary_text())
+            .or(agent.last_prompt.as_deref())
+            .unwrap_or("—"),
+    )
+    .replace('\n', " ")
 }
 
 fn inspector_latest_agent<'a>(
@@ -16357,7 +16364,10 @@ fn topology_agent_summary(agent: &Agent, layout: WatchLayout) -> String {
             .as_deref()
             .or(agent.summary_text())
             .or(agent.last_prompt.as_deref())
-            .map_or_else(|| agent.state.to_string(), str::to_string)
+            .map_or_else(
+                || agent.state.to_string(),
+                |text| muxa::prompt_headline(text).into_owned(),
+            )
     };
     let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_chars(&one_line, WINDOW_ACTIVITY_ITEM_CHARS)
@@ -16481,7 +16491,7 @@ fn swarm_topology_agent_summary(agent: &Agent) -> String {
         .as_deref()
         .or(agent.summary_text())
         .or(agent.last_prompt.as_deref())
-        .unwrap_or("waiting")
+        .map_or(std::borrow::Cow::Borrowed("waiting"), muxa::prompt_headline)
         .replace('\n', " ");
     parts.push(activity);
     parts.join(" · ")
