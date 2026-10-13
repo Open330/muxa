@@ -1023,7 +1023,7 @@ fn fleet_dispatch_launch_retry_and_status_use_one_attachable_tmux_work() {
     struct TmuxCleanup(PathBuf);
     impl Drop for TmuxCleanup {
         fn drop(&mut self) {
-            let _ = Command::new("tmux")
+            let _ = Command::new(muxa::tmux::tmux_binary())
                 .args(["-L", "default", "kill-server"])
                 .env("TMUX_TMPDIR", &self.0)
                 .env_remove("TMUX")
@@ -1031,7 +1031,7 @@ fn fleet_dispatch_launch_retry_and_status_use_one_attachable_tmux_work() {
         }
     }
     use std::os::unix::fs::PermissionsExt;
-    assert!(Command::new("tmux")
+    assert!(Command::new(muxa::tmux::tmux_binary())
         .arg("-V")
         .output()
         .unwrap()
@@ -1147,7 +1147,7 @@ prompt = "Test provider"
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(std::fs::read_to_string(&marker).unwrap().lines().count(), 1);
-    let sessions = Command::new("tmux")
+    let sessions = Command::new(muxa::tmux::tmux_binary())
         .args(["-L", "default", "list-sessions", "-F", "#{session_name}"])
         .env("TMUX_TMPDIR", &daemon.tmux_tmpdir)
         .env_remove("TMUX")
