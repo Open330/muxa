@@ -385,6 +385,16 @@ and select a session or window to filter its history. Unlock details with the
 existing dashboard PAT control or sign in as an operator to read requests,
 replies, and artifacts. Locking access immediately clears loaded details.
 
+Collaboration opens as a message list beside a detail reader. The list shows
+participants, status, timestamps, response latency, update counts, and body
+previews for authenticated operators. Search applies to loaded messages;
+partial-history counts are labeled when older pages remain. Graph and Sequence
+are separate views; the graph supports zoom and fit in both dimensions.
+Drag the separators (or use arrow keys while focused) to resize the navigator,
+list/detail split, and panel height. Sizes persist across reloads. Expand fills
+the viewport; restore or Escape returns to the normal layout. Narrow screens
+stack the list and detail reader.
+
 ## Sessions, windows and panes
 
 muxa tracks every agent by where it runs: a tmux (or rmux) **session**, a
