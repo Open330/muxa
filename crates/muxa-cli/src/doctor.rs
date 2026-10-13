@@ -872,6 +872,11 @@ fn watch_popup_binding(list_keys_output: &str) -> Option<&str> {
 /// takes 2 more, landing at 118 — one column short of the inspector for
 /// the entire reason the managed block uses `-B` and `100%`.
 fn popup_binding_is_full_client(binding: &str) -> bool {
+    // The current managed block runs `muxa watch --popup`, which opens its
+    // own borderless, full-width popup (`mux_control::watch_popup`).
+    if binding.contains("muxa watch --popup") {
+        return true;
+    }
     let width_full = binding.contains("-w \"100%\"") || binding.contains("-w 100%");
     // tmux prints merged short flags, so `-B -E` comes back as `-BE`.
     let borderless = binding
@@ -1426,11 +1431,14 @@ mod tests {
     /// What tmux prints for the run-shell-wrapped managed binding: the
     /// popup flags live inside the escaped inner string, but they are
     /// still whitespace-separated tokens of the one list-keys line.
+    /// The managed block today: muxa opens and sizes the popup itself.
+    const LIVE_SELF_SIZED: &str = r#"bind-key    -T prefix       s                         run-shell -b "muxa watch --popup --caller-client '#{client_name}' --caller-pane '#{pane_id}'""#;
     const LIVE_WRAPPED: &str = r#"bind-key    -T prefix s       run-shell -b "tmux display-popup -c '#{client_name}' -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch --caller-client '#{client_name}' --caller-pane '#{pane_id}'"""#;
 
     #[test]
     fn the_wrapped_binding_still_reads_as_full_client() {
         assert!(popup_binding_is_full_client(LIVE_WRAPPED));
+        assert!(popup_binding_is_full_client(LIVE_SELF_SIZED));
         assert_eq!(watch_popup_binding(LIVE_WRAPPED), Some(LIVE_WRAPPED));
     }
 
