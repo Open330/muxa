@@ -24,10 +24,9 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     (
         "Setup",
         &[
-            "init", "onboard", "doctor", "config", "upgrade", "daemon", "mcp",
+            "init", "onboard", "doctor", "config", "upgrade", "daemon", "registry", "mcp",
         ],
     ),
-    ("Maintenance", &["sync", "prune", "panes"]),
 ];
 
 /// The grouped command list, as `{tab}`-free text for the help template.
@@ -140,7 +139,7 @@ mod tests {
     }
 
     /// Former top-level names that now live under a parent command.
-    const MOVED: &[&str] = &["logs"];
+    const MOVED: &[&str] = &["logs", "sync", "prune", "panes"];
 
     fn parse(argv: &[&str]) -> crate::Cmd {
         crate::Args::try_parse_from(argv)
@@ -168,6 +167,38 @@ mod tests {
             panic!("`muxa daemon logs` must parse");
         };
         assert_eq!(format!("{old:?}"), format!("{new:?}"));
+
+        let prune = ["--older-than", "30m", "--all", "-y"];
+        let old_argv: Vec<&str> = ["muxa", "prune"].iter().chain(&prune).copied().collect();
+        let new_argv: Vec<&str> = ["muxa", "registry", "prune"]
+            .iter()
+            .chain(&prune)
+            .copied()
+            .collect();
+        let crate::Cmd::Prune(old) = parse(&old_argv) else {
+            panic!("`muxa prune` must still parse");
+        };
+        let crate::Cmd::Registry {
+            action: crate::RegistryCmd::Prune(new),
+        } = parse(&new_argv)
+        else {
+            panic!("`muxa registry prune` must parse");
+        };
+        assert_eq!(format!("{old:?}"), format!("{new:?}"));
+        assert!(matches!(parse(&["muxa", "sync"]), crate::Cmd::Sync));
+        assert!(matches!(
+            parse(&["muxa", "registry", "sync"]),
+            crate::Cmd::Registry {
+                action: crate::RegistryCmd::Sync
+            }
+        ));
+        assert!(matches!(parse(&["muxa", "panes"]), crate::Cmd::Panes));
+        assert!(matches!(
+            parse(&["muxa", "registry", "panes"]),
+            crate::Cmd::Registry {
+                action: crate::RegistryCmd::Panes
+            }
+        ));
     }
 
     #[test]

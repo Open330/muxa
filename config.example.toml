@@ -27,7 +27,7 @@
 # Backfill discovery: when muxad starts, scan tmux panes for running agents
 # (matched against `pane_current_command`) and synthesize Started events so
 # they appear in `muxa status` without waiting for a fresh hook. The same
-# routine powers `muxa sync`. Default on.
+# routine powers `muxa registry sync`. Default on.
 [discovery]
 # enabled = true
 
@@ -43,7 +43,7 @@
 #                                      # Stopped so the GC reaps them — e.g. codex sessions driven through a
 #                                      # detached app-server/remote bridge that fire paneless hooks and never
 #                                      # stop on their own. Only the registry row is removed; the tmux session
-#                                      # (if any) is untouched. `muxa prune` does this on demand. Set 0 to disable.
+#                                      # (if any) is untouched. `muxa registry prune` does this on demand. Set 0 to disable.
 
 # Screen-manifest fallback detection: for agent CLIs muxa has NO hooks for
 # (cursor-agent, amp, copilot, aider, goose, and any you declare), the daemon

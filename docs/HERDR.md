@@ -132,7 +132,7 @@ can tell which host governs a row (see reaping guard below).
    alive by emitting activity; a dead one ages out. The check takes a *set*
    of observing kinds (today always the one active backend) so a future
    multi-host daemon can pass several without changing shape. Note
-   `muxa prune` targets *paneless* orphans only — a foreign-host row still
+   `muxa registry prune` targets *paneless* orphans only — a foreign-host row still
    carries its `herdr:`/`zellij:` pane id, so this age-out (not `prune`) is
    what clears it.
 5. **CLI attach** (`main.rs jump_to_pane`, done): `HostKind::Herdr` arm →

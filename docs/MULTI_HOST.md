@@ -134,8 +134,8 @@ With the set in place, the CLI reads aggregate across it:
   *first* — a `herdr:` row focuses via a herdr backend even when the
   process-global host is tmux — falling back to the process-global
   backend's kind for unrecognized ids (`dispatch_kind`).
-- **Other surfaces**: `muxa panes`, `stats`, and `timeline` enumerate
-  via `all_panes()` (concat across the set); `muxa panes` prints a
+- **Other surfaces**: `muxa registry panes`, `stats`, and `timeline` enumerate
+  via `all_panes()` (concat across the set); `muxa registry panes` prints a
   per-host empty hint for any host in the set that contributed zero.
   Live pane captures (`watch` preview, `dashboard`) resolve the backend
   by pane-id namespace (`backend_for_pane`). `current_pane`/status-line

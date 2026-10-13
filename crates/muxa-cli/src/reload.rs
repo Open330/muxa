@@ -604,7 +604,7 @@ pub async fn reload(client: &Client, args: ReloadArgs) -> Result<()> {
     )?;
     println!(
         "\nagent conversations resume only where a provider id existed; \
-         `muxa prune` clears the rows whose panes are gone."
+         `muxa registry prune` clears the rows whose panes are gone."
     );
     Ok(())
 }

@@ -222,8 +222,15 @@ enum Cmd {
         #[command(subcommand)]
         which: HookCmd,
     },
-    /// Debug: print the active pane-host inventory.
+    /// Former name of `muxa registry panes`.
+    #[command(hide = true)]
     Panes,
+    /// Inspect and repair the agent registry: backfill from panes, drop
+    /// orphan rows, list pane hosts.
+    Registry {
+        #[command(subcommand)]
+        action: RegistryCmd,
+    },
     /// Overlay every pane in the current tmux window with its agent's
     /// state, summary, latest prompt, and latest response — then jump to
     /// one by its `display-panes` digit.
@@ -349,7 +356,8 @@ enum Cmd {
     /// queue without jumping.
     #[command(visible_alias = "go")]
     Attend(attend::Args),
-    /// Backfill the registry by scanning tmux panes for agent processes.
+    /// Former name of `muxa registry sync`.
+    #[command(hide = true)]
     Sync,
     /// Interactive install wizard — wires tmux, agent hooks, systemd,
     /// and the dashboard. Use `--preset standard --yes` for one-shot
@@ -388,24 +396,40 @@ enum Cmd {
     /// `muxad` + `muxa-cli` → restart the daemon → verify the IPC
     /// socket is responsive. One command for the full update flow.
     Upgrade(upgrade::Args),
-    /// Delete accumulated "orphan" agent rows — paneless, surfaceless,
+    /// Former name of `muxa registry prune`.
+    #[command(hide = true)]
+    Prune(PruneArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum RegistryCmd {
+    /// Backfill the registry by scanning tmux panes for agent processes.
+    Sync,
+    /// Delete accumulated "orphan" agent rows.
+    ///
+    /// Orphans are paneless, surfaceless,
     /// pid-less ghosts left by remote/detached sessions (e.g. codex driven
     /// through a detached `app-server`), including references to missing
     /// native PTY sessions. Only registry rows are removed;
     /// tmux sessions are never touched. The daemon also ages these out on
     /// its own after `[reconciler] paneless_stale_timeout_secs` (24h default).
-    Prune {
-        /// Only prune rows idle at least this long (e.g. `30m`, `1h`, `24h`).
-        /// Spares recently-active sessions. Ignored when `--all` is set.
-        #[arg(long, default_value = "1h")]
-        older_than: String,
-        /// Prune every orphan row regardless of age.
-        #[arg(long)]
-        all: bool,
-        /// Skip the confirmation prompt.
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
+    Prune(PruneArgs),
+    /// Debug: print the active pane-host inventory.
+    Panes,
+}
+
+#[derive(Debug, clap::Args)]
+struct PruneArgs {
+    /// Only prune rows idle at least this long (e.g. `30m`, `1h`, `24h`).
+    /// Spares recently-active sessions. Ignored when `--all` is set.
+    #[arg(long, default_value = "1h")]
+    older_than: String,
+    /// Prune every orphan row regardless of age.
+    #[arg(long)]
+    all: bool,
+    /// Skip the confirmation prompt.
+    #[arg(long, short = 'y')]
+    yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1324,6 +1348,13 @@ async fn main() -> Result<()> {
         Cmd::Activity(activity_args) => activity_query::run(&cfg, activity_args).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => cmd_panes(),
+        Cmd::Registry { action } => match action {
+            RegistryCmd::Sync => cmd_sync(&client).await,
+            RegistryCmd::Prune(prune) => {
+                cmd_prune(&client, &prune.older_than, prune.all, prune.yes).await
+            }
+            RegistryCmd::Panes => cmd_panes(),
+        },
         Cmd::Peek(peek_args) => peek::run(&client, peek_args).await,
         Cmd::Watch {
             popup: _,
@@ -1421,16 +1452,12 @@ async fn main() -> Result<()> {
         Cmd::Restore(restore_args) => reload::restore(restore_args),
         Cmd::Reload(reload_args) => reload::reload(&client, reload_args).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
-        Cmd::Prune {
-            older_than,
-            all,
-            yes,
-        } => cmd_prune(&client, &older_than, all, yes).await,
+        Cmd::Prune(prune) => cmd_prune(&client, &prune.older_than, prune.all, prune.yes).await,
     }
 }
 
 /// Parse a short human duration (`45s`, `30m`, `1h`, `2d`, or a bare
-/// seconds count) into whole seconds. Used by `muxa prune --older-than`.
+/// seconds count) into whole seconds. Used by `muxa registry prune --older-than`.
 fn parse_duration_secs(s: &str) -> Result<u64> {
     let s = s.trim();
     anyhow::ensure!(!s.is_empty(), "empty duration");
