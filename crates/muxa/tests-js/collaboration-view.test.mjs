@@ -26,3 +26,26 @@ test('graph fit considers height as well as width and tolerates a hidden viewpor
   assert.equal(graphFitScale(1000,800,516,816),.5);
   assert.equal(graphFitScale(1000,800,0,0),1);
 });
+
+test('unchanged refresh keeps DOM nodes and clearing invalidates cached private HTML', async () => {
+  const { setStableHTML, clearStableHTML } = await import('../src/dashboard/web/collaboration-view.mjs');
+  let writes = 0;
+  const node = {childNodes: [], set innerHTML(value) {writes++; this.childNodes = value ? [{}] : [];}, replaceChildren() {this.childNodes=[];}};
+  setStableHTML(node,'private body');
+  const original = node.childNodes[0];
+  assert.equal(setStableHTML(node,'private body'), false);
+  assert.equal(node.childNodes[0], original);
+  assert.equal(writes,1);
+  clearStableHTML(node);
+  assert.equal(node.childNodes.length,0);
+  assert.equal(setStableHTML(node,'private body'),true);
+});
+
+test('location labels keep complete pane identifiers and message links omit credentials', async () => {
+  const {participantLocation,messageLink} = await import('../src/dashboard/web/collaboration-view.mjs');
+  assert.equal(participantLocation({agent_kind:'claude_code',pane:'rmux:%123456'}),'rmux:%123456');
+  const link = new URL(messageLink('http://localhost:7878/?token=secret#token=secret&workspace=old',{id:'req_123'}));
+  assert.equal(link.search,'');
+  assert.equal(new URLSearchParams(link.hash.slice(1)).get('message'),'req_123');
+  assert.ok(!link.href.includes('secret'));
+});

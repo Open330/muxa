@@ -820,6 +820,9 @@ const COLLABORATION_CURSOR_ID_MAX_BYTES: usize = 128;
 /// its typed contract.
 #[derive(Debug, Default, Deserialize)]
 struct CollaborationHttpQuery {
+    until: Option<String>,
+    id: Option<String>,
+    q: Option<String>,
     /// Same grammar as the CLI timeline (`24h`, `7d`, RFC3339, `all`, ...).
     since: Option<String>,
     #[serde(alias = "work_id")]
@@ -854,7 +857,7 @@ struct CollaborationPagination {
 struct CollaborationHttpResponse {
     #[serde(with = "time::serde::rfc3339")]
     generated_at: OffsetDateTime,
-    /// False outside authenticated `auth = "token"` mode. Topology and status
+    /// False without operator authentication. Topology and status
     /// remain useful for the graph, but message bodies and attached details
     /// are omitted.
     details_included: bool,
@@ -867,7 +870,7 @@ async fn collaboration_handler(
     headers: HeaderMap,
     Query(http): Query<CollaborationHttpQuery>,
 ) -> Response {
-    let (query, limit) = match collaboration_query_from_http(http) {
+    let (mut query, limit) = match collaboration_query_from_http(http) {
         Ok(query) => query,
         Err(error) => {
             return (
@@ -877,6 +880,7 @@ async fn collaboration_handler(
                 .into_response();
         }
     };
+    query.search_bodies = dashboard_details_authorized(&state, &headers);
     // All-scope reads are explicitly operator-only in CollaborationStore.
     // The dashboard is the operator surface; the room value is immaterial at
     // this scope but keeps the authority marker a normal console participant.
@@ -957,6 +961,17 @@ fn collaboration_query_from_http(
         .map(|raw| timeline::parse_since(raw, now, "all collaboration history"))
         .transpose()?
         .and_then(|range| range.since_at);
+    let until = http
+        .until
+        .as_deref()
+        .map(|raw| {
+            OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| "until must be an RFC3339 timestamp".to_string())
+        })
+        .transpose()?;
+    if since.zip(until).is_some_and(|(start, end)| start > end) {
+        return Err("since must not be later than until".to_string());
+    }
     let limit = http
         .limit
         .as_deref()
@@ -975,6 +990,10 @@ fn collaboration_query_from_http(
         .map_err(|error| format!("invalid room; expected a JSON RoomId: {error}"))?;
     Ok((
         CollaborationQuery {
+            until,
+            request_id: non_empty_collaboration_filter("id", http.id)?,
+            search: non_empty_collaboration_filter("q", http.q)?,
+            search_bodies: false,
             since,
             work_id: non_empty_collaboration_filter("work", http.work)?,
             workspace_id: non_empty_collaboration_filter("workspace", http.workspace)?,
@@ -3847,6 +3866,47 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let response = body_json(response).await;
         assert_eq!(response["pagination"]["total"], 3);
+    }
+
+    #[tokio::test]
+    async fn history_search_never_exposes_private_body_matches_to_public_readers() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+        let requests = seed_collaboration_requests(&collaboration).await;
+        let app = router(public_read_state("secret").with_collaboration(collaboration));
+        for (token, total) in [(None, 0), (Some("invalid"), 0), (Some("secret"), 1)] {
+            let mut builder = Request::builder().uri("/api/collaboration?q=round%20one&limit=1");
+            if let Some(token) = token {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response).await["pagination"]["total"], total);
+        }
+        let exact = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/collaboration?id={}", requests[0].id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(exact).await["pagination"]["total"], 1);
+        let reversed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?since=2026-10-14T00:00:00Z&until=2026-10-13T00:00:00Z")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reversed.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

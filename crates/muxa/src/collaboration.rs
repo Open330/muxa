@@ -836,6 +836,18 @@ pub struct CollaborationQuery {
         skip_serializing_if = "Option::is_none",
         with = "time::serde::rfc3339::option"
     )]
+    pub until: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub search_bodies: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
     pub since: Option<OffsetDateTime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
@@ -1451,6 +1463,92 @@ fn append_session_query_filters(
     Ok(())
 }
 
+fn collaboration_search_paths() -> &'static [&'static str] {
+    &[
+        "$.id",
+        "$.kind",
+        "$.status",
+        "$.workspace_id",
+        "$.work_id",
+        "$.thread_id",
+        "$.parent_request_id",
+        "$.from.alias",
+        "$.from.roles",
+        "$.from.agent_kind",
+        "$.from.pane",
+        "$.from.agent_session_id",
+        "$.from.tmux_session_name",
+        "$.from.window_name",
+        "$.to.alias",
+        "$.to.roles",
+        "$.to.agent_kind",
+        "$.to.pane",
+        "$.to.agent_session_id",
+        "$.to.tmux_session_name",
+        "$.to.window_name",
+    ]
+}
+
+fn collaboration_search_text(request: &CollaborationRequest, bodies: bool) -> String {
+    let value = serde_json::to_value(request).expect("collaboration request serializes");
+    let mut fields = collaboration_search_paths()
+        .iter()
+        .filter_map(|path| {
+            value.pointer(&format!(
+                "/{}",
+                path.trim_start_matches("$.").replace('.', "/")
+            ))
+        })
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .map_or_else(|| value.to_string(), str::to_string)
+        })
+        .collect::<Vec<_>>();
+    if bodies {
+        fields.push(request.body.clone());
+        if let Some(reply) = &request.reply {
+            fields.push(reply.body.clone());
+        }
+        fields.extend(request.updates.iter().map(|update| update.body.clone()));
+    }
+    fields.join(" ")
+}
+
+fn append_search_query_filters(
+    query: &CollaborationQuery,
+    clauses: &mut Vec<String>,
+    values: &mut Vec<Value>,
+) -> Result<(), CollaborationError> {
+    for (operator, instant) in [(">=", query.since), ("<=", query.until)] {
+        if let Some(instant) = instant {
+            clauses.push(format!("created_at_ns {operator} ?"));
+            values.push(Value::Integer(timestamp_nanos(instant)?));
+        }
+    }
+    if let Some(search) = &query.search {
+        let mut fields = collaboration_search_paths()
+            .iter()
+            .map(|path| format!("COALESCE(CAST(json_extract(payload, '{path}') AS TEXT), '')"))
+            .collect::<Vec<_>>();
+        if query.search_bodies {
+            fields.extend(
+                ["$.body", "$.reply.body"]
+                    .iter()
+                    .map(|path| format!("COALESCE(json_extract(payload, '{path}'), '')")),
+            );
+            fields.push("COALESCE((SELECT group_concat(json_extract(value, '$.body'), ' ') FROM json_each(payload, '$.updates')), '')".to_string());
+        }
+        clauses.push(format!(
+            "instr(lower({}), lower(?)) > 0",
+            fields.join(" || ' ' || ")
+        ));
+        values.push(Value::Text(search.clone()));
+    }
+    Ok(())
+}
+
 fn query_database(
     path: &Path,
     caller: &Participant,
@@ -1464,11 +1562,9 @@ fn query_database(
     if let Some(clause) = request_access_clause(caller, mailbox, scope, &mut values) {
         clauses.push(clause);
     }
-    if let Some(since) = query.since {
-        clauses.push("created_at_ns >= ?".to_string());
-        values.push(Value::Integer(timestamp_nanos(since)?));
-    }
+    append_search_query_filters(query, &mut clauses, &mut values)?;
     for (column, value) in [
+        ("id", query.request_id.as_ref()),
         ("workspace_id", query.workspace_id.as_ref()),
         ("work_id", query.work_id.as_ref()),
         ("thread_id", query.thread_id.as_ref()),
@@ -1589,6 +1685,13 @@ fn request_matches_query(request: &CollaborationRequest, query: &CollaborationQu
         &request.from
     };
     query.since.is_none_or(|since| request.created_at >= since)
+        && query.until.is_none_or(|until| request.created_at <= until)
+        && query.request_id.as_ref().is_none_or(|id| request.id == *id)
+        && query.search.as_ref().is_none_or(|search| {
+            collaboration_search_text(request, query.search_bodies)
+                .to_ascii_lowercase()
+                .contains(&search.to_ascii_lowercase())
+        })
         && query
             .workspace_id
             .as_ref()
@@ -3463,6 +3566,105 @@ fn valid_identity_token(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn history_search_filters_before_pagination_in_memory_and_sqlite() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mailbox = if durable {
+                CollaborationStore::load(CollaborationOptions {
+                    path: Some(dir.path().join("history.sqlite3")),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+            } else {
+                CollaborationStore::in_memory(CollaborationOptions::default())
+            };
+            let sender = participant("%123456", "sender");
+            let recipient = participant("%2", "recipient");
+            let root = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "hidden needle %_ 한글".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            mailbox
+                .update_request(&sender, &root.id, "progress needle".into())
+                .await
+                .unwrap();
+            mailbox
+                .reply(
+                    &recipient,
+                    &root.id,
+                    RequestStatus::Completed,
+                    "reply needle".into(),
+                    vec![],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            mailbox
+                .create(
+                    sender,
+                    recipient,
+                    NewRequest {
+                        body: "newer unrelated".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let console = Participant::console(root.from.room.clone());
+            for text in ["hidden needle %_ 한글", "progress needle", "reply needle"] {
+                let query = CollaborationQuery {
+                    search: Some(text.into()),
+                    search_bodies: true,
+                    limit: Some(1),
+                    ..Default::default()
+                };
+                let page = mailbox
+                    .query_for(&console, RequestMailbox::All, MailboxScope::All, &query)
+                    .await
+                    .unwrap();
+                assert_eq!(page.total, 1);
+                assert_eq!(page.requests[0].id, root.id);
+                let public = mailbox
+                    .query_for(
+                        &console,
+                        RequestMailbox::All,
+                        MailboxScope::All,
+                        &CollaborationQuery {
+                            search_bodies: false,
+                            ..query
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(public.total, 0);
+            }
+            let page = mailbox
+                .query_for(
+                    &console,
+                    RequestMailbox::All,
+                    MailboxScope::All,
+                    &CollaborationQuery {
+                        request_id: Some(root.id.clone()),
+                        until: Some(root.created_at),
+                        search: Some("%123456".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.total, 1);
+        }
+    }
+
     use super::*;
     use crate::config::CollaborationScope;
 

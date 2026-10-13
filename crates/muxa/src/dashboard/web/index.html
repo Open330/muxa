@@ -136,7 +136,7 @@
                       <option value="24h">24 hours</option>
                       <option value="7d" selected>7 days</option>
                       <option value="30d">30 days</option>
-                      <option value="">all retained</option>
+                      <option value="all">all retained</option><option value="custom">custom period</option>
                     </select>
                   </label>
                   <label><span class="filter-label">room</span>
@@ -175,6 +175,7 @@
                     </select>
                   </label>
                 </div>
+                <div id="collaboration-custom-period" class="collaboration-custom-period" hidden><label>from <input id="collaboration-since" type="datetime-local"></label><label>to <input id="collaboration-until" type="datetime-local"></label><span id="collaboration-period-error" role="status"></span></div>
                 <details class="collaboration-room-disclosure"><summary>Sessions &amp; rooms</summary><div class="collaboration-rooms" id="collaboration-rooms" aria-label="Rooms"></div></details>
                 <div id="collaboration-summary" class="collaboration-summary" aria-label="Loaded history summary"></div>
                 <div class="collaboration-view-controls">
@@ -183,7 +184,7 @@
                     <button class="control-btn" id="collaboration-tab-graph" role="tab" data-collaboration-view="graph" aria-controls="collaboration-graph-pane" aria-selected="false" tabindex="-1">Graph</button>
                     <button class="control-btn" id="collaboration-tab-sequence" role="tab" data-collaboration-view="sequence" aria-controls="collaboration-sequence-pane" aria-selected="false" tabindex="-1">Sequence</button>
                   </div>
-                  <input id="collaboration-search" type="search" class="collaboration-search" placeholder="Find participant, ID, or message…" aria-label="Search loaded collaboration messages">
+                  <input id="collaboration-search" type="search" class="collaboration-search" placeholder="Search retained history…" aria-label="Search retained collaboration history">
                   <button class="control-btn" type="button" id="collaboration-clear-selection" hidden>show all</button>
                 </div>
                 <div class="collaboration-reader" id="collaboration-reader">
