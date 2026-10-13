@@ -11,6 +11,7 @@ mod dashboard_tui;
 mod doctor;
 mod fleet_cli;
 mod fleet_watch;
+mod help_groups;
 mod init;
 mod interactive_child;
 mod logs;
@@ -100,6 +101,7 @@ enum Cmd {
         json: bool,
     },
     /// Print a one-liner status suitable for tmux `status-right`.
+    #[command(hide = true)]
     StatusLine {
         #[arg(long)]
         pane: Option<String>,
@@ -215,6 +217,7 @@ enum Cmd {
     /// Query raw activity ledger intervals.
     Activity(activity_query::Args),
     /// Hook adapter entrypoints invoked by the agent CLIs themselves.
+    #[command(hide = true)]
     Hook {
         #[command(subcommand)]
         which: HookCmd,
@@ -328,6 +331,7 @@ enum Cmd {
     },
     /// Bridge the owner-only local muxad socket over an authenticated SSH
     /// stdio channel for Muxa Fleet. Usually launched by another muxad.
+    #[command(hide = true)]
     Relay {
         #[arg(long, default_value_t = true)]
         stdio: bool,
@@ -1197,6 +1201,19 @@ async fn cmd_ask(
     }
 }
 
+/// Parse argv with the grouped top-level help (see `help_groups`).
+fn parse_args() -> Args {
+    use clap::{CommandFactory, FromArgMatches};
+    let command = Args::command();
+    let template = format!(
+        "{{before-help}}{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{}\
+         Options:\n{{options}}{{after-help}}",
+        help_groups::grouped_commands(&command)
+    );
+    let matches = command.help_template(template).get_matches();
+    Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
 #[allow(clippy::too_many_lines)] // top-level CLI subcommand wiring
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1208,7 +1225,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let args = Args::parse();
+    let args = parse_args();
     if let Cmd::Watch {
         popup: true,
         caller_client,
