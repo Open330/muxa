@@ -3374,7 +3374,7 @@ table.data td.pane-cell .crumbs { flex-wrap: nowrap; white-space: nowrap; }
   display: grid;
   grid-template-columns: minmax(200px, var(--collaboration-list-width, 52%)) 8px minmax(0, 1fr);
   flex: 1;
-  min-height: 180px;
+  min-height: 0;
   overflow: hidden;
 }
 .collaboration-history-pane, .collaboration-detail-pane {
