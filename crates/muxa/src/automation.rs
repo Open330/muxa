@@ -2244,7 +2244,7 @@ fn table_name(table: &toml_edit::Table) -> Option<String> {
 
 /// The `automation.rule` array of tables, created (with an implicit
 /// `[automation]` parent) when absent.
-fn automation_rules_mut(
+pub(crate) fn automation_rules_mut(
     document: &mut toml_edit::DocumentMut,
 ) -> Result<&mut toml_edit::ArrayOfTables, String> {
     let automation = implicit_table(document.as_table_mut(), "automation")?;
@@ -2263,7 +2263,7 @@ fn automation_rules_mut(
 /// Render a rule as the `[[automation.rule]]` table the loader reads back,
 /// key for key. Built by serializing the rule itself, so a new field cannot
 /// be silently dropped on write-back.
-fn rule_table(rule: &AutomationRule) -> Result<toml_edit::Table, String> {
+pub(crate) fn rule_table(rule: &AutomationRule) -> Result<toml_edit::Table, String> {
     let text = toml::to_string(rule).map_err(|error| format!("rendering rule: {error}"))?;
     let document: toml_edit::DocumentMut = text
         .parse()
@@ -2303,7 +2303,7 @@ fn load_document(path: &Path) -> Result<toml_edit::DocumentMut, String> {
 
 /// Write-then-rename in the target's directory, keeping the mode of the
 /// file being replaced (a fresh file is owner-only).
-fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
     use std::io::Write as _;
     if let Some(parent) = path
         .parent()

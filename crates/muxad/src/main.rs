@@ -143,7 +143,18 @@ async fn main() -> Result<()> {
         .init();
 
     let config_path = args.config.clone().or_else(paths::default_config_file);
-    let cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
+    let mut cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
+    if let Some(path) = config_path.as_deref() {
+        match muxa::automation_defaults::install(path) {
+            Ok(true) => {
+                cfg =
+                    Config::load_or_default(Some(path)).context("reloading default automations")?;
+                tracing::info!("installed missing disabled default automations");
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "could not install disabled default automations"),
+        }
+    }
     // Daemon-only invariants — the dashboard wire-up and sink fan-out
     // checks the CLI deliberately skips. Failing here is preferable to
     // crashing mid-startup once we try to bind the dashboard socket.

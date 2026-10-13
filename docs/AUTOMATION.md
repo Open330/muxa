@@ -12,9 +12,43 @@ The cap is only the first rule anyone wants, so the mechanism is general —
 an **event**, some **filters**, a **delay**, and an **action** — and the
 first rule is just one instance of it.
 
-**Automation ships enabled with no rules.** A fresh install runs the
-engine and does nothing. Nothing is typed into any pane until you write a
-rule, or Muxa.app writes one for you.
+**Automation ships with four disabled rules.** `muxa init` installs them;
+`muxad` also adds missing rules on startup for binary-only upgrades. Existing
+rules with the same names keep every setting, including their enabled state.
+The engine is enabled by default, but new rules do nothing until you enable them.
+
+| Rule | Action | Timing |
+| ---- | ------ | ------ |
+| `resume-codex-capacity` | Send `continue` for the specific Codex capacity error | 2m + up to 15s jitter; at most 6/hour/pane |
+| `resume-after-limit` | Send `continue` after a usage cap resets | Reset + 2m; 20m fallback without a reset time |
+| `notify-waiting-input` | Record an input-wait notice | 5m + jitter |
+| `notify-persistent-error` | Record a non-quota error notice | 5m + jitter |
+
+`notify` records a daemon log notice and automation ledger entry; it does not
+send an OS notification. The existing cooldown, hourly ceilings, live condition
+check and one-firing-per-episode guards apply to every rule.
+
+```console
+muxa automation list
+muxa automation enable resume-codex-capacity
+muxa automation test resume-codex-capacity
+muxa automation disable resume-codex-capacity
+```
+
+New installs and upgrades add only missing names. Your custom rules, comments,
+engine enable/pause settings, and changes to existing starter rules survive.
+Removing a starter rule removes it until the next init or daemon startup; leave
+it disabled to keep it inactive. Uninstalling init wiring retains these editable
+rules as operator configuration.
+
+To add the rules to an existing installation explicitly:
+
+```console
+muxa init --component automation --yes
+```
+
+When the daemon is already running, restart it after init to load file edits.
+CLI `automation enable/disable/add` changes the live engine immediately.
 
 ## Quick start
 

@@ -91,7 +91,7 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
         && args.component.iter().all(|component| {
             matches!(
                 component.as_str(),
-                "ask" | "agent-instructions" | "agent-skills" | "agent-mcp"
+                "ask" | "automation" | "agent-instructions" | "agent-skills" | "agent-mcp"
             )
         });
     if !preflight_ok(mode, &detect, args.uninstall, config_only) {
@@ -111,6 +111,7 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
     };
     let mut plan = plan::build(direction, &chosen, &detect, &socket)?;
     integration::extend_plan(&mut plan, &detect, config_path.as_deref(), &socket)?;
+    plan::extend_automation(&mut plan, config_path.as_deref())?;
     if matches!(direction, Direction::Install) && args.start_daemon && !manages_daemon(&chosen) {
         // Append last so disk edits + service enablement happen first;
         // by the time we try to start muxad the file/socket layout it

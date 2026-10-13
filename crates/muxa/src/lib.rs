@@ -38,6 +38,7 @@ pub mod adapters;
 pub mod agent_control;
 pub mod ask;
 pub mod automation;
+pub mod automation_defaults;
 pub mod automation_judge;
 pub mod backend;
 mod codex_binding;

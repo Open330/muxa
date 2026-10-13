@@ -109,7 +109,10 @@ pub fn build(
     for c in &comps {
         match c {
             // These share a manifest and are planned together after ordinary edits.
-            Component::AgentInstructions | Component::AgentSkills | Component::AgentMcp => {}
+            Component::AgentInstructions
+            | Component::AgentSkills
+            | Component::AgentMcp
+            | Component::Automation => {}
             Component::TmuxPopup
             | Component::TmuxStatusLine
             | Component::TmuxPeek
@@ -206,6 +209,31 @@ pub fn build(
         actions,
         warnings,
     })
+}
+
+/// Install defaults into the selected config, folding onto other planned edits.
+/// Rules become operator configuration, so uninstall retains them.
+pub fn extend_automation(plan: &mut Plan, config_path: Option<&Path>) -> Result<()> {
+    if plan.direction != Direction::Install || !plan.components.contains(&Component::Automation) {
+        return Ok(());
+    }
+    let Some(path) = config_path
+        .map(Path::to_path_buf)
+        .or_else(muxa::paths::default_config_file)
+    else {
+        return Ok(());
+    };
+    let (before, original) = file_base(&plan.actions, &path)?;
+    if let Some(after) = muxa::automation_defaults::merge(&original).map_err(anyhow::Error::msg)? {
+        plan.actions.push(Action::EditFile {
+            component: Component::Automation,
+            path,
+            before,
+            after,
+            outcome: Outcome::Inserted,
+        });
+    }
+    Ok(())
 }
 
 fn plan_opencode(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
@@ -875,5 +903,46 @@ mod tests {
             &mut actions,
         );
         assert!(matches!(actions.as_slice(), [Action::EditFile { .. }]));
+    }
+    #[test]
+    fn automation_install_uses_selected_config_and_preserves_pending_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("selected.toml");
+        let pending = "# pending\n[ask]\nenabled = true\n";
+        let mut plan = Plan {
+            direction: Direction::Install,
+            components: vec![Component::Automation],
+            actions: vec![Action::EditFile {
+                component: Component::Ask,
+                path: path.clone(),
+                before: None,
+                after: pending.into(),
+                outcome: Outcome::Inserted,
+            }],
+            warnings: Vec::new(),
+        };
+        extend_automation(&mut plan, Some(&path)).unwrap();
+        let Action::EditFile {
+            path: selected,
+            before,
+            after,
+            ..
+        } = plan.actions.last().unwrap()
+        else {
+            panic!("expected config edit");
+        };
+        assert_eq!(selected, &path);
+        assert_eq!(before.as_deref(), Some(pending));
+        assert!(after.contains("# pending"));
+        let config: muxa::Config = toml::from_str(after).unwrap();
+        assert!(config.ask.enabled);
+        assert_eq!(config.automation.rule.len(), 4);
+        assert!(config.automation.rule.iter().all(|rule| !rule.enabled));
+        assert!(!path.exists(), "planning must not mutate files");
+        extend_automation(&mut plan, Some(&path)).unwrap();
+        assert_eq!(plan.actions.len(), 2, "reinstall must be a no-op");
+        plan.direction = Direction::Uninstall;
+        extend_automation(&mut plan, Some(&path)).unwrap();
+        assert_eq!(plan.actions.len(), 2, "uninstall retains operator rules");
     }
 }
