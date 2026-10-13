@@ -661,7 +661,7 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
             window_index: window_index.to_owned(),
             pane_index: pane_index.to_owned(),
             path: path.to_owned(),
-            replayable: command.as_deref().is_some_and(is_replayable),
+            replayable: is_replayable_command(command.as_deref(), argv.as_deref()),
             command,
             argv,
             agent: agents.get(&namespaced(endpoint.host, pane_id)).cloned(),
@@ -1245,6 +1245,23 @@ fn is_replayable(command: &str) -> bool {
     !command.is_empty() && !command.contains(['(', ')', '[', ']'])
 }
 
+/// [`is_replayable`], judged from the argv when it was captured. A rewritten
+/// title lands in the program argument (`argv[0]`, the rest blank), while a
+/// real command keeps its arguments apart — so an agent launched with an
+/// instruction like `"… (commit, push) …"` is still a command, and is
+/// relaunched rather than silently left out of the restore.
+fn is_replayable_command(command: Option<&str>, argv: Option<&[String]>) -> bool {
+    match argv {
+        Some([program, rest @ ..]) if !program.is_empty() => {
+            let title_like = program.contains(['(', ')', '[', ']']);
+            let rewritten =
+                program.contains(char::is_whitespace) && rest.iter().all(String::is_empty);
+            !title_like && !rewritten
+        }
+        _ => command.is_some_and(is_replayable),
+    }
+}
+
 fn pane_target(pane: &PaneShape) -> String {
     format!(
         "={}:{}.{}",
@@ -1589,8 +1606,15 @@ fn read_snapshot(path: &Path) -> Result<Snapshot> {
         path.to_path_buf()
     };
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let snapshot: Snapshot =
+    let mut snapshot: Snapshot =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    // Re-judge with the current rule, so snapshots taken before it still
+    // relaunch an argv-captured command that merely contains parentheses.
+    for pane in &mut snapshot.panes {
+        if pane.argv.is_some() {
+            pane.replayable = is_replayable_command(pane.command.as_deref(), pane.argv.as_deref());
+        }
+    }
     if snapshot.version > SNAPSHOT_VERSION {
         bail!(
             "{} was written by a newer muxa (format {} > {SNAPSHOT_VERSION})",
@@ -1792,6 +1816,28 @@ mod tests {
     fn a_rewritten_argv_is_not_replayable() {
         assert!(is_replayable("python -m uvicorn asgi:app --port 6002"));
         assert!(!is_replayable("puma 5.6.8 (tcp://0.0.0.0:5072) [admin]"));
+    }
+
+    /// The pane a real reload skipped: an agent whose first instruction
+    /// contained "(commit, push, PR creation and Linear updates)".
+    #[test]
+    fn parentheses_in_an_argument_do_not_make_a_command_a_title() {
+        let argv = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+        let agent = argv(&[
+            "/home/june/.local/bin/aas",
+            "exec",
+            "e-ed@claude",
+            "--",
+            "--dangerously-skip-permissions",
+            "Stop before the FINALIZE steps (commit, push, PR creation) [then review]",
+        ]);
+        let joined = agent.join(" ");
+        assert!(is_replayable_command(Some(&joined), Some(&agent)));
+        // A rewritten title is one argument, the rest blank.
+        let title = argv(&["puma 5.6.8 (tcp://0.0.0.0:5072) [admin]", "", ""]);
+        assert!(!is_replayable_command(Some(&title[0]), Some(&title)));
+        // Without argv (macOS), the joined line keeps the old rule.
+        assert!(!is_replayable_command(Some(&joined), None));
     }
 
     #[test]
