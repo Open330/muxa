@@ -523,6 +523,10 @@ pub struct AutomationRule {
     /// or a pane-host namespace: `tmux`, `cmux`, `rmux`, `zellij`, `herdr`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Regex matched against the latest notification. Missing notifications do
+    /// not match. Rechecked at firing time so a changed error cancels the action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<String>,
     /// Which rate-limit windows count. Only valid with `on = "rate_limited"`;
     /// empty means any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -592,6 +596,7 @@ impl AutomationRule {
             work: None,
             pane: None,
             host: None,
+            notification: None,
             scope: Vec::new(),
             for_: None,
             wait: None,
@@ -705,6 +710,13 @@ impl AutomationRule {
                     "work {work:?} is not a valid regex: {error}"
                 )));
             }
+        }
+        if let Some(pattern) = &self.notification {
+            regex::Regex::new(pattern).map_err(|error| {
+                named(format!(
+                    "notification {pattern:?} is not a valid regex: {error}"
+                ))
+            })?;
         }
         if let Some(host) = &self.host {
             if parse_host_filter(host).is_none() {
@@ -845,6 +857,9 @@ impl AutomationRule {
         if let Some(host) = &self.host {
             parts.push(format!("host={host}"));
         }
+        if let Some(notification) = &self.notification {
+            parts.push(format!("notification={notification}"));
+        }
         if !self.scope.is_empty() {
             let scopes: Vec<String> = self
                 .scope
@@ -920,6 +935,7 @@ pub struct AutomationSubject {
     pub workspace: Option<String>,
     pub work: Option<String>,
     pub state: AgentState,
+    pub last_notification: Option<String>,
     pub rate_limit_scope: Option<RateLimitScope>,
     pub rate_limit_source: Option<RateLimitSource>,
     pub rate_limited_until: Option<OffsetDateTime>,
@@ -942,6 +958,7 @@ impl AutomationSubject {
             workspace: None,
             work: None,
             state: agent.state,
+            last_notification: agent.last_notification.clone(),
             rate_limit_scope: agent.rate_limit_scope,
             rate_limit_source: agent.rate_limit_source,
             rate_limited_until: agent.rate_limited_until,
@@ -1038,6 +1055,15 @@ impl AutomationSubject {
         if let Some(Ok(pattern)) = rule.work_regex() {
             match self.work.as_deref() {
                 Some(work) if pattern.is_match(work) => {}
+                _ => return false,
+            }
+        }
+        if let Some(pattern) = &rule.notification {
+            match (
+                regex::Regex::new(pattern),
+                self.last_notification.as_deref(),
+            ) {
+                (Ok(regex), Some(message)) if regex.is_match(message) => {}
                 _ => return false,
             }
         }
@@ -1301,6 +1327,12 @@ impl Scheduler {
             return Decision::Skip(SkipReason::ConditionCleared);
         }
         if !subject.satisfies(firing.only_if_still) {
+            return Decision::Skip(SkipReason::ConditionCleared);
+        }
+        if !subject.matches_filters(rule) {
+            return Decision::Skip(SkipReason::FilterMismatch);
+        }
+        if subject.agent_session_id != firing.agent_session_id || subject.socket != firing.socket {
             return Decision::Skip(SkipReason::ConditionCleared);
         }
         if guards.episode_handled {
@@ -1725,6 +1757,8 @@ pub struct AutomationRuleView {
     pub pane: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope: Vec<RateLimitScope>,
     #[serde(default, rename = "for", skip_serializing_if = "Option::is_none")]
@@ -1924,6 +1958,7 @@ impl AutomationStore {
                     work: rule.work.clone(),
                     pane: rule.pane.clone(),
                     host: rule.host.clone(),
+                    notification: rule.notification.clone(),
                     scope: rule.scope.clone(),
                     for_: rule.for_,
                     text: rule.text.clone(),
@@ -2336,6 +2371,7 @@ mod tests {
             workspace: Some("callabo".into()),
             work: Some("CAL-1234".into()),
             state: AgentState::Error,
+            last_notification: None,
             rate_limit_scope: Some(RateLimitScope::FiveHour),
             rate_limit_source: Some(RateLimitSource::Statusline),
             rate_limited_until: Some(NOW + time::Duration::hours(1)),
@@ -2678,6 +2714,85 @@ waaait = "5m"
             capped_subject().current_event(),
             Some(AutomationEvent::RateLimited),
         );
+    }
+
+    #[test]
+    fn capacity_notification_filters_and_rechecks_the_live_error() {
+        let config = AutomationConfig::default();
+        let mut rule = AutomationRule::new(
+            "resume-codex-capacity",
+            AutomationEvent::Error,
+            AutomationAction::SendPrompt,
+        );
+        rule.agent = vec![AgentKindSpec(AgentKind::Codex)];
+        rule.notification = Some("(?i)^Selected model is at capacity\\.".into());
+        rule.text = Some("continue".into());
+        rule.wait = Some(WaitSpec::after_event(time::Duration::minutes(2)));
+        rule.jitter = Some(DurationSpec::seconds(0));
+        rule.validate().unwrap();
+        let mut subject = capped_subject();
+        subject.kind = AgentKind::Codex;
+        subject.rate_limit_scope = None;
+        subject.last_notification =
+            Some("Selected model is at capacity. Please try a different model.".into());
+        let decision = Scheduler::arm(&config, &rule, &subject, GuardState::default(), NOW, 0.0);
+        let firing = decision.firing().unwrap();
+        assert_eq!(firing.fire_at, NOW + time::Duration::minutes(2));
+        let confirm = |subject: &AutomationSubject| {
+            Scheduler::confirm(
+                &config,
+                &rule,
+                firing,
+                Some(subject),
+                GuardState::default(),
+                firing.fire_at,
+            )
+        };
+        assert!(confirm(&subject).firing().is_some());
+        for notification in [None, Some("Network connection failed".into())] {
+            subject.last_notification = notification;
+            assert_eq!(
+                Scheduler::arm(&config, &rule, &subject, GuardState::default(), NOW, 0.0)
+                    .skip_reason(),
+                Some(SkipReason::FilterMismatch)
+            );
+            assert_eq!(
+                confirm(&subject).skip_reason(),
+                Some(SkipReason::FilterMismatch)
+            );
+        }
+        subject.last_notification = Some("Selected model is at capacity.".into());
+        subject.state = AgentState::Working;
+        assert_eq!(
+            confirm(&subject).skip_reason(),
+            Some(SkipReason::ConditionCleared)
+        );
+        subject.state = AgentState::Error;
+        subject.agent_session_id = "replacement-session".into();
+        assert_eq!(
+            confirm(&subject).skip_reason(),
+            Some(SkipReason::ConditionCleared)
+        );
+        subject
+            .agent_session_id
+            .clone_from(&firing.agent_session_id);
+        assert_eq!(
+            Scheduler::arm(
+                &config,
+                &rule,
+                &subject,
+                GuardState {
+                    episode_handled: true,
+                    ..GuardState::default()
+                },
+                NOW,
+                0.0
+            )
+            .skip_reason(),
+            Some(SkipReason::EpisodeAlreadyHandled)
+        );
+        rule.notification = Some("[".into());
+        assert!(rule.validate().unwrap_err().contains("notification"));
     }
 
     // --- scheduler: filters ------------------------------------------------
@@ -3559,6 +3674,7 @@ waaait = "5m"
             work: Some("^CAL-".into()),
             pane: None,
             host: None,
+            notification: None,
             scope: vec![RateLimitScope::FiveHour],
             for_: None,
             text: Some("continue".into()),

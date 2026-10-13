@@ -49,6 +49,30 @@ $ echo '{"name":"resume-after-limit","on":"rate_limited","action":"send_prompt",
 wrote resume-after-limit
 ```
 
+## Retry Codex model capacity errors
+
+Capacity failures are ordinary `error` events, not usage caps. Match the latest
+notification to avoid resuming unrelated errors:
+
+```toml
+[[automation.rule]]
+name = "resume-codex-capacity"
+on = "error"
+agent = ["codex"]
+notification = '(?i)^Selected model is at capacity\.'
+action = "send_prompt"
+text = "continue"
+wait = "2m"
+jitter = "15s"
+cooldown = "2m"
+max_per_hour = 6
+```
+
+The notification filter is checked both when scheduling and before sending.
+If the error changes or the agent resumes, nothing is sent. Each error episode
+gets one attempt; another attempt requires a new episode. The existing hourly
+limits and cooldown still apply.
+
 ## Commands
 
 | Command | What it does |
@@ -86,6 +110,7 @@ workspace = "callabo"            # exact workspace id stamped on the pane
 work = "^CAL-"                   # regex on the Work id
 pane = "%42"                     # exact pane id
 host = "local"                   # `local`, or tmux / cmux / rmux / zellij / herdr
+notification = "(?i)capacity"     # regex on the latest notification
 scope = ["five_hour"]            # rate-limit window (rate_limited only)
 
 # --- when to act ---
