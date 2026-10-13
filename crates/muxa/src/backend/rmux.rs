@@ -220,6 +220,7 @@ impl RmuxBackend {
         let Ok(paste) = scoped.control_command(&[
             "paste-buffer",
             "-p",
+            "-r",
             "-b",
             &buffer,
             "-t",

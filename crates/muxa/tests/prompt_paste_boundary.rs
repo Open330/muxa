@@ -19,7 +19,9 @@ fn wait_file(path: &std::path::Path) -> Vec<u8> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Ok(bytes) = std::fs::read(path) {
-            return bytes;
+            if !bytes.is_empty() {
+                return bytes;
+            }
         }
         assert!(
             Instant::now() < deadline,
@@ -30,7 +32,7 @@ fn wait_file(path: &std::path::Path) -> Vec<u8> {
     }
 }
 
-fn check(binary: String, rmux: bool) {
+fn check(binary: &str, rmux: bool, text: &str) {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("server.sock").to_str().unwrap().to_owned();
     let script = dir.path().join("input.py");
@@ -44,14 +46,17 @@ tty.setraw(0)
 os.write(1, b'\x1b[?2004h')
 open(sys.argv[1], 'wb').write(b'ready')
 data = b''
-while not data.endswith(b'\r'):
+while data != b'\r' and not data.endswith(b'\x1b[201~\r'):
     data += os.read(0, 1)
 open(sys.argv[2], 'wb').write(data)
 time.sleep(30)
 ",
     )
     .unwrap();
-    let server = Server { binary, socket };
+    let server = Server {
+        binary: binary.into(),
+        socket,
+    };
     let command = format!(
         "python3 {} {} {}",
         script.display(),
@@ -90,23 +95,45 @@ time.sleep(30)
     };
     let pane = if rmux { format!("rmux:{pane}") } else { pane };
     wait_file(&ready);
-    assert!(backend.send_prompt_text_on(Some(&server.socket), &pane, "continue"));
+    assert!(backend.send_prompt_text_on(Some(&server.socket), &pane, text));
     // No sleep: the explicit end boundary must precede the separate submit.
     assert!(backend.send_text_on(Some(&server.socket), &pane, "\r"));
-    assert_eq!(wait_file(&received), b"\x1b[200~continue\x1b[201~\r");
+    let expected = if text.is_empty() {
+        b"\r".to_vec()
+    } else {
+        [
+            b"\x1b[200~".as_slice(),
+            text.as_bytes(),
+            b"\x1b[201~\r".as_slice(),
+        ]
+        .concat()
+    };
+    assert_eq!(wait_file(&received), expected);
 }
 
 #[test]
 #[ignore = "requires native tmux and python3; creates an isolated test server"]
-fn tmux_short_prompt_has_explicit_boundary_before_enter() {
-    check("/usr/bin/tmux".into(), false);
+fn tmux_prompts_preserve_text_and_end_boundary_before_enter() {
+    for text in [
+        "continue",
+        "한국어 입력 확인;",
+        "first line\nsecond line",
+        "",
+    ] {
+        check("/usr/bin/tmux", false, text);
+    }
 }
 
 #[test]
 #[ignore = "requires rmux and python3; creates an isolated test server"]
-fn rmux_short_prompt_has_explicit_boundary_before_enter() {
-    check(
-        std::env::var("MUXA_TEST_RMUX_BINARY").unwrap_or_else(|_| "rmux".into()),
-        true,
-    );
+fn rmux_prompts_preserve_text_and_end_boundary_before_enter() {
+    let binary = std::env::var("MUXA_TEST_RMUX_BINARY").unwrap_or_else(|_| "rmux".into());
+    for text in [
+        "continue",
+        "한국어 입력 확인;",
+        "first line\nsecond line",
+        "",
+    ] {
+        check(&binary, true, text);
+    }
 }

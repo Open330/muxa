@@ -1,11 +1,12 @@
 # Prompt delivery and submission
 
 Muxa sends prompt text and the submit key as separate operations. Native tmux
-and rmux use `load-buffer` followed by `paste-buffer -p` for every nonempty
+and rmux use `load-buffer` followed by `paste-buffer -p -r` for every nonempty
 prompt, including a one-line `continue`. The terminal supplies bracketed-paste
 start/end markers when the application enables that mode. Enter follows the end
 marker in the same PTY input stream; these hosts no longer wait an arbitrary
-120ms between text and Enter.
+120ms between text and Enter. The `-r` option preserves the prompt's LF
+line breaks rather than converting them to CR, keeping multiline text intact.
 
 This avoids Codex's heuristic for detecting simulated typing as a paste burst.
 In Codex CLI 0.162.1, the heuristic suppresses Enter through a 120ms window;
@@ -48,4 +49,5 @@ cargo test -p muxa --test prompt_paste_boundary -- --ignored
 
 The last command requires native tmux, rmux, and Python 3. It creates temporary
 isolated servers and verifies the exact paste-start/text/paste-end/Enter bytes
-with no delay, then removes those servers. It does not use existing agent panes.
+with no delay for one-line, Unicode, multiline, and empty Enter-only inputs,
+then removes those servers. It does not use existing agent panes.

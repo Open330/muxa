@@ -488,7 +488,7 @@ fn feed_stdin_with_timeout(
 /// [`send_text_on`] for text that [`needs_paste`] flags.
 ///
 /// Sequence: `load-buffer -b <buf> -` (payload on stdin, never in argv) →
-/// `paste-buffer -p -b <buf> -t <pane>` (`-p` = bracketed paste) →
+/// `paste-buffer -p -r -b <buf> -t <pane>` (`-p` = bracketed paste, `-r` = preserve LF) →
 /// `delete-buffer -b <buf>` (best-effort scratch cleanup).
 ///
 /// Bracketed paste is best-effort by nature: a paste-aware target (Claude
@@ -516,7 +516,7 @@ pub(crate) fn paste_text_on(socket: Option<&str>, pane_id: &str, text: &str) -> 
     }
 
     let mut paste = tmux_command_targeting(socket);
-    paste.args(["paste-buffer", "-p", "-b", &buf, "-t", pane_id]);
+    paste.args(["paste-buffer", "-p", "-r", "-b", &buf, "-t", pane_id]);
     let pasted = command_output_with_timeout(
         paste,
         TMUX_COMMAND_TIMEOUT,
