@@ -573,6 +573,7 @@ mod tests {
             "editor",
         ]);
         cols[12] = "workspace-is-not-a-socket";
+        cols[18] = "codex";
         cols[32] = "alpha-group";
         cols.push(socket);
         cols.join("\t")
@@ -600,6 +601,7 @@ mod tests {
         assert_eq!(pane.session_group.as_deref(), Some("alpha-group"));
         assert_eq!(pane.current_path, "/tmp/project");
         assert_eq!(pane.pane_pid, 4242);
+        assert_eq!(pane.agent_program.as_deref(), Some("codex"));
         assert_eq!(pane.socket.as_deref(), Some("/tmp/rmux.sock"));
     }
 

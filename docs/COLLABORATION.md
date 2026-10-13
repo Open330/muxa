@@ -104,11 +104,14 @@ Once connected, muxa's initialization instructions surface same-window peers
 as reviewers or narrowly scoped delegated subagents. An agent can call
 `muxa_collaboration_guide` to retrieve the contract again.
 
-If `muxa doctor` reports a pane as synthetic, that agent does not yet have a
-stable session identity and is omitted from room participants and request
-targets. Submit a prompt to trigger a hook event; if it remains synthetic,
-restart the agent and check again. This prevents a request from being pinned to
-a placeholder identity that the later real session could never claim.
+An agent launched through Muxa does not need `--prompt` to become a peer.
+The launcher records the provider and immediately registers the observed CLI
+through discovery. Before the first hook, a matching live process is exposed
+as a pending peer, selectable by provider, pane, alias, role, or automatic
+routing. Requests wait for an idle row; the real session adopts them when its
+first hook arrives. Launch marks alone are insufficient: an exited CLI that
+leaves a shell behind is not exposed as a pending peer. Unmanaged synthetic
+rows remain outside the peer list.
 
 Existing `prefix+s` watch bindings need no additional shortcut after upgrading.
 
@@ -439,15 +442,14 @@ both files before any downgrade.
 ## Wake-up safety
 
 With `idle_only`, muxad injects only when the exact
-hook-authoritative participant is `Idle`. It never injects into `Working`,
-`WaitingInput`, `WaitingChoice`, or `Error` panes. Synthetic screen-detected
-agents have no stable session identity, so they are not room participants and
-are never selected automatically.
+participant is `Idle`. It never injects into `Working`, `WaitingInput`,
+`WaitingChoice`, or `Error` panes. Unmanaged synthetic screen-detected agents
+are not room participants and are never selected automatically.
 
-The single exception is a request explicitly addressed to a pane Muxa launched
-whose agent has not registered yet. Such a request carries a *pending pane*
-recipient, and the pane's synthetic row serves only as the idle gate for
-delivering it. Safety is unchanged where it matters: a startup approval gate
+A Muxa-launched CLI with a matching live process is exposed as a pending peer
+before its first prompt. Such a request carries a *pending pane* recipient,
+and the pane's synthetic row supplies the idle gate for delivering it. A startup
+approval gate
 still blocks delivery, because the bundled screen manifests classify it as
 `WaitingInput`/`WaitingChoice` rather than `Idle`. A pane with no muxa launch
 mark and no classified agent process is never addressable this way, so a

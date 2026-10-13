@@ -1930,7 +1930,7 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
         Ok(request) => request,
         Err(error) => return error_result(&format!("call_peer send failed: {error}")),
     };
-    let peer_pending = selection.peer.is_none();
+    let peer_pending = muxa::collaboration::is_pending_session(&sent.to.agent_session_id);
     let mut common = json!({
         "sent": true,
         "selected_peer": selection.peer.clone().unwrap_or_else(|| sent.to.clone()),
@@ -4007,6 +4007,7 @@ mod tests {
     fn registration_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -4680,6 +4681,23 @@ mod tests {
             select_peer(&room, "@muxa-peer").unwrap().unwrap().pane,
             "%3"
         );
+    }
+
+    #[test]
+    fn a_launched_peer_without_a_first_prompt_is_selectable_by_every_target() {
+        let current = peer_participant(AgentKind::ClaudeCode, "%1", AgentState::Idle);
+        let mut pending = peer_participant(AgentKind::Codex, "%2", AgentState::Starting);
+        pending.agent_session_id = "pending-pane:default:%2".into();
+        pending.alias = Some("review".into());
+        pending.roles = vec!["reviewer".into()];
+        let room = peer_room(current, vec![pending]);
+        for target in ["auto", "codex", "@review", "role:reviewer", "pane:%2"] {
+            let selected = select_peer(&room, target).unwrap().unwrap();
+            assert_eq!(selected.pane, "%2");
+            assert!(muxa::collaboration::is_pending_session(
+                &selected.peer.unwrap().agent_session_id
+            ));
+        }
     }
 
     /// An explicitly addressed pane with no registered peer is handed to muxad

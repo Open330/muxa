@@ -2649,18 +2649,27 @@ async fn collaboration_participants(
 ) -> CollaborationTopology {
     let mut agents = store.snapshot().await;
     let listed = backends.to_vec();
-    let panes = tokio::task::spawn_blocking(move || {
-        listed
+    let discovery_agents = agents.clone();
+    let (panes, mut participants) = tokio::task::spawn_blocking(move || {
+        let panes = listed
             .iter()
             .flat_map(|backend| backend.list_panes())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let participants = collaboration::participants_from(&discovery_agents, &panes);
+        (panes, participants)
     })
     .await
     .unwrap_or_default();
     if bind_unplaced_codex_origin(store, backends, &agents, &panes, origin_session).await {
         agents = store.snapshot().await;
+        let refreshed = agents.clone();
+        let observed = panes.clone();
+        participants = tokio::task::spawn_blocking(move || {
+            collaboration::participants_from(&refreshed, &observed)
+        })
+        .await
+        .unwrap_or_default();
     }
-    let mut participants = collaboration::participants_from(&agents, &panes);
     collaboration.enrich_participants(&mut participants).await;
     CollaborationTopology {
         participants,
@@ -6960,6 +6969,7 @@ mod tests {
     fn collaboration_test_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: Some("callabo".into()),
@@ -9918,6 +9928,7 @@ mod tests {
 
         let pane = PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,

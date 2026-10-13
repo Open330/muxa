@@ -639,6 +639,9 @@ pub struct PaneInfo {
     /// identity; either can be absent on unmanaged or partially stamped panes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_id: Option<String>,
+    /// Provider recorded by the Muxa launcher, before the first hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_program: Option<String>,
     /// `@muxa_agent_role` — the role a muxa-managed launch stamped on this
     /// pane (`implementer`, `reviewer`, ...). Declared by the launcher, not
     /// self-registered by the agent, so it survives the window before the
@@ -773,6 +776,7 @@ pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) ->
             socket: socket.map(Into::into),
             workspace_id: first_non_empty(cols.get(22), cols.get(12)),
             work_id: first_non_empty(cols.get(23), cols.get(15)),
+            agent_program: non_empty(cols.get(18)),
             agent_role: non_empty(cols.get(19)),
             agent_alias: non_empty(cols.get(31)),
             session_group: non_empty(cols.get(32)),
@@ -1612,8 +1616,24 @@ mod tests {
         assert_eq!(pane.pane_id, "%1");
         assert_eq!(pane.agent_role, None);
         assert_eq!(pane.agent_alias, None);
+        assert_eq!(pane.agent_program, None);
         assert_eq!(pane.workspace_id, None);
         assert_eq!(pane.work_id, None);
+    }
+
+    #[test]
+    fn pane_parser_preserves_the_launched_provider_without_role_or_alias() {
+        let mut columns = vec![""; 33];
+        columns[0] = "%2";
+        columns[1] = "main";
+        columns[5] = "codex";
+        columns[7] = "42";
+        columns[18] = "codex";
+        columns[21] = "1";
+        let panes = parse_pane_lines(&columns.join("\t"));
+        assert_eq!(panes[0].agent_program.as_deref(), Some("codex"));
+        assert!(panes[0].agent_role.is_none());
+        assert!(panes[0].agent_alias.is_none());
     }
 
     /// And the reverse: an unaliased pane must not grow the payload it sends
@@ -1622,6 +1642,7 @@ mod tests {
     fn an_unaliased_pane_serializes_without_the_new_keys() {
         let pane = PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             pane_id: "%1".into(),

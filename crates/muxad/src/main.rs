@@ -1663,15 +1663,17 @@ async fn wake_idle_collaboration_peers_with_inflight(
     }
     let agents = store.snapshot().await;
     let listed_backends = backends.to_vec();
-    let panes = tokio::task::spawn_blocking(move || {
-        listed_backends
+    let discovery_agents = agents.clone();
+    let (panes, mut participants) = tokio::task::spawn_blocking(move || {
+        let panes = listed_backends
             .iter()
             .flat_map(|backend| backend.list_panes())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let participants = muxa::collaboration::participants_from(&discovery_agents, &panes);
+        (panes, participants)
     })
     .await
     .unwrap_or_default();
-    let mut participants = muxa::collaboration::participants_from(&agents, &panes);
     collaboration.enrich_participants(&mut participants).await;
 
     for request in requests {
@@ -3307,6 +3309,7 @@ mod tests {
     fn collaboration_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
