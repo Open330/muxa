@@ -656,7 +656,12 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         .prompt
         .as_deref()
         .filter(|prompt| !prompt.trim().is_empty());
-    let command = request.agent.launch_command(&request.options, prompt);
+    // Replace tmux's command shell, so the pane's foreground command and PID
+    // describe the CLI even before it emits a hook.
+    let command = format!(
+        "exec {}",
+        request.agent.launch_command(&request.options, prompt)
+    );
     let args = tmux_args(&request, &cwd, &command)?;
     let output = crate::mux_control::ambient_command_with_args(&args)?
         .output()
@@ -746,6 +751,10 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         crate::tmux_work::cleanup_pane(&pane);
         return Err(error).context("record muxa tmux metadata");
     }
+    // Hooks may not fire until the first prompt. Register the observed CLI
+    // now, using discovery's placeholder so a later real hook replaces it.
+    // Missing/older daemons remain supported; periodic discovery retries.
+    register_launched_agent(&request, &pane);
     // Minting belongs to the agent's session-start hook, which reaches the
     // room's arbiter. Doing it here too would allocate from a namespace this
     // process cannot see all of — the bug the arbiter exists to close — so an
@@ -771,6 +780,35 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         cwd,
         prompt_supplied: prompt.is_some(),
     })
+}
+
+fn register_launched_agent(request: &StartRequest, pane: &str) {
+    use muxa::backend::PaneBackend;
+    let observed = if let Some(endpoint) = muxa::backend::rmux::endpoint_from_env() {
+        muxa::RmuxBackend::with_endpoint(endpoint).resolve_pane(&format!("rmux:{pane}"))
+    } else {
+        muxa::TmuxBackend::new().resolve_pane(pane)
+    };
+    let Some(observed) = observed else { return };
+    let Some(discovered) = muxa::discovery::discover_from_panes(&[observed])
+        .into_iter()
+        .next()
+    else {
+        return;
+    };
+    if muxa::discovery::classify_command(request.agent.label()) != Some(discovered.kind) {
+        return;
+    }
+    let event = muxa::discovery::synthesize_started(&discovered, time::OffsetDateTime::now_utc());
+    let _ = muxa::ipc::blocking_call(
+        &request.socket,
+        &serde_json::json!({
+            "protocol": muxa::event::PROTOCOL_VERSION,
+            "kind": "ingest",
+            "event": event,
+        }),
+        std::time::Duration::from_secs(2),
+    );
 }
 
 struct PreparedLaunch {

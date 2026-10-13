@@ -38,6 +38,8 @@ pub mod adapters;
 pub mod agent_control;
 pub mod ask;
 pub mod automation;
+pub mod automation_choice;
+pub mod automation_defaults;
 pub mod automation_judge;
 pub mod backend;
 mod codex_binding;
@@ -65,6 +67,7 @@ mod prompt_headline;
 #[doc(hidden)]
 pub mod test_support;
 pub use prompt_headline::prompt_headline;
+pub mod prompt_delivery;
 pub mod reconcile;
 pub mod request;
 pub mod scope_filter;

@@ -1588,16 +1588,15 @@ fn state_label(state: AgentState) -> &'static str {
 
 fn send_prompt(pane: &str, text: &str) -> Result<()> {
     let sent = if muxa::backend::rmux::endpoint_from_env().is_some() {
-        muxa::PaneBackend::send_text(&muxa::RmuxBackend::new(), pane, text)
+        muxa::PaneBackend::send_prompt_text_on(&muxa::RmuxBackend::new(), None, pane, text)
     } else {
-        muxa::tmux::send_text(pane, text)
+        muxa::PaneBackend::send_prompt_text_on(&muxa::TmuxBackend::new(), None, pane, text)
     };
     if !sent {
         bail!("tmux refused the prompt; the pane may be gone");
     }
-    // The agent CLIs treat text and submit as separate events; typing into
-    // a TUI that is still redrawing swallows the newline.
-    std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
+    // Native hosts have an explicit paste end; other hosts use a fallback.
+    std::thread::sleep(muxa::backend::prompt_submit_grace(pane));
     let output =
         crate::mux_control::ambient_command_with_args(&["send-keys", "-t", pane, "Enter"])?
             .output()

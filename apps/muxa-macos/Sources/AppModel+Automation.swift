@@ -105,6 +105,7 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
     var work = ""
     var pane = ""
     var host = ""
+    var notification: String?
     var idleFor = ""
     var wait = ""
     var fallback = ""
@@ -303,6 +304,7 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
             work: work,
             pane: pane,
             host: host,
+            notification: notification,
             scope: event.supportsScopeFilter ? Self.sorted(scopes) : [],
             idleFor: event.requiresDuration ? idleFor : nil,
             wait: wait,
@@ -333,6 +335,7 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
             work: rule.work ?? "",
             pane: rule.pane ?? "",
             host: rule.host ?? "",
+            notification: rule.notification,
             idleFor: rule.idleFor ?? "",
             wait: rule.wait ?? "",
             fallback: rule.fallback ?? "",

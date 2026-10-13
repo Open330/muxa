@@ -5087,6 +5087,7 @@ mod tests {
     fn pane(id: &str, session: &str) -> muxa::tmux::PaneInfo {
         muxa::tmux::PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,

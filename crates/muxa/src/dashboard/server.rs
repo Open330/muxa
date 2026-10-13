@@ -1572,9 +1572,9 @@ async fn run_work_control(
         candidates
             .into_iter()
             .map(|(backend, socket, pane)| {
-                let sent = backend.send_text_on(Some(&socket), &pane, &text);
+                let sent = backend.send_prompt_text_on(Some(&socket), &pane, &text);
                 let submitted = if sent && submit {
-                    std::thread::sleep(crate::backend::PROMPT_SUBMIT_GRACE);
+                    std::thread::sleep(crate::backend::prompt_submit_grace(&pane));
                     backend.send_text_on(Some(&socket), &pane, "\r")
                 } else {
                     false
@@ -1853,9 +1853,9 @@ async fn pane_prompt_handler(
     let pane_for_send = pane.clone();
     let (sent, submitted) = tokio::task::spawn_blocking(move || {
         let socket = socket.as_deref();
-        let sent = backend.send_text_on(socket, &pane_for_send, &text);
+        let sent = backend.send_prompt_text_on(socket, &pane_for_send, &text);
         let submitted = if sent && submit {
-            std::thread::sleep(crate::backend::PROMPT_SUBMIT_GRACE);
+            std::thread::sleep(crate::backend::prompt_submit_grace(&pane_for_send));
             backend.send_text_on(socket, &pane_for_send, "\r")
         } else {
             false
@@ -3112,6 +3112,7 @@ mod tests {
     ) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -3581,6 +3582,7 @@ mod tests {
         };
         let herdr = scanner::herdr_scan_result(vec![crate::tmux::PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -3613,6 +3615,7 @@ mod tests {
             HostKind::Rmux,
             vec![crate::tmux::PaneInfo {
                 session_group: None,
+                agent_program: None,
                 agent_role: None,
                 agent_alias: None,
                 workspace_id: None,
@@ -3647,6 +3650,7 @@ mod tests {
             kind: HostKind::Rmux,
             panes: vec![crate::tmux::PaneInfo {
                 session_group: None,
+                agent_program: None,
                 agent_role: None,
                 agent_alias: None,
                 workspace_id: None,

@@ -3191,6 +3191,7 @@ mod tests {
             .unwrap();
         let pane = PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -5448,6 +5449,7 @@ mod tests {
     fn pane(id: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
