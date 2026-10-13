@@ -243,7 +243,7 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 | `muxa recap [--pane %N]` | 보관된 disk history에서 최근 prompt 조회. |
 | `muxa peers` / `muxa identity` / `muxa msg` | 같은 tmux window의 agent를 찾고 이름/역할을 지정해 durable request/reply 메시지를 주고받음. |
 | `muxa skill add/list/show/remove` | watch/dashboard 메시지, watch ask, MCP peer call에서 사용할 `/` prompt 템플릿 관리. |
-| `muxa host add/list/label/annotate/doctor` | physical SSH node와 Kubernetes-style label/annotation 관리. |
+| `muxa fleet host add/list/label/annotate/doctor` | physical SSH node와 Kubernetes-style label/annotation 관리. |
 | `muxa fleet status/watch/capture/send/attach` | 중앙 host → session → window → pane(agent) 관측/제어. |
 | `muxa stats --since today` | WACT/ACT/WORK/WAIT 중심 summary. day/project/agent/session 단위로 묶을 수 있고, `--graph`는 WACT 시간 그래프만, `--verbose`는 진단 컬럼을 표시. |
 | `muxa stats report --since week` | day/project/agent/session 모든 breakdown을 ACT/WACT 중심 테이블로 표시 (`--json` / `--markdown`로 export). |
@@ -327,9 +327,9 @@ SSH stdio relay와 독립적인 last-known cache를 유지합니다. 기본값�
 muxa fleet status                         # local은 이미 표시됨
 muxa fleet status -L environment,region   # 필요한 label column만 추가
 muxa fleet status -o wide                 # 공간에 따라 hostname/version/latency
-muxa host label local environment=development
-muxa host add dev muxa-devbox --label environment=development --mode observe
-muxa host doctor dev
+muxa fleet host label local environment=development
+muxa fleet host add dev muxa-devbox --label environment=development --mode observe
+muxa fleet host doctor dev
 muxa fleet watch
 # 같은 진입점: muxa watch --fleet
 # `muxa init`은 이 화면을 tmux prefix+S에 연결함(local watch는 prefix+s 유지)

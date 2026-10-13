@@ -18,7 +18,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     ("Work & layout", &["work", "workspace", "window", "agent"]),
     ("Analytics", &["stats", "timeline"]),
     ("Save & restore", &["snapshot", "restore", "reload"]),
-    ("Fleet", &["fleet", "host"]),
+    ("Fleet", &["fleet"]),
     ("Run & automate", &["proc", "automation"]),
     (
         "Setup",
@@ -140,7 +140,7 @@ mod tests {
     /// Former top-level names that now live under a parent command.
     const MOVED: &[&str] = &[
         "logs", "sync", "prune", "panes", "run", "attach", "detach", "register", "report",
-        "activity",
+        "activity", "host",
     ];
 
     fn parse(argv: &[&str]) -> crate::Cmd {
@@ -334,6 +334,26 @@ mod tests {
             let error = placement(&argv).expect_err("summary flag before a view");
             assert!(error.to_string().contains(misplaced[0]), "{error}");
         }
+    }
+
+    #[test]
+    fn host_moved_under_fleet() {
+        let host = ["label", "dev", "tier=worker", "--overwrite"];
+        let old_argv: Vec<&str> = ["muxa", "host"].iter().chain(&host).copied().collect();
+        let new_argv: Vec<&str> = ["muxa", "fleet", "host"]
+            .iter()
+            .chain(&host)
+            .copied()
+            .collect();
+        let crate::Cmd::Host(old) = parse(&old_argv) else {
+            panic!("`muxa host` must still parse");
+        };
+        let crate::Cmd::Fleet(new) = parse(&new_argv) else {
+            panic!("`muxa fleet host` must parse");
+        };
+        let new = format!("{new:?}");
+        assert!(new.contains("Host("), "{new}");
+        assert!(new.contains(&format!("{old:?}")), "{new}");
     }
 
     #[test]

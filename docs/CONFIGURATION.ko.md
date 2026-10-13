@@ -501,8 +501,8 @@ manager 단계에서 차단합니다.
 ProxyJump, host-key 정책은 `~/.ssh/config`에 둡니다. `muxa_path`와 `remote_socket`은
 fixed remote command token으로 검증됩니다. label은 Kubernetes-style selector에 쓰고,
 annotation은 설명형 value를 허용하지만 같은 namespaced key 문법을 사용합니다.
-inventory는 `muxa host add/label/annotate`로 atomic하게 편집하는 것을 권장합니다.
-controller metadata는 `muxa host label local`, `muxa host annotate local`로 관리하며
+inventory는 `muxa fleet host add/label/annotate`로 atomic하게 편집하는 것을 권장합니다.
+controller metadata는 `muxa fleet host label local`, `muxa fleet host annotate local`로 관리하며
 muxad가 제공하는 identity label은 덮어쓸 수 없습니다.
 [FLEET.ko.md](FLEET.ko.md)를 참고하세요.
 

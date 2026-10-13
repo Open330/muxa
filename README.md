@@ -295,7 +295,7 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
 | `muxa peers` / `muxa identity` / `muxa msg` | Discover and name same-window agents, then exchange durable request/reply messages. |
 | `muxa skill add/list/show/remove` | Manage reusable `/` prompt templates for watch/dashboard messages, watch ask, and MCP peer calls. |
-| `muxa host add/list/label/annotate/doctor` | Manage physical SSH nodes and Kubernetes-style labels/annotations. |
+| `muxa fleet host add/list/label/annotate/doctor` | Manage physical SSH nodes and Kubernetes-style labels/annotations. |
 | `muxa fleet status/watch/capture/send/attach` | Central host → session → window → pane(agent) observation and control. |
 | `muxa stats --since today` | Focused WACT/ACT/WORK/WAIT summary; group by day/project/agent/session. Add `--graph` for graph-only WACT over time or `--verbose` for diagnostic columns. |
 | `muxa stats report --since week` | All breakdowns (day/project/agent/session) as focused ACT/WACT tables; add `--json` or `--markdown` to export. |
@@ -395,9 +395,9 @@ independent last-known cache per node. `observe` is the default, while
 muxa fleet status                         # local is already present
 muxa fleet status -L environment,region   # opt-in label columns
 muxa fleet status -o wide                 # hostname/version/latency when space permits
-muxa host label local environment=development
-muxa host add dev muxa-devbox --label environment=development --mode observe
-muxa host doctor dev
+muxa fleet host label local environment=development
+muxa fleet host add dev muxa-devbox --label environment=development --mode observe
+muxa fleet host doctor dev
 muxa fleet watch
 # equivalent entry point: muxa watch --fleet
 # `muxa init` also binds this view to tmux prefix+S (local watch stays prefix+s)

@@ -54,10 +54,10 @@ No setup is required for the controller node:
 
 ```bash
 muxa fleet status
-muxa host show local
-muxa host doctor local
-muxa host label local environment=development
-muxa host annotate local muxa.dev/owner=platform
+muxa fleet host show local
+muxa fleet host doctor local
+muxa fleet host label local environment=development
+muxa fleet host annotate local muxa.dev/owner=platform
 ```
 
 `local` has the same stable NodeId and topology shape as a remote node, but it
@@ -71,15 +71,15 @@ Register hosts through the CLI so Muxa validates and atomically updates the
 TOML inventory:
 
 ```bash
-muxa host add dev muxa-devbox \
+muxa fleet host add dev muxa-devbox \
   --label environment=development \
   --label region=icn \
   --annotation muxa.dev/owner=platform \
   --mode observe
 
-muxa host doctor dev
-muxa host list
-muxa host show dev
+muxa fleet host doctor dev
+muxa fleet host list
+muxa fleet host show dev
 ```
 
 The first remote-host command enables outbound SSH Fleet connections. The
@@ -91,17 +91,17 @@ prints a reminder to restart it manually.
 Labels follow Kubernetes key/value rules and are meant for selection:
 
 ```bash
-muxa host label dev tier=worker accelerator=gpu
-muxa host label dev tier=worker --overwrite
-muxa host label dev accelerator-              # remove
-muxa host tag dev region=icn                   # visible alias of label
+muxa fleet host label dev tier=worker accelerator=gpu
+muxa fleet host label dev tier=worker --overwrite
+muxa fleet host label dev accelerator-              # remove
+muxa fleet host tag dev region=icn                   # visible alias of label
 ```
 
 Annotation keys use the same namespaced key rules but their values may hold
 descriptive text or URLs:
 
 ```bash
-muxa host annotate dev muxa.dev/runbook=https://example.invalid/dev
+muxa fleet host annotate dev muxa.dev/runbook=https://example.invalid/dev
 ```
 
 The controller alias is human-friendly configuration identity. The relay also
@@ -132,8 +132,8 @@ apply to remote inventory entries:
   reconnect backoff.
 - `connect = "on_demand"` remains disconnected until `muxa fleet connect`.
 
-Use `muxa host disable` to keep metadata but suppress all connections, and
-`muxa host enable` to restore it.
+Use `muxa fleet host disable` to keep metadata but suppress all connections, and
+`muxa fleet host enable` to restore it.
 
 ## Operating the fleet
 
@@ -303,7 +303,7 @@ into keystrokes.
   `BatchMode=yes` and never disables host-key checking.
 - Fleet forces `ClearAllForwardings=yes` and does not request agent forwarding.
 - Start new hosts in observe mode, then promote only the hosts that need
-  control with `muxa host add ... --mode control --overwrite`.
+  control with `muxa fleet host add ... --mode control --overwrite`.
 - Treat access to the controller's muxad socket, config file, and SSH keys as
   shell-equivalent authority.
 - Use labels for selection, not secrets. Annotations are displayed in the

@@ -151,8 +151,8 @@
 # max_parallel_connects = 6
 # capture_policy        = "selected" # selected | never; pane text is fetched on demand only
 
-# Optional metadata for the built-in controller node. `muxa host label local`
-# and `muxa host annotate local` edit these tables. muxad supplies immutable
+# Optional metadata for the built-in controller node. `muxa fleet host label local`
+# and `muxa fleet host annotate local` edit these tables. muxad supplies immutable
 # muxa.io/local, muxa.io/transport, and kubernetes.io/* identity labels.
 # [fleet.local.labels]
 # environment = "development"

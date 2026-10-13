@@ -624,8 +624,8 @@ both pane and window capture at the manager even on control hosts.
 identity, ProxyJump, and host-key policy in `~/.ssh/config`. `muxa_path` and
 `remote_socket` are validated as fixed remote command tokens. Labels implement
 Kubernetes-style selectors; annotations allow descriptive values but use the
-same namespaced key syntax. Prefer `muxa host add/label/annotate` to edit the
-inventory atomically. Use `muxa host label local` and `muxa host annotate
+same namespaced key syntax. Prefer `muxa fleet host add/label/annotate` to edit the
+inventory atomically. Use `muxa fleet host label local` and `muxa fleet host annotate
 local` for controller metadata; muxad-managed identity labels cannot be
 overridden. See [FLEET.md](FLEET.md).
 
