@@ -57,3 +57,25 @@ export function initResizeHandle(handle, { read, write, min, max, step = 10, axi
     apply(event.key === "Home" ? min : event.key === "End" ? max : read() + (event.key === increase ? step : -step));
   });
 }
+
+const renderedHTML = new WeakMap();
+export function setStableHTML(node, html) {
+  if (node.childNodes.length && renderedHTML.get(node) === html) return false;
+  node.innerHTML = html;
+  renderedHTML.set(node, html);
+  return true;
+}
+export function clearStableHTML(node) {
+  if (!node) return;
+  renderedHTML.delete(node);
+  node.replaceChildren();
+}
+export function participantLocation(participant) {
+  return participant?.console ? 'operator console' : participant?.pane || participant?.agent_session_id || 'unknown';
+}
+export function messageLink(href, request) {
+  const url = new URL(href);
+  url.search = '';
+  url.hash = new URLSearchParams({ message: request.id }).toString();
+  return url.toString();
+}

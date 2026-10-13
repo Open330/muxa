@@ -3570,3 +3570,9 @@ body.has-collaboration-expanded {
 }
 
 .collaboration-expanded > .panel-header .collapse-btn { display: none; }
+
+.collaboration-custom-period { display: flex; flex-wrap: wrap; gap: 12px; padding: 8px 12px; }
+.collaboration-custom-period[hidden] { display: none; }
+.collaboration-custom-period input { background: var(--surface); color: var(--fg); border: 1px solid var(--border); padding: 6px; }
+.collaboration-detail-actions { display: flex; gap: 6px; margin-top: 10px; }
+@media (max-width: 820px) { .panel-height-resizer { display: none; } }

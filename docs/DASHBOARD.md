@@ -387,13 +387,20 @@ replies, and artifacts. Locking access immediately clears loaded details.
 
 Collaboration opens as a message list beside a detail reader. The list shows
 participants, status, timestamps, response latency, update counts, and body
-previews for authenticated operators. Search applies to loaded messages;
-partial-history counts are labeled when older pages remain. Graph and Sequence
+previews for authenticated operators. Search filters retained history on the server before pagination. Public and
+viewer searches cover visible metadata; authenticated operators can also
+search request, reply, and progress bodies. Counts reflect all matching rows,
+while summaries of loaded pages are labeled when older pages remain. Custom
+period controls accept a start and end time. Graph and Sequence
 are separate views; the graph supports zoom and fit in both dimensions.
 Drag the separators (or use arrow keys while focused) to resize the navigator,
 list/detail split, and panel height. Sizes persist across reloads. Expand fills
 the viewport; restore or Escape returns to the normal layout. Narrow screens
-stack the list and detail reader.
+stack the list and detail reader and hide the desktop height handle.
+Unchanged refreshes preserve text selection and reading position. Thread and
+parent buttons open related history across rooms, and message links reopen an
+exact retained request even outside the default period. Copy-link strips all
+other URL parameters; copy-conversation is available to authenticated operators.
 
 ## Sessions, windows and panes
 
