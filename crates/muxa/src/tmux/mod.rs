@@ -499,7 +499,7 @@ fn feed_stdin_with_timeout(
 /// submits per newline), so it's the least-surprising default for multi-line
 /// submit semantics. The trailing submit CR (`submit:true`) is sent separately
 /// as a `send-keys` Enter and is unaffected.
-fn paste_text_on(socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+pub(crate) fn paste_text_on(socket: Option<&str>, pane_id: &str, text: &str) -> bool {
     let buf = paste_buffer_name();
 
     let mut load = tmux_command_targeting(socket);

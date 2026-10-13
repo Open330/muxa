@@ -1336,10 +1336,9 @@ impl AutomationEngine {
                 if !firing.submit {
                     return true;
                 }
-                // Same grace the collaboration waker uses: codex's TUI reads
-                // an immediate trailing Enter as part of the pasted burst and
-                // leaves the prompt composed but unsubmitted.
-                tokio::time::sleep(muxa::backend::PROMPT_SUBMIT_GRACE).await;
+                // Native hosts use explicit paste boundaries; only hosts
+                // without that support need a best-effort fallback delay.
+                tokio::time::sleep(muxa::backend::prompt_submit_grace(&firing.pane)).await;
                 send_automation_text(&self.backends, firing, "\r").await
             }
             // A notice, not a keystroke: nothing is typed into the pane. The
@@ -1519,9 +1518,15 @@ async fn send_automation_text(
     let pane = firing.pane.clone();
     let socket = firing.socket.clone();
     let text = text.to_string();
-    tokio::task::spawn_blocking(move || backend.send_text_on(socket.as_deref(), &pane, &text))
-        .await
-        .unwrap_or(false)
+    tokio::task::spawn_blocking(move || {
+        if text == "\r" || text == "\u{3}" {
+            backend.send_text_on(socket.as_deref(), &pane, &text)
+        } else {
+            backend.send_prompt_text_on(socket.as_deref(), &pane, &text)
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 fn spawn_collaboration_waker_task(
@@ -1696,7 +1701,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
             );
         }
         let prompt = mailbox_collaboration_request_prompt(&request);
-        let (sent, submitted) = send_collaboration_wake(recipient, &prompt, backends).await;
+        let (sent, submitted) = send_collaboration_wake(recipient, &prompt, backends, store).await;
         if submitted {
             wake_inflight.insert(wake_key);
         }
@@ -1719,6 +1724,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
         backends,
         replies,
         wake_inflight,
+        store,
     )
     .await;
 }
@@ -1731,6 +1737,7 @@ async fn wake_senders_of_ready_replies(
     backends: &[muxa::SharedBackend],
     replies: Vec<CollaborationRequest>,
     wake_inflight: &mut HashSet<(String, Option<String>, String)>,
+    store: &muxa::Store,
 ) {
     for request in replies {
         let Some(sender) = idle_collaboration_participant(participants, &request.from) else {
@@ -1747,7 +1754,7 @@ async fn wake_senders_of_ready_replies(
             request.to.label(),
             request.id,
         );
-        let (sent, submitted) = send_collaboration_wake(sender, &prompt, backends).await;
+        let (sent, submitted) = send_collaboration_wake(sender, &prompt, backends, store).await;
         if submitted {
             wake_inflight.insert(wake_key);
         }
@@ -1813,7 +1820,7 @@ async fn deliver_full_collaboration_request(
                     "failed to persist direct wake prompt phase",
                 );
             }
-            tokio::time::sleep(muxa::backend::PROMPT_SUBMIT_GRACE).await;
+            tokio::time::sleep(muxa::backend::prompt_submit_grace(&recipient.pane)).await;
             submit_direct_collaboration_prompt(collaboration, recipient, &request.id, backends)
                 .await
         }
@@ -2044,14 +2051,27 @@ async fn send_collaboration_wake(
     participant: &muxa::collaboration::Participant,
     prompt: &str,
     backends: &[muxa::SharedBackend],
+    store: &muxa::Store,
 ) -> (bool, bool) {
+    let agents = store.by_pane(&participant.pane).await;
+    let observer = muxa::prompt_delivery::SubmissionObserver::new(
+        store,
+        &agents,
+        participant.socket.as_deref(),
+        prompt,
+    );
     let sent = send_collaboration_text(participant, prompt, backends).await;
     let submitted = if sent {
-        tokio::time::sleep(muxa::backend::PROMPT_SUBMIT_GRACE).await;
+        tokio::time::sleep(muxa::backend::prompt_submit_grace(&participant.pane)).await;
         send_collaboration_text(participant, "\r", backends).await
     } else {
         false
     };
+    if submitted {
+        let confirmed = observer.confirm().await;
+        tracing::debug!(pane = participant.pane, submission_confirmed = ?confirmed,
+            "collaboration Enter delivered; application acknowledgement observed separately");
+    }
     (sent, submitted)
 }
 
@@ -2073,9 +2093,15 @@ async fn send_collaboration_text(
     let pane = participant.pane.clone();
     let socket = participant.socket.clone();
     let text = text.to_string();
-    tokio::task::spawn_blocking(move || backend.send_text_on(socket.as_deref(), &pane, &text))
-        .await
-        .unwrap_or(false)
+    tokio::task::spawn_blocking(move || {
+        if text == "\r" || text == "\u{3}" {
+            backend.send_text_on(socket.as_deref(), &pane, &text)
+        } else {
+            backend.send_prompt_text_on(socket.as_deref(), &pane, &text)
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Spawn the GC task: evicts long-stopped agents on a periodic timer.

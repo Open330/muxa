@@ -307,6 +307,10 @@ impl PaneBackend for RmuxBackend {
             .is_ok()
     }
 
+    fn send_prompt_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+        text.is_empty() || self.paste_text_on(socket, pane_id, text)
+    }
+
     fn capture_pane_on(&self, endpoint: Option<&str>, pane_id: &str) -> Option<String> {
         self.capture_on(endpoint, pane_id)
     }

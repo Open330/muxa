@@ -64,12 +64,17 @@ use std::time::Duration;
 
 use crate::tmux::PaneInfo;
 
-/// Grace period between literal prompt injection and the submit key.
-/// Codex's TUI treats an immediate trailing Enter as part of a pasted burst,
-/// leaving the prompt composed but unsubmitted. All control-plane send paths
-/// use the same delay so dashboard sends, MCP sends, and collaboration wakes
-/// behave consistently.
-pub const PROMPT_SUBMIT_GRACE: Duration = Duration::from_millis(120);
+/// Fallback for hosts without an explicit paste boundary. This is best effort,
+/// not an application submission acknowledgement. Native tmux/rmux prompt
+/// injection uses bracketed paste and does not need a timing heuristic.
+pub const PROMPT_SUBMIT_GRACE: Duration = Duration::from_millis(250);
+
+pub fn prompt_submit_grace(pane: &str) -> Duration {
+    match pane_id_host_kind(pane) {
+        Some(HostKind::Tmux | HostKind::Rmux) => Duration::ZERO,
+        _ => PROMPT_SUBMIT_GRACE,
+    }
+}
 
 /// Whether a pane observation is authoritative enough for destructive use.
 ///
@@ -517,6 +522,14 @@ pub trait PaneBackend: Send + Sync + 'static {
         self.send_text(pane_id, text)
     }
 
+    /// Inject a prompt with an explicit paste boundary when supported. Unlike
+    /// raw `send_text_on`, this never sends prompt text as simulated typing.
+    /// Empty text is a no-op, allowing an Enter-only operation without clearing
+    /// the application's paste state. Control keys must use `send_text_on`.
+    fn send_prompt_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+        text.is_empty() || self.send_text_on(socket, pane_id, text)
+    }
+
     /// Like [`Self::capture_pane`] but targeting the pane on the specific host
     /// server named by `socket` — the control-plane `capture` counterpart to
     /// [`Self::send_text_on`]. The default impl ignores `socket` and delegates
@@ -601,6 +614,9 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
     }
     fn send_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
         (**self).send_text_on(socket, pane_id, text)
+    }
+    fn send_prompt_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+        (**self).send_prompt_text_on(socket, pane_id, text)
     }
     fn capture_pane_on(&self, socket: Option<&str>, pane_id: &str) -> Option<String> {
         (**self).capture_pane_on(socket, pane_id)

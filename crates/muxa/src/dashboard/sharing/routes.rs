@@ -684,13 +684,13 @@ fn perform(
     let pane = observed_target(&backend, target)?;
     let socket = Some(target.socket.as_str());
     if let Some(text) = text {
-        if !backend.send_text_on(socket, &pane.pane_id, &text) {
+        if !backend.send_prompt_text_on(socket, &pane.pane_id, &text) {
             return Err((
                 StatusCode::BAD_GATEWAY,
                 "prompt delivery failed; inspect output before retrying",
             ));
         }
-        std::thread::sleep(crate::backend::PROMPT_SUBMIT_GRACE);
+        std::thread::sleep(crate::backend::prompt_submit_grace(&pane.pane_id));
         if observed_target(&backend, target).is_err()
             || !backend.send_text_on(socket, &pane.pane_id, "\r")
         {

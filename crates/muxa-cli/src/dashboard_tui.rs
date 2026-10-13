@@ -3036,11 +3036,11 @@ fn send_to_exact_pane(pane: &PaneKey, text: &str, submit: bool) -> std::result::
     if !backend.caps().send_text {
         return Err(format!("{} pane input is not supported", endpoint.host));
     }
-    if !backend.send_text_on(Some(&endpoint.socket), &pane.pane_id, text) {
+    if !backend.send_prompt_text_on(Some(&endpoint.socket), &pane.pane_id, text) {
         return Err("input was rejected".into());
     }
     if submit {
-        std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
+        std::thread::sleep(muxa::backend::prompt_submit_grace(&pane.pane_id));
         if !backend.send_text_on(Some(&endpoint.socket), &pane.pane_id, "\r") {
             return Err("prompt text was sent but submit failed".into());
         }

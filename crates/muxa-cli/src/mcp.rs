@@ -1166,9 +1166,13 @@ async fn call_tool(
                     // "Enter delivered" (`submitted`); surface the latter so a
                     // caller whose submit was requested but not delivered learns
                     // the text already landed and must not blindly resend it.
-                    Ok(outcome) => {
-                        render_send_result(text.len(), pane, submit, Some(outcome.submitted))
-                    }
+                    Ok(outcome) => render_send_result(
+                        text.len(),
+                        pane,
+                        submit,
+                        Some(outcome.submitted),
+                        outcome.submission_confirmed,
+                    ),
                     Err(e) => error_result(&format!("send_prompt failed: {e}")),
                 },
             )
@@ -3303,29 +3307,33 @@ async fn wait_for_reply(client: &Client, args: &Value) -> Value {
     }
 }
 
-/// Render the `muxa_send_prompt` result, defensively tolerating both the
-/// legacy contract (success = text sent, and Enter pressed if requested) and
-/// the newer daemon shape that reports Enter delivery separately.
-///
-/// `submitted` is what the daemon actually reported about the Enter keystroke:
-/// - `None` — the daemon didn't say (older client method that returns `()`):
-///   fall back to the caller's `submit` intent.
-/// - `Some(true)` — Enter was delivered; the line is committed.
-/// - `Some(false)` — the text landed but Enter did **not**; surfaced plainly
-///   so the caller doesn't assume the line was committed.
-fn render_send_result(text_len: usize, pane: &str, submit: bool, submitted: Option<bool>) -> Value {
+/// Report Enter transport acceptance separately from application acknowledgement.
+/// Legacy daemons and missing hooks leave application submission unknown.
+fn render_send_result(
+    text_len: usize,
+    pane: &str,
+    submit: bool,
+    submitted: Option<bool>,
+    submission_confirmed: Option<bool>,
+) -> Value {
     match submitted {
         Some(false) if submit => text_result(&format!(
             "sent {text_len} chars to {pane}, but the line was NOT submitted \
              (Enter not delivered) — the text is typed but not yet committed",
         )),
         _ => {
-            // No daemon signal → trust the requested `submit`; an explicit
-            // `Some(true)` confirms it.
-            let committed = submitted.unwrap_or(submit);
+            let enter_sent = submitted.unwrap_or(false);
             text_result(&format!(
                 "sent {text_len} chars to {pane}{}",
-                if committed { " and submitted" } else { "" },
+                if submission_confirmed == Some(true) {
+                    " and submission confirmed"
+                } else if enter_sent {
+                    "; Enter sent, application submission unconfirmed (do not resend text)"
+                } else if submit {
+                    "; submission status unavailable (do not resend text)"
+                } else {
+                    ""
+                },
             ))
         }
     }
@@ -3369,7 +3377,8 @@ async fn send_prompt_with_local_cmux(
         let target_prompt = prompt.to_string();
         if let Ok(Some(outcome)) = tokio::task::spawn_blocking(move || {
             let backend = muxa::backend::cmux::CmuxBackend::with_endpoint(endpoint);
-            if !muxa::PaneBackend::send_text(&backend, &target_pane, &target_prompt) {
+            if !muxa::PaneBackend::send_prompt_text_on(&backend, None, &target_pane, &target_prompt)
+            {
                 return None;
             }
             let submitted = if submit {
@@ -3383,6 +3392,7 @@ async fn send_prompt_with_local_cmux(
             Some(SendPromptOutcome {
                 sent: true,
                 submitted,
+                submission_confirmed: None,
             })
         })
         .await
@@ -5130,13 +5140,19 @@ mod tests {
     fn render_send_result_covers_all_submit_shapes() {
         let text = |v: &Value| v["content"][0]["text"].as_str().unwrap().to_string();
 
-        // Unknown submit status (client returns `()` today) → trust intent.
-        assert!(text(&render_send_result(5, "%1", true, None)).contains("and submitted"));
-        assert!(!text(&render_send_result(5, "%1", false, None)).contains("submitted"));
-        // Daemon confirms Enter landed.
-        assert!(text(&render_send_result(5, "%1", true, Some(true))).contains("and submitted"));
+        // Older daemon: requested intent does not prove application submission.
+        assert!(text(&render_send_result(5, "%1", true, None, None)).contains("status unavailable"));
+        assert!(!text(&render_send_result(5, "%1", false, None, None)).contains("submitted"));
+        // PromptSubmitted evidence confirms application submission.
+        assert!(
+            text(&render_send_result(5, "%1", true, Some(true), Some(true)))
+                .contains("submission confirmed")
+        );
+        let unconfirmed = text(&render_send_result(5, "%1", true, Some(true), None));
+        assert!(unconfirmed.contains("application submission unconfirmed"));
+        assert!(!unconfirmed.contains("submission confirmed"));
         // Daemon says text landed but Enter did NOT — surfaced to the caller.
-        let not_submitted = text(&render_send_result(5, "%1", true, Some(false)));
+        let not_submitted = text(&render_send_result(5, "%1", true, Some(false), None));
         assert!(not_submitted.contains("NOT submitted"), "{not_submitted}");
     }
 

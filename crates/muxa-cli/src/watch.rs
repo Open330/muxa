@@ -132,13 +132,6 @@ pub fn parse_collab_layout(value: &str) -> Option<CollabLayout> {
 /// hitting `K`/`R`/`c`, short enough not to mask the next interaction.
 const FOOTER_HINT_TTL: Duration = Duration::from_secs(2);
 
-/// Delay between injecting prompt text into a tmux pane and sending the
-/// submit key. Codex's TUI coalesces very fast input bursts as pasted
-/// content; without a small gap, the trailing Enter can be swallowed into
-/// that burst and the prompt stays composed until the user presses Enter
-/// again manually.
-const PROMPT_SUBMIT_GRACE: Duration = muxa::backend::PROMPT_SUBMIT_GRACE;
-
 /// Channel capacity for the wake signal sent from the input loop to the
 /// background refresh task. Capacity 1 is intentional: when the user mashes
 /// `r`, we want extra requests to coalesce into a single pending wake rather
@@ -1546,26 +1539,20 @@ impl Effects for RealEffects {
     }
 
     fn send_prompt(&mut self, pane_id: &str, text: &str) -> std::result::Result<(), String> {
-        send_prompt_to_tmux(
-            pane_id,
-            text,
-            PROMPT_SUBMIT_GRACE,
-            |args| run_status("tmux", args),
-            std::thread::sleep,
-        )
+        send_prompt_to_backend(&muxa::TmuxBackend::new(), None, pane_id, text)
     }
 
     fn send_prompt_to(&mut self, pane: &PaneKey, text: &str) -> std::result::Result<(), String> {
         let endpoint = &pane.window.session.endpoint;
-        if !crate::mux_control::supported(endpoint.host) {
-            return Err(format!("{} pane prompt is not supported", endpoint.host));
-        }
-        send_prompt_to_tmux(
-            pane.pane_id.strip_prefix("rmux:").unwrap_or(&pane.pane_id),
+        let backend = muxa::active_backends()
+            .into_iter()
+            .find(|b| b.kind() == endpoint.host)
+            .ok_or_else(|| format!("{} backend is not active", endpoint.host))?;
+        send_prompt_to_backend(
+            backend.as_ref(),
+            Some(&endpoint.socket),
+            &pane.pane_id,
             text,
-            PROMPT_SUBMIT_GRACE,
-            |args| crate::mux_control::run(endpoint, args),
-            std::thread::sleep,
         )
     }
 
@@ -1714,22 +1701,20 @@ impl Effects for RealEffects {
     }
 }
 
-fn send_prompt_to_tmux<R, S>(
-    pane_id: &str,
+fn send_prompt_to_backend(
+    backend: &dyn muxa::PaneBackend,
+    socket: Option<&str>,
+    pane: &str,
     text: &str,
-    submit_delay: Duration,
-    mut run_tmux: R,
-    mut sleep: S,
-) -> std::result::Result<(), String>
-where
-    R: FnMut(&[&str]) -> std::result::Result<(), String>,
-    S: FnMut(Duration),
-{
-    run_tmux(&["send-keys", "-t", pane_id, "-l", "--", text])?;
-    if !submit_delay.is_zero() {
-        sleep(submit_delay);
+) -> std::result::Result<(), String> {
+    if !backend.send_prompt_text_on(socket, pane, text) {
+        return Err("prompt input failed".into());
     }
-    run_tmux(&["send-keys", "-t", pane_id, "Enter"])
+    std::thread::sleep(muxa::backend::prompt_submit_grace(pane));
+    if !backend.send_text_on(socket, pane, "\r") {
+        return Err("prompt text was sent but Enter failed; do not resend text".into());
+    }
+    Ok(())
 }
 
 /// Result of attempting to spawn-and-pipe to a clipboard helper.
@@ -28327,57 +28312,6 @@ sort = ["state"]
             }
             other => panic!("expected Err, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn tmux_prompt_send_waits_before_submit_key() {
-        let mut calls: Vec<Vec<String>> = Vec::new();
-        let mut sleeps = Vec::new();
-
-        let result = send_prompt_to_tmux(
-            "%42",
-            "hello",
-            Duration::from_millis(120),
-            |args| {
-                calls.push(args.iter().map(|arg| (*arg).to_string()).collect());
-                Ok(())
-            },
-            |delay| sleeps.push(delay),
-        );
-
-        assert!(result.is_ok());
-        assert_eq!(
-            calls,
-            vec![
-                vec!["send-keys", "-t", "%42", "-l", "--", "hello"],
-                vec!["send-keys", "-t", "%42", "Enter"],
-            ]
-        );
-        assert_eq!(sleeps, vec![Duration::from_millis(120)]);
-    }
-
-    #[test]
-    fn tmux_prompt_send_skips_submit_when_literal_input_fails() {
-        let mut calls: Vec<Vec<String>> = Vec::new();
-        let mut sleeps = Vec::new();
-
-        let result = send_prompt_to_tmux(
-            "%42",
-            "hello",
-            Duration::from_millis(120),
-            |args| {
-                calls.push(args.iter().map(|arg| (*arg).to_string()).collect());
-                Err("tmux exited with 1".into())
-            },
-            |delay| sleeps.push(delay),
-        );
-
-        assert_eq!(result.unwrap_err(), "tmux exited with 1");
-        assert_eq!(
-            calls,
-            vec![vec!["send-keys", "-t", "%42", "-l", "--", "hello"]]
-        );
-        assert!(sleeps.is_empty());
     }
 
     #[test]

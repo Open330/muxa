@@ -866,11 +866,17 @@ pub struct Response {
     /// Whether a `send_prompt`'s submit CR landed. Present only on a
     /// `send_prompt` response. `false` with `sent:true` and a requested
     /// `submit:true` is a PARTIAL success: the text is in the pane but the
-    /// Enter didn't commit — retry the submit alone (e.g. `send_prompt` with
-    /// empty text + submit), never the whole prompt. `false` is also the
+    /// host rejected Enter. Inspect the current input before an Enter-only
+    /// retry; never resend the whole prompt. `true` is transport acceptance,
+    /// not an application acknowledgement (see `submission_confirmed`). `false` is also the
     /// normal value when `submit:false` was requested (nothing to submit).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submitted: Option<bool>,
+    /// Application-level `PromptSubmitted` evidence, separate from transport
+    /// acceptance. None means unobserved (including hosts without hooks),
+    /// never a reason to resend the body or blindly retry Enter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submission_confirmed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room: Option<RoomContext>,
     /// Handle issued by the room's namespace arbiter. Absent when the room
@@ -970,6 +976,7 @@ impl Response {
             capture: None,
             sent: None,
             submitted: None,
+            submission_confirmed: None,
             room: None,
             handle: None,
             collaboration_requests: None,
@@ -3666,14 +3673,20 @@ async fn handle(
                                     // socket call, so run it off the async worker.
                                     // Text and submit CR are TWO non-atomic
                                     // injections; report the outcomes separately.
+                                    let observer = crate::prompt_delivery::SubmissionObserver::new(
+                                        &store,
+                                        &agents,
+                                        socket.as_deref(),
+                                        &text,
+                                    );
                                     let (sent, submitted) =
                                         tokio::task::spawn_blocking(move || {
                                             let s = socket.as_deref();
-                                            let sent = target.send_text_on(s, &pane, &text);
+                                            let sent = target.send_prompt_text_on(s, &pane, &text);
                                             let submitted = if sent && submit {
                                                 if !text.is_empty() {
                                                     std::thread::sleep(
-                                                        crate::backend::PROMPT_SUBMIT_GRACE,
+                                                        crate::backend::prompt_submit_grace(&pane),
                                                     );
                                                 }
                                                 target.send_text_on(s, &pane, "\r")
@@ -3686,7 +3699,13 @@ async fn handle(
                                         .unwrap_or((false, false));
                                     if sent {
                                         tracing::debug!(submit, submitted, "send_prompt");
-                                        Response::with_send_result(sent, submitted)
+                                        let mut response =
+                                            Response::with_send_result(sent, submitted);
+                                        if submitted {
+                                            response.submission_confirmed =
+                                                observer.confirm().await;
+                                        }
+                                        response
                                     } else {
                                         // Nothing landed — safe for the caller to
                                         // retry the whole send.
@@ -4868,8 +4887,10 @@ pub struct SendPromptOutcome {
     /// The text injection landed. Always `true` here (a failed text send is an
     /// `Err`); carried explicitly for symmetry and forward-compatibility.
     pub sent: bool,
-    /// The submit carriage return landed and committed the line.
+    /// The host accepted the submit carriage return. This alone does not
+    /// establish that the application committed the prompt.
     pub submitted: bool,
+    pub submission_confirmed: Option<bool>,
 }
 
 /// Long-lived handle returned by [`Client::subscribe`]. Calls to
@@ -5597,6 +5618,7 @@ impl Client {
             sent: resp["sent"].as_bool().unwrap_or(true),
             // Absent field (older daemon) → fall back to the requested intent.
             submitted: resp["submitted"].as_bool().unwrap_or(submit),
+            submission_confirmed: resp["submission_confirmed"].as_bool(),
         })
     }
 
@@ -10075,6 +10097,67 @@ mod tests {
             ],
         );
 
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_prompt_confirms_hook_without_repeating_body_or_enter() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send-confirm.sock");
+        let store = Store::shared();
+        let id = AgentId {
+            kind: AgentKind::Codex,
+            session_id: "original".into(),
+            surface: None,
+            pane: Some("%1".into()),
+            tmux_socket: None,
+            cwd: None,
+        };
+        store
+            .apply(&AgentEvent::Started {
+                id: id.clone(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let (backend, sends) = RecordingBackend::new(HostKind::Tmux, true);
+        let (tx, handle) = serve(&sock, store.clone(), vec![backend]).await;
+        let observed = sends.clone();
+        let hook = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if observed
+                        .lock()
+                        .unwrap()
+                        .last()
+                        .is_some_and(|(_, t)| t == "\r")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            store
+                .apply(&AgentEvent::PromptSubmitted {
+                    id,
+                    prompt: "continue".into(),
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+        });
+        let outcome = Client::new(sock)
+            .send_prompt("%1", "continue", true)
+            .await
+            .unwrap();
+        assert!(outcome.sent && outcome.submitted);
+        assert_eq!(outcome.submission_confirmed, Some(true));
+        hook.await.unwrap();
+        assert_eq!(
+            *sends.lock().unwrap(),
+            vec![("%1".into(), "continue".into()), ("%1".into(), "\r".into()),]
+        );
         tx.send(()).unwrap();
         handle.await.unwrap();
     }
