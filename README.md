@@ -301,7 +301,7 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa report --since week` | All breakdowns (day/project/agent/session) as focused ACT/WACT tables; add `--json` or `--markdown` to export. |
 | `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`, or use `--view heatmap`. |
 | `muxa activity --type agent\|tmux\|human` | Raw activity ledger intervals. |
-| `muxa sync` | Backfill the registry by scanning active pane hosts. |
+| `muxa registry sync` / `prune` / `panes` | Backfill the registry from active pane hosts, drop orphan rows, or list pane hosts. |
 | `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
 | `muxa agent start --agent codex [--host auto\|native\|tmux]` | Start an allowlisted agent. `auto` uses tmux inside tmux and a muxa-owned PTY in a plain terminal. |

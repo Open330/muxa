@@ -289,7 +289,7 @@ async fn maybe_hint_orphans(client: &Client) {
         })
         .count();
     if orphans > 0 {
-        println!("\n{orphans} stale orphan agent row(s) with no pane — run `muxa prune` to clear (tmux sessions unaffected).");
+        println!("\n{orphans} stale orphan agent row(s) with no pane — run `muxa registry prune` to clear (tmux sessions unaffected).");
     }
 }
 

@@ -249,7 +249,7 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 | `muxa report --since week` | day/project/agent/session 모든 breakdown을 ACT/WACT 중심 테이블로 표시 (`--json` / `--markdown`로 export). |
 | `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링하고 `--sort waiting` 정렬이나 `--view heatmap`을 사용할 수 있음. |
 | `muxa activity --type agent\|tmux\|human` | raw activity ledger interval 조회. |
-| `muxa sync` | tmux pane scan으로 registry backfill. |
+| `muxa registry sync` / `prune` / `panes` | pane scan으로 registry backfill, orphan row 정리, pane host 목록. |
 | `muxa agent start --agent codex [--host auto\|native\|tmux]` | allowlist agent 실행. `auto`는 실제 tmux 셸에서는 tmux를, 일반 터미널에서는 muxa-owned PTY를 사용. |
 | `muxa work start muxa-onboarding --workspace muxa --agent codex ...` | workspace session과 work window를 만들거나 재사용하고 agent pane을 추가. |
 | `muxa workspace list/show/close` | workspace/project session을 조회하거나 명시적으로 종료. |
