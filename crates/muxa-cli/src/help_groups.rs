@@ -18,9 +18,8 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     ("Work & layout", &["work", "workspace", "window", "agent"]),
     ("Analytics", &["stats", "report", "timeline", "activity"]),
     ("Save & restore", &["snapshot", "restore", "reload"]),
-    ("PTY sessions", &["run", "attach", "detach", "register"]),
     ("Fleet", &["fleet", "host"]),
-    ("Automation", &["automation"]),
+    ("Run & automate", &["proc", "automation"]),
     (
         "Setup",
         &[
@@ -139,7 +138,9 @@ mod tests {
     }
 
     /// Former top-level names that now live under a parent command.
-    const MOVED: &[&str] = &["logs", "sync", "prune", "panes"];
+    const MOVED: &[&str] = &[
+        "logs", "sync", "prune", "panes", "run", "attach", "detach", "register",
+    ];
 
     fn parse(argv: &[&str]) -> crate::Cmd {
         crate::Args::try_parse_from(argv)
@@ -193,11 +194,63 @@ mod tests {
             }
         ));
         assert!(matches!(parse(&["muxa", "panes"]), crate::Cmd::Panes));
+
+        let run = ["--name", "job", "--detach", "--", "sleep", "-x"];
+        let old_argv: Vec<&str> = ["muxa", "run"].iter().chain(&run).copied().collect();
+        let new_argv: Vec<&str> = ["muxa", "proc", "run"]
+            .iter()
+            .chain(&run)
+            .copied()
+            .collect();
+        let crate::Cmd::Run(old) = parse(&old_argv) else {
+            panic!("`muxa run` must still parse");
+        };
+        let crate::Cmd::Proc {
+            action: crate::ProcCmd::Run(new),
+        } = parse(&new_argv)
+        else {
+            panic!("`muxa proc run` must parse");
+        };
+        assert_eq!(format!("{old:?}"), format!("{new:?}"));
+        assert_eq!(new.command, ["sleep", "-x"]);
+
+        let register = ["--name", "loop", "--pid", "42", "--pane", "%3"];
+        let old_argv: Vec<&str> = ["muxa", "register"]
+            .iter()
+            .chain(&register)
+            .copied()
+            .collect();
+        let new_argv: Vec<&str> = ["muxa", "proc", "register"]
+            .iter()
+            .chain(&register)
+            .copied()
+            .collect();
+        let crate::Cmd::Register(old) = parse(&old_argv) else {
+            panic!("`muxa register` must still parse");
+        };
+        let crate::Cmd::Proc {
+            action: crate::ProcCmd::Register(new),
+        } = parse(&new_argv)
+        else {
+            panic!("`muxa proc register` must parse");
+        };
+        assert_eq!(format!("{old:?}"), format!("{new:?}"));
+
         assert!(matches!(
-            parse(&["muxa", "registry", "panes"]),
-            crate::Cmd::Registry {
-                action: crate::RegistryCmd::Panes
-            }
+            parse(&["muxa", "attach", "s1"]),
+            crate::Cmd::Attach { session } if session == "s1"
+        ));
+        assert!(matches!(
+            parse(&["muxa", "proc", "attach", "s1"]),
+            crate::Cmd::Proc { action: crate::ProcCmd::Attach { session } } if session == "s1"
+        ));
+        assert!(matches!(
+            parse(&["muxa", "detach", "s1"]),
+            crate::Cmd::Detach { session } if session == "s1"
+        ));
+        assert!(matches!(
+            parse(&["muxa", "proc", "detach", "s1"]),
+            crate::Cmd::Proc { action: crate::ProcCmd::Detach { session } } if session == "s1"
         ));
     }
 

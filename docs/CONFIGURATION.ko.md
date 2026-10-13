@@ -445,7 +445,7 @@ paneless_stale_timeout_secs = 86400
 ```
 
 stale state가 오래 남는 것을 줄입니다. timeout 값 `0`은 해당 timeout 비활성화입니다.
-같은 루프가 pid-liveness 스윕도 돌려, 등록된 백그라운드 task(`muxa register` 참고)는
+같은 루프가 pid-liveness 스윕도 돌려, 등록된 백그라운드 task(`muxa proc register` 참고)는
 프로세스가 종료되면 `stopped`로 전환됩니다.
 
 Codex rollout 조회는 전체 `interval_secs` 보정 주기와 별개로 2초마다 실행됩니다.
