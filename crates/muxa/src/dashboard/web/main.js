@@ -1,3 +1,4 @@
+import { collaborationSummary, messagePreview, responseLatency, graphFitScale, initResizeHandle } from "./collaboration-view.mjs";
 import { baseSessionName, canonicalDashboardPanes, intervalPlacement } from "./session-model.mjs";
 import { openShareManager } from "./sharing-admin.mjs";
 import { openAccessManager } from "./operators-admin.mjs";
@@ -3396,7 +3397,8 @@ function initDynamicEventDelegation() {
     const request = store.collaboration.requests.find((candidate) => candidate.id === id);
     if (!request) return;
     store.ui.selectedCollaborationRequest = id;
-    renderCollaborationDetail(request);
+    renderCollaborationMessages();
+    document.querySelector(".collaboration-detail-pane").scrollTop = 0;
     dom.collaborationDetail.scrollIntoView({ block: "nearest", behavior: "smooth" });
   });
   dom.collaborationSequence?.addEventListener("keydown", (event) => {
@@ -3418,6 +3420,8 @@ function initDynamicEventDelegation() {
     if (!event.target.closest("[data-close-collaboration-detail]")) return;
     store.ui.selectedCollaborationRequest = "";
     dom.collaborationDetail.hidden = true;
+    document.getElementById("collaboration-detail-empty").hidden = false;
+    renderCollaborationMessages();
   });
 
   dom.sessionList.addEventListener("click", (event) => {
@@ -3847,6 +3851,9 @@ function renderCollaboration() {
     dom.collaborationGraph.innerHTML = `<div class="empty-block">${esc(data.unavailable)}</div>`;
     dom.collaborationSequence.innerHTML = `<div class="empty-block compact">collaboration history is unavailable</div>`;
     dom.collaborationDetail.hidden = true;
+    document.getElementById("collaboration-messages").innerHTML = `<div class="empty-block">${esc(data.unavailable)}</div>`;
+    document.getElementById("collaboration-summary").replaceChildren();
+    document.getElementById("collaboration-detail-empty").hidden = false;
     dom.collaborationPageMeta.textContent = "";
     dom.collaborationLoadMore.hidden = true;
     return;
@@ -3867,6 +3874,7 @@ function renderCollaboration() {
   renderCollaborationRooms(projection.rooms);
   renderCollaborationGraph(projection);
   renderCollaborationSequence();
+  renderCollaborationMessages();
 }
 
 // The rail scope narrows the loaded messages to those touching a pane in the
@@ -3994,9 +4002,7 @@ function renderCollaborationGraph(projection) {
   const { radiusX, radiusY } = graphRadii(projection.nodes.length);
   const width = Math.max(560, Math.ceil(radiusX * 2 + GRAPH_MARGIN_X * 2));
   const height = Math.max(320, Math.ceil(radiusY * 2 + GRAPH_MARGIN_Y * 2));
-  // Scale down to fit the pane, but not below ~60% or labels become unreadable;
-  // past that the pane scrolls (and starts centered, below).
-  const minWidth = Math.min(width, Math.round(width * .6));
+  const minWidth = 0;
   const positions = graphNodePositions(projection.nodes, width, height);
   const nodeById = new Map(projection.nodes.map((node) => [node.id, node]));
   const edges = projection.edges.map((edge, index) => {
@@ -4039,6 +4045,7 @@ function renderCollaborationGraph(projection) {
     <td>${esc(nodeById.get(edge.to)?.label || edge.to)}</td>
     <td>${edge.count}</td><td>${edge.replyCount}</td><td>${esc(dominantCount(edge.kinds))}</td><td>${esc(dominantCount(edge.statuses))}</td>
   </tr>`).join("");
+  const graphScroll = { left: dom.collaborationGraph.scrollLeft, top: dom.collaborationGraph.scrollTop };
   dom.collaborationGraph.innerHTML = `<svg class="collaboration-graph-svg" viewBox="0 0 ${width} ${height}" style="min-width:${minWidth}px" role="img" aria-label="Directional collaboration graph">
     <defs>
       <marker id="collab-request-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
@@ -4048,14 +4055,10 @@ function renderCollaborationGraph(projection) {
     <g class="collaboration-nodes">${nodes}</g>
   </svg>
   <div class="sr-only"><table><caption>Collaboration graph edge summary</caption><thead><tr><th>From</th><th>To</th><th>Requests</th><th>Replies</th><th>Kind</th><th>Status</th></tr></thead><tbody>${accessibleRows}</tbody></table></div>`;
-  // Center only when the layout size changes; live refreshes of the same
-  // graph must not throw away where the viewer has panned to.
-  const canvas = dom.collaborationGraph;
-  const size = `${width}x${height}`;
-  if (canvas.dataset.graphSize !== size) {
-    canvas.dataset.graphSize = size;
-    canvas.scrollLeft = (canvas.scrollWidth - canvas.clientWidth) / 2;
-    canvas.scrollTop = (canvas.scrollHeight - canvas.clientHeight) / 2;
+  updateCollaborationZoom();
+  if (collaborationZoom !== "fit") {
+    dom.collaborationGraph.scrollLeft = graphScroll.left;
+    dom.collaborationGraph.scrollTop = graphScroll.top;
   }
 }
 
@@ -4168,6 +4171,7 @@ function renderCollaborationDetail(request) {
   const links = (request.links || []).map((link) => typeof link === "string" ? { label: link, url: link } : link);
   const detailsIncluded = store.collaboration.details_included;
   dom.collaborationDetail.hidden = false;
+  document.getElementById("collaboration-detail-empty").hidden = true;
   dom.collaborationDetail.innerHTML = `
     <div class="collaboration-detail-head">
       <span class="collaboration-kind">${esc(request.kind || "request")}</span>
@@ -4178,10 +4182,14 @@ function renderCollaborationDetail(request) {
     <dl class="collaboration-detail-meta">
       <dt>id</dt><dd>${esc(request.id)}</dd>
       <dt>room</dt><dd>${esc(roomLabel(request))}</dd>
+      <dt>from</dt><dd>${esc(request.from?.console ? "operator console" : `${request.from?.agent_kind || "agent"} · ${request.from?.pane || "—"}`)}</dd>
+      <dt>to</dt><dd>${esc(request.to?.console ? "operator console" : `${request.to?.agent_kind || "agent"} · ${request.to?.pane || "—"}`)}</dd>
       ${work ? `<dt>work</dt><dd>${esc(work)}</dd>` : ""}
       ${thread ? `<dt>thread</dt><dd>${esc(thread)}</dd>` : ""}
       ${parent ? `<dt>parent</dt><dd>${esc(parent)}</dd>` : ""}
       <dt>sent</dt><dd>${esc(request.created_at ? new Date(request.created_at).toLocaleString() : "—")}</dd>
+      <dt>response time</dt><dd>${responseLatency(request) === null ? "—" : formatDuration(responseLatency(request) / 1000)}</dd>
+      <dt>updates</dt><dd>${request.updates?.length || 0}</dd>
     </dl>
     ${detailsIncluded ? `<div class="collaboration-message-body"><span>request</span><pre>${esc(request.body || "")}</pre></div>` : `<div class="collaboration-detail-redacted">${store.access.mode === "read_only" ? "Message details are unavailable on this read-only dashboard." : "Sign in as an operator or unlock access to read the request, reply, and artifacts."}
       ${store.access.writeAvailable && !store.access.writeAuthorized ? '<button class="control-btn" type="button" data-unlock-collaboration>unlock details with PAT</button>' : ""}
@@ -4206,6 +4214,143 @@ function chooseCollaborationRoom(room) {
   dom.collaborationRoom.value = store.filters.collaborationRoom;
   renderCollaboration();
   fetchCollaboration().catch(() => {});
+}
+
+
+let collaborationSearch = "";
+let collaborationZoom = "fit";
+
+function collaborationVisibleMessages() {
+  return collaborationSequence(scopedCollaborationRequests(), {
+    edgeKey: store.ui.selectedCollaborationEdge,
+    room: store.ui.selectedCollaborationRoom,
+  }).filter(request => {
+    if (!collaborationSearch) return true;
+    const metadata = [request.id, request.kind, request.status, participantLabel(request.from), participantLabel(request.to),
+      request.from?.pane, request.to?.pane, roomLabel(request), requestThreadId(request), requestWorkId(request)];
+    if (store.collaboration.details_included) metadata.push(request.body, request.reply?.body, ...(request.updates || []).map(update => update.body));
+    return metadata.join(" ").toLowerCase().includes(collaborationSearch);
+  }).reverse();
+}
+
+function renderCollaborationMessages() {
+  const messages = collaborationVisibleMessages();
+  const summary = collaborationSummary(messages);
+  document.getElementById("collaboration-summary").innerHTML = [
+    ["messages", summary.total], ["replies", summary.replies], ["waiting", summary.pending], ["attention", summary.attention],
+    ["median response", summary.medianLatency === null ? "—" : formatDuration(summary.medianLatency / 1000)],
+  ].map(([label, value]) => `<div><strong>${esc(value)}</strong><span>${label}</span></div>`).join("")
+    + `<small>${store.collaboration.pagination.has_more ? "loaded messages · partial history" : "loaded messages"}${collaborationSearch ? " · search filtered" : ""}</small>`;
+  const list = document.getElementById("collaboration-messages");
+  const scroll = list.scrollTop;
+  const focusedId = document.activeElement?.closest?.("[data-collaboration-message]")?.dataset.collaborationMessage;
+  list.innerHTML = messages.map(request => {
+    const selected = request.id === store.ui.selectedCollaborationRequest;
+    const duration = responseLatency(request);
+    return `<button class="collaboration-message-row${selected ? " selected" : ""}" type="button" data-collaboration-message="${esc(request.id)}" aria-pressed="${selected}">
+      <div class="message-row-heading"><b>${esc(participantLabel(request.from))} → ${esc(participantLabel(request.to))}</b><span class="collaboration-status ${collaborationStatusClass(request.status)}">${esc(request.status)}</span></div>
+      <div class="message-row-context"><span>${esc(request.kind)} · ${esc(roomLabel(request))}</span><time>${esc(request.created_at ? dateTimeLabel(new Date(request.created_at)) : "—")}</time></div>
+      <div class="message-row-context"><span>${esc(request.from?.console ? "console" : request.from?.pane || "—")} → ${esc(request.to?.console ? "console" : request.to?.pane || "—")}</span>${store.collaboration.details_included && (request.artifacts?.length || request.reply?.artifacts?.length) ? `<span>${(request.artifacts?.length || 0) + (request.reply?.artifacts?.length || 0)} artifacts</span>` : ""}</div>
+      <p>${esc(messagePreview(request, store.collaboration.details_included))}</p>
+      <div class="message-row-footer"><code>${esc(request.id)}</code><span>${request.reply ? "replied" : "no reply"}${duration !== null ? ` · ${formatDuration(duration / 1000)}` : ""}${request.updates?.length ? ` · ${request.updates.length} updates` : ""}</span></div>
+    </button>`;
+  }).join("") || '<div class="empty-block">No loaded messages match. Change the filters or load older messages.</div>';
+  list.scrollTop = scroll;
+  if (focusedId) [...list.querySelectorAll("[data-collaboration-message]")].find(row => row.dataset.collaborationMessage === focusedId)?.focus({ preventScroll: true });
+  const selected = messages.find(request => request.id === store.ui.selectedCollaborationRequest);
+  if (selected) renderCollaborationDetail(selected);
+  else dom.collaborationDetail.hidden = true;
+  document.getElementById("collaboration-detail-empty").hidden = Boolean(selected);
+}
+
+function setCollaborationExpanded(expanded) {
+  dom.topologyPanel.classList.toggle("collaboration-expanded", expanded);
+  document.body.classList.toggle("has-collaboration-expanded", expanded);
+  const button = document.getElementById("collaboration-fullscreen");
+  button.textContent = expanded ? "restore" : "expand";
+  button.setAttribute("aria-pressed", String(expanded));
+}
+
+function updateCollaborationZoom() {
+  const svg = dom.collaborationGraph.querySelector("svg");
+  if (!svg || document.getElementById("collaboration-graph-pane").hidden) return;
+  const { width, height } = svg.viewBox.baseVal;
+  const scale = collaborationZoom === "fit"
+    ? graphFitScale(width, height, dom.collaborationGraph.clientWidth, dom.collaborationGraph.clientHeight) : collaborationZoom;
+  const changed = svg.dataset.scale !== String(scale);
+  svg.style.width = `${width * scale}px`;
+  svg.style.height = `${height * scale}px`;
+  svg.dataset.scale = String(scale);
+  document.getElementById("collaboration-zoom-label").textContent = `${Math.round(scale * 100)}%`;
+  if (changed && collaborationZoom === "fit") {
+    dom.collaborationGraph.scrollLeft = 0;
+    dom.collaborationGraph.scrollTop = 0;
+  }
+}
+
+function initCollaborationLayout() {
+  const panel = dom.topologyPanel;
+  const reader = document.getElementById("collaboration-reader");
+  for (const [id, variable, key, fallback, min, max, axis, percent] of [
+    ["collaboration-nav-resize", "--session-nav-width", "navWidth", 240, 160, 440, "x", false],
+    ["collaboration-reader-resize", "--collaboration-list-width", "listWidth", 52, 25, 75, "x", true],
+    ["collaboration-height-resize", "--collaboration-height", "height", Math.round(window.innerHeight * .7), 420, 1600, "y", false],
+  ]) {
+    let value = Number(loadValue(`muxa.collaboration.${key}`, fallback));
+    initResizeHandle(document.getElementById(id), {
+      read: () => value, min, max, axis, step: percent ? 2 : 20,
+      deltaToValue: delta => percent ? delta / Math.max(1, reader.clientWidth) * 100 : delta,
+      write: next => { value = next; panel.style.setProperty(variable, `${next}${percent ? "%" : "px"}`); saveValue(`muxa.collaboration.${key}`, next); },
+    });
+  }
+  const tabs = [...document.querySelectorAll("[data-collaboration-view]")];
+  const selectView = view => {
+    for (const tab of tabs) {
+      const selected = tab.dataset.collaborationView === view;
+      tab.setAttribute("aria-selected", String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+    }
+    document.getElementById("collaboration-messages").hidden = view !== "messages";
+    document.getElementById("collaboration-graph-pane").hidden = view !== "graph";
+    document.getElementById("collaboration-sequence-pane").hidden = view !== "sequence";
+    saveValue("muxa.collaboration.view", view);
+    requestAnimationFrame(updateCollaborationZoom);
+  };
+  for (const tab of tabs) {
+    tab.addEventListener("click", () => selectView(tab.dataset.collaborationView));
+    tab.addEventListener("keydown", event => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === "Home" ? tabs[0] : event.key === "End" ? tabs.at(-1)
+        : tabs[(tabs.indexOf(tab) + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length];
+      next.click(); next.focus();
+    });
+  }
+  const saved = loadValue("muxa.collaboration.view", "messages");
+  selectView(["messages", "graph", "sequence"].includes(saved) ? saved : "messages");
+  document.getElementById("collaboration-search").addEventListener("input", event => {
+    collaborationSearch = event.target.value.trim().toLowerCase();
+    renderCollaborationMessages();
+  });
+  document.getElementById("collaboration-messages").addEventListener("click", event => {
+    const row = event.target.closest("[data-collaboration-message]");
+    if (!row) return;
+    store.ui.selectedCollaborationRequest = row.dataset.collaborationMessage;
+    document.querySelector(".collaboration-detail-pane").scrollTop = 0;
+    renderCollaborationMessages();
+  });
+  document.getElementById("collaboration-fullscreen").addEventListener("click", () => setCollaborationExpanded(!panel.classList.contains("collaboration-expanded")));
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape" && !event.defaultPrevented && panel.classList.contains("collaboration-expanded")) setCollaborationExpanded(false);
+  });
+  for (const [id, factor] of [["collaboration-zoom-in", 1.25], ["collaboration-zoom-out", .8]]) {
+    document.getElementById(id).addEventListener("click", () => {
+      const current = Number(dom.collaborationGraph.querySelector("svg")?.dataset.scale) || 1;
+      collaborationZoom = Math.max(.1, Math.min(3, current * factor)); updateCollaborationZoom();
+    });
+  }
+  document.getElementById("collaboration-zoom-fit").addEventListener("click", () => { collaborationZoom = "fit"; updateCollaborationZoom(); });
+  new ResizeObserver(updateCollaborationZoom).observe(dom.collaborationGraph);
 }
 
 // ── Data loading ──────────────────────────────────────────────────
@@ -4249,6 +4394,9 @@ function initSessionViews() {
     const collaboration = view === "collaboration";
     dom.topologyDetail.hidden = collaboration;
     document.getElementById("collaboration-panel").hidden = !collaboration;
+    dom.topologyPanel.classList.toggle("collaboration-active", collaboration);
+    document.getElementById("collaboration-height-resize").hidden = !collaboration;
+    if (!collaboration) setCollaborationExpanded(false);
     for (const tab of tabs) {
       const selected = tab.dataset.sessionView === view;
       tab.setAttribute("aria-selected", String(selected));
@@ -4571,6 +4719,7 @@ async function main() {
   initPaneDrawer();
   initTopology();
   initSessionViews();
+  initCollaborationLayout();
   initAgentsJump();
   renderStaticChips();
   setConnectionStatus("connecting", "loading…");
