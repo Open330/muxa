@@ -923,18 +923,20 @@ fn check_tmux_blocks() -> CheckResult {
 /// the path the same way the IPC client does — a plain connect — so a
 /// stale pin downgrades to a warning instead of a misleading ✔.
 fn check_muxa_socket_env(daemon_socket: &Path, env: &TmuxEnvironment) -> CheckResult {
-    let out = muxa::tmux::tmux_command()
-        .args(["show-environment", "-g", "MUXA_SOCKET"])
-        .output();
-    let value = match out {
-        Ok(o) if o.status.success() => {
-            match parse_muxa_socket_env(&String::from_utf8_lossy(&o.stdout)) {
-                Some(value) => value,
-                None => return muxa_socket_unset(daemon_socket, env),
-            }
-        }
-        Ok(_) => return muxa_socket_unset(daemon_socket, env),
-        Err(e) => return CheckResult::Warn(format!("tmux: could not query environment ({e})")),
+    // Ask the server this shell is in. Native tmux pointed at an rmux
+    // socket (`$TMUX` inside rmux) cannot read it and reported the pin as
+    // unset even when it was set.
+    let value = match crate::mux_control::Control::Ambient.output(&[
+        "show-environment",
+        "-g",
+        "MUXA_SOCKET",
+    ]) {
+        Ok(stdout) => match parse_muxa_socket_env(&stdout) {
+            Some(value) => value,
+            None => return muxa_socket_unset(daemon_socket, env),
+        },
+        // A variable that was never set is a non-zero exit, as before.
+        Err(_) => return muxa_socket_unset(daemon_socket, env),
     };
 
     if socket_is_reachable(Path::new(&value)) {
