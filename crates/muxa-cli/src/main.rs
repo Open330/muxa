@@ -177,7 +177,9 @@ enum Cmd {
     /// Read and replace the daemon's config.toml, the same way Muxa.app's
     /// Advanced settings does.
     Config(config_cmd::Args),
-    /// Manage local/SSH host inventory and Kubernetes-style metadata.
+    /// Former name of `muxa fleet host`. Muxa.app still invokes it, and an
+    /// app may run against an older or newer CLI, so keep this alias.
+    #[command(hide = true)]
     Host(fleet_cli::HostArgs),
     /// Observe and control this node plus SSH-connected Muxa hosts.
     Fleet(fleet_cli::FleetArgs),

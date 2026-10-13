@@ -51,10 +51,10 @@ controller node는 별도 설정 없이 바로 사용할 수 있습니다.
 
 ```bash
 muxa fleet status
-muxa host show local
-muxa host doctor local
-muxa host label local environment=development
-muxa host annotate local muxa.dev/owner=platform
+muxa fleet host show local
+muxa fleet host doctor local
+muxa fleet host label local environment=development
+muxa fleet host annotate local muxa.dev/owner=platform
 ```
 
 `local`도 remote node와 같은 stable NodeId와 topology를 가지지만 SSH를 사용하지 않고
@@ -66,15 +66,15 @@ metadata는 `[fleet.local]`에 저장됩니다. `muxa.io/local`, `muxa.io/transp
 CLI를 사용하면 TOML을 검증하고 atomic하게 변경합니다.
 
 ```bash
-muxa host add dev muxa-devbox \
+muxa fleet host add dev muxa-devbox \
   --label environment=development \
   --label region=icn \
   --annotation muxa.dev/owner=platform \
   --mode observe
 
-muxa host doctor dev
-muxa host list
-muxa host show dev
+muxa fleet host doctor dev
+muxa fleet host list
+muxa fleet host show dev
 ```
 
 첫 remote host 명령은 outbound SSH Fleet 연결을 활성화합니다. `[fleet] enabled = false`여도
@@ -85,17 +85,17 @@ config 변경은 보존하고 수동 restart 안내를 출력합니다.
 label은 Kubernetes key/value 규칙을 따르는 selection metadata입니다.
 
 ```bash
-muxa host label dev tier=worker accelerator=gpu
-muxa host label dev tier=worker --overwrite
-muxa host label dev accelerator-              # 제거
-muxa host tag dev region=icn                   # label의 visible alias
+muxa fleet host label dev tier=worker accelerator=gpu
+muxa fleet host label dev tier=worker --overwrite
+muxa fleet host label dev accelerator-              # 제거
+muxa fleet host tag dev region=icn                   # label의 visible alias
 ```
 
 annotation key도 namespaced key 규칙을 따르지만 value에는 설명이나 URL을 넣을 수
 있습니다.
 
 ```bash
-muxa host annotate dev muxa.dev/runbook=https://example.invalid/dev
+muxa fleet host annotate dev muxa.dev/runbook=https://example.invalid/dev
 ```
 
 controller alias는 사람이 읽는 config identity입니다. relay는 별도로
@@ -123,7 +123,7 @@ local node는 항상 connected/control이며, 아래 설정은 remote inventory�
 - `connect = "auto"`: bounded exponential backoff로 persistent relay를 유지합니다.
 - `connect = "on_demand"`: `muxa fleet connect` 전까지 연결하지 않습니다.
 
-`muxa host disable`은 metadata를 남기고 연결만 막으며, `muxa host enable`로 다시
+`muxa fleet host disable`은 metadata를 남기고 연결만 막으며, `muxa fleet host enable`로 다시
 활성화합니다.
 
 ## 사용
