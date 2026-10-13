@@ -187,7 +187,7 @@
 # compact_interval_secs = 3600      # rewrites the file every hour
 
 # Activity ledger: append-only duration events used by `muxa stats` and
-# `muxa report`. Records closed agent-state intervals plus closed tmux
+# `muxa stats report`. Records closed agent-state intervals plus closed tmux
 # foreground intervals, so duration survives pane/session removal.
 [activity]
 # enabled               = true
@@ -221,7 +221,7 @@
 # path          = "/home/$USER/.local/share/muxa/session-activity.json"
 # interval_secs = 5
 
-# `muxa stats` / `muxa report` ACTIVE (engaged time) estimate. Each human action
+# `muxa stats` / `muxa stats report` ACTIVE (engaged time) estimate. Each human action
 # (a prompt or a tmux keypress/scroll) is padded into a window; these tune it.
 [stats]
 # active_lookback_secs     = 60    # seconds credited before each action

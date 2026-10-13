@@ -16,7 +16,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     ),
     ("Collaborate", &["peers", "msg", "identity", "ask", "skill"]),
     ("Work & layout", &["work", "workspace", "window", "agent"]),
-    ("Analytics", &["stats", "report", "timeline", "activity"]),
+    ("Analytics", &["stats", "timeline"]),
     ("Save & restore", &["snapshot", "restore", "reload"]),
     ("Fleet", &["fleet", "host"]),
     ("Run & automate", &["proc", "automation"]),
@@ -139,7 +139,8 @@ mod tests {
 
     /// Former top-level names that now live under a parent command.
     const MOVED: &[&str] = &[
-        "logs", "sync", "prune", "panes", "run", "attach", "detach", "register",
+        "logs", "sync", "prune", "panes", "run", "attach", "detach", "register", "report",
+        "activity",
     ];
 
     fn parse(argv: &[&str]) -> crate::Cmd {
@@ -252,6 +253,87 @@ mod tests {
             parse(&["muxa", "proc", "detach", "s1"]),
             crate::Cmd::Proc { action: crate::ProcCmd::Detach { session } } if session == "s1"
         ));
+    }
+
+    #[test]
+    fn stats_views_keep_their_old_names() {
+        let report = ["--since", "week", "--limit", "3", "--markdown"];
+        let old_argv: Vec<&str> = ["muxa", "report"].iter().chain(&report).copied().collect();
+        let new_argv: Vec<&str> = ["muxa", "stats", "report"]
+            .iter()
+            .chain(&report)
+            .copied()
+            .collect();
+        let crate::Cmd::Report(old) = parse(&old_argv) else {
+            panic!("`muxa report` must still parse");
+        };
+        let crate::Cmd::Stats(new) = parse(&new_argv) else {
+            panic!("`muxa stats report` must parse");
+        };
+        let Some(crate::stats::StatsCmd::Report(view_args)) = new.action() else {
+            panic!("`muxa stats report` must select the report view");
+        };
+        assert_eq!(format!("{:?}", old.args), format!("{view_args:?}"));
+        assert_eq!((old.window.since.as_str(), new.since()), ("week", "week"));
+
+        let activity = ["--since", "today", "--type", "agent", "--limit", "5"];
+        let old_argv: Vec<&str> = ["muxa", "activity"]
+            .iter()
+            .chain(&activity)
+            .copied()
+            .collect();
+        let new_argv: Vec<&str> = ["muxa", "stats", "activity"]
+            .iter()
+            .chain(&activity)
+            .copied()
+            .collect();
+        let crate::Cmd::Activity(old) = parse(&old_argv) else {
+            panic!("`muxa activity` must still parse");
+        };
+        let crate::Cmd::Stats(new) = parse(&new_argv) else {
+            panic!("`muxa stats activity` must parse");
+        };
+        let Some(crate::stats::StatsCmd::Activity(view_args)) = new.action() else {
+            panic!("`muxa stats activity` must select the activity view");
+        };
+        assert_eq!(format!("{:?}", old.args), format!("{view_args:?}"));
+        assert_eq!((old.window.since.as_str(), new.since()), ("today", "today"));
+    }
+
+    /// Shared options read the same on either side of the view name; options
+    /// that only the summary understands are refused before a view instead
+    /// of being dropped silently.
+    #[test]
+    fn stats_options_are_order_independent_or_refused() {
+        let before = parse(&[
+            "muxa", "stats", "--since", "week", "--theme", "mono", "report",
+        ]);
+        let after = parse(&[
+            "muxa", "stats", "report", "--since", "week", "--theme", "mono",
+        ]);
+        let (crate::Cmd::Stats(before), crate::Cmd::Stats(after)) = (before, after) else {
+            panic!("both spellings select `muxa stats`");
+        };
+        assert_eq!(format!("{before:?}"), format!("{after:?}"));
+        assert_eq!(before.since(), "week");
+
+        let placement = |argv: &[&str]| {
+            let mut command = crate::Args::command();
+            let matches = command.clone().try_get_matches_from(argv).expect(argv[2]);
+            crate::stats::check_flag_placement(&mut command, &matches)
+        };
+        assert!(placement(&["muxa", "stats", "--graph"]).is_ok());
+        assert!(placement(&["muxa", "stats", "--since", "week", "report"]).is_ok());
+        assert!(placement(&["muxa", "stats", "report", "--limit", "3"]).is_ok());
+        for misplaced in [["--graph", ""], ["--limit", "3"]] {
+            let argv: Vec<&str> = ["muxa", "stats"]
+                .into_iter()
+                .chain(misplaced.into_iter().filter(|part| !part.is_empty()))
+                .chain(["report"])
+                .collect();
+            let error = placement(&argv).expect_err("summary flag before a view");
+            assert!(error.to_string().contains(misplaced[0]), "{error}");
+        }
     }
 
     #[test]

@@ -74,9 +74,9 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 | `muxa watch` | Main TUI for agents, prompts, live previews, hierarchy-aware mailbox history, and table/sequence collaboration. |
 | `muxa dashboard` | Work-first TUI console; `P` prompts and `A` aborts every live agent in the selected Work. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |
-| `muxa stats` / `muxa report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
+| `muxa stats` / `muxa stats report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
 | `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
-| `muxa activity` | Raw duration ledger query for debugging exactly what fed stats/report. |
+| `muxa stats activity` | Raw duration ledger query for debugging exactly what fed stats/report. |
 | `muxa automation` | Rules that act on agent state — the built-in one resumes a session after its usage cap resets. |
 | BarShelf widget (macOS) | Menu-bar popover summary of active, working, waiting, and error agents. |
 | Muxa for Mac | Native workbench for Work, Explore, Inbox, Ask, Shells, and Files, with a libghostty terminal and notifications; native PTYs remain owned by `muxad`. |
@@ -298,9 +298,9 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa host add/list/label/annotate/doctor` | Manage physical SSH nodes and Kubernetes-style labels/annotations. |
 | `muxa fleet status/watch/capture/send/attach` | Central host → session → window → pane(agent) observation and control. |
 | `muxa stats --since today` | Focused WACT/ACT/WORK/WAIT summary; group by day/project/agent/session. Add `--graph` for graph-only WACT over time or `--verbose` for diagnostic columns. |
-| `muxa report --since week` | All breakdowns (day/project/agent/session) as focused ACT/WACT tables; add `--json` or `--markdown` to export. |
+| `muxa stats report --since week` | All breakdowns (day/project/agent/session) as focused ACT/WACT tables; add `--json` or `--markdown` to export. |
 | `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`, or use `--view heatmap`. |
-| `muxa activity --type agent\|tmux\|human` | Raw activity ledger intervals. |
+| `muxa stats activity --type agent\|tmux\|human` | Raw activity ledger intervals. |
 | `muxa registry sync` / `prune` / `panes` | Backfill the registry from active pane hosts, drop orphan rows, or list pane hosts. |
 | `muxa proc register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa proc run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. `muxa proc attach/detach X` reconnects or leaves it. |
@@ -332,14 +332,14 @@ Common stats queries:
 ```bash
 muxa stats --since today --group-by session
 muxa stats --since yesterday --group-by project
-muxa report --since last-week
+muxa stats report --since last-week
 muxa timeline --since today --session main
 muxa timeline --since today --exclude-session 'monitor*'
 muxa stats --since month --exclude-pane '%42' --exclude-session 'monitor*'
 muxa timeline --since today --group-by kind --sort waiting
 muxa timeline --view heatmap --since 12w
 muxa timeline --day 2026-06-06
-muxa activity --since today --type human
+muxa stats activity --since today --type human
 ```
 
 `--since` accepts `today`, `yesterday`, `week` for a rolling 7-day window,
@@ -350,7 +350,7 @@ like `2026-06-06`, RFC3339 timestamps, and `all`. See
 [docs/ACTIVITY.md](docs/ACTIVITY.md) for ledger semantics, including
 `HUMAN`, `THINK`, and `ACT`.
 
-`muxa stats`, `muxa report`, and `muxa timeline` also accept
+`muxa stats`, `muxa stats report`, and `muxa timeline` also accept
 `--exclude-pane` and `--exclude-session` for long-lived monitoring scopes.
 Patterns are case-sensitive and support `*` and `?`, e.g.
 `--exclude-session 'monitor*'`.

@@ -6,16 +6,12 @@ use muxa::{ActivityEntry, Config, HumanInteractionKind};
 use serde::Serialize;
 use time::OffsetDateTime;
 
-use crate::theme::{self, CliTheme, TableTone, ThemeArg};
+use crate::theme::{self, CliTheme, TableTone};
 use crate::time_range::TimeRange;
 use crate::{terminal_width, truncate_cell, use_colors};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Time window to include: today, yesterday, week, month, last-week, last-month, 24h, 7d, RFC3339 timestamp, or all.
-    #[arg(long, default_value = "7d")]
-    since: String,
-
     /// Filter by ledger entry type.
     #[arg(long = "type", value_enum)]
     entry_type: Option<EntryType>,
@@ -27,16 +23,22 @@ pub struct Args {
     /// Maximum rows to print. Set 0 for all rows.
     #[arg(long, default_value_t = 50)]
     limit: usize,
-
-    /// One-shot visual theme override for table output.
-    #[arg(long, value_enum)]
-    theme: Option<ThemeArg>,
 }
 
-impl Args {
+/// `muxa activity`, the former name of `muxa stats activity`.
+#[derive(Debug, clap::Args)]
+pub struct ActivityInvocation {
+    #[command(flatten)]
+    pub window: crate::stats::Window,
+
+    #[command(flatten)]
+    pub args: Args,
+}
+
+impl ActivityInvocation {
     #[cfg(test)]
-    pub(crate) fn theme(&self) -> Option<ThemeArg> {
-        self.theme
+    pub(crate) fn theme(&self) -> Option<crate::theme::ThemeArg> {
+        self.window.theme
     }
 }
 
@@ -75,7 +77,7 @@ struct ActivityRow {
     detail: String,
 }
 
-pub async fn run(cfg: &Config, args: Args) -> Result<()> {
+pub async fn run(cfg: &Config, window: &crate::stats::Window, args: Args) -> Result<()> {
     if !cfg.activity.enabled {
         bail!("activity ledger is disabled by config");
     }
@@ -88,7 +90,7 @@ pub async fn run(cfg: &Config, args: Args) -> Result<()> {
         bail!("activity ledger path could not be resolved");
     };
 
-    let range = parse_since(&args.since, OffsetDateTime::now_utc())?;
+    let range = parse_since(&window.since, OffsetDateTime::now_utc())?;
     let mut entries = muxa::activity::load(&path)
         .await
         .with_context(|| format!("loading activity ledger {}", path.display()))?;
@@ -111,7 +113,9 @@ pub async fn run(cfg: &Config, args: Args) -> Result<()> {
     };
 
     match args.format {
-        OutputFormat::Table => render_table(&doc, theme::for_config(cfg, args.theme, use_colors())),
+        OutputFormat::Table => {
+            render_table(&doc, theme::for_config(cfg, window.theme, use_colors()));
+        }
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&doc)?),
     }
     Ok(())
@@ -178,7 +182,7 @@ fn row_for_entry(entry: &ActivityEntry) -> ActivityRow {
 }
 
 fn render_table(doc: &ActivityDocument, theme: CliTheme) {
-    println!("muxa activity");
+    println!("muxa stats activity");
     println!("Range: {}", doc.range);
     if let Some(since_at) = doc.since_at.as_deref() {
         println!("Since: {since_at}");

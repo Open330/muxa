@@ -21,14 +21,122 @@ use crate::{terminal_width, truncate_cell, use_colors};
 
 mod timeline;
 
+/// Options every `muxa stats` view shares. They are global, so they read the
+/// same before or after a subcommand: `stats --since week report` is
+/// `stats report --since week`.
+#[derive(Debug, clap::Args)]
+pub struct Window {
+    /// Time window to include: today, yesterday, week, month, last-week, last-month, 24h, 7d, RFC3339 timestamp, or all.
+    #[arg(long, default_value = "7d", global = true)]
+    pub since: String,
+
+    /// One-shot visual theme override for table output.
+    #[arg(long, value_enum, global = true)]
+    pub theme: Option<ThemeArg>,
+}
+
+/// `muxa stats`: the summary by default, or one of the other views of the
+/// same retained history.
+#[derive(Debug, clap::Args)]
+pub struct StatsCommand {
+    #[command(subcommand)]
+    action: Option<StatsCmd>,
+
+    #[command(flatten)]
+    window: Window,
+
+    #[command(flatten)]
+    summary: Args,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum StatsCmd {
+    /// Every breakdown (day, project, agent, session) as ACT/WACT tables,
+    /// or as JSON/Markdown for export.
+    Report(ReportArgs),
+    /// Query raw activity ledger intervals.
+    Activity(crate::activity_query::Args),
+}
+
+impl StatsCommand {
+    #[cfg(test)]
+    pub(crate) fn theme(&self) -> Option<ThemeArg> {
+        self.window.theme
+    }
+
+    #[cfg(test)]
+    pub(crate) fn action(&self) -> Option<&StatsCmd> {
+        self.action.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn since(&self) -> &str {
+        &self.window.since
+    }
+}
+
+/// `muxa report`, the former name of `muxa stats report`.
+#[derive(Debug, clap::Args)]
+pub struct ReportInvocation {
+    #[command(flatten)]
+    pub window: Window,
+
+    #[command(flatten)]
+    pub args: ReportArgs,
+}
+
+/// clap silently drops summary-only flags given before a subcommand
+/// (`stats --graph report`), so refuse them instead of ignoring them.
+pub(crate) fn check_flag_placement(
+    command: &mut clap::Command,
+    matches: &clap::ArgMatches,
+) -> Result<(), clap::Error> {
+    let Some(("stats", stats_matches)) = matches.subcommand() else {
+        return Ok(());
+    };
+    let Some((view, _)) = stats_matches.subcommand() else {
+        return Ok(());
+    };
+    let stats = command
+        .find_subcommand("stats")
+        .expect("`stats` is a subcommand");
+    let misplaced: Vec<String> = stats
+        .get_arguments()
+        .filter(|arg| !arg.is_global_set())
+        .filter(|arg| {
+            stats_matches.value_source(arg.get_id().as_str())
+                == Some(clap::parser::ValueSource::CommandLine)
+        })
+        .map(|arg| format!("--{}", arg.get_long().unwrap_or(arg.get_id().as_str())))
+        .collect();
+    if misplaced.is_empty() {
+        return Ok(());
+    }
+    Err(command.error(
+        clap::error::ErrorKind::ArgumentConflict,
+        format!(
+            "{} belongs to the `muxa stats` summary, not `muxa stats {view}`; \
+             put `{view}` options after `{view}`",
+            misplaced.join(", ")
+        ),
+    ))
+}
+
+/// Dispatch `muxa stats` to the summary or the chosen view.
+pub async fn run_command(client: &Client, cfg: &Config, command: StatsCommand) -> Result<()> {
+    match command.action {
+        None => run(client, cfg, &command.window, command.summary).await,
+        Some(StatsCmd::Report(args)) => run_report(client, cfg, &command.window, args).await,
+        Some(StatsCmd::Activity(args)) => {
+            crate::activity_query::run(cfg, &command.window, args).await
+        }
+    }
+}
+
 #[derive(Debug, clap::Args)]
 // CLI flags are independent toggles, not a state machine to fold into an enum.
 #[allow(clippy::struct_excessive_bools)]
 pub struct Args {
-    /// Time window to include: today, yesterday, week, month, last-week, last-month, 24h, 7d, RFC3339 timestamp, or all.
-    #[arg(long, default_value = "7d")]
-    since: String,
-
     /// Dimension used for the row breakdown.
     #[arg(long, value_enum, default_value_t = GroupBy::Day)]
     group_by: GroupBy,
@@ -96,10 +204,6 @@ pub struct Args {
     #[arg(long = "exclude-session", value_name = "GLOB", value_delimiter = ',')]
     exclude_session: Vec<String>,
 
-    /// One-shot visual theme override for table output.
-    #[arg(long, value_enum)]
-    theme: Option<ThemeArg>,
-
     /// Print diagnostic table columns plus the full explanatory notes
     /// (methodology for THINK/ACTIVE, the retained-history window, ledger
     /// fallbacks). Without this, the table focuses on ACT/WACT and only
@@ -108,19 +212,8 @@ pub struct Args {
     verbose: bool,
 }
 
-impl Args {
-    #[cfg(test)]
-    pub(crate) fn theme(&self) -> Option<ThemeArg> {
-        self.theme
-    }
-}
-
 #[derive(Debug, clap::Args)]
 pub struct ReportArgs {
-    /// Time window to include: today, yesterday, week, month, last-week, last-month, 24h, 7d, RFC3339 timestamp, or all.
-    #[arg(long, default_value = "7d")]
-    since: String,
-
     /// Maximum rows per report section. Set 0 for all rows.
     #[arg(long, default_value_t = 10)]
     limit: usize,
@@ -140,10 +233,6 @@ pub struct ReportArgs {
     /// Exclude tmux session names or ids matching a glob. Repeat or comma-separate values.
     #[arg(long = "exclude-session", value_name = "GLOB", value_delimiter = ',')]
     exclude_session: Vec<String>,
-
-    /// One-shot visual theme override for table output.
-    #[arg(long, value_enum)]
-    theme: Option<ThemeArg>,
 
     /// Print diagnostic table columns plus the full explanatory notes
     /// (methodology for THINK/ACTIVE, the retained-history window, ledger
@@ -227,9 +316,9 @@ impl GroupBy {
     }
 }
 
-pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
+async fn run(client: &Client, cfg: &Config, window: &Window, args: Args) -> Result<()> {
     let exclusions = ScopeExclusions::new(args.exclude_pane.clone(), args.exclude_session.clone());
-    let data = load_data(client, cfg, &args.since, &exclusions).await?;
+    let data = load_data(client, cfg, &window.since, &exclusions).await?;
     if args.timeline {
         let options = timeline::TimelineOptions {
             group_by: args.group_by,
@@ -238,7 +327,7 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
             cell_minutes: args.cell,
             limit: args.limit,
         };
-        let theme = theme::for_config(cfg, args.theme, use_colors());
+        let theme = theme::for_config(cfg, window.theme, use_colors());
         print!(
             "{}",
             timeline::render(&data, options, terminal_width(), theme)
@@ -251,7 +340,7 @@ pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
     match format {
         OutputFormat::Table => render_table(
             &doc,
-            theme::for_config(cfg, args.theme, use_colors()),
+            theme::for_config(cfg, window.theme, use_colors()),
             args.verbose,
         ),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&doc)?),
@@ -293,9 +382,14 @@ async fn maybe_hint_orphans(client: &Client) {
     }
 }
 
-pub async fn run_report(client: &Client, cfg: &Config, args: ReportArgs) -> Result<()> {
+pub async fn run_report(
+    client: &Client,
+    cfg: &Config,
+    window: &Window,
+    args: ReportArgs,
+) -> Result<()> {
     let exclusions = ScopeExclusions::new(args.exclude_pane.clone(), args.exclude_session.clone());
-    let data = load_data(client, cfg, &args.since, &exclusions).await?;
+    let data = load_data(client, cfg, &window.since, &exclusions).await?;
     let docs = [
         // Days read chronologically (the day-key string sorts by date), so a
         // report shows the shape of the week in order rather than ranked by
@@ -331,7 +425,7 @@ pub async fn run_report(client: &Client, cfg: &Config, args: ReportArgs) -> Resu
     match OutputFormat::resolve(OutputFormat::Table, args.json, args.markdown) {
         OutputFormat::Table => render_report_tables(
             &docs,
-            theme::for_config(cfg, args.theme, use_colors()),
+            theme::for_config(cfg, window.theme, use_colors()),
             args.verbose,
         ),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&docs)?),
@@ -2388,7 +2482,7 @@ fn render_table(doc: &StatsDocument, theme: CliTheme, verbose: bool) {
     print_notes(&doc.notes, verbose, "muxa stats --verbose");
 }
 
-/// Table output for `muxa report`: the same range header and per-section tables
+/// Table output for `muxa stats report`: the same range header and per-section tables
 /// as `stats`, one table per group-by dimension. Totals/notes are identical
 /// across the documents (they aggregate the same data), so the range header and
 /// notes are printed once, from the first document.
@@ -2396,7 +2490,7 @@ fn render_report_tables(docs: &[StatsDocument], theme: CliTheme, verbose: bool) 
     let Some(first) = docs.first() else {
         return;
     };
-    print_range_header("muxa report", first);
+    print_range_header("muxa stats report", first);
     println!();
 
     let terminal_width = terminal_width();
@@ -2418,7 +2512,7 @@ fn render_report_tables(docs: &[StatsDocument], theme: CliTheme, verbose: bool) 
         println!("{}", compaction_hint());
     }
 
-    print_notes(&first.notes, verbose, "muxa report --verbose");
+    print_notes(&first.notes, verbose, "muxa stats report --verbose");
 }
 
 fn print_range_header(title: &str, doc: &StatsDocument) {
@@ -3037,7 +3131,7 @@ fn render_markdown_report(docs: &[StatsDocument]) -> String {
     let Some(first) = docs.first() else {
         return out;
     };
-    push_markdown_overview(&mut out, "muxa report", first);
+    push_markdown_overview(&mut out, "muxa stats report", first);
     for doc in docs {
         push_markdown_rows(
             &mut out,

@@ -70,9 +70,9 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 | `muxa watch` | agent/pane 관측, prompt, live preview, hierarchy-aware mailbox와 table/sequence 협업을 제공하는 기본 TUI. |
 | `muxa dashboard` | Work 중심 TUI. `P`는 선택 Work의 모든 live agent에 prompt를 보내고 `A`는 모두 중단. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
-| `muxa stats` / `muxa report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
+| `muxa stats` / `muxa stats report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
 | `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
-| `muxa activity` | stats/report에 들어간 raw duration ledger 조회. |
+| `muxa stats activity` | stats/report에 들어간 raw duration ledger 조회. |
 | BarShelf widget (macOS) | active/working/waiting/error agent를 메뉴바 popover에서 요약. |
 | Muxa for Mac | Work·Explore·Inbox·Ask·Shells·Files를 제공하는 네이티브 작업 공간, libghostty 터미널과 알림. 네이티브 PTY는 `muxad`가 소유. |
 | Dashboard | 선택적 loopback HTTP UI. 실시간 업데이트·timeline·협업 graph와 [OIDC 로그인 기반 pane/window 공유](docs/DASHBOARD.md#invite-someone-to-a-pane)(조회/프롬프트 권한)를 지원. |
@@ -246,9 +246,9 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 | `muxa host add/list/label/annotate/doctor` | physical SSH node와 Kubernetes-style label/annotation 관리. |
 | `muxa fleet status/watch/capture/send/attach` | 중앙 host → session → window → pane(agent) 관측/제어. |
 | `muxa stats --since today` | WACT/ACT/WORK/WAIT 중심 summary. day/project/agent/session 단위로 묶을 수 있고, `--graph`는 WACT 시간 그래프만, `--verbose`는 진단 컬럼을 표시. |
-| `muxa report --since week` | day/project/agent/session 모든 breakdown을 ACT/WACT 중심 테이블로 표시 (`--json` / `--markdown`로 export). |
+| `muxa stats report --since week` | day/project/agent/session 모든 breakdown을 ACT/WACT 중심 테이블로 표시 (`--json` / `--markdown`로 export). |
 | `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링하고 `--sort waiting` 정렬이나 `--view heatmap`을 사용할 수 있음. |
-| `muxa activity --type agent\|tmux\|human` | raw activity ledger interval 조회. |
+| `muxa stats activity --type agent\|tmux\|human` | raw activity ledger interval 조회. |
 | `muxa registry sync` / `prune` / `panes` | pane scan으로 registry backfill, orphan row 정리, pane host 목록. |
 | `muxa agent start --agent codex [--host auto\|native\|tmux]` | allowlist agent 실행. `auto`는 실제 tmux 셸에서는 tmux를, 일반 터미널에서는 muxa-owned PTY를 사용. |
 | `muxa work start muxa-onboarding --workspace muxa --agent codex ...` | workspace session과 work window를 만들거나 재사용하고 agent pane을 추가. |
@@ -269,14 +269,14 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 ```bash
 muxa stats --since today --group-by session
 muxa stats --since yesterday --group-by project
-muxa report --since last-week
+muxa stats report --since last-week
 muxa timeline --since today --session main
 muxa timeline --since today --exclude-session 'monitor*'
 muxa stats --since month --exclude-pane '%42' --exclude-session 'monitor*'
 muxa timeline --since today --group-by kind --sort waiting
 muxa timeline --view heatmap --since 12w
 muxa timeline --day 2026-06-06
-muxa activity --since today --type human
+muxa stats activity --since today --type human
 ```
 
 `--since`는 `today`, `yesterday`, 최근 7일 rolling window인 `week`, 최근
@@ -286,7 +286,7 @@ muxa activity --since today --type human
 `all`을 받습니다. `HUMAN`, `THINK`, `ACT`를 포함한
 ledger 판정 기준은 [docs/ACTIVITY.ko.md](docs/ACTIVITY.ko.md)에 있습니다.
 
-계속 켜둔 monitoring scope는 `muxa stats`, `muxa report`, `muxa timeline`에서
+계속 켜둔 monitoring scope는 `muxa stats`, `muxa stats report`, `muxa timeline`에서
 `--exclude-pane`, `--exclude-session`으로 제외할 수 있습니다. 패턴은
 case-sensitive이고 `*`, `?` wildcard를 지원합니다. 예:
 `--exclude-session 'monitor*'`.

@@ -814,7 +814,7 @@ fn default_collaboration_max_message_bytes() -> usize {
 }
 
 /// `[stats]` config — tuning for the engaged ("active") time estimate in
-/// `muxa stats` / `muxa report`. ACTIVE pads each human action (a prompt or a
+/// `muxa stats` / `muxa stats report`. ACTIVE pads each human action (a prompt or a
 /// tmux input tick) into a window; these control its size.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

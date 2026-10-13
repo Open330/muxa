@@ -2,7 +2,7 @@
 
 `muxa timeline` shows how agent sessions moved through work, waiting,
 errors, human interaction, and tmux foreground time. It is the visual view of
-the same duration data used by `muxa stats` and `muxa report`.
+the same duration data used by `muxa stats` and `muxa stats report`.
 
 ## Quick Start
 

@@ -207,15 +207,17 @@ enum Cmd {
         action: IdentityCmd,
     },
     /// Summarize retained prompt history, live agents, and session duration.
-    Stats(stats::Args),
-    /// Generate a Markdown activity report from the retained stats.
-    Report(stats::ReportArgs),
+    Stats(stats::StatsCommand),
+    /// Former name of `muxa stats report`.
+    #[command(hide = true)]
+    Report(stats::ReportInvocation),
     /// Explore agent work/wait/error intervals as an interactive timeline.
     Timeline(timeline::Args),
     /// Work-board TUI for tracking Work, Runs, external issues, and agents.
     Dashboard(dashboard_tui::Args),
-    /// Query raw activity ledger intervals.
-    Activity(activity_query::Args),
+    /// Former name of `muxa stats activity`.
+    #[command(hide = true)]
+    Activity(activity_query::ActivityInvocation),
     /// Hook adapter entrypoints invoked by the agent CLIs themselves.
     #[command(hide = true)]
     Hook {
@@ -1261,7 +1263,9 @@ fn parse_args() -> Args {
          Options:\n{{options}}{{after-help}}",
         help_groups::grouped_commands(&command)
     );
-    let matches = command.help_template(template).get_matches();
+    let mut command = command.help_template(template);
+    let matches = command.clone().get_matches();
+    stats::check_flag_placement(&mut command, &matches).unwrap_or_else(|error| error.exit());
     Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
 }
 
@@ -1369,11 +1373,11 @@ async fn main() -> Result<()> {
         Cmd::Work { action } => run_work_cmd(action, &cfg, config_path, &client).await,
         Cmd::Workspace { action } => run_workspace_cmd(action),
         Cmd::Identity { action } => cmd_identity(&client, action).await,
-        Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
-        Cmd::Report(report_args) => stats::run_report(&client, &cfg, report_args).await,
+        Cmd::Stats(stats_command) => stats::run_command(&client, &cfg, stats_command).await,
+        Cmd::Report(report) => stats::run_report(&client, &cfg, &report.window, report.args).await,
         Cmd::Timeline(timeline_args) => timeline::run(&client, &cfg, timeline_args).await,
         Cmd::Dashboard(dashboard_args) => cmd_dashboard(&client, &cfg, dashboard_args).await,
-        Cmd::Activity(activity_args) => activity_query::run(&cfg, activity_args).await,
+        Cmd::Activity(activity) => activity_query::run(&cfg, &activity.window, activity.args).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => cmd_panes(),
         Cmd::Registry { action } => match action {
