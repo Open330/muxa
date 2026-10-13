@@ -24,7 +24,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     (
         "Setup",
         &[
-            "init", "onboard", "doctor", "config", "upgrade", "daemon", "logs", "mcp",
+            "init", "onboard", "doctor", "config", "upgrade", "daemon", "mcp",
         ],
     ),
     ("Maintenance", &["sync", "prune", "panes"]),
@@ -137,6 +137,37 @@ mod tests {
         let help = grouped_commands(&command);
         assert!(help.contains("attend (go)"));
         assert!(!help.contains("relay"));
+    }
+
+    /// Former top-level names that now live under a parent command.
+    const MOVED: &[&str] = &["logs"];
+
+    fn parse(argv: &[&str]) -> crate::Cmd {
+        crate::Args::try_parse_from(argv)
+            .unwrap_or_else(|error| panic!("{argv:?}: {error}"))
+            .cmd
+    }
+
+    /// Commands that moved under a parent keep their old top-level name as a
+    /// hidden alias, so scripts and hook configs written against it still run.
+    #[test]
+    fn moved_commands_keep_their_old_names() {
+        let command = crate::Args::command();
+        for old in MOVED {
+            let sub = command.find_subcommand(old).expect(old);
+            assert!(sub.is_hide_set(), "`{old}` moved under a parent; hide it");
+        }
+
+        let crate::Cmd::Logs(old) = parse(&["muxa", "logs", "-n", "5", "-N"]) else {
+            panic!("`muxa logs` must still parse");
+        };
+        let crate::Cmd::Daemon {
+            action: crate::daemon::Action::Logs(new),
+        } = parse(&["muxa", "daemon", "logs", "-n", "5", "-N"])
+        else {
+            panic!("`muxa daemon logs` must parse");
+        };
+        assert_eq!(format!("{old:?}"), format!("{new:?}"));
     }
 
     #[test]

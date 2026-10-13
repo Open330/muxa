@@ -34,6 +34,11 @@ pub enum Action {
     Restart,
     /// Report whether muxad is serving the selected socket.
     Status,
+    /// Tail muxad's stdout/stderr logs without remembering paths.
+    ///
+    /// Falls back to `journalctl --user -u muxad` on Linux when the
+    /// systemd unit is the source of truth.
+    Logs(crate::logs::Args),
 }
 
 pub async fn run(
@@ -47,6 +52,7 @@ pub async fn run(
         Action::Stop => stop(client, socket).await,
         Action::Restart => restart(client, socket, config_path).await,
         Action::Status => status(client, socket).await,
+        Action::Logs(args) => crate::logs::run(args).await,
     }
 }
 

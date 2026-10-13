@@ -1,4 +1,4 @@
-//! `muxa logs` — tail muxad's stdout/stderr without remembering paths.
+//! `muxa daemon logs` — tail muxad's stdout/stderr without remembering paths.
 //!
 //! Default sources are `/tmp/muxad.log` and `/tmp/muxad.err` (the paths the
 //! macOS launchd plist redirects to, and where the install wizard's
@@ -228,8 +228,8 @@ async fn follow_files(paths: &[PathBuf], filter: Option<&str>, colored: bool) ->
                         //
                         // KNOWN LIMITATION: if the file is rotated (moved
                         // and replaced) we keep following the *old* inode.
-                        // Re-running `muxa logs` picks up the new file.
-                        eprintln!("muxa logs: read error on {}: {e}", path.display());
+                        // Re-running `muxa daemon logs` picks up the new file.
+                        eprintln!("muxa daemon logs: read error on {}: {e}", path.display());
                         break;
                     }
                 }
