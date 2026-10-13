@@ -3473,13 +3473,8 @@ struct TreeRows {
 impl TreeRows {
     fn agent(&self, label: String, agent: &Agent) -> Vec<Cell> {
         let state = status_state_label(agent.state, self.layout).to_string();
-        let prompt = agent
-            .last_prompt
-            .as_deref()
-            .unwrap_or("-")
-            .lines()
-            .next()
-            .unwrap_or("");
+        let headline = muxa::prompt_headline(agent.last_prompt.as_deref().unwrap_or("-"));
+        let prompt = headline.lines().next().unwrap_or("");
         vec![
             Cell::new(truncate_cell(&label, self.name_width)),
             status_state_cell(&state, agent.state, self.theme),
@@ -4056,7 +4051,7 @@ fn render_status_table(
         let pane = pane_display(a, panes);
         let state_txt = status_state_label(a.state, layout).to_string();
         let last_activity = relative_time(now, a.last_activity_at);
-        let prompt_raw = a.last_prompt.as_deref().unwrap_or("-");
+        let prompt_raw = muxa::prompt_headline(a.last_prompt.as_deref().unwrap_or("-"));
         let prompt = prompt_raw.lines().next().unwrap_or("");
 
         let state_cell = status_state_cell(&state_txt, a.state, theme);
