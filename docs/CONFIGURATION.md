@@ -567,7 +567,7 @@ paneless_stale_timeout_secs = 86400
 
 The reconciler keeps stale states from staying misleading forever. Timeout
 values of `0` disable that timeout. The same loop also runs the pid-liveness
-sweep that flips registered background tasks (see `muxa register`) to
+sweep that flips registered background tasks (see `muxa proc register`) to
 `stopped` once their process exits.
 
 Codex rollout polling runs every two seconds independently of the full

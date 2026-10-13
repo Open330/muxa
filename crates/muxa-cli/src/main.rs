@@ -293,43 +293,23 @@ enum Cmd {
         #[arg(long, value_name = "PANE")]
         caller_pane: Option<String>,
     },
-    /// Run a command in a muxa-owned PTY session.
-    Run {
-        /// Human-readable session name.
-        #[arg(long)]
-        name: Option<String>,
-        /// Working directory for the child process. Defaults to the current directory.
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        /// Spawn the session and return without attaching.
-        #[arg(long)]
-        detach: bool,
-        /// Command and arguments to run. Use `--` before commands with flags.
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
+    /// Run, attach to, or register processes muxa tracks without agent hooks.
+    Proc {
+        #[command(subcommand)]
+        action: ProcCmd,
     },
-    /// Attach this terminal to a muxa-owned PTY session.
+    /// Former name of `muxa proc run`.
+    #[command(hide = true)]
+    Run(RunArgs),
+    /// Former name of `muxa proc attach`.
+    #[command(hide = true)]
     Attach { session: String },
-    /// Mark a muxa-owned PTY session as detached.
+    /// Former name of `muxa proc detach`.
+    #[command(hide = true)]
     Detach { session: String },
-    /// Register an arbitrary background process (shell script, game,
-    /// automation loop) so it shows up in `muxa status`/`muxa watch`,
-    /// tracked by pid liveness. Defaults `--pid` to the calling shell.
-    Register {
-        /// Display name shown in the NAME column.
-        #[arg(long)]
-        name: String,
-        /// Process id to track. Defaults to the parent process (the shell
-        /// that invoked `muxa register`).
-        #[arg(long)]
-        pid: Option<u32>,
-        /// Working directory to record (informational).
-        #[arg(long)]
-        cwd: Option<String>,
-        /// tmux pane id to associate, when the process lives in one.
-        #[arg(long)]
-        pane: Option<String>,
-    },
+    /// Former name of `muxa proc register`.
+    #[command(hide = true)]
+    Register(RegisterArgs),
     /// Internal bridge used by the zellij WASM plugin.
     #[command(hide = true)]
     ZellijPluginSnapshot {
@@ -399,6 +379,54 @@ enum Cmd {
     /// Former name of `muxa registry prune`.
     #[command(hide = true)]
     Prune(PruneArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProcCmd {
+    /// Run a command in a muxa-owned PTY session.
+    Run(RunArgs),
+    /// Attach this terminal to a muxa-owned PTY session.
+    Attach { session: String },
+    /// Mark a muxa-owned PTY session as detached.
+    Detach { session: String },
+    /// Show any background process in `muxa status`/`muxa watch`.
+    ///
+    /// For a shell script, game, or automation loop. Tracked by pid
+    /// liveness. Defaults `--pid` to the calling shell.
+    Register(RegisterArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct RunArgs {
+    /// Human-readable session name.
+    #[arg(long)]
+    name: Option<String>,
+    /// Working directory for the child process. Defaults to the current directory.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Spawn the session and return without attaching.
+    #[arg(long)]
+    detach: bool,
+    /// Command and arguments to run. Use `--` before commands with flags.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct RegisterArgs {
+    /// Display name shown in the NAME column.
+    #[arg(long)]
+    name: String,
+    /// Process id to track. Defaults to the parent process (the shell
+    /// that invoked `muxa proc register`).
+    #[arg(long)]
+    pid: Option<u32>,
+    /// Working directory to record (informational).
+    #[arg(long)]
+    cwd: Option<String>,
+    /// tmux pane id to associate, when the process lives in one.
+    #[arg(long)]
+    pane: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1416,20 +1444,38 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Cmd::Run {
-            name,
-            cwd,
-            detach,
-            command,
-        } => cmd_run(&client, &socket, name, cwd, detach, command).await,
+        Cmd::Proc { action } => match action {
+            ProcCmd::Run(run) => {
+                cmd_run(&client, &socket, run.name, run.cwd, run.detach, run.command).await
+            }
+            ProcCmd::Attach { session } => cmd_attach(&client, &session).await,
+            ProcCmd::Detach { session } => cmd_detach(&client, &session).await,
+            ProcCmd::Register(register) => {
+                cmd_register(
+                    &client,
+                    register.name,
+                    register.pid,
+                    register.cwd,
+                    register.pane,
+                )
+                .await
+            }
+        },
+        Cmd::Run(run) => {
+            cmd_run(&client, &socket, run.name, run.cwd, run.detach, run.command).await
+        }
         Cmd::Attach { session } => cmd_attach(&client, &session).await,
         Cmd::Detach { session } => cmd_detach(&client, &session).await,
-        Cmd::Register {
-            name,
-            pid,
-            cwd,
-            pane,
-        } => cmd_register(&client, name, pid, cwd, pane).await,
+        Cmd::Register(register) => {
+            cmd_register(
+                &client,
+                register.name,
+                register.pid,
+                register.cwd,
+                register.pane,
+            )
+            .await
+        }
         Cmd::ZellijPluginSnapshot { json } => cmd_zellij_plugin_snapshot(&client, &json).await,
         Cmd::Relay { stdio } => {
             if !stdio {
@@ -2164,7 +2210,7 @@ async fn cmd_register(
     cwd: Option<String>,
     pane: Option<String>,
 ) -> Result<()> {
-    // Default to the calling shell so `muxa register --name X` from a pane
+    // Default to the calling shell so `muxa proc register --name X` from a pane
     // tracks that shell without the user hunting for a pid.
     let pid = pid.or_else(|| Some(std::os::unix::process::parent_id()));
     client

@@ -553,7 +553,7 @@ async fn run_native(
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         println!(
-            "started {} in native session {} (cwd {})\nattach with: muxa attach {}",
+            "started {} in native session {} (cwd {})\nattach with: muxa proc attach {}",
             result.agent.label(),
             result
                 .session
@@ -573,7 +573,7 @@ async fn run_native(
 fn native_refusal(args: &StartArgs) -> Option<&'static str> {
     if args.work.is_some() || args.workspace.is_some() {
         return Some(
-            "managed --work/--workspace launch is not available on the native host yet; use --host tmux or `muxa run`",
+            "managed --work/--workspace launch is not available on the native host yet; use --host tmux or `muxa proc run`",
         );
     }
     if args.target.is_some() || args.placement != Placement::Pane {
