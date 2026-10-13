@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `muxa stats` splits an interval that crosses midnight between its days.
+  Before, a state held overnight (an agent left waiting on a question) was
+  credited whole to the day it ended, putting 15h of WAIT on a morning that
+  was 10h old. Totals are unchanged.
 - `muxa stats` / `report` recorded no attached or hands-on time (WACT/ACT
   `-`) for workspaces on rmux: session activity sampled only tmux and herdr.
   rmux is sampled now. Its session ids are kept apart from tmux's
