@@ -71,6 +71,14 @@ tests. The live checks must cover:
    `TMUX_TMPDIR`. Without them it writes the real history and scans the real
    multiplexer.
 
+Tests that execute a fixture script must create it with
+`muxa::test_support::write_executable`, not `fs::write` followed by `chmod`.
+Tests run in parallel threads. A child forked by another test inherits the
+open write handle until it execs, and the fixture then fails to start with
+ETXTBSY ("Text file busy"), which looks like a random flake. Likewise, query
+a test's own tmux through `muxa::tmux::tmux_binary()`: a bare `tmux` can be
+rmux's shim.
+
 CI runs clippy on unpinned stable, so run `rustup update stable` before
 pushing. New lints otherwise appear in CI on code you did not touch.
 

@@ -4231,16 +4231,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_cli_instance_spawns_the_binary_it_names() {
-        use std::os::unix::fs::PermissionsExt;
-
         let directory = tempdir().unwrap();
         let fake = directory.path().join("claude-work");
-        std::fs::write(
+        crate::test_support::write_executable(
             &fake,
             "#!/bin/sh\nprintf '%s' \"{\\\"is_error\\\":false,\\\"result\\\":\\\"PONG $*\\\",\\\"session_id\\\":\\\"s-1\\\"}\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            0o755,
+        );
 
         let config = AskProviderConfig {
             engine: Some("claude".into()),
@@ -4464,11 +4461,8 @@ mod tests {
     /// An executable script standing in for `muxa-afm`.
     #[cfg(target_os = "macos")]
     fn fake_apple_helper(directory: &Path, name: &str, script: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         let path = directory.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&path, format!("#!/bin/sh\n{script}\n"), 0o755);
         path
     }
 

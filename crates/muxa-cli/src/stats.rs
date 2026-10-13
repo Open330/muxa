@@ -930,15 +930,21 @@ fn build_rows(
         if secs == 0 {
             continue;
         }
-        let key = agent_group_key(data, agent, group_by);
-        let acc = rows.entry(key).or_default();
-        add_state_secs(
-            agent.state,
-            secs,
-            &mut acc.working_secs,
-            &mut acc.waiting_secs,
-            &mut acc.error_secs,
-        );
+        let slices = if group_by == GroupBy::Day {
+            day_overlap_slices(data, agent.state_entered_at, data.now)
+        } else {
+            vec![(agent_group_key(data, agent, group_by), secs)]
+        };
+        for (key, secs) in slices {
+            let acc = rows.entry(key).or_default();
+            add_state_secs(
+                agent.state,
+                secs,
+                &mut acc.working_secs,
+                &mut acc.waiting_secs,
+                &mut acc.error_secs,
+            );
+        }
     }
 
     for agent in &data.agents {
@@ -1065,6 +1071,11 @@ fn add_activity_rows(
                 entry,
                 state_transition_overlap_secs(data, entry),
             ),
+            ActivityEntry::SessionForeground(entry) if group_by == GroupBy::Day => {
+                for (day, secs) in day_overlap_slices(data, entry.started_at, entry.ended_at) {
+                    rows.entry(day).or_default().foreground_secs += secs;
+                }
+            }
             ActivityEntry::SessionForeground(entry) => {
                 let secs = session_foreground_overlap_secs(data, entry);
                 if secs == 0 {
@@ -1689,19 +1700,66 @@ fn add_state_transition_row(
     if secs == 0 && !data.range.includes(entry.at) {
         return;
     }
-    let acc = rows
-        .entry(state_transition_group_key(data, entry, group_by))
-        .or_default();
-    add_state_secs(
-        entry.from,
-        secs,
-        &mut acc.working_secs,
-        &mut acc.waiting_secs,
-        &mut acc.error_secs,
-    );
-    if data.range.includes(entry.at) && is_attention_state(entry.to) {
-        acc.attention_events += 1;
+    let key = state_transition_group_key(data, entry, group_by);
+    if group_by == GroupBy::Day {
+        // A state held across midnight belongs to each day it covered, not
+        // all to the day it ended (an overnight wait once put 15h on a
+        // morning that was 10h old).
+        for (day, secs) in day_overlap_slices(data, transition_started_at(entry), entry.at) {
+            let acc = rows.entry(day).or_default();
+            add_state_secs(
+                entry.from,
+                secs,
+                &mut acc.working_secs,
+                &mut acc.waiting_secs,
+                &mut acc.error_secs,
+            );
+        }
+    } else {
+        let acc = rows.entry(key.clone()).or_default();
+        add_state_secs(
+            entry.from,
+            secs,
+            &mut acc.working_secs,
+            &mut acc.waiting_secs,
+            &mut acc.error_secs,
+        );
     }
+    if data.range.includes(entry.at) && is_attention_state(entry.to) {
+        rows.entry(key).or_default().attention_events += 1;
+    }
+}
+
+/// `[started_at, ended_at)` clipped to the report range as [`overlap_secs`]
+/// clips it, then split at the viewer's local midnights: one `(day, secs)`
+/// per calendar day the interval covers.
+fn day_overlap_slices(
+    data: &StatsData,
+    started_at: OffsetDateTime,
+    ended_at: OffsetDateTime,
+) -> Vec<(String, u64)> {
+    let start = data
+        .range
+        .since_at
+        .map_or(started_at, |since| started_at.max(since));
+    let end = ended_at.min(data.range.effective_end(data.now));
+    let offset = local_offset();
+    let mut slices = Vec::new();
+    let mut cursor = start;
+    while cursor < end {
+        let next_midnight = cursor
+            .to_offset(offset)
+            .date()
+            .next_day()
+            .map_or(end, |day| local_day_start(day, offset));
+        let slice_end = next_midnight.min(end);
+        let secs = u64::try_from((slice_end - cursor).whole_seconds()).unwrap_or(0);
+        if secs > 0 {
+            slices.push((format_day(cursor), secs));
+        }
+        cursor = slice_end;
+    }
+    slices
 }
 
 /// Historical records outlive tmux's view sessions. Fold only generated
@@ -1824,6 +1882,12 @@ fn add_open_session_foreground_rows(
         let Some(since) = activity.attached_since else {
             continue;
         };
+        if group_by == GroupBy::Day {
+            for (day, secs) in day_overlap_slices(data, since, data.now) {
+                rows.entry(day).or_default().foreground_secs += secs;
+            }
+            continue;
+        }
         let secs = overlap_secs(data, since, data.now);
         if secs == 0 {
             continue;
@@ -3568,6 +3632,45 @@ pub(crate) mod tests {
             })),
         ];
         d
+    }
+
+    /// An agent waiting from 22:00 to 03:00 local time waited two hours on
+    /// the first day and three on the second, not five on the second.
+    #[test]
+    fn a_state_held_across_midnight_is_split_between_its_days() {
+        let offset = local_offset();
+        let day_one = local_day_start(datetime!(2026-05-30 00:00:00 UTC).date(), offset);
+        let entered = day_one + time::Duration::hours(22);
+        let ended = day_one + time::Duration::hours(27);
+        let mut d = data(Vec::new());
+        d.now = day_one + time::Duration::days(3);
+        d.range = TimeRange {
+            label: "bounded".into(),
+            since_at: Some(day_one),
+            until_at: Some(day_one + time::Duration::days(2)),
+        };
+        d.activity_entries = vec![ActivityEntry::StateTransition(StateTransitionEntry::new(
+            StateTransitionInput {
+                at: ended,
+                kind: AgentKind::ClaudeCode,
+                session_id: "overnight".into(),
+                pane: Some("%1".into()),
+                session_name: Some("main".into()),
+                cwd: None,
+                from: AgentState::WaitingInput,
+                to: AgentState::Stopped,
+                state_entered_at: Some(entered),
+            },
+        ))];
+        let rows = build_rows(&d, GroupBy::Day, 0, SortKey::Name, false);
+        let waiting = |day: OffsetDateTime| {
+            rows.iter()
+                .find(|row| row.key == format_day(day))
+                .map_or(0, |row| row.waiting_secs)
+        };
+        assert_eq!(waiting(entered), 2 * 3600, "{rows:?}");
+        assert_eq!(waiting(ended), 3 * 3600, "{rows:?}");
+        assert_eq!(build_totals(&d).waiting_secs, 5 * 3600);
     }
 
     #[test]
