@@ -370,9 +370,8 @@ enum Cmd {
     /// with `claude mcp add --scope user muxa -- muxa mcp`. Refuses to start if the
     /// daemon socket is unreachable. See docs/MCP.md.
     Mcp,
-    /// Tail muxad's stdout/stderr logs without remembering paths.
-    /// Falls back to `journalctl --user -u muxad` on Linux when the
-    /// systemd unit is the source of truth.
+    /// Former name of `muxa daemon logs`, kept for scripts and muscle memory.
+    #[command(hide = true)]
     Logs(logs::Args),
     /// Capture this multiplexer's workspace — sessions, windows, panes,
     /// geometry, and what each pane is running — so a restart can be undone
