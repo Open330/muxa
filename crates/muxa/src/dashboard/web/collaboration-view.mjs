@@ -61,8 +61,19 @@ export function initResizeHandle(handle, { read, write, min, max, step = 10, axi
 const renderedHTML = new WeakMap();
 export function setStableHTML(node, html) {
   if (node.childNodes.length && renderedHTML.get(node) === html) return false;
+  const selection = globalThis.getSelection?.();
+  const pre = selection?.anchorNode?.parentElement?.closest('pre');
+  const selected = pre && node.contains(pre) && selection.anchorNode === pre.firstChild && selection.focusNode === pre.firstChild
+    ? { text: pre.textContent, anchor: selection.anchorOffset, focus: selection.focusOffset } : null;
+  const parent = node.parentElement;
+  const scroll = parent?.scrollTop;
   node.innerHTML = html;
   renderedHTML.set(node, html);
+  if (selected) {
+    const replacement = [...node.querySelectorAll('pre')].find(candidate => candidate.textContent === selected.text);
+    if (replacement?.firstChild) selection.setBaseAndExtent(replacement.firstChild, selected.anchor, replacement.firstChild, selected.focus);
+  }
+  if (parent && Number.isFinite(scroll)) parent.scrollTop = scroll;
   return true;
 }
 export function clearStableHTML(node) {
