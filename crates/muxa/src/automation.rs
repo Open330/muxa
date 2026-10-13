@@ -352,6 +352,8 @@ pub enum AutomationAction {
     Notify,
     /// Send the pane's interrupt key. Types no prompt.
     Interrupt,
+    /// Press Enter only on a visibly selected Yes/Proceed confirmation.
+    PressEnter,
 }
 
 /// The live-state predicate re-checked at fire time.
@@ -425,9 +427,8 @@ pub fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
 
 /// `[automation]` — the master switch, the pause, and the rules.
 ///
-/// Defaults to enabled **with no rules**: a fresh install runs the engine's
-/// bookkeeping and does nothing, until the operator (or Muxa.app) writes a
-/// rule.
+/// An empty config enables the engine with no rules. Init and daemon startup
+/// install disabled starter rules; only operator-enabled rules can act.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutomationConfig {
@@ -822,6 +823,20 @@ impl AutomationRule {
                 if self.text.is_some() || self.submit.is_some() {
                     return Err(named(
                         "`text` and `submit` belong to `action = \"send_prompt\"`".into(),
+                    ));
+                }
+            }
+            AutomationAction::PressEnter => {
+                if self.on != AutomationEvent::WaitingInput
+                    || self.only_if_still() != AutomationCondition::WaitingInput
+                {
+                    return Err(named(
+                        "press_enter requires waiting_input and a waiting_input recheck".into(),
+                    ));
+                }
+                if self.text.is_some() || self.message.is_some() || self.submit.is_some() {
+                    return Err(named(
+                        "press_enter takes no text, message, or submit".into(),
                     ));
                 }
             }
@@ -1288,7 +1303,7 @@ impl Scheduler {
             text: match rule.action {
                 AutomationAction::SendPrompt => rule.text.clone(),
                 AutomationAction::Notify => rule.message.clone(),
-                AutomationAction::Interrupt => None,
+                AutomationAction::Interrupt | AutomationAction::PressEnter => None,
             },
             submit: rule.submit(),
             only_if_still: rule.only_if_still(),

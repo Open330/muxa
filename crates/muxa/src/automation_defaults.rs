@@ -46,7 +46,21 @@ pub fn rules() -> Vec<AutomationRule> {
     error.message = Some("Agent has remained in an error state for five minutes.".into());
     error.wait = Some(WaitSpec::after_event(time::Duration::minutes(5)));
 
-    vec![capacity, limit, input, error]
+    let mut confirm = AutomationRule::new(
+        "confirm-selected-yes",
+        AutomationEvent::WaitingInput,
+        AutomationAction::PressEnter,
+    );
+    confirm.agent = vec![
+        crate::automation::AgentKindSpec(crate::AgentKind::Codex),
+        crate::automation::AgentKindSpec(crate::AgentKind::ClaudeCode),
+    ];
+    confirm.wait = Some(WaitSpec::after_event(time::Duration::seconds(5)));
+    confirm.jitter = Some(DurationSpec::seconds(0));
+    confirm.cooldown = Some(DurationSpec::seconds(30));
+    confirm.max_per_hour = Some(10);
+
+    vec![capacity, limit, input, error, confirm]
         .into_iter()
         .map(|mut rule| {
             rule.enabled = false;
@@ -103,10 +117,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fresh_install_has_four_valid_disabled_rules_and_is_idempotent() {
+    fn fresh_install_has_five_valid_disabled_rules_and_is_idempotent() {
         let text = merge("").unwrap().unwrap();
         let config: Config = toml::from_str(&text).unwrap();
-        assert_eq!(config.automation.rule.len(), 4);
+        assert_eq!(config.automation.rule.len(), 5);
         assert!(config.automation.rule.iter().all(|rule| !rule.enabled));
         config.validate().unwrap();
         assert_eq!(merge(&text).unwrap(), None);
@@ -140,7 +154,7 @@ message = "custom"
         assert!(text.contains("# user config"));
         assert!(text.contains("# keep my settings"));
         assert!(text.contains("theme = \"classic\""));
-        assert_eq!(after.automation.rule.len(), 5);
+        assert_eq!(after.automation.rule.len(), 6);
         assert_eq!(after.automation.rule[..2], before.automation.rule);
         assert!(!after.automation.enabled);
         assert_eq!(

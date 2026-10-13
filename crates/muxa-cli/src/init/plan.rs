@@ -936,7 +936,7 @@ mod tests {
         assert!(after.contains("# pending"));
         let config: muxa::Config = toml::from_str(after).unwrap();
         assert!(config.ask.enabled);
-        assert_eq!(config.automation.rule.len(), 4);
+        assert_eq!(config.automation.rule.len(), 5);
         assert!(config.automation.rule.iter().all(|rule| !rule.enabled));
         assert!(!path.exists(), "planning must not mutate files");
         extend_automation(&mut plan, Some(&path)).unwrap();

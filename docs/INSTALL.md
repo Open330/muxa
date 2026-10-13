@@ -280,8 +280,8 @@ tmux source-file ~/.tmux.conf
 
 If you need a manual rollback, restore the `.muxa-backup-<unix_ts>` files.
 
-`muxa init` also installs four disabled automation rules for capacity retries,
-usage-limit recovery, input-wait notices and persistent-error notices. Enable
+`muxa init` also installs five disabled automation rules for capacity retries,
+usage-limit recovery, input-wait notices, persistent-error notices and selected Yes/Proceed confirmations. Enable
 individual rules with `muxa automation enable <name>`; existing same-name rules
 are preserved. Binary-only upgrades add missing rules when muxad next starts.
 See [Automation](AUTOMATION.md).

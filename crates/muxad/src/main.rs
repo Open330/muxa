@@ -1325,6 +1325,7 @@ impl AutomationEngine {
     /// place to read.
     async fn perform(&self, firing: &PlannedFiring) -> bool {
         match firing.action {
+            AutomationAction::PressEnter => self.confirm_selected_yes(firing).await,
             AutomationAction::SendPrompt => {
                 let Some(text) = firing.text.as_deref() else {
                     return false;
@@ -1360,6 +1361,60 @@ impl AutomationEngine {
                 send_automation_text(&self.backends, firing, "\u{3}").await
             }
         }
+    }
+
+    /// Capture immediately before Enter; a waiting state alone cannot identify
+    /// the selected option. Recheck state/config after the blocking capture.
+    async fn confirm_selected_yes(&self, firing: &PlannedFiring) -> bool {
+        let revision = *self.automation.subscribe().borrow();
+        let Some(kind) = muxa::backend::pane_id_host_kind(&firing.pane) else {
+            return false;
+        };
+        let Some(backend) = self
+            .backends
+            .iter()
+            .find(|backend| backend.kind() == kind)
+            .cloned()
+        else {
+            return false;
+        };
+        let pane = firing.pane.clone();
+        let socket = firing.socket.clone();
+        let capture =
+            tokio::task::spawn_blocking(move || backend.capture_pane_on(socket.as_deref(), &pane));
+        let Ok(Ok(Some(screen))) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), capture).await
+        else {
+            return false;
+        };
+        if !muxa::automation_choice::affirmative_choice_visible(&screen) {
+            return false;
+        }
+        let config = self.automation.config().await;
+        let Some(rule) = config.rule_named(&firing.rule) else {
+            return false;
+        };
+        if revision != *self.automation.subscribe().borrow() {
+            return false;
+        }
+        if !config.active_at(time::OffsetDateTime::now_utc())
+            || !rule.enabled
+            || rule.action != AutomationAction::PressEnter
+        {
+            return false;
+        }
+        let Some(agent) = self.store.by_session(&firing.agent_session_id).await else {
+            return false;
+        };
+        let subject = AutomationSubject::from_agent(&agent);
+        if subject.pane.as_deref() != Some(firing.pane.as_str())
+            || subject.socket != firing.socket
+            || subject.episode() != firing.episode
+            || !subject.satisfies(muxa::automation::AutomationCondition::WaitingInput)
+        {
+            return false;
+        }
+        send_automation_text(&self.backends, firing, "\r").await
     }
 
     /// The registry row behind a firing, as the live store has it now.
@@ -4650,6 +4705,63 @@ mod tests {
             assert!(sends.lock().unwrap().is_empty());
             engine.rescan().await;
             assert!(engine.pending.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn automation_enter_sends_one_key_only_for_an_affirmative_choice() {
+        for (screen, expected) in [
+            ("› 1. Yes, continue\n  2. No\nPress enter to continue", true),
+            ("  1. Yes\n› 2. No\nPress enter to continue", false),
+            ("› Type your reply", false),
+        ] {
+            let store = muxa::Store::shared();
+            add_agent(&store, "%1", "waiting", AgentKind::ClaudeCode).await;
+            store
+                .apply(&AgentEvent::NotificationFired {
+                    id: AgentId {
+                        kind: AgentKind::ClaudeCode,
+                        session_id: "waiting".into(),
+                        surface: None,
+                        pane: Some("%1".into()),
+                        tmux_socket: Some("default".into()),
+                        cwd: Some("/repo".into()),
+                    },
+                    level: muxa::event::NotificationLevel::NeedsChoice,
+                    message: "Confirm choice".into(),
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+            let sends = Arc::new(Mutex::new(Vec::new()));
+            let backend: muxa::SharedBackend = Arc::new(JudgmentBackend {
+                inner: CollaborationWakeBackend {
+                    panes: vec![collaboration_pane("%1", "0")],
+                    sends: sends.clone(),
+                },
+                screen: Arc::new(Mutex::new(screen.into())),
+            });
+            let mut rule = muxa::automation_defaults::rules()
+                .into_iter()
+                .find(|rule| rule.name == "confirm-selected-yes")
+                .unwrap();
+            rule.enabled = true;
+            rule.wait = Some(muxa::automation::parse_wait("0s").unwrap());
+            let config = muxa::automation::AutomationConfig {
+                rule: vec![rule],
+                ..Default::default()
+            };
+            let automation = AutomationStore::in_memory(config);
+            let mut engine = AutomationEngine::new(automation, store, vec![backend]);
+            for _ in 0..2 {
+                engine.rescan().await;
+                engine.fire_due().await;
+            }
+            let expected_sends = if expected {
+                vec![("%1".into(), "\r".into())]
+            } else {
+                vec![]
+            };
+            assert_eq!(*sends.lock().unwrap(), expected_sends, "{screen}");
         }
     }
 

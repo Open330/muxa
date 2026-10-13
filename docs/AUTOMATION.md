@@ -12,7 +12,7 @@ The cap is only the first rule anyone wants, so the mechanism is general —
 an **event**, some **filters**, a **delay**, and an **action** — and the
 first rule is just one instance of it.
 
-**Automation ships with four disabled rules.** `muxa init` installs them;
+**Automation ships with five disabled rules.** `muxa init` installs them;
 `muxad` also adds missing rules on startup for binary-only upgrades. Existing
 rules with the same names keep every setting, including their enabled state.
 The engine is enabled by default, but new rules do nothing until you enable them.
@@ -23,6 +23,7 @@ The engine is enabled by default, but new rules do nothing until you enable them
 | `resume-after-limit` | Send `continue` after a usage cap resets | Reset + 2m; 20m fallback without a reset time |
 | `notify-waiting-input` | Record an input-wait notice | 5m + jitter |
 | `notify-persistent-error` | Record a non-quota error notice | 5m + jitter |
+| `confirm-selected-yes` | Press Enter on the selected Yes/Proceed option | 5s; at most 10/hour/pane |
 
 `notify` records a daemon log notice and automation ledger entry; it does not
 send an OS notification. The existing cooldown, hourly ceilings, live condition
@@ -49,6 +50,26 @@ muxa init --component automation --yes
 
 When the daemon is already running, restart it after init to load file edits.
 CLI `automation enable/disable/add` changes the live engine immediately.
+
+## Confirm selected Yes / Proceed
+
+`confirm-selected-yes` is installed disabled. It watches Claude/Codex input
+waits and uses `action = "press_enter"`. Before Enter, muxad captures the
+current pane and requires exactly one highlighted `Yes` or `Proceed` row and
+an Enter/confirmation footer. A selected `No`, plain text input, an ambiguous
+screen or a failed capture receives no key. The live waiting state and episode
+are checked again after capture. The rule does not move the selection.
+
+```console
+muxa automation enable confirm-selected-yes
+muxa automation disable confirm-selected-yes
+```
+
+Enabling this rule authorizes confirmation of the selected affirmative option,
+including permission prompts. `automation test` evaluates the deterministic
+state checks without sending keys; the screen check runs immediately before
+an actual Enter action. `press_enter` requires `on = "waiting_input"`, its
+waiting-input recheck, and no `text`, `message` or `submit` payload.
 
 ## Quick start
 
@@ -187,6 +208,7 @@ Closed set.
 | `send_prompt` | `text` (required), `submit` (default `true`) | Types `text` into the pane, waits the same submit grace the collaboration waker uses, then sends Enter. |
 | `notify` | `message` (required) | Emits a daemon-side notice and a ledger entry. Types nothing. |
 | `interrupt` | — | Sends the pane's interrupt (`Ctrl-C`). Types no prompt. |
+| `press_enter` | — | Checks the selected affirmative confirmation and live waiting state, then sends Enter. |
 
 `text` is refused at load time if it contains terminal control sequences.
 An automation types into a live TUI; escape sequences reaching one are how

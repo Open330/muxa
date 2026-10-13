@@ -131,7 +131,7 @@ impl Component {
             Component::AgentSkills => "Agents: shared collaboration skill with symlinks",
             Component::AgentMcp => "Agents: register Muxa MCP for Codex and Claude Code",
             Component::Ask => "Ask: headless questions to an agent from watch",
-            Component::Automation => "Automation: install four disabled starter rules",
+            Component::Automation => "Automation: install five disabled starter rules",
         }
     }
 

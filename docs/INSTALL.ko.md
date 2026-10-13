@@ -266,7 +266,7 @@ tmux source-file ~/.tmux.conf
 수동 rollback이 필요하면 `.muxa-backup-<unix_ts>` 파일을 복원합니다.
 
 `muxa init`은 capacity 재시도, 사용량 제한 후 재개, 입력 대기 알림,
-오류 지속 알림 규칙 네 개를 비활성 상태로 설치합니다.
+오류 지속 알림, 선택된 Yes/Proceed 확인 규칙 다섯 개를 비활성 상태로 설치합니다.
 `muxa automation enable <name>`으로 필요한 규칙을 켤 수 있습니다.
 같은 이름의 기존 규칙은 설정과 활성 상태를 유지합니다. 바이너리만
 업데이트한 경우에도 다음 muxad 시작 시 빠진 규칙을 추가합니다.
