@@ -77,7 +77,8 @@ fn first_sentence(about: &str) -> String {
     let line = about.lines().next().unwrap_or_default().trim();
     let end = [" — ", ". ", ": "]
         .iter()
-        .filter_map(|delimiter| line.find(delimiter))
+        .flat_map(|delimiter| line.match_indices(delimiter).map(|(at, _)| at))
+        .filter(|&at| is_sentence_break(&line[..at]))
         .min()
         .unwrap_or(line.len());
     let sentence = line[..end].trim_end_matches('.');
@@ -86,6 +87,12 @@ fn first_sentence(about: &str) -> String {
     }
     let cut: String = sentence.chars().take(SUMMARY_CHARS - 1).collect();
     format!("{}…", cut.trim_end())
+}
+
+/// A delimiter ends the summary unless it sits inside parentheses
+/// ("(default: `$TMUX_PANE`)") or follows a one-word label ("Debug: …").
+fn is_sentence_break(before: &str) -> bool {
+    before.matches('(').count() == before.matches(')').count() && before.contains(' ')
 }
 
 #[cfg(test)]
@@ -144,6 +151,14 @@ mod tests {
         assert_eq!(
             first_sentence("Update muxa: `git pull` → install"),
             "Update muxa"
+        );
+        assert_eq!(
+            first_sentence("Show prompts for the pane (default: `$TMUX_PANE`)."),
+            "Show prompts for the pane (default: `$TMUX_PANE`)"
+        );
+        assert_eq!(
+            first_sentence("Debug: print the active pane-host inventory."),
+            "Debug: print the active pane-host inventory"
         );
         assert!(first_sentence(&"word ".repeat(40)).chars().count() <= SUMMARY_CHARS);
     }
