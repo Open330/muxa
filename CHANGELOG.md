@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Instruction-launched agents.** Resuming an agent that was launched with
     its first instruction no longer sends that instruction again; flags and
     their values are kept.
+  - **Parenthesised instructions.** An agent whose command contained
+    parentheses, such as an instruction mentioning "(commit, push)", was taken
+    for a process title and left out of the restore. When the argv was
+    captured, only the program argument is judged now; older snapshots are
+    re-judged when they are read.
 - Run from a plain terminal or a tmux shell, `muxa status` listed agents
   living in rmux as raw `rmux:%N` ids. `status`, `dashboard` and `attend` now
   name panes from every active host, matched to the agent's server. When no
