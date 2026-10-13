@@ -2566,7 +2566,7 @@ fn spawn_session_activity_task(
         return None;
     };
     // One sampling source per host in the set that HAS a foreground signal:
-    // tmux (`list-clients`) and herdr (focused workspace over its socket).
+    // tmux and rmux (`list-clients`) and herdr (focused workspace over its socket).
     // zellij has no client-attach signal, so it contributes no source. A single
     // tracker polls them all into one ledger — two independent trackers writing
     // `session-activity.json` would clobber each other (each `save()` rewrites
@@ -2577,16 +2577,22 @@ fn spawn_session_activity_task(
     for backend in backends {
         match backend.kind() {
             muxa::HostKind::Tmux => sources.push(muxa::SessionActivitySource::Tmux),
+            muxa::HostKind::Rmux => sources.push(muxa::SessionActivitySource::Rmux),
             muxa::HostKind::Herdr => sources.push(muxa::SessionActivitySource::Herdr {
                 socket_path: muxa::backend::herdr::default_socket_path(),
             }),
-            muxa::HostKind::Cmux | muxa::HostKind::Rmux | muxa::HostKind::Zellij => {}
+            muxa::HostKind::Cmux | muxa::HostKind::Zellij => {}
         }
     }
     let source_kinds: Vec<muxa::HostKind> = backends
         .iter()
         .map(|b| b.kind())
-        .filter(|kind| matches!(kind, muxa::HostKind::Tmux | muxa::HostKind::Herdr))
+        .filter(|kind| {
+            matches!(
+                kind,
+                muxa::HostKind::Tmux | muxa::HostKind::Rmux | muxa::HostKind::Herdr
+            )
+        })
         .collect();
     let tracker = muxa::SessionActivityTracker::new(
         path.clone(),
