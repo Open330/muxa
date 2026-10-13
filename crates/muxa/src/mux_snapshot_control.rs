@@ -358,20 +358,18 @@ fn failure_detail(output: &WorkCommandOutput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     /// A stand-in `muxa` that records its argv and answers like the CLI.
     fn fake_cli(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("muxa");
-        std::fs::write(
+        crate::test_support::write_executable(
             &path,
             format!(
                 "#!/bin/sh\necho \"$@\" >> \"{}/argv\"\n{body}\n",
                 dir.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            0o755,
+        );
         path
     }
 

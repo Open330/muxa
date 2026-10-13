@@ -1292,20 +1292,16 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn native_tmux_resolution_skips_rmux_shim() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let shim = dir.path().join("tmux");
         let rmux = dir.path().join("rmux");
         let native = dir.path().join("native");
-        std::fs::write(
+        crate::test_support::write_executable(
             &rmux,
             "#!/bin/sh\ncase \"$0\" in */tmux) echo 'tmux 3.4';; *) echo 'rmux 0.10.0';; esac\n",
-        )
-        .unwrap();
-        std::fs::write(&native, "#!/bin/sh\necho 'tmux 3.4'\n").unwrap();
-        for path in [&rmux, &native] {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+            0o700,
+        );
+        crate::test_support::write_executable(&native, "#!/bin/sh\necho 'tmux 3.4'\n", 0o700);
         std::os::unix::fs::symlink(&rmux, &shim).unwrap();
         assert!(Command::new(&shim)
             .arg("-V")

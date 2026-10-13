@@ -62,6 +62,8 @@ pub mod pipeline_run;
 mod process_snapshot;
 pub mod process_tree;
 mod prompt_headline;
+#[doc(hidden)]
+pub mod test_support;
 pub use prompt_headline::prompt_headline;
 pub mod reconcile;
 pub mod request;
