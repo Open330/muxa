@@ -3,6 +3,25 @@ import Darwin
 import Testing
 @testable import Muxa
 
+@Test func automationEditingPreservesNotificationFilter() throws {
+    let pattern = #"(?i)^Selected model is at capacity\. "#
+    let source: [String: Any] = [
+        "name": "resume-codex-capacity", "on": "error", "action": "send_prompt",
+        "agent": ["codex"], "text": "continue", "notification": pattern,
+    ]
+    let data = try JSONSerialization.data(withJSONObject: source)
+    let rule = try JSONDecoder().decode(MuxaAutomationRule.self, from: data)
+    var draft = MuxaAutomationRuleDraft.draft(editing: rule)
+    draft.wait = "5m"
+    let wire = draft.rule.wireObject
+    #expect(wire["notification"] as? String == pattern)
+    #expect(wire["wait"] as? String == "5m")
+    #expect(draft.rule.tomlSnippet.contains("notification = \(MuxaAutomationRule.tomlString(pattern))\n"))
+    let saved = try JSONSerialization.data(withJSONObject: wire)
+    let reloaded = try JSONDecoder().decode(MuxaAutomationRule.self, from: saved)
+    #expect(reloaded.wireObject["notification"] as? String == pattern)
+}
+
 @Test func automationAskConditionDefaultsAndRoundTrips() throws {
     let data = Data(#"{"name":"judge","on":"error","action":"interrupt","ask_condition":{"prompt":"  Is the task done?\nQuote: \"yes\"  ","provider":"team-openai"}}"#.utf8)
     let rule = try JSONDecoder().decode(MuxaAutomationRule.self, from: data)
