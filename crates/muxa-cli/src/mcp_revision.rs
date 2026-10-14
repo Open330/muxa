@@ -98,7 +98,7 @@ impl RevisionPlan {
         let stdio = server.get("url").is_none()
             && args.is_some_and(|args| {
                 crate::Args::try_parse_from(std::iter::once("muxa").chain(args))
-                    .is_ok_and(|args| matches!(args.cmd, crate::Cmd::Mcp))
+                    .is_ok_and(|args| matches!(args.cmd, Some(crate::Cmd::Mcp)))
             });
         if !managed_command || !stdio {
             return Ok(None);

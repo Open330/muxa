@@ -4644,7 +4644,7 @@ mod tests {
                     scope,
                     ..
                 },
-        } = parsed.cmd
+        } = parsed.cmd.expect("explicit subcommand")
         else {
             panic!("expected list")
         };
