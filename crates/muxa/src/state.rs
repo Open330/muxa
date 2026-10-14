@@ -1127,6 +1127,34 @@ fn apply_rate_limited(agent: &mut Agent, ev: &AgentEvent) {
     agent.state = AgentState::Error;
 }
 
+/// Adopt the hook's pane when the row has none, or when the session has moved
+/// (see [`hook_moved_session`]): a multiplexer restart renumbers panes and the
+/// agent resumes in a new one, while the old id may already belong to another
+/// agent. Keeping it would route this session's identity, wakes and replies
+/// there. A moved row drops its endpoint so `refresh_endpoint` re-adopts the
+/// hook's.
+fn refresh_pane(agent: &mut Agent, id: &AgentId, new_agent: bool) {
+    if agent.pane.is_none() {
+        agent.pane.clone_from(&id.pane);
+    } else if !new_agent && hook_moved_session(agent, id) {
+        agent.pane.clone_from(&id.pane);
+        agent.tmux_socket = None;
+    }
+}
+
+/// Whether a hook for a known session reports it in a different pane, from a
+/// source trustworthy enough to move it. The hook reads `$TMUX_PANE` inside the
+/// agent's own process, except for Codex: its TUIs share one app-server whose
+/// hooks inherit the *first* pane's `$TMUX_PANE`, so Codex pane bindings come
+/// from `codex_binding` (resume argv, cwd, visible prompt) instead.
+fn hook_moved_session(agent: &Agent, id: &AgentId) -> bool {
+    id.pane.is_some()
+        && agent.pane != id.pane
+        && !is_synthetic(&id.session_id)
+        && id.kind != AgentKind::Codex
+        && agent.kind != AgentKind::Codex
+}
+
 /// Reconcile pane occupants for an incoming `Started` event.
 ///
 /// Returns `false` when the event should be dropped (re-running `muxa sync`
@@ -1347,9 +1375,7 @@ impl Store {
         });
 
         // Keep identity fields fresh — adapters may re-send with more info.
-        if agent.pane.is_none() {
-            agent.pane.clone_from(&id.pane);
-        }
+        refresh_pane(agent, id, new_agent);
         refresh_endpoint(agent, id);
         if agent.surface.is_none() {
             agent.surface.clone_from(&id.surface);
@@ -4940,6 +4966,54 @@ mod tests {
         assert_eq!(
             store.snapshot().await[0].tmux_socket.as_deref(),
             Some("default")
+        );
+    }
+
+    /// A multiplexer restart renumbers panes and the agent resumes in a new
+    /// one. Its hooks must move the session there, or its identity stays on
+    /// an id that now belongs to another agent. Codex is the exception: its
+    /// shared app-server's hooks carry another pane's `$TMUX_PANE`.
+    #[tokio::test]
+    async fn a_resumed_session_follows_its_hook_into_a_new_pane() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-10-14 08:00:00 UTC);
+        let id = |kind, session: &str, pane: &str| AgentId {
+            tmux_socket: Some("/tmp/rmux-1/default".into()),
+            kind,
+            session_id: session.into(),
+            surface: None,
+            pane: Some(pane.into()),
+            cwd: None,
+        };
+        for (kind, session) in [
+            (AgentKind::ClaudeCode, "claude-s"),
+            (AgentKind::Codex, "codex-t"),
+        ] {
+            store
+                .apply(&AgentEvent::Started {
+                    id: id(kind, session, "rmux:%13"),
+                    at: t0,
+                })
+                .await;
+            store
+                .apply(&AgentEvent::PromptSubmitted {
+                    id: id(kind, session, "rmux:%20"),
+                    prompt: "after the restart".into(),
+                    at: t0 + time::Duration::minutes(1),
+                })
+                .await;
+        }
+        let snap = store.snapshot().await;
+        let pane = |session: &str| {
+            snap.iter()
+                .find(|a| a.session_id == session)
+                .and_then(|a| a.pane.clone())
+        };
+        assert_eq!(pane("claude-s").as_deref(), Some("rmux:%20"));
+        assert_eq!(
+            pane("codex-t").as_deref(),
+            Some("rmux:%13"),
+            "a Codex hook's pane is borrowed from the shared app-server"
         );
     }
 
