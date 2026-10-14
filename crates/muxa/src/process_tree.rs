@@ -54,8 +54,12 @@ pub struct WorkloadSummary {
 }
 
 impl WorkloadSummary {
+    /// Nothing at all runs in the pane: no agent, no shell, no child. An agent
+    /// with no children of its own is not empty: dropping it here once made
+    /// the per-pane scan lose 40 of 50 live agents.
     pub fn is_empty(&self) -> bool {
-        self.process_count == 0
+        self.primary_pid.is_none()
+            && self.process_count == 0
             && self.shell_count == 0
             && self.subagent_count == 0
             && self.helper_count == 0
@@ -67,19 +71,21 @@ impl WorkloadSummary {
     }
 }
 
-/// Scan every pane and return non-empty workload summaries keyed by pane id.
+/// Scan every pane and return its workload summary keyed by pane id.
 ///
-/// Empty summaries are omitted so callers can clear stale data by treating a
-/// missing key as [`WorkloadSummary::default`].
+/// Every scanned pane has an entry, empty or not, so a missing key means "not
+/// scanned this pass" and never "nothing runs there". Callers that only want
+/// to clear stale data can still treat a missing key as
+/// [`WorkloadSummary::default`].
 #[cfg(target_os = "linux")]
 pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummary> {
     let mut out = HashMap::new();
     // Each pane once, not once per `~view~` listing of a grouped session.
     for pane in &crate::tmux::canonical_panes(panes) {
-        let summary = scan_pane_workload(pane);
-        if !summary.is_empty() {
-            out.insert(pane.pane_id.clone(), summary);
+        if pane.pane_pid == 0 {
+            continue;
         }
+        out.insert(pane.pane_id.clone(), scan_pane_workload(pane));
     }
     out
 }
@@ -96,9 +102,7 @@ pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummar
             continue;
         }
         let summary = summarize(table.descendants(pane.pane_pid, MAX_DEPTH, MAX_NODES));
-        if !summary.is_empty() {
-            out.insert(pane.pane_id.clone(), summary);
-        }
+        out.insert(pane.pane_id.clone(), summary);
     }
     out
 }
@@ -459,6 +463,15 @@ fn read_descendants(root: u32) -> Vec<ProcessInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An agent with no child processes is a workload, not an empty pane.
+    #[test]
+    fn a_lone_agent_process_is_not_an_empty_workload() {
+        let summary = summarize(vec![proc(20, 10, 1, "claude", "claude --resume x")]);
+        assert!(summary.primary_pid.is_some());
+        assert!(!summary.is_empty());
+        assert!(WorkloadSummary::default().is_empty());
+    }
 
     fn proc(pid: u32, parent_pid: u32, depth: u8, comm: &str, cmdline: &str) -> ProcessInfo {
         ProcessInfo {
