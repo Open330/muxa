@@ -75,6 +75,10 @@ const SANDBOX_CONFIG: &str = "\
 [discovery]
 enabled = false
 
+# Practice agents report hooks; never import the caller's Codex sessions.
+[reconciler]
+codex_rollout_enabled = false
+
 [collaboration]
 enabled = true
 # The tour must never type into a pane the learner is reading.
@@ -314,6 +318,8 @@ impl Sandbox {
             "MUXA_CONFIG",
             "XDG_DATA_HOME",
             "MUXA_TMUX_SOCKET",
+            "MUXA_HOSTS",
+            "MUXA_HOST",
         ] {
             let _ = writeln!(body, "export {key}='{}'", self.env_value(key));
         }
@@ -1634,6 +1640,11 @@ pub(super) fn steps() -> &'static [Step] {
 }
 
 /// How many actions the tour asks for.
+pub(super) fn quick_steps() -> &'static [Step] {
+    &STEPS[AGENTS_ARRIVE..=BLOCK_CODEX_STEP]
+}
+
+#[cfg(test)]
 pub(super) fn step_count() -> usize {
     STEPS.len()
 }
@@ -1689,6 +1700,7 @@ struct Seen {
 }
 
 struct Tour<'a> {
+    quick: bool,
     sandbox: &'a Sandbox,
     /// Mutable: `F2` switches it mid-tour, the way the simulation's footer did.
     language: UiLanguage,
@@ -1711,6 +1723,21 @@ struct Tour<'a> {
 }
 
 impl Tour<'_> {
+    fn progress(&self, index: usize) -> (usize, usize) {
+        if self.quick {
+            (index - AGENTS_ARRIVE + 1, quick_steps().len())
+        } else {
+            (index + 1, STEPS.len())
+        }
+    }
+    fn reminder(&self, index: usize, cue: &str) -> String {
+        if self.quick {
+            let (position, total) = self.progress(index);
+            format!("{DIM}▸ {position}/{total}{RESET}  {YELLOW}{cue}{RESET}\n")
+        } else {
+            reminder_line(index, cue)
+        }
+    }
     fn clients(&self) -> String {
         self.sandbox
             .tmux_quiet(&["list-clients", "-F", "#{client_name}"])
@@ -1801,11 +1828,20 @@ impl Tour<'_> {
                 }
                 self.seen.watch
             }
-            Detect::PaneRunning(command) => self
-                .sandbox
-                .tmux_quiet(&["list-panes", "-a", "-F", "#{pane_current_command}"])
-                .lines()
-                .any(|line| line.trim() == *command),
+            Detect::PaneRunning(command) => {
+                let running = self
+                    .sandbox
+                    .tmux_quiet(&["list-panes", "-a", "-F", "#{pane_current_command}"])
+                    .lines()
+                    .any(|line| line.trim() == *command);
+                // The next step can be closed before its first poll. Retain
+                // the observation that advanced this step instead of requiring
+                // the same process to be observed a second time.
+                if running && *command == "muxa" {
+                    self.seen.watch = true;
+                }
+                running
+            }
             Detect::ActivePaneIsCodex => self.fleet.as_ref().is_some_and(|fleet| {
                 self.sandbox
                     .tmux_quiet(&["display-message", "-p", "#{pane_id}"])
@@ -2040,7 +2076,8 @@ impl Tour<'_> {
     /// to replace: bash draws the first prompt itself.
     fn print_step(&self, index: usize, achieved: &str, title: &str, cue: &str) -> Result<()> {
         let rule = "─".repeat(RULE_WIDTH);
-        let done = (index + 1) * BAR_WIDTH / STEPS.len();
+        let (position, total) = self.progress(index);
+        let done = position * BAR_WIDTH / total;
         let bar = format!(
             "{GREEN}{}{RESET}{DIM}{}{RESET}",
             "━".repeat(done),
@@ -2052,19 +2089,17 @@ impl Tour<'_> {
         // nothing to erase, and bash draws the first prompt itself.
         let clear = if self.seen.prompt { "\r\x1b[2K" } else { "" };
         let tail = if self.seen.prompt {
-            format!("{}{PROMPT}", reminder_line(index, cue))
+            format!("{}{PROMPT}", self.reminder(index, cue))
         } else {
             String::new()
         };
         print!(
             "{clear}\n{DIM}{rule}{RESET}\n\
-             {BOLD}muxa onboarding{RESET}  {DIM}{}/{}{RESET}  {bar}\n\
+             {BOLD}muxa onboarding{RESET}  {DIM}{position}/{total}{RESET}  {bar}\n\
              {GREEN}{achieved}{RESET}\n\
              {title}\n\
              {YELLOW}{BOLD}{cue}{RESET}\n\
-             {DIM}{rule}{RESET}\n{tail}",
-            index + 1,
-            STEPS.len()
+             {DIM}{rule}{RESET}\n{tail}"
         );
         std::io::stdout()
             .flush()
@@ -2088,11 +2123,12 @@ impl Tour<'_> {
         // Their prompt reads this on every redraw, so running a command does
         // not scroll the instruction away — the block above is printed once,
         // when the step changes, and this line comes back with every prompt.
-        self.sandbox.write_cue(&reminder_line(index, cue))?;
+        self.sandbox.write_cue(&self.reminder(index, cue))?;
 
+        let (position, total) = self.progress(index);
         self.sandbox.narrate(
-            index + 1,
-            STEPS.len(),
+            position,
+            total,
             achieved,
             title,
             cue,
@@ -2122,27 +2158,99 @@ impl Tour<'_> {
         Ok(())
     }
 
+    fn finish_quick(&self, shell: &mut std::process::Child) -> Result<()> {
+        // Keep the destination visible so the learner can see why it waited.
+        // F10 exits without requiring a tmux prefix lesson in the short demo.
+        if !self.clients().is_empty() {
+            self.sandbox
+                .tmux_command(&["bind-key", "-n", "F10", "detach-client"])?;
+            self.sandbox.narrate(
+                3,
+                3,
+                tr(
+                    self.language,
+                    "✓ you are in the waiting agent's terminal",
+                    "✓ 기다리는 agent의 터미널에 도착했습니다",
+                ),
+                tr(
+                    self.language,
+                    "Read its question. You can return to your project when ready.",
+                    "질문을 확인하세요. 준비되면 내 프로젝트로 돌아갑니다.",
+                ),
+                tr(self.language, "F10 finishes the demo", "F10 으로 데모 종료"),
+                None,
+                match self.language {
+                    UiLanguage::En => "한국어",
+                    UiLanguage::Ko => "English",
+                },
+            )?;
+            let finished = Instant::now();
+            while !self.clients().is_empty()
+                && !INTERRUPTED.load(Ordering::SeqCst)
+                && finished.elapsed() < STEP_TIMEOUT
+                && shell.try_wait()?.is_none()
+            {
+                std::thread::sleep(POLL);
+            }
+        }
+        Ok(())
+    }
+
     fn drive(&mut self) -> Result<usize> {
-        // Prints rather than paints: nobody is attached yet.
-        self.narrate(0, self.no_quiz)?;
+        let first = if self.quick { AGENTS_ARRIVE } else { 0 };
+        let end = if self.quick {
+            BLOCK_CODEX_STEP + 1
+        } else {
+            STEPS.len()
+        };
+        if self.quick {
+            self.perform(0)?;
+            let session = "muxa-onboarding";
+            self.before_split = self
+                .sandbox
+                .tmux_command(&["list-panes", "-t", session, "-F", "#{pane_id}"])?
+                .lines()
+                .map(str::to_string)
+                .collect();
+            self.sandbox
+                .tmux_command(&["split-window", "-d", "-t", session])?;
+            self.sandbox.prepare_agents(self.language)?;
+            self.fleet = Some(self.sandbox.add_agents(
+                session,
+                &self.before_split,
+                self.language,
+            )?);
+        }
+        self.narrate(first, self.no_quiz)?;
 
         // The learner's own shell, in their own terminal. They are not attached
         // to anything yet — Act I is where they attach themselves, which is the
         // lesson. The tour polls alongside rather than taking the keyboard.
-        let mut shell = Command::new("bash")
-            .arg("--rcfile")
-            .arg(&self.sandbox.rcfile)
-            .spawn()
-            .context("starting your shell")?;
+        let mut command = if self.quick {
+            let mut command = Command::new(&self.sandbox.tmux);
+            command.args([
+                "-S",
+                &self.sandbox.env_value("MUXA_TMUX_SOCKET"),
+                "attach-session",
+                "-t",
+                "muxa-onboarding",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("bash");
+            command.arg("--rcfile").arg(&self.sandbox.rcfile);
+            command
+        };
+        let mut shell = command.spawn().context("opening the practice workspace")?;
         // From here on bash owns the line, so a printed block has to clear it
         // and put the prompt back.
         self.seen.prompt = true;
 
-        let mut index = 0usize;
+        let mut index = first;
         let mut entered = Instant::now();
         let mut offered_escape = self.no_quiz;
 
-        while index < STEPS.len() {
+        while index < end {
             if INTERRUPTED.load(Ordering::SeqCst) {
                 break;
             }
@@ -2161,7 +2269,7 @@ impl Tour<'_> {
                 index += 1;
                 entered = Instant::now();
                 offered_escape = self.no_quiz;
-                if index < STEPS.len() {
+                if index < end {
                     self.on_enter(index)?;
                     self.narrate(index, offered_escape)?;
                 }
@@ -2180,7 +2288,7 @@ impl Tour<'_> {
                 index += 1;
                 entered = Instant::now();
                 offered_escape = self.no_quiz;
-                if index < STEPS.len() {
+                if index < end {
                     self.on_enter(index)?;
                     self.narrate(index, offered_escape)?;
                 }
@@ -2193,6 +2301,9 @@ impl Tour<'_> {
             std::thread::sleep(POLL);
         }
 
+        if self.quick && index == end {
+            self.finish_quick(&mut shell)?;
+        }
         let _ = self.sandbox.tmux_command(&["kill-server"]);
         let _ = shell.kill();
         let _ = shell.wait();
@@ -2201,6 +2312,14 @@ impl Tour<'_> {
 }
 
 pub(super) fn run(language: UiLanguage, no_quiz: bool) -> Result<()> {
+    run_tour(language, no_quiz, false)
+}
+
+pub(super) fn run_quick(language: UiLanguage) -> Result<()> {
+    run_tour(language, true, true)
+}
+
+fn run_tour(language: UiLanguage, no_quiz: bool, quick: bool) -> Result<()> {
     preflight(language)?;
     trap_signals();
 
@@ -2226,6 +2345,7 @@ pub(super) fn run(language: UiLanguage, no_quiz: bool) -> Result<()> {
         sandbox.script_command(&["daemon"])?;
         sandbox.prepare_status()?;
         let mut tour = Tour {
+            quick,
             sandbox: &sandbox,
             language,
             fleet: None,
@@ -2237,8 +2357,23 @@ pub(super) fn run(language: UiLanguage, no_quiz: bool) -> Result<()> {
         (tour.drive()?, sandbox)
     };
 
-    outcome_line(language, completed);
-    next_steps(language);
+    if quick {
+        println!(
+            "{}",
+            if completed > BLOCK_CODEX_STEP {
+                tr(language, "Done — you found the agent waiting for you. Run `muxa` for your own project, or `muxa onboard` for the full tour.", "완료 — 기다리는 agent로 이동했습니다. 내 프로젝트에서는 `muxa`, 상세 학습은 `muxa onboard`를 실행하세요.")
+            } else {
+                tr(
+                    language,
+                    "Demo stopped early. Run `muxa onboard --quick` to try again.",
+                    "데모를 중간에 종료했습니다. `muxa onboard --quick`으로 다시 체험하세요.",
+                )
+            }
+        );
+    } else {
+        outcome_line(language, completed);
+        next_steps(language);
+    }
     // `Drop` tears the sandbox down here, on every path including a panic.
     drop(sandbox);
     println!();

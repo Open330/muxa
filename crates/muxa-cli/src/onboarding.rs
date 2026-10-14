@@ -8,10 +8,14 @@ mod live;
 use anyhow::Result;
 
 #[derive(Debug, Clone, clap::Args, Default)]
+#[allow(clippy::struct_excessive_bools)] // independent public CLI switches
 pub struct Args {
     /// Print the complete guide without starting the live sandbox.
     #[arg(long)]
     pub print: bool,
+    /// Try the three-step demo: open watch, see states, and attend a waiting agent.
+    #[arg(long, conflicts_with = "tour")]
+    pub quick: bool,
     /// Offer the live tour's skip key from the first step.
     #[arg(long)]
     pub no_quiz: bool,
@@ -49,13 +53,13 @@ pub enum Language {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UiLanguage {
+pub(crate) enum UiLanguage {
     En,
     Ko,
 }
 
 impl Language {
-    fn resolve(self) -> UiLanguage {
+    pub(crate) fn resolve(self) -> UiLanguage {
         match self {
             Self::En => UiLanguage::En,
             Self::Ko => UiLanguage::Ko,
@@ -80,7 +84,7 @@ fn language_from_locale(locale: &str) -> UiLanguage {
     }
 }
 
-fn tr(language: UiLanguage, en: &'static str, ko: &'static str) -> &'static str {
+pub(crate) fn tr(language: UiLanguage, en: &'static str, ko: &'static str) -> &'static str {
     match language {
         UiLanguage::En => en,
         UiLanguage::Ko => ko,
@@ -90,25 +94,38 @@ fn tr(language: UiLanguage, en: &'static str, ko: &'static str) -> &'static str 
 pub fn run(args: Args) -> Result<()> {
     let language = args.lang.resolve();
     if args.print {
-        print!("{}", printable_guide(language));
+        print!("{}", printable_guide_for(language, args.quick));
         return Ok(());
     }
 
+    if args.quick {
+        return live::run_quick(language);
+    }
     match args.tour {
         Tour::Live => live::run(language, args.no_quiz),
     }
 }
 
+#[cfg(test)]
 fn printable_guide(language: UiLanguage) -> String {
+    printable_guide_for(language, false)
+}
+
+fn printable_guide_for(language: UiLanguage, quick: bool) -> String {
     use std::fmt::Write as _;
 
+    let steps = if quick {
+        live::quick_steps()
+    } else {
+        live::steps()
+    };
     let mut guide = String::new();
     let _ = writeln!(
         guide,
         "{}",
         match language {
-            UiLanguage::En => format!("Muxa live onboarding · {} steps", live::step_count()),
-            UiLanguage::Ko => format!("Muxa 라이브 온보딩 · {}단계", live::step_count()),
+            UiLanguage::En => format!("Muxa live onboarding · {} steps", steps.len()),
+            UiLanguage::Ko => format!("Muxa 라이브 온보딩 · {}단계", steps.len()),
         }
     );
     let _ = writeln!(guide, "================================");
@@ -138,7 +155,7 @@ fn printable_guide(language: UiLanguage) -> String {
     // harness to hold the two together; a second copy here drifted the moment
     // a step was inserted — the guide claimed fifteen while the tour ran
     // sixteen, and its test asserted the stale number so nothing failed.
-    for (index, step) in live::steps().iter().enumerate() {
+    for (index, step) in steps.iter().enumerate() {
         let _ = writeln!(
             guide,
             "{:>2}. {}",
@@ -148,6 +165,12 @@ fn printable_guide(language: UiLanguage) -> String {
         let _ = writeln!(guide, "    {}", tr(language, step.cue_en, step.cue_ko));
     }
 
+    if quick {
+        let _ = writeln!(guide, "{}", tr(language,
+            "Practice agents are prepared automatically. F2 changes language, F12 skips a step. After attending, F10 finishes and removes the sandbox.",
+            "연습용 agent는 자동으로 준비됩니다. F2는 언어 전환, F12는 단계 건너뛰기입니다. 이동 후 F10으로 마치면 sandbox를 삭제합니다."));
+        return guide;
+    }
     let _ = writeln!(guide);
     let _ = writeln!(
         guide,
@@ -186,6 +209,18 @@ mod tests {
     }
 
     #[test]
+    fn quick_guide_starts_with_agents_and_skips_tmux_lessons() {
+        for language in [UiLanguage::En, UiLanguage::Ko] {
+            let guide = printable_guide_for(language, true);
+            assert_eq!(numbered_steps(&guide).len(), 3);
+            assert!(guide.contains("muxa watch"));
+            assert!(guide.contains("muxa attend"));
+            assert!(!guide.contains("tmux new-session"));
+            assert!(!guide.contains("muxa msg send"));
+        }
+    }
+
+    #[test]
     fn locale_detection_keeps_live_tour_language_selection() {
         assert_eq!(language_from_locale("ko_KR.UTF-8"), UiLanguage::Ko);
         assert_eq!(language_from_locale("ko-KR"), UiLanguage::Ko);
@@ -204,8 +239,8 @@ mod tests {
             assert_eq!(steps.len(), live::step_count());
             assert!(steps[0].starts_with(" 1."));
             assert!(
-                guide.contains(&format!("{} steps", live::step_count()))
-                    || guide.contains(&format!("{}단계", live::step_count()))
+                guide.contains(&format!("{} steps", steps.len()))
+                    || guide.contains(&format!("{}단계", steps.len()))
             );
         }
     }

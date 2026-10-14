@@ -3210,6 +3210,7 @@ pub(crate) struct App {
     /// popup listing every keybinding — the same pattern as `confirm`,
     /// just with a static body and no follow-up dispatch.
     pub help_open: bool,
+    demo_available: bool,
     /// Transient footer hint set after a quick action runs. The
     /// renderer hides the default keybinding strip while this is fresh
     /// (`set_at.elapsed() < FOOTER_HINT_TTL`). The run loop never
@@ -3487,6 +3488,7 @@ impl App {
             ask_agent: "claude".into(),
             command_palette: None,
             help_open: false,
+            demo_available: std::env::var_os("TMUX").is_none() && which::which("tmux").is_ok(),
             footer_hint: None,
         }
     }
@@ -7746,6 +7748,11 @@ pub async fn run(
         let mut quit = false;
         for ev in events {
             match handle_event(ev, &mut app) {
+                Action::TryDemo => {
+                    jump_target = Some(WatchOpenTarget::Demo);
+                    quit = true;
+                    break;
+                }
                 Action::Quit => {
                     quit = true;
                     break;
@@ -9628,6 +9635,7 @@ pub(crate) enum Action {
     SubmitRename,
     None,
     Quit,
+    TryDemo,
     Refresh,
     /// Drain and re-exec the daemon onto whatever binary is installed now.
     /// The remedy for the skew bar, reachable without leaving watch.
@@ -9723,6 +9731,7 @@ pub(crate) enum Action {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchOpenTarget {
+    Demo,
     TopologyPane(PaneKey),
     LegacyPane(String),
 }
@@ -10147,6 +10156,15 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             Action::None
         }
         KeyCode::Esc => Action::Quit,
+        KeyCode::Enter if onboarding_empty(app) => handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            app,
+        ),
+        KeyCode::Char('d')
+            if onboarding_empty(app) && app.browse_keys_active() && app.demo_available =>
+        {
+            Action::TryDemo
+        }
         KeyCode::Enter => quick_prompt_action(app),
         KeyCode::Down => {
             app.move_down();
@@ -10241,6 +10259,16 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
                 dir_cursor,
                 name,
                 name_cursor,
+                agent: [
+                    SpawnAgent::Claude,
+                    SpawnAgent::Codex,
+                    SpawnAgent::Gemini,
+                    SpawnAgent::Antigravity,
+                    SpawnAgent::Opencode,
+                ]
+                .into_iter()
+                .find(|agent| which::which(agent.label()).is_ok())
+                .unwrap_or_default(),
                 ..SpawnComposer::default()
             });
             Action::None
@@ -17018,6 +17046,15 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
 /// state, not a rendering glitch. Distinguishes "nothing tracked at all"
 /// from "everything visible is hidden as paneless" so the hint is
 /// actionable in both cases.
+fn onboarding_empty(app: &App) -> bool {
+    app.rows.is_empty()
+        && app.search_query.is_empty()
+        && !app.attention_only
+        && app.paneless_hidden == 0
+        && app.paneless_attention == 0
+        && app.last_error.is_none()
+}
+
 fn render_empty_table(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpec) {
     let title = if app.uses_tree() {
         " Topology "
@@ -17086,11 +17123,24 @@ fn render_empty_table(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpe
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            "No agents tracked.",
+            "Start your first coding agent",
             Style::default().add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
-            "Start an agent, or run `muxa doctor` to check setup.",
+            "Enter / n: start an agent in the current folder",
+            theme.dim_style(),
+        )));
+    }
+
+    if onboarding_empty(app) {
+        if app.demo_available {
+            lines.push(Line::from(Span::styled(
+                "d: try the three-step demo · no API calls",
+                theme.dim_style(),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "Already running one? r: refresh · muxa doctor: check detection",
             theme.dim_style(),
         )));
     }
@@ -18697,6 +18747,54 @@ mod tests {
 
     /// Two windows so the single-window compaction does not fold the window
     /// row into its session — the `C` binding has to answer from either.
+    #[test]
+    fn empty_watch_enter_opens_agent_creation_without_a_selected_row() {
+        let mut app = App::with_config(WatchConfig::default());
+        assert!(onboarding_empty(&app));
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::None));
+        let composer = app.spawn.as_ref().expect("agent creation form");
+        assert!(composer.target.is_none());
+        assert!(!composer.dir.is_empty());
+    }
+
+    #[test]
+    fn empty_watch_demo_key_requires_a_supported_environment() {
+        let mut app = App::with_config(WatchConfig::default());
+        app.demo_available = true;
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+                &mut app
+            ),
+            Action::TryDemo
+        ));
+        app.demo_available = false;
+        assert!(!matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+                &mut app
+            ),
+            Action::TryDemo
+        ));
+    }
+
+    #[test]
+    fn filters_and_hidden_agents_do_not_offer_first_run_actions() {
+        let mut app = App::with_config(WatchConfig::default());
+        app.attention_only = true;
+        assert!(!onboarding_empty(&app));
+        app.attention_only = false;
+        app.search_query = "codex".into();
+        assert!(!onboarding_empty(&app));
+        app.search_query.clear();
+        app.paneless_hidden = 1;
+        assert!(!onboarding_empty(&app));
+    }
+
     fn two_window_topology_fixture() -> (Vec<Agent>, Vec<PaneInfo>) {
         let panes = vec![
             fake_topology_pane("default", "$1", "muxa", "@1", "TEST-1", 0, "%1", 0),
@@ -26660,6 +26758,7 @@ sort = ["state"]
             // preview-suite assertions.
             Action::None
             | Action::Quit
+            | Action::TryDemo
             | Action::Refresh
             | Action::AttachPane(_)
             | Action::AttachTopologyPane(_)
@@ -29121,6 +29220,7 @@ sort = ["state"]
         let backend = TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = snapshot_app();
+        app.demo_available = false;
         terminal.draw(|f| render(f, &mut app)).unwrap();
         insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));
     }
