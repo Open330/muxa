@@ -162,6 +162,10 @@ enum Cmd {
         /// Queue the Ask and return immediately instead of waiting for its answer.
         #[arg(long)]
         detach: bool,
+        /// Start a fresh conversation with the provider instead of resuming
+        /// the current one. The old conversation stays in history.
+        #[arg(long)]
+        new: bool,
         /// Print the stored Ask entry as JSON.
         #[arg(long)]
         json: bool,
@@ -1173,16 +1177,30 @@ fn render_ask_providers(providers: &[muxa::ask::AskProviderInfo]) -> String {
     out
 }
 
-async fn cmd_ask(
-    client: &Client,
-    prompt: String,
+/// Flags of one `muxa ask <prompt>` invocation.
+#[allow(clippy::struct_excessive_bools)] // independent CLI switches
+struct AskOptions {
     agent: Option<String>,
     api_key_stdin: bool,
     detach: bool,
+    new: bool,
     json: bool,
     timeout_secs: u64,
-) -> Result<()> {
+}
+
+async fn cmd_ask(client: &Client, prompt: String, options: AskOptions) -> Result<()> {
+    let AskOptions {
+        agent,
+        api_key_stdin,
+        detach,
+        new,
+        json,
+        timeout_secs,
+    } = options;
     let selected = client.ask_agent(agent.as_deref()).await?;
+    if new {
+        client.ask_reset().await?;
+    }
     let api_key = if api_key_stdin {
         anyhow::ensure!(
             !std::io::stdin().is_terminal(),
@@ -1340,6 +1358,7 @@ async fn main() -> Result<()> {
             agent,
             api_key_stdin,
             detach,
+            new,
             json,
             timeout_secs,
         } => {
@@ -1349,11 +1368,14 @@ async fn main() -> Result<()> {
             cmd_ask(
                 &client,
                 prompt,
-                agent,
-                api_key_stdin,
-                detach,
-                json,
-                timeout_secs,
+                AskOptions {
+                    agent,
+                    api_key_stdin,
+                    detach,
+                    new,
+                    json,
+                    timeout_secs,
+                },
             )
             .await
         }
@@ -4554,6 +4576,18 @@ mod tests {
         assert!(api_key_stdin);
         assert!(detach);
         assert!(json);
+    }
+
+    #[test]
+    fn ask_new_starts_a_fresh_conversation_only_when_asked() {
+        let fresh = Args::try_parse_from(["muxa", "ask", "--new", "start over"]).unwrap();
+        let Cmd::Ask { new, prompt, .. } = fresh.cmd else {
+            panic!("expected ask command");
+        };
+        assert!(new);
+        assert_eq!(prompt.as_deref(), Some("start over"));
+        let resumed = Args::try_parse_from(["muxa", "ask", "continue"]).unwrap();
+        assert!(matches!(resumed.cmd, Cmd::Ask { new: false, .. }));
     }
 
     #[test]
