@@ -66,8 +66,8 @@ impl StaleReport {
             };
             let _ = write!(
                 out,
-                "\n• Codex shared app-server (pid {pid}): {count} thread(s). Queue MCP refresh:\n    \
-                 {env}muxa reload mcp{profile}\n  The host schedules connection refresh; acceptance is not proof it has applied. \
+                "\n• Codex shared app-server (pid {pid}): {count} old MCP process(es). Queue MCP refresh:\n    \
+                 {env}muxa reload mcp{profile}\n  The host queues refresh; old connections may remain through active turns or until the next new turn. \
                  If unsupported, restart the owning Codex app-server when its sessions are idle."
             );
         }

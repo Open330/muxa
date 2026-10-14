@@ -103,7 +103,7 @@ fn pending_session_id(pane: &str, socket: Option<&str>) -> String {
 /// request through this predicate, so anything picking a recipient must use
 /// it too: a candidate it rejects can never be served.
 pub fn addresses(to: &Participant, caller: &Participant) -> bool {
-    if to.same_endpoint(caller) {
+    if to.same_session(caller) {
         return true;
     }
     is_pending_session(&to.agent_session_id)
@@ -405,6 +405,22 @@ impl Participant {
             || format!("{}@{}", self.agent_kind, self.pane),
             |alias| format!("{alias}@{}", self.pane),
         )
+    }
+
+    /// Durable mailbox ownership follows a registered session across pane/window
+    /// moves on the same host and control socket. Pending recipients remain
+    /// pinned to their endpoint until a real session adopts them.
+    fn same_session(&self, other: &Self) -> bool {
+        if self.console
+            || other.console
+            || self.agent_session_id.is_empty()
+            || is_pending_session(&self.agent_session_id)
+        {
+            return self.same_endpoint(other);
+        }
+        self.agent_session_id == other.agent_session_id
+            && self.socket == other.socket
+            && self.room.host == other.room.host
     }
 
     fn same_endpoint(&self, other: &Self) -> bool {
@@ -1107,6 +1123,8 @@ fn open_database(path: &Path) -> Result<Connection, CollaborationError> {
                  to_room_host, to_room_socket, to_room_window_id,
                  created_at_ns DESC, id DESC
              );
+         CREATE INDEX IF NOT EXISTS collab_from_session_idx ON collaboration_requests(from_agent_session_id, from_socket, from_room_host, created_at_ns DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS collab_to_session_idx ON collaboration_requests(to_agent_session_id, to_socket, to_room_host, created_at_ns DESC, id DESC);
          CREATE INDEX IF NOT EXISTS collab_from_endpoint_idx
              ON collaboration_requests(
                  from_pane, from_socket, from_agent_session_id,
@@ -1368,10 +1386,24 @@ fn push_endpoint_values(values: &mut Vec<Value>, participant: &Participant) {
     values.push(Value::Text(participant.agent_session_id.clone()));
 }
 
+fn session_caller_clause(prefix: &str, caller: &Participant, values: &mut Vec<Value>) -> String {
+    if caller.console
+        || caller.agent_session_id.is_empty()
+        || is_pending_session(&caller.agent_session_id)
+    {
+        push_endpoint_values(values, caller);
+        return format!(
+            "({prefix}_pane = ? AND {prefix}_socket IS ? AND {prefix}_agent_session_id = ?)"
+        );
+    }
+    values.push(nullable_text(caller.socket.as_ref()));
+    values.push(Value::Text(caller.agent_session_id.clone()));
+    values.push(Value::Text(caller.room.host.clone()));
+    format!("({prefix}_socket IS ? AND {prefix}_agent_session_id = ? AND {prefix}_room_host = ?)")
+}
+
 fn incoming_caller_clause(caller: &Participant, values: &mut Vec<Value>) -> String {
-    let mut alternatives =
-        vec!["(to_pane = ? AND to_socket IS ? AND to_agent_session_id = ?)".to_string()];
-    push_endpoint_values(values, caller);
+    let mut alternatives = vec![session_caller_clause("to", caller, values)];
     if !caller.console && !is_pending_session(&caller.agent_session_id) {
         alternatives.push(
             "(to_agent_session_id LIKE 'pending-pane:%' AND to_pane = ? AND to_socket IS ?
@@ -1412,22 +1444,15 @@ fn request_access_clause(
                 }
             }
         }
-        MailboxScope::Caller => {
-            let sent =
-                "(from_pane = ? AND from_socket IS ? AND from_agent_session_id = ?)".to_string();
-            match mailbox {
-                RequestMailbox::Incoming => Some(incoming_caller_clause(caller, values)),
-                RequestMailbox::Sent => {
-                    push_endpoint_values(values, caller);
-                    Some(sent)
-                }
-                RequestMailbox::All => {
-                    let incoming = incoming_caller_clause(caller, values);
-                    push_endpoint_values(values, caller);
-                    Some(format!("({incoming} OR {sent})"))
-                }
+        MailboxScope::Caller => match mailbox {
+            RequestMailbox::Incoming => Some(incoming_caller_clause(caller, values)),
+            RequestMailbox::Sent => Some(session_caller_clause("from", caller, values)),
+            RequestMailbox::All => {
+                let incoming = incoming_caller_clause(caller, values);
+                let sent = session_caller_clause("from", caller, values);
+                Some(format!("({incoming} OR {sent})"))
             }
-        }
+        },
     }
 }
 
@@ -1667,9 +1692,9 @@ fn request_visible(
     match scope {
         MailboxScope::Caller => match mailbox {
             RequestMailbox::Incoming => addresses(&request.to, caller),
-            RequestMailbox::Sent => request.from.same_endpoint(caller),
+            RequestMailbox::Sent => request.from.same_session(caller),
             RequestMailbox::All => {
-                request.from.same_endpoint(caller) || addresses(&request.to, caller)
+                request.from.same_session(caller) || addresses(&request.to, caller)
             }
         },
         MailboxScope::Room => match mailbox {
@@ -2499,8 +2524,8 @@ impl CollaborationStore {
             let request = requests
                 .get_mut(request_id)
                 .ok_or_else(|| CollaborationError::NotFound(request_id.to_string()))?;
-            let is_sender = request.from.same_endpoint(caller);
-            if !is_sender && !addresses(&request.to, caller) {
+            let is_sender = request.from.same_session(caller);
+            if !caller.console && !is_sender && !addresses(&request.to, caller) {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
             if is_sender && request.reply.is_some() && request.reply_read_at.is_none() {
@@ -2571,9 +2596,9 @@ impl CollaborationStore {
             .filter(|request| match scope {
                 MailboxScope::Caller => match mailbox {
                     RequestMailbox::Incoming => addresses(&request.to, caller),
-                    RequestMailbox::Sent => request.from.same_endpoint(caller),
+                    RequestMailbox::Sent => request.from.same_session(caller),
                     RequestMailbox::All => {
-                        request.from.same_endpoint(caller) || addresses(&request.to, caller)
+                        request.from.same_session(caller) || addresses(&request.to, caller)
                     }
                 },
                 MailboxScope::Room => match mailbox {
@@ -2748,7 +2773,7 @@ impl CollaborationStore {
             let request = requests
                 .get_mut(request_id)
                 .ok_or_else(|| CollaborationError::NotFound(request_id.to_string()))?;
-            if !request.from.same_endpoint(caller) {
+            if !request.from.same_session(caller) {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
             match request.status {
@@ -2913,7 +2938,7 @@ impl CollaborationStore {
             .await
             .values()
             .filter(|request| {
-                request.from.same_endpoint(participant)
+                request.from.same_session(participant)
                     && request.reply.is_some()
                     && request.reply_read_at.is_none()
             })
@@ -3907,6 +3932,116 @@ mod tests {
                 .await,
             Err(CollaborationError::AlreadyTerminal(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn moved_sessions_keep_mailbox_ownership_without_cross_host_access() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mailbox = CollaborationStore::load(CollaborationOptions {
+                path: durable.then(|| dir.path().join("moved.sqlite3")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let sender = participant("%1", "sender");
+            let recipient = participant("%2", "recipient");
+            let request = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "move test".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            for (original, mailbox_kind) in [
+                (&sender, RequestMailbox::Sent),
+                (&recipient, RequestMailbox::Incoming),
+            ] {
+                let mut moved = original.clone();
+                moved.pane = "%9".into();
+                moved.room.window_id = "@9".into();
+                assert!(mailbox.get_for(&moved, &request.id).await.is_ok());
+                assert_eq!(
+                    mailbox
+                        .list_for(&moved, mailbox_kind, MailboxScope::Caller)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    mailbox
+                        .query_for(
+                            &moved,
+                            mailbox_kind,
+                            MailboxScope::Caller,
+                            &CollaborationQuery::default()
+                        )
+                        .await
+                        .unwrap()
+                        .total,
+                    1
+                );
+                let mut strangers = vec![moved.clone(); 3];
+                strangers[0].agent_session_id = "stranger".into();
+                strangers[1].socket = Some("other".into());
+                strangers[2].room.host = "other-host".into();
+                for stranger in strangers {
+                    assert!(matches!(
+                        mailbox.get_for(&stranger, &request.id).await,
+                        Err(CollaborationError::NotParticipant(_))
+                    ));
+                    assert_eq!(
+                        mailbox
+                            .query_for(
+                                &stranger,
+                                mailbox_kind,
+                                MailboxScope::Caller,
+                                &CollaborationQuery::default()
+                            )
+                            .await
+                            .unwrap()
+                            .total,
+                        0
+                    );
+                }
+            }
+            let mut moved_recipient = recipient;
+            moved_recipient.pane = "%10".into();
+            moved_recipient.room.window_id = "@10".into();
+            mailbox
+                .reply(
+                    &moved_recipient,
+                    &request.id,
+                    RequestStatus::Completed,
+                    "done".into(),
+                    vec![],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            let mut moved_sender = sender;
+            moved_sender.pane = "%11".into();
+            assert_eq!(mailbox.unread_reply_count(&moved_sender).await, 1);
+            assert!(mailbox
+                .get_for(&moved_sender, &request.id)
+                .await
+                .unwrap()
+                .reply_read_at
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn pending_session_does_not_follow_pane_move() {
+        let pending = participant("%1", "pending-pane:default:%1");
+        let mut moved = pending.clone();
+        moved.pane = "%2".into();
+        assert!(!addresses(&pending, &moved));
     }
 
     fn participant(pane: &str, session: &str) -> Participant {
@@ -5558,6 +5693,84 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_exact_read_matches_all_scope_without_acknowledging_agent_reply() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = CollaborationStore::load(CollaborationOptions {
+                path: durable.then(|| dir.path().join("operator-read.sqlite3")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let sender = participant_in_window("%1", "sender", "@1");
+            let recipient = participant_in_window("%2", "recipient", "@1");
+            let request = store
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "read exactly one".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .reply(
+                    &recipient,
+                    &request.id,
+                    RequestStatus::Completed,
+                    "reply".into(),
+                    vec![],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            let console = console_in_window("@2");
+            let listed = store
+                .list_for(&console, RequestMailbox::All, MailboxScope::All)
+                .await
+                .unwrap();
+            let read = store.get_for(&console, &request.id).await.unwrap();
+            assert_eq!(read.id, listed[0].id);
+            assert!(read.reply_read_at.is_none());
+            assert_eq!(store.unread_reply_count(&sender).await, 1);
+            assert!(matches!(
+                store
+                    .get_for(&participant("%3", "stranger"), &request.id)
+                    .await,
+                Err(CollaborationError::NotParticipant(_))
+            ));
+            assert!(matches!(
+                store.get_for(&console, "missing").await,
+                Err(CollaborationError::NotFound(_))
+            ));
+            let reloaded = if durable {
+                CollaborationStore::load(CollaborationOptions {
+                    path: Some(dir.path().join("operator-read.sqlite3")),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+            } else {
+                store
+            };
+            assert!(reloaded
+                .get_for(&console, &request.id)
+                .await
+                .unwrap()
+                .reply_read_at
+                .is_none());
+            assert!(reloaded
+                .get_for(&sender, &request.id)
+                .await
+                .unwrap()
+                .reply_read_at
+                .is_some());
+        }
     }
 
     #[tokio::test]

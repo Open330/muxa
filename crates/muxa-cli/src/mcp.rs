@@ -303,7 +303,7 @@ fn initialize_result(_config: &muxa::config::Config) -> Value {
         "capabilities": { "tools": {} },
         "serverInfo": {
             "name": "muxa",
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": crate::mcp_revision::server_version(),
         },
         "instructions": instructions,
     })
@@ -2571,19 +2571,24 @@ fn select_peer(
         }));
     }
     let pane_target = target.strip_prefix("pane:").unwrap_or(target);
+    let pane_target = if pane_target.starts_with('%') && room.current.pane.starts_with("rmux:") {
+        format!("rmux:{pane_target}")
+    } else {
+        pane_target.to_owned()
+    };
     if let Some(peer) = live.iter().copied().find(|peer| peer.pane == pane_target) {
         return Ok(Some(PeerSelection::registered(
             peer.clone(),
             format!("explicit pane {}", peer.pane),
         )));
     }
-    if is_pane_selector(pane_target) {
+    if is_pane_selector(&pane_target) {
         // An explicitly addressed pane that hosts no registered peer is not an
         // error here: muxad resolves a muxa-launched pane whose agent has not
         // registered yet, and refuses anything else. Deciding that locally
         // would duplicate — and could contradict — the authoritative guard.
         return Ok(Some(PeerSelection::pending(
-            pane_target.to_string(),
+            pane_target.clone(),
             format!("explicit pane {pane_target}, pending its agent's registration"),
         )));
     }
@@ -5016,6 +5021,19 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "parent_request_id must be a string");
+    }
+
+    #[test]
+    fn bare_pane_selectors_use_the_callers_rmux_namespace() {
+        let current = peer_participant(AgentKind::Codex, "rmux:%1", AgentState::Idle);
+        let peer = peer_participant(AgentKind::ClaudeCode, "rmux:%143", AgentState::Idle);
+        let room = peer_room(current, vec![peer]);
+        for target in ["%143", "pane:%143", "rmux:%143", "pane:rmux:%143"] {
+            let selected = select_peer(&room, target).unwrap().unwrap();
+            assert_eq!(selected.pane, "rmux:%143");
+        }
+        let pending = select_peer(&room, "%999").unwrap().unwrap();
+        assert_eq!(pending.pane, "rmux:%999");
     }
 
     #[test]

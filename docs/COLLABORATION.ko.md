@@ -502,6 +502,10 @@ owner-only socket 모델도 그대로입니다.
 session의 incoming/sent/all 이력을 보여줍니다. `room_context`는 새 incoming
 request 수와 아직 확인하지 않은 reply 수를 각각 반환합니다.
 
+등록된 agent는 같은 host와 control socket에서 pane·window를 이동해도 자신의
+이전 요청을 조회할 수 있습니다. pane을 재사용한 다른 session에는 권한이 넘어가지
+않으며, 등록 전 pending 요청은 원래 pane과 room에 고정됩니다.
+
 발신자는 요청이 `queued`인 동안만 취소할 수 있습니다. 수신자가 inbox를 읽어
 `claimed`가 된 뒤에는 이미 작업이 시작됐을 수 있으므로 취소를 거부합니다.
 
@@ -511,3 +515,20 @@ request 수와 아직 확인하지 않은 reply 수를 각각 반환합니다.
 하려면 `work_mode = execute`와 path scope를 명시하세요. 현재 path scope는 agent
 간 협업 계약이며 OS sandbox는 아닙니다. 서로 다른 agent가 동시에 같은 파일을
 수정해야 하는 작업에는 별도 git worktree를 권장합니다.
+
+
+CLI 목록의 기본 `--scope auto`는 추적된 agent에서는 자신의 우편함을,
+일반 터미널에서는 operator console로 현재 room의 메시지를 조회합니다.
+`--scope caller`는 agent 신원을 요구하며, `--scope all`은 모든 room을 조회합니다.
+명시된 agent session의 신원 오류는 조회 범위를 자동으로 넓히지 않습니다.
+
+CLI `muxa msg list`는 기본 20건의 메타데이터를 출력합니다. 본문·답변·진행 기록·
+provenance는 `--full`로 명시할 때 포함합니다. JSON 배열의 `id`와 저장된 `status`는
+유지하며, `--limit`·`--offset`으로 페이지를 지정합니다.
+`muxa msg list --request-id REQUEST --full --json`은 해당 요청 하나를 직접 조회합니다.
+최종 답변만 필요하면 `muxa msg wait REQUEST --body --output FILE`을 사용합니다.
+짧은 timeout을 반복 조회하지 말고 완료 알림이나 실질적인 작업 체크포인트에서 읽습니다.
+
+`--limit 0`은 일치하는 전체 기록을 요청합니다. 페이지가 잘리면 CLI가 전체 건수와
+다음 offset을 stderr에 표시합니다. JSON 배열은 유지하지만 본문·답변·wake 전달·
+provenance를 읽던 기존 진단 스크립트에는 `--full`을 추가해야 합니다.

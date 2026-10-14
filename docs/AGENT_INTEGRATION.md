@@ -124,13 +124,13 @@ Bare `muxa reload` retains its existing snapshot/restart/restore behavior.
 `reload mux` names that operation explicitly. Neither is needed for MCP refresh.
 The MCP operation uses a WebSocket connection over the existing Unix control
 socket of an already-running host, then the official `config/mcpServer/reload` API. It does
-not edit configuration, start another app-server or restart the multiplexer.
+not start another app-server or restart the multiplexer.
 This API has no individual MCP-server filter: the command prints the real scope.
 
 `--all` selects distinct profiles owning stale shared Codex MCP processes.
 Unidentified profiles and other agent owners are listed for manual reconnect;
 it does not guess a profile or inject interactive menu commands.
-States are `planned` (dry run), `queued` (API accepted), `unsupported`, `rejected`,
+States are `planned` (dry run), `queued` (API accepted), `reloaded` (verified Muxa connections), `unsupported`, `rejected`,
 `unavailable` (no request submitted), or `unknown` (submission may have occurred
 without acknowledgement). Each host has a bounded `--timeout-secs` (default 15,
 maximum 60). An uncertain request is never automatically retried or escalated to
@@ -138,3 +138,31 @@ a broader restart. Transport/API failures return nonzero after reporting all
 selected hosts, so a partially successful run retains its per-profile evidence.
 
 Protocol reference: [OpenAI App Server documentation](https://learn.chatgpt.com/docs/app-server).
+
+
+When the registered local Muxa binary changes, `reload mcp` records its SHA-256
+under the reserved `mcp_servers.muxa.env.MUXA_MCP_BINARY_REVISION` key. Codex can
+reuse live clients when their configuration is unchanged; this revision makes
+the new binary a different client configuration. It updates only an existing
+local `muxa mcp` registration, not remote/custom transports or disabled entries.
+The official config writer receives the exact user-layer version to reject
+concurrent changes, and a private config backup is made before the write (the latest three are retained).
+An identical binary revision produces no config write. Unrelated user settings
+and integration ownership are preserved. `--dry-run` reports
+`binary_revision_update` without writing configuration.
+
+API acceptance is `queued`. The command then checks each loaded Muxa connection's
+server version and compact-report capability through `mcpServerStatus/list`.
+`reloaded` means all observed enabled Muxa connections report the installed
+revision. Exit 2 means accepted but still pending/unverified; exit 1 is a failure
+or an owner requiring manual reconnect. Do not repeat a pending reload in a loop.
+The old-process counters are diagnostic: captured runtimes can retain obsolete
+processes even after fresh connections are available. These checks cover Muxa
+connections, not the readiness of other configured MCP servers.
+
+The command never restarts app-server or agents, and never starts model turns
+solely to refresh tools. For clients without the API or custom entries that
+cannot be revised, use their reconnect action. As a last resort after finishing
+active work, the existing
+`CODEX_HOME=/path/to/profile codex app-server daemon restart` reconnects a whole
+Codex host and disconnects its clients; Muxa does not escalate to it automatically.

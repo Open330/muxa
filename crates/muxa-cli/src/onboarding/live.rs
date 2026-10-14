@@ -1610,8 +1610,8 @@ const STEPS: &[Step] = &[
         achieved_ko: "✓ 메시지가 claude에게 닿았고, mailbox로 답이 왔습니다",
         title_en: "`list` shows what you sent, and what came back.",
         title_ko: "`list`는 보낸 것과 돌아온 답을 보여줍니다.",
-        cue_en: "run:   muxa msg list",
-        cue_ko: "입력:   muxa msg list",
+        cue_en: "run:   muxa msg list --full",
+        cue_ko: "입력:   muxa msg list --full",
         detect: Detect::TypedCommand("muxa msg list"),
     },
     Step {
