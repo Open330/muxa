@@ -260,6 +260,8 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 | `muxa mcp` | coding agent가 상태 확인, 메시지, pane capture, 변경 대기, tmux lifecycle을 Muxa를 통해 수행하는 MCP stdio server. [docs/MCP.md](docs/MCP.md) 참고. |
 | `muxa snapshot` | 이 멀티플렉서의 작업 공간 — 세션·윈도우·pane·geometry·작업 디렉터리, 그리고 각 pane이 실행 중인 커맨드라인 — 을 `$XDG_DATA_HOME/muxa/snapshots`에 캡처. |
 | `muxa restore [DIR] [--run]` | 스냅샷에서 작업 공간 재구성. `--run` 없이는 계획만 출력 — 해당 세션이 남아 있는 서버에 복원하면 pane이 교체되지 않고 추가되기 때문. |
+| `muxa reload mcp [--codex-home DIR]` | 실행 중인 Codex 프로필의 MCP 전체 갱신을 요청합니다. API 수락은 `queued`로 표시하며 app-server·pane을 재시작하지 않습니다. `--all`은 오래된 공유 Codex 프로필, `--dry-run`은 범위 확인용입니다. |
+| `muxa reload mux [--snapshot DIR]` | 아래 전체 멀티플렉서 reload의 명시적 이름입니다. |
 | `muxa reload [--snapshot DIR]` | 스냅샷 → 멀티플렉서 재시작 → 작업 공간 복원. 새 tmux/rmux 빌드를 pane 서른 개를 손으로 다시 만들지 않고 적용하는 방법. 재시작 대상 서버 **바깥**에서 실행하며, muxa가 추적하던 pane은 자기 대화로 돌아온다. |
 | `muxa init` | install/uninstall wizard. |
 | `muxad` | daemon process. |

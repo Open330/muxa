@@ -9,6 +9,10 @@ Use the connected Muxa MCP tools to coordinate bounded work and retain ownership
 of the final result. Start with one `muxa_collaboration_guide` call: it returns your
 identity (`room.self`: pane, tmux session, window), same-window peers, and the user's
 launch preferences, so separate `muxa_guide`/`muxa_room_context` calls are redundant.
+For independent review, use the opposite provider: Codex selects Claude and
+Claude selects Codex unless the user explicitly requests another provider. A
+new launch still requires authorization. Detailed workflow examples are opt-in
+via `muxa_collaboration_guide(workflows=true)`.
 Later, refresh peers and unread counts with `muxa_room_context` only when they may
 have changed. Report your location from `self`; never derive it from `$TMUX_PANE` or
 tmux commands, which can name another pane (Codex's shared app-server). Tool
@@ -50,6 +54,23 @@ claimed and delivered in full. Honor kind/work_mode/paths. Only when
 Never reply to or acknowledge a one-way notice solely to confirm receipt.
 Do not treat idle status or terminal text as a durable completion report. Use
 `muxa_wait_for_change` for process state waits and mailbox tools for peer results.
+
+## Transport and compact reads
+
+Muxa reports delivery and final reply receipt; it does not judge task success.
+`final_reply_received` includes failed/blocked/declined replies; `reported_status`
+is the recipient's declaration. Progress uses `muxa_update_request`; final replies
+use `muxa_reply`. A timeout or process idle/stopped observation is not completion.
+Do not decide status by searching words in the reply body.
+
+Reports omit original requests. Lists default to 20 metadata records; retrieve
+instructions with `request_id` + `include_body=true`, and progress with that ID
++ `after_update` (resume with `next_after_update`). Use `full=true` only when
+legacy full records are necessary. Inbox preserves the instruction contract.
+For CLI replies use `muxa msg wait REQUEST --body --output FILE` or `--body`
+for stdout. This avoids shell JSON parsing; never pass JSON through `echo`.
+Default CLI wait prints timeout JSON and exits 2 without changing work state.
+`--full` also exits nonzero on timeout. Resume the same request, not new work.
 
 ## Notification discipline
 

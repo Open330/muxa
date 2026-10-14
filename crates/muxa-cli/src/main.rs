@@ -5,6 +5,7 @@ mod agent_launch;
 mod attend;
 mod automation;
 mod collab_screen;
+mod collaboration_output;
 mod config_cmd;
 mod daemon;
 mod dashboard_tui;
@@ -16,6 +17,7 @@ mod init;
 mod interactive_child;
 mod logs;
 mod mcp;
+mod mcp_reload;
 mod message_skill;
 mod mux_control;
 mod onboarding;
@@ -376,8 +378,7 @@ enum Cmd {
     /// Rebuild a workspace from a snapshot. Prints the plan unless `--run`
     Restore(reload::RestoreArgs),
 
-    /// Snapshot, restart the multiplexer, and put the workspace back. Run it
-    /// from outside the server it restarts
+    /// Reload MCP connections or snapshot/restart/restore the multiplexer
     Reload(reload::ReloadArgs),
 
     /// Update muxa from the source repo: `git pull` → cargo install
@@ -587,6 +588,15 @@ enum MsgCmd {
         /// Maximum wait in seconds (clamped to 600).
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
+        /// Print only the final reply body, without shell-side JSON parsing.
+        #[arg(long, conflicts_with = "full")]
+        body: bool,
+        /// Return the legacy full request JSON instead of a compact reply receipt.
+        #[arg(long)]
+        full: bool,
+        /// Write the result directly to a UTF-8 file instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Cancel a request that the recipient has not claimed yet.
     Cancel {
@@ -2016,7 +2026,21 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
         MsgCmd::Wait {
             request_id,
             timeout_secs,
-        } => cmd_msg_wait(client, &origin, &request_id, timeout_secs).await?,
+            body,
+            full,
+            output,
+        } => {
+            cmd_msg_wait(
+                client,
+                &origin,
+                &request_id,
+                timeout_secs,
+                body,
+                full,
+                output.as_deref(),
+            )
+            .await?;
+        }
         MsgCmd::Cancel { request_id, json } => {
             let request = client.collaboration_cancel(&origin, &request_id).await?;
             print_collaboration_receipt(&request, json)?;
@@ -2053,16 +2077,50 @@ async fn cmd_msg_wait(
     origin: &CollaborationOrigin,
     request_id: &str,
     timeout_secs: u64,
+    body: bool,
+    full: bool,
+    output: Option<&Path>,
 ) -> Result<()> {
     let request = client
         .collaboration_wait(origin, request_id, timeout_secs)
         .await?;
-    if request.status.is_terminal() {
-        println!("{}", serde_json::to_string_pretty(&request)?);
-        Ok(())
-    } else {
-        anyhow::bail!("timed out waiting for {request_id}")
+    if !request.status.is_terminal() && body {
+        eprintln!("wait deadline reached for {request_id}; no final reply received");
+        std::process::exit(2);
     }
+    let text = render_reply_output(&request, body, full)?;
+    if let Some(path) = output {
+        std::fs::write(path, text).with_context(|| format!("write reply to {}", path.display()))?;
+    } else {
+        println!("{text}");
+    }
+    if !request.status.is_terminal() {
+        // No work judgement: this invocation reached its wait deadline.
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn render_reply_output(
+    request: &muxa::collaboration::CollaborationRequest,
+    body: bool,
+    full: bool,
+) -> Result<String> {
+    if body {
+        return request
+            .reply
+            .as_ref()
+            .map(|reply| reply.body.clone())
+            .ok_or_else(|| anyhow::anyhow!("no final reply received for {}", request.id));
+    }
+    if full {
+        return Ok(serde_json::to_string(request)?);
+    }
+    let mut value = collaboration_output::outcome(request);
+    if !request.status.is_terminal() {
+        value["reason"] = serde_json::json!("timeout");
+    }
+    Ok(serde_json::to_string(&value)?)
 }
 
 /// What `send`, `reply`, and `cancel` say when they worked.
@@ -4361,6 +4419,102 @@ fn status_state_cell(label: &str, state: AgentState, theme: CliTheme) -> Cell {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reload_scopes_preserve_legacy_mux_and_reject_cross_scope_options() {
+        for argv in [
+            vec!["muxa", "reload", "--yes"],
+            vec!["muxa", "reload", "mux", "--yes"],
+            vec!["muxa", "reload", "mcp", "--dry-run", "--json"],
+            vec!["muxa", "reload", "mcp", "--all"],
+            vec!["muxa", "reload", "mcp", "--codex-home", "/profiles/account"],
+        ] {
+            assert!(Args::try_parse_from(&argv).is_ok(), "rejected {argv:?}");
+        }
+        for argv in [
+            vec!["muxa", "reload", "--yes", "mcp"],
+            vec!["muxa", "reload", "mcp", "--layout-only"],
+            vec![
+                "muxa",
+                "reload",
+                "mcp",
+                "--all",
+                "--codex-home",
+                "/profiles/account",
+            ],
+            vec!["muxa", "reload", "mcp", "--timeout-secs", "0"],
+        ] {
+            assert!(Args::try_parse_from(&argv).is_err(), "accepted {argv:?}");
+        }
+    }
+
+    #[test]
+    fn reply_output_preserves_json_escapes_and_direct_body() {
+        let mut request = collaboration_output::fixture();
+        let body = "pending\nquote: \" \\ path\n한글";
+        request.status = RequestStatus::Failed;
+        request.reply = Some(muxa::collaboration::CollaborationReply {
+            status: RequestStatus::Failed,
+            body: body.into(),
+            artifacts: vec![],
+            air_artifacts: vec![],
+            at: time::OffsetDateTime::UNIX_EPOCH,
+        });
+        let output = render_reply_output(&request, false, false).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["reply"]["body"], body);
+        assert_eq!(value["final_reply_received"], true);
+        assert_eq!(value["reported_status"], "failed");
+        assert_eq!(render_reply_output(&request, true, false).unwrap(), body);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &render_reply_output(&request, false, true).unwrap()
+            )
+            .unwrap(),
+            serde_json::json!(request)
+        );
+    }
+
+    #[test]
+    fn reply_timeout_does_not_close_or_fail_work() {
+        let request = collaboration_output::fixture();
+        let output = render_reply_output(&request, false, false).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["reason"], "timeout");
+        assert_eq!(value["delivery_state"], "claimed");
+        assert_eq!(value["final_reply_received"], false);
+        assert!(value.get("reported_status").is_none());
+        assert!(render_reply_output(&request, true, false).is_err());
+    }
+
+    #[test]
+    fn message_wait_cli_supports_direct_body_file_and_legacy_full_record() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "msg",
+            "wait",
+            "req-test",
+            "--body",
+            "--output",
+            "/tmp/reply.txt",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.cmd,
+            Cmd::Msg {
+                action: MsgCmd::Wait {
+                    body: true,
+                    output: Some(_),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(Args::try_parse_from(["muxa", "msg", "wait", "req-test", "--full"]).is_ok());
+        assert!(
+            Args::try_parse_from(["muxa", "msg", "wait", "req-test", "--body", "--full"]).is_err()
+        );
+    }
+
     /// rmux exports the tmux compatibility variables alongside its own, and
     /// the CLI once read `$TMUX_PANE` directly — yielding a bare `%118` where
     /// hooks stamp `rmux:%118`, so the origin matched no tracked agent and
@@ -4462,7 +4616,7 @@ mod tests {
         };
         assert!(about("snapshot").starts_with("Capture this multiplexer"));
         assert!(about("restore").starts_with("Rebuild a workspace"));
-        assert!(about("reload").starts_with("Snapshot, restart"));
+        assert!(about("reload").starts_with("Reload MCP"));
         assert!(about("upgrade").starts_with("Update muxa from the source repo"));
     }
 

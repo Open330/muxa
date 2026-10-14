@@ -227,7 +227,7 @@ muxa msg send peer "review the risks in this plan" --kind review \
   --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"CAL-6924 plan","locator":{"display":".air/cal-6924-plan.air.json","disclosure":"local-only"}}'
 muxa msg inbox
 muxa msg reply req_... "review complete" --status completed
-muxa msg wait req_... --timeout-secs 300
+muxa msg wait req_... --timeout-secs 300 --body
 muxa msg list --mailbox sent
 muxa msg list --scope room     # every participant in this window
 muxa msg list --scope all      # every room this daemon holds
@@ -235,6 +235,18 @@ muxa msg list --scope all --since 7d --work CAL-7345 --kind review \
   --status completed --limit 50 --offset 0
 muxa msg cancel req_... # queued requests only
 ```
+
+`muxa msg wait` defaults to compact JSON describing delivery and final reply
+receipt, not work success. A timeout is a JSON observation (`reason: timeout`)
+with exit code 2; this describes the wait, not the work result. Transport errors remain nonzero. Use `--body` to print only the
+final reply, or `--body --output /tmp/reply.txt` to write it directly without
+shell-side JSON parsing. `--body` also exits 2 on timeout without writing a body/file; a closed request
+with no final reply is an error.
+`--full` opts into the legacy complete request JSON. Do not grep the reply for
+`pending`/`timeout` to decide completion, or pass JSON through shell `echo`:
+it can expand JSON escapes. Use direct stdout/file output, or pipe directly to
+a JSON parser. Progress and final replies remain distinct; a final reply's
+status is declared by its author and verified by the requester.
 
 `send`, `reply`, and `cancel` print a one-line receipt; `list` and `inbox`
 print each request followed by its reply, when one has come back. Add `--json`
