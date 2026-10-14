@@ -2,9 +2,9 @@
 //!
 //! Answers the question "is muxa working correctly?" without making the
 //! user know any paths or service-manager incantations. Each check
-//! prints exactly one line with a `✔ / ✗ / ⚠` glyph and an actionable
-//! hint when it fails. The output is cliclack-styled so it matches
-//! `muxa init`'s look.
+//! yields a `✔ / ✗ / ⚠` result with an actionable hint when it fails;
+//! `doctor_report` groups them by section and provider, folding whatever
+//! passes so the issues stand out (`-v` lists everything).
 //!
 //! Why this lives in its own module instead of reusing
 //! `init::verify`: verify is post-apply (one shot, narrow scope),
@@ -23,6 +23,8 @@ use muxa::state::SYNTHETIC_SESSION_PREFIX;
 use muxa::tmux::layout::{self, ClientSurface};
 use muxa::Agent;
 use tokio::time::timeout;
+
+use crate::doctor_report::{tilde, Level, Report};
 
 use crate::init::files::{antigravity, claude, codex, gemini, launchd, systemd as systemd_files};
 
@@ -53,117 +55,148 @@ const MUXAD_ERR_LOG: &str = "/tmp/muxad.err";
 /// computes from `--socket` / `MUXA_SOCKET` / `cfg.socket` / the default.
 /// Threading it in (rather than re-deriving from defaults here) keeps
 /// `muxa doctor` honest about which socket muxa would actually talk to.
-pub async fn run(socket: PathBuf, config: Option<&Path>) -> Result<()> {
-    let _ = cliclack::intro("muxa doctor");
+pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Result<()> {
+    let mut report = Report::default();
 
-    let mut issues = 0u32;
-
-    // 1. muxad responsive over IPC.
-    tally(check_muxad(&socket).await, &mut issues);
-
-    // 1½. Agents seen via discovery but not yet correlated with a hook.
-    //      Skipped silently when muxad is unreachable — `check_muxad`
-    //      already owns and reported that condition.
+    // muxad: reachable, every live agent correlated, how it is kept running.
+    add(&mut report, "muxad", None, check_muxad(&socket).await);
+    // Skipped silently when muxad is unreachable: `check_muxad` already
+    // owns and reported that condition.
     if let Some(snapshot) = fetch_snapshot(&socket).await {
-        tally(check_synthetic_agents(&snapshot), &mut issues);
+        add(
+            &mut report,
+            "muxad",
+            None,
+            check_synthetic_agents(&snapshot),
+        );
+    }
+    add(&mut report, "muxad", None, check_service_manager());
+    add(&mut report, "muxad", None, check_unit_file());
+    // Recent muxad errors. These are warnings, not failures: a stale ERROR
+    // line from yesterday shouldn't make the whole run look red.
+    let warnings = recent_muxad_errors(MUXAD_ERR_LOG, 20, 3);
+    if warnings.is_empty() {
+        add(
+            &mut report,
+            "muxad",
+            None,
+            CheckResult::Ok("recent log clean".into()),
+        );
+    }
+    for line in &warnings {
+        add(
+            &mut report,
+            "muxad",
+            None,
+            CheckResult::Warn(format_warning_line(line)),
+        );
     }
 
-    // 2. Service manager status (per-OS).
-    tally(check_service_manager(), &mut issues);
-
-    // 3. Service manager unit file on disk.
-    tally(check_unit_file(), &mut issues);
-
-    // 4. Per-agent hook configuration. Label-prefixed, so it folds
-    //    its own message before handing off to `tally`.
+    // One hook per agent CLI, so the provider is the group.
     for (label, result) in check_agent_hooks() {
-        let labelled = match result {
-            CheckResult::Ok(m) => CheckResult::Ok(format!("{label} — {m}")),
-            CheckResult::Warn(m) => CheckResult::Warn(format!("{label} — {m}")),
-            CheckResult::Fail(m) => CheckResult::Fail(format!("{label} — {m}")),
-        };
-        tally(labelled, &mut issues);
+        let provider = label.trim_start_matches("Hooks · ").to_string();
+        add(&mut report, "Hooks", Some(&provider), result);
     }
+
+    // Installed instructions, MCP entries and skills, one file per provider.
     match crate::init::integration::diagnostics(config) {
         Ok(checks) => {
             for (healthy, message) in checks {
-                tally(
-                    if healthy {
-                        CheckResult::Ok(message)
-                    } else {
-                        CheckResult::Warn(message)
-                    },
-                    &mut issues,
-                );
+                let (group, message) = match message.split_once(": ") {
+                    Some((component, rest)) => (
+                        Some(component.trim_start_matches("agent-").to_string()),
+                        rest.to_string(),
+                    ),
+                    None => (None, message),
+                };
+                let result = if healthy {
+                    CheckResult::Ok(message)
+                } else {
+                    CheckResult::Warn(message)
+                };
+                add(&mut report, "Agent integration", group.as_deref(), result);
             }
         }
-        Err(error) => tally(
-            CheckResult::Warn(format!("Agent integration: {error}")),
-            &mut issues,
+        Err(error) => add(
+            &mut report,
+            "Agent integration",
+            None,
+            CheckResult::Warn(error.to_string()),
         ),
     }
+    // Agent tool servers (`muxa mcp`) still on a pre-upgrade binary: their
+    // tools keep old behavior until the host refreshes them.
+    add(
+        &mut report,
+        "Agent integration",
+        None,
+        check_stale_agent_servers(),
+    );
 
-    // 4½. Agent tool servers (`muxa mcp`) still on a pre-upgrade binary:
-    //     their tools keep old behavior until the agent or server restarts.
-    tally(check_stale_agent_servers(), &mut issues);
-
-    // 4¾. What the tmux server and client this doctor run is talking to
-    //     can actually do. Read once and threaded into the tmux checks
-    //     below, because a config-isolated or control-mode server changes
-    //     what their remedies should be: "run `muxa init`" is wrong advice
-    //     for a server that will never read `~/.tmux.conf`.
+    // What the tmux server and client this run talks to can actually do. Read
+    // once and threaded into the checks below, because a config-isolated or
+    // control-mode server changes what their remedies should be: "run `muxa
+    // init`" is wrong advice for a server that will never read `~/.tmux.conf`.
     let tmux_env = TmuxEnvironment::probe();
-    tally(tmux_env.describe(), &mut issues);
-
-    // 5. tmux marker blocks.
-    tally(check_tmux_blocks(), &mut issues);
-
-    // 5¼. …and whether the binding tmux would actually run is the one
-    // those blocks describe. A duplicate `bind-key` later in the file,
-    // or a server that never re-read the file, leaves the block present
-    // and the behaviour stale.
-    tally(check_tmux_watch_binding(&tmux_env), &mut issues);
-
-    // 5½. MUXA_SOCKET env — the variable that lets every pane agree
-    // on the daemon socket path after a restart.
-    tally(check_muxa_socket_env(&socket, &tmux_env), &mut issues);
-
-    // 5¾. Where config.toml is expected to live. Informational, but the
-    // path differs per OS and nothing else prints it.
-    tally(check_config_file(), &mut issues);
-
-    // 5⅞. Workspace marks vs session names. Reported, never acted on:
-    // the mark legitimately outranks the name, so a disagreement is a thing
-    // to know about rather than a thing to refuse.
-    tally(check_workspace_marks(), &mut issues);
-
-    // 6. Recent muxad errors. These are surfaced as warnings (not
-    //    failures) — a stale ERROR line from yesterday shouldn't make
-    //    the whole doctor run look red.
-    let warnings = recent_muxad_errors(MUXAD_ERR_LOG, 20, 3);
-    if warnings.is_empty() {
-        log_ok("Recent muxad log clean");
-    } else {
-        for line in &warnings {
-            log_warn(&format_warning_line(line));
-        }
-        issues += u32::try_from(warnings.len()).unwrap_or(u32::MAX);
+    for result in [
+        tmux_env.describe(),
+        check_tmux_blocks(),
+        // A duplicate `bind-key` later in the file, or a server that never
+        // re-read it, leaves the block present and the behaviour stale.
+        check_tmux_watch_binding(&tmux_env),
+        // The variable that lets every pane agree on the daemon socket.
+        check_muxa_socket_env(&socket, &tmux_env),
+        // Reported, never acted on: the mark legitimately outranks the name.
+        check_workspace_marks(),
+    ] {
+        add(
+            &mut report,
+            "tmux",
+            None,
+            result.map(|m| m.trim_start_matches("tmux: ").to_string()),
+        );
     }
 
-    // Summary footer matches the cliclack box style; outro renders
-    // the closing └ glyph.
+    add(
+        &mut report,
+        "Config",
+        None,
+        check_config_file().map(|m| m.trim_start_matches("config: ").to_string()),
+    );
+
+    println!("┌  muxa doctor");
+    print!("{}", report.render(verbose, &paint));
     // Point at the per-check guidance printed above rather than asserting a
     // blanket `muxa init`/`upgrade` remedy — several warnings (e.g. "restart
     // the agents to enable hook events") are not fixed by either command.
-    let summary = if issues == 0 {
-        "All clean ✓".to_string()
-    } else if issues == 1 {
-        "1 issue — see the ⚠/✗ line above for its specific fix".to_string()
-    } else {
-        format!("{issues} issues — see the ⚠/✗ lines above for their specific fixes")
+    let summary = match report.issues() {
+        0 => "All clean ✓".to_string(),
+        1 => "1 issue — see the ⚠/✗ line above for its specific fix".to_string(),
+        issues => format!("{issues} issues — see the ⚠/✗ lines above for their specific fixes"),
     };
-    let _ = cliclack::outro(summary);
+    println!("└  {summary}");
     Ok(())
+}
+
+fn add(report: &mut Report, section: &'static str, group: Option<&str>, result: CheckResult) {
+    let (level, message) = match result {
+        CheckResult::Ok(m) => (Level::Ok, m),
+        CheckResult::Warn(m) => (Level::Warn, m),
+        CheckResult::Fail(m) => (Level::Fail, m),
+    };
+    report.push(section, group, level, tilde(&message));
+}
+
+fn paint(level: Level, text: &str) -> String {
+    if !crate::use_colors() {
+        return text.to_string();
+    }
+    let styled = match level {
+        Level::Ok => console::style(text).green(),
+        Level::Warn => console::style(text).yellow(),
+        Level::Fail => console::style(text).red(),
+    };
+    styled.force_styling(true).to_string()
 }
 
 /// Workspace identity lives in a tmux session option, and the session name is
@@ -211,31 +244,12 @@ enum CheckResult {
     Fail(String),
 }
 
-fn log_ok(msg: &str) {
-    let _ = cliclack::log::success(format!("✔ {msg}"));
-}
-
-fn log_warn(msg: &str) {
-    let _ = cliclack::log::warning(format!("⚠ {msg}"));
-}
-
-fn log_fail(msg: &str) {
-    let _ = cliclack::log::error(format!("✗ {msg}"));
-}
-
-/// Fold a uniform check into the running issue count + log line.
-/// One call site per check keeps `run()` readable and removes the
-/// Ok/Warn/Fail boilerplate that used to repeat for every check.
-fn tally(result: CheckResult, issues: &mut u32) {
-    match result {
-        CheckResult::Ok(msg) => log_ok(&msg),
-        CheckResult::Warn(msg) => {
-            log_warn(&msg);
-            *issues += 1;
-        }
-        CheckResult::Fail(msg) => {
-            log_fail(&msg);
-            *issues += 1;
+impl CheckResult {
+    fn map(self, f: impl FnOnce(String) -> String) -> Self {
+        match self {
+            Self::Ok(m) => Self::Ok(f(m)),
+            Self::Warn(m) => Self::Warn(f(m)),
+            Self::Fail(m) => Self::Fail(f(m)),
         }
     }
 }
@@ -807,7 +821,10 @@ impl TmuxEnvironment {
 /// intact and doctor green while `prefix+s` opens an inset popup, whose
 /// inner width cannot reach the 120 columns the watch inspector needs.
 fn check_tmux_watch_binding(env: &TmuxEnvironment) -> CheckResult {
-    let out = muxa::tmux::tmux_command()
+    // Scoped like the other tmux checks. Unscoped, it asked the default
+    // socket, and rmux, unlike tmux, starts a server to answer: every
+    // isolated doctor run (the test suite included) left one behind.
+    let out = muxa::tmux::tmux_command_scoped()
         .args(["list-keys", "-T", "prefix"])
         .output();
     let text = match out {
