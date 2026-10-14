@@ -73,6 +73,9 @@ impl RevisionPlan {
         else {
             return Ok(None);
         };
+        if server.get("enabled").and_then(toml::Value::as_bool) == Some(false) {
+            return Ok(None);
+        }
         let command = server
             .get("command")
             .and_then(toml::Value::as_str)
@@ -232,6 +235,27 @@ mod tests {
         assert!(RevisionPlan::prepare(dir.path(), &binary, &revision)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn disabled_registration_is_never_selected_for_revision_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (setting, selected) in [
+            ("enabled=false\n", false),
+            ("enabled=true\n", true),
+            ("", true),
+        ] {
+            let config = format!("[mcp_servers.muxa]\ncommand='muxa'\nargs=['mcp']\n{setting}");
+            std::fs::write(&path, &config).unwrap();
+            assert_eq!(
+                RevisionPlan::prepare(dir.path(), Path::new("/none"), "sha256:test")
+                    .unwrap()
+                    .is_some(),
+                selected
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), config);
+        }
     }
 
     #[test]

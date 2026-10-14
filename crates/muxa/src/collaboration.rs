@@ -2525,7 +2525,7 @@ impl CollaborationStore {
                 .get_mut(request_id)
                 .ok_or_else(|| CollaborationError::NotFound(request_id.to_string()))?;
             let is_sender = request.from.same_session(caller);
-            if !is_sender && !addresses(&request.to, caller) {
+            if !caller.console && !is_sender && !addresses(&request.to, caller) {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
             if is_sender && request.reply.is_some() && request.reply_read_at.is_none() {
@@ -5693,6 +5693,84 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_exact_read_matches_all_scope_without_acknowledging_agent_reply() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = CollaborationStore::load(CollaborationOptions {
+                path: durable.then(|| dir.path().join("operator-read.sqlite3")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let sender = participant_in_window("%1", "sender", "@1");
+            let recipient = participant_in_window("%2", "recipient", "@1");
+            let request = store
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "read exactly one".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .reply(
+                    &recipient,
+                    &request.id,
+                    RequestStatus::Completed,
+                    "reply".into(),
+                    vec![],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            let console = console_in_window("@2");
+            let listed = store
+                .list_for(&console, RequestMailbox::All, MailboxScope::All)
+                .await
+                .unwrap();
+            let read = store.get_for(&console, &request.id).await.unwrap();
+            assert_eq!(read.id, listed[0].id);
+            assert!(read.reply_read_at.is_none());
+            assert_eq!(store.unread_reply_count(&sender).await, 1);
+            assert!(matches!(
+                store
+                    .get_for(&participant("%3", "stranger"), &request.id)
+                    .await,
+                Err(CollaborationError::NotParticipant(_))
+            ));
+            assert!(matches!(
+                store.get_for(&console, "missing").await,
+                Err(CollaborationError::NotFound(_))
+            ));
+            let reloaded = if durable {
+                CollaborationStore::load(CollaborationOptions {
+                    path: Some(dir.path().join("operator-read.sqlite3")),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+            } else {
+                store
+            };
+            assert!(reloaded
+                .get_for(&console, &request.id)
+                .await
+                .unwrap()
+                .reply_read_at
+                .is_none());
+            assert!(reloaded
+                .get_for(&sender, &request.id)
+                .await
+                .unwrap()
+                .reply_read_at
+                .is_some());
+        }
     }
 
     #[tokio::test]
