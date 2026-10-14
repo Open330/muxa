@@ -578,19 +578,23 @@ impl<L: LivenessSource> Reconciler<L> {
         };
         let workload_scan_us =
             u64::try_from(workload_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        // Detached app-server hooks can retain another terminal's pane.
-        // Explicit resume ids plus live process ancestry outrank that binding.
+        // Detached app-server hooks can retain another terminal's pane, and a
+        // multiplexer restart renumbers every pane while `muxa reload`
+        // relaunches agents by resume id. Explicit resume ids plus live process
+        // ancestry outrank the stored binding, so an idle resumed agent is not
+        // left on an id that now belongs to another pane until its next hook.
         let mut codex_hosts = Vec::new();
         if !union_panes.is_empty()
             && self.store.snapshot().await.iter().any(|agent| {
-                agent.kind == AgentKind::Codex && !agent.session_id.starts_with("synthetic-")
+                matches!(agent.kind, AgentKind::Codex | AgentKind::ClaudeCode)
+                    && !agent.session_id.starts_with("synthetic-")
             })
         {
             let panes = union_panes.clone();
             let scan = tokio::task::spawn_blocking(move || process_tree::scan_codex_panes(&panes))
                 .await
                 .unwrap_or_default();
-            self.store.rebind_codex_resumes(&scan.resume_bindings).await;
+            self.store.rebind_resumes(&scan.resume_bindings).await;
             codex_hosts = scan.hosts;
         }
         let reconcile_started = Instant::now();

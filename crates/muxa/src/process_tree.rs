@@ -106,7 +106,10 @@ pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummar
 /// Live Codex evidence from one walk of every pane's process tree.
 #[derive(Debug, Default)]
 pub struct CodexPaneScan {
-    /// Explicit `codex resume <id>` sessions and the one pane each runs in.
+    /// Explicit resume ids (`codex resume <id>`, `claude --resume <id>`) and
+    /// the one pane each runs in. A multiplexer restart renumbers panes and
+    /// `muxa reload` relaunches agents this way, so this is how a registry row
+    /// finds its new pane before the agent's next hook.
     pub resume_bindings: Vec<(String, PaneInfo)>,
     /// Panes running an interactive Codex, resumed or fresh. A thread behind
     /// the shared app-server reports no pane, and the screen detector can
@@ -141,7 +144,7 @@ pub fn scan_codex_panes(panes: &[PaneInfo]) -> CodexPaneScan {
         .map(|(pane, _)| (*pane).clone())
         .collect();
     CodexPaneScan {
-        resume_bindings: unique_codex_resume_bindings(scanned.into_iter()),
+        resume_bindings: unique_resume_bindings(scanned.into_iter()),
         hosts,
     }
 }
@@ -162,13 +165,13 @@ fn is_interactive_codex(process: &ProcessInfo) -> bool {
     )
 }
 
-fn unique_codex_resume_bindings<'a>(
+fn unique_resume_bindings<'a>(
     scanned: impl Iterator<Item = (&'a PaneInfo, Vec<ProcessInfo>)>,
 ) -> Vec<(String, PaneInfo)> {
     let mut candidates: HashMap<String, Vec<PaneInfo>> = HashMap::new();
     for (pane, processes) in scanned {
         for process in processes {
-            let Some(sid) = codex_resume_id(&process) else {
+            let Some(sid) = resume_id(&process) else {
                 continue;
             };
             let matches = candidates.entry(sid.to_owned()).or_default();
@@ -184,6 +187,35 @@ fn unique_codex_resume_bindings<'a>(
         .into_iter()
         .filter_map(|(sid, mut panes)| (panes.len() == 1).then(|| (sid, panes.remove(0))))
         .collect()
+}
+
+/// The session an agent process was explicitly started on, if any.
+fn resume_id(process: &ProcessInfo) -> Option<&str> {
+    match agent_kind(process) {
+        Some(AgentKind::Codex) => codex_resume_id(process),
+        Some(AgentKind::ClaudeCode) => claude_resume_id(process),
+        _ => None,
+    }
+}
+
+/// `claude --resume <id>` / `-r <id>` / `--resume=<id>`, and the explicit
+/// `--session-id <id>` a forked session is started with.
+fn claude_resume_id(process: &ProcessInfo) -> Option<&str> {
+    let mut args = process.cmdline.split_whitespace();
+    while let Some(arg) = args.next() {
+        let sid = match arg {
+            "--resume" | "-r" | "--session-id" => args.next()?,
+            _ => match arg
+                .strip_prefix("--resume=")
+                .or_else(|| arg.strip_prefix("--session-id="))
+            {
+                Some(sid) => sid,
+                None => continue,
+            },
+        };
+        return uuid::Uuid::parse_str(sid).ok().map(|_| sid);
+    }
+    None
 }
 
 fn codex_resume_id(process: &ProcessInfo) -> Option<&str> {
@@ -451,14 +483,14 @@ mod tests {
             proc(20, 10, 1, "codex", &format!("codex resume {sid}")),
             proc(21, 20, 2, "codex", &format!("codex resume {sid}")),
         ];
-        let bindings = unique_codex_resume_bindings(std::iter::once((&a, processes.clone())));
+        let bindings = unique_resume_bindings(std::iter::once((&a, processes.clone())));
         assert!(processes.iter().all(is_interactive_codex));
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].0, sid);
         let b = a.clone();
         a.socket = Some("other-server".into());
         assert!(
-            unique_codex_resume_bindings([(&a, processes.clone()), (&b, processes)].into_iter())
+            unique_resume_bindings([(&a, processes.clone()), (&b, processes)].into_iter())
                 .is_empty(),
             "same session in multiple servers must remain ambiguous"
         );
@@ -488,6 +520,32 @@ mod tests {
                 expected,
                 "{args}"
             );
+        }
+    }
+
+    #[test]
+    fn claude_resume_identity_reads_the_explicit_session_flags() {
+        let sid = "9e48c8ff-1b70-4a3e-9f32-1581a05f0f75";
+        for args in [
+            format!("/home/u/.local/bin/claude --dangerously-skip-permissions --resume {sid}"),
+            format!("claude -r {sid}"),
+            format!("claude --resume={sid}"),
+            format!("claude --fork-session --session-id {sid}"),
+        ] {
+            assert_eq!(
+                resume_id(&proc(30, 10, 2, "claude", &args)),
+                Some(sid),
+                "{args}"
+            );
+        }
+        for (comm, args) in [
+            // The launch wrapper carries the same argv but is not the agent.
+            ("aas", format!("aas exec e-ed@claude -- --resume {sid}")),
+            ("claude", "claude --resume".into()),
+            ("claude", "claude --resume my-session-title".into()),
+            ("claude", "claude --dangerously-skip-permissions".into()),
+        ] {
+            assert_eq!(resume_id(&proc(30, 10, 2, comm, &args)), None, "{args}");
         }
     }
 
