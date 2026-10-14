@@ -113,7 +113,24 @@ pub struct RestoreArgs {
 }
 
 #[derive(Debug, Parser)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct ReloadArgs {
+    #[command(subcommand)]
+    target: Option<ReloadTarget>,
+    #[command(flatten)]
+    multiplexer: MultiplexerReloadArgs,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ReloadTarget {
+    /// Refresh existing Codex MCP connections; does not restart the app-server or panes
+    Mcp(crate::mcp_reload::McpReloadArgs),
+    /// Snapshot, restart the multiplexer, and restore the workspace (same as bare reload)
+    Mux(MultiplexerReloadArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct MultiplexerReloadArgs {
     /// Restore from this snapshot instead of taking a fresh one. Use it to
     /// retry a restore that was interrupted.
     #[arg(long)]
@@ -539,6 +556,14 @@ fn live_shape(endpoint: &BackendEndpoint) -> Option<plan::LiveShape> {
 }
 
 pub async fn reload(client: &Client, args: ReloadArgs) -> Result<()> {
+    match args.target {
+        Some(ReloadTarget::Mcp(args)) => crate::mcp_reload::run(args).await,
+        Some(ReloadTarget::Mux(args)) => reload_multiplexer(client, args).await,
+        None => reload_multiplexer(client, args.multiplexer).await,
+    }
+}
+
+async fn reload_multiplexer(client: &Client, args: MultiplexerReloadArgs) -> Result<()> {
     if inside_a_multiplexer() {
         bail!(
             "refusing to reload from inside a multiplexer: this kills the server \

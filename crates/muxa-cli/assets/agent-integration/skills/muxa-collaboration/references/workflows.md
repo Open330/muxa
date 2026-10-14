@@ -2,6 +2,11 @@
 
 ## Independent review
 
+For independent review, Codex uses Claude and Claude uses Codex unless the
+user explicitly selects a different provider. Resolve a matching peer in room
+context; when a new reviewer is authorized, explicitly launch that opposite
+provider instead of choosing the caller's own provider.
+
 For "@peer review the current changes", retrieve room context, then call
 `muxa_call_peer(target="auto", intent="review", body="Review the current diff for
 correctness. Acceptance criteria: ...; checks already run: ...; focus: ...",

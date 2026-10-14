@@ -30,6 +30,8 @@ time = { workspace = true }
 # `io-std` (on top of the workspace feature set) gives `muxa mcp` async
 # stdin/stdout for its JSON-RPC stdio loop.
 tokio = { workspace = true, features = ["io-std"] }
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
