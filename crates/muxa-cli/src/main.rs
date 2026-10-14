@@ -20,6 +20,7 @@ mod interactive_child;
 mod logs;
 mod mcp;
 mod mcp_reload;
+mod mcp_revision;
 mod message_skill;
 mod mux_control;
 mod onboarding;
@@ -567,9 +568,15 @@ enum MsgCmd {
         /// either the human window name or stable tmux window id.
         #[arg(long, visible_alias = "room")]
         window: Option<String>,
-        /// Maximum number of matching messages to print.
-        #[arg(long)]
+        /// Maximum number of matching messages to print (default 20; 0 for all).
+        #[arg(long, default_value = "20")]
         limit: Option<usize>,
+        /// Read one exact request instead of retrieving mailbox history.
+        #[arg(long, conflicts_with_all = ["mailbox", "since", "work", "workspace", "thread", "kind", "status", "window", "limit", "offset"])]
+        request_id: Option<String>,
+        /// Include full original requests and replies; default is metadata only.
+        #[arg(long)]
+        full: bool,
         /// Number of matching messages to skip before applying `--limit`.
         #[arg(long, default_value_t = 0)]
         offset: usize,
@@ -1903,8 +1910,8 @@ impl CollaborationListFilters {
             .filter(|request| self.matches(request))
             .skip(self.offset);
         match self.limit {
+            Some(0) | None => matches.collect(),
             Some(limit) => matches.take(limit).collect(),
-            None => matches.collect(),
         }
     }
 
@@ -2042,6 +2049,8 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             status,
             window,
             limit,
+            request_id,
+            full,
             offset,
             json,
         } => {
@@ -2056,7 +2065,17 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                 limit,
                 offset,
             )?;
-            cmd_msg_list(client, &origin, &mailbox, &scope, &filters, json).await?;
+            cmd_msg_list(
+                client,
+                &origin,
+                &mailbox,
+                &scope,
+                &filters,
+                request_id.as_deref(),
+                full,
+                json,
+            )
+            .await?;
         }
         MsgCmd::Reply {
             request_id,
@@ -2139,12 +2158,15 @@ async fn cmd_msg_expire(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // CLI scope, filters and output flags
 async fn cmd_msg_list(
     client: &Client,
     origin: &CollaborationOrigin,
     mailbox: &str,
     scope: &str,
     filters: &CollaborationListFilters,
+    request_id: Option<&str>,
+    full: bool,
     json: bool,
 ) -> Result<()> {
     let scope = collaboration_list_scope(scope)?;
@@ -2155,11 +2177,30 @@ async fn cmd_msg_list(
         console: !matches!(scope, MailboxScope::Caller),
         ..origin.clone()
     };
-    let requests = client
-        .collaboration_list_scoped(&listing_origin, collaboration_mailbox(mailbox)?, scope)
-        .await?;
+    let mailbox = collaboration_mailbox(mailbox)?;
+    let requests = if let Some(id) = request_id {
+        let request = client.collaboration_get(&listing_origin, id).await?;
+        if matches!(scope, MailboxScope::Room) {
+            let room = client.collaboration_context(origin).await?.current.room;
+            if request.from.room != room && request.to.room != room {
+                anyhow::bail!("request {id} is outside the selected room");
+            }
+        }
+        vec![request]
+    } else {
+        client
+            .collaboration_list_scoped(&listing_origin, mailbox, scope)
+            .await?
+    };
+    let total = requests
+        .iter()
+        .filter(|request| filters.matches(request))
+        .count();
     let requests = filters.apply(requests);
-    print_collaboration_messages(&requests, json, origin, scope)
+    if requests.len() < total.saturating_sub(filters.offset) {
+        eprintln!("Showing {} of {total} matching messages; next page: --offset {} (or --limit 0 for all).", requests.len(), filters.offset.saturating_add(requests.len()));
+    }
+    print_collaboration_messages(&requests, json, full, origin, scope)
 }
 
 async fn cmd_msg_wait(
@@ -2270,14 +2311,43 @@ fn participant_location(participant: &Participant) -> String {
     format!("{session}:{window}")
 }
 
+fn render_message_list(
+    requests: &[muxa::collaboration::CollaborationRequest],
+    full: bool,
+) -> Result<String> {
+    if full {
+        return Ok(serde_json::to_string_pretty(requests)?);
+    }
+    let values = requests
+        .iter()
+        .map(|request| -> Result<serde_json::Value> {
+            let mut value = collaboration_output::message(request, false);
+            let object = value.as_object_mut().expect("message is an object");
+            let id = object.remove("request_id").expect("message has an id");
+            object.insert("id".into(), id);
+            // Preserve CLI filter consumers; this is the stored declaration, not a task judgement.
+            object.insert("status".into(), serde_json::json!(request.status));
+            object.insert(
+                "created_at".into(),
+                serde_json::json!(request
+                    .created_at
+                    .format(&time::format_description::well_known::Rfc3339)?),
+            );
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(serde_json::to_string(&values)?)
+}
+
 fn print_collaboration_messages(
     requests: &[muxa::collaboration::CollaborationRequest],
     json: bool,
+    full: bool,
     origin: &CollaborationOrigin,
     scope: MailboxScope,
 ) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(requests)?);
+        println!("{}", render_message_list(requests, full)?);
     } else if requests.is_empty() {
         println!("No collaboration messages.");
     } else {
@@ -2324,9 +2394,13 @@ fn print_collaboration_messages(
                     format!("  [via {} {caller}{pid} {}]", p.client_kind, p.origin_match)
                 });
             println!(
-                "{}  {:?}  {:?}  {}{}\n  {}",
-                request.id, request.status, request.kind, direction, provenance, request.body,
+                "{}  {:?}  {:?}  {}{}",
+                request.id, request.status, request.kind, direction, provenance
             );
+            if !full {
+                continue;
+            }
+            println!("  {}", request.body);
             // Without this the sender sees their own question and a status, and
             // the answer they were told to come here for is nowhere on screen.
             if let Some(reply) = &request.reply {
@@ -4513,6 +4587,60 @@ fn status_state_cell(label: &str, state: AgentState, theme: CliTheme) -> Cell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_list_defaults_are_bounded_and_full_output_is_explicit() {
+        let parsed = Args::try_parse_from(["muxa", "msg", "list", "--json"]).unwrap();
+        let Cmd::Msg {
+            action:
+                MsgCmd::List {
+                    limit,
+                    full,
+                    request_id,
+                    ..
+                },
+        } = parsed.cmd
+        else {
+            panic!("expected list")
+        };
+        assert_eq!(limit, Some(20));
+        assert!(!full);
+        assert!(request_id.is_none());
+        let mut request = collaboration_output::fixture();
+        request.body = "private original instructions".into();
+        let compact: serde_json::Value =
+            serde_json::from_str(&render_message_list(&[request.clone()], false).unwrap()).unwrap();
+        assert_eq!(compact[0]["id"], request.id);
+        assert_eq!(compact[0]["created_at"], "2026-10-14T00:00:00Z");
+        assert!(compact[0].get("body").is_none());
+        assert!(compact[0].get("reply").is_none());
+        assert!(compact[0].get("provenance").is_none());
+        let legacy: serde_json::Value =
+            serde_json::from_str(&render_message_list(&[request], true).unwrap()).unwrap();
+        assert_eq!(legacy[0]["body"], "private original instructions");
+        assert!(
+            Args::try_parse_from(["muxa", "msg", "list", "--request-id", "req-1", "--full"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn explicit_zero_limit_preserves_complete_filtered_history() {
+        let request = collaboration_output::fixture();
+        let requests = vec![request; 25];
+        let default_page = CollaborationListFilters {
+            limit: Some(20),
+            ..Default::default()
+        }
+        .apply(requests.clone());
+        assert_eq!(default_page.len(), 20);
+        let all = CollaborationListFilters {
+            limit: Some(0),
+            ..Default::default()
+        }
+        .apply(requests);
+        assert_eq!(all.len(), 25);
+    }
 
     #[test]
     fn reload_scopes_preserve_legacy_mux_and_reject_cross_scope_options() {

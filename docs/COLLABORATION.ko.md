@@ -511,3 +511,15 @@ request 수와 아직 확인하지 않은 reply 수를 각각 반환합니다.
 하려면 `work_mode = execute`와 path scope를 명시하세요. 현재 path scope는 agent
 간 협업 계약이며 OS sandbox는 아닙니다. 서로 다른 agent가 동시에 같은 파일을
 수정해야 하는 작업에는 별도 git worktree를 권장합니다.
+
+
+CLI `muxa msg list`는 기본 20건의 메타데이터를 출력합니다. 본문·답변·진행 기록·
+provenance는 `--full`로 명시할 때 포함합니다. JSON 배열의 `id`와 저장된 `status`는
+유지하며, `--limit`·`--offset`으로 페이지를 지정합니다.
+`muxa msg list --request-id REQUEST --full --json`은 해당 요청 하나를 직접 조회합니다.
+최종 답변만 필요하면 `muxa msg wait REQUEST --body --output FILE`을 사용합니다.
+짧은 timeout을 반복 조회하지 말고 완료 알림이나 실질적인 작업 체크포인트에서 읽습니다.
+
+`--limit 0`은 일치하는 전체 기록을 요청합니다. 페이지가 잘리면 CLI가 전체 건수와
+다음 offset을 stderr에 표시합니다. JSON 배열은 유지하지만 본문·답변·wake 전달·
+provenance를 읽던 기존 진단 스크립트에는 `--full`을 추가해야 합니다.

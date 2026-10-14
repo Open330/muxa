@@ -34,11 +34,14 @@ schemas and returned IDs describe the currently installed capabilities.
 
 1. Resolve existing peers from room context. Choose an explicit pane, provider,
    alias, or unambiguous role when the recipient matters. Never infer pane IDs.
-2. For new work, use `muxa_call_peer`. State the objective, relevant context,
+2. Use the exact `peer.pane` returned by room context, including `rmux:`. If a
+   peer moved or disappeared, refresh context once; do not retry old IDs or aliases.
+   For new work, use `muxa_call_peer`. State the objective, relevant context,
    acceptance criteria, permitted paths, and expected verification/artifacts.
    Review and question requests are read-only. Editing requires `intent=task`
    and `execute=true` within the user's authorized delegation scope.
-3. Prefer `wait=false` while independent local work remains. Keep the returned
+3. Prefer `wait=false` while independent local work remains. Read the result after
+   its completion wake or a substantive work checkpoint; avoid short timeout polling. Keep the returned
    `request_id`; retrieve the structured reply with `muxa_wait_reply`. For an
    existing report or feedback request, use `muxa_peer_report` before sending work.
 4. A timeout or `peer_pending` means the request may still be active. Continue
@@ -69,6 +72,9 @@ instructions with `request_id` + `include_body=true`, and progress with that ID
 legacy full records are necessary. Inbox preserves the instruction contract.
 For CLI replies use `muxa msg wait REQUEST --body --output FILE` or `--body`
 for stdout. This avoids shell JSON parsing; never pass JSON through `echo`.
+CLI `muxa msg list --json` defaults to 20 metadata rows. Use
+`--request-id REQUEST --full` for one original request, or `--full` for explicit
+full history pages. Use `--offset` for another page, not a repeated whole list.
 Default CLI wait prints timeout JSON and exits 2 without changing work state.
 `--full` also exits nonzero on timeout. Resume the same request, not new work.
 
@@ -77,6 +83,7 @@ Default CLI wait prints timeout JSON and exits 2 without changing work state.
 Agree on reporting checkpoints when dispatching work. Omit receipt confirmations,
 "in progress", and unchanged status. Consolidate intermediate findings at meaningful
 build/test or review checkpoints; check the inbox then instead of polling for notices.
+Never update a terminal request; use a new request with `parent_request_id` for new work.
 If the installed tools support `muxa_update_request`, record progress on the original
 request. Otherwise send one consolidated `kind="notice"`, `expects_reply=false`
 message with `parent_request_id` referencing the original request.

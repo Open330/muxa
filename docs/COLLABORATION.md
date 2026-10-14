@@ -505,11 +505,26 @@ Every collaboration IPC operation (context, identity, send, inbox, list,
 reply, get, wait, and cancel) is also appended to
 `$XDG_DATA_HOME/muxa/collaboration-audit.ndjson`. The `0600` ledger records the
 represented origin/session, OS-observed caller, target/request id, and outcome,
-but never duplicates message or reply bodies. `muxa msg list --json` and
-`muxa_list_messages` expose the creation provenance stored on each request;
+but never duplicates message or reply bodies. `muxa msg list --json --full` and
+`muxa_list_messages` with `full=true` expose the creation provenance stored on each request;
 requests created before this field existed simply omit it.
 
 Provenance remains audit evidence, not a permission gate. An observed/asserted
 pane mismatch is recorded as `mismatched` but does not block the operation, so
 host-scoped explicit-pane routing and the existing high-authority owner-only
 socket workflow remain unchanged.
+
+
+CLI message lists default to 20 metadata rows, without original instructions,
+reply bodies, updates or provenance. `--json` retains an array with `id`, stored
+`status`, endpoints and transport receipt fields. Use `--full` to restore full
+records; `--limit` and `--offset` explicitly control history pages.
+`muxa msg list --request-id REQUEST --full --json` fetches one authorized request
+directly instead of downloading mailbox history. For the final reply alone use
+`muxa msg wait REQUEST --body --output FILE`. Prefer completion wakes to repeated
+short timeout waits.
+
+`--limit 0` explicitly requests all matching rows. When a page is truncated,
+the CLI prints the total and next offset on stderr. Default JSON remains an
+array, but diagnostic fields such as bodies, replies, wake delivery and
+provenance now require `--full`; existing diagnostic scripts should add it.

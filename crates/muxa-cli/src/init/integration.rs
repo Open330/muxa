@@ -660,9 +660,9 @@ fn mcp(
         ..
     }) = &prior
     {
-        if current.as_ref() != Some(installed)
-            && current != *previous
-            && current != *before_apply
+        if !crate::mcp_revision::entries_equal(current.as_ref(), Some(installed))
+            && !crate::mcp_revision::entries_equal(current.as_ref(), previous.as_ref())
+            && !crate::mcp_revision::entries_equal(current.as_ref(), before_apply.as_ref())
             && current.is_some()
         {
             warn_preserved(plan, &host.config, "Muxa MCP registration changed since installation; reconcile it before re-running agent-mcp");
@@ -797,12 +797,15 @@ fn uninstall_record(plan: &mut Plan, record: &Record) -> Result<bool> {
         } => {
             let (_, original) = file_base(&plan.actions, &record.path)?;
             let current = read_server(&original, *host)?;
-            if current.as_ref() == Some(installed)
-                || (current.is_some() && current == *before_apply)
+            if current.is_some()
+                && (crate::mcp_revision::entries_equal(current.as_ref(), Some(installed))
+                    || crate::mcp_revision::entries_equal(current.as_ref(), before_apply.as_ref()))
             {
                 let after = write_server(&original, *host, previous.as_ref())?;
                 edit(plan, component, record.path.clone(), after)?;
-            } else if current.is_some() && current != *previous {
+            } else if current.is_some()
+                && !crate::mcp_revision::entries_equal(current.as_ref(), previous.as_ref())
+            {
                 warn_preserved(
                     plan,
                     &record.path,
@@ -850,7 +853,9 @@ pub fn diagnostics(config: Option<&Path>) -> Result<Vec<(bool, String)>> {
                     .ok()
                     .and_then(|s| read_server(&s, *host).ok().flatten())
                     .as_ref()
-                    == Some(installed)
+                    .is_some_and(|current| {
+                        crate::mcp_revision::entries_equal(Some(current), Some(installed))
+                    })
                     && installed.get("enabled").and_then(Value::as_bool) != Some(false)
             }
             RecordKind::Unmanaged { .. } => false,
@@ -1007,6 +1012,24 @@ mod tests {
         assert!(!f.root.exists());
         assert!(!f.hosts[0].home.exists());
         assert!(!f.hosts[1].skill.exists());
+    }
+
+    #[test]
+    fn binary_revision_remains_owned_and_uninstallable() {
+        let f = Fixture::new();
+        apply::run(&f.plan(Direction::Install, &[Component::AgentMcp]), false).unwrap();
+        let path = &f.hosts[0].config;
+        let original = fs::read_to_string(path).unwrap();
+        let mut server = read_server(&original, Host::Codex).unwrap().unwrap();
+        server["env"][crate::mcp_revision::ENV_KEY] = json!("sha256:new");
+        write(
+            path,
+            &write_server(&original, Host::Codex, Some(&server)).unwrap(),
+        );
+        apply::run(&f.plan(Direction::Uninstall, &[Component::AgentMcp]), false).unwrap();
+        assert!(read_server(&fs::read_to_string(path).unwrap(), Host::Codex)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
