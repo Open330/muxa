@@ -248,7 +248,9 @@ pub fn scan_panes(backend: &dyn PaneBackend) -> Vec<Discovered> {
     if !backend.caps().current_command {
         return Vec::new();
     }
-    discover_from_panes(&backend.list_panes())
+    // One synthetic ingest and one process walk per pane, not one per
+    // `~view~` listing of a grouped session.
+    discover_from_panes(&crate::tmux::canonical_panes(&backend.list_panes()))
 }
 
 /// The synthetic session id muxa mints for a pane that has no real hook-derived
@@ -406,6 +408,7 @@ mod tests {
     fn pane(id: &str, cmd: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,

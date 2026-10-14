@@ -89,9 +89,9 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 | `muxa watch` | Main TUI for agents, prompts, live previews, hierarchy-aware mailbox history, and table/sequence collaboration. |
 | `muxa dashboard` | Work-first TUI console; `P` prompts and `A` aborts every live agent in the selected Work. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |
-| `muxa stats` / `muxa report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
+| `muxa stats` / `muxa stats report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
 | `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
-| `muxa activity` | Raw duration ledger query for debugging exactly what fed stats/report. |
+| `muxa stats activity` | Raw duration ledger query for debugging exactly what fed stats/report. |
 | `muxa automation` | Rules that act on agent state — the built-in one resumes a session after its usage cap resets. |
 | BarShelf widget (macOS) | Menu-bar popover summary of active, working, waiting, and error agents. |
 | Muxa for Mac | Native workbench for Work, Explore, Inbox, Ask, Shells, and Files, with a libghostty terminal and notifications; native PTYs remain owned by `muxad`. |
@@ -268,7 +268,13 @@ Then:
 3. Press `m`, type the request, and press `Enter`. At any point in the draft,
    `/` opens reusable skills registered with `muxa skill add`; selection inserts
    at the cursor and a second `Enter` sends. Press `M` to read and reply from
-   the mailbox (`b` remains an alias).
+   the mailbox.
+
+Press `prefix+M` from an agent pane, or `Alt-M` on its row in local watch, to
+move it into a new session/window or an existing window without restarting.
+The shared menu supports destination search, follow/stay, split direction,
+and undo. On a window row, `Alt-M` moves every pane and the layout together;
+`Ctrl-W` in the popup switches pane/window scope. See [moving a running agent](docs/WATCH.md#move-a-running-agent).
 
 `M` on a window combines its room; on a session it combines all windows and
 groups the read-only history by window. On the collaboration screen, `v`
@@ -301,7 +307,7 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 
 | Command | Purpose |
 | --- | --- |
-| `muxa status [--json]` | Human-readable table, or a versioned JSON snapshot for desktop integrations. |
+| `muxa status [--flat\|--json]` | Agents as a session / window / pane tree (`--flat`: one row per agent), or a versioned JSON snapshot for desktop integrations. |
 | `muxa watch [--view session\|window\|pane]` | Live workspace → work → agent TUI picker/dashboard. |
 | `muxa dashboard [--since today]` | Work-card TUI with Run capture, per-agent and Work-wide prompt/abort actions, ACT/WACT totals, and collaboration controls. |
 | `muxa attend [--cycle] [--list]` | Focus or list agents needing attention. |
@@ -310,19 +316,19 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
 | `muxa peers` / `muxa identity` / `muxa msg` | Discover and name same-window agents, then exchange durable request/reply messages. |
 | `muxa skill add/list/show/remove` | Manage reusable `/` prompt templates for watch/dashboard messages, watch ask, and MCP peer calls. |
-| `muxa host add/list/label/annotate/doctor` | Manage physical SSH nodes and Kubernetes-style labels/annotations. |
+| `muxa fleet host add/list/label/annotate/doctor` | Manage physical SSH nodes and Kubernetes-style labels/annotations. |
 | `muxa fleet status/watch/capture/send/attach` | Central host → session → window → pane(agent) observation and control. |
 | `muxa stats --since today` | Focused WACT/ACT/WORK/WAIT summary; group by day/project/agent/session. Add `--graph` for graph-only WACT over time or `--verbose` for diagnostic columns. |
-| `muxa report --since week` | All breakdowns (day/project/agent/session) as focused ACT/WACT tables; add `--json` or `--markdown` to export. |
+| `muxa stats report --since week` | All breakdowns (day/project/agent/session) as focused ACT/WACT tables; add `--json` or `--markdown` to export. |
 | `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`, or use `--view heatmap`. |
-| `muxa activity --type agent\|tmux\|human` | Raw activity ledger intervals. |
-| `muxa sync` | Backfill the registry by scanning active pane hosts. |
-| `muxa register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
-| `muxa run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. |
+| `muxa stats activity --type agent\|tmux\|human` | Raw activity ledger intervals. |
+| `muxa registry sync` / `prune` / `panes` | Backfill the registry from active pane hosts, drop orphan rows, or list pane hosts. |
+| `muxa proc register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
+| `muxa proc run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. `muxa proc attach/detach X` reconnects or leaves it. |
 | `muxa agent start --agent codex [--host auto\|native\|tmux]` | Start an allowlisted agent. `auto` uses tmux inside tmux and a muxa-owned PTY in a plain terminal. |
 | `muxa work init` | Describe a work pipeline in your own words; an agent writes the `[ticket]`/`[[route]]`/`[pipeline.*]` config, validated and shown before anything is written. |
 | `muxa work compose "implementer in claude, reviewer in codex after it"` | Draft one pipeline from a description without writing anything: the reply is the same JSON `muxa work pipeline set --from-json` accepts, validated like it, so Muxa.app can show it for review first. |
-| `muxa ask providers` / `muxa ask provider add anthropic-work --engine anthropic` | List the Ask providers with what each needs, and compose the list: an instance names its engine (Claude Code, Codex, Gemini CLIs; Anthropic, OpenAI APIs; Apple Intelligence on a Mac, with no key), its model, and its own key variable, so several keys for one engine can coexist. |
+| `muxa ask providers` / `muxa ask provider add anthropic-work --engine anthropic` / `muxa ask provider use codex` | List the Ask providers with what each needs, and compose the list: an instance names its engine (Claude Code, Codex, Gemini CLIs; Anthropic, OpenAI APIs; Apple Intelligence on a Mac, with no key), its model, and its own key variable, so several keys for one engine can coexist. `use` makes one the default and saves it as `[ask] agent`. |
 | `muxa automation list` / `muxa automation test resume-after-limit` | Inspect the rule engine and see what a rule would do right now without firing it. A rule reacts to an agent event (a session limit, a wait for input, an idle stretch) after a delay, with guards that a rule cannot opt out of. See [docs/AUTOMATION.md](docs/AUTOMATION.md). |
 | `muxa config show` / `muxa config set --from new.toml` | Read and replace the daemon's `config.toml` through muxad, which parses and validates before writing. Muxa.app's Settings › Advanced edits the same file the same way. |
 | `muxa work preset apply solo --route '.*'` | Write a built-in pipeline (`solo`, `pair`, `triad`) into `config.toml` without an agent turn; `muxa work options --json` prints the routes, pipelines, skills, and presets a launcher can offer. |
@@ -338,6 +344,8 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa mcp` | MCP stdio server so a coding agent can orchestrate muxa — inspect agents, send prompts, capture panes, wait for changes (`claude mcp add --scope user muxa -- muxa mcp`, see [docs/MCP.md](docs/MCP.md)). |
 | `muxa snapshot` | Capture this multiplexer's workspace — sessions, windows, panes, geometry, working directories, and each pane's own command line — into `$XDG_DATA_HOME/muxa/snapshots`. |
 | `muxa restore [DIR] [--run]` | Rebuild a workspace from a snapshot. Prints the plan unless `--run`, because restoring into a server that still has those sessions adds panes rather than replacing them. |
+| `muxa reload mcp [--codex-home DIR]` | Ask the existing Codex app-server to refresh all configured MCP connections for that profile. It reports queued acceptance; it does not restart panes or app-server. `--all` targets discovered stale shared Codex profiles; `--dry-run` previews scope. |
+| `muxa reload mux [--snapshot DIR]` | Explicit name for the full multiplexer reload below. |
 | `muxa reload [--snapshot DIR]` | Snapshot, restart the multiplexer, and put the workspace back — the way to pick up a new tmux/rmux build without rebuilding thirty panes by hand. Run it from outside the server it restarts; a pane muxa tracked comes back on its own conversation. |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |
@@ -347,14 +355,14 @@ Common stats queries:
 ```bash
 muxa stats --since today --group-by session
 muxa stats --since yesterday --group-by project
-muxa report --since last-week
+muxa stats report --since last-week
 muxa timeline --since today --session main
 muxa timeline --since today --exclude-session 'monitor*'
 muxa stats --since month --exclude-pane '%42' --exclude-session 'monitor*'
 muxa timeline --since today --group-by kind --sort waiting
 muxa timeline --view heatmap --since 12w
 muxa timeline --day 2026-06-06
-muxa activity --since today --type human
+muxa stats activity --since today --type human
 ```
 
 `--since` accepts `today`, `yesterday`, `week` for a rolling 7-day window,
@@ -365,7 +373,7 @@ like `2026-06-06`, RFC3339 timestamps, and `all`. See
 [docs/ACTIVITY.md](docs/ACTIVITY.md) for ledger semantics, including
 `HUMAN`, `THINK`, and `ACT`.
 
-`muxa stats`, `muxa report`, and `muxa timeline` also accept
+`muxa stats`, `muxa stats report`, and `muxa timeline` also accept
 `--exclude-pane` and `--exclude-session` for long-lived monitoring scopes.
 Patterns are case-sensitive and support `*` and `?`, e.g.
 `--exclude-session 'monitor*'`.
@@ -410,9 +418,9 @@ independent last-known cache per node. `observe` is the default, while
 muxa fleet status                         # local is already present
 muxa fleet status -L environment,region   # opt-in label columns
 muxa fleet status -o wide                 # hostname/version/latency when space permits
-muxa host label local environment=development
-muxa host add dev muxa-devbox --label environment=development --mode observe
-muxa host doctor dev
+muxa fleet host label local environment=development
+muxa fleet host add dev muxa-devbox --label environment=development --mode observe
+muxa fleet host doctor dev
 muxa fleet watch
 # equivalent entry point: muxa watch --fleet
 # `muxa init` also binds this view to tmux prefix+S (local watch stays prefix+s)

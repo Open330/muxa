@@ -53,7 +53,7 @@ impl Detection {
     /// Components that should be pre-checked by default given this
     /// detection result.
     pub fn default_selection(&self) -> Vec<Component> {
-        let mut out = Vec::new();
+        let mut out = vec![Component::Automation];
         if self.tmux.is_some() {
             out.push(Component::TmuxPopup);
             out.push(Component::TmuxStatusLine);
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn default_selection_with_no_tools_only_picks_daemon_manager() {
+    fn default_selection_with_no_tools_picks_disabled_rules_and_daemon_manager() {
         // `Detection::default()` represents a host with no tmux,
         // no agents, no service managers. We still pre-check the
         // OS-fallback daemon-manager (`MuxadShellrc`) so a default
@@ -265,7 +265,7 @@ mod tests {
         // point of the post-v0.4.1 wizard.
         let d = Detection::default();
         let sel = d.default_selection();
-        assert_eq!(sel, vec![Component::MuxadShellrc]);
+        assert_eq!(sel, vec![Component::Automation, Component::MuxadShellrc]);
     }
 
     #[test]

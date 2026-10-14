@@ -27,8 +27,13 @@ impl ScopeExclusions {
         session_id: Option<&str>,
         session_name: Option<&str>,
     ) -> bool {
+        // A `~view~` client of a grouped session is that session: excluding
+        // `callabo` must also drop records labelled `callabo~view~N`.
         pane.is_some_and(|pane| matches_any(&self.pane_patterns, pane))
-            || session_name.is_some_and(|name| matches_any(&self.session_patterns, name))
+            || session_name.is_some_and(|name| {
+                matches_any(&self.session_patterns, name)
+                    || matches_any(&self.session_patterns, crate::tmux::base_session_name(name))
+            })
             || session_id.is_some_and(|id| matches_any(&self.session_patterns, id))
     }
 }
@@ -98,5 +103,12 @@ mod tests {
         assert!(exclusions.excludes(None, Some("agent-1"), Some("watch-main")));
         assert!(exclusions.excludes(None, Some("watch-agent"), None));
         assert!(!exclusions.excludes(Some("%1"), Some("agent-1"), Some("main")));
+    }
+
+    #[test]
+    fn a_session_exclusion_covers_its_grouped_views() {
+        let exclusions = ScopeExclusions::new(Vec::new(), vec!["callabo".into()]);
+        assert!(exclusions.excludes(None, None, Some("callabo~view~743208")));
+        assert!(!exclusions.excludes(None, None, Some("callabo-base")));
     }
 }

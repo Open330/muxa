@@ -124,7 +124,7 @@ private struct MuxaGeneralSettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 Text("System follows the current macOS appearance automatically.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
 
@@ -133,7 +133,7 @@ private struct MuxaGeneralSettingsView: View {
             Section("Startup") {
                 Toggle("Show the Workbench when Muxa launches", isOn: $showWorkbenchOnLaunch)
                 Text("When disabled, Muxa starts in the menu bar and keeps host monitoring available.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                 HStack {
                     Button("Show Welcome Guide…") {
@@ -141,7 +141,7 @@ private struct MuxaGeneralSettingsView: View {
                         NSApp.activate(ignoringOtherApps: true)
                     }
                     Text("The first-launch tour of Work, Explore, Inbox, and Shells, with the setup checklist.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -157,11 +157,11 @@ private struct MuxaGeneralSettingsView: View {
                 }
                 if !directoryExists {
                     Label("This folder is not currently available.", systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.orange)
                 } else {
                     Text("Used as the initial folder in Start Work. Leave empty to use route configuration.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -241,7 +241,7 @@ private struct MuxaFleetSettingsPane: View {
                         }
                         if !hosts.contains(where: { !$0.local }) {
                             Label("No SSH hosts yet. Add one to watch its panes and run Work on it from this Mac.", systemImage: "info.circle")
-                                .font(.caption)
+                                .font(MuxaType.detail)
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
@@ -284,7 +284,7 @@ private struct MuxaFleetSettingsRow: View {
                             Text(fleetHostModeLabel(host.mode))
                         }
                     }
-                    .font(.caption2.weight(.semibold))
+                    .font(MuxaType.meta.weight(.semibold))
                     .foregroundStyle(.secondary)
                 }
                 Group {
@@ -296,7 +296,7 @@ private struct MuxaFleetSettingsRow: View {
                         Text("SSH target unavailable")
                     }
                 }
-                .font(.caption.monospaced())
+                .font(MuxaType.detail.monospaced())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             }
@@ -311,9 +311,9 @@ private struct MuxaFleetSettingsRow: View {
                         Text("Version unavailable")
                     }
                 }
-                .font(.caption.monospacedDigit())
+                .font(MuxaType.detail.monospacedDigit())
                 Text("\(host.remote?.agents.count ?? 0) agents · \(host.remote?.panes.count ?? 0) panes")
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
             }
         }
@@ -359,10 +359,10 @@ private struct MuxaRuntimeSettingsPane: View {
                         .textSelection(.enabled)
                 }
                 if case .failed(let detail) = model.connectionState {
-                    Text(detail).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                    Text(detail).font(MuxaType.detail).foregroundStyle(.red).textSelection(.enabled)
                 }
                 if case .upgradeRequired(let detail) = model.connectionState {
-                    Text(detail).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                    Text(detail).font(MuxaType.detail).foregroundStyle(.red).textSelection(.enabled)
                 }
             }
 
@@ -405,7 +405,7 @@ private struct MuxaRuntimeSettingsPane: View {
                     MuxaDaemonReloadButton(model: model, title: "Reload Bundled muxad…")
                 }
                 Text("Reloading replaces the process on the owner-only socket. tmux sessions remain, but native PTY sessions end.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
         }

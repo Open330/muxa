@@ -51,6 +51,18 @@ struct TerminalCaptureFormatter: Sendable {
         return output
     }
 
+    /// A pane capture has a row for every pane line, so a screen whose
+    /// output stops halfway ends in blank rows. The view keeps its bottom in
+    /// sight, so those rows would push the newest output out of it.
+    static func trimmingTrailingBlankLines(_ content: AttributedString) -> AttributedString {
+        let characters = content.characters
+        guard let last = characters.lastIndex(where: { !$0.isWhitespace }) else {
+            return content
+        }
+        let end = characters[last...].firstIndex(of: "\n") ?? characters.endIndex
+        return AttributedString(content[content.startIndex..<end])
+    }
+
     /// Decodes raw capture bytes as UTF-8 without a leading partial character.
     static func decode(_ bytes: Data) -> String {
         var start = bytes.startIndex
@@ -64,21 +76,28 @@ struct TerminalCaptureFormatter: Sendable {
         var container = AttributeContainer()
         guard !style.isPlain else { return container }
 
-        var foreground = style.foreground.map(palette.color(for:)) ?? palette.foreground
-        var background = style.background.map(palette.color(for:))
+        var foreground = style.foreground.map(palette.rgb(for:)) ?? palette.foreground
+        var background = style.background.map(palette.rgb(for:))
         if style.reverse {
             let previousForeground = foreground
             foreground = background ?? palette.background
             background = previousForeground
         }
-        if style.dim {
-            foreground = foreground.opacity(0.6)
-        }
-        if style.foreground != nil || style.reverse || style.dim {
-            container.swiftUI.foregroundColor = foreground
+        // The same rule as Ghostty's `minimum-contrast`: a color that would
+        // vanish into its cell background becomes black or white.
+        let contrasted = foreground.ensuringContrast(
+            TerminalCapturePalette.minimumContrast,
+            against: background ?? palette.background
+        )
+        let colorChanged = style.foreground != nil || style.reverse || contrasted != foreground
+        foreground = contrasted
+        if colorChanged || style.dim {
+            container.swiftUI.foregroundColor = style.dim
+                ? foreground.color.opacity(TerminalCapturePalette.faintOpacity)
+                : foreground.color
         }
         if let background {
-            container.swiftUI.backgroundColor = background
+            container.swiftUI.backgroundColor = background.color
         }
 
         var intent: InlinePresentationIntent = []
@@ -242,77 +261,145 @@ struct TerminalTextStyle: Equatable, Sendable {
     }
 }
 
-/// Colors used to draw a pane capture. The values match the GhosttyTerminal
-/// default theme (Afterglow for dark, Alabaster for light) that the
-/// interactive attach surface renders with, so the read-only preview and the
-/// Ghostty view show the same colors on the `MuxaSurfacePalette.terminal`
-/// backgrounds.
+/// An sRGB terminal color.
+struct TerminalRGB: Equatable, Sendable {
+    let red: UInt8
+    let green: UInt8
+    let blue: UInt8
+
+    init(red: UInt8, green: UInt8, blue: UInt8) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+    }
+
+    init(hex: UInt32) {
+        self.init(
+            red: UInt8((hex >> 16) & 0xFF),
+            green: UInt8((hex >> 8) & 0xFF),
+            blue: UInt8(hex & 0xFF)
+        )
+    }
+
+    static let black = TerminalRGB(hex: 0x000000)
+    static let white = TerminalRGB(hex: 0xFFFFFF)
+
+    var color: Color {
+        Color(red: Double(red) / 255, green: Double(green) / 255, blue: Double(blue) / 255)
+    }
+
+    /// `RRGGBB`, the form a Ghostty config line takes.
+    var hexString: String {
+        String(format: "%02X%02X%02X", red, green, blue)
+    }
+
+    /// WCAG relative luminance.
+    var luminance: Double {
+        func linear(_ component: UInt8) -> Double {
+            let value = Double(component) / 255
+            return value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+    }
+
+    /// WCAG contrast ratio, 1 (none) through 21 (black on white).
+    func contrast(with other: TerminalRGB) -> Double {
+        let lighter = max(luminance, other.luminance)
+        let darker = min(luminance, other.luminance)
+        return (lighter + 0.05) / (darker + 0.05)
+    }
+
+    /// This color, or black or white (whichever stands out more) when this
+    /// color's contrast against `background` is below `minimum`. It is the
+    /// rule Ghostty's `minimum-contrast` applies when drawing a cell.
+    func ensuringContrast(_ minimum: Double, against background: TerminalRGB) -> TerminalRGB {
+        guard contrast(with: background) < minimum else { return self }
+        return Self.white.contrast(with: background) > Self.black.contrast(with: background)
+            ? .white
+            : .black
+    }
+}
+
+/// Colors for terminal text: the read-only pane preview draws with them, and
+/// `ghosttyTheme` hands the same values to the interactive Ghostty surface so
+/// the two views look alike on the `MuxaSurfacePalette.terminal` backgrounds.
+///
+/// The backgrounds and foregrounds are GhosttyTerminal's defaults (Afterglow
+/// for dark, Alabaster for light), but their ANSI colors are not: agent CLIs
+/// draw secondary text in bright black and accents in red, magenta, and the
+/// bright yellows and greens, which those themes render at 1.5–3:1 contrast.
+/// Every chromatic entry here keeps the theme's hue at 4.5:1 or better, and
+/// the bright row is distinct from the normal row.
 struct TerminalCapturePalette: Sendable {
-    let foreground: Color
-    let background: Color
+    let foreground: TerminalRGB
+    let background: TerminalRGB
+    let cursor: TerminalRGB
+    let selection: TerminalRGB
     /// The 16 ANSI colors: 0–7 normal, 8–15 bright.
-    let ansi: [Color]
+    let ansi: [TerminalRGB]
+
+    /// Ghostty's `minimum-contrast`. Low enough that the palette above is
+    /// never touched, high enough to rescue an app's own RGB or 256-color
+    /// choice that disappears on these backgrounds (black text on dark).
+    static let minimumContrast = 3.0
+    /// Ghostty's `faint-opacity` for SGR 2 (dim) text. Its default of 0.5
+    /// leaves agent CLIs' dimmed hints too faint to read.
+    static let faintOpacity = 0.7
 
     static func palette(for colorScheme: ColorScheme) -> TerminalCapturePalette {
         colorScheme == .dark ? .dark : .light
     }
 
     static let dark = TerminalCapturePalette(
-        foreground: Color(hex: 0xD0D0D0),
-        background: Color(hex: 0x212121),
+        foreground: TerminalRGB(hex: 0xD0D0D0),
+        background: TerminalRGB(hex: 0x212121),
+        cursor: TerminalRGB(hex: 0xD0D0D0),
+        selection: TerminalRGB(hex: 0x3A3F4B),
         ansi: [
-            0x151515, 0xAC4142, 0x7E8E50, 0xE4B567, 0x6C99BB, 0x9F4E86, 0x7DD5CF, 0xD0D0D0,
-            0x505050, 0xAC4142, 0x7E8E50, 0xE4B567, 0x6C99BB, 0x9F4E86, 0x7DD5CF, 0xF5F5F5,
-        ].map(Color.init(hex:))
+            0x151515, 0xD9675F, 0x98A964, 0xE4B567, 0x7EA6C8, 0xC17BB0, 0x7DD5CF, 0xD0D0D0,
+            0x8C8C8C, 0xEF8A82, 0xB4C67E, 0xF2CB86, 0x9DBEE0, 0xD99CCB, 0xA2E6E1, 0xF5F5F5,
+        ].map(TerminalRGB.init(hex:))
     )
 
     static let light = TerminalCapturePalette(
-        foreground: Color(hex: 0x000000),
-        background: Color(hex: 0xF7F7F7),
+        foreground: TerminalRGB(hex: 0x000000),
+        background: TerminalRGB(hex: 0xF7F7F7),
+        cursor: TerminalRGB(hex: 0x007ACC),
+        selection: TerminalRGB(hex: 0xC9D0D9),
         ansi: [
-            0x000000, 0xAA3731, 0x448C27, 0xCB8800, 0x325CC0, 0x7A3E9D, 0x0083B2, 0xF7F7F7,
-            0x777777, 0xF03E31, 0x60CB00, 0xFFBC5D, 0x007ACC, 0xE64CE6, 0x00AACB, 0xF7F7F7,
-        ].map(Color.init(hex:))
+            0x000000, 0xAA3731, 0x3F7F24, 0x8F6200, 0x325CC0, 0x7A3E9D, 0x00718F, 0xF7F7F7,
+            0x6B6B6B, 0xC4271B, 0x2F7500, 0x8A5A00, 0x0066AA, 0xA0309F, 0x006E85, 0xF7F7F7,
+        ].map(TerminalRGB.init(hex:))
     )
 
     func color(for terminalColor: TerminalColor) -> Color {
+        rgb(for: terminalColor).color
+    }
+
+    func rgb(for terminalColor: TerminalColor) -> TerminalRGB {
         switch terminalColor {
         case .indexed(let index) where index < 16:
             return ansi[Int(index)]
         case .indexed(let index):
             let (red, green, blue) = Self.xtermComponents(index)
-            return Color(red: red, green: green, blue: blue)
+            return TerminalRGB(red: red, green: green, blue: blue)
         case .rgb(let red, let green, let blue):
-            return Color(
-                red: Double(red) / 255,
-                green: Double(green) / 255,
-                blue: Double(blue) / 255
-            )
+            return TerminalRGB(red: red, green: green, blue: blue)
         }
     }
 
-    /// sRGB components (0–1) of xterm 256-color indexes 16–255: a 6×6×6 cube
+    /// sRGB components of xterm 256-color indexes 16–255: a 6×6×6 cube
     /// followed by a 24-step gray ramp.
-    static func xtermComponents(_ index: UInt8) -> (red: Double, green: Double, blue: Double) {
+    static func xtermComponents(_ index: UInt8) -> (red: UInt8, green: UInt8, blue: UInt8) {
         if index >= 232 {
-            let gray = Double(8 + 10 * (Int(index) - 232)) / 255
+            let gray = UInt8(8 + 10 * (Int(index) - 232))
             return (gray, gray, gray)
         }
         let offset = Int(index) - 16
-        func level(_ value: Int) -> Double {
-            value == 0 ? 0 : Double(55 + 40 * value) / 255
+        func level(_ value: Int) -> UInt8 {
+            value == 0 ? 0 : UInt8(55 + 40 * value)
         }
         return (level(offset / 36), level((offset / 6) % 6), level(offset % 6))
-    }
-}
-
-private extension Color {
-    init(hex: UInt32) {
-        self.init(
-            red: Double((hex >> 16) & 0xFF) / 255,
-            green: Double((hex >> 8) & 0xFF) / 255,
-            blue: Double(hex & 0xFF) / 255
-        )
     }
 }
 

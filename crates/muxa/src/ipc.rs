@@ -535,6 +535,11 @@ enum RequestBody {
     AskProviderRemove {
         id: String,
     },
+    /// Select `provider` and write it to `[ask] agent`, so the choice
+    /// survives a restart. Answers with the updated list.
+    AskProviderDefault {
+        provider: String,
+    },
     // --- automation_v1 ---------------------------------------------------
     /// Every `[[automation.rule]]` with its effective timing, its guards,
     /// and how often it has fired lately, plus the engine's master switch
@@ -633,6 +638,13 @@ enum RequestBody {
         origin: CollaborationOrigin,
         request_id: String,
     },
+    /// Operator housekeeping: expire never-claimed requests older than
+    /// `older_than_secs`. Answers with the affected requests.
+    CollaborationExpire {
+        older_than_secs: u64,
+        #[serde(default)]
+        dry_run: bool,
+    },
 
     /// Wholesale pane-metadata snapshot pushed by an out-of-process
     /// backend source — today the zellij WASM plugin forwarding
@@ -642,6 +654,10 @@ enum RequestBody {
     /// no-op on tmux (that backend enumerates panes itself).
     BackendPaneSnapshot {
         panes: Vec<PaneInfo>,
+    },
+    /// Observe locations after a move, without changing agent activity/state.
+    RefreshPaneLocations {
+        pane: String,
     },
     SpawnSession {
         command: String,
@@ -757,6 +773,7 @@ const CAPABILITIES: &[&str] = &[
     "needs_choice",
     "rate_limited",
     "collaboration_mailbox",
+    "collaboration_expire_v1",
     "collaboration_lifecycle",
     "collaboration_wait",
     "collaboration_subscribe",
@@ -787,6 +804,7 @@ const CAPABILITIES: &[&str] = &[
     "ask_send_new_v1",
     "ask_subscribe",
     "ask_providers_v1",
+    "ask_provider_default_v1",
     "work_compose_v1",
     "automation_v1",
     "automation_ask_v1",
@@ -866,11 +884,17 @@ pub struct Response {
     /// Whether a `send_prompt`'s submit CR landed. Present only on a
     /// `send_prompt` response. `false` with `sent:true` and a requested
     /// `submit:true` is a PARTIAL success: the text is in the pane but the
-    /// Enter didn't commit — retry the submit alone (e.g. `send_prompt` with
-    /// empty text + submit), never the whole prompt. `false` is also the
+    /// host rejected Enter. Inspect the current input before an Enter-only
+    /// retry; never resend the whole prompt. `true` is transport acceptance,
+    /// not an application acknowledgement (see `submission_confirmed`). `false` is also the
     /// normal value when `submit:false` was requested (nothing to submit).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submitted: Option<bool>,
+    /// Application-level `PromptSubmitted` evidence, separate from transport
+    /// acceptance. None means unobserved (including hosts without hooks),
+    /// never a reason to resend the body or blindly retry Enter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submission_confirmed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room: Option<RoomContext>,
     /// Handle issued by the room's namespace arbiter. Absent when the room
@@ -970,6 +994,7 @@ impl Response {
             capture: None,
             sent: None,
             submitted: None,
+            submission_confirmed: None,
             room: None,
             handle: None,
             collaboration_requests: None,
@@ -2642,18 +2667,27 @@ async fn collaboration_participants(
 ) -> CollaborationTopology {
     let mut agents = store.snapshot().await;
     let listed = backends.to_vec();
-    let panes = tokio::task::spawn_blocking(move || {
-        listed
+    let discovery_agents = agents.clone();
+    let (panes, mut participants) = tokio::task::spawn_blocking(move || {
+        let panes = listed
             .iter()
             .flat_map(|backend| backend.list_panes())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let participants = collaboration::participants_from(&discovery_agents, &panes);
+        (panes, participants)
     })
     .await
     .unwrap_or_default();
     if bind_unplaced_codex_origin(store, backends, &agents, &panes, origin_session).await {
         agents = store.snapshot().await;
+        let refreshed = agents.clone();
+        let observed = panes.clone();
+        participants = tokio::task::spawn_blocking(move || {
+            collaboration::participants_from(&refreshed, &observed)
+        })
+        .await
+        .unwrap_or_default();
     }
-    let mut participants = collaboration::participants_from(&agents, &panes);
     collaboration.enrich_participants(&mut participants).await;
     CollaborationTopology {
         participants,
@@ -3240,6 +3274,9 @@ async fn handle(
                 }
                 RequestBody::Prune { max_age_secs } => {
                     kind = "prune";
+                    store
+                        .reconcile_native_surfaces(|id| sessions.session_liveness(id))
+                        .await;
                     let cutoff = time::OffsetDateTime::now_utc()
                         - std::time::Duration::from_secs(max_age_secs);
                     let pruned = store.prune_orphans(cutoff).await;
@@ -3630,6 +3667,23 @@ async fn handle(
                     tracing::debug!(panes = count, "backend_pane_snapshot");
                     Response::ok()
                 }
+                RequestBody::RefreshPaneLocations { pane } => {
+                    kind = "refresh_pane_locations";
+                    match resolve_backend(&backends, &pane) {
+                        Err(error) => Response::err(format!("no active {error} backend")),
+                        Ok(target) => {
+                            let target = target.clone();
+                            match tokio::task::spawn_blocking(move || target.observe_panes()).await
+                            {
+                                Ok(observation) => {
+                                    store.refresh_pane_locations(&observation.panes).await;
+                                    Response::ok()
+                                }
+                                Err(error) => Response::err(error.to_string()),
+                            }
+                        }
+                    }
+                }
                 RequestBody::SendPrompt { pane, text, submit } => {
                     kind = "send_prompt";
                     match resolve_backend(&backends, &pane) {
@@ -3663,14 +3717,20 @@ async fn handle(
                                     // socket call, so run it off the async worker.
                                     // Text and submit CR are TWO non-atomic
                                     // injections; report the outcomes separately.
+                                    let observer = crate::prompt_delivery::SubmissionObserver::new(
+                                        &store,
+                                        &agents,
+                                        socket.as_deref(),
+                                        &text,
+                                    );
                                     let (sent, submitted) =
                                         tokio::task::spawn_blocking(move || {
                                             let s = socket.as_deref();
-                                            let sent = target.send_text_on(s, &pane, &text);
+                                            let sent = target.send_prompt_text_on(s, &pane, &text);
                                             let submitted = if sent && submit {
                                                 if !text.is_empty() {
                                                     std::thread::sleep(
-                                                        crate::backend::PROMPT_SUBMIT_GRACE,
+                                                        crate::backend::prompt_submit_grace(&pane),
                                                     );
                                                 }
                                                 target.send_text_on(s, &pane, "\r")
@@ -3683,7 +3743,13 @@ async fn handle(
                                         .unwrap_or((false, false));
                                     if sent {
                                         tracing::debug!(submit, submitted, "send_prompt");
-                                        Response::with_send_result(sent, submitted)
+                                        let mut response =
+                                            Response::with_send_result(sent, submitted);
+                                        if submitted {
+                                            response.submission_confirmed =
+                                                observer.confirm().await;
+                                        }
+                                        response
                                     } else {
                                         // Nothing landed — safe for the caller to
                                         // retry the whole send.
@@ -4045,6 +4111,13 @@ async fn handle(
                         executable,
                     };
                     match ask.add_provider(request).await {
+                        Ok(providers) => Response::with_ask_providers(providers),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::AskProviderDefault { provider } => {
+                    kind = "ask_provider_default";
+                    match ask.set_default_agent(&provider).await {
                         Ok(providers) => Response::with_ask_providers(providers),
                         Err(error) => Response::err(error.to_string()),
                     }
@@ -4451,6 +4524,21 @@ async fn handle(
                     .await;
                     response
                 }
+                RequestBody::CollaborationExpire {
+                    older_than_secs,
+                    dry_run,
+                } => {
+                    kind = "collaboration_expire";
+                    let age =
+                        time::Duration::seconds(i64::try_from(older_than_secs).unwrap_or(i64::MAX));
+                    let cutoff = time::OffsetDateTime::now_utc()
+                        .checked_sub(age)
+                        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+                    match collaboration.expire_queued_before(cutoff, dry_run).await {
+                        Ok(requests) => Response::with_collaboration_requests(requests),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
                 RequestBody::CollaborationCancel { origin, request_id } => {
                     kind = "collaboration_cancel";
                     collaboration_actor.observe_pane(&backends).await;
@@ -4527,7 +4615,10 @@ async fn handle(
                 }
                 RequestBody::ListSessions => {
                     kind = "list_sessions";
-                    Response::with_sessions(sessions.list_sessions())
+                    match sessions.list_sessions_checked() {
+                        Ok(list) => Response::with_sessions(list),
+                        Err(error) => Response::err(error.to_string()),
+                    }
                 }
                 RequestBody::CaptureSession { session_id } => {
                     kind = "capture_session";
@@ -4862,8 +4953,10 @@ pub struct SendPromptOutcome {
     /// The text injection landed. Always `true` here (a failed text send is an
     /// `Err`); carried explicitly for symmetry and forward-compatibility.
     pub sent: bool,
-    /// The submit carriage return landed and committed the line.
+    /// The host accepted the submit carriage return. This alone does not
+    /// establish that the application committed the prompt.
     pub submitted: bool,
+    pub submission_confirmed: Option<bool>,
 }
 
 /// Long-lived handle returned by [`Client::subscribe`]. Calls to
@@ -5158,6 +5251,12 @@ impl Client {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "snapshot" });
         let resp = self.call(&req).await?;
         decode_agents(&resp)
+    }
+
+    pub async fn refresh_pane_locations(&self, pane: &str) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "refresh_pane_locations", "pane": pane });
+        self.call_checked(&req).await?;
+        Ok(())
     }
 
     /// Read the central physical-host cache. This is a local Unix-socket
@@ -5591,6 +5690,7 @@ impl Client {
             sent: resp["sent"].as_bool().unwrap_or(true),
             // Absent field (older daemon) → fall back to the requested intent.
             submitted: resp["submitted"].as_bool().unwrap_or(submit),
+            submission_confirmed: resp["submission_confirmed"].as_bool(),
         })
     }
 
@@ -5880,6 +5980,21 @@ impl Client {
 
     /// Remove an `[ask.providers.<id>]` instance and read back the updated
     /// list. Requires the `ask_providers_v1` capability.
+    /// Select `provider` and persist it as `[ask] agent`. Requires the
+    /// `ask_provider_default_v1` capability.
+    pub async fn ask_provider_default(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<AskProviderInfo>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_provider_default",
+            "provider": provider,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_providers"].clone()).map_err(RuntimeError::Json)
+    }
+
     pub async fn ask_provider_remove(
         &self,
         id: &str,
@@ -6199,6 +6314,23 @@ impl Client {
             )
             .await;
         }
+    }
+
+    /// Expire never-claimed requests older than `older_than_secs`, or list
+    /// them with `dry_run`. Requires the `collaboration_expire_v1` capability.
+    pub async fn collaboration_expire(
+        &self,
+        older_than_secs: u64,
+        dry_run: bool,
+    ) -> Result<Vec<CollaborationRequest>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_expire",
+            "older_than_secs": older_than_secs,
+            "dry_run": dry_run,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
     }
 
     pub async fn collaboration_cancel(
@@ -6932,6 +7064,7 @@ mod tests {
     fn collaboration_test_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: Some("callabo".into()),
@@ -7615,6 +7748,63 @@ mod tests {
                     == Some(collaboration::CONSOLE_SESSION_ID)
         }));
 
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_clears_missing_native_surface_without_reconciler() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-prune-native.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let client = Client::new(sock);
+        for (sid, at) in [
+            (
+                "old-native",
+                OffsetDateTime::now_utc() - time::Duration::days(2),
+            ),
+            ("fresh-native", OffsetDateTime::now_utc()),
+        ] {
+            client
+                .ingest(&AgentEvent::Started {
+                    id: AgentId {
+                        kind: AgentKind::Codex,
+                        session_id: sid.into(),
+                        surface: Some(crate::event::SurfaceRef {
+                            kind: crate::event::SurfaceKind::Pty,
+                            id: format!("pty:{sid}"),
+                            workspace: None,
+                        }),
+                        pane: None,
+                        tmux_socket: None,
+                        cwd: None,
+                    },
+                    at,
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            client
+                .prune(std::time::Duration::from_secs(3600))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(store.by_session("old-native").await.is_none());
+        let fresh = store.by_session("fresh-native").await.unwrap();
+        assert!(fresh.surface.is_none());
+        assert_eq!(fresh.state, AgentState::Stopped);
+        assert_eq!(client.prune(std::time::Duration::ZERO).await.unwrap(), 1);
         tx.send(()).unwrap();
         handle.await.unwrap();
     }
@@ -8382,6 +8572,7 @@ mod tests {
         assert!(caps.contains(&"ask_conversations_v1"));
         assert!(caps.contains(&"ask_send_new_v1"));
         assert!(caps.contains(&"ask_providers_v1"));
+        assert!(caps.contains(&"ask_provider_default_v1"));
         assert!(caps.contains(&"work_compose_v1"));
         assert!(!caps.contains(&RESTART_CAPABILITY));
         assert!(!caps.contains(&STOP_CAPABILITY));
@@ -8769,6 +8960,16 @@ mod tests {
         .unwrap();
         match remove {
             RequestBody::AskProviderRemove { id } => assert_eq!(id, "anthropic-work"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let default: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "ask_provider_default",
+            "provider": "codex",
+        }))
+        .unwrap();
+        match default {
+            RequestBody::AskProviderDefault { provider } => assert_eq!(provider, "codex"),
             other => panic!("unexpected {other:?}"),
         }
 
@@ -9833,6 +10034,7 @@ mod tests {
 
         let pane = PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -10012,6 +10214,67 @@ mod tests {
             ],
         );
 
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_prompt_confirms_hook_without_repeating_body_or_enter() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send-confirm.sock");
+        let store = Store::shared();
+        let id = AgentId {
+            kind: AgentKind::Codex,
+            session_id: "original".into(),
+            surface: None,
+            pane: Some("%1".into()),
+            tmux_socket: None,
+            cwd: None,
+        };
+        store
+            .apply(&AgentEvent::Started {
+                id: id.clone(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let (backend, sends) = RecordingBackend::new(HostKind::Tmux, true);
+        let (tx, handle) = serve(&sock, store.clone(), vec![backend]).await;
+        let observed = sends.clone();
+        let hook = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if observed
+                        .lock()
+                        .unwrap()
+                        .last()
+                        .is_some_and(|(_, t)| t == "\r")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            store
+                .apply(&AgentEvent::PromptSubmitted {
+                    id,
+                    prompt: "continue".into(),
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+        });
+        let outcome = Client::new(sock)
+            .send_prompt("%1", "continue", true)
+            .await
+            .unwrap();
+        assert!(outcome.sent && outcome.submitted);
+        assert_eq!(outcome.submission_confirmed, Some(true));
+        hook.await.unwrap();
+        assert_eq!(
+            *sends.lock().unwrap(),
+            vec![("%1".into(), "continue".into()), ("%1".into(), "\r".into()),]
+        );
         tx.send(()).unwrap();
         handle.await.unwrap();
     }

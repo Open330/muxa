@@ -999,12 +999,10 @@ mod tests {
     #[cfg(unix)]
     mod child {
         use super::*;
-        use std::os::unix::fs::PermissionsExt;
 
         fn script(dir: &Path, body: &str) -> PathBuf {
             let path = dir.join("fake-muxa");
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::test_support::write_executable(&path, format!("#!/bin/sh\n{body}\n"), 0o700);
             path
         }
 

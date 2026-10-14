@@ -7,8 +7,10 @@
 //! `$TMUX_TMPDIR` / the `default` socket points to. For the global view —
 //! every tmux server running for this user — see [`scanner`].
 
+mod canonical;
 pub mod layout;
 pub mod scanner;
+pub use canonical::{base_session_name, canonical_panes, prefer as prefer_listing, GroupedPaneRow};
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -486,7 +488,7 @@ fn feed_stdin_with_timeout(
 /// [`send_text_on`] for text that [`needs_paste`] flags.
 ///
 /// Sequence: `load-buffer -b <buf> -` (payload on stdin, never in argv) →
-/// `paste-buffer -p -b <buf> -t <pane>` (`-p` = bracketed paste) →
+/// `paste-buffer -p -r -b <buf> -t <pane>` (`-p` = bracketed paste, `-r` = preserve LF) →
 /// `delete-buffer -b <buf>` (best-effort scratch cleanup).
 ///
 /// Bracketed paste is best-effort by nature: a paste-aware target (Claude
@@ -497,7 +499,7 @@ fn feed_stdin_with_timeout(
 /// submits per newline), so it's the least-surprising default for multi-line
 /// submit semantics. The trailing submit CR (`submit:true`) is sent separately
 /// as a `send-keys` Enter and is unaffected.
-fn paste_text_on(socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+pub(crate) fn paste_text_on(socket: Option<&str>, pane_id: &str, text: &str) -> bool {
     let buf = paste_buffer_name();
 
     let mut load = tmux_command_targeting(socket);
@@ -514,7 +516,7 @@ fn paste_text_on(socket: Option<&str>, pane_id: &str, text: &str) -> bool {
     }
 
     let mut paste = tmux_command_targeting(socket);
-    paste.args(["paste-buffer", "-p", "-b", &buf, "-t", pane_id]);
+    paste.args(["paste-buffer", "-p", "-r", "-b", &buf, "-t", pane_id]);
     let pasted = command_output_with_timeout(
         paste,
         TMUX_COMMAND_TIMEOUT,
@@ -637,6 +639,9 @@ pub struct PaneInfo {
     /// identity; either can be absent on unmanaged or partially stamped panes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_id: Option<String>,
+    /// Provider recorded by the Muxa launcher, before the first hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_program: Option<String>,
     /// `@muxa_agent_role` — the role a muxa-managed launch stamped on this
     /// pane (`implementer`, `reviewer`, ...). Declared by the launcher, not
     /// self-registered by the agent, so it survives the window before the
@@ -771,6 +776,7 @@ pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) ->
             socket: socket.map(Into::into),
             workspace_id: first_non_empty(cols.get(22), cols.get(12)),
             work_id: first_non_empty(cols.get(23), cols.get(15)),
+            agent_program: non_empty(cols.get(18)),
             agent_role: non_empty(cols.get(19)),
             agent_alias: non_empty(cols.get(31)),
             session_group: non_empty(cols.get(32)),
@@ -1290,20 +1296,16 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn native_tmux_resolution_skips_rmux_shim() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let shim = dir.path().join("tmux");
         let rmux = dir.path().join("rmux");
         let native = dir.path().join("native");
-        std::fs::write(
+        crate::test_support::write_executable(
             &rmux,
             "#!/bin/sh\ncase \"$0\" in */tmux) echo 'tmux 3.4';; *) echo 'rmux 0.10.0';; esac\n",
-        )
-        .unwrap();
-        std::fs::write(&native, "#!/bin/sh\necho 'tmux 3.4'\n").unwrap();
-        for path in [&rmux, &native] {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+            0o700,
+        );
+        crate::test_support::write_executable(&native, "#!/bin/sh\necho 'tmux 3.4'\n", 0o700);
         std::os::unix::fs::symlink(&rmux, &shim).unwrap();
         assert!(Command::new(&shim)
             .arg("-V")
@@ -1614,8 +1616,24 @@ mod tests {
         assert_eq!(pane.pane_id, "%1");
         assert_eq!(pane.agent_role, None);
         assert_eq!(pane.agent_alias, None);
+        assert_eq!(pane.agent_program, None);
         assert_eq!(pane.workspace_id, None);
         assert_eq!(pane.work_id, None);
+    }
+
+    #[test]
+    fn pane_parser_preserves_the_launched_provider_without_role_or_alias() {
+        let mut columns = vec![""; 33];
+        columns[0] = "%2";
+        columns[1] = "main";
+        columns[5] = "codex";
+        columns[7] = "42";
+        columns[18] = "codex";
+        columns[21] = "1";
+        let panes = parse_pane_lines(&columns.join("\t"));
+        assert_eq!(panes[0].agent_program.as_deref(), Some("codex"));
+        assert!(panes[0].agent_role.is_none());
+        assert!(panes[0].agent_alias.is_none());
     }
 
     /// And the reverse: an unaliased pane must not grow the payload it sends
@@ -1624,6 +1642,7 @@ mod tests {
     fn an_unaliased_pane_serializes_without_the_new_keys() {
         let pane = PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             pane_id: "%1".into(),

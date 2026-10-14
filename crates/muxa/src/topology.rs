@@ -773,6 +773,7 @@ fn append_cmux_hook_panes(
             HostKind::Cmux,
             PaneInfo {
                 session_group: None,
+                agent_program: None,
                 agent_role: None,
                 agent_alias: None,
                 workspace_id: None,
@@ -845,6 +846,7 @@ mod tests {
     fn pane(socket: &str, session_name: &str, window_name: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,

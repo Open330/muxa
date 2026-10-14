@@ -27,7 +27,7 @@
 # Backfill discovery: when muxad starts, scan tmux panes for running agents
 # (matched against `pane_current_command`) and synthesize Started events so
 # they appear in `muxa status` without waiting for a fresh hook. The same
-# routine powers `muxa sync`. Default on.
+# routine powers `muxa registry sync`. Default on.
 [discovery]
 # enabled = true
 
@@ -43,7 +43,7 @@
 #                                      # Stopped so the GC reaps them — e.g. codex sessions driven through a
 #                                      # detached app-server/remote bridge that fire paneless hooks and never
 #                                      # stop on their own. Only the registry row is removed; the tmux session
-#                                      # (if any) is untouched. `muxa prune` does this on demand. Set 0 to disable.
+#                                      # (if any) is untouched. `muxa registry prune` does this on demand. Set 0 to disable.
 
 # Screen-manifest fallback detection: for agent CLIs muxa has NO hooks for
 # (cursor-agent, amp, copilot, aider, goose, and any you declare), the daemon
@@ -151,8 +151,8 @@
 # max_parallel_connects = 6
 # capture_policy        = "selected" # selected | never; pane text is fetched on demand only
 
-# Optional metadata for the built-in controller node. `muxa host label local`
-# and `muxa host annotate local` edit these tables. muxad supplies immutable
+# Optional metadata for the built-in controller node. `muxa fleet host label local`
+# and `muxa fleet host annotate local` edit these tables. muxad supplies immutable
 # muxa.io/local, muxa.io/transport, and kubernetes.io/* identity labels.
 # [fleet.local.labels]
 # environment = "development"
@@ -187,7 +187,7 @@
 # compact_interval_secs = 3600      # rewrites the file every hour
 
 # Activity ledger: append-only duration events used by `muxa stats` and
-# `muxa report`. Records closed agent-state intervals plus closed tmux
+# `muxa stats report`. Records closed agent-state intervals plus closed tmux
 # foreground intervals, so duration survives pane/session removal.
 [activity]
 # enabled               = true
@@ -221,7 +221,7 @@
 # path          = "/home/$USER/.local/share/muxa/session-activity.json"
 # interval_secs = 5
 
-# `muxa stats` / `muxa report` ACTIVE (engaged time) estimate. Each human action
+# `muxa stats` / `muxa stats report` ACTIVE (engaged time) estimate. Each human action
 # (a prompt or a tmux keypress/scroll) is padded into a window; these tune it.
 [stats]
 # active_lookback_secs     = 60    # seconds credited before each action

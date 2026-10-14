@@ -136,15 +136,24 @@ final class MuxaWorkbenchTabs: ObservableObject {
 
     @discardableResult
     func close(_ selection: MuxaSidebarSelection, groupID: UUID) -> MuxaSidebarSelection? {
-        guard let groupIndex = groups.firstIndex(where: { $0.id == groupID }),
-              let tabIndex = groups[groupIndex].tabs.firstIndex(of: selection) else {
+        guard let group = group(id: groupID), group.tabs.contains(selection) else {
             return focusedSelection
         }
-
-        groups[groupIndex].tabs.remove(at: tabIndex)
         recentlyClosed.removeAll { $0 == selection }
         recentlyClosed.append(selection)
         if recentlyClosed.count > 20 { recentlyClosed.removeFirst() }
+        detach(selection, from: groupID)
+        return focusedSelection
+    }
+
+    /// Takes a tab out of a group without recording it as closed: the
+    /// shared half of closing a tab and dragging it to another group. A
+    /// group left empty goes away unless it is the last one.
+    private func detach(_ selection: MuxaSidebarSelection, from groupID: UUID) {
+        guard let groupIndex = groups.firstIndex(where: { $0.id == groupID }),
+              let tabIndex = groups[groupIndex].tabs.firstIndex(of: selection) else { return }
+
+        groups[groupIndex].tabs.remove(at: tabIndex)
         groups[groupIndex].history.removeAll { $0 == selection }
         if groups[groupIndex].preview == selection {
             groups[groupIndex].preview = nil
@@ -162,7 +171,6 @@ final class MuxaWorkbenchTabs: ObservableObject {
                 focusedGroupID = groups[fallbackIndex].id
             }
         }
-        return focusedSelection
     }
 
     /// ⇧⌘T: reopens the most recently closed editor that still exists and is
@@ -200,9 +208,11 @@ final class MuxaWorkbenchTabs: ObservableObject {
 
     /// Muxa currently keeps at most two editor groups so each terminal remains
     /// usable at the app's supported minimum window width.
+    static let maxGroups = 2
+
     @discardableResult
     func splitRight(selection: MuxaSidebarSelection, from groupID: UUID) -> UUID {
-        if groups.count >= 2,
+        if groups.count >= Self.maxGroups,
            let other = groups.first(where: { $0.id != groupID }) {
             open(selection, preview: false, groupID: other.id)
             return other.id
@@ -223,15 +233,121 @@ final class MuxaWorkbenchTabs: ObservableObject {
     }
 
     func move(tabIdentifier: String, before target: MuxaSidebarSelection, groupID: UUID) {
-        guard let groupIndex = groups.firstIndex(where: { $0.id == groupID }),
-              let sourceIndex = groups[groupIndex].tabs.firstIndex(where: {
-                  $0.tabIdentifier == tabIdentifier
-              }),
-              let targetIndex = groups[groupIndex].tabs.firstIndex(of: target),
-              sourceIndex != targetIndex else { return }
-        let moved = groups[groupIndex].tabs.remove(at: sourceIndex)
-        let adjustedTarget = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex
-        groups[groupIndex].tabs.insert(moved, at: adjustedTarget)
+        guard let group = group(id: groupID),
+              let moved = group.tabs.first(where: { $0.tabIdentifier == tabIdentifier }),
+              let targetIndex = group.tabs.firstIndex(of: target) else { return }
+        move(moved, from: groupID, to: groupID, at: targetIndex)
+    }
+
+    /// Which side of a group a dragged tab opens a new group on.
+    enum SplitSide: Equatable {
+        case leading
+        case trailing
+    }
+
+    /// Drops a dragged tab into a group's strip before the tab at `index`
+    /// (`tabs.count` for the end), the way VS Code does: within a group it
+    /// reorders, across groups it moves (or, with `copy`, opens a second
+    /// copy). The moved tab becomes the target's active, kept-open tab, and a
+    /// source group left empty closes.
+    func move(
+        _ selection: MuxaSidebarSelection,
+        from sourceID: UUID,
+        to targetID: UUID,
+        at index: Int,
+        copy: Bool = false
+    ) {
+        guard group(id: sourceID)?.tabs.contains(selection) == true,
+              group(id: targetID) != nil else { return }
+        if sourceID != targetID, !copy {
+            detach(selection, from: sourceID)
+        }
+        insert(selection, into: targetID, at: index)
+    }
+
+    /// Drops a dragged tab on the leading or trailing edge of a group's
+    /// editor. With room for another group it opens one on that side;
+    /// otherwise the tab joins the neighbouring group on that side.
+    func split(
+        _ selection: MuxaSidebarSelection,
+        from sourceID: UUID,
+        beside targetID: UUID,
+        side: SplitSide,
+        copy: Bool = false
+    ) {
+        guard canSplit(selection, from: sourceID, beside: targetID, side: side, copy: copy),
+              let targetIndex = groups.firstIndex(where: { $0.id == targetID }) else { return }
+        let neighbourIndex = side == .leading ? targetIndex - 1 : targetIndex + 1
+        // A group's only tab dropped on its own edge: the group would close
+        // under it, so the neighbour is the only place to go.
+        let targetCloses = sourceID == targetID && !copy && group(id: sourceID)?.tabs == [selection]
+        if groups.indices.contains(neighbourIndex),
+           targetCloses || projectedGroupCount(selection, from: sourceID, copy: copy) >= Self.maxGroups {
+            let neighbour = groups[neighbourIndex]
+            move(selection, from: sourceID, to: neighbour.id, at: neighbour.tabs.count, copy: copy)
+            return
+        }
+        if !copy { detach(selection, from: sourceID) }
+        // Detaching may have closed the source group and shifted indexes.
+        guard let anchor = groups.firstIndex(where: { $0.id == targetID }) else { return }
+        let newGroup = Group(
+            id: UUID(),
+            tabs: [selection],
+            active: selection,
+            preview: nil,
+            history: [selection]
+        )
+        groups.insert(newGroup, at: side == .leading ? anchor : anchor + 1)
+        focusedGroupID = newGroup.id
+    }
+
+    /// Whether dropping on `side` of `targetID` does anything: a lone tab
+    /// cannot split off its own group, and at the group limit a side with no
+    /// neighbouring group has nowhere to go.
+    func canSplit(
+        _ selection: MuxaSidebarSelection,
+        from sourceID: UUID,
+        beside targetID: UUID,
+        side: SplitSide,
+        copy: Bool = false
+    ) -> Bool {
+        guard let source = group(id: sourceID), source.tabs.contains(selection),
+              let targetIndex = groups.firstIndex(where: { $0.id == targetID }) else { return false }
+        let neighbourIndex = side == .leading ? targetIndex - 1 : targetIndex + 1
+        let hasNeighbour = groups.indices.contains(neighbourIndex)
+        if sourceID == targetID, source.tabs.count == 1, !copy {
+            // Splitting would leave this group empty: only a move into the
+            // neighbour is meaningful.
+            return hasNeighbour
+        }
+        if projectedGroupCount(selection, from: sourceID, copy: copy) < Self.maxGroups { return true }
+        guard hasNeighbour else { return false }
+        // Moving into the neighbour is a no-op when the neighbour is the source.
+        return groups[neighbourIndex].id != sourceID || copy
+    }
+
+    /// The group count once the dragged tab leaves its source.
+    private func projectedGroupCount(_ selection: MuxaSidebarSelection, from sourceID: UUID, copy: Bool) -> Int {
+        guard !copy, let source = group(id: sourceID),
+              source.tabs == [selection], groups.count > 1 else { return groups.count }
+        return groups.count - 1
+    }
+
+    private func insert(_ selection: MuxaSidebarSelection, into groupID: UUID, at index: Int) {
+        guard let groupIndex = groups.firstIndex(where: { $0.id == groupID }) else { return }
+        var position = min(max(index, 0), groups[groupIndex].tabs.count)
+        if let existing = groups[groupIndex].tabs.firstIndex(of: selection) {
+            groups[groupIndex].tabs.remove(at: existing)
+            if existing < position { position -= 1 }
+        }
+        groups[groupIndex].tabs.insert(selection, at: position)
+        // A tab the operator placed by hand is not a preview any more.
+        if groups[groupIndex].preview == selection {
+            groups[groupIndex].preview = nil
+        }
+        groups[groupIndex].active = selection
+        touch(selection, in: &groups[groupIndex])
+        focusedGroupID = groupID
     }
 
     func prune(where isAvailable: (MuxaSidebarSelection) -> Bool) {

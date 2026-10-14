@@ -75,6 +75,19 @@ fn to_synthetic(state: ScreenState) -> SyntheticState {
     }
 }
 
+/// The agent kind that picks a pane's manifest: the registry's, else the
+/// process tree's. A registry row of `Unknown` kind is this detector's own
+/// placeholder and says nothing about which agent is there. Letting it shadow
+/// the process tree dropped the pane from candidacy, which stopped the row,
+/// which re-admitted the pane on the next tick: every restored Codex pane
+/// behind a launch wrapper flipped idle/stopped each interval until its first
+/// hook arrived.
+fn selecting_kind(registry: Option<AgentKind>, discovered: Option<AgentKind>) -> Option<AgentKind> {
+    registry
+        .filter(|kind| *kind != AgentKind::Unknown)
+        .or(discovered)
+}
+
 /// Build the synthetic [`AgentId`] for a screen-detected pane. Uses the SAME
 /// [`muxa::synthetic_session_id`] convention discovery mints, so a discovery
 /// placeholder and this screen row collapse onto one registry key and share the
@@ -214,7 +227,9 @@ impl ScreenDetector {
         let panes: Vec<(usize, PaneInfo, Option<AgentKind>)> = spawn_blocking(move || {
             let mut out = Vec::new();
             for (i, backend) in backends.iter().enumerate() {
-                let listed = backend.list_panes();
+                // One capture per pane per tick, not one per `~view~`
+                // listing of a grouped session's pane.
+                let listed = muxa::tmux::canonical_panes(&backend.list_panes());
                 let discovered: HashMap<String, AgentKind> =
                     muxa::discovery::discover_from_panes(&listed)
                         .into_iter()
@@ -249,8 +264,7 @@ impl ScreenDetector {
                     || registry_kind == Some(AgentKind::Codex))
                 .then_some(registry_kind)
                 .flatten();
-                let by_kind = registry
-                    .or(discovered)
+                let by_kind = selecting_kind(registry, discovered)
                     .and_then(AgentKind::screen_manifest_name)
                     .and_then(|name| self.manifests.manifest_for_name(name));
                 by_kind.or(direct).map(|m| (i, p, m.clone()))
@@ -454,6 +468,27 @@ mod tests {
 
     use super::*;
 
+    /// The detector's own `Unknown` placeholder must not hide the agent the
+    /// process tree found, or the pane falls out of candidacy every other
+    /// tick and its row flips between idle and stopped.
+    #[test]
+    fn an_unknown_placeholder_does_not_shadow_the_discovered_agent() {
+        assert_eq!(
+            selecting_kind(Some(AgentKind::Unknown), Some(AgentKind::Codex)),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(
+            selecting_kind(None, Some(AgentKind::Codex)),
+            Some(AgentKind::Codex)
+        );
+        // A real registry kind still wins over the process tree.
+        assert_eq!(
+            selecting_kind(Some(AgentKind::ClaudeCode), Some(AgentKind::Codex)),
+            Some(AgentKind::ClaudeCode)
+        );
+        assert_eq!(selecting_kind(Some(AgentKind::Unknown), None), None);
+    }
+
     const AT: OffsetDateTime = datetime!(2026-07-20 12:00:00 UTC);
 
     /// A fake backend: a fixed pane inventory plus a pane-id → capture-text map
@@ -509,6 +544,7 @@ mod tests {
     fn pane(pane_id: &str, command: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,

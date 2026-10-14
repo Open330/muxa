@@ -25,6 +25,7 @@
 //! could plug in a multi-server tmux scanner, a screen/zellij adapter, or
 //! a remote-host probe — all without touching `Reconciler` or `Store`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -150,6 +151,12 @@ pub struct Reconciler<L: LivenessSource> {
     /// `Some`, read lifecycle and quota evidence even when hooks are missing.
     /// `None` (default) disables the poll.
     codex_sessions_root: Option<PathBuf>,
+    native_sessions: Option<crate::session::SharedSessionBackend>,
+    /// When each observed host last answered well enough to protect its rows
+    /// from the cross-host age-out. Seeded with construction time, so a host
+    /// has to stay unanswered for the whole inactivity window — one timed-out
+    /// `tmux list-panes` under load must not stop every long-idle tmux agent.
+    last_protected: std::sync::Mutex<HashMap<HostKind, Instant>>,
 }
 
 impl<L: LivenessSource> Reconciler<L> {
@@ -171,6 +178,7 @@ impl<L: LivenessSource> Reconciler<L> {
     /// the daemon never constructs one that way — `active_backends()` is never
     /// empty.
     pub fn with_sources(store: SharedStore, sources: Vec<L>, interval: Duration) -> Self {
+        let kinds: Vec<HostKind> = sources.iter().map(LivenessSource::kind).collect();
         Self {
             store,
             sources: sources.into_iter().map(Arc::new).collect(),
@@ -180,6 +188,13 @@ impl<L: LivenessSource> Reconciler<L> {
             stuck_waiting_timeout: Duration::ZERO,
             paneless_stale_timeout: Duration::ZERO,
             codex_sessions_root: None,
+            native_sessions: None,
+            last_protected: std::sync::Mutex::new(
+                kinds
+                    .into_iter()
+                    .map(|kind| (kind, Instant::now()))
+                    .collect(),
+            ),
         }
     }
 
@@ -188,6 +203,12 @@ impl<L: LivenessSource> Reconciler<L> {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    #[must_use]
+    pub fn with_native_sessions(mut self, sessions: crate::session::SharedSessionBackend) -> Self {
+        self.native_sessions = Some(sessions);
         self
     }
 
@@ -450,6 +471,24 @@ impl<L: LivenessSource> Reconciler<L> {
         }
     }
 
+    /// Record this tick's protecting hosts and return every host that has
+    /// protected its rows within the inactivity window, so only a host that
+    /// stays silent for that long ages its rows out.
+    fn recently_protected(&self, answered: &[HostKind]) -> Vec<HostKind> {
+        let now = Instant::now();
+        let mut last = self
+            .last_protected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for kind in answered {
+            last.insert(*kind, now);
+        }
+        last.iter()
+            .filter(|(_, at)| now.duration_since(**at) < self.paneless_stale_timeout)
+            .map(|(kind, _)| *kind)
+            .collect()
+    }
+
     /// Run a single reconciliation pass on demand. Useful for tests, for
     /// surfacing a "force reconcile" CLI command later, and for triggering
     /// a pass right after startup discovery so the user doesn't wait a full
@@ -510,6 +549,7 @@ impl<L: LivenessSource> Reconciler<L> {
             .filter(|(_, o)| o.protects_stale_rows())
             .map(|(k, _)| *k)
             .collect();
+        let stale_protected_kinds = self.recently_protected(&stale_protected_kinds);
         let total_panes: usize = observations.iter().map(|(_, o)| o.panes.len()).sum();
         // Fix 3/5: the union of panes from COMPLETE observations only. An
         // incompletely-observed host contributes no panes, so its rows are
@@ -587,6 +627,11 @@ impl<L: LivenessSource> Reconciler<L> {
         };
         let store_update_us =
             u64::try_from(reconcile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if let Some(sessions) = &self.native_sessions {
+            self.store
+                .reconcile_native_surfaces(|id| sessions.session_liveness(id))
+                .await;
+        }
         let stuck_w = self
             .store
             .mark_stuck_idle_from(
@@ -829,9 +874,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn native_sessions_reconcile_even_when_pane_observation_fails() {
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "native-ghost".into(),
+                    surface: Some(crate::event::SurfaceRef {
+                        kind: crate::event::SurfaceKind::Pty,
+                        id: "pty:previous-daemon".into(),
+                        workspace: None,
+                    }),
+                    pane: None,
+                    tmux_socket: None,
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let runner = Reconciler::new(
+            store.clone(),
+            FakeLiveness::incomplete(Vec::new()),
+            Duration::from_secs(1),
+        )
+        .with_native_sessions(crate::session::PtySessionBackend::shared());
+        runner.reconcile_once().await;
+        let row = store.by_session("native-ghost").await.unwrap();
+        assert_eq!(row.state, AgentState::Stopped);
+        assert!(row.surface.is_none());
+    }
+
     fn pane(id: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -985,22 +1063,40 @@ mod tests {
         assert!(store.by_session("herdr-alive").await.is_some());
     }
 
-    /// Fix 4: the cross-host age-out keys off the COMPLETE-this-tick kinds, so a
-    /// chronically-incomplete host's stale rows age out (nothing else ever
-    /// reaps them) while a freshly-active row on the same host survives. tmux
-    /// answers complete; herdr times out (incomplete) every tick, so `Herdr` is
-    /// absent from `complete_kinds` and its rows are treated like a host outside
-    /// the set. A herdr row idle past the window flips to `Stopped`; a herdr row
-    /// with recent activity is spared by the last-activity threshold.
+    /// One timed-out tmux scan under load used to stop every tmux row idle
+    /// past the window — long-idle agents vanished from `muxa watch` while
+    /// their panes were alive. A single incomplete tick must not do that.
+    #[tokio::test]
+    async fn cross_host_spares_a_transiently_incomplete_host() {
+        let store = Store::shared();
+        let old = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&started("tmux-idle", "%1", old)).await;
+
+        let tmux = FakeLiveness::new(vec![pane("%1")]).with_kind(HostKind::Tmux);
+        let r = Reconciler::with_sources(store.clone(), vec![tmux], Duration::from_millis(10))
+            .with_paneless_stale_timeout(Duration::from_secs(60));
+        r.reconcile_once().await;
+        *r.sources[0].observation.lock().unwrap() = PaneObservation::incomplete(Vec::new());
+        r.reconcile_once().await;
+
+        assert_eq!(
+            store.by_session("tmux-idle").await.map(|a| a.state),
+            Some(AgentState::Idle),
+        );
+    }
+
+    /// Fix 4: a chronically-incomplete host's stale rows age out (nothing else
+    /// ever reaps them) once it has failed to answer for the whole inactivity
+    /// window, while a freshly-active row on the same host survives. tmux
+    /// answers complete; herdr times out (incomplete) every tick. Inside the
+    /// window herdr is still presumed present; past it, a herdr row idle past
+    /// the window flips to `Stopped` and a recently-active one is spared by the
+    /// last-activity threshold.
     #[tokio::test]
     async fn cross_host_ages_out_chronically_incomplete_host() {
         let store = Store::shared();
         let old = datetime!(2026-04-24 12:00:00 UTC);
-        let fresh = time::OffsetDateTime::now_utc();
         store.apply(&started("herdr-stale", "herdr:p1", old)).await;
-        store
-            .apply(&started("herdr-fresh", "herdr:p2", fresh))
-            .await;
 
         let tmux = FakeLiveness::new(vec![pane("%1")]).with_kind(HostKind::Tmux);
         // herdr never answers — incomplete, empty, every tick.
@@ -1008,6 +1104,21 @@ mod tests {
         let r =
             Reconciler::with_sources(store.clone(), vec![tmux, herdr], Duration::from_millis(10))
                 .with_paneless_stale_timeout(Duration::from_secs(1));
+        // Inside the window herdr is still presumed present.
+        r.reconcile_once().await;
+        assert_eq!(
+            store.by_session("herdr-stale").await.map(|a| a.state),
+            Some(AgentState::Idle),
+            "a host is not given up on before the window elapses",
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        store
+            .apply(&started(
+                "herdr-fresh",
+                "herdr:p2",
+                time::OffsetDateTime::now_utc(),
+            ))
+            .await;
         r.reconcile_once().await;
 
         let snap = store.snapshot().await;

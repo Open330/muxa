@@ -78,11 +78,11 @@ struct PipelineComposerView: View {
                     .font(.title2.weight(.semibold))
                 if let host = target.host {
                     Text("Saved into the muxa config on \(host) when you save; nothing is written while drafting.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 } else {
                     Text("Saved to this Mac's library; Sync to hosts writes it elsewhere.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -109,7 +109,7 @@ struct PipelineComposerView: View {
 
             PipelineFlowLayout(spacing: 6) {
                 Text("Try:")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 3)
                 ForEach(PipelineComposerSession.examples, id: \.self) { example in
@@ -132,7 +132,7 @@ struct PipelineComposerView: View {
                 if session.isDrafting {
                     ProgressView().controlSize(.small)
                     Text("Asking \(session.providerTitle)…")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                     Button("Cancel") { session.cancel() }
                         .controlSize(.small)
@@ -153,7 +153,7 @@ struct PipelineComposerView: View {
 
             if let error = session.errorMessage {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
@@ -166,18 +166,18 @@ struct PipelineComposerView: View {
         switch session.backend {
         case .checking:
             Text("Checking whether muxad can draft pipelines…")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .font(MuxaType.meta)
+                .foregroundStyle(.secondary)
         case .daemon:
             EmptyView()
         case .bundledCLI:
             Text("The running muxad predates in-app drafting; the bundled muxa CLI asks the provider instead.")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .font(MuxaType.meta)
+                .foregroundStyle(.secondary)
         case .unavailable:
             HStack(spacing: 8) {
                 Label("Update muxad to draft pipelines", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
                 Spacer()
                 Button("Describe in a Shell tab instead…") { describeInShell() }
@@ -202,13 +202,13 @@ struct PipelineComposerView: View {
                 Spacer()
                 if let draft = session.draft {
                     Text("\(draft.agents.count) agents")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.tertiary)
+                        .font(MuxaType.meta.monospacedDigit())
+                        .foregroundStyle(.secondary)
                 }
             }
             if let description = session.draft?.description, !description.isEmpty {
                 Text(description)
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -227,10 +227,10 @@ struct PipelineComposerView: View {
             if !session.notes.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     Label("Notes from \(session.providerTitle)", systemImage: "text.quote")
-                        .font(.caption.weight(.semibold))
+                        .font(MuxaType.detail.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Text(session.notes)
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
@@ -244,7 +244,7 @@ struct PipelineComposerView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(session.problems, id: \.self) { problem in
                         Label(problem, systemImage: "exclamationmark.circle")
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.orange)
                     }
                 }
@@ -269,8 +269,8 @@ struct PipelineComposerView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     ForEach(session.history) { step in
                         Label(step.request, systemImage: "checkmark.circle")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .font(MuxaType.meta)
+                            .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
                 }
@@ -284,7 +284,7 @@ struct PipelineComposerView: View {
         VStack(alignment: .leading, spacing: 8) {
             if let saveError {
                 Label(saveError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
@@ -293,7 +293,7 @@ struct PipelineComposerView: View {
                 if session.hasDraft, routesAreEmpty {
                     Toggle("Also add route .* → this pipeline", isOn: $addsCatchAllRoute)
                         .toggleStyle(.checkbox)
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .help("Adds a catch-all route so every Work id uses this pipeline")
                 }
                 Spacer()
@@ -384,26 +384,26 @@ private struct ComposerAgentRow: View {
                 .frame(width: 110, alignment: .leading)
                 .lineLimit(1)
             Text(agent.program)
-                .font(.caption2.weight(.medium))
+                .font(MuxaType.meta.weight(.medium))
                 .foregroundStyle(agentProgramTint(agent.program))
                 .padding(.horizontal, 5)
                 .padding(.vertical, 1)
                 .background(agentProgramTint(agent.program).opacity(0.12), in: Capsule())
             if agent.role.isEmpty {
                 Text("no role")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.detail)
+                    .foregroundStyle(.secondary)
             } else {
                 Text(agent.role)
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
             if !agent.after.isEmpty {
                 Text("after \(agent.after.map { "@\($0)" }.joined(separator: ", "))")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
         }

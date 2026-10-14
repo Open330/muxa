@@ -2,19 +2,24 @@
 
 mod activity_query;
 mod agent_launch;
+mod agent_move;
 mod attend;
 mod automation;
 mod collab_screen;
+mod collaboration_output;
 mod config_cmd;
 mod daemon;
 mod dashboard_tui;
 mod doctor;
+mod doctor_report;
 mod fleet_cli;
 mod fleet_watch;
+mod help_groups;
 mod init;
 mod interactive_child;
 mod logs;
 mod mcp;
+mod mcp_reload;
 mod message_skill;
 mod mux_control;
 mod onboarding;
@@ -95,11 +100,15 @@ enum Cmd {
         /// One-shot visual theme override.
         #[arg(long, value_enum, conflicts_with = "json")]
         theme: Option<ThemeArg>,
+        /// One row per agent instead of the session / window / pane tree.
+        #[arg(long, conflicts_with = "json")]
+        flat: bool,
         /// Emit a stable JSON snapshot for desktop widgets and other integrations.
         #[arg(long)]
         json: bool,
     },
     /// Print a one-liner status suitable for tmux `status-right`.
+    #[command(hide = true)]
     StatusLine {
         #[arg(long)]
         pane: Option<String>,
@@ -160,6 +169,10 @@ enum Cmd {
         /// Queue the Ask and return immediately instead of waiting for its answer.
         #[arg(long)]
         detach: bool,
+        /// Start a fresh conversation with the provider instead of resuming
+        /// the current one. The old conversation stays in history.
+        #[arg(long)]
+        new: bool,
         /// Print the stored Ask entry as JSON.
         #[arg(long)]
         json: bool,
@@ -175,7 +188,9 @@ enum Cmd {
     /// Read and replace the daemon's config.toml, the same way Muxa.app's
     /// Advanced settings does.
     Config(config_cmd::Args),
-    /// Manage local/SSH host inventory and Kubernetes-style metadata.
+    /// Former name of `muxa fleet host`. Muxa.app still invokes it, and an
+    /// app may run against an older or newer CLI, so keep this alias.
+    #[command(hide = true)]
     Host(fleet_cli::HostArgs),
     /// Observe and control this node plus SSH-connected Muxa hosts.
     Fleet(fleet_cli::FleetArgs),
@@ -205,22 +220,32 @@ enum Cmd {
         action: IdentityCmd,
     },
     /// Summarize retained prompt history, live agents, and session duration.
-    Stats(stats::Args),
-    /// Generate a Markdown activity report from the retained stats.
-    Report(stats::ReportArgs),
+    Stats(stats::StatsCommand),
+    /// Former name of `muxa stats report`.
+    #[command(hide = true)]
+    Report(stats::ReportInvocation),
     /// Explore agent work/wait/error intervals as an interactive timeline.
     Timeline(timeline::Args),
     /// Work-board TUI for tracking Work, Runs, external issues, and agents.
     Dashboard(dashboard_tui::Args),
-    /// Query raw activity ledger intervals.
-    Activity(activity_query::Args),
+    /// Former name of `muxa stats activity`.
+    #[command(hide = true)]
+    Activity(activity_query::ActivityInvocation),
     /// Hook adapter entrypoints invoked by the agent CLIs themselves.
+    #[command(hide = true)]
     Hook {
         #[command(subcommand)]
         which: HookCmd,
     },
-    /// Debug: print the active pane-host inventory.
+    /// Former name of `muxa registry panes`.
+    #[command(hide = true)]
     Panes,
+    /// Inspect and repair the agent registry: backfill from panes, drop
+    /// orphan rows, list pane hosts.
+    Registry {
+        #[command(subcommand)]
+        action: RegistryCmd,
+    },
     /// Overlay every pane in the current tmux window with its agent's
     /// state, summary, latest prompt, and latest response — then jump to
     /// one by its `display-panes` digit.
@@ -283,43 +308,23 @@ enum Cmd {
         #[arg(long, value_name = "PANE")]
         caller_pane: Option<String>,
     },
-    /// Run a command in a muxa-owned PTY session.
-    Run {
-        /// Human-readable session name.
-        #[arg(long)]
-        name: Option<String>,
-        /// Working directory for the child process. Defaults to the current directory.
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        /// Spawn the session and return without attaching.
-        #[arg(long)]
-        detach: bool,
-        /// Command and arguments to run. Use `--` before commands with flags.
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
+    /// Run, attach to, or register processes muxa tracks without agent hooks.
+    Proc {
+        #[command(subcommand)]
+        action: ProcCmd,
     },
-    /// Attach this terminal to a muxa-owned PTY session.
+    /// Former name of `muxa proc run`.
+    #[command(hide = true)]
+    Run(RunArgs),
+    /// Former name of `muxa proc attach`.
+    #[command(hide = true)]
     Attach { session: String },
-    /// Mark a muxa-owned PTY session as detached.
+    /// Former name of `muxa proc detach`.
+    #[command(hide = true)]
     Detach { session: String },
-    /// Register an arbitrary background process (shell script, game,
-    /// automation loop) so it shows up in `muxa status`/`muxa watch`,
-    /// tracked by pid liveness. Defaults `--pid` to the calling shell.
-    Register {
-        /// Display name shown in the NAME column.
-        #[arg(long)]
-        name: String,
-        /// Process id to track. Defaults to the parent process (the shell
-        /// that invoked `muxa register`).
-        #[arg(long)]
-        pid: Option<u32>,
-        /// Working directory to record (informational).
-        #[arg(long)]
-        cwd: Option<String>,
-        /// tmux pane id to associate, when the process lives in one.
-        #[arg(long)]
-        pane: Option<String>,
-    },
+    /// Former name of `muxa proc register`.
+    #[command(hide = true)]
+    Register(RegisterArgs),
     /// Internal bridge used by the zellij WASM plugin.
     #[command(hide = true)]
     ZellijPluginSnapshot {
@@ -328,6 +333,7 @@ enum Cmd {
     },
     /// Bridge the owner-only local muxad socket over an authenticated SSH
     /// stdio channel for Muxa Fleet. Usually launched by another muxad.
+    #[command(hide = true)]
     Relay {
         #[arg(long, default_value_t = true)]
         stdio: bool,
@@ -345,14 +351,19 @@ enum Cmd {
     /// queue without jumping.
     #[command(visible_alias = "go")]
     Attend(attend::Args),
-    /// Backfill the registry by scanning tmux panes for agent processes.
+    /// Former name of `muxa registry sync`.
+    #[command(hide = true)]
     Sync,
     /// Interactive install wizard — wires tmux, agent hooks, systemd,
     /// and the dashboard. Use `--preset standard --yes` for one-shot
     /// non-interactive installs.
     Init(init::Args),
     /// Run end-to-end diagnostics and report any setup issues.
-    Doctor,
+    Doctor {
+        /// List every check, including the ones that pass.
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Start, stop, restart, or inspect the local muxad process.
     Daemon {
         #[command(subcommand)]
@@ -366,9 +377,8 @@ enum Cmd {
     /// with `claude mcp add --scope user muxa -- muxa mcp`. Refuses to start if the
     /// daemon socket is unreachable. See docs/MCP.md.
     Mcp,
-    /// Tail muxad's stdout/stderr logs without remembering paths.
-    /// Falls back to `journalctl --user -u muxad` on Linux when the
-    /// systemd unit is the source of truth.
+    /// Former name of `muxa daemon logs`, kept for scripts and muscle memory.
+    #[command(hide = true)]
     Logs(logs::Args),
     /// Capture this multiplexer's workspace — sessions, windows, panes,
     /// geometry, and what each pane is running — so a restart can be undone
@@ -377,31 +387,95 @@ enum Cmd {
     /// Rebuild a workspace from a snapshot. Prints the plan unless `--run`
     Restore(reload::RestoreArgs),
 
-    /// Snapshot, restart the multiplexer, and put the workspace back. Run it
-    /// from outside the server it restarts
+    /// Reload MCP connections or snapshot/restart/restore the multiplexer
     Reload(reload::ReloadArgs),
 
     /// Update muxa from the source repo: `git pull` → cargo install
     /// `muxad` + `muxa-cli` → restart the daemon → verify the IPC
     /// socket is responsive. One command for the full update flow.
     Upgrade(upgrade::Args),
-    /// Delete accumulated "orphan" agent rows — paneless, surfaceless,
+    /// Former name of `muxa registry prune`.
+    #[command(hide = true)]
+    Prune(PruneArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProcCmd {
+    /// Run a command in a muxa-owned PTY session.
+    Run(RunArgs),
+    /// Attach this terminal to a muxa-owned PTY session.
+    Attach { session: String },
+    /// Mark a muxa-owned PTY session as detached.
+    Detach { session: String },
+    /// Show any background process in `muxa status`/`muxa watch`.
+    ///
+    /// For a shell script, game, or automation loop. Tracked by pid
+    /// liveness. Defaults `--pid` to the calling shell.
+    Register(RegisterArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct RunArgs {
+    /// Human-readable session name.
+    #[arg(long)]
+    name: Option<String>,
+    /// Working directory for the child process. Defaults to the current directory.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Spawn the session and return without attaching.
+    #[arg(long)]
+    detach: bool,
+    /// Command and arguments to run. Use `--` before commands with flags.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct RegisterArgs {
+    /// Display name shown in the NAME column.
+    #[arg(long)]
+    name: String,
+    /// Process id to track. Defaults to the parent process (the shell
+    /// that invoked `muxa proc register`).
+    #[arg(long)]
+    pid: Option<u32>,
+    /// Working directory to record (informational).
+    #[arg(long)]
+    cwd: Option<String>,
+    /// tmux pane id to associate, when the process lives in one.
+    #[arg(long)]
+    pane: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum RegistryCmd {
+    /// Backfill the registry by scanning tmux panes for agent processes.
+    Sync,
+    /// Delete accumulated "orphan" agent rows.
+    ///
+    /// Orphans are paneless, surfaceless,
     /// pid-less ghosts left by remote/detached sessions (e.g. codex driven
-    /// through a detached `app-server`). Only registry rows are removed;
+    /// through a detached `app-server`), including references to missing
+    /// native PTY sessions. Only registry rows are removed;
     /// tmux sessions are never touched. The daemon also ages these out on
     /// its own after `[reconciler] paneless_stale_timeout_secs` (24h default).
-    Prune {
-        /// Only prune rows idle at least this long (e.g. `30m`, `1h`, `24h`).
-        /// Spares recently-active sessions. Ignored when `--all` is set.
-        #[arg(long, default_value = "1h")]
-        older_than: String,
-        /// Prune every orphan row regardless of age.
-        #[arg(long)]
-        all: bool,
-        /// Skip the confirmation prompt.
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
+    Prune(PruneArgs),
+    /// Debug: print the active pane-host inventory.
+    Panes,
+}
+
+#[derive(Debug, clap::Args)]
+struct PruneArgs {
+    /// Only prune rows idle at least this long (e.g. `30m`, `1h`, `24h`).
+    /// Spares recently-active sessions. Ignored when `--all` is set.
+    #[arg(long, default_value = "1h")]
+    older_than: String,
+    /// Prune every orphan row regardless of age.
+    #[arg(long)]
+    all: bool,
+    /// Skip the confirmation prompt.
+    #[arg(long, short = 'y')]
+    yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -523,11 +597,33 @@ enum MsgCmd {
         /// Maximum wait in seconds (clamped to 600).
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
+        /// Print only the final reply body, without shell-side JSON parsing.
+        #[arg(long, conflicts_with = "full")]
+        body: bool,
+        /// Return the legacy full request JSON instead of a compact reply receipt.
+        #[arg(long)]
+        full: bool,
+        /// Write the result directly to a UTF-8 file instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Cancel a request that the recipient has not claimed yet.
     Cancel {
         request_id: String,
         /// Print the stored request instead of a one-line receipt.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Operator cleanup: expire every request nobody claimed within the
+    /// given age, whoever sent it, including senders that no longer exist.
+    Expire {
+        /// Age past which an unclaimed request expires (e.g. `24h`, `7d`).
+        #[arg(long, value_name = "AGE")]
+        older_than: String,
+        /// List what would expire without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the affected requests as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -604,6 +700,16 @@ enum AskProviderCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Make a provider the default: questions go to it from now on, and
+    /// `[ask] agent` is rewritten so a daemon restart keeps the choice.
+    /// `muxa ask --agent` switches only until the next restart.
+    Use {
+        /// Provider id from `muxa ask providers`.
+        id: String,
+        /// Print the updated provider list as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a provider instance. A built-in id keeps its row and only
     /// loses the settings you gave it.
     Remove {
@@ -656,10 +762,14 @@ enum AgentCmd {
     Start(agent_launch::StartArgs),
     /// Interrupt or terminate one muxa-managed tmux pane or native PTY session.
     Control(tmux_work::AgentControlArgs),
+    /// Move a running agent without restarting its conversation.
+    Move(agent_move::MoveArgs),
 }
 
 #[derive(Debug, Subcommand)]
 enum WindowCmd {
+    /// Move a whole live window, including all agents and its layout.
+    Move(agent_move::MoveArgs),
     /// Set a stable display name, or restore tmux's automatic process name.
     Rename(tmux_work::WindowRenameArgs),
 }
@@ -890,12 +1000,14 @@ async fn run_agent_cmd(
     match action {
         AgentCmd::Start(args) => agent_launch::run(args, client, socket_path, cfg).await,
         AgentCmd::Control(args) => tmux_work::run_agent_control(args, client).await,
+        AgentCmd::Move(args) => agent_move::run(args, Some(client.socket().to_path_buf())).await,
     }
 }
 
-fn run_window_cmd(action: WindowCmd) -> Result<()> {
+async fn run_window_cmd(action: WindowCmd) -> Result<()> {
     match action {
         WindowCmd::Rename(args) => tmux_work::run_window_rename(args),
+        WindowCmd::Move(args) => agent_move::run_window(args, None).await,
     }
 }
 
@@ -1032,6 +1144,24 @@ async fn cmd_ask_admin(client: &Client, action: AskCmd) -> Result<()> {
             report_provider_change(&providers, &id, json)?;
         }
         AskCmd::Provider {
+            action: AskProviderCmd::Use { id, json },
+        } => {
+            require_capability(client, "ask_provider_default_v1", "ask provider use").await?;
+            let providers = client.ask_provider_default(&id).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&providers)?);
+            } else {
+                let selected = providers
+                    .iter()
+                    .find(|provider| provider.selected)
+                    .context("the daemon reported no selected provider")?;
+                println!(
+                    "{}: now the default ask provider ({} on {}); saved as [ask] agent",
+                    selected.id, selected.title, selected.engine
+                );
+            }
+        }
+        AskCmd::Provider {
             action: AskProviderCmd::Remove { id, json },
         } => {
             let providers = client.ask_provider_remove(&id).await?;
@@ -1113,16 +1243,30 @@ fn render_ask_providers(providers: &[muxa::ask::AskProviderInfo]) -> String {
     out
 }
 
-async fn cmd_ask(
-    client: &Client,
-    prompt: String,
+/// Flags of one `muxa ask <prompt>` invocation.
+#[allow(clippy::struct_excessive_bools)] // independent CLI switches
+struct AskOptions {
     agent: Option<String>,
     api_key_stdin: bool,
     detach: bool,
+    new: bool,
     json: bool,
     timeout_secs: u64,
-) -> Result<()> {
+}
+
+async fn cmd_ask(client: &Client, prompt: String, options: AskOptions) -> Result<()> {
+    let AskOptions {
+        agent,
+        api_key_stdin,
+        detach,
+        new,
+        json,
+        timeout_secs,
+    } = options;
     let selected = client.ask_agent(agent.as_deref()).await?;
+    if new {
+        client.ask_reset().await?;
+    }
     let api_key = if api_key_stdin {
         anyhow::ensure!(
             !std::io::stdin().is_terminal(),
@@ -1196,6 +1340,21 @@ async fn cmd_ask(
     }
 }
 
+/// Parse argv with the grouped top-level help (see `help_groups`).
+fn parse_args() -> Args {
+    use clap::{CommandFactory, FromArgMatches};
+    let command = Args::command();
+    let template = format!(
+        "{{before-help}}{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{}\
+         Options:\n{{options}}{{after-help}}",
+        help_groups::grouped_commands(&command)
+    );
+    let mut command = command.help_template(template);
+    let matches = command.clone().get_matches();
+    stats::check_flag_placement(&mut command, &matches).unwrap_or_else(|error| error.exit());
+    Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
 #[allow(clippy::too_many_lines)] // top-level CLI subcommand wiring
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1207,8 +1366,20 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let args = Args::parse();
+    let args = parse_args();
     let cmd = args.cmd.unwrap_or(Cmd::Start);
+    if let Cmd::Agent {
+        action: AgentCmd::Move(move_args),
+    } = &cmd
+    {
+        return agent_move::run(move_args.clone(), args.socket.clone()).await;
+    }
+    if let Cmd::Window {
+        action: WindowCmd::Move(move_args),
+    } = &cmd
+    {
+        return agent_move::run_window(move_args.clone(), args.socket.clone()).await;
+    }
     if let Cmd::Watch {
         popup: true,
         caller_client,
@@ -1253,7 +1424,7 @@ async fn main() -> Result<()> {
 
     match cmd {
         Cmd::Start => start::run(&client, cfg, socket, config_path).await,
-        Cmd::Status { theme, json } => cmd_status(&client, &cfg, theme, json).await,
+        Cmd::Status { theme, flat, json } => cmd_status(&client, &cfg, theme, flat, json).await,
         Cmd::StatusLine {
             pane,
             needs_attention,
@@ -1271,6 +1442,7 @@ async fn main() -> Result<()> {
             agent,
             api_key_stdin,
             detach,
+            new,
             json,
             timeout_secs,
         } => {
@@ -1280,11 +1452,14 @@ async fn main() -> Result<()> {
             cmd_ask(
                 &client,
                 prompt,
-                agent,
-                api_key_stdin,
-                detach,
-                json,
-                timeout_secs,
+                AskOptions {
+                    agent,
+                    api_key_stdin,
+                    detach,
+                    new,
+                    json,
+                    timeout_secs,
+                },
             )
             .await
         }
@@ -1302,17 +1477,24 @@ async fn main() -> Result<()> {
             .await
         }
         Cmd::Agent { action } => run_agent_cmd(action, &client, &socket, &cfg).await,
-        Cmd::Window { action } => run_window_cmd(action),
+        Cmd::Window { action } => run_window_cmd(action).await,
         Cmd::Work { action } => run_work_cmd(action, &cfg, config_path, &client).await,
         Cmd::Workspace { action } => run_workspace_cmd(action),
         Cmd::Identity { action } => cmd_identity(&client, action).await,
-        Cmd::Stats(stats_args) => stats::run(&client, &cfg, stats_args).await,
-        Cmd::Report(report_args) => stats::run_report(&client, &cfg, report_args).await,
+        Cmd::Stats(stats_command) => stats::run_command(&client, &cfg, stats_command).await,
+        Cmd::Report(report) => stats::run_report(&client, &cfg, &report.window, report.args).await,
         Cmd::Timeline(timeline_args) => timeline::run(&client, &cfg, timeline_args).await,
         Cmd::Dashboard(dashboard_args) => cmd_dashboard(&client, &cfg, dashboard_args).await,
-        Cmd::Activity(activity_args) => activity_query::run(&cfg, activity_args).await,
+        Cmd::Activity(activity) => activity_query::run(&cfg, &activity.window, activity.args).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => cmd_panes(),
+        Cmd::Registry { action } => match action {
+            RegistryCmd::Sync => cmd_sync(&client).await,
+            RegistryCmd::Prune(prune) => {
+                cmd_prune(&client, &prune.older_than, prune.all, prune.yes).await
+            }
+            RegistryCmd::Panes => cmd_panes(),
+        },
         Cmd::Peek(peek_args) => peek::run(&client, peek_args).await,
         Cmd::Watch {
             popup: _,
@@ -1374,20 +1556,38 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Cmd::Run {
-            name,
-            cwd,
-            detach,
-            command,
-        } => cmd_run(&client, &socket, name, cwd, detach, command).await,
+        Cmd::Proc { action } => match action {
+            ProcCmd::Run(run) => {
+                cmd_run(&client, &socket, run.name, run.cwd, run.detach, run.command).await
+            }
+            ProcCmd::Attach { session } => cmd_attach(&client, &session).await,
+            ProcCmd::Detach { session } => cmd_detach(&client, &session).await,
+            ProcCmd::Register(register) => {
+                cmd_register(
+                    &client,
+                    register.name,
+                    register.pid,
+                    register.cwd,
+                    register.pane,
+                )
+                .await
+            }
+        },
+        Cmd::Run(run) => {
+            cmd_run(&client, &socket, run.name, run.cwd, run.detach, run.command).await
+        }
         Cmd::Attach { session } => cmd_attach(&client, &session).await,
         Cmd::Detach { session } => cmd_detach(&client, &session).await,
-        Cmd::Register {
-            name,
-            pid,
-            cwd,
-            pane,
-        } => cmd_register(&client, name, pid, cwd, pane).await,
+        Cmd::Register(register) => {
+            cmd_register(
+                &client,
+                register.name,
+                register.pid,
+                register.cwd,
+                register.pane,
+            )
+            .await
+        }
         Cmd::ZellijPluginSnapshot { json } => cmd_zellij_plugin_snapshot(&client, &json).await,
         Cmd::Relay { stdio } => {
             if !stdio {
@@ -1399,7 +1599,7 @@ async fn main() -> Result<()> {
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket, config_path).await,
-        Cmd::Doctor => doctor::run(socket, config_path.as_deref()).await,
+        Cmd::Doctor { verbose } => doctor::run(socket, config_path.as_deref(), verbose).await,
         Cmd::Daemon { action } => {
             daemon::run(action, &client, &socket, config_path.as_deref()).await
         }
@@ -1410,16 +1610,12 @@ async fn main() -> Result<()> {
         Cmd::Restore(restore_args) => reload::restore(restore_args),
         Cmd::Reload(reload_args) => reload::reload(&client, reload_args).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
-        Cmd::Prune {
-            older_than,
-            all,
-            yes,
-        } => cmd_prune(&client, &older_than, all, yes).await,
+        Cmd::Prune(prune) => cmd_prune(&client, &prune.older_than, prune.all, prune.yes).await,
     }
 }
 
 /// Parse a short human duration (`45s`, `30m`, `1h`, `2d`, or a bare
-/// seconds count) into whole seconds. Used by `muxa prune --older-than`.
+/// seconds count) into whole seconds. Used by `muxa registry prune --older-than`.
 fn parse_duration_secs(s: &str) -> Result<u64> {
     let s = s.trim();
     anyhow::ensure!(!s.is_empty(), "empty duration");
@@ -1447,9 +1643,14 @@ async fn cmd_prune(client: &Client, older_than: &str, all: bool, yes: bool) -> R
         parse_duration_secs(older_than)?
     };
     let now = OffsetDateTime::now_utc();
-    let agents = client.snapshot().await.unwrap_or_default();
+    let agents = client.snapshot().await?;
+    let sessions = client.list_sessions().await?;
     let is_orphan = |a: &Agent| {
-        a.kind != AgentKind::Task && a.pane.is_none() && a.surface.is_none() && a.pid.is_none()
+        let missing_surface = a.surface.as_ref().is_none_or(|surface| {
+            surface.kind == muxa::event::SurfaceKind::Pty
+                && !sessions.iter().any(|session| session.id == surface.id)
+        });
+        a.kind != AgentKind::Task && a.pane.is_none() && missing_surface && a.pid.is_none()
     };
     let candidates = agents
         .iter()
@@ -1747,6 +1948,16 @@ fn participant_matches_window(participant: &Participant, wanted: &str) -> bool {
 
 #[allow(clippy::too_many_lines)] // explicit message subcommand dispatch keeps output compatibility visible
 async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
+    // Housekeeping acts on the whole store, not as a participant, so it must
+    // not require the caller to be a tracked agent.
+    if let MsgCmd::Expire {
+        older_than,
+        dry_run,
+        json,
+    } = action
+    {
+        return cmd_msg_expire(client, &older_than, dry_run, json).await;
+    }
     let origin = collaboration_origin(client).await?;
     match action {
         MsgCmd::Send {
@@ -1871,12 +2082,60 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
         MsgCmd::Wait {
             request_id,
             timeout_secs,
-        } => cmd_msg_wait(client, &origin, &request_id, timeout_secs).await?,
+            body,
+            full,
+            output,
+        } => {
+            cmd_msg_wait(
+                client,
+                &origin,
+                &request_id,
+                timeout_secs,
+                body,
+                full,
+                output.as_deref(),
+            )
+            .await?;
+        }
         MsgCmd::Cancel { request_id, json } => {
             let request = client.collaboration_cancel(&origin, &request_id).await?;
             print_collaboration_receipt(&request, json)?;
         }
+        MsgCmd::Expire { .. } => unreachable!("handled before resolving an origin"),
     }
+    Ok(())
+}
+
+async fn cmd_msg_expire(
+    client: &Client,
+    older_than: &str,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    require_capability(client, "collaboration_expire_v1", "msg expire").await?;
+    let secs = parse_duration_secs(older_than)?;
+    anyhow::ensure!(secs > 0, "--older-than must be greater than zero");
+    let requests = client.collaboration_expire(secs, dry_run).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&requests)?);
+        return Ok(());
+    }
+    let verb = if dry_run { "would expire" } else { "expired" };
+    if requests.is_empty() {
+        println!("nothing unclaimed is older than {older_than}");
+        return Ok(());
+    }
+    for request in &requests {
+        println!(
+            "{verb}  {}  {:?}  {} -> {}  (queued since {})",
+            request.id,
+            request.kind,
+            request.from.label(),
+            request.to.label(),
+            request.created_at.date(),
+        );
+    }
+    println!("{} request(s) {verb}", requests.len());
     Ok(())
 }
 
@@ -1908,16 +2167,50 @@ async fn cmd_msg_wait(
     origin: &CollaborationOrigin,
     request_id: &str,
     timeout_secs: u64,
+    body: bool,
+    full: bool,
+    output: Option<&Path>,
 ) -> Result<()> {
     let request = client
         .collaboration_wait(origin, request_id, timeout_secs)
         .await?;
-    if request.status.is_terminal() {
-        println!("{}", serde_json::to_string_pretty(&request)?);
-        Ok(())
-    } else {
-        anyhow::bail!("timed out waiting for {request_id}")
+    if !request.status.is_terminal() && body {
+        eprintln!("wait deadline reached for {request_id}; no final reply received");
+        std::process::exit(2);
     }
+    let text = render_reply_output(&request, body, full)?;
+    if let Some(path) = output {
+        std::fs::write(path, text).with_context(|| format!("write reply to {}", path.display()))?;
+    } else {
+        println!("{text}");
+    }
+    if !request.status.is_terminal() {
+        // No work judgement: this invocation reached its wait deadline.
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn render_reply_output(
+    request: &muxa::collaboration::CollaborationRequest,
+    body: bool,
+    full: bool,
+) -> Result<String> {
+    if body {
+        return request
+            .reply
+            .as_ref()
+            .map(|reply| reply.body.clone())
+            .ok_or_else(|| anyhow::anyhow!("no final reply received for {}", request.id));
+    }
+    if full {
+        return Ok(serde_json::to_string(request)?);
+    }
+    let mut value = collaboration_output::outcome(request);
+    if !request.status.is_terminal() {
+        value["reason"] = serde_json::json!("timeout");
+    }
+    Ok(serde_json::to_string(&value)?)
 }
 
 /// What `send`, `reply`, and `cancel` say when they worked.
@@ -2121,7 +2414,7 @@ async fn cmd_register(
     cwd: Option<String>,
     pane: Option<String>,
 ) -> Result<()> {
-    // Default to the calling shell so `muxa register --name X` from a pane
+    // Default to the calling shell so `muxa proc register --name X` from a pane
     // tracks that shell without the user hunting for a pid.
     let pid = pid.or_else(|| Some(std::os::unix::process::parent_id()));
     client
@@ -2318,8 +2611,9 @@ fn key_to_pty_input(key: crossterm::event::KeyEvent) -> Option<String> {
 async fn cmd_attend(client: &Client, args: attend::Args) -> Result<()> {
     // Enumerate panes across every active host so a herdr agent that needs
     // a human is jumpable from a tmux-primary shell (and vice versa). The
-    // jump itself dispatches per-row in `jump_to_pane`.
-    let panes = all_panes().await;
+    // jump itself dispatches per-row in `jump_to_pane`. One row per pane, so
+    // the queue never labels a grouped pane by a `~view~` client session.
+    let panes = muxa::tmux::canonical_panes(&all_panes().await);
     if let Some(target) = attend::run(client, panes, args).await? {
         if muxa::backend::pane_id_host_kind(&target.pane) == Some(muxa::HostKind::Cmux) {
             let backend = target.endpoint.map_or_else(
@@ -2338,13 +2632,22 @@ async fn cmd_attend(client: &Client, args: attend::Args) -> Result<()> {
 async fn cmd_sync(client: &Client) -> Result<()> {
     use std::fmt::Write as _;
 
-    // Each CLI invocation builds its own backend so `MUXA_HOST` etc.
-    // resolve at the user's environment rather than the daemon's
-    // (which may have been started under a different shell).
-    let backend = muxa::default_backend();
-    let report = discovery::run_discovery(client, backend.as_ref())
-        .await
-        .context("running discovery")?;
+    // Each CLI invocation resolves hosts in the user's environment rather
+    // than the daemon's (which may have been started under a different
+    // shell) — every active host, so a sync from a plain terminal or a tmux
+    // shell still finds agents running in rmux.
+    let mut report = discovery::DiscoveryReport::default();
+    for backend in muxa::active_backends() {
+        let found = discovery::run_discovery(client, backend.as_ref())
+            .await
+            .context("running discovery")?;
+        report.claude_code += found.claude_code;
+        report.codex += found.codex;
+        report.gemini_cli += found.gemini_cli;
+        report.antigravity += found.antigravity;
+        report.skipped_known += found.skipped_known;
+        report.failed += found.failed;
+    }
 
     // Build the kind breakdown only for non-zero counts so the line stays
     // readable when only one agent kind is present.
@@ -2505,7 +2808,7 @@ pub(crate) async fn cmd_watch(
         skills: message_skills,
         collaboration_scope: cfg.collaboration.scope,
     };
-    if let Some(target) = watch::run(
+    if let Some(target) = Box::pin(watch::run(
         client,
         watch_cfg,
         message_composer,
@@ -2513,7 +2816,7 @@ pub(crate) async fn cmd_watch(
         activity_path.clone(),
         config_path,
         caller_pane,
-    )
+    ))
     .await?
     {
         match target {
@@ -2521,6 +2824,7 @@ pub(crate) async fn cmd_watch(
                 quick: true,
                 ..Default::default()
             })?,
+            watch::WatchOpenTarget::Moved(key) => agent_move::follow(&key)?,
             watch::WatchOpenTarget::TopologyPane(key) => {
                 jump_to_topology_pane_logged(&key, activity_path.as_deref()).await;
             }
@@ -3364,6 +3668,7 @@ async fn cmd_status(
     client: &Client,
     cfg: &Config,
     theme: Option<ThemeArg>,
+    flat: bool,
     json: bool,
 ) -> Result<()> {
     let agents = client.snapshot().await?;
@@ -3378,16 +3683,238 @@ async fn cmd_status(
         println!("no active agents");
         return Ok(());
     }
-    // Resolve the full pane inventory once via the active backend so
-    // `pane_display` does N lookups against a slice instead of N
-    // backend calls. Empty on backends without pane metadata (zellij
-    // CLI without the WASM plugin) — table still renders, just with
-    // raw pane ids in the location column.
-    let backend = muxa::default_backend();
-    let panes = backend.list_panes();
+    // Resolve the full pane inventory once so `pane_display` does N lookups
+    // against a slice instead of N backend calls. Every active host, not
+    // just the one this shell runs in: from a plain terminal (or a tmux
+    // shell) the agents live in rmux, and only the env-detected backend
+    // would leave every row as a raw `rmux:%N`. One row per pane, so a
+    // grouped session's `~view~` listing never names it.
+    let panes = all_panes().await;
     let theme = theme::for_config(cfg, theme, use_colors());
-    print_table(&agents, &panes, OffsetDateTime::now_utc(), theme);
+    let now = OffsetDateTime::now_utc();
+    if flat {
+        print_table(&agents, &muxa::tmux::canonical_panes(&panes), now, theme);
+        return Ok(());
+    }
+    // The same session / window / pane tree `status --json` and `watch`
+    // show, built from every host's panes (grouped `~view~` sessions fold
+    // onto their base). Row inputs are grouped by host like `--json`.
+    let mut by_host: std::collections::BTreeMap<
+        String,
+        (muxa::HostKind, Vec<muxa::tmux::PaneInfo>),
+    > = std::collections::BTreeMap::new();
+    for pane in panes {
+        let host = muxa::backend::pane_id_host_kind(&pane.pane_id).unwrap_or(muxa::HostKind::Tmux);
+        by_host
+            .entry(host.to_string())
+            .or_insert_with(|| (host, Vec::new()))
+            .1
+            .push(pane);
+    }
+    let inputs = by_host
+        .into_values()
+        .map(|(host, panes)| muxa::TopologyInput::new(host, panes))
+        .collect();
+    let topology = muxa::TopologySnapshot::build(now, inputs, agents);
+    println!(
+        "{}",
+        render_status_tree(&topology, now, theme, terminal_width())
+    );
     Ok(())
+}
+
+/// `muxa status` as a tree: each session, its windows, and the agents in
+/// their panes, with the flat table's state / age / prompt columns.
+/// Sessions and windows without an agent are left out; agents with no pane
+/// close the list. Single-agent sessions and windows collapse to one row.
+fn render_status_tree(
+    topology: &muxa::TopologySnapshot,
+    now: OffsetDateTime,
+    theme: CliTheme,
+    terminal_width: usize,
+) -> String {
+    let (mut table, layout, name_width, prompt_width) = status_tree_table(theme, terminal_width);
+    let rows = TreeRows {
+        layout,
+        name_width,
+        prompt_width,
+        theme,
+        now,
+    };
+    for session in &topology.sessions {
+        push_session_rows(&mut table, &rows, session);
+    }
+    if !topology.unassigned_agents.is_empty() {
+        table.add_row(rows.group("(no pane)", String::new()));
+        let count = topology.unassigned_agents.len();
+        for (at, agent) in topology.unassigned_agents.iter().enumerate() {
+            let name = if agent.kind == AgentKind::Task {
+                agent.session_id.clone()
+            } else {
+                crate::watch::agent_kind_short(agent.kind).to_string()
+            };
+            table.add_row(rows.agent(format!("{}{name}", branch(at, count)), agent));
+        }
+    }
+    format!("{table}")
+}
+
+/// Cell builders shared by every row of the status tree.
+struct TreeRows {
+    layout: StatusTableLayout,
+    name_width: usize,
+    prompt_width: usize,
+    theme: CliTheme,
+    now: OffsetDateTime,
+}
+
+impl TreeRows {
+    fn agent(&self, label: String, agent: &Agent) -> Vec<Cell> {
+        let state = status_state_label(agent.state, self.layout).to_string();
+        let headline = muxa::prompt_headline(agent.last_prompt.as_deref().unwrap_or("-"));
+        let prompt = headline.lines().next().unwrap_or("");
+        vec![
+            Cell::new(truncate_cell(&label, self.name_width)),
+            status_state_cell(&state, agent.state, self.theme),
+            self.theme.right_cell(
+                truncate_cell(&relative_time(self.now, agent.last_activity_at), 7),
+                TableTone::Dim,
+            ),
+            Cell::new(truncate_cell(prompt, self.prompt_width)),
+        ]
+    }
+
+    fn group(&self, label: &str, summary: String) -> Vec<Cell> {
+        vec![
+            self.theme
+                .cell(truncate_cell(label, self.name_width), TableTone::Header),
+            Cell::new(""),
+            Cell::new(""),
+            self.theme
+                .cell(truncate_cell(&summary, self.prompt_width), TableTone::Dim),
+        ]
+    }
+
+    fn label(&self, label: &str) -> Vec<Cell> {
+        vec![
+            Cell::new(truncate_cell(label, self.name_width)),
+            Cell::new(""),
+            Cell::new(""),
+            Cell::new(""),
+        ]
+    }
+}
+
+fn branch(at: usize, count: usize) -> &'static str {
+    if at + 1 == count {
+        "└─ "
+    } else {
+        "├─ "
+    }
+}
+
+/// One session's rows. A session with one agent is a single row; with one
+/// window its agents hang off the session; a window with one agent carries
+/// it on the window's own row.
+fn push_session_rows(table: &mut Table, rows: &TreeRows, session: &muxa::SessionNode) {
+    let kind = |agent: &Agent| crate::watch::agent_kind_short(agent.kind);
+    let windows: Vec<_> = session
+        .windows
+        .iter()
+        .filter_map(|window| {
+            let agents: Vec<_> = window
+                .panes
+                .iter()
+                .filter_map(|pane| pane.agent.as_ref().map(|agent| (pane, agent)))
+                .collect();
+            (!agents.is_empty()).then_some((window, agents))
+        })
+        .collect();
+    match windows.as_slice() {
+        [] => {}
+        [(_, agents)] if agents.len() == 1 => {
+            let agent = agents[0].1;
+            table.add_row(rows.agent(format!("{} · {}", session.name, kind(agent)), agent));
+        }
+        [(_, agents)] => {
+            table.add_row(rows.group(&session.name, state_summary(&session.states)));
+            for (at, (pane, agent)) in agents.iter().enumerate() {
+                let label = format!("{}{} {}", branch(at, agents.len()), pane.index, kind(agent));
+                table.add_row(rows.agent(label, agent));
+            }
+        }
+        _ => {
+            table.add_row(rows.group(&session.name, state_summary(&session.states)));
+            for (window_at, (window, agents)) in windows.iter().enumerate() {
+                let window_branch = branch(window_at, windows.len());
+                let window_label = format!("{window_branch}{}:{}", window.index, window.name);
+                if let [(_, agent)] = agents.as_slice() {
+                    table.add_row(rows.agent(format!("{window_label} · {}", kind(agent)), agent));
+                    continue;
+                }
+                table.add_row(rows.label(&window_label));
+                let indent = if window_at + 1 == windows.len() {
+                    "   "
+                } else {
+                    "│  "
+                };
+                for (at, (pane, agent)) in agents.iter().enumerate() {
+                    let label = format!(
+                        "{indent}{}{} {}",
+                        branch(at, agents.len()),
+                        pane.index,
+                        kind(agent)
+                    );
+                    table.add_row(rows.agent(label, agent));
+                }
+            }
+        }
+    }
+}
+
+/// The status table with NAME widened for tree prefixes: returns the table,
+/// its layout, and the NAME and prompt widths its rows must truncate to.
+fn status_tree_table(
+    theme: CliTheme,
+    terminal_width: usize,
+) -> (Table, StatusTableLayout, usize, usize) {
+    let layout = status_table_layout(terminal_width);
+    // Give the prefixes room from the prompt so window names stay readable.
+    let widen = TREE_NAME_EXTRA.min(status_prompt_width(terminal_width, layout).saturating_sub(16));
+    let prompt_width = status_prompt_width(terminal_width, layout) - widen;
+    let name_width = match layout {
+        StatusTableLayout::Full => 24,
+        StatusTableLayout::Compact => 18,
+        StatusTableLayout::Minimal => 14,
+    } + widen;
+    let mut constraints = status_table_constraints(layout, prompt_width);
+    constraints[0] =
+        ColumnConstraint::Absolute(Width::Fixed(u16::try_from(name_width).unwrap_or(u16::MAX)));
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_BORDERS_ONLY)
+        .set_content_arrangement(ContentArrangement::Disabled)
+        .set_constraints(constraints)
+        .set_header(status_table_header(layout, prompt_width, theme));
+    (table, layout, name_width, prompt_width)
+}
+
+/// Extra NAME columns in tree mode, for the `│  ├─ ` prefixes.
+const TREE_NAME_EXTRA: usize = 8;
+
+fn state_summary(states: &muxa::StateDistribution) -> String {
+    let waiting = states.waiting_input + states.waiting_choice;
+    [
+        (states.working, "working"),
+        (waiting, "waiting"),
+        (states.error, "error"),
+        (states.idle, "idle"),
+    ]
+    .iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, label)| format!("{count} {label}"))
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 fn status_json(
@@ -3560,11 +4087,7 @@ fn cmd_panes() -> Result<()> {
 
     let terminal_width = terminal_width();
     let mut out = std::io::stdout().lock();
-    for p in &all {
-        let line = format!(
-            "{:<8} {}:{}.{}  tty={}  cmd={}  title={}",
-            p.pane_id, p.session, p.window_index, p.pane_index, p.tty, p.current_command, p.title
-        );
+    for line in pane_inventory_lines(&all) {
         if let Err(error) = writeln!(out, "{}", truncate_cell(&line, terminal_width)) {
             if error.kind() == std::io::ErrorKind::BrokenPipe {
                 return Ok(());
@@ -3586,6 +4109,42 @@ fn cmd_panes() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `muxa panes` rows. A session group lists each pane once per `~view~`
+/// member: show the pane once, under its base session, with how many views
+/// share it.
+fn pane_inventory_lines(all: &[muxa::tmux::PaneInfo]) -> Vec<String> {
+    let mut listings: std::collections::HashMap<(Option<String>, String), usize> =
+        std::collections::HashMap::new();
+    for pane in all {
+        *listings
+            .entry((pane.socket.clone(), pane.pane_id.clone()))
+            .or_default() += 1;
+    }
+    muxa::tmux::canonical_panes(all)
+        .iter()
+        .map(|p| {
+            let views = match listings
+                .get(&(p.socket.clone(), p.pane_id.clone()))
+                .map_or(0, |count| count - 1)
+            {
+                0 => String::new(),
+                1 => "  +1 view".to_owned(),
+                n => format!("  +{n} views"),
+            };
+            format!(
+                "{:<8} {}:{}.{}{views}  tty={}  cmd={}  title={}",
+                p.pane_id,
+                p.session,
+                p.window_index,
+                p.pane_index,
+                p.tty,
+                p.current_command,
+                p.title
+            )
+        })
+        .collect()
 }
 
 /// The empty-state diagnostic for a host that reported no panes. Two ways
@@ -3739,9 +4298,27 @@ pub(crate) fn pane_display(a: &Agent, panes: &[muxa::tmux::PaneInfo]) -> String 
         }
         return "-".to_string();
     };
-    match panes.iter().find(|p| p.pane_id == raw) {
-        Some(p) => format!("{}:{}.{}", p.session, p.window_index, p.pane_index),
-        None => raw.to_string(),
+    // Pane ids repeat across servers; when the row names its server, only
+    // that server's pane is this one.
+    let located = panes.iter().find(|p| {
+        p.pane_id == raw
+            && match (a.tmux_socket.as_deref(), p.socket.as_deref()) {
+                (Some(agent), Some(pane)) => {
+                    muxa::backend::pane_endpoints_match(Some(raw), agent, pane)
+                }
+                _ => true,
+            }
+    });
+    match (located, a.tmux_session.as_deref()) {
+        (Some(p), _) => format!("{}:{}.{}", p.session, p.window_index, p.pane_index),
+        // No live listing (host unreachable from this shell): the session
+        // the daemon recorded still says where the agent is.
+        (None, Some(session)) if !session.is_empty() => format!(
+            "{}:{}",
+            muxa::tmux::base_session_name(session),
+            raw.rsplit(':').next().unwrap_or(raw)
+        ),
+        (None, _) => raw.to_string(),
     }
 }
 
@@ -3804,7 +4381,7 @@ fn render_status_table(
         let pane = pane_display(a, panes);
         let state_txt = status_state_label(a.state, layout).to_string();
         let last_activity = relative_time(now, a.last_activity_at);
-        let prompt_raw = a.last_prompt.as_deref().unwrap_or("-");
+        let prompt_raw = muxa::prompt_headline(a.last_prompt.as_deref().unwrap_or("-"));
         let prompt = prompt_raw.lines().next().unwrap_or("");
 
         let state_cell = status_state_cell(&state_txt, a.state, theme);
@@ -3937,6 +4514,102 @@ fn status_state_cell(label: &str, state: AgentState, theme: CliTheme) -> Cell {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reload_scopes_preserve_legacy_mux_and_reject_cross_scope_options() {
+        for argv in [
+            vec!["muxa", "reload", "--yes"],
+            vec!["muxa", "reload", "mux", "--yes"],
+            vec!["muxa", "reload", "mcp", "--dry-run", "--json"],
+            vec!["muxa", "reload", "mcp", "--all"],
+            vec!["muxa", "reload", "mcp", "--codex-home", "/profiles/account"],
+        ] {
+            assert!(Args::try_parse_from(&argv).is_ok(), "rejected {argv:?}");
+        }
+        for argv in [
+            vec!["muxa", "reload", "--yes", "mcp"],
+            vec!["muxa", "reload", "mcp", "--layout-only"],
+            vec![
+                "muxa",
+                "reload",
+                "mcp",
+                "--all",
+                "--codex-home",
+                "/profiles/account",
+            ],
+            vec!["muxa", "reload", "mcp", "--timeout-secs", "0"],
+        ] {
+            assert!(Args::try_parse_from(&argv).is_err(), "accepted {argv:?}");
+        }
+    }
+
+    #[test]
+    fn reply_output_preserves_json_escapes_and_direct_body() {
+        let mut request = collaboration_output::fixture();
+        let body = "pending\nquote: \" \\ path\n한글";
+        request.status = RequestStatus::Failed;
+        request.reply = Some(muxa::collaboration::CollaborationReply {
+            status: RequestStatus::Failed,
+            body: body.into(),
+            artifacts: vec![],
+            air_artifacts: vec![],
+            at: time::OffsetDateTime::UNIX_EPOCH,
+        });
+        let output = render_reply_output(&request, false, false).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["reply"]["body"], body);
+        assert_eq!(value["final_reply_received"], true);
+        assert_eq!(value["reported_status"], "failed");
+        assert_eq!(render_reply_output(&request, true, false).unwrap(), body);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &render_reply_output(&request, false, true).unwrap()
+            )
+            .unwrap(),
+            serde_json::json!(request)
+        );
+    }
+
+    #[test]
+    fn reply_timeout_does_not_close_or_fail_work() {
+        let request = collaboration_output::fixture();
+        let output = render_reply_output(&request, false, false).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["reason"], "timeout");
+        assert_eq!(value["delivery_state"], "claimed");
+        assert_eq!(value["final_reply_received"], false);
+        assert!(value.get("reported_status").is_none());
+        assert!(render_reply_output(&request, true, false).is_err());
+    }
+
+    #[test]
+    fn message_wait_cli_supports_direct_body_file_and_legacy_full_record() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "msg",
+            "wait",
+            "req-test",
+            "--body",
+            "--output",
+            "/tmp/reply.txt",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.cmd.expect("explicit subcommand"),
+            Cmd::Msg {
+                action: MsgCmd::Wait {
+                    body: true,
+                    output: Some(_),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(Args::try_parse_from(["muxa", "msg", "wait", "req-test", "--full"]).is_ok());
+        assert!(
+            Args::try_parse_from(["muxa", "msg", "wait", "req-test", "--body", "--full"]).is_err()
+        );
+    }
+
     /// rmux exports the tmux compatibility variables alongside its own, and
     /// the CLI once read `$TMUX_PANE` directly — yielding a bare `%118` where
     /// hooks stamp `rmux:%118`, so the origin matched no tracked agent and
@@ -3986,6 +4659,45 @@ mod tests {
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
 
+    #[tokio::test]
+    async fn prune_command_includes_missing_native_session_in_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("prune-native.sock");
+        let store = muxa::Store::shared();
+        let server = muxa::ipc::Server::new(socket.clone(), store.clone());
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let client = Client::new(socket);
+        client
+            .ingest(&muxa::AgentEvent::Started {
+                id: muxa::AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "cal-7651-ghost".into(),
+                    surface: Some(muxa::SurfaceRef {
+                        kind: muxa::SurfaceKind::Pty,
+                        id: "pty:missing".into(),
+                        workspace: None,
+                    }),
+                    pane: None,
+                    tmux_socket: None,
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc() - time::Duration::days(2),
+            })
+            .await
+            .unwrap();
+        cmd_prune(&client, "1h", false, true).await.unwrap();
+        assert!(store.by_session("cal-7651-ghost").await.is_none());
+        shutdown.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
     #[test]
     fn snapshot_restore_reload_and_upgrade_each_carry_their_own_help() {
         use clap::CommandFactory;
@@ -3999,7 +4711,7 @@ mod tests {
         };
         assert!(about("snapshot").starts_with("Capture this multiplexer"));
         assert!(about("restore").starts_with("Rebuild a workspace"));
-        assert!(about("reload").starts_with("Snapshot, restart"));
+        assert!(about("reload").starts_with("Reload MCP"));
         assert!(about("upgrade").starts_with("Update muxa from the source repo"));
     }
 
@@ -4144,6 +4856,21 @@ mod tests {
     }
 
     #[test]
+    fn ask_new_starts_a_fresh_conversation_only_when_asked() {
+        let fresh = Args::try_parse_from(["muxa", "ask", "--new", "start over"]).unwrap();
+        let Cmd::Ask { new, prompt, .. } = fresh.cmd.expect("explicit subcommand") else {
+            panic!("expected ask command");
+        };
+        assert!(new);
+        assert_eq!(prompt.as_deref(), Some("start over"));
+        let resumed = Args::try_parse_from(["muxa", "ask", "continue"]).unwrap();
+        assert!(matches!(
+            resumed.cmd.expect("explicit subcommand"),
+            Cmd::Ask { new: false, .. }
+        ));
+    }
+
+    #[test]
     fn the_provider_table_names_the_engine_behind_each_instance() {
         let mut providers = std::collections::BTreeMap::new();
         providers.insert(
@@ -4240,6 +4967,16 @@ mod tests {
         assert_eq!(api_key_env, None);
         assert!(!clear_model);
         assert!(clear_api_key_env);
+        let args = Args::try_parse_from(["muxa", "ask", "provider", "use", "codex"]).unwrap();
+        assert!(matches!(
+            args.cmd.expect("explicit subcommand"),
+            Cmd::Ask {
+                action: Some(AskCmd::Provider {
+                    action: AskProviderCmd::Use { ref id, json: false },
+                }),
+                ..
+            } if id == "codex"
+        ));
         // Setting and clearing the same key at once is a contradiction.
         assert!(Args::try_parse_from([
             "muxa",
@@ -4674,6 +5411,7 @@ mod tests {
     fn pane(id: &str, session: &str) -> muxa::tmux::PaneInfo {
         muxa::tmux::PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -5324,10 +6062,19 @@ mod tests {
             args.cmd.expect("explicit subcommand"),
             Cmd::Status {
                 json: true,
-                theme: None
+                theme: None,
+                flat: false,
             }
         ));
         assert!(Args::try_parse_from(["muxa", "status", "--json", "--theme", "minimal"]).is_err());
+        assert!(matches!(
+            Args::try_parse_from(["muxa", "status", "--flat"])
+                .unwrap()
+                .cmd
+                .expect("explicit subcommand"),
+            Cmd::Status { flat: true, .. }
+        ));
+        assert!(Args::try_parse_from(["muxa", "status", "--json", "--flat"]).is_err());
     }
 
     #[test]
@@ -5529,6 +6276,126 @@ mod tests {
         assert_eq!(truncate_cell("한글테스트입니다", 6), "한...");
     }
 
+    /// `muxa status` nests agents under their window and session, folds a
+    /// grouped `~view~` session onto its base, and lists paneless agents last.
+    #[test]
+    fn status_tree_groups_agents_by_session_and_window() {
+        let pane = |id: &str, session: &str, session_id: &str, window: &str, index: &str| {
+            serde_json::from_value::<muxa::tmux::PaneInfo>(serde_json::json!({
+                "pane_id": id, "session": session, "session_id": session_id,
+                "session_group": "callabo", "window_id": format!("@{window}"),
+                "window_name": format!("w{window}"), "window_index": window,
+                "pane_index": index, "tty": "", "current_command": "aas", "title": "",
+                "pane_pid": 0, "socket": "default"
+            }))
+            .unwrap()
+        };
+        let panes = vec![
+            pane("%1", "callabo", "$1", "0", "0"),
+            pane("%1", "callabo~view~9", "$9", "0", "0"),
+            pane("%2", "callabo", "$1", "1", "0"),
+            pane("%3", "callabo", "$1", "1", "1"),
+        ];
+        let mut agents = vec![
+            agent("a", Some("%1"), AgentState::Working, "first task"),
+            agent("b", Some("%2"), AgentState::Idle, "second"),
+            agent("c", Some("%3"), AgentState::WaitingInput, "third"),
+            agent("d", None, AgentState::Idle, "background"),
+        ];
+        for a in &mut agents {
+            a.tmux_socket = a.pane.as_ref().map(|_| "default".to_owned());
+        }
+        let now = OffsetDateTime::now_utc();
+        let topology = muxa::TopologySnapshot::build(
+            now,
+            vec![muxa::TopologyInput::new(muxa::HostKind::Tmux, panes)],
+            agents,
+        );
+        let rendered = render_status_tree(&topology, now, CliTheme::plain(), 120);
+        let lines: Vec<&str> = rendered
+            .lines()
+            .map(|line| line.strip_prefix("│ ").unwrap_or(line).trim_end())
+            .collect();
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} missing:\n{rendered}"))
+        };
+        assert!(!rendered.contains("~view~"), "{rendered}");
+        assert!(lines[at("callabo")].contains("1 working · 1 waiting · 1 idle"));
+        // A window with one agent carries it on its own line.
+        assert!(at("callabo") < at("├─ 0:w0 · claude"));
+        assert!(lines[at("├─ 0:w0 · claude")].contains("first task"));
+        assert!(at("├─ 0:w0 · claude") < at("└─ 1:w1"));
+        assert!(at("└─ 1:w1") < at("   ├─ 0 claude"));
+        assert!(at("   ├─ 0 claude") < at("   └─ 1 claude"));
+        assert!(at("└─ 1:w1") < at("(no pane)"));
+        assert!(lines[at("(no pane)") + 1].contains("background"));
+    }
+
+    /// One agent in a session is one line; one window drops its row.
+    #[test]
+    fn status_tree_collapses_single_window_and_single_agent_sessions() {
+        let pane = |id: &str, session: &str, index: &str| {
+            serde_json::from_value::<muxa::tmux::PaneInfo>(serde_json::json!({
+                "pane_id": id, "session": session, "session_id": format!("${session}"),
+                "window_id": format!("@{session}"), "window_name": "zsh",
+                "window_index": "0", "pane_index": index, "tty": "",
+                "current_command": "aas", "title": "", "pane_pid": 0, "socket": "default"
+            }))
+            .unwrap()
+        };
+        let panes = vec![
+            pane("%1", "solo", "0"),
+            pane("%2", "pair", "0"),
+            pane("%3", "pair", "1"),
+        ];
+        let mut agents = vec![
+            agent("a", Some("%1"), AgentState::Idle, "solo prompt"),
+            agent("b", Some("%2"), AgentState::Working, "left"),
+            agent("c", Some("%3"), AgentState::Idle, "right"),
+        ];
+        for a in &mut agents {
+            a.tmux_socket = Some("default".to_owned());
+        }
+        let now = OffsetDateTime::now_utc();
+        let topology = muxa::TopologySnapshot::build(
+            now,
+            vec![muxa::TopologyInput::new(muxa::HostKind::Tmux, panes)],
+            agents,
+        );
+        let rendered = render_status_tree(&topology, now, CliTheme::plain(), 120);
+        let lines: Vec<&str> = rendered.lines().collect();
+        let solo: Vec<_> = lines.iter().filter(|l| l.contains("solo")).collect();
+        assert_eq!(solo.len(), 1, "{rendered}");
+        assert!(solo[0].contains("solo · claude") && solo[0].contains("solo prompt"));
+        assert!(
+            !rendered.contains("0:zsh"),
+            "single windows drop their row:\n{rendered}"
+        );
+        assert!(rendered.contains("├─ 0 claude") && rendered.contains("└─ 1 claude"));
+    }
+
+    #[test]
+    fn pane_inventory_lists_grouped_panes_once_with_their_view_count() {
+        let pane = |session: &str, session_id: &str| {
+            serde_json::from_value::<muxa::tmux::PaneInfo>(serde_json::json!({
+                "pane_id": "%2", "session": session, "session_id": session_id,
+                "window_index": "2", "pane_index": "0", "tty": "/dev/pts/9",
+                "current_command": "aas", "title": "t", "pane_pid": 0, "socket": "default"
+            }))
+            .unwrap()
+        };
+        let lines = pane_inventory_lines(&[
+            pane("callabo~view~1", "$8"),
+            pane("callabo", "$0"),
+            pane("callabo~view~2", "$9"),
+        ]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("callabo:2.0  +2 views"), "{lines:?}");
+    }
+
     #[test]
     fn pane_display_shows_task_name_when_paneless() {
         // A paneless background task shows its registered name in NAME...
@@ -5538,6 +6405,33 @@ mod tests {
         // ...while other paneless agents (e.g. SDK sessions) still show "-".
         let sdk = agent("sdk-1", None, AgentState::Idle, "");
         assert_eq!(pane_display(&sdk, &[]), "-");
+    }
+
+    /// `muxa status` from a plain terminal, where the live listing lacks the
+    /// agents' host: the recorded session still names them, and a pane id
+    /// on another server is never taken for this one.
+    #[test]
+    fn pane_display_matches_the_server_and_falls_back_to_the_session() {
+        let mut agent = agent("cx", Some("rmux:%2"), AgentState::Idle, "");
+        agent.tmux_socket = Some("/tmp/rmux-1/default".into());
+        agent.tmux_session = Some("callabo~view~7".into());
+        assert_eq!(pane_display(&agent, &[]), "callabo:%2");
+
+        let pane = |socket: &str, session: &str| -> muxa::tmux::PaneInfo {
+            serde_json::from_value(serde_json::json!({
+                "pane_id": "rmux:%2", "session": session, "window_index": "2",
+                "pane_index": "0", "tty": "", "current_command": "aas", "title": "",
+                "pane_pid": 0, "socket": socket
+            }))
+            .unwrap()
+        };
+        let panes = [
+            pane("/tmp/rmux-9/other", "elsewhere"),
+            pane("/tmp/rmux-1/default", "callabo"),
+        ];
+        assert_eq!(pane_display(&agent, &panes), "callabo:2.0");
+        agent.tmux_session = None;
+        assert_eq!(pane_display(&agent, &panes[..1]), "rmux:%2");
     }
 
     #[test]

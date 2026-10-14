@@ -2,9 +2,9 @@
 //!
 //! Answers the question "is muxa working correctly?" without making the
 //! user know any paths or service-manager incantations. Each check
-//! prints exactly one line with a `✔ / ✗ / ⚠` glyph and an actionable
-//! hint when it fails. The output is cliclack-styled so it matches
-//! `muxa init`'s look.
+//! yields a `✔ / ✗ / ⚠` result with an actionable hint when it fails;
+//! `doctor_report` groups them by section and provider, folding whatever
+//! passes so the issues stand out (`-v` lists everything).
 //!
 //! Why this lives in its own module instead of reusing
 //! `init::verify`: verify is post-apply (one shot, narrow scope),
@@ -23,6 +23,8 @@ use muxa::state::SYNTHETIC_SESSION_PREFIX;
 use muxa::tmux::layout::{self, ClientSurface};
 use muxa::Agent;
 use tokio::time::timeout;
+
+use crate::doctor_report::{tilde, Level, Report};
 
 use crate::init::files::{antigravity, claude, codex, gemini, launchd, systemd as systemd_files};
 
@@ -53,117 +55,151 @@ const MUXAD_ERR_LOG: &str = "/tmp/muxad.err";
 /// computes from `--socket` / `MUXA_SOCKET` / `cfg.socket` / the default.
 /// Threading it in (rather than re-deriving from defaults here) keeps
 /// `muxa doctor` honest about which socket muxa would actually talk to.
-pub async fn run(socket: PathBuf, config: Option<&Path>) -> Result<()> {
-    let _ = cliclack::intro("muxa doctor");
+pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Result<()> {
+    let mut report = Report::default();
 
-    let mut issues = 0u32;
-
-    // 1. muxad responsive over IPC.
-    tally(check_muxad(&socket).await, &mut issues);
-
-    // 1½. Agents seen via discovery but not yet correlated with a hook.
-    //      Skipped silently when muxad is unreachable — `check_muxad`
-    //      already owns and reported that condition.
+    // muxad: reachable, every live agent correlated, how it is kept running.
+    add(&mut report, "muxad", None, check_muxad(&socket).await);
+    // Skipped silently when muxad is unreachable: `check_muxad` already
+    // owns and reported that condition.
     if let Some(snapshot) = fetch_snapshot(&socket).await {
-        tally(check_synthetic_agents(&snapshot), &mut issues);
+        add(
+            &mut report,
+            "muxad",
+            None,
+            check_synthetic_agents(&snapshot),
+        );
+        if let Some(result) = check_stale_requests(&socket).await {
+            add(&mut report, "muxad", None, result);
+        }
+    }
+    add(&mut report, "muxad", None, check_service_manager());
+    add(&mut report, "muxad", None, check_unit_file());
+    // Recent muxad errors. These are warnings, not failures: a stale ERROR
+    // line from yesterday shouldn't make the whole run look red.
+    let warnings = recent_muxad_errors(MUXAD_ERR_LOG, 20, 3);
+    if warnings.is_empty() {
+        add(
+            &mut report,
+            "muxad",
+            None,
+            CheckResult::Ok("recent log clean".into()),
+        );
+    }
+    for line in &warnings {
+        add(
+            &mut report,
+            "muxad",
+            None,
+            CheckResult::Warn(format_warning_line(line)),
+        );
     }
 
-    // 2. Service manager status (per-OS).
-    tally(check_service_manager(), &mut issues);
-
-    // 3. Service manager unit file on disk.
-    tally(check_unit_file(), &mut issues);
-
-    // 4. Per-agent hook configuration. Label-prefixed, so it folds
-    //    its own message before handing off to `tally`.
+    // One hook per agent CLI, so the provider is the group.
     for (label, result) in check_agent_hooks() {
-        let labelled = match result {
-            CheckResult::Ok(m) => CheckResult::Ok(format!("{label} — {m}")),
-            CheckResult::Warn(m) => CheckResult::Warn(format!("{label} — {m}")),
-            CheckResult::Fail(m) => CheckResult::Fail(format!("{label} — {m}")),
-        };
-        tally(labelled, &mut issues);
+        let provider = label.trim_start_matches("Hooks · ").to_string();
+        add(&mut report, "Hooks", Some(&provider), result);
     }
+
+    // Installed instructions, MCP entries and skills, one file per provider.
     match crate::init::integration::diagnostics(config) {
         Ok(checks) => {
             for (healthy, message) in checks {
-                tally(
-                    if healthy {
-                        CheckResult::Ok(message)
-                    } else {
-                        CheckResult::Warn(message)
-                    },
-                    &mut issues,
-                );
+                let (group, message) = match message.split_once(": ") {
+                    Some((component, rest)) => (
+                        Some(component.trim_start_matches("agent-").to_string()),
+                        rest.to_string(),
+                    ),
+                    None => (None, message),
+                };
+                let result = if healthy {
+                    CheckResult::Ok(message)
+                } else {
+                    CheckResult::Warn(message)
+                };
+                add(&mut report, "Agent integration", group.as_deref(), result);
             }
         }
-        Err(error) => tally(
-            CheckResult::Warn(format!("Agent integration: {error}")),
-            &mut issues,
+        Err(error) => add(
+            &mut report,
+            "Agent integration",
+            None,
+            CheckResult::Warn(error.to_string()),
         ),
     }
+    // Agent tool servers (`muxa mcp`) still on a pre-upgrade binary: their
+    // tools keep old behavior until the host refreshes them.
+    add(
+        &mut report,
+        "Agent integration",
+        None,
+        check_stale_agent_servers(),
+    );
 
-    // 4½. Agent tool servers (`muxa mcp`) still on a pre-upgrade binary:
-    //     their tools keep old behavior until the agent or server restarts.
-    tally(check_stale_agent_servers(), &mut issues);
-
-    // 4¾. What the tmux server and client this doctor run is talking to
-    //     can actually do. Read once and threaded into the tmux checks
-    //     below, because a config-isolated or control-mode server changes
-    //     what their remedies should be: "run `muxa init`" is wrong advice
-    //     for a server that will never read `~/.tmux.conf`.
+    // What the tmux server and client this run talks to can actually do. Read
+    // once and threaded into the checks below, because a config-isolated or
+    // control-mode server changes what their remedies should be: "run `muxa
+    // init`" is wrong advice for a server that will never read `~/.tmux.conf`.
     let tmux_env = TmuxEnvironment::probe();
-    tally(tmux_env.describe(), &mut issues);
-
-    // 5. tmux marker blocks.
-    tally(check_tmux_blocks(), &mut issues);
-
-    // 5¼. …and whether the binding tmux would actually run is the one
-    // those blocks describe. A duplicate `bind-key` later in the file,
-    // or a server that never re-read the file, leaves the block present
-    // and the behaviour stale.
-    tally(check_tmux_watch_binding(&tmux_env), &mut issues);
-
-    // 5½. MUXA_SOCKET env — the variable that lets every pane agree
-    // on the daemon socket path after a restart.
-    tally(check_muxa_socket_env(&socket, &tmux_env), &mut issues);
-
-    // 5¾. Where config.toml is expected to live. Informational, but the
-    // path differs per OS and nothing else prints it.
-    tally(check_config_file(), &mut issues);
-
-    // 5⅞. Workspace marks vs session names. Reported, never acted on:
-    // the mark legitimately outranks the name, so a disagreement is a thing
-    // to know about rather than a thing to refuse.
-    tally(check_workspace_marks(), &mut issues);
-
-    // 6. Recent muxad errors. These are surfaced as warnings (not
-    //    failures) — a stale ERROR line from yesterday shouldn't make
-    //    the whole doctor run look red.
-    let warnings = recent_muxad_errors(MUXAD_ERR_LOG, 20, 3);
-    if warnings.is_empty() {
-        log_ok("Recent muxad log clean");
-    } else {
-        for line in &warnings {
-            log_warn(&format_warning_line(line));
-        }
-        issues += u32::try_from(warnings.len()).unwrap_or(u32::MAX);
+    for result in [
+        tmux_env.describe(),
+        check_tmux_blocks(),
+        // A duplicate `bind-key` later in the file, or a server that never
+        // re-read it, leaves the block present and the behaviour stale.
+        check_tmux_watch_binding(&tmux_env),
+        // The variable that lets every pane agree on the daemon socket.
+        check_muxa_socket_env(&socket, &tmux_env),
+        // Reported, never acted on: the mark legitimately outranks the name.
+        check_workspace_marks(),
+    ] {
+        add(
+            &mut report,
+            "tmux",
+            None,
+            result.map(|m| m.trim_start_matches("tmux: ").to_string()),
+        );
     }
 
-    // Summary footer matches the cliclack box style; outro renders
-    // the closing └ glyph.
+    add(
+        &mut report,
+        "Config",
+        None,
+        check_config_file().map(|m| m.trim_start_matches("config: ").to_string()),
+    );
+
+    println!("┌  muxa doctor");
+    print!("{}", report.render(verbose, &paint));
     // Point at the per-check guidance printed above rather than asserting a
     // blanket `muxa init`/`upgrade` remedy — several warnings (e.g. "restart
     // the agents to enable hook events") are not fixed by either command.
-    let summary = if issues == 0 {
-        "All clean ✓".to_string()
-    } else if issues == 1 {
-        "1 issue — see the ⚠/✗ line above for its specific fix".to_string()
-    } else {
-        format!("{issues} issues — see the ⚠/✗ lines above for their specific fixes")
+    let summary = match report.issues() {
+        0 => "All clean ✓".to_string(),
+        1 => "1 issue — see the ⚠/✗ line above for its specific fix".to_string(),
+        issues => format!("{issues} issues — see the ⚠/✗ lines above for their specific fixes"),
     };
-    let _ = cliclack::outro(summary);
+    println!("└  {summary}");
     Ok(())
+}
+
+fn add(report: &mut Report, section: &'static str, group: Option<&str>, result: CheckResult) {
+    let (level, message) = match result {
+        CheckResult::Ok(m) => (Level::Ok, m),
+        CheckResult::Warn(m) => (Level::Warn, m),
+        CheckResult::Fail(m) => (Level::Fail, m),
+    };
+    report.push(section, group, level, tilde(&message));
+}
+
+fn paint(level: Level, text: &str) -> String {
+    if !crate::use_colors() {
+        return text.to_string();
+    }
+    let styled = match level {
+        Level::Ok => console::style(text).green(),
+        Level::Warn => console::style(text).yellow(),
+        Level::Fail => console::style(text).red(),
+    };
+    styled.force_styling(true).to_string()
 }
 
 /// Workspace identity lives in a tmux session option, and the session name is
@@ -211,31 +247,12 @@ enum CheckResult {
     Fail(String),
 }
 
-fn log_ok(msg: &str) {
-    let _ = cliclack::log::success(format!("✔ {msg}"));
-}
-
-fn log_warn(msg: &str) {
-    let _ = cliclack::log::warning(format!("⚠ {msg}"));
-}
-
-fn log_fail(msg: &str) {
-    let _ = cliclack::log::error(format!("✗ {msg}"));
-}
-
-/// Fold a uniform check into the running issue count + log line.
-/// One call site per check keeps `run()` readable and removes the
-/// Ok/Warn/Fail boilerplate that used to repeat for every check.
-fn tally(result: CheckResult, issues: &mut u32) {
-    match result {
-        CheckResult::Ok(msg) => log_ok(&msg),
-        CheckResult::Warn(msg) => {
-            log_warn(&msg);
-            *issues += 1;
-        }
-        CheckResult::Fail(msg) => {
-            log_fail(&msg);
-            *issues += 1;
+impl CheckResult {
+    fn map(self, f: impl FnOnce(String) -> String) -> Self {
+        match self {
+            Self::Ok(m) => Self::Ok(f(m)),
+            Self::Warn(m) => Self::Warn(f(m)),
+            Self::Fail(m) => Self::Fail(f(m)),
         }
     }
 }
@@ -289,6 +306,68 @@ async fn check_muxad(socket: &Path) -> CheckResult {
 /// One-shot snapshot fetch shared by the post-IPC checks. Returns
 /// `None` when muxad is unreachable so callers can skip rather than
 /// double-reporting the daemon-down condition `check_muxad` owns.
+/// Requests nobody has claimed for a day. Only the sender can cancel one, the
+/// sender is often an agent that has since exited, and one-way notices never
+/// wake their recipient, so these accumulate silently. `None` when the daemon
+/// predates `msg expire` or does not answer.
+async fn check_stale_requests(socket: &Path) -> Option<CheckResult> {
+    const DAY: u64 = 24 * 60 * 60;
+    let client = Client::new(socket.to_path_buf());
+    let hello = timeout(
+        Duration::from_millis(1500),
+        client.hello(Duration::from_millis(1500)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !hello
+        .capabilities
+        .iter()
+        .any(|c| c == "collaboration_expire_v1")
+    {
+        return None;
+    }
+    let stale = timeout(
+        Duration::from_millis(1500),
+        client.collaboration_expire(DAY, true),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some(stale_requests_verdict(&stale))
+}
+
+fn stale_requests_verdict(stale: &[muxa::collaboration::CollaborationRequest]) -> CheckResult {
+    if stale.is_empty() {
+        return CheckResult::Ok("no request has waited unclaimed over 24h".into());
+    }
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let quiet = stale
+        .iter()
+        .filter(|request| !request.should_notify())
+        .count();
+    let quiet = if quiet == 0 {
+        String::new()
+    } else {
+        format!(
+            " ({quiet} one-way notice{} that never wake their recipient)",
+            plural(quiet)
+        )
+    };
+    let oldest = stale
+        .iter()
+        .map(|request| request.created_at.date())
+        .min()
+        .map_or_else(String::new, |date| format!(", oldest from {date}"));
+    CheckResult::Warn(format!(
+        "{} request{} unclaimed for over 24h{quiet}{oldest}. Review with \
+         `muxa msg expire --older-than 24h --dry-run`; close with \
+         `muxa msg expire --older-than 24h`",
+        stale.len(),
+        plural(stale.len()),
+    ))
+}
+
 async fn fetch_snapshot(socket: &Path) -> Option<Vec<Agent>> {
     let client = Client::new(socket.to_path_buf());
     match timeout(Duration::from_millis(1500), client.snapshot()).await {
@@ -807,7 +886,10 @@ impl TmuxEnvironment {
 /// intact and doctor green while `prefix+s` opens an inset popup, whose
 /// inner width cannot reach the 120 columns the watch inspector needs.
 fn check_tmux_watch_binding(env: &TmuxEnvironment) -> CheckResult {
-    let out = muxa::tmux::tmux_command()
+    // Scoped like the other tmux checks. Unscoped, it asked the default
+    // socket, and rmux, unlike tmux, starts a server to answer: every
+    // isolated doctor run (the test suite included) left one behind.
+    let out = muxa::tmux::tmux_command_scoped()
         .args(["list-keys", "-T", "prefix"])
         .output();
     let text = match out {
@@ -872,6 +954,11 @@ fn watch_popup_binding(list_keys_output: &str) -> Option<&str> {
 /// takes 2 more, landing at 118 — one column short of the inspector for
 /// the entire reason the managed block uses `-B` and `100%`.
 fn popup_binding_is_full_client(binding: &str) -> bool {
+    // The current managed block runs `muxa watch --popup`, which opens its
+    // own borderless, full-width popup (`mux_control::watch_popup`).
+    if binding.contains("muxa watch --popup") {
+        return true;
+    }
     let width_full = binding.contains("-w \"100%\"") || binding.contains("-w 100%");
     // tmux prints merged short flags, so `-B -E` comes back as `-BE`.
     let borderless = binding
@@ -918,18 +1005,20 @@ fn check_tmux_blocks() -> CheckResult {
 /// the path the same way the IPC client does — a plain connect — so a
 /// stale pin downgrades to a warning instead of a misleading ✔.
 fn check_muxa_socket_env(daemon_socket: &Path, env: &TmuxEnvironment) -> CheckResult {
-    let out = muxa::tmux::tmux_command()
-        .args(["show-environment", "-g", "MUXA_SOCKET"])
-        .output();
-    let value = match out {
-        Ok(o) if o.status.success() => {
-            match parse_muxa_socket_env(&String::from_utf8_lossy(&o.stdout)) {
-                Some(value) => value,
-                None => return muxa_socket_unset(daemon_socket, env),
-            }
-        }
-        Ok(_) => return muxa_socket_unset(daemon_socket, env),
-        Err(e) => return CheckResult::Warn(format!("tmux: could not query environment ({e})")),
+    // Ask the server this shell is in. Native tmux pointed at an rmux
+    // socket (`$TMUX` inside rmux) cannot read it and reported the pin as
+    // unset even when it was set.
+    let value = match crate::mux_control::Control::Ambient.output(&[
+        "show-environment",
+        "-g",
+        "MUXA_SOCKET",
+    ]) {
+        Ok(stdout) => match parse_muxa_socket_env(&stdout) {
+            Some(value) => value,
+            None => return muxa_socket_unset(daemon_socket, env),
+        },
+        // A variable that was never set is a non-zero exit, as before.
+        Err(_) => return muxa_socket_unset(daemon_socket, env),
     };
 
     if socket_is_reachable(Path::new(&value)) {
@@ -950,28 +1039,33 @@ fn check_muxa_socket_env(daemon_socket: &Path, env: &TmuxEnvironment) -> CheckRe
 /// needed at all: a pane with no pin falls back to the default socket
 /// path, which is the right answer whenever muxad is listening there.
 /// Only a daemon on a *non-default* socket makes the missing pin bite.
+///
+/// That holds on every server, not just config-isolated ones: `muxa init`
+/// deliberately writes no pin for the default socket (`needs_socket_pin`),
+/// so telling a default-socket user to run it promised a fix that never
+/// came, and the warning returned after every multiplexer restart.
 fn muxa_socket_unset(daemon_socket: &Path, env: &TmuxEnvironment) -> CheckResult {
-    if !env.isolated() {
-        return CheckResult::Warn(
-            "tmux: MUXA_SOCKET not set — run `muxa init` to repair socket propagation".into(),
-        );
-    }
     let shown = daemon_socket.display();
     if same_path(daemon_socket, &muxa::paths::default_socket()) {
-        CheckResult::Ok(format!(
-            "tmux: MUXA_SOCKET unset on {}, which reads no `~/.tmux.conf` — harmless, since \
-             panes fall back to the default socket muxad already listens on ({shown})",
+        return CheckResult::Ok(format!(
+            "tmux: MUXA_SOCKET unset on {} — harmless, since panes fall back to the default \
+             socket muxad already listens on ({shown})",
             env.server_label()
-        ))
-    } else {
-        CheckResult::Warn(format!(
-            "tmux: MUXA_SOCKET unset on {}, which reads no `~/.tmux.conf`, and muxad listens on \
-             the non-default {shown} — panes there will fall back to the default path and fail \
-             to reach it; pin it on that server with `tmux set-environment -g MUXA_SOCKET \
-             {shown}`",
-            env.server_label()
-        ))
+        ));
     }
+    if !env.isolated() {
+        return CheckResult::Warn(format!(
+            "tmux: MUXA_SOCKET not set and muxad listens on the non-default {shown} — run \
+             `muxa init` to pin it in `~/.tmux.conf`"
+        ));
+    }
+    CheckResult::Warn(format!(
+        "tmux: MUXA_SOCKET unset on {}, which reads no `~/.tmux.conf`, and muxad listens on \
+         the non-default {shown} — panes there will fall back to the default path and fail \
+         to reach it; pin it on that server with `tmux set-environment -g MUXA_SOCKET \
+         {shown}`",
+        env.server_label()
+    ))
 }
 
 /// Whether two socket paths name the same file, tolerating the `/tmp` →
@@ -1082,6 +1176,67 @@ fn uid_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_participant(pane: &str, session: &str) -> muxa::collaboration::Participant {
+        muxa::collaboration::Participant {
+            agent_kind: muxa::AgentKind::Codex,
+            agent_session_id: session.into(),
+            pane: pane.into(),
+            socket: None,
+            room: muxa::collaboration::RoomId {
+                host: "tmux".into(),
+                socket: None,
+                window_id: "@1".into(),
+            },
+            tmux_session_id: None,
+            tmux_session_name: None,
+            window_name: None,
+            state: muxa::AgentState::Idle,
+            cwd: None,
+            alias: None,
+            roles: Vec::new(),
+            console: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_requests_are_counted_with_their_quiet_notices() {
+        use muxa::collaboration::{
+            CollaborationOptions, CollaborationStore, NewRequest, RequestKind,
+        };
+        assert!(matches!(stale_requests_verdict(&[]), CheckResult::Ok(_)));
+
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (from, to) = (test_participant("%1", "a"), test_participant("%2", "b"));
+        for kind in [RequestKind::Question, RequestKind::Notice] {
+            store
+                .create(
+                    from.clone(),
+                    to.clone(),
+                    NewRequest {
+                        kind,
+                        body: "x".into(),
+                        expects_reply: kind != RequestKind::Notice,
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let cutoff = time::OffsetDateTime::now_utc() + time::Duration::seconds(1);
+        let stale = store.expire_queued_before(cutoff, true).await.unwrap();
+        let CheckResult::Warn(message) = stale_requests_verdict(&stale) else {
+            panic!("stale requests are a warning");
+        };
+        assert!(
+            message.starts_with("2 requests unclaimed for over 24h (1 one-way notice "),
+            "{message}"
+        );
+        assert!(
+            message.contains("muxa msg expire --older-than 24h --dry-run"),
+            "{message}"
+        );
+    }
 
     /// A server the user owns: their `~/.tmux.conf` was read, and a
     /// terminal client is showing it.
@@ -1216,11 +1371,22 @@ mod tests {
         assert!(!msg.contains("muxa init"), "{msg}");
     }
 
+    /// `muxa init` writes no pin for the default socket, so on the user's
+    /// own server too a missing pin is fine; only a moved socket needs init.
     #[test]
-    fn an_unset_socket_pin_on_the_users_own_server_still_points_at_init() {
+    fn an_unset_socket_pin_on_the_users_own_server_needs_init_only_off_default() {
         let result = muxa_socket_unset(&muxa::paths::default_socket(), &user_owned_server());
+        assert!(is_ok(&result), "{}", message(&result));
+        assert!(!message(&result).contains("muxa init"));
+
+        let moved = PathBuf::from("/tmp/muxa-elsewhere.sock");
+        let result = muxa_socket_unset(&moved, &user_owned_server());
         assert!(matches!(result, CheckResult::Warn(_)));
-        assert!(message(&result).contains("muxa init"));
+        assert!(
+            message(&result).contains("muxa init"),
+            "{}",
+            message(&result)
+        );
     }
 
     #[test]
@@ -1426,11 +1592,14 @@ mod tests {
     /// What tmux prints for the run-shell-wrapped managed binding: the
     /// popup flags live inside the escaped inner string, but they are
     /// still whitespace-separated tokens of the one list-keys line.
+    /// The managed block today: muxa opens and sizes the popup itself.
+    const LIVE_SELF_SIZED: &str = r#"bind-key    -T prefix       s                         run-shell -b "muxa watch --popup --caller-client '#{client_name}' --caller-pane '#{pane_id}'""#;
     const LIVE_WRAPPED: &str = r#"bind-key    -T prefix s       run-shell -b "tmux display-popup -c '#{client_name}' -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch --caller-client '#{client_name}' --caller-pane '#{pane_id}'"""#;
 
     #[test]
     fn the_wrapped_binding_still_reads_as_full_client() {
         assert!(popup_binding_is_full_client(LIVE_WRAPPED));
+        assert!(popup_binding_is_full_client(LIVE_SELF_SIZED));
         assert_eq!(watch_popup_binding(LIVE_WRAPPED), Some(LIVE_WRAPPED));
     }
 

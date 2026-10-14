@@ -3,12 +3,12 @@
 //! `muxa upgrade` replaces the binaries and re-execs muxad, and every hook
 //! runs the new `muxa` on its next event. The long-lived `muxa mcp` servers
 //! are different: each agent (or Codex's shared app-server, once per thread)
-//! spawned one and keeps it until that agent or server restarts, so their
+//! spawned one and keeps it until the host refreshes MCP or restarts, so their
 //! tools keep the old behavior after an upgrade. Killing one does not help —
 //! the agent does not respawn it and its muxa tools simply fail.
 //!
 //! This scan lists those processes by who owns them, so `muxa upgrade` and
-//! `muxa doctor` can say exactly what to restart.
+//! `muxa doctor` can identify the owner that must refresh MCP.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -51,7 +51,7 @@ impl StaleReport {
         }
         let mut out = format!(
             "{} agent tool server(s) (`muxa mcp`) still run the pre-upgrade muxa; their \
-             muxa tools keep the old behavior until the owner restarts. Hooks need nothing.",
+             muxa tools keep the old behavior until the host refreshes them. Hooks need nothing.",
             self.total()
         );
         for ((pid, home), count) in &self.shared_codex {
@@ -59,10 +59,16 @@ impl StaleReport {
                 .as_deref()
                 .map(|home| format!("CODEX_HOME={home} "))
                 .unwrap_or_default();
+            let profile = if home.is_none() {
+                " --codex-home <owning-profile>"
+            } else {
+                ""
+            };
             let _ = write!(
                 out,
-                "\n• Codex shared app-server (pid {pid}): {count} thread(s). When those \
-                 sessions are idle:\n    {env}codex app-server daemon restart"
+                "\n• Codex shared app-server (pid {pid}): {count} thread(s). Queue MCP refresh:\n    \
+                 {env}muxa reload mcp{profile}\n  The host schedules connection refresh; acceptance is not proof it has applied. \
+                 If unsupported, restart the owning Codex app-server when its sessions are idle."
             );
         }
         if !self.panes.is_empty() {
@@ -79,16 +85,16 @@ impl StaleReport {
                 .collect();
             let _ = write!(
                 out,
-                "\n• Agents in {}: restart each (resume its conversation), or restart \
-                 every pane at once from outside the multiplexer:\n    muxa reload",
+                "\n• Agents in {}: reconnect MCP in each agent client. If its client has no \
+                 reconnect support, restart that agent and resume its conversation.",
                 panes.join(", ")
             );
         }
         if self.other > 0 {
             let _ = write!(
                 out,
-                "\n• {} more whose owner could not be identified — restart the agent \
-                 that launched it.",
+                "\n• {} more whose owner could not be identified — identify the client \
+                 that launched it and reconnect MCP there.",
                 self.other
             );
         }
@@ -148,13 +154,12 @@ fn classify(
     let by_pid: HashMap<u32, &Proc> = procs.iter().map(|p| (p.pid, p)).collect();
     // A pane in a grouped session is listed once per `~view~` client
     // session; name it by its base session.
-    let mut pane_of_pid: HashMap<u32, &muxa::tmux::PaneInfo> = HashMap::new();
-    for pane in panes.iter().filter(|pane| pane.pane_pid != 0) {
-        let slot = pane_of_pid.entry(pane.pane_pid).or_insert(pane);
-        if slot.session.contains("~view~") && !pane.session.contains("~view~") {
-            *slot = pane;
-        }
-    }
+    let canonical = muxa::tmux::canonical_panes(panes);
+    let pane_of_pid: HashMap<u32, &muxa::tmux::PaneInfo> = canonical
+        .iter()
+        .filter(|pane| pane.pane_pid != 0)
+        .map(|pane| (pane.pane_pid, pane))
+        .collect();
     let mut report = StaleReport::default();
     for proc in procs {
         if !is_muxa_mcp(&proc.args) || proc.age <= age_of_binary + START_SLACK {
@@ -335,8 +340,9 @@ mod tests {
         assert_eq!(report.panes.get("rmux:%217 (callabo:4.1)"), Some(&1));
         assert_eq!(report.total(), 3);
         let text = report.guidance().unwrap();
-        assert!(text.contains("CODEX_HOME=/home/u/.codex codex app-server daemon restart"));
-        assert!(text.contains("muxa reload"));
+        assert!(text.contains("CODEX_HOME=/home/u/.codex muxa reload mcp"));
+        assert!(text.contains("reconnect MCP in each agent client"));
+        assert!(!text.contains("every pane at once"));
         assert!(StaleReport::default().guidance().is_none());
     }
 }

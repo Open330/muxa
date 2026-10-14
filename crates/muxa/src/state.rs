@@ -40,6 +40,15 @@ use tokio::sync::{broadcast, watch, Notify, RwLock};
 pub const SYNTHETIC_SESSION_PREFIX: &str = "synthetic-";
 const CLAUDE_IDLE_PROMPT_NOTIFICATION: &str = "Claude is waiting for your input";
 
+/// The listing that names a pane: a grouped session reports one per `~view~`
+/// member; the base session represents it whatever the scan order.
+fn best_listing<'p>(listings: impl Iterator<Item = &'p PaneInfo>) -> Option<&'p PaneInfo> {
+    listings.fold(None, |kept, pane| match kept {
+        Some(kept) if !crate::tmux::prefer_listing(pane, kept) => Some(kept),
+        _ => Some(pane),
+    })
+}
+
 fn is_synthetic(session_id: &str) -> bool {
     session_id.starts_with(SYNTHETIC_SESSION_PREFIX)
 }
@@ -1503,6 +1512,62 @@ impl Store {
         removed
     }
 
+    /// Reconcile native PTY ownership with an authoritative session lookup.
+    /// `None` means the surface no longer exists; `Some(false)` means its
+    /// process exited but output is still available. A failed lookup is a no-op.
+    /// Lookups run under the registry lock, so a new hook cannot race cleanup.
+    pub async fn reconcile_native_surfaces<F>(&self, lookup: F) -> usize
+    where
+        F: Fn(&str) -> Result<Option<bool>, crate::session::SessionError> + Send,
+    {
+        let mut agents = self.agents.write().await;
+        let mut changed = 0;
+        for agent in agents.values_mut() {
+            let Some(surface) = agent.surface.as_ref() else {
+                continue;
+            };
+            if surface.kind != crate::event::SurfaceKind::Pty || agent.pane.is_some() {
+                continue;
+            }
+            let running = match lookup(&surface.id) {
+                Ok(Some(true)) | Err(_) => continue,
+                Ok(other) => other,
+            };
+            let missing = running.is_none();
+            if missing {
+                agent.surface = None;
+            }
+            // A surviving pid after daemon restart still owns its task row.
+            // Detach the stale surface, but leave pid liveness to its own sweep.
+            if missing && agent.pid.is_some_and(pid_alive) {
+                changed += 1;
+                continue;
+            }
+            let previous = agent.state;
+            if previous != AgentState::Stopped {
+                agent.state = AgentState::Stopped;
+                agent.state_entered_at = OffsetDateTime::now_utc();
+                agent.subagents.clear();
+                let _ = self.transitions.send(Transition {
+                    from: previous,
+                    to: agent.state,
+                    agent: Arc::new(agent.clone()),
+                });
+            }
+            if missing || previous != AgentState::Stopped {
+                // Reconciliation is not new agent activity: retain its age so
+                // an old ghost is immediately eligible for prune and GC.
+                changed += 1;
+            }
+        }
+        drop(agents);
+        if changed > 0 {
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
+        changed
+    }
+
     /// Immediately delete fully orphaned rows (no pane, surface, or pid)
     /// whose last activity predates `cutoff`. The on-demand analogue of the
     /// reconciler's `mark_stale_paneless_stopped` age-out — backs `muxa
@@ -1882,14 +1947,24 @@ impl Store {
             let Some(cands) = panes_by_id.get(pane_id) else {
                 continue;
             };
+            // Among a grouped session's `~view~` listings of the pane, name
+            // it by the base session, whatever order the scan listed them in.
             let chosen = match a.tmux_socket.as_deref() {
-                Some(sock) => cands.iter().find(|p| p.socket.as_deref() == Some(sock)),
-                None => match cands.len() {
-                    1 => cands.first(),
-                    _ => cands
+                Some(sock) => best_listing(
+                    cands
                         .iter()
-                        .find(|p| p.socket.as_deref() == Some("default"))
-                        .or(cands.first()),
+                        .copied()
+                        .filter(|p| p.socket.as_deref() == Some(sock)),
+                ),
+                None => match cands.len() {
+                    1 => cands.first().copied(),
+                    _ => best_listing(
+                        cands
+                            .iter()
+                            .copied()
+                            .filter(|p| p.socket.as_deref() == Some("default")),
+                    )
+                    .or_else(|| best_listing(cands.iter().copied())),
                 },
             };
             if let Some(p) = chosen {
@@ -2084,6 +2159,29 @@ impl Store {
         let mut report = self.reconcile_hosted(live_panes, HostKind::Tmux).await;
         report.paneless_correlated = paneless_correlated;
         report
+    }
+
+    /// Refresh physical session names after a live pane move. A partial scan
+    /// can update names, but must never reap agents or manufacture activity.
+    pub async fn refresh_pane_locations(&self, live_panes: &[PaneInfo]) {
+        let mut agents = self.agents.write().await;
+        let before: HashMap<_, _> = agents
+            .iter()
+            .map(|(id, a)| (id.clone(), (a.tmux_session.clone(), a.tmux_socket.clone())))
+            .collect();
+        let mut by_id: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
+        for pane in live_panes {
+            by_id.entry(&pane.pane_id).or_default().push(pane);
+        }
+        Self::backfill_tmux_names(&mut agents, &by_id);
+        let changed = agents.iter().any(|(id, a)| {
+            before.get(id) != Some(&(a.tmux_session.clone(), a.tmux_socket.clone()))
+        });
+        drop(agents);
+        if changed {
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
     }
 
     /// Repair a binding using an explicit running `codex resume <session>`
@@ -2861,6 +2959,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_surface_reconciliation_distinguishes_missing_exited_and_failed_lookups() {
+        let store = Store::shared();
+        let old = OffsetDateTime::now_utc() - time::Duration::days(2);
+        let mut rows = Vec::new();
+        for sid in ["missing", "exited", "running", "failed", "foreign", "paned"] {
+            let mut row = stored_agent(sid, AgentKind::Codex, AgentState::Idle, None);
+            row.last_activity_at = old;
+            row.pane = (sid == "paned").then(|| "%123".into());
+            row.surface = Some(SurfaceRef {
+                kind: if sid == "foreign" {
+                    crate::event::SurfaceKind::Tmux
+                } else {
+                    crate::event::SurfaceKind::Pty
+                },
+                id: sid.into(),
+                workspace: None,
+            });
+            rows.push(row);
+        }
+        store.hydrate(rows).await;
+        let lookup = |id: &str| match id {
+            "missing" => Ok(None),
+            "exited" => Ok(Some(false)),
+            "running" => Ok(Some(true)),
+            "failed" => Err(crate::session::SessionError::Pty("unavailable".into())),
+            other => panic!("must not observe another owner's surface: {other}"),
+        };
+        assert_eq!(store.reconcile_native_surfaces(lookup).await, 2);
+        let missing = store.by_session("missing").await.unwrap();
+        assert_eq!(missing.state, AgentState::Stopped);
+        assert!(missing.surface.is_none());
+        assert_eq!(missing.last_activity_at, old);
+        let exited = store.by_session("exited").await.unwrap();
+        assert_eq!(exited.state, AgentState::Stopped);
+        assert!(
+            exited.surface.is_some(),
+            "retained output remains accessible"
+        );
+        for sid in ["running", "failed", "foreign", "paned"] {
+            let row = store.by_session(sid).await.unwrap();
+            assert_eq!(row.state, AgentState::Idle);
+            assert!(row.surface.is_some());
+        }
+        assert_eq!(store.reconcile_native_surfaces(lookup).await, 0);
+        assert_eq!(store.prune_orphans(OffsetDateTime::now_utc()).await, 1);
+        assert!(store.by_session("missing").await.is_none());
+        assert!(store.by_session("failed").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn missing_native_surface_keeps_a_surviving_pid_task_alive() {
+        let store = Store::shared();
+        let mut row = stored_agent("survivor", AgentKind::Task, AgentState::Idle, None);
+        row.pane = None;
+        row.pid = Some(std::process::id());
+        row.surface = Some(SurfaceRef {
+            kind: crate::event::SurfaceKind::Pty,
+            id: "pty:old-daemon".into(),
+            workspace: None,
+        });
+        store.hydrate(vec![row]).await;
+        assert_eq!(store.reconcile_native_surfaces(|_| Ok(None)).await, 1);
+        let row = store.by_session("survivor").await.unwrap();
+        assert_eq!(row.state, AgentState::Idle);
+        assert!(row.surface.is_none());
+        assert_eq!(store.prune_orphans(OffsetDateTime::now_utc()).await, 0);
+    }
+
+    #[tokio::test]
     async fn prune_orphans_deletes_only_stale_ownerless_rows() {
         let store = Store::shared();
         let old = datetime!(2026-04-24 12:00:00 UTC);
@@ -3047,6 +3214,7 @@ mod tests {
             .unwrap();
         let pane = PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -5304,6 +5472,7 @@ mod tests {
     fn pane(id: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -5529,6 +5698,31 @@ mod tests {
         let untagged = store.by_session("untagged").await.expect("agent kept");
         assert_eq!(untagged.tmux_session.as_deref(), Some("main"));
         assert_eq!(untagged.tmux_socket.as_deref(), Some("default"));
+
+        let before = store.by_session("on-amux").await.unwrap();
+        let mut moved = pane("%1");
+        moved.socket = Some("amux".into());
+        moved.session = "moved-session".into();
+        // A partial observation cannot age out the unobserved default row.
+        store.refresh_pane_locations(&[moved]).await;
+        let after = store.by_session("on-amux").await.unwrap();
+        let mut expected = before;
+        expected.tmux_session = Some("moved-session".into());
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            store
+                .by_session("untagged")
+                .await
+                .unwrap()
+                .tmux_session
+                .as_deref(),
+            Some("main")
+        );
+        store.refresh_pane_locations(&[]).await;
+        assert_eq!(store.snapshot().await.len(), 2);
     }
 
     /// A socket-tagged agent whose server no longer has its pane is reaped

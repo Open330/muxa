@@ -1,3 +1,4 @@
+import { baseSessionName } from "./session-model.mjs";
 // Entries for the dashboard's Workspaces rail.
 //
 // muxa's managed layout is Workspace = tmux session, Run = window, Agent =
@@ -105,7 +106,7 @@ export function buildRailEntries({ workspaces = [], topology = null, unlinked = 
   for (const run of unlinked) {
     const name = run.session_name || run.execution?.session_id;
     if (!name) continue;
-    const entry = ensure(run.execution?.socket, name);
+    const entry = ensure(run.execution?.socket, baseSessionName(name));
     const known = entry.sessionKey !== "";
     entry.windowIds.add(run.execution?.window_id || run.id);
     entry.latest = later(entry.latest, run.latest_at);
@@ -221,7 +222,7 @@ export function railScope(entry) {
 export function inRailScope(scope, { session, socket } = {}) {
   if (!scope) return true;
   if (!scope.session) return false;
-  if (session !== scope.session) return false;
+  if (baseSessionName(session) !== baseSessionName(scope.session)) return false;
   return !scope.socket || !socket || socketShort(socket) === scope.socket;
 }
 

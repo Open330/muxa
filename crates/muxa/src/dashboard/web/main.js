@@ -1,3 +1,5 @@
+import { collaborationSummary, messagePreview, responseLatency, graphFitScale, initResizeHandle, setStableHTML, clearStableHTML, participantLocation, messageLink } from "./collaboration-view.mjs";
+import { baseSessionName, canonicalDashboardPanes, intervalPlacement } from "./session-model.mjs";
 import { openShareManager } from "./sharing-admin.mjs";
 import { openAccessManager } from "./operators-admin.mjs";
 import { renderLanding } from "./landing.mjs";
@@ -39,6 +41,7 @@ import {
   participantLabel,
   projectCollaboration,
   requestRoomKey,
+  roomKey,
   requestThreadId,
   requestWorkId,
   roomLabel,
@@ -215,6 +218,7 @@ async function upgradeWithToken() {
 }
 
 async function signOut() {
+  clearCollaborationDetails();
   try {
     await fetch("/auth/logout", {
       method: "POST",
@@ -521,6 +525,7 @@ function renderAccess() {
 }
 
 async function fetchAccess() {
+  const wasAuthorized = store.access.writeAuthorized;
   const data = await jsonFetch("/api/access");
   store.access = {
     mode: data.mode || "read_only",
@@ -533,6 +538,10 @@ async function fetchAccess() {
     login: normalizeLogin(data.login),
   };
   renderAccess();
+  if (wasAuthorized !== store.access.writeAuthorized) {
+    clearCollaborationDetails();
+    fetchCollaboration().catch(() => {});
+  }
   return store.access;
 }
 
@@ -545,13 +554,18 @@ function initAccessControl() {
   dom.editAccess.addEventListener("click", async () => {
     if (store.access.writeAuthorized && store.access.mode === "public_read") {
       localStorage.removeItem(TOKEN_KEY);
+      clearCollaborationDetails();
+      if (store.access.login.signedIn && store.access.login.role === "operator") {
+        await signOut();
+        return;
+      }
       await fetchAccess().catch(() => {});
       showToast("edit locked · public read-only");
       return;
     }
     if (store.access.writeAuthorized) return;
 
-    const token = window.prompt("Muxa edit PAT");
+    const token = window.prompt("Muxa dashboard PAT");
     if (!token) return;
     localStorage.setItem(TOKEN_KEY, token.trim());
     try {
@@ -906,13 +920,18 @@ function paneMatchesSelectedSession(pane) {
 
 function laneMatchesSelectedSession(lane) {
   const session = selectedSession();
-  return !session || lane.session_name === session || lane.session_id === session;
+  return !session || baseSessionName(lane.session_name) === baseSessionName(session) || lane.session_id === session;
 }
 
 function setSelectedSession(session) {
   const next = session || "";
   if (store.filters.timelineSession === next && store.timeline) return;
   store.filters.timelineSession = next;
+  store.filters.collaborationRoom = "";
+  store.filters.collaborationRoomObject = null;
+  store.ui.selectedCollaborationRoom = "";
+  store.ui.selectedCollaborationEdge = "";
+  store.ui.selectedCollaborationRequest = "";
   store.ui.selectedSegment = null;
   store.ui.terminalCapture = null;
   store.indexes.timelineSessionByAgent.clear();
@@ -924,6 +943,8 @@ function setSelectedSession(session) {
   renderWorkItems();
   renderInspector();
   fetchTimeline({ force: true }).catch(() => {});
+  fetchCollaboration().catch(() => {});
+  renderCollaboration();
 }
 
 // Select a rail entry (a tmux session, a managed workspace, or both): the
@@ -932,9 +953,10 @@ function setSelectedSession(session) {
 // the Sessions navigator tree shows only that session. The scope lives in
 // `#workspace=<name>` (`&wsocket=` when the name exists on several tmux
 // servers), separate from the navigator's detail selection
-// (`#session=`/`#window=`/`#pane=`), so selecting something in the navigator
-// never rescopes the page.
+// (`#session=`/`#window=`/`#pane=`). Navigator selections also synchronize
+// this scope; windows additionally narrow Collaboration to their room.
 function setSelectedWorkspace(workspaceKey, { updateHash = true } = {}) {
+  collaborationMessageFilter = "";
   const entry = railEntries().find((candidate) => candidate.key === workspaceKey) || null;
   const nextKey = entry?.key || "";
   const changed = store.ui.selectedWorkspaceKey !== nextKey;
@@ -956,6 +978,14 @@ function setSelectedWorkspace(workspaceKey, { updateHash = true } = {}) {
     renderPanes();
     renderWorkItems();
     renderInspector();
+  }
+  if (changed || store.filters.collaborationRoom) {
+    store.filters.collaborationRoom = "";
+    store.filters.collaborationRoomObject = null;
+    store.ui.selectedCollaborationRoom = "";
+    store.ui.selectedCollaborationEdge = "";
+    store.ui.selectedCollaborationRequest = "";
+    fetchCollaboration().catch(() => {});
   }
   renderCollaboration();
 }
@@ -1005,7 +1035,7 @@ function applyScopeHash() {
 }
 
 // Make the rail follow a session picked in the Timeline's workspace filter
-// (the navigator no longer rescopes the page).
+// and diagnostics. Navigator windows also scope Collaboration by room.
 function syncRailToSession(session, socket, { updateHash = false } = {}) {
   const entry = session ? findRailEntry(railEntries(), { session, socket }) : null;
   if (!entry && session) {
@@ -1155,7 +1185,7 @@ function buildSessionSummaries() {
   if (store.cache.sessionSummariesKey === cacheKey) return store.cache.sessionSummaries;
   const map = new Map();
   const ensure = (label) => {
-    const key = label || "no session";
+    const key = baseSessionName(label) || "no session";
     if (!map.has(key)) {
       map.set(key, {
         label: key,
@@ -1189,7 +1219,7 @@ function buildSessionSummaries() {
   }
   if (compactSessions.length === 0) {
     for (const lane of store.timeline?.lanes || []) {
-      const label = lane.session_name || lane.session_id || "no session";
+      const label = baseSessionName(lane.session_name || lane.session_id || "no session");
       const s = ensure(label);
       s.lanes += 1;
       addTimelineTotals(s.totals, lane.totals || {});
@@ -1364,7 +1394,7 @@ function renderWorkExecution(work) {
     return `<section class="execution-run">
       <div class="execution-breadcrumb">
         <span>run</span> ${esc(run.id)}
-        <b>›</b><span>session</span> ${esc(run.session_name)}
+        <b>›</b><span>session</span> ${esc(baseSessionName(run.session_name))}
         <b>›</b><span>window</span> ${esc(run.window_index)} · ${esc(run.window_name)}
         <small>${esc(run.state)} · ${esc(run.execution?.host || "")} · ${esc(socket)}</small>
       </div>
@@ -1409,7 +1439,7 @@ function renderUnlinkedExecutions() {
   const list = visible.map(({ run, session, window: windowId, socket }) => {
     const node = topologyWindowFor(windowId, socket);
     const cells = `<span class="state-dot ${run.state === "failed" ? "error" : run.state === "running" ? "working" : "idle"}"></span>
-    <span><b>${esc(run.session_name)}:${esc(run.window_index)}</b><small>${esc(run.window_name || run.id)}</small></span>
+    <span><b>${esc(baseSessionName(run.session_name))}:${esc(run.window_index)}</b><small>${esc(run.window_name || run.id)}</small></span>
     <span>${esc(run.state)}</span>
     <span>${(run.panes || []).length} panes</span>
     <span title="${esc(run.cwd || "")}">${esc(run.cwd || "no cwd")}</span>`;
@@ -1560,10 +1590,10 @@ function renderTimeline() {
 
   const compactSummary = !selectedSession() ? doc.summary : null;
   if (compactSummary) {
-    dom.timelineAxis.innerHTML = "";
+    renderTimelineAxis(start, end);
     renderTimelineHeatmap(summaryDayBuckets(compactSummary.days || []));
-    renderAllSessionsTimelineSummary(compactSummary);
-    dom.timelineMeta.textContent = `${compactSummary.sessions?.length || 0} sessions · partial summary`;
+    renderAllSessionsTimelineSummary(compactSummary, start, end);
+    dom.timelineMeta.textContent = `${compactSummary.sessions?.length || 0} sessions · activity over time`;
     renderOverview();
     renderSessionSidebar();
     renderInspector();
@@ -1609,73 +1639,39 @@ function renderTimeline() {
   renderInspector();
 }
 
-function renderAllSessionsTimelineSummary(summary) {
-  const sources = summary.sources || [];
-  const maxSecs = Math.max(1, ...sources.map((source) => sourceSummarySecs(source)));
+function renderAllSessionsTimelineSummary(summary, start, end) {
+  const lanes = summary.overview || [];
   dom.timelineBody.innerHTML = `
     <div class="timeline-summary-head">
       <strong>All sessions overview</strong>
-      <span>aggregated · select a session for exact intervals</span>
+      <span>activity over time · select a session for agent intervals</span>
     </div>
-    <div class="timeline-summary-lanes">
-      ${sources.map((source) => renderTimelineSummaryLane(source, maxSecs)).join("")}
-    </div>`;
+    ${lanes.map((lane) => {
+      const source = (summary.sources || []).find((candidate) => candidate.kind === lane.kind);
+      const label = lane.kind === "agent" ? `agents · ${lane.state === "waiting_input" ? "waiting" : lane.state}`
+        : lane.kind === "human" ? "interaction" : "tmux";
+      const segments = lane.intervals.map((interval) => {
+        const position = intervalPlacement(interval, start, end);
+        if (!position) return "";
+        const cls = lane.kind === "human" ? "source-human" : lane.kind === "tmux" ? "source-tmux"
+          : lane.state === "waiting_input" ? "state-waiting" : `state-${lane.state}`;
+        const title = `${label} · ${dateTimeLabel(new Date(position.start))} → ${dateTimeLabel(new Date(position.end))}`;
+        return `<span class="timeline-segment ${esc(cls)}" style="left:${position.left}%;width:${position.width}%" title="${esc(title)}"></span>`;
+      }).join("");
+      return `<div class="timeline-lane">
+        <div class="timeline-label"><span>${esc(label)}</span><small>${esc(source ? sourceSummaryLabel(source, lane.state) : "")}</small></div>
+        <div class="timeline-track">${segments}</div>
+      </div>`;
+    }).join("") || `<div class="timeline-empty">no activity in this window</div>`}`;
 }
 
-function renderTimelineSummaryLane(source, maxSecs) {
-  const secs = sourceSummarySecs(source);
-  const width = secs > 0 ? Math.max(1, (secs / maxSecs) * 100) : 0;
-  const totals = source.totals || {};
-  const label = source.kind === "human" ? "interaction" : source.kind || "agent";
-  const segments = source.kind === "agent"
-    ? renderAgentSummarySegments(totals)
-    : `<span class="timeline-summary-fill source-${source.kind === "tmux" ? "tmux" : "human"}" style="width:100%"></span>`;
-  return `<div class="timeline-summary-lane">
-    <div class="timeline-label">
-      <span>${esc(label)}</span>
-      <small>${esc(sourceSummaryLabel(source))}</small>
-    </div>
-    <div class="timeline-summary-track">
-      <div class="timeline-summary-scale" style="width:${width}%">${segments}</div>
-    </div>
-  </div>`;
-}
-
-function renderAgentSummarySegments(totals) {
-  const parts = [
-    ["state-working", totals.working_secs || 0],
-    ["state-waiting", totals.waiting_secs || 0],
-    ["state-error", totals.error_secs || 0],
-  ];
-  const total = parts.reduce((sum, [, secs]) => sum + secs, 0);
-  if (!total) return "";
-  return parts
-    .filter(([, secs]) => secs > 0)
-    .map(([cls, secs]) => `<span class="timeline-summary-fill ${cls}" style="width:${(secs / total) * 100}%"></span>`)
-    .join("");
-}
-
-function sourceSummarySecs(source) {
-  const totals = source.totals || {};
-  if (source.kind === "human") return totals.human_secs || 0;
-  if (source.kind === "tmux") return totals.foreground_secs || 0;
-  return (totals.working_secs || 0) +
-    (totals.waiting_secs || 0) +
-    (totals.error_secs || 0);
-}
-
-function sourceSummaryLabel(source) {
+function sourceSummaryLabel(source, state) {
   const totals = source.totals || {};
   const suffix = `${source.sessions || 0} sessions · ${source.lanes || 0} lanes`;
   if (source.kind === "human") return `interact ${formatDuration(totals.human_secs || 0)} · ${suffix}`;
   if (source.kind === "tmux") return `tmux ${formatDuration(totals.foreground_secs || 0)} · ${suffix}`;
-  return [
-    totals.active_secs ? `act ${formatDuration(totals.active_secs)}` : "",
-    totals.working_secs ? `work ${formatDuration(totals.working_secs)}` : "",
-    totals.waiting_secs ? `wait ${formatDuration(totals.waiting_secs)}` : "",
-    totals.error_secs ? `err ${formatDuration(totals.error_secs)}` : "",
-    suffix,
-  ].filter(Boolean).join(" · ");
+  const key = state === "waiting_input" ? "waiting_secs" : `${state}_secs`;
+  return `${formatDuration(totals[key] || 0)} agent time · ${suffix}`;
 }
 
 function summaryDayBuckets(days) {
@@ -1706,7 +1702,7 @@ function groupTimelineLanesBySession(lanes) {
   const groups = new Map();
   const activeBySession = activeSessionsByLabel();
   for (const lane of lanes) {
-    const label = lane.session_name || lane.session_id || "no session";
+    const label = baseSessionName(lane.session_name || lane.session_id || "no session");
     const key = label === "no session" ? "zzzz:no-session" : `session:${label.toLowerCase()}`;
     if (!groups.has(key)) {
       groups.set(key, {
@@ -2042,17 +2038,16 @@ function renderTimelineAxis(start, end) {
   const html = Array.from({ length: ticks + 1 }, (_, i) => {
     const pct = (i / ticks) * 100;
     const at = new Date(start + (end - start) * (i / ticks));
-    return `<span style="left:${pct}%">${esc(timeLabel(at))}</span>`;
+    const label = end - start >= 86_400_000 ? dateTimeLabel(at) : timeLabel(at);
+    return `<span style="left:${pct}%">${esc(label)}</span>`;
   }).join("");
   dom.timelineAxis.innerHTML = `<div class="timeline-axis-spacer"></div><div class="timeline-axis-track">${html}</div>`;
 }
 
 function renderTimelineSegment(interval, start, end) {
-  const s = Math.max(start, Date.parse(interval.started_at));
-  const e = Math.min(end, Date.parse(interval.ended_at));
-  if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) return "";
-  const left = ((s - start) / (end - start)) * 100;
-  const width = Math.max(0.5, ((e - s) / (end - start)) * 100);
+  const position = intervalPlacement(interval, start, end);
+  if (!position) return "";
+  const { start: s, end: e, left, width } = position;
   const cls = timelineSegmentClass(interval);
   const title = [
     interval.detail || timelineSegmentLabel(interval),
@@ -2113,17 +2108,17 @@ function laneTotalsLabel(totals) {
 function renderTimelineSessionOptions(doc) {
   store.timelineSessions.clear();
   for (const p of store.panes || []) {
-    if (p.session) store.timelineSessions.add(p.session);
+    if (p.session) store.timelineSessions.add(baseSessionName(p.session));
   }
   for (const lane of doc.lanes || []) {
-    if (lane.session_name) store.timelineSessions.add(lane.session_name);
+    if (lane.session_name) store.timelineSessions.add(baseSessionName(lane.session_name));
     if (lane.session_id) store.timelineSessions.add(lane.session_id);
   }
   for (const session of doc.active_sessions || []) {
-    if (session.label) store.timelineSessions.add(session.label);
+    if (session.label) store.timelineSessions.add(baseSessionName(session.label));
   }
   for (const session of store.timelineSummary?.summary?.sessions || doc.summary?.sessions || []) {
-    if (session.label) store.timelineSessions.add(session.label);
+    if (session.label) store.timelineSessions.add(baseSessionName(session.label));
   }
   const current = store.filters.timelineSession;
   const options = [`<option value="">all workspaces</option>`]
@@ -2446,6 +2441,8 @@ function initPaneDrawer() {
     openPaneFrom(row);
   });
   window.addEventListener("hashchange", () => {
+    const message = new URLSearchParams(window.location.hash.slice(1)).get("message");
+    if (message) { openCollaborationHistory({ message }).catch(() => {}); return; }
     applyScopeHash();
     applyTopologyHash();
     openPaneFromHash();
@@ -2645,8 +2642,8 @@ function renderTopology() {
   renderTopologyDetail(topology, sessions);
 }
 
-// Detail selection only: what the navigator's right-hand side (and the pane
-// drawer) shows. It never changes the page scope, which is the rail's.
+// Session selection also scopes diagnostics; window and pane selection
+// remains a detail action within that session.
 function selectTopology(key, { focusTree = false, updateHash = true } = {}) {
   const topology = currentTopology();
   const node = topology.nodes.get(key);
@@ -2659,6 +2656,14 @@ function selectTopology(key, { focusTree = false, updateHash = true } = {}) {
   if (node.type === "socket") {
     toggleTopologyNode(key);
     return;
+  }
+  if (node.type === "session" || node.type === "window") {
+    const session = node.type === "window" ? topology.nodes.get(node.sessionKey) : node;
+    const entry = session && findRailEntry(railEntries(), { session: session.name, socket: session.socket });
+    if (entry) setSelectedWorkspace(entry.key, { updateHash });
+    const room = node.type === "window"
+      ? { host: node.host, socket: node.socket, window_id: node.id } : null;
+    chooseCollaborationRoom(room ? { key: roomKey(room), room } : null);
   }
   topologyState.selection = { type: node.type, key };
   // Make the selection visible in the tree.
@@ -2840,7 +2845,7 @@ function renderTopologyDetail(topology, sessions) {
 function tailsActive() {
   const selection = topologyState.selection;
   return Boolean(selection?.type === "window" && store.access.writeAuthorized && !topologyState.tailsDenied
-    && !document.hidden && !dom.topologyPanel?.classList.contains("collapsed"));
+    && !document.hidden && !dom.topologyDetail.hidden && !dom.topologyPanel?.classList.contains("collapsed"));
 }
 
 function setTail(key, text) {
@@ -3314,6 +3319,7 @@ let collaborationFilterTimer = null;
 function initCollaborationControls() {
   if (!dom.collaborationGraph) return;
   const refreshFromControls = () => {
+    collaborationMessageFilter = "";
     store.filters.collaborationRange = dom.collaborationRange.value;
     store.filters.collaborationWork = dom.collaborationWork.value.trim();
     store.filters.collaborationThread = dom.collaborationThread.value.trim();
@@ -3341,11 +3347,15 @@ function initCollaborationControls() {
   dom.collaborationRefresh.addEventListener("click", () => fetchCollaboration().catch(() => {}));
   dom.collaborationLoadMore.addEventListener("click", () => fetchCollaboration({ append: true }).catch(() => {}));
   dom.collaborationClearSelection.addEventListener("click", () => {
+    const hadHistoryFilter = Boolean(collaborationMessageFilter || store.filters.collaborationThread);
+    collaborationMessageFilter = "";
+    store.filters.collaborationThread = "";
+    dom.collaborationThread.value = "";
     const hadRoomFilter = Boolean(store.filters.collaborationRoom);
     store.ui.selectedCollaborationEdge = "";
     store.ui.selectedCollaborationRoom = "";
     store.ui.selectedCollaborationRequest = "";
-    if (hadRoomFilter) {
+    if (hadRoomFilter || hadHistoryFilter) {
       store.filters.collaborationRoom = "";
       store.filters.collaborationRoomObject = null;
       dom.collaborationRoom.value = "";
@@ -3376,6 +3386,14 @@ function initDynamicEventDelegation() {
     activateEdge(edge);
   });
   dom.collaborationRooms?.addEventListener("click", (event) => {
+    const sessionButton = event.target.closest("[data-collaboration-session]");
+    if (sessionButton) {
+      const session = sessionButton.getAttribute("data-collaboration-session");
+      const entry = findRailEntry(railEntries(), { session, socket: sessionButton.getAttribute("data-collaboration-socket") });
+      if (entry) setSelectedWorkspace(entry.key);
+      else if (session) syncRailToSession(session);
+      return;
+    }
     const button = event.target.closest("[data-collaboration-room-index]");
     const index = Number(button?.getAttribute("data-collaboration-room-index"));
     const room = store.cache.collaborationProjection?.rooms[index];
@@ -3387,7 +3405,9 @@ function initDynamicEventDelegation() {
     const request = store.collaboration.requests.find((candidate) => candidate.id === id);
     if (!request) return;
     store.ui.selectedCollaborationRequest = id;
-    renderCollaborationDetail(request);
+    renderCollaborationMessages();
+    document.querySelector(".collaboration-detail-pane").scrollTop = 0;
+    dom.collaborationDetail.scrollIntoView({ block: "nearest", behavior: "smooth" });
   });
   dom.collaborationSequence?.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" && event.key !== " ") return;
@@ -3396,10 +3416,38 @@ function initDynamicEventDelegation() {
     event.preventDefault();
     item.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
-  dom.collaborationDetail?.addEventListener("click", (event) => {
+  dom.collaborationDetail?.addEventListener("click", async (event) => {
+    const threadButton = event.target.closest("[data-open-collaboration-thread]");
+    const parentButton = event.target.closest("[data-open-collaboration-message]");
+    if (threadButton || parentButton) {
+      await openCollaborationHistory({ thread: threadButton?.dataset.openCollaborationThread, message: parentButton?.dataset.openCollaborationMessage });
+      return;
+    }
+    const selected = store.collaboration.requests.find(request => request.id === store.ui.selectedCollaborationRequest);
+    if (event.target.closest("[data-copy-collaboration-link]") && selected) {
+      try { await navigator.clipboard.writeText(messageLink(window.location.href, selected)); showToast("message link copied"); }
+      catch { showToast("clipboard unavailable"); }
+      return;
+    }
+    if (event.target.closest("[data-copy-collaboration-message]") && selected && store.collaboration.details_included) {
+      const conversation = [selected.body, ...(selected.updates || []).map(update => update.body), selected.reply?.body].filter(Boolean).join("\n\n");
+      try { await navigator.clipboard.writeText(conversation); showToast("conversation copied"); }
+      catch { showToast("clipboard unavailable"); }
+      return;
+    }
+    if (event.target.closest("[data-unlock-collaboration]")) {
+      dom.editAccess.click();
+      return;
+    }
+    if (event.target.closest("[data-login-collaboration]")) {
+      signIn();
+      return;
+    }
     if (!event.target.closest("[data-close-collaboration-detail]")) return;
     store.ui.selectedCollaborationRequest = "";
     dom.collaborationDetail.hidden = true;
+    document.getElementById("collaboration-detail-empty").hidden = false;
+    renderCollaborationMessages();
   });
 
   dom.sessionList.addEventListener("click", (event) => {
@@ -3829,6 +3877,9 @@ function renderCollaboration() {
     dom.collaborationGraph.innerHTML = `<div class="empty-block">${esc(data.unavailable)}</div>`;
     dom.collaborationSequence.innerHTML = `<div class="empty-block compact">collaboration history is unavailable</div>`;
     dom.collaborationDetail.hidden = true;
+    document.getElementById("collaboration-messages").innerHTML = `<div class="empty-block">${esc(data.unavailable)}</div>`;
+    document.getElementById("collaboration-summary").replaceChildren();
+    document.getElementById("collaboration-detail-empty").hidden = false;
     dom.collaborationPageMeta.textContent = "";
     dom.collaborationLoadMore.hidden = true;
     return;
@@ -3849,14 +3900,24 @@ function renderCollaboration() {
   renderCollaborationRooms(projection.rooms);
   renderCollaborationGraph(projection);
   renderCollaborationSequence();
+  renderCollaborationMessages();
 }
 
 // The rail scope narrows the loaded messages to those touching a pane in the
 // scoped session (see collaboration-model.mjs scopeCollaborationRequests).
-// The collaboration API has no session filter (its room filter is one
-// window), so this happens here, over the already range-bounded page.
-function scopedCollaborationRequests() {
+// The API applies the same session/socket filter before pagination; this
+// projection keeps an old loaded page out of a newly selected scope.
+function collaborationScope() {
   const scope = currentScope();
+  const session = scope?.session || selectedSession();
+  if (!session) return scope;
+  const entry = selectedRailEntry();
+  const node = entry?.sessionKey ? currentTopology().nodes.get(entry.sessionKey) : null;
+  return { ...scope, session: baseSessionName(session), socket: node?.socket || "" };
+}
+
+function scopedCollaborationRequests() {
+  const scope = collaborationScope();
   const requests = store.collaboration.requests;
   if (!scope) return requests;
   const key = `${store.revisions.collaboration}:${store.revisions.panes}:${store.revisions.agents}:${JSON.stringify(scope)}`;
@@ -3871,12 +3932,13 @@ function scopedCollaborationRequests() {
 function renderCollaborationScope() {
   if (!dom.collaborationScope) return;
   const entry = selectedRailEntry();
-  dom.collaborationScope.hidden = !entry;
-  if (!entry) return;
-  dom.collaborationScopeName.textContent = entry.label;
-  dom.collaborationScope.title = entry.sessionName
-    ? `Only messages sent or received by a pane in tmux session ${entry.sessionName}`
-    : `Only messages filed under Work in workspace ${entry.workspaceKey}`;
+  const scope = collaborationScope();
+  dom.collaborationScope.hidden = !scope;
+  if (!scope) return;
+  dom.collaborationScopeName.textContent = entry?.label || scope.session;
+  dom.collaborationScope.title = scope.session
+    ? `Only messages sent or received by a pane in tmux session ${scope.session}`
+    : `Only messages filed under Work in workspace ${scope.workspace}`;
 }
 
 function renderCollaborationFilterOptions(projection) {
@@ -3897,15 +3959,25 @@ function renderCollaborationFilterOptions(projection) {
 }
 
 function renderCollaborationRooms(rooms) {
-  if (!rooms.length) {
-    dom.collaborationRooms.innerHTML = "";
-    return;
-  }
-  dom.collaborationRooms.innerHTML = rooms.map((room, index) => `
-    <button class="collaboration-room-chip${room.key === store.ui.selectedCollaborationRoom ? " active" : ""}"
-      type="button" data-collaboration-room-index="${index}">
-      <span>${esc(room.label)}</span><b>${room.count}</b>
-    </button>`).join("");
+  const groups = new Map();
+  rooms.forEach((room, index) => {
+    const key = JSON.stringify([room.socket, room.session]);
+    if (!groups.has(key)) groups.set(key, { session: room.session, socket: room.socket, rooms: [], count: 0 });
+    const group = groups.get(key);
+    group.rooms.push({ room, index });
+    group.count += room.count;
+  });
+  dom.collaborationRooms.innerHTML = [...groups.values()].map((group) => `
+    <section class="collaboration-session-group">
+      <button type="button" class="collaboration-session-select" data-collaboration-session="${esc(group.session)}" data-collaboration-socket="${esc(group.socket)}">
+        <b>${esc(group.session || "outside tmux")}</b><span>${group.count} messages · ${group.rooms.length} rooms</span>
+      </button>
+      <div class="collaboration-session-rooms">${group.rooms.map(({ room, index }) => `
+        <button class="collaboration-room-chip${room.key === store.ui.selectedCollaborationRoom ? " active" : ""}"
+          type="button" data-collaboration-room-index="${index}">
+          <span>${esc(room.label)}</span><b>${room.count}</b>
+        </button>`).join("")}</div>
+    </section>`).join("");
 }
 
 // Nodes sit on an ellipse whose perimeter leaves roughly one node box of
@@ -3956,9 +4028,7 @@ function renderCollaborationGraph(projection) {
   const { radiusX, radiusY } = graphRadii(projection.nodes.length);
   const width = Math.max(560, Math.ceil(radiusX * 2 + GRAPH_MARGIN_X * 2));
   const height = Math.max(320, Math.ceil(radiusY * 2 + GRAPH_MARGIN_Y * 2));
-  // Scale down to fit the pane, but not below ~60% or labels become unreadable;
-  // past that the pane scrolls (and starts centered, below).
-  const minWidth = Math.min(width, Math.round(width * .6));
+  const minWidth = 0;
   const positions = graphNodePositions(projection.nodes, width, height);
   const nodeById = new Map(projection.nodes.map((node) => [node.id, node]));
   const edges = projection.edges.map((edge, index) => {
@@ -3992,7 +4062,7 @@ function renderCollaborationGraph(projection) {
     return `<g class="collaboration-node kind-${esc(kind)}" transform="translate(${pos.x} ${pos.y})">
       <rect x="-50" y="-30" width="100" height="60" rx="9"></rect>
       <text class="collaboration-node-label" text-anchor="middle" y="-3">${esc(node.label).slice(0, 18)}</text>
-      <text class="collaboration-node-subtitle" text-anchor="middle" y="14">${esc(node.subtitle).slice(0, 22)}</text>
+      <text class="collaboration-node-subtitle" text-anchor="middle" y="14">${esc(participantLocation(node.participant))}</text>
       <title>${esc(node.participant.agent_session_id || node.id)}</title>
     </g>`;
   }).join("");
@@ -4001,6 +4071,7 @@ function renderCollaborationGraph(projection) {
     <td>${esc(nodeById.get(edge.to)?.label || edge.to)}</td>
     <td>${edge.count}</td><td>${edge.replyCount}</td><td>${esc(dominantCount(edge.kinds))}</td><td>${esc(dominantCount(edge.statuses))}</td>
   </tr>`).join("");
+  const graphScroll = { left: dom.collaborationGraph.scrollLeft, top: dom.collaborationGraph.scrollTop };
   dom.collaborationGraph.innerHTML = `<svg class="collaboration-graph-svg" viewBox="0 0 ${width} ${height}" style="min-width:${minWidth}px" role="img" aria-label="Directional collaboration graph">
     <defs>
       <marker id="collab-request-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>
@@ -4010,14 +4081,10 @@ function renderCollaborationGraph(projection) {
     <g class="collaboration-nodes">${nodes}</g>
   </svg>
   <div class="sr-only"><table><caption>Collaboration graph edge summary</caption><thead><tr><th>From</th><th>To</th><th>Requests</th><th>Replies</th><th>Kind</th><th>Status</th></tr></thead><tbody>${accessibleRows}</tbody></table></div>`;
-  // Center only when the layout size changes; live refreshes of the same
-  // graph must not throw away where the viewer has panned to.
-  const canvas = dom.collaborationGraph;
-  const size = `${width}x${height}`;
-  if (canvas.dataset.graphSize !== size) {
-    canvas.dataset.graphSize = size;
-    canvas.scrollLeft = (canvas.scrollWidth - canvas.clientWidth) / 2;
-    canvas.scrollTop = (canvas.scrollHeight - canvas.clientHeight) / 2;
+  updateCollaborationZoom();
+  if (collaborationZoom !== "fit") {
+    dom.collaborationGraph.scrollLeft = graphScroll.left;
+    dom.collaborationGraph.scrollTop = graphScroll.top;
   }
 }
 
@@ -4026,7 +4093,7 @@ function renderCollaborationSequence() {
     edgeKey: store.ui.selectedCollaborationEdge,
     room: store.ui.selectedCollaborationRoom,
   });
-  const selected = Boolean(store.ui.selectedCollaborationEdge || store.ui.selectedCollaborationRoom);
+  const selected = Boolean(store.ui.selectedCollaborationEdge || store.ui.selectedCollaborationRoom || collaborationMessageFilter || store.filters.collaborationThread);
   dom.collaborationClearSelection.hidden = !selected;
   dom.collaborationSequenceMeta.textContent = selected
     ? `${requests.length} requests · chronological`
@@ -4080,7 +4147,7 @@ function renderCollaborationSequence() {
   const laneLabels = participants.map((participant, index) => {
     const x = left + index * laneWidth;
     return `<text class="sequence-lane-label" text-anchor="middle" x="${x}" y="18">${esc(participant.label).slice(0, 18)}</text>
-      <text class="sequence-lane-subtitle" text-anchor="middle" x="${x}" y="34">${esc(participant.subtitle).slice(0, 20)}</text>`;
+      <text class="sequence-lane-subtitle" text-anchor="middle" x="${x}" y="34">${esc(participantLocation(participant.participant))}</text>`;
   }).join("");
   const lanes = participants.map((participant, index) => {
     const x = left + index * laneWidth;
@@ -4097,6 +4164,7 @@ function renderCollaborationSequence() {
       : `M ${sx} ${y} L ${tx} ${y}`;
     return `<g class="sequence-event ${event.reply ? "reply" : "request"} ${collaborationStatusClass(event.status)}"
       role="button" tabindex="0" aria-label="${esc(`${event.label}, ${time}`)}" data-collaboration-request="${esc(event.request.id)}">
+      <rect class="sequence-event-hit" x="0" y="${y - 25}" width="${width}" height="${rowHeight - 2}" fill="transparent"></rect>
       <path d="${path}" marker-end="url(#${event.reply ? "sequence-reply-arrow" : "sequence-request-arrow"})"></path>
       <circle cx="${sx}" cy="${y}" r="4"></circle>
       <text class="sequence-event-label" text-anchor="middle" x="${labelX}" y="${y - 9}">${esc(event.label)}</text>
@@ -4125,42 +4193,225 @@ function renderCollaborationDetail(request) {
   const work = requestWorkId(request);
   const thread = requestThreadId(request);
   const parent = request.parent_request_id || "";
-  const artifacts = [...(request.artifacts || []), ...(reply?.artifacts || [])];
+  const artifacts = [...(request.artifacts || []), ...(request.air_artifacts || []), ...(reply?.artifacts || []), ...(reply?.air_artifacts || [])];
   const links = (request.links || []).map((link) => typeof link === "string" ? { label: link, url: link } : link);
   const detailsIncluded = store.collaboration.details_included;
   dom.collaborationDetail.hidden = false;
-  dom.collaborationDetail.innerHTML = `
+  document.getElementById("collaboration-detail-empty").hidden = true;
+  setStableHTML(dom.collaborationDetail, `
     <div class="collaboration-detail-head">
       <span class="collaboration-kind">${esc(request.kind || "request")}</span>
       <strong>${esc(participantLabel(request.from))} → ${esc(participantLabel(request.to))}</strong>
       <span class="collaboration-status ${collaborationStatusClass(request.status)}">${esc(request.status || "unknown")}</span>
       <button class="icon-btn" type="button" data-close-collaboration-detail aria-label="Close message detail">×</button>
     </div>
+    <div class="collaboration-detail-actions"><button class="control-btn" type="button" data-copy-collaboration-link>copy link</button>${detailsIncluded ? '<button class="control-btn" type="button" data-copy-collaboration-message>copy conversation</button>' : ""}</div>
     <dl class="collaboration-detail-meta">
       <dt>id</dt><dd>${esc(request.id)}</dd>
       <dt>room</dt><dd>${esc(roomLabel(request))}</dd>
+      <dt>from</dt><dd>${esc(request.from?.console ? "operator console" : `${request.from?.agent_kind || "agent"} · ${request.from?.pane || "—"}`)}</dd>
+      <dt>to</dt><dd>${esc(request.to?.console ? "operator console" : `${request.to?.agent_kind || "agent"} · ${request.to?.pane || "—"}`)}</dd>
       ${work ? `<dt>work</dt><dd>${esc(work)}</dd>` : ""}
-      ${thread ? `<dt>thread</dt><dd>${esc(thread)}</dd>` : ""}
-      ${parent ? `<dt>parent</dt><dd>${esc(parent)}</dd>` : ""}
+      ${thread ? `<dt>thread</dt><dd><button type="button" class="control-btn" data-open-collaboration-thread="${esc(thread)}">${esc(thread)}</button></dd>` : ""}
+      ${parent ? `<dt>parent</dt><dd><button type="button" class="control-btn" data-open-collaboration-message="${esc(parent)}">${esc(parent)}</button></dd>` : ""}
       <dt>sent</dt><dd>${esc(request.created_at ? new Date(request.created_at).toLocaleString() : "—")}</dd>
+      <dt>response time</dt><dd>${responseLatency(request) === null ? "—" : formatDuration(responseLatency(request) / 1000)}</dd>
+      <dt>updates</dt><dd>${request.updates?.length || 0}</dd>
     </dl>
-    ${detailsIncluded ? `<div class="collaboration-message-body"><span>request</span><pre>${esc(request.body || "")}</pre></div>` : `<div class="collaboration-detail-redacted">Message bodies and artifacts are available only when dashboard auth mode is token.</div>`}
-    ${detailsIncluded && reply ? `<div class="collaboration-message-body reply"><span>reply · ${esc(reply.status || request.status)}</span><pre>${esc(reply.body || "")}</pre></div>` : ""}
+    ${detailsIncluded ? `<div class="collaboration-message-body"><span>request</span><pre>${esc(request.body || "")}</pre></div>` : `<div class="collaboration-detail-redacted">${store.access.mode === "read_only" ? "Message details are unavailable on this read-only dashboard." : "Sign in as an operator or unlock access to read the request, reply, and artifacts."}
+      ${store.access.writeAvailable && !store.access.writeAuthorized ? '<button class="control-btn" type="button" data-unlock-collaboration>unlock details with PAT</button>' : ""}
+      ${store.access.login.available && !store.access.login.signedIn ? '<button class="control-btn" type="button" data-login-collaboration>sign in</button>' : ""}
+      </div>`}
+    ${detailsIncluded ? (request.updates || []).map(update => `<div class="collaboration-message-body"><span>update · ${esc(participantLabel(update.author))} · ${esc(new Date(update.at).toLocaleString())}</span><pre>${esc(update.body || "")}</pre></div>`).join("") : ""}
+    ${detailsIncluded && reply ? `<div class="collaboration-message-body reply"><span>reply · ${esc(reply.status || request.status)} · ${esc(reply.at ? new Date(reply.at).toLocaleString() : "")}</span><pre>${esc(reply.body || "")}</pre></div>` : ""}
+    ${detailsIncluded && request.paths?.length ? `<div class="collaboration-detail-list"><span>paths</span>${request.paths.map(path => `<code>${esc(path)}</code>`).join("")}</div>` : ""}
     ${detailsIncluded && artifacts.length ? `<div class="collaboration-detail-list"><span>artifacts</span>${artifacts.map((artifact) => `<code>${esc(typeof artifact === "string" ? artifact : JSON.stringify(artifact))}</code>`).join("")}</div>` : ""}
     ${detailsIncluded && links.length ? `<div class="collaboration-detail-list"><span>links</span>${links.map((link) => {
       const href = safeExternalHref(link.url || link.href);
       return href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(link.label || href)}</a>` : `<code>${esc(link.label || link.url || link.href || "")}</code>`;
-    }).join("")}</div>` : ""}`;
+    }).join("")}</div>` : ""}`);
 }
 
 function chooseCollaborationRoom(room) {
+  collaborationMessageFilter = "";
   store.filters.collaborationRoom = room?.key || "";
   store.filters.collaborationRoomObject = room?.room || null;
   store.ui.selectedCollaborationRoom = room?.key || "";
   store.ui.selectedCollaborationEdge = "";
   store.ui.selectedCollaborationRequest = "";
   dom.collaborationRoom.value = store.filters.collaborationRoom;
+  renderCollaboration();
   fetchCollaboration().catch(() => {});
+}
+
+
+let collaborationSearch = "";
+let collaborationMessageFilter = "";
+let collaborationZoom = "fit";
+
+function collaborationVisibleMessages() {
+  return collaborationSequence(scopedCollaborationRequests(), {
+    edgeKey: store.ui.selectedCollaborationEdge,
+    room: store.ui.selectedCollaborationRoom,
+  }).reverse();
+}
+
+function renderCollaborationMessages() {
+  const messages = collaborationVisibleMessages();
+  const summary = collaborationSummary(messages);
+  document.getElementById("collaboration-summary").innerHTML = [
+    ["messages", summary.total], ["replies", summary.replies], ["waiting", summary.pending], ["attention", summary.attention],
+    ["median response", summary.medianLatency === null ? "—" : formatDuration(summary.medianLatency / 1000)],
+  ].map(([label, value]) => `<div><strong>${esc(value)}</strong><span>${label}</span></div>`).join("")
+    + `<small>${store.collaboration.pagination.has_more ? "loaded messages · partial history" : "loaded messages"}${collaborationSearch ? " · server search" : ""}</small>`;
+  const list = document.getElementById("collaboration-messages");
+  const scroll = list.scrollTop;
+  const focusedId = document.activeElement?.closest?.("[data-collaboration-message]")?.dataset.collaborationMessage;
+  const listHTML = messages.map(request => {
+    const selected = request.id === store.ui.selectedCollaborationRequest;
+    const duration = responseLatency(request);
+    return `<button class="collaboration-message-row${selected ? " selected" : ""}" type="button" data-collaboration-message="${esc(request.id)}" aria-pressed="${selected}">
+      <div class="message-row-heading"><b>${esc(participantLabel(request.from))} → ${esc(participantLabel(request.to))}</b><span class="collaboration-status ${collaborationStatusClass(request.status)}">${esc(request.status)}</span></div>
+      <div class="message-row-context"><span>${esc(request.kind)} · ${esc(roomLabel(request))}</span><time>${esc(request.created_at ? dateTimeLabel(new Date(request.created_at)) : "—")}</time></div>
+      <div class="message-row-context"><span>${esc(request.from?.console ? "console" : request.from?.pane || "—")} → ${esc(request.to?.console ? "console" : request.to?.pane || "—")}</span>${store.collaboration.details_included && (request.artifacts?.length || request.reply?.artifacts?.length) ? `<span>${(request.artifacts?.length || 0) + (request.reply?.artifacts?.length || 0)} artifacts</span>` : ""}</div>
+      <p>${esc(messagePreview(request, store.collaboration.details_included))}</p>
+      <div class="message-row-footer"><code>${esc(request.id)}</code><span>${request.reply ? "replied" : "no reply"}${duration !== null ? ` · ${formatDuration(duration / 1000)}` : ""}${request.updates?.length ? ` · ${request.updates.length} updates` : ""}</span></div>
+    </button>`;
+  }).join("") || '<div class="empty-block">No loaded messages match. Change the filters or load older messages.</div>';
+  setStableHTML(list, listHTML);
+  list.scrollTop = scroll;
+  if (focusedId) [...list.querySelectorAll("[data-collaboration-message]")].find(row => row.dataset.collaborationMessage === focusedId)?.focus({ preventScroll: true });
+  const selected = messages.find(request => request.id === store.ui.selectedCollaborationRequest);
+  if (selected) renderCollaborationDetail(selected);
+  else dom.collaborationDetail.hidden = true;
+  document.getElementById("collaboration-detail-empty").hidden = Boolean(selected);
+}
+
+async function openCollaborationHistory({ thread = "", message = "" } = {}) {
+  setSelectedWorkspace("");
+  store.filters.collaborationRoom = "";
+  store.filters.collaborationRoomObject = null;
+  store.ui.selectedCollaborationRoom = "";
+  store.ui.selectedCollaborationEdge = "";
+  store.filters.collaborationWork = "";
+  store.filters.collaborationKind = "";
+  store.filters.collaborationStatus = "";
+  dom.collaborationWork.value = "";
+  dom.collaborationKind.value = "";
+  dom.collaborationStatus.value = "";
+  collaborationSearch = "";
+  document.getElementById("collaboration-search").value = "";
+  collaborationMessageFilter = message;
+  store.filters.collaborationThread = thread;
+  dom.collaborationThread.value = thread;
+  store.filters.collaborationRange = "all";
+  dom.collaborationRange.value = "all";
+  document.getElementById("collaboration-custom-period").hidden = true;
+  store.ui.selectedCollaborationRequest = message;
+  document.getElementById("session-tab-collaboration").click();
+  document.getElementById("collaboration-tab-messages").click();
+  await fetchCollaboration();
+  if (message) window.history.replaceState(null, "", messageLink(window.location.href, { id: message }));
+}
+
+function setCollaborationExpanded(expanded) {
+  dom.topologyPanel.classList.toggle("collaboration-expanded", expanded);
+  document.body.classList.toggle("has-collaboration-expanded", expanded);
+  const button = document.getElementById("collaboration-fullscreen");
+  button.textContent = expanded ? "restore" : "expand";
+  button.setAttribute("aria-pressed", String(expanded));
+}
+
+function updateCollaborationZoom() {
+  const svg = dom.collaborationGraph.querySelector("svg");
+  if (!svg || document.getElementById("collaboration-graph-pane").hidden) return;
+  const { width, height } = svg.viewBox.baseVal;
+  const scale = collaborationZoom === "fit"
+    ? graphFitScale(width, height, dom.collaborationGraph.clientWidth, dom.collaborationGraph.clientHeight) : collaborationZoom;
+  const changed = svg.dataset.scale !== String(scale);
+  svg.style.width = `${width * scale}px`;
+  svg.style.height = `${height * scale}px`;
+  svg.dataset.scale = String(scale);
+  document.getElementById("collaboration-zoom-label").textContent = `${Math.round(scale * 100)}%`;
+  if (changed && collaborationZoom === "fit") {
+    dom.collaborationGraph.scrollLeft = 0;
+    dom.collaborationGraph.scrollTop = 0;
+  }
+}
+
+function initCollaborationLayout() {
+  const panel = dom.topologyPanel;
+  const reader = document.getElementById("collaboration-reader");
+  for (const [id, variable, key, fallback, min, max, axis, percent] of [
+    ["collaboration-nav-resize", "--session-nav-width", "navWidth", 240, 160, 440, "x", false],
+    ["collaboration-reader-resize", "--collaboration-list-width", "listWidth", 52, 25, 75, "x", true],
+    ["collaboration-height-resize", "--collaboration-height", "height", Math.round(window.innerHeight * .7), 420, 1600, "y", false],
+  ]) {
+    let value = Number(loadValue(`muxa.collaboration.${key}`, fallback));
+    initResizeHandle(document.getElementById(id), {
+      read: () => value, min, max, axis, step: percent ? 2 : 20,
+      deltaToValue: delta => percent ? delta / Math.max(1, reader.clientWidth) * 100 : delta,
+      write: next => { value = next; panel.style.setProperty(variable, `${next}${percent ? "%" : "px"}`); saveValue(`muxa.collaboration.${key}`, next); },
+    });
+  }
+  const tabs = [...document.querySelectorAll("[data-collaboration-view]")];
+  const selectView = view => {
+    for (const tab of tabs) {
+      const selected = tab.dataset.collaborationView === view;
+      tab.setAttribute("aria-selected", String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+    }
+    document.getElementById("collaboration-messages").hidden = view !== "messages";
+    document.getElementById("collaboration-graph-pane").hidden = view !== "graph";
+    document.getElementById("collaboration-sequence-pane").hidden = view !== "sequence";
+    saveValue("muxa.collaboration.view", view);
+    requestAnimationFrame(updateCollaborationZoom);
+  };
+  for (const tab of tabs) {
+    tab.addEventListener("click", () => selectView(tab.dataset.collaborationView));
+    tab.addEventListener("keydown", event => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === "Home" ? tabs[0] : event.key === "End" ? tabs.at(-1)
+        : tabs[(tabs.indexOf(tab) + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length];
+      next.click(); next.focus();
+    });
+  }
+  const saved = loadValue("muxa.collaboration.view", "messages");
+  selectView(["messages", "graph", "sequence"].includes(saved) ? saved : "messages");
+  let searchTimer;
+  document.getElementById("collaboration-search").addEventListener("input", event => {
+    collaborationSearch = event.target.value.trim();
+    collaborationMessageFilter = "";
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => fetchCollaboration().catch(() => {}), 250);
+  });
+  for (const id of ["collaboration-since", "collaboration-until"]) document.getElementById(id).addEventListener("change", () => {
+    collaborationMessageFilter = "";
+    fetchCollaboration().catch(() => {});
+  });
+  dom.collaborationRange.addEventListener("change", () => {
+    document.getElementById("collaboration-custom-period").hidden = dom.collaborationRange.value !== "custom";
+  });
+  document.getElementById("collaboration-messages").addEventListener("click", event => {
+    const row = event.target.closest("[data-collaboration-message]");
+    if (!row) return;
+    store.ui.selectedCollaborationRequest = row.dataset.collaborationMessage;
+    document.querySelector(".collaboration-detail-pane").scrollTop = 0;
+    renderCollaborationMessages();
+  });
+  document.getElementById("collaboration-fullscreen").addEventListener("click", () => setCollaborationExpanded(!panel.classList.contains("collaboration-expanded")));
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape" && !event.defaultPrevented && panel.classList.contains("collaboration-expanded")) setCollaborationExpanded(false);
+  });
+  for (const [id, factor] of [["collaboration-zoom-in", 1.25], ["collaboration-zoom-out", .8]]) {
+    document.getElementById(id).addEventListener("click", () => {
+      const current = Number(dom.collaborationGraph.querySelector("svg")?.dataset.scale) || 1;
+      collaborationZoom = Math.max(.1, Math.min(3, current * factor)); updateCollaborationZoom();
+    });
+  }
+  document.getElementById("collaboration-zoom-fit").addEventListener("click", () => { collaborationZoom = "fit"; updateCollaborationZoom(); });
+  new ResizeObserver(updateCollaborationZoom).observe(dom.collaborationGraph);
 }
 
 // ── Data loading ──────────────────────────────────────────────────
@@ -4184,12 +4435,76 @@ function scheduleLiveRender({ panes = false, terminals = false } = {}) {
   });
 }
 
+function clearCollaborationDetails() {
+  collaborationRequestController?.abort();
+  collaborationRequestController = null;
+  collaborationRequest = null;
+  collaborationRequestKey = "";
+  store.collaboration.requests = [];
+  store.collaboration.details_included = false;
+  store.collaboration.pagination = { total: 0, has_more: false };
+  store.revisions.collaboration += 1;
+  clearStableHTML(dom.collaborationDetail);
+  if (dom.collaborationDetail) dom.collaborationDetail.hidden = true;
+  renderCollaboration();
+}
+
+function initSessionViews() {
+  const tabs = [...document.querySelectorAll("[data-session-view]")];
+  const select = (view, { refresh = true } = {}) => {
+    const collaboration = view === "collaboration";
+    dom.topologyDetail.hidden = collaboration;
+    document.getElementById("collaboration-panel").hidden = !collaboration;
+    dom.topologyPanel.classList.toggle("collaboration-active", collaboration);
+    document.getElementById("collaboration-height-resize").hidden = !collaboration;
+    if (!collaboration) setCollaborationExpanded(false);
+    for (const tab of tabs) {
+      const selected = tab.dataset.sessionView === view;
+      tab.setAttribute("aria-selected", String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+    }
+    saveValue("muxa.dashboard.sessionView", view);
+    pollTails();
+    if (collaboration && refresh) fetchCollaboration().catch(() => {});
+  };
+  for (const tab of tabs) {
+    tab.addEventListener("click", () => select(tab.dataset.sessionView));
+    tab.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === "Home" ? tabs[0] : event.key === "End" ? tabs.at(-1)
+        : tabs[(tabs.indexOf(tab) + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length];
+      next.click();
+      next.focus();
+    });
+  }
+  select(loadValue("muxa.dashboard.sessionView", "execution") === "collaboration" ? "collaboration" : "execution", { refresh: false });
+}
+
 let collaborationRequest = null;
+let collaborationRequestController = null;
+let collaborationRequestKey = "";
 async function fetchCollaboration({ append = false } = {}) {
-  if (!dom.collaborationGraph || collaborationRequest) return collaborationRequest;
+  if (!dom.collaborationGraph) return;
   const params = new URLSearchParams({ limit: String(COLLABORATION_PAGE_SIZE) });
   const filters = store.filters;
-  if (filters.collaborationRange) params.set("since", filters.collaborationRange);
+  if (filters.collaborationRange === "custom") {
+    const start = document.getElementById("collaboration-since").value;
+    const end = document.getElementById("collaboration-until").value;
+    const error = !start || !end ? "Choose start and end times." : new Date(start) > new Date(end) ? "Start time must be before end time." : "";
+    document.getElementById("collaboration-period-error").textContent = error;
+    if (error) {
+      collaborationRequestController?.abort();
+      collaborationRequestController = null;
+      collaborationRequest = null;
+      dom.collaborationRefresh.disabled = false;
+      return;
+    }
+    params.set("since", new Date(start).toISOString());
+    params.set("until", new Date(end).toISOString());
+  } else if (filters.collaborationRange) params.set("since", filters.collaborationRange);
+  if (collaborationSearch) params.set("q", collaborationSearch);
+  if (collaborationMessageFilter) params.set("id", collaborationMessageFilter);
   if (filters.collaborationWork) {
     const slash = filters.collaborationWork.indexOf("/");
     if (slash > 0) {
@@ -4203,19 +4518,31 @@ async function fetchCollaboration({ append = false } = {}) {
   if (filters.collaborationKind) params.set("kind", filters.collaborationKind);
   if (filters.collaborationStatus) params.set("status", filters.collaborationStatus);
   if (filters.collaborationRoomObject) params.set("room", JSON.stringify(filters.collaborationRoomObject));
+  const scope = collaborationScope();
+  if (scope?.session) params.set("session", scope.session);
+  if (scope?.socket) params.set("socket", scope.socket);
+  if (scope?.workspace && !scope.session) params.set("workspace", scope.workspace);
   if (append) {
     const page = store.collaboration.pagination;
     if (page.next_cursor) params.set("cursor", page.next_cursor);
     else if (page.next_offset != null) params.set("offset", String(page.next_offset));
   }
 
+  const key = params.toString();
+  if (collaborationRequest && collaborationRequestKey === key) return collaborationRequest;
+  collaborationRequestController?.abort();
+  const controller = new AbortController();
+  collaborationRequestController = controller;
+  collaborationRequestKey = key;
   dom.collaborationRefresh.disabled = true;
   collaborationRequest = (async () => {
     try {
       const resp = await fetch(`/api/collaboration?${params.toString()}`, {
+        signal: controller.signal,
         credentials: "same-origin",
         headers: authHeaders(),
       });
+      if (collaborationRequestController !== controller) return;
       if (resp.status === 401) {
         await showLanding();
         throw new Error("unauthorized");
@@ -4238,19 +4565,25 @@ async function fetchCollaboration({ append = false } = {}) {
         throw new Error(message);
       }
       const incoming = normalizeCollaborationPayload(await resp.json());
+      if (collaborationRequestController !== controller) return;
       const requests = append
         ? mergeCollaborationRequests(store.collaboration.requests, incoming.requests)
         : incoming.requests;
+      if (store.collaboration.details_included && !incoming.details_included) clearStableHTML(dom.collaborationDetail);
       store.collaboration = { ...incoming, requests, unavailable: "" };
       store.revisions.collaboration += 1;
       renderCollaboration();
     } catch (error) {
+      if (error?.name === "AbortError" || collaborationRequestController !== controller) return;
       if (error?.message === "unauthorized") throw error;
       store.collaboration.unavailable = error?.message || "could not load collaboration history";
       renderCollaboration();
     } finally {
-      collaborationRequest = null;
-      dom.collaborationRefresh.disabled = false;
+      if (collaborationRequestController === controller) {
+        collaborationRequest = null;
+        collaborationRequestController = null;
+        dom.collaborationRefresh.disabled = false;
+      }
     }
   })();
   return collaborationRequest;
@@ -4289,7 +4622,7 @@ async function fetchPanes() {
         return;
       }
       store.cache.paneFingerprint = fingerprint;
-      store.panes = panes;
+      store.panes = canonicalDashboardPanes(panes);
       store.paneErrors = errors;
       store.revisions.panes += 1;
       rebuildPaneIndexes();
@@ -4443,7 +4776,7 @@ function applyTransition(t) {
 
 let timelineRefreshTimer = null;
 function scheduleTimelineRefresh() {
-  if (!selectedSession() || timelineRefreshTimer || !timelineCanRefresh()) return;
+  if (timelineRefreshTimer || !timelineCanRefresh()) return;
   const cooldown = Math.max(0, TIMELINE_MIN_REFRESH_INTERVAL_MS - (Date.now() - lastTimelineFetchAt));
   timelineRefreshTimer = setTimeout(() => {
     timelineRefreshTimer = null;
@@ -4463,6 +4796,8 @@ async function main() {
   initDynamicEventDelegation();
   initPaneDrawer();
   initTopology();
+  initSessionViews();
+  initCollaborationLayout();
   initAgentsJump();
   renderStaticChips();
   setConnectionStatus("connecting", "loading…");
@@ -4506,6 +4841,9 @@ async function main() {
   setTimeout(pollTerminals, TERMINALS_REFETCH_INTERVAL_MS);
   setTimeout(pollTimeline, TIMELINE_REFETCH_INTERVAL_MS);
   setTimeout(pollCollaboration, COLLABORATION_REFETCH_INTERVAL_MS);
+
+  const linkedMessage = new URLSearchParams(window.location.hash.slice(1)).get("message");
+  if (linkedMessage) await openCollaborationHistory({ message: linkedMessage });
 
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
@@ -4560,8 +4898,9 @@ async function pollTimeline() {
 
 async function pollCollaboration() {
   if (store.access.signInRequired) return; // landing page: nothing to poll
-  const collapsed = document.getElementById("collaboration-panel")?.classList.contains("collapsed");
-  if (!document.hidden && !collapsed) await fetchCollaboration().catch(() => {});
+  const hidden = document.getElementById("collaboration-panel")?.hidden
+    || document.getElementById("topology-panel")?.classList.contains("collapsed");
+  if (!document.hidden && !hidden) await fetchCollaboration().catch(() => {});
   setTimeout(pollCollaboration, COLLABORATION_REFETCH_INTERVAL_MS);
 }
 

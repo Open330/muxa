@@ -249,7 +249,8 @@ muxa ask --agent claude --detach --json "배포 계획을 검토해줘"
 muxa ask --agent anthropic "reaper가 건드리는 파일은?"
 security find-generic-password -w -s my-codex-key \
   | muxa ask --agent codex --api-key-stdin "이 저장소를 검토해줘"
-muxa ask --agent anthropic-work "…"   # 직접 추가한 provider를 id로 지정
+muxa ask --agent anthropic-work "…"   # 직접 추가한 provider를 id로 지정 (다음 재시작 전까지)
+muxa ask provider use codex           # 기본 provider로 지정하고 [ask] agent에 저장
 muxa ask providers [--json]           # 모든 provider: engine, 종류, 모델, 키 확보 여부, 선택 상태
 muxa ask provider add anthropic-work --engine anthropic \
   --title "Anthropic (work)" --api-key-env WORK_ANTHROPIC_KEY
@@ -445,7 +446,7 @@ paneless_stale_timeout_secs = 86400
 ```
 
 stale state가 오래 남는 것을 줄입니다. timeout 값 `0`은 해당 timeout 비활성화입니다.
-같은 루프가 pid-liveness 스윕도 돌려, 등록된 백그라운드 task(`muxa register` 참고)는
+같은 루프가 pid-liveness 스윕도 돌려, 등록된 백그라운드 task(`muxa proc register` 참고)는
 프로세스가 종료되면 `stopped`로 전환됩니다.
 
 Codex rollout 조회는 전체 `interval_secs` 보정 주기와 별개로 2초마다 실행됩니다.
@@ -501,8 +502,8 @@ manager 단계에서 차단합니다.
 ProxyJump, host-key 정책은 `~/.ssh/config`에 둡니다. `muxa_path`와 `remote_socket`은
 fixed remote command token으로 검증됩니다. label은 Kubernetes-style selector에 쓰고,
 annotation은 설명형 value를 허용하지만 같은 namespaced key 문법을 사용합니다.
-inventory는 `muxa host add/label/annotate`로 atomic하게 편집하는 것을 권장합니다.
-controller metadata는 `muxa host label local`, `muxa host annotate local`로 관리하며
+inventory는 `muxa fleet host add/label/annotate`로 atomic하게 편집하는 것을 권장합니다.
+controller metadata는 `muxa fleet host label local`, `muxa fleet host annotate local`로 관리하며
 muxad가 제공하는 identity label은 덮어쓸 수 없습니다.
 [FLEET.ko.md](FLEET.ko.md)를 참고하세요.
 

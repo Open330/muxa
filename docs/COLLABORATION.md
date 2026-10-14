@@ -15,7 +15,7 @@ mailbox, not through terminal screen scraping.
 - `muxa watch` is not an agent. It is the **operator console** — the human at
   the keyboard is the sender, whatever the pane the popup was opened from
   happens to contain.
-- Select any agent; `m` sends and `M` opens the mailbox (`b` remains an alias).
+- Select any agent; `m` sends and `M` opens the mailbox.
 
 So the normal agent-to-agent workflow is: put two agents in one window and let
 them message each other over MCP. The operator workflow is separate and needs
@@ -104,11 +104,14 @@ Once connected, muxa's initialization instructions surface same-window peers
 as reviewers or narrowly scoped delegated subagents. An agent can call
 `muxa_collaboration_guide` to retrieve the contract again.
 
-If `muxa doctor` reports a pane as synthetic, that agent does not yet have a
-stable session identity and is omitted from room participants and request
-targets. Submit a prompt to trigger a hook event; if it remains synthetic,
-restart the agent and check again. This prevents a request from being pinned to
-a placeholder identity that the later real session could never claim.
+An agent launched through Muxa does not need `--prompt` to become a peer.
+The launcher records the provider and immediately registers the observed CLI
+through discovery. Before the first hook, a matching live process is exposed
+as a pending peer, selectable by provider, pane, alias, role, or automatic
+routing. Requests wait for an idle row; the real session adopts them when its
+first hook arrives. Launch marks alone are insufficient: an exited CLI that
+leaves a shell behind is not exposed as a pending peer. Unmanaged synthetic
+rows remain outside the peer list.
 
 Existing `prefix+s` watch bindings need no additional shortcut after upgrading.
 
@@ -224,7 +227,7 @@ muxa msg send peer "review the risks in this plan" --kind review \
   --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"CAL-6924 plan","locator":{"display":".air/cal-6924-plan.air.json","disclosure":"local-only"}}'
 muxa msg inbox
 muxa msg reply req_... "review complete" --status completed
-muxa msg wait req_... --timeout-secs 300
+muxa msg wait req_... --timeout-secs 300 --body
 muxa msg list --mailbox sent
 muxa msg list --scope room     # every participant in this window
 muxa msg list --scope all      # every room this daemon holds
@@ -232,6 +235,18 @@ muxa msg list --scope all --since 7d --work CAL-7345 --kind review \
   --status completed --limit 50 --offset 0
 muxa msg cancel req_... # queued requests only
 ```
+
+`muxa msg wait` defaults to compact JSON describing delivery and final reply
+receipt, not work success. A timeout is a JSON observation (`reason: timeout`)
+with exit code 2; this describes the wait, not the work result. Transport errors remain nonzero. Use `--body` to print only the
+final reply, or `--body --output /tmp/reply.txt` to write it directly without
+shell-side JSON parsing. `--body` also exits 2 on timeout without writing a body/file; a closed request
+with no final reply is an error.
+`--full` opts into the legacy complete request JSON. Do not grep the reply for
+`pending`/`timeout` to decide completion, or pass JSON through shell `echo`:
+it can expand JSON escapes. Use direct stdout/file output, or pipe directly to
+a JSON parser. Progress and final replies remain distinct; a final reply's
+status is declared by its author and verified by the requester.
 
 `send`, `reply`, and `cancel` print a one-line receipt; `list` and `inbox`
 print each request followed by its reply, when one has come back. Add `--json`
@@ -264,7 +279,7 @@ remains the legacy bare array. `--since` accepts durations such as `2h`/`7d`,
 local dates, RFC 3339 timestamps, and the same calendar keywords as timeline.
 
 The same lifecycle is available interactively in `muxa watch`: `m` sends to the
-selected room peer, `M`/`b` opens non-claiming mailbox history, `i` claims the
+selected room peer, `M` opens non-claiming mailbox history, `i` claims the
 inbox, and `e` replies. On a window row, `M` reads the whole room; on a session
 row it reads every room grouped by window. Those aggregate views are read-only.
 The collaboration screen toggles between a newest-first table and chronological
@@ -439,15 +454,14 @@ both files before any downgrade.
 ## Wake-up safety
 
 With `idle_only`, muxad injects only when the exact
-hook-authoritative participant is `Idle`. It never injects into `Working`,
-`WaitingInput`, `WaitingChoice`, or `Error` panes. Synthetic screen-detected
-agents have no stable session identity, so they are not room participants and
-are never selected automatically.
+participant is `Idle`. It never injects into `Working`, `WaitingInput`,
+`WaitingChoice`, or `Error` panes. Unmanaged synthetic screen-detected agents
+are not room participants and are never selected automatically.
 
-The single exception is a request explicitly addressed to a pane Muxa launched
-whose agent has not registered yet. Such a request carries a *pending pane*
-recipient, and the pane's synthetic row serves only as the idle gate for
-delivering it. Safety is unchanged where it matters: a startup approval gate
+A Muxa-launched CLI with a matching live process is exposed as a pending peer
+before its first prompt. Such a request carries a *pending pane* recipient,
+and the pane's synthetic row supplies the idle gate for delivering it. A startup
+approval gate
 still blocks delivery, because the bundled screen manifests classify it as
 `WaitingInput`/`WaitingChoice` rather than `Idle`. A pane with no muxa launch
 mark and no classified agent process is never addressable this way, so a

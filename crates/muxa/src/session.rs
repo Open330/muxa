@@ -218,6 +218,43 @@ impl PtySessionBackend {
         Arc::new(Self::default())
     }
 
+    /// Authoritative lookup of an exact native surface: missing, running, or
+    /// exited but retained for output capture. Errors are not evidence of death.
+    pub fn session_liveness(&self, id: &str) -> Result<Option<bool>, SessionError> {
+        self.prune_exited();
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| SessionError::Pty("session registry lock poisoned".into()))?;
+        let Some(session) = sessions.get(id) else {
+            return Ok(None);
+        };
+        let meta = session
+            .meta
+            .lock()
+            .map_err(|_| SessionError::Pty("session meta lock poisoned".into()))?;
+        Ok(Some(!meta.exited))
+    }
+
+    /// Unlike the compatibility list API, never turn a failed observation into
+    /// an empty inventory. Cleanup clients must be able to distinguish them.
+    pub fn list_sessions_checked(&self) -> Result<Vec<SessionRef>, SessionError> {
+        self.prune_exited();
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| SessionError::Pty("session registry lock poisoned".into()))?;
+        let mut refs = Vec::with_capacity(sessions.len());
+        for session in sessions.values() {
+            let meta = session
+                .meta
+                .lock()
+                .map_err(|_| SessionError::Pty("session meta lock poisoned".into()))?;
+            refs.push(meta.reference());
+        }
+        Ok(refs)
+    }
+
     pub fn spawn_session(&self, input: SpawnSession) -> Result<SessionRef, SessionError> {
         if input.command.trim().is_empty() {
             return Err(SessionError::Pty("command is empty".into()));
@@ -329,7 +366,7 @@ impl PtySessionBackend {
         };
         sessions.retain(|_, session| {
             let Ok(meta) = session.meta.lock() else {
-                return false;
+                return true;
             };
             if !meta.exited {
                 return true;
@@ -516,17 +553,7 @@ struct PtySession {
 impl PtySession {
     fn reference(&self) -> SessionRef {
         let meta = self.meta.lock().expect("session meta lock poisoned");
-        SessionRef {
-            id: meta.id.clone(),
-            backend: SessionBackendKind::Pty,
-            display_name: meta.display_name.clone(),
-            cwd: meta.cwd.clone(),
-            attached_clients: meta.total_attached_clients(),
-            has_been_attached: meta.has_been_attached,
-            exited: meta.exited,
-            exit_status: meta.exit_status,
-            pid: meta.pid,
-        }
+        meta.reference()
     }
 
     fn snapshot_text(&self) -> Result<(u16, u16, String, bool), SessionError> {
@@ -659,6 +686,20 @@ struct SessionMeta {
 }
 
 impl SessionMeta {
+    fn reference(&self) -> SessionRef {
+        SessionRef {
+            id: self.id.clone(),
+            backend: SessionBackendKind::Pty,
+            display_name: self.display_name.clone(),
+            cwd: self.cwd.clone(),
+            attached_clients: self.total_attached_clients(),
+            has_been_attached: self.has_been_attached,
+            exited: self.exited,
+            exit_status: self.exit_status,
+            pid: self.pid,
+        }
+    }
+
     fn total_attached_clients(&self) -> usize {
         self.attached_clients
             .saturating_add(self.attached_client_ids.len())
@@ -756,6 +797,57 @@ fn validate_env_pair(key: &str, value: &str) -> Result<(), SessionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_session_observation_failure_is_not_an_empty_inventory() {
+        let backend = PtySessionBackend::shared();
+        let poisoned = backend.clone();
+        let _ = thread::spawn(move || {
+            let _guard = poisoned.sessions.lock().unwrap();
+            panic!("simulate a failed session registry");
+        })
+        .join();
+        assert!(backend.list_sessions_checked().is_err());
+        assert!(backend.session_liveness("pty:unknown").is_err());
+        assert_eq!(
+            PtySessionBackend::default()
+                .session_liveness("pty:unknown")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn native_session_liveness_keeps_exited_output_until_retention_ends() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let backend = PtySessionBackend::default();
+        let session = backend
+            .spawn_session(SpawnSession {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "read line".into()],
+                env: Vec::new(),
+                cwd: None,
+                name: None,
+                cols: None,
+                rows: None,
+            })
+            .unwrap();
+        assert_eq!(backend.session_liveness(&session.id).unwrap(), Some(true));
+        let native = backend.get(&session.id).unwrap();
+        {
+            let mut meta = native.meta.lock().unwrap();
+            meta.exited = true;
+            meta.exited_at = Some(SystemTime::now());
+        }
+        assert_eq!(backend.session_liveness(&session.id).unwrap(), Some(false));
+        assert!(backend.capture(&session.id).is_ok());
+        native.meta.lock().unwrap().exited_at =
+            Some(SystemTime::now() - EXITED_SESSION_TTL - Duration::from_secs(1));
+        assert_eq!(backend.session_liveness(&session.id).unwrap(), None);
+        native.killer.lock().unwrap().kill().unwrap();
+    }
 
     #[test]
     fn generated_session_ids_do_not_collide_in_same_process() {

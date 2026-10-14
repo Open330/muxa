@@ -150,7 +150,7 @@ struct WorkStartView: View {
                                 Text("The route on \(host) names no folder; type the project path on that host.")
                             }
                         }
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(routePinsDirectory ? Color.secondary : Color.orange)
                     }
                 }
@@ -171,7 +171,7 @@ struct WorkStartView: View {
                 Section("Task") {
                     TextField("External issue, for example CAL-1234 (optional)", text: $external)
                     Text("An empty external issue creates a local Muxa Work; the issue never becomes the Work identity.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                     TextEditor(text: $taskBody)
                         .font(.body)
@@ -179,7 +179,7 @@ struct WorkStartView: View {
                         .overlay(alignment: .topLeading) {
                             if taskBody.isEmpty {
                                 Text("What should the collaborators accomplish?")
-                                    .foregroundStyle(.tertiary)
+                                    .foregroundStyle(.secondary)
                                     .padding(.top, 7)
                                     .padding(.leading, 5)
                                     .allowsHitTesting(false)
@@ -197,13 +197,13 @@ struct WorkStartView: View {
             if let error = model.workStartError {
                 VStack(alignment: .leading, spacing: 8) {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.red)
                         .textSelection(.enabled)
                     if model.needsWorkConfiguration {
                         HStack {
                             Text("No Work routing is configured yet. Install a preset above, or let an agent write the config in an interactive Shell tab.")
-                                .font(.caption)
+                                .font(MuxaType.detail)
                                 .foregroundStyle(.secondary)
                             Spacer()
                             Button("Configure Work…", action: configureWork)
@@ -218,7 +218,7 @@ struct WorkStartView: View {
                 HStack(spacing: 8) {
                     if model.isStartingWork { ProgressView().controlSize(.small) }
                     Text(status)
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
                 .padding(.horizontal, 20)
@@ -230,8 +230,8 @@ struct WorkStartView: View {
 
             HStack {
                 Text("Runs the bundled canonical `muxa work up` implementation through owner-only muxad IPC.")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel") { isPresented = false }
                     .disabled(model.isStartingWork)
@@ -288,11 +288,11 @@ struct WorkStartView: View {
                     "Starting Work on \(host) needs the updated muxad on this Mac (Use Bundled muxad), and muxa on \(host) must know `work options`.",
                     systemImage: "exclamationmark.triangle"
                 )
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.orange)
             } else if !isLocalHost {
                 Text("The pipeline and route come from \(host)'s config; agents start in tmux on that host.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
         }
@@ -304,7 +304,7 @@ struct WorkStartView: View {
             if let route = matchedRoute {
                 Label {
                     Text(routeDescription(route))
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 } icon: {
                     Image(systemName: "arrow.triangle.branch")
@@ -314,7 +314,7 @@ struct WorkStartView: View {
                 EmptyView()
             } else {
                 Label("No route matches this Work id; choose a pipeline below.", systemImage: "arrow.triangle.branch")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
             }
         }
@@ -358,26 +358,26 @@ struct WorkStartView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         if let description = selected.description, !description.isEmpty {
                             Text(description)
-                                .font(.caption)
+                                .font(MuxaType.detail)
                                 .foregroundStyle(.secondary)
                         }
                         PipelineStagesView(agents: selected.agents)
                         if let layout = selected.layout, !layout.isEmpty {
                             Text("tmux layout \(layout)")
-                                .font(.caption2.monospaced())
-                                .foregroundStyle(.tertiary)
+                                .font(MuxaType.meta.monospaced())
+                                .foregroundStyle(.secondary)
                         }
                     }
                 } else if pipeline.isEmpty {
                     Text("The route for this Work id names no pipeline. Pick one to launch.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.orange)
                 }
             }
         } else if let error = model.workOptionsError(for: isLocalHost ? nil : host) {
             TextField("Pipeline (use configured route when empty)", text: $pipeline)
             Label(error, systemImage: "exclamationmark.triangle.fill")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.orange)
                 .textSelection(.enabled)
         } else {
@@ -389,7 +389,7 @@ struct WorkStartView: View {
                     Text("Reading pipelines from \(host)…")
                 }
             }
-            .font(.caption)
+            .font(MuxaType.detail)
             .foregroundStyle(.secondary)
         }
     }
@@ -475,14 +475,33 @@ struct WorkCommandCenterView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     private let columns = [GridItem(.adaptive(minimum: 260, maximum: 420), spacing: 12)]
-    private let metricColumns = [GridItem(.adaptive(minimum: 120), spacing: 12)]
 
-    private var attentionCount: Int {
-        model.workGroups.lazy.filter { $0.attentionCount > 0 }.count
+    /// Every agent that needs the reader, on every host, with or without a
+    /// pane or a Work, errors first: the agents the Dock badge counts as
+    /// needing attention (it also counts unread ones).
+    private var attentionAgents: [MuxaHostedAgent] {
+        model.hostedAgents
+            .filter { $0.agent.status.needsAttention }
+            .sorted { $0.agent.status.priority < $1.agent.status.priority }
+    }
+
+    private var limitedAgents: [MuxaHostedAgent] {
+        model.hostedAgents.filter { $0.agent.status.isLimited }
+    }
+
+    /// An agent's pane editor when it has a live pane, its agent editor
+    /// otherwise.
+    private func open(_ hosted: MuxaHostedAgent) {
+        if let pane = MuxaAgentAttentionCenter.paneIdentity(for: hosted),
+           model.executionSnapshot.watchPane(id: pane) != nil {
+            model.selectWatchPane(pane)
+        } else {
+            model.select(.agent(hosted.id))
+        }
     }
 
     private var workingCount: Int {
-        model.hostedAgents.lazy.filter { ["working", "starting"].contains($0.agent.state) }.count
+        model.hostedAgents.lazy.filter { $0.agent.status == .working }.count
     }
 
     var body: some View {
@@ -501,11 +520,52 @@ struct WorkCommandCenterView: View {
                     }
                 }
 
-                LazyVGrid(columns: metricColumns, alignment: .leading, spacing: 12) {
-                    CommandCenterMetric(title: "Managed Work", value: model.workGroups.count, color: .accentColor)
-                    CommandCenterMetric(title: "Working Agents", value: workingCount, color: .blue)
-                    CommandCenterMetric(title: "Needs Attention", value: attentionCount, color: .orange)
-                    CommandCenterMetric(title: "Hosts", value: model.fleetHosts.count, color: .mint)
+                CommandCenterStatusLine(
+                    working: workingCount,
+                    attention: attentionAgents.count,
+                    limited: limitedAgents.count,
+                    work: model.workGroups.count,
+                    hosts: model.fleetHosts.count
+                )
+
+                CommandCenterAttentionList(
+                    attention: attentionAgents,
+                    limited: limitedAgents,
+                    open: open
+                )
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Active Work")
+                        .font(.system(size: 14, weight: .semibold))
+                    if model.workGroups.isEmpty {
+                        HStack(spacing: 10) {
+                            Image(systemName: "square.stack.3d.up.slash")
+                                .foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("No managed Work yet")
+                                    .font(MuxaType.body.weight(.medium))
+                                Text("Start a configured pipeline here. Muxa will keep Work identity separate from its tmux window and agents.")
+                                    .font(MuxaType.detail)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 8)
+                            Button("Start your first Work") { model.presentWorkStart() }
+                                .buttonStyle(.muxaSecondary)
+                        }
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
+                    } else {
+                        LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+                            ForEach(model.workGroups) { work in
+                                WorkCommandCard(
+                                    work: work,
+                                    open: { model.select(.work(work.identity)) },
+                                    moduleModel: model
+                                )
+                            }
+                        }
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
@@ -522,7 +582,7 @@ struct WorkCommandCenterView: View {
                                         VStack(alignment: .leading, spacing: 1) {
                                             Text(host.alias).fontWeight(.medium)
                                             Text("\(host.remote?.agents.filter { $0.state != "stopped" }.count ?? 0) agents · \(fleetHostStateLabel(host.state))")
-                                                .font(.caption2)
+                                                .font(MuxaType.meta)
                                                 .foregroundStyle(.secondary)
                                         }
                                     }
@@ -537,38 +597,6 @@ struct WorkCommandCenterView: View {
                 }
 
                 pipelinesSection
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Active Work")
-                        .font(.system(size: 14, weight: .semibold))
-                    if model.workGroups.isEmpty {
-                        VStack(spacing: 12) {
-                            Image(systemName: "square.stack.3d.up.slash")
-                                .font(.system(size: 34))
-                                .foregroundStyle(.secondary)
-                            Text("No managed Work yet")
-                                .font(.headline)
-                            Text("Start a configured pipeline here. Muxa will keep Work identity separate from its tmux window and agents.")
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
-                            Button("Start your first Work") { model.presentWorkStart() }
-                                .buttonStyle(.muxaPrimary)
-                        }
-                        .padding(32)
-                        .frame(maxWidth: .infinity)
-                        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
-                    } else {
-                        LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
-                            ForEach(model.workGroups) { work in
-                                WorkCommandCard(
-                                    work: work,
-                                    open: { model.select(.work(work.identity)) },
-                                    moduleModel: model
-                                )
-                            }
-                        }
-                    }
-                }
             }
             .padding(28)
             .frame(maxWidth: 1250, alignment: .leading)
@@ -598,6 +626,9 @@ struct WorkCommandCenterView: View {
     /// Pipelines are one library kept in sync across hosts; routes carry
     /// host-specific folders, so they stay per host.
     @State private var routesHost = ""
+    /// The preset gallery is a one-time setup step; it waits behind a button
+    /// so it does not take over the Command Center every day.
+    @State private var showsPresetGallery = false
     @State private var syncingPipelines = Set<String>()
     @State private var syncFailures: [String: String] = [:]
     @ObservedObject private var pipelineComposer = PipelineComposerPresenter.shared
@@ -624,8 +655,8 @@ struct WorkCommandCenterView: View {
                     .font(.system(size: 14, weight: .semibold))
                 if let path = model.workOptions?.configPath {
                     Text(path)
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.tertiary)
+                        .font(MuxaType.meta.monospaced())
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .help(path)
@@ -673,12 +704,24 @@ struct WorkCommandCenterView: View {
                     "Host sync needs the updated muxad on this Mac (Settings › Runtime › Reload Bundled muxad).",
                     systemImage: "exclamationmark.triangle"
                 )
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.orange)
             }
 
             if let options = model.workOptions(for: pipelinesHostAlias) {
-                if options.pipelines.isEmpty {
+                if options.pipelines.isEmpty, !showsPresetGallery {
+                    HStack(spacing: 10) {
+                        Text("No pipelines yet. Muxa ships presets for one, two, and three agents.")
+                            .font(MuxaType.detail)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        Button("Browse Presets") { showsPresetGallery = true }
+                            .buttonStyle(.muxaGhost)
+                    }
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
+                } else if options.pipelines.isEmpty {
                     WorkPresetGallery(
                         options: options,
                         host: pipelinesHostAlias,
@@ -713,7 +756,7 @@ struct WorkCommandCenterView: View {
                             } icon: {
                                 Image(systemName: "exclamationmark.triangle.fill")
                             }
-                                .font(.caption)
+                                .font(MuxaType.detail)
                                 .foregroundStyle(.orange)
                                 .textSelection(.enabled)
                         }
@@ -721,14 +764,14 @@ struct WorkCommandCenterView: View {
                     routesSection
                     if let error = model.workOptionsError {
                         Label(error, systemImage: "exclamationmark.triangle.fill")
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.orange)
                             .textSelection(.enabled)
                     }
                 }
             } else if let error = model.workOptionsError(for: pipelinesHostAlias) {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
                     .textSelection(.enabled)
                     .padding(14)
@@ -785,7 +828,7 @@ struct WorkCommandCenterView: View {
                         Text(entry.pipeline.name)
                             .font(.callout.weight(.medium))
                         Text("on host \(entry.host)")
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.secondary)
                         PipelineStagesView(agents: entry.pipeline.agents, compact: true)
                             .frame(maxWidth: 420)
@@ -843,12 +886,12 @@ struct WorkCommandCenterView: View {
                 } icon: {
                     Image(systemName: "exclamationmark.triangle.fill")
                 }
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
                     .textSelection(.enabled)
             } else {
                 Text("Reading routes on \(routesHost)…")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
         }
@@ -886,24 +929,192 @@ struct WorkCommandCenterView: View {
     }
 }
 
-private struct CommandCenterMetric: View {
-    let title: LocalizedStringKey
-    let value: Int
-    let color: Color
+/// The Command Center's counts as one sentence-like line. A zero count
+/// says nothing worth a card, so only Needs attention and Hosts always
+/// show: attention because "none" is the answer the reader came for.
+private struct CommandCenterStatusLine: View {
+    let working: Int
+    let attention: Int
+    let limited: Int
+    let work: Int
+    let hosts: Int
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(verbatim: "\(value)")
-                .font(.system(size: 20, weight: .semibold).monospacedDigit())
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 18) { items }
+            VStack(alignment: .leading, spacing: 8) { items }
+        }
+    }
+
+    @ViewBuilder
+    private var items: some View {
+        if attention > 0 {
+            stat(attention, "Need attention", color: .orange, symbol: "exclamationmark.circle.fill")
+        } else {
+            Label("Nothing needs you", systemImage: "checkmark.circle.fill")
+                .font(MuxaType.body.weight(.medium))
+                .foregroundStyle(.green)
+        }
+        if working > 0 {
+            stat(working, "Working", color: .blue, symbol: "circle.dotted")
+        }
+        if limited > 0 {
+            stat(limited, "Limited", color: .purple, symbol: "hourglass")
+        }
+        if work > 0 {
+            stat(work, "Managed Work", color: .accentColor, symbol: "square.stack.3d.up")
+        }
+        stat(hosts, "Hosts", color: .secondary, symbol: "server.rack")
+    }
+
+    private func stat(_ value: Int, _ title: LocalizedStringKey, color: Color, symbol: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: symbol)
                 .foregroundStyle(color)
+            Text(verbatim: "\(value)")
+                .font(.system(size: 17, weight: .semibold).monospacedDigit())
             Text(title)
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
+        .fixedSize()
     }
+}
+
+/// What the Command Center asks the reader to look at first: agents that
+/// need them, worst first, each with what it last said. Rate-limited agents
+/// follow on one line each, with when they resume.
+private struct CommandCenterAttentionList: View {
+    let attention: [MuxaHostedAgent]
+    let limited: [MuxaHostedAgent]
+    let open: (MuxaHostedAgent) -> Void
+
+    private static let limit = 6
+
+    var body: some View {
+        if !attention.isEmpty || !limited.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Look at now")
+                    .font(.system(size: 14, weight: .semibold))
+                VStack(spacing: 0) {
+                    ForEach(Array(attention.prefix(Self.limit).enumerated()), id: \.element.id) { index, hosted in
+                        if index > 0 { Divider().padding(.leading, 36) }
+                        attentionRow(hosted)
+                    }
+                    if attention.count > Self.limit {
+                        Divider()
+                        Text("\(attention.count - Self.limit) more in Explore › Needs attention")
+                            .font(MuxaType.detail)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 9)
+                    }
+                    if !limited.isEmpty {
+                        if !attention.isEmpty { Divider() }
+                        limitedRow
+                    }
+                }
+                .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: MuxaTheme.panelRadius, style: .continuous)
+                        .stroke(Color(nsColor: .separatorColor).opacity(0.4), lineWidth: 0.5)
+                }
+            }
+        }
+    }
+
+    private func attentionRow(_ hosted: MuxaHostedAgent) -> some View {
+        Button { open(hosted) } label: {
+            HStack(alignment: .top, spacing: 10) {
+                HostIdentityBadge(identity: hosted.host, size: 26)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text(commandCenterAgentTitle(hosted))
+                            .font(MuxaType.body.weight(.semibold))
+                            .lineLimit(1)
+                        AgentStatusTag(status: hosted.agent.status, detailed: true)
+                        Spacer(minLength: 6)
+                        Text(verbatim: commandCenterAgentLocation(hosted))
+                            .font(MuxaType.meta)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    if let activity = agentActivity(hosted.agent) {
+                        Text(activity)
+                            .font(MuxaType.detail)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var limitedRow: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "hourglass")
+                .foregroundStyle(.purple)
+                .frame(width: 26)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(verbatim: "\(String(localized: "Limited")) · \(limited.count)")
+                    .font(MuxaType.detail.weight(.semibold))
+                    .foregroundStyle(.purple)
+                LimitedAgentLinks(agents: limited, open: open)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Rate-limited agents as `@name → 15:45 host` links, wrapping as needed.
+private struct LimitedAgentLinks: View {
+    let agents: [MuxaHostedAgent]
+    let open: (MuxaHostedAgent) -> Void
+
+    var body: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 10, alignment: .leading)], alignment: .leading, spacing: 4) {
+            ForEach(agents) { hosted in
+                Button { open(hosted) } label: {
+                    HStack(spacing: 4) {
+                        Text(commandCenterAgentTitle(hosted))
+                            .font(MuxaType.detail.weight(.medium))
+                        if case .limited(let cap) = hosted.agent.status, let until = cap.until {
+                            Text(verbatim: "→ \(MuxaUsageFormat.clock(until))")
+                                .font(MuxaType.meta.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(verbatim: hosted.host.alias)
+                            .font(MuxaType.meta)
+                            .foregroundStyle(.secondary)
+                    }
+                    .lineLimit(1)
+                }
+                .buttonStyle(.plain)
+                .help(Text(verbatim: commandCenterAgentLocation(hosted)))
+            }
+        }
+    }
+}
+
+private func commandCenterAgentTitle(_ hosted: MuxaHostedAgent) -> String {
+    hosted.pane?.agentAlias.map { "@\($0)" }
+        ?? hosted.agent.aiTitle?.nonEmpty
+        ?? hosted.pane?.title.nonEmpty
+        ?? hosted.agent.kind.replacingOccurrences(of: "_", with: " ")
+}
+
+private func commandCenterAgentLocation(_ hosted: MuxaHostedAgent) -> String {
+    guard let pane = hosted.pane else { return hosted.host.alias }
+    return "\(hosted.host.alias) · \(pane.session) › \(pane.windowName)"
 }
 
 private struct WorkCommandCard: View {
@@ -929,7 +1140,7 @@ private struct WorkCommandCard: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(work.workspaceID.uppercased())
-                            .font(.caption2.weight(.semibold))
+                            .font(MuxaType.meta.weight(.semibold))
                             .foregroundStyle(.secondary)
                         Text(work.title)
                             .font(.headline)
@@ -940,7 +1151,7 @@ private struct WorkCommandCard: View {
                     } icon: {
                         Image(systemName: "circle.fill")
                     }
-                    .font(.caption.weight(.medium))
+                    .font(MuxaType.detail.weight(.medium))
                     .foregroundStyle(work.attentionCount > 0 ? .orange : work.workingCount > 0 ? .blue : .green)
                     if let moduleModel {
                         MuxaModuleMenu(
@@ -971,7 +1182,7 @@ private struct WorkCommandCard: View {
                         Label(work.hostAliases.joined(separator: ", "), systemImage: "network")
                     }
                 }
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
             }
             .padding(15)
@@ -1198,7 +1409,7 @@ struct MuxaAskView: View {
                     .font(.headline)
                 if let activeConversation {
                     Image(systemName: "chevron.right")
-                        .font(.caption2)
+                        .font(MuxaType.meta)
                         .foregroundStyle(.tertiary)
                     Text(activeConversation.title)
                         .font(.subheadline.weight(.medium))
@@ -1212,13 +1423,13 @@ struct MuxaAskView: View {
                     } icon: {
                         Image(systemName: exportFailed ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
                     }
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(exportFailed ? Color.orange : Color.secondary)
                     .lineLimit(1)
                 } else {
                     Text("Conversations resume where the provider left off")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                        .font(MuxaType.detail)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 conversationExportMenu
@@ -1230,7 +1441,7 @@ struct MuxaAskView: View {
 
             if model.askUsesSnapshots {
                 Text("Shared Ask history refreshes periodically from the coordinator.")
-                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14)
+                    .font(MuxaType.detail).foregroundStyle(.secondary).padding(.horizontal, 14)
             }
             if model.askEnabled == false {
                 HStack(alignment: .center, spacing: 12) {
@@ -1253,7 +1464,7 @@ struct MuxaAskView: View {
                                 Text("Muxa will run the selected provider CLI headlessly. Provider usage may be billed to your account.")
                             }
                         }
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 12)
@@ -1484,12 +1695,12 @@ struct MuxaAskView: View {
     private var askSendStatus: some View {
         if let error = model.askError {
             Text(error)
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.red)
                 .lineLimit(2)
         } else {
             Text("⌘↩ Send")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
         }
         if model.isSendingAsk { ProgressView().controlSize(.small) }
@@ -1542,7 +1753,7 @@ private struct AskComposerEditor: View {
             if text.isEmpty {
                 Text(placeholder)
                     .font(.body)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                     // NSTextView uses these insets for its first baseline. Keeping
                     // the overlay inside the same padded container also gives it
                     // the exact same wrapping width as the editable text.
@@ -1585,12 +1796,12 @@ private struct AskConversationTurn: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 7) {
                 Text(askedDate?.formatted(date: .abbreviated, time: .shortened) ?? compactInboxTimestamp(entry.askedAt))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.detail.monospacedDigit())
+                    .foregroundStyle(.secondary)
                 Spacer()
                 Circle().fill(statusColor).frame(width: 6, height: 6)
                 Text(askStatusLabel(entry.status))
-                    .font(.caption.weight(.medium))
+                    .font(MuxaType.detail.weight(.medium))
                     .foregroundStyle(statusColor)
                 if entry.status == "running" { ProgressView().controlSize(.mini) }
                 AskTurnExportMenu(entry: entry)
@@ -1630,7 +1841,7 @@ private struct AskConversationTurn: View {
                 } icon: {
                     Image(systemName: "exclamationmark.triangle.fill")
                 }
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.red)
                 .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1685,7 +1896,7 @@ private struct AskTurnExportMenu: View {
             AskTurnExportItems(entry: entry)
         } label: {
             Image(systemName: "square.and.arrow.up")
-                .font(.caption)
+                .font(MuxaType.detail)
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
@@ -1713,7 +1924,7 @@ private struct AskMessageBlock: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
                 Label(role, systemImage: icon)
-                .font(.caption.weight(.semibold))
+                .font(MuxaType.detail.weight(.semibold))
                 .foregroundStyle(compact ? tint : Color.secondary)
 
             ReadableMarkdownContent(source: source)
@@ -1846,7 +2057,7 @@ struct MuxaOperatorInboxView: View {
 
             if let error = model.inboxError {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
                     .textSelection(.enabled)
                     .padding(.horizontal, 12)
@@ -1878,14 +2089,14 @@ struct MuxaOperatorInboxView: View {
             } label: {
                 HStack(spacing: 6) {
                     Label(summary, systemImage: "wifi.exclamationmark")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.orange)
                         .lineLimit(1)
                     Image(systemName: showingHostFailureDetails ? "chevron.down" : "chevron.right")
-                        .font(.caption2.weight(.semibold))
+                        .font(MuxaType.meta.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Text("Showing their last known messages")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -1899,7 +2110,7 @@ struct MuxaOperatorInboxView: View {
             if showingHostFailureDetails {
                 ForEach(details, id: \.self) { line in
                     Text(line)
-                        .font(.caption.monospaced())
+                        .font(MuxaType.detail.monospaced())
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .lineLimit(2)
@@ -1914,7 +2125,7 @@ struct MuxaOperatorInboxView: View {
 
     private func inboxMetric(_ text: Text, _ value: Int, color: Color) -> some View {
         text
-            .font(.caption2.weight(.semibold).monospacedDigit())
+            .font(MuxaType.meta.weight(.semibold).monospacedDigit())
             .foregroundStyle(value > 0 ? color : Color.secondary)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
@@ -1959,7 +2170,7 @@ struct MuxaOperatorInboxView: View {
                     Text("Commands and replies")
                         .font(.subheadline.weight(.semibold))
                     Text("\(visibleMessages.count) conversations across reachable hosts")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -2064,21 +2275,21 @@ private struct OperatorMessageRow: View {
                     .lineLimit(1)
                 Spacer(minLength: 6)
                 Text(collaborationStatusLabel(request.reply?.status ?? request.status))
-                    .font(.caption.weight(.semibold))
+                    .font(MuxaType.detail.weight(.semibold))
                     .foregroundStyle(statusColor)
                 Text(compactInboxTimestamp(request.createdAt))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.detail.monospacedDigit())
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
 
             HStack(spacing: 8) {
                 Label(message.host.alias, systemImage: "server.rack")
-                    .font(.caption.monospaced())
+                    .font(MuxaType.detail.monospaced())
                     .foregroundStyle(.secondary)
                 if let work = request.workID {
                     Text([request.workspaceID, work].compactMap { $0 }.joined(separator: " / "))
-                        .font(.caption.weight(.medium))
+                        .font(MuxaType.detail.weight(.medium))
                         .foregroundStyle(Color.accentColor)
                         .lineLimit(1)
                 }
@@ -2103,8 +2314,8 @@ private struct OperatorMessageRow: View {
                             .foregroundStyle(message.hasUnreadReply ? Color.orange : Color.secondary)
                         Spacer()
                         Text(compactInboxTimestamp(reply.at))
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.tertiary)
+                            .font(MuxaType.detail.monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
                     Text(inboxPreview(reply.body))
                         .font(.callout)
@@ -2195,7 +2406,7 @@ private struct OperatorMessageDetail: View {
                         .font(.headline)
                         .lineLimit(1)
                     Text(verbatim: "\(message.host.alias) · \(compactInboxTimestamp(request.createdAt))")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -2232,7 +2443,7 @@ private struct OperatorMessageDetail: View {
                                 .lineLimit(1)
                         }
                     }
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
 
                     OperatorMessageDetailSection(
@@ -2294,8 +2505,8 @@ private struct OperatorMessageDetailSection: View {
                     .foregroundStyle(tint)
                 Spacer()
                 Text(timestamp)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.detail.monospacedDigit())
+                    .foregroundStyle(.secondary)
             }
             ReadableMarkdownContent(source: source)
         }
@@ -2464,7 +2675,7 @@ private struct MuxaCollaborationView: View {
                 }
                 .frame(width: 130)
                 Text("to \(pane.pane.agentAlias.map { "@\($0)" } ?? pane.pane.paneID)")
-                    .font(.caption.monospaced())
+                    .font(MuxaType.detail.monospaced())
                     .foregroundStyle(.secondary)
                 Spacer()
             }
@@ -2475,7 +2686,7 @@ private struct MuxaCollaborationView: View {
                 .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
             HStack {
                 if let error {
-                    Text(error).font(.caption).foregroundStyle(.red).lineLimit(2)
+                    Text(error).font(MuxaType.detail).foregroundStyle(.red).lineLimit(2)
                 }
                 Spacer()
                 if sending { ProgressView().controlSize(.small) }
@@ -2544,16 +2755,16 @@ private struct CollaborationRequestCard: View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
                 Text(collaborationKindLabel(request.kind))
-                    .font(.caption.weight(.semibold))
+                    .font(MuxaType.detail.weight(.semibold))
                 Text(request.workMode == "execute" ? "Execute" : "Read only")
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(request.workMode == "execute" ? Color.orange : Color.secondary)
                 Text(collaborationStatusLabel(request.status))
-                    .font(.caption2.weight(.medium))
+                    .font(MuxaType.meta.weight(.medium))
                     .foregroundStyle(collaborationStatusColor(request.status))
                 Spacer()
                 Text(verbatim: "\(request.from.label) → \(request.to.label)")
-                    .font(.caption2.monospaced())
+                    .font(MuxaType.meta.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -2564,7 +2775,7 @@ private struct CollaborationRequestCard: View {
                     MarkdownContent(source: response.body)
                 }
                 Label(collaborationStatusLabel(response.status), systemImage: "arrowshape.turn.up.left.fill")
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(collaborationStatusColor(response.status))
             }
             if incoming, request.reply == nil {
@@ -2617,7 +2828,7 @@ private struct CollaborationReplyView: View {
                 .frame(minHeight: 120)
                 .padding(7)
                 .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
-            if let error { Text(error).font(.caption).foregroundStyle(.red) }
+            if let error { Text(error).font(MuxaType.detail).foregroundStyle(.red) }
             HStack {
                 Spacer()
                 Button("Cancel", action: completed)
@@ -2745,7 +2956,7 @@ struct HostRegistrationView: View {
                 Section {
                     Toggle("Replace an existing host with this alias", isOn: $overwrite)
                     Text("Observe is the safe default. Control permits prompts, attach, and collaboration operations on the remote host.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
 
@@ -2763,7 +2974,7 @@ struct HostRegistrationView: View {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
                     Text("Saving inventory and reloading muxad…")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
                 .padding(.bottom, 14)
@@ -2814,14 +3025,14 @@ private struct WatchLivePanePanel: View {
         VStack(spacing: 0) {
             HStack(spacing: 9) {
                 Label("Live Pane", systemImage: "terminal")
-                    .font(.caption.weight(.semibold))
+                    .font(MuxaType.detail.weight(.semibold))
                     .fixedSize()
                 Text(verbatim: "\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)")
-                    .font(.caption2.monospaced())
+                    .font(MuxaType.meta.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                 Text(attachedSessionID == nil ? "Read-only" : "Fitted · Interactive")
-                    .font(.caption2.weight(.medium))
+                    .font(MuxaType.meta.weight(.medium))
                     .foregroundStyle(attachedSessionID == nil ? Color.secondary : Color.green)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
@@ -3017,7 +3228,7 @@ struct WatchHostTree: View {
                             .lineLimit(1)
                         Spacer(minLength: 4)
                         Text(verbatim: "\(group.paneCount)")
-                            .font(.caption2.monospacedDigit())
+                            .font(MuxaType.meta.monospacedDigit())
                             .foregroundStyle(.secondary)
                         Circle()
                             .fill(fleetHostColor(group.host.state))
@@ -3127,8 +3338,8 @@ private struct WatchSessionTree: View {
                         }
                         Spacer(minLength: 3)
                         Text(verbatim: singleWindow.map { "\($0.panes.count)" } ?? "\(session.windows.count)")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.tertiary)
+                            .font(MuxaType.meta.monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
                     .padding(.trailing, 7)
                     .frame(maxWidth: .infinity, minHeight: MuxaTheme.rowHeight, alignment: .leading)
@@ -3215,8 +3426,8 @@ private struct WatchWindowTree: View {
                             .lineLimit(1)
                         Spacer(minLength: 3)
                         Text(verbatim: "#\(window.index) · \(window.panes.count)")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.tertiary)
+                            .font(MuxaType.meta.monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
                     .padding(.trailing, 7)
                     .frame(maxWidth: .infinity, minHeight: MuxaTheme.rowHeight, alignment: .leading)
@@ -3271,13 +3482,6 @@ private struct WatchPaneRow: View {
             ?? pane.pane.paneID
     }
 
-    private var subtitle: String {
-        let state = pane.agent.map { agentStateLabel($0.state) }
-        return [pane.pane.paneID, pane.pane.currentCommand, state]
-            .compactMap { $0?.nonEmpty }
-            .joined(separator: " · ")
-    }
-
     var body: some View {
         Button { selectPane(pane.id) } label: {
             HStack(spacing: 0) {
@@ -3285,25 +3489,15 @@ private struct WatchPaneRow: View {
                 Color.clear.frame(width: 16)
                 HStack(spacing: 6) {
                     Image(systemName: pane.agent == nil ? "terminal" : "person.crop.circle")
-                        .font(.caption)
-                        .foregroundStyle(pane.agent.map { agentStateColor($0.state) } ?? Color.secondary)
+                        .font(MuxaType.detail)
+                        .foregroundStyle(.secondary)
                         .frame(width: 17)
-                Circle()
-                    .fill(pane.agent.map { agentStateColor($0.state) } ?? Color.secondary)
-                        .frame(width: 5, height: 5)
                     Text(title)
                         .font(.callout)
                         .lineLimit(1)
                     MuxaUnreadDot(pane: pane.id) // WS-A
                     Spacer(minLength: 3)
-                    Text(subtitle)
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                    if paneNeedsAttention(pane) {
-                        Image(systemName: "exclamationmark.circle.fill")
-                            .foregroundStyle(.orange)
-                    }
+                    WatchPaneRowTrailing(pane: pane)
                 }
                 .padding(.trailing, 8)
             }
@@ -3313,6 +3507,7 @@ private struct WatchPaneRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .help(watchPaneHelp(pane))
         .simultaneousGesture(
             TapGesture(count: 2).onEnded { openPinnedPane(pane.id) }
         )
@@ -3321,6 +3516,68 @@ private struct WatchPaneRow: View {
             Button("Open Pinned") { openPinnedPane(pane.id) }
         }
     }
+}
+
+/// The trailing edge of a pane row: an agent's status, said once. A status
+/// that asks something of the reader (an error, a question, a rate limit)
+/// gets its word; working and idle agents, the common case, keep only the
+/// dot so the column stays quiet. A plain shell shows its command.
+private struct WatchPaneRowTrailing: View {
+    let pane: MuxaWatchPane
+
+    var body: some View {
+        if let status = pane.agentStatus {
+            AgentStatusTag(status: status, showsLabel: status.priority <= 2)
+        } else if let command = pane.pane.currentCommand.nonEmpty {
+            Text(command)
+                .font(MuxaType.meta.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+}
+
+/// The tmux address and latest activity, which a row leaves to the tooltip.
+private func watchPaneHelp(_ pane: MuxaWatchPane) -> String {
+    var lines = ["\(pane.host.alias) · \(pane.pane.session) › \(pane.pane.windowName) › \(pane.pane.paneID)"]
+    if let status = pane.agentStatus {
+        lines.append(status.label())
+    } else if let command = pane.pane.currentCommand.nonEmpty {
+        lines.append(command)
+    }
+    if let activity = watchPaneActivity(pane) {
+        lines.append(String(activity.prefix(200)))
+    }
+    return lines.joined(separator: "\n")
+}
+
+/// One line on what the pane's agent last did, for rows with room for it.
+func watchPaneActivity(_ pane: MuxaWatchPane) -> String? {
+    pane.agent.flatMap(agentActivity)
+}
+
+/// One line on what an agent last did.
+func agentActivity(_ agent: MuxaAgent) -> String? {
+    let text = agent.recap?.nonEmpty
+        ?? agent.lastNotification?.nonEmpty
+        ?? agent.lastResponse?.nonEmpty
+    return text.map { firstReadableLine($0) }
+}
+
+/// The first line of `text` with Markdown emphasis and list markers removed,
+/// for a one-line preview.
+func firstReadableLine(_ text: String) -> String {
+    let line = text.split(whereSeparator: \.isNewline)
+        .lazy
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .first { !$0.isEmpty } ?? ""
+    var cleaned = line.replacingOccurrences(of: "**", with: "")
+        .replacingOccurrences(of: "__", with: "")
+        .replacingOccurrences(of: "`", with: "")
+    for marker in ["- ", "* ", "• ", "# ", "## ", "### "] where cleaned.hasPrefix(marker) {
+        cleaned.removeFirst(marker.count)
+    }
+    return cleaned
 }
 
 /// A globally sortable Explore row. Unlike the topology tree it carries its
@@ -3352,35 +3609,23 @@ struct WatchFlatPaneRow: View {
                     .padding(.top, 1)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Circle()
-                            .fill(pane.agent.map { agentStateColor($0.state) } ?? Color.secondary)
-                            .frame(width: 6, height: 6)
                         Text(title)
                             .font(.callout.weight(.medium))
                             .lineLimit(1)
                         MuxaUnreadDot(pane: pane.id) // WS-A
                         Spacer(minLength: 3)
-                        Text(pane.pane.paneID)
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(.tertiary)
+                        WatchPaneRowTrailing(pane: pane)
+                    }
+                    if let activity = watchPaneActivity(pane) {
+                        Text(activity)
+                            .font(MuxaType.detail)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
                     Text(location)
-                        .font(.caption2)
+                        .font(MuxaType.meta)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                    if let agent = pane.agent {
-                        Text(agentStateLabel(agent.state))
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(agentStateColor(agent.state))
-                    } else if let command = pane.pane.currentCommand.nonEmpty {
-                        Text(command)
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    } else {
-                        Text("Shell")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
                 }
             }
             .padding(.horizontal, 7)
@@ -3394,6 +3639,7 @@ struct WatchFlatPaneRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .help(watchPaneHelp(pane))
         .simultaneousGesture(
             TapGesture(count: 2).onEnded { openPinnedPane(pane.id) }
         )
@@ -3417,7 +3663,7 @@ private func explorerIndent(depth: Int) -> some View {
 
 private func hierarchyChevron(_ expanded: Bool) -> some View {
     Image(systemName: "chevron.right")
-        .font(.caption2.weight(.semibold))
+        .font(MuxaType.meta.weight(.semibold))
         .foregroundStyle(.secondary)
         .rotationEffect(.degrees(expanded ? 90 : 0))
         .frame(width: 12, height: 20)
@@ -3430,6 +3676,8 @@ private struct FleetPaneInspector: View {
     let openInShell: () -> Void
     @State private var showsMetadata = false
     @State private var agentsExpanded = true
+    /// Overview sections the reader opened past their preview length.
+    @State private var expandedSections = Set<String>()
 
     private var window: MuxaWatchWindow? {
         model.executionSnapshot.watchWindow(containing: pane.id)
@@ -3454,13 +3702,13 @@ private struct FleetPaneInspector: View {
 
                 selectedPaneOverview
 
-                if let window {
+                if let window, window.panes.contains(where: { $0.id != pane.id }) {
                     windowOverview(window)
                 }
 
                 if let error = model.attachError {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.red)
                         .textSelection(.enabled)
                 }
@@ -3470,19 +3718,22 @@ private struct FleetPaneInspector: View {
             .frame(maxWidth: 1100, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
+        .onChange(of: pane.id) { _ in expandedSections = [] }
     }
 
     @ViewBuilder
     private func windowOverview(_ window: MuxaWatchWindow) -> some View {
         DisclosureGroup(isExpanded: $agentsExpanded) {
             VStack(spacing: 1) {
-                ForEach(window.panes) { item in
+                // The selected pane is the subject of this whole inspector;
+                // listing it again repeated its response word for word.
+                ForEach(window.panes.filter { $0.id != pane.id }) { item in
                     Button {
                         model.selectWatchPane(item.id)
                     } label: {
                         HStack(alignment: .top, spacing: 9) {
                             Circle()
-                                .fill(item.agent.map { agentStateColor($0.state) } ?? Color.secondary)
+                                .fill(item.agent.map { $0.status.color } ?? Color.secondary)
                                 .frame(width: 7, height: 7)
                                 .padding(.top, 5)
                             VStack(alignment: .leading, spacing: 2) {
@@ -3490,17 +3741,14 @@ private struct FleetPaneInspector: View {
                                     Text(overviewTitle(item))
                                         .font(.subheadline.weight(item.id == pane.id ? .semibold : .regular))
                                     if let agent = item.agent {
-                                        Text(agentStateLabel(agent.state))
-                                            .font(.caption2.weight(.medium))
-                                            .foregroundStyle(agentStateColor(agent.state))
+                                        Text(agent.status.label())
+                                            .font(MuxaType.meta.weight(.medium))
+                                            .foregroundStyle(agent.status.color)
                                     }
                                     Spacer(minLength: 4)
-                                    Text(item.pane.paneID)
-                                        .font(.caption2.monospaced())
-                                        .foregroundStyle(.tertiary)
                                 }
                                 Text(overviewSummary(item) ?? String(localized: "No task summary has been reported for this pane yet."))
-                                    .font(.caption)
+                                    .font(MuxaType.detail)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(2)
                                     .multilineTextAlignment(.leading)
@@ -3521,11 +3769,11 @@ private struct FleetPaneInspector: View {
             .padding(.top, 9)
         } label: {
             HStack(spacing: 8) {
-                Label("Agents in this window", systemImage: "person.2")
+                Label("Others in this window", systemImage: "person.2")
                     .font(.headline)
                 if let identity = windowWorkIdentity(window) {
                     Text(verbatim: "\(identity.workspaceID) / \(identity.workID)")
-                        .font(.caption.weight(.medium))
+                        .font(MuxaType.detail.weight(.medium))
                         .foregroundStyle(Color.accentColor)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
@@ -3533,7 +3781,7 @@ private struct FleetPaneInspector: View {
                 }
                 Spacer(minLength: 6)
                 Text("\(window.panes.count) panes · \(window.panes.compactMap(\.agent).count) agents")
-                    .font(.caption.monospacedDigit())
+                    .font(MuxaType.detail.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
         }
@@ -3554,7 +3802,7 @@ private struct FleetPaneInspector: View {
                         .font(.headline.weight(.semibold))
                     agentStatus(agent)
                 }
-                .font(.caption)
+                .font(MuxaType.detail)
 
                 if let summary = agent.recap?.nonEmpty,
                    let response = agent.lastResponse?.nonEmpty,
@@ -3565,14 +3813,14 @@ private struct FleetPaneInspector: View {
                                 String(localized: "Summary"),
                                 systemImage: "list.bullet.rectangle",
                                 summary,
-                                lineLimit: compact ? 5 : 8
+                                lineLimit: compact ? 3 : 4
                             )
                             .frame(maxWidth: .infinity, alignment: .topLeading)
                             overviewSection(
                                 String(localized: "Latest response"),
                                 systemImage: "text.bubble",
                                 response,
-                                lineLimit: compact ? 6 : 12
+                                lineLimit: compact ? 4 : 6
                             )
                             .frame(maxWidth: .infinity, alignment: .topLeading)
                         }
@@ -3581,13 +3829,13 @@ private struct FleetPaneInspector: View {
                                 String(localized: "Summary"),
                                 systemImage: "list.bullet.rectangle",
                                 summary,
-                                lineLimit: compact ? 5 : 8
+                                lineLimit: compact ? 3 : 4
                             )
                             overviewSection(
                                 String(localized: "Latest response"),
                                 systemImage: "text.bubble",
                                 response,
-                                lineLimit: compact ? 6 : 12
+                                lineLimit: compact ? 4 : 6
                             )
                         }
                     }
@@ -3596,14 +3844,14 @@ private struct FleetPaneInspector: View {
                         String(localized: "Summary"),
                         systemImage: "list.bullet.rectangle",
                         summary,
-                        lineLimit: compact ? 5 : 9
+                        lineLimit: compact ? 3 : 5
                     )
                 } else if let response = agent.lastResponse?.nonEmpty {
                     overviewSection(
                         String(localized: "Latest response"),
                         systemImage: "text.bubble",
                         response,
-                        lineLimit: compact ? 6 : 12
+                        lineLimit: compact ? 4 : 6
                     )
                 }
 
@@ -3612,7 +3860,7 @@ private struct FleetPaneInspector: View {
                         activity.title,
                         systemImage: activity.systemImage,
                         activity.source,
-                        lineLimit: compact ? 4 : 7
+                        lineLimit: compact ? 2 : 3
                     )
                 }
             }
@@ -3621,7 +3869,7 @@ private struct FleetPaneInspector: View {
                 "No agent session is currently associated with this pane.",
                 systemImage: "person.crop.circle.badge.questionmark"
             )
-            .font(.caption)
+            .font(MuxaType.detail)
             .foregroundStyle(.secondary)
         }
     }
@@ -3635,7 +3883,7 @@ private struct FleetPaneInspector: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
                 Label(title, systemImage: systemImage)
-                    .font(.caption.weight(.semibold))
+                    .font(MuxaType.detail.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 4)
                 Button {
@@ -3649,7 +3897,24 @@ private struct FleetPaneInspector: View {
                 .buttonStyle(.plain)
                 .help("Copy \(title.lowercased())")
             }
-            MarkdownContent(source: source, lineLimit: lineLimit, selectable: false)
+            MarkdownContent(
+                source: source,
+                lineLimit: expandedSections.contains(title) ? nil : lineLimit,
+                selectable: expandedSections.contains(title),
+                font: MuxaType.body
+            )
+            if source.count > lineLimit * 70 || source.filter(\.isNewline).count >= lineLimit {
+                Button(expandedSections.contains(title) ? "Show less" : "Show more") {
+                    if expandedSections.contains(title) {
+                        expandedSections.remove(title)
+                    } else {
+                        expandedSections.insert(title)
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(MuxaType.detail.weight(.medium))
+                .foregroundStyle(Color.accentColor)
+            }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3727,8 +3992,9 @@ private struct FleetPaneInspector: View {
                     Text(pane.host.alias)
                     if let agent = pane.agent {
                         Text(verbatim: "·")
-                        Text(agentStateLabel(agent.state))
-                            .foregroundStyle(agentStateColor(agent.state))
+                        // The breadcrumb bar above carries the reset time
+                        // and the auto-resume action for a rate limit.
+                        AgentStatusTag(status: agent.status, detailed: !agent.status.isLimited)
                     }
                     if let identity = pane.pane.workIdentity {
                         Text(verbatim: "·")
@@ -3736,7 +4002,7 @@ private struct FleetPaneInspector: View {
                             .foregroundStyle(Color.accentColor)
                     }
                 }
-                .font(.caption.weight(.medium))
+                .font(MuxaType.detail.weight(.medium))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             }
@@ -3784,7 +4050,7 @@ private struct FleetPaneInspector: View {
                         metadataRow("Directory", path)
                     }
                 }
-                .font(.caption)
+                .font(MuxaType.detail)
                 .textSelection(.enabled)
             }
             .padding(16)
@@ -3794,14 +4060,12 @@ private struct FleetPaneInspector: View {
 
     @ViewBuilder
     private func agentStatus(_ agent: MuxaAgent) -> some View {
-        Label(agentStateLabel(agent.state), systemImage: "circle.fill")
-            .foregroundStyle(agentStateColor(agent.state))
-        if let modelName = agent.model { Text(modelName) }
-        // WS-C usage
-        if let context = agent.contextUsedPercent {
-            MuxaContextMeter(percent: context)
+        // Status sits in the identity line and usage in the breadcrumb bar;
+        // repeating them here made each read three times.
+        if let modelName = agent.model {
+            Text(modelName)
+                .foregroundStyle(.secondary)
         }
-        MuxaRateLimitBadge(agent: agent)
     }
 }
 
@@ -3849,7 +4113,7 @@ struct PromptComposerStatus: View {
                         showsDetails.toggle()
                     } label: {
                         Label(feedback.message, systemImage: feedback.succeeded ? "checkmark.circle" : "exclamationmark.circle")
-                            .font(.caption2)
+                            .font(MuxaType.meta)
                             .lineLimit(1)
                             .truncationMode(.tail)
                             .foregroundStyle(feedback.succeeded ? Color.green : Color.red)
@@ -3946,7 +4210,7 @@ private struct PanePromptComposer: View {
             }
             if !host.local && host.mode != "control" {
                 Text("This host is registered in observe mode. Change it to control to send prompts.")
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(.orange)
             }
         }
@@ -4028,7 +4292,7 @@ struct WorkPromptComposer: View {
             }
             if promptHosts.contains(where: { !$0.local && $0.mode != "control" }) {
                 Text("This host is registered in observe mode. Change it to control to send prompts.")
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(.orange)
             }
         }
@@ -4168,12 +4432,6 @@ struct DetachedModuleView: View {
         )
         .frame(minWidth: 680, minHeight: 480)
     }
-}
-
-private func paneNeedsAttention(_ pane: MuxaWatchPane) -> Bool {
-    pane.agent.map {
-        ["waiting_input", "waiting_choice", "blocked", "error", "failed"].contains($0.state)
-    } ?? false
 }
 
 private struct ConsoleUnavailableView: View {

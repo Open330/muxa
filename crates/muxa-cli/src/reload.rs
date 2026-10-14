@@ -113,7 +113,24 @@ pub struct RestoreArgs {
 }
 
 #[derive(Debug, Parser)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct ReloadArgs {
+    #[command(subcommand)]
+    target: Option<ReloadTarget>,
+    #[command(flatten)]
+    multiplexer: MultiplexerReloadArgs,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ReloadTarget {
+    /// Refresh existing Codex MCP connections; does not restart the app-server or panes
+    Mcp(crate::mcp_reload::McpReloadArgs),
+    /// Snapshot, restart the multiplexer, and restore the workspace (same as bare reload)
+    Mux(MultiplexerReloadArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct MultiplexerReloadArgs {
     /// Restore from this snapshot instead of taking a fresh one. Use it to
     /// retry a restore that was interrupted.
     #[arg(long)]
@@ -539,6 +556,14 @@ fn live_shape(endpoint: &BackendEndpoint) -> Option<plan::LiveShape> {
 }
 
 pub async fn reload(client: &Client, args: ReloadArgs) -> Result<()> {
+    match args.target {
+        Some(ReloadTarget::Mcp(args)) => crate::mcp_reload::run(args).await,
+        Some(ReloadTarget::Mux(args)) => reload_multiplexer(client, args).await,
+        None => reload_multiplexer(client, args.multiplexer).await,
+    }
+}
+
+async fn reload_multiplexer(client: &Client, args: MultiplexerReloadArgs) -> Result<()> {
     if inside_a_multiplexer() {
         bail!(
             "refusing to reload from inside a multiplexer: this kills the server \
@@ -604,7 +629,7 @@ pub async fn reload(client: &Client, args: ReloadArgs) -> Result<()> {
     )?;
     println!(
         "\nagent conversations resume only where a provider id existed; \
-         `muxa prune` clears the rows whose panes are gone."
+         `muxa registry prune` clears the rows whose panes are gone."
     );
     Ok(())
 }
@@ -661,7 +686,7 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
             window_index: window_index.to_owned(),
             pane_index: pane_index.to_owned(),
             path: path.to_owned(),
-            replayable: command.as_deref().is_some_and(is_replayable),
+            replayable: is_replayable_command(command.as_deref(), argv.as_deref()),
             command,
             argv,
             agent: agents.get(&namespaced(endpoint.host, pane_id)).cloned(),
@@ -1118,12 +1143,21 @@ fn resume_hint(pane: &PaneShape) -> Option<String> {
 /// conversation id spliced in when muxa knows one and the command does not
 /// already carry it.
 fn relaunch_command(pane: &PaneShape) -> Option<String> {
+    let resuming = pane.agent.as_ref().and_then(|agent| {
+        (!agent.session_id.is_empty() && !agent.session_id.starts_with("synthetic"))
+            .then_some(agent.kind.as_str())
+    });
     let command = match pane.argv.as_deref() {
-        Some(argv) if !argv.is_empty() => argv
-            .iter()
-            .map(|argument| shell_word(argument))
-            .collect::<Vec<_>>()
-            .join(" "),
+        Some(argv) if !argv.is_empty() => {
+            let argv = match resuming {
+                Some(kind) => without_initial_prompt(argv, kind),
+                None => argv.to_vec(),
+            };
+            argv.iter()
+                .map(|argument| shell_word(argument))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
         _ => pane.command.clone()?,
     };
     let Some(agent) = pane.agent.as_ref() else {
@@ -1143,12 +1177,114 @@ fn relaunch_command(pane: &PaneShape) -> Option<String> {
     }
 }
 
+/// An agent launched with its first instruction (`claude … 'Read ISSUE.md
+/// and …'`) would, resumed with that argv, send the instruction again and
+/// restart the task. Drop the prompt argument; keep every flag and the
+/// values of the flags known to take one.
+///
+/// A prompt is a positional argument with whitespace in it, after the
+/// agent's own arguments begin (past a wrapper's `--`, or the `claude` /
+/// `codex` program, or an `aas` `name@claude` target). A one-word value of an
+/// unknown flag is therefore never mistaken for one.
+fn without_initial_prompt(argv: &[String], kind: &str) -> Vec<String> {
+    let value_flags: &[&str] = match kind {
+        "claude_code" => &[
+            "--model",
+            "--permission-mode",
+            "--add-dir",
+            "--append-system-prompt",
+            "--system-prompt",
+            "--allowedTools",
+            "--allowed-tools",
+            "--disallowedTools",
+            "--disallowed-tools",
+            "--mcp-config",
+            "--settings",
+            "--session-id",
+            "--resume",
+            "-r",
+            "--output-format",
+            "--input-format",
+            "--fallback-model",
+            "--agents",
+            "--agent",
+            "--setting-sources",
+            "--plugin-dir",
+            "--max-turns",
+        ],
+        "codex" => &[
+            "-m",
+            "--model",
+            "-c",
+            "--config",
+            "-p",
+            "--profile",
+            "-s",
+            "--sandbox",
+            "-a",
+            "--ask-for-approval",
+            "-C",
+            "--cd",
+            "-i",
+            "--image",
+            "--enable",
+            "--disable",
+            "--add-dir",
+        ],
+        _ => return argv.to_vec(),
+    };
+    let program = |argument: &str| {
+        let name = argument.rsplit('/').next().unwrap_or(argument);
+        matches!(name, "claude" | "codex") || name.ends_with("@claude") || name.ends_with("@codex")
+    };
+    let start = argv
+        .iter()
+        .rposition(|argument| argument == "--" || program(argument))
+        .map_or(0, |at| at + 1);
+    let mut kept = argv[..start].to_vec();
+    let mut takes_value = false;
+    for argument in &argv[start..] {
+        if takes_value {
+            takes_value = false;
+            kept.push(argument.clone());
+            continue;
+        }
+        if argument.starts_with('-') {
+            takes_value = !argument.contains('=') && value_flags.contains(&argument.as_str());
+            kept.push(argument.clone());
+            continue;
+        }
+        if argument.chars().any(char::is_whitespace) {
+            continue;
+        }
+        kept.push(argument.clone());
+    }
+    kept
+}
+
 /// False for argv a process rewrote into a status line. Puma and friends
 /// replace their own argv with something like
 /// `puma 5.6.8 (tcp://0.0.0.0:5072) [admin]`, which reads like a command and
 /// is not one; the original invocation is simply not in the process table.
 fn is_replayable(command: &str) -> bool {
     !command.is_empty() && !command.contains(['(', ')', '[', ']'])
+}
+
+/// [`is_replayable`], judged from the argv when it was captured. A rewritten
+/// title lands in the program argument (`argv[0]`, the rest blank), while a
+/// real command keeps its arguments apart — so an agent launched with an
+/// instruction like `"… (commit, push) …"` is still a command, and is
+/// relaunched rather than silently left out of the restore.
+fn is_replayable_command(command: Option<&str>, argv: Option<&[String]>) -> bool {
+    match argv {
+        Some([program, rest @ ..]) if !program.is_empty() => {
+            let title_like = program.contains(['(', ')', '[', ']']);
+            let rewritten =
+                program.contains(char::is_whitespace) && rest.iter().all(String::is_empty);
+            !title_like && !rewritten
+        }
+        _ => command.is_some_and(is_replayable),
+    }
 }
 
 fn pane_target(pane: &PaneShape) -> String {
@@ -1495,8 +1631,15 @@ fn read_snapshot(path: &Path) -> Result<Snapshot> {
         path.to_path_buf()
     };
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let snapshot: Snapshot =
+    let mut snapshot: Snapshot =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    // Re-judge with the current rule, so snapshots taken before it still
+    // relaunch an argv-captured command that merely contains parentheses.
+    for pane in &mut snapshot.panes {
+        if pane.argv.is_some() {
+            pane.replayable = is_replayable_command(pane.command.as_deref(), pane.argv.as_deref());
+        }
+    }
     if snapshot.version > SNAPSHOT_VERSION {
         bail!(
             "{} was written by a newer muxa (format {} > {SNAPSHOT_VERSION})",
@@ -1519,8 +1662,26 @@ struct ChildCommand {
 /// What a pane is running: the pane's own process is the shell, and the
 /// command is its child. Only readable while that process lives, which is why
 /// it is captured before the restart rather than reconstructed after one.
+///
+/// A pane started *with* a command (`new-window 'aas exec … -- --yolo'`,
+/// as `muxa agent start` does) has no shell: its own process is the command.
+/// Taking its child there records what the wrapper launched (`node …/codex`)
+/// and drops the wrapper — and with it the account profile a resume needs.
 #[cfg(target_os = "linux")]
 fn child_command(pane_pid: u32) -> Option<ChildCommand> {
+    if let Some(own) = std::fs::read(format!("/proc/{pane_pid}/cmdline"))
+        .ok()
+        .map(|raw| split_cmdline(&raw))
+        .filter(|argv| !argv.is_empty())
+    {
+        let command = own.join(" ").trim().to_owned();
+        if !command.is_empty() && !is_shell(&command) {
+            return Some(ChildCommand {
+                command,
+                argv: Some(own),
+            });
+        }
+    }
     let children =
         std::fs::read_to_string(format!("/proc/{pane_pid}/task/{pane_pid}/children")).ok()?;
     children.split_whitespace().find_map(|child| {
@@ -1542,27 +1703,43 @@ fn child_command(pane_pid: u32) -> Option<ChildCommand> {
 #[cfg(not(target_os = "linux"))]
 fn child_command(pane_pid: u32) -> Option<ChildCommand> {
     let output = std::process::Command::new("ps")
-        .args(["-axo", "ppid=,command="])
+        .args(["-axo", "pid=,ppid=,command="])
         .output()
         .ok()?;
-    children_of(&String::from_utf8_lossy(&output.stdout), pane_pid).map(|command| ChildCommand {
-        command,
-        argv: None,
+    pane_command_of(&String::from_utf8_lossy(&output.stdout), pane_pid).map(|command| {
+        ChildCommand {
+            command,
+            argv: None,
+        }
     })
 }
 
-/// The first non-shell command among a process's children, from a
-/// `ps -axo ppid=,command=` listing.
+/// What a pane runs, from a `ps -axo pid=,ppid=,command=` listing: the
+/// pane's own process when it is not a shell (a pane started with its
+/// command), else the first non-shell command among its children.
 #[cfg(any(not(target_os = "linux"), test))]
-fn children_of(listing: &str, parent: u32) -> Option<String> {
-    listing.lines().find_map(|line| {
-        let (ppid, command) = line.trim_start().split_once(char::is_whitespace)?;
-        if ppid.parse::<u32>().ok()? != parent {
-            return None;
+fn pane_command_of(listing: &str, pane: u32) -> Option<String> {
+    let rows: Vec<(u32, u32, &str)> = listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let parent = fields.next()?.parse().ok()?;
+            let rest = line.trim_start();
+            let rest = rest[rest.find(char::is_whitespace)?..].trim_start();
+            let command = rest[rest.find(char::is_whitespace)?..].trim();
+            Some((pid, parent, command))
+        })
+        .collect();
+    let usable = |command: &str| !command.is_empty() && !is_shell(command);
+    if let Some((_, _, own)) = rows.iter().find(|(pid, _, _)| *pid == pane) {
+        if usable(own) {
+            return Some((*own).to_owned());
         }
-        let command = command.trim();
-        (!command.is_empty() && !is_shell(command)).then(|| command.to_owned())
-    })
+    }
+    rows.iter()
+        .find(|(_, parent, command)| *parent == pane && usable(command))
+        .map(|(_, _, command)| (*command).to_owned())
 }
 
 /// `/proc/<pid>/cmdline` is NUL-terminated arguments. Only the final NUL is
@@ -1666,6 +1843,28 @@ mod tests {
         assert!(!is_replayable("puma 5.6.8 (tcp://0.0.0.0:5072) [admin]"));
     }
 
+    /// The pane a real reload skipped: an agent whose first instruction
+    /// contained "(commit, push, PR creation and Linear updates)".
+    #[test]
+    fn parentheses_in_an_argument_do_not_make_a_command_a_title() {
+        let argv = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+        let agent = argv(&[
+            "/home/june/.local/bin/aas",
+            "exec",
+            "e-ed@claude",
+            "--",
+            "--dangerously-skip-permissions",
+            "Stop before the FINALIZE steps (commit, push, PR creation) [then review]",
+        ]);
+        let joined = agent.join(" ");
+        assert!(is_replayable_command(Some(&joined), Some(&agent)));
+        // A rewritten title is one argument, the rest blank.
+        let title = argv(&["puma 5.6.8 (tcp://0.0.0.0:5072) [admin]", "", ""]);
+        assert!(!is_replayable_command(Some(&title[0]), Some(&title)));
+        // Without argv (macOS), the joined line keeps the old rule.
+        assert!(!is_replayable_command(Some(&joined), None));
+    }
+
     #[test]
     fn a_tracked_claude_pane_comes_back_on_its_own_conversation() {
         let mut claude = pane("work", "0", "0", Some("aas e june@claude"));
@@ -1705,20 +1904,96 @@ mod tests {
     }
 
     #[test]
-    fn children_are_picked_out_of_a_bsd_ps_listing() {
-        let listing = "    1 /sbin/launchd\n\
-                       4242 -zsh\n\
-                       4242 aas e june@claude\n\
-                       4243 codex resume abc\n";
+    fn a_pane_command_is_its_own_process_unless_that_is_a_shell() {
+        let listing = "    1     0 /sbin/launchd\n\
+                       4242     1 -zsh\n\
+                       4250  4242 aas e june@claude\n\
+                       4300     1 aas exec e-ed@codex -- --yolo\n\
+                       4301  4300 node /bin/codex --yolo\n";
+        // A shell pane runs its child.
         assert_eq!(
-            children_of(listing, 4242).as_deref(),
+            pane_command_of(listing, 4242).as_deref(),
             Some("aas e june@claude")
         );
+        // A pane started with its command runs that command, wrapper and all —
+        // not the program the wrapper launched.
         assert_eq!(
-            children_of(listing, 4243).as_deref(),
-            Some("codex resume abc")
+            pane_command_of(listing, 4300).as_deref(),
+            Some("aas exec e-ed@codex -- --yolo")
         );
-        assert_eq!(children_of(listing, 7), None);
+        assert_eq!(pane_command_of(listing, 7), None);
+    }
+
+    /// The panes found in a real snapshot: a Claude started with its task
+    /// instruction, and wrapped Codex panes.
+    #[test]
+    fn a_resumed_agent_does_not_replay_its_first_instruction() {
+        let shape = |argv: &[&str], kind: &str, session: &str| {
+            let mut pane = pane("callabo", "1", "0", Some(&argv.join(" ")));
+            pane.argv = Some(argv.iter().map(|a| (*a).to_owned()).collect());
+            pane.agent = Some(AgentShape {
+                kind: kind.into(),
+                session_id: session.into(),
+            });
+            pane
+        };
+        let claude = shape(
+            &[
+                "aas",
+                "exec",
+                "e-ed@claude",
+                "--",
+                "--dangerously-skip-permissions",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "be brief and careful",
+                "You are already the implementation agent. Read ./ISSUE.md",
+            ],
+            "claude_code",
+            "7961fc4b",
+        );
+        assert_eq!(
+            relaunch_command(&claude).as_deref(),
+            Some(
+                "aas exec e-ed@claude -- --dangerously-skip-permissions --model opus \
+                 --append-system-prompt 'be brief and careful' --resume 7961fc4b"
+            )
+        );
+        let codex = shape(
+            &[
+                "aas",
+                "exec",
+                "e-ed@codex",
+                "--",
+                "--yolo",
+                "Review the diff please",
+            ],
+            "codex",
+            "01a12f38",
+        );
+        assert_eq!(
+            relaunch_command(&codex).as_deref(),
+            Some("aas exec e-ed@codex -- --yolo resume 01a12f38")
+        );
+        // Bare program, prompt last.
+        let bare = shape(
+            &[
+                "/home/june/.local/bin/claude",
+                "--dangerously-skip-permissions",
+                "fix the bug",
+            ],
+            "claude_code",
+            "s1",
+        );
+        assert_eq!(
+            relaunch_command(&bare).as_deref(),
+            Some("/home/june/.local/bin/claude --dangerously-skip-permissions --resume s1")
+        );
+        // Not resuming: the argv replays untouched.
+        let mut fresh = bare.clone();
+        fresh.agent = None;
+        assert!(relaunch_command(&fresh).unwrap().contains("'fix the bug'"));
     }
 
     #[test]

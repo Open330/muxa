@@ -278,16 +278,16 @@ struct ArtifactFolderPicker: View {
                 guard !suggestions.isEmpty else { return }
                 selected = min(max(0, selected + delta), suggestions.count - 1)
             }).frame(height: 26)
-            Text(root.hostAlias == "local" ? "This Mac · ~ / Documents / …" : root.hostAlias).font(.caption).foregroundStyle(.secondary)
-            if let error { Text(error).font(.caption).foregroundStyle(.red) }
+            Text(root.hostAlias == "local" ? "This Mac · ~ / Documents / …" : root.hostAlias).font(MuxaType.detail).foregroundStyle(.secondary)
+            if let error { Text(error).font(MuxaType.detail).foregroundStyle(.red) }
             ForEach(Array(suggestions.prefix(8).enumerated()), id: \.element) { index, value in
                 Button { path = value + "/" } label: {
-                    HStack { Image(systemName: "folder"); Text((value as NSString).lastPathComponent); Spacer(); Image(systemName: "arrow.turn.down.right").font(.caption) }
+                    HStack { Image(systemName: "folder"); Text((value as NSString).lastPathComponent); Spacer(); Image(systemName: "arrow.turn.down.right").font(MuxaType.detail) }
                         .padding(6).contentShape(Rectangle()).background(index == selected ? Color.accentColor.opacity(0.15) : Color.clear).cornerRadius(4)
                 }.buttonStyle(.plain)
             }
             HStack {
-                Text("↑ ↓ Select · Tab Complete · Return Open").font(.caption2).foregroundStyle(.secondary)
+                Text("↑ ↓ Select · Tab Complete · Return Open").font(MuxaType.meta).foregroundStyle(.secondary)
                 Spacer()
                 if loading { ProgressView().controlSize(.small) }
                 Button("Open") { navigate() }.disabled(loading)

@@ -14,7 +14,7 @@ struct SidebarGuidedEmptyRow<Actions: View>: View {
             Label(title, systemImage: systemImage)
                 .foregroundStyle(.secondary)
             Text(detail)
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 6) {

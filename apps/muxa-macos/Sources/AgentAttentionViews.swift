@@ -131,12 +131,12 @@ struct MuxaAppNotificationsSection: View {
             Toggle("Show the count on the Dock icon", isOn: $dockBadge)
                 .onChange(of: dockBadge) { _ in attention.refreshDockBadge() }
             Text("Muxa skips the pane you are looking at and repeats for the same agent within 30 seconds. An agent that finished or started waiting since you last opened it keeps a dot until you do.")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
             authorizationRow
             if daemonNotifierEnabled, notifyAttention || notifyFinished {
                 Label("muxad's desktop notifications are also on, so you may be notified twice.", systemImage: "exclamationmark.circle")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
             }
         }
@@ -150,12 +150,12 @@ struct MuxaAppNotificationsSection: View {
             EmptyView()
         case .allowed:
             Label("macOS allows Muxa to notify you.", systemImage: "checkmark.circle")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
         case .notDetermined:
             HStack {
                 Text("macOS will ask the first time Muxa has something to tell you.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Allow Notifications…") {
@@ -169,7 +169,7 @@ struct MuxaAppNotificationsSection: View {
         case .denied:
             HStack {
                 Label("Notifications for Muxa are off in System Settings.", systemImage: "bell.slash")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
                 Spacer()
                 Button("Open System Settings") {

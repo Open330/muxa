@@ -97,7 +97,12 @@ fn pending_session_id(pane: &str, socket: Option<&str>) -> String {
 /// recipient: the request was addressed to a pane before any session existed
 /// there, so the real agent that registered on that pane — and only on that
 /// exact pane and control endpoint — owns it too.
-fn addresses(to: &Participant, caller: &Participant) -> bool {
+/// Whether `caller` may receive a request addressed to `to`: the exact
+/// session, or, for a request still waiting on a launching agent, the agent
+/// that now occupies that pane *in the same room*. Delivery reserves the
+/// request through this predicate, so anything picking a recipient must use
+/// it too: a candidate it rejects can never be served.
+pub fn addresses(to: &Participant, caller: &Participant) -> bool {
     if to.same_endpoint(caller) {
         return true;
     }
@@ -836,6 +841,18 @@ pub struct CollaborationQuery {
         skip_serializing_if = "Option::is_none",
         with = "time::serde::rfc3339::option"
     )]
+    pub until: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub search_bodies: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
     pub since: Option<OffsetDateTime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
@@ -857,6 +874,8 @@ pub struct CollaborationQuery {
     pub tmux_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_session_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_socket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1412,6 +1431,129 @@ fn request_access_clause(
     }
 }
 
+fn append_session_query_filters(
+    connection: &Connection,
+    query: &CollaborationQuery,
+    clauses: &mut Vec<String>,
+    values: &mut Vec<Value>,
+) -> Result<(), CollaborationError> {
+    if let Some(name) = &query.tmux_session_name {
+        // Include retained records made through a numeric client view, while
+        // keeping the filter before pagination/counting and index-backed.
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT anchor_tmux_session_name FROM collaboration_requests WHERE anchor_tmux_session_name IS NOT NULL",
+        )?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|candidate| {
+                crate::tmux::base_session_name(candidate) == crate::tmux::base_session_name(name)
+            })
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            clauses.push("0".to_string());
+        } else {
+            clauses.push(format!(
+                "anchor_tmux_session_name IN ({})",
+                vec!["?"; names.len()].join(",")
+            ));
+            values.extend(names.into_iter().map(Value::Text));
+        }
+    }
+    if let Some(socket) = &query.tmux_socket {
+        clauses.push("(CASE WHEN json_extract(payload, '$.from.console') THEN COALESCE(to_socket, to_room_socket) ELSE COALESCE(from_socket, from_room_socket) END) = ?".to_string());
+        values.push(Value::Text(socket.clone()));
+    }
+    Ok(())
+}
+
+fn collaboration_search_paths() -> &'static [&'static str] {
+    &[
+        "$.id",
+        "$.kind",
+        "$.status",
+        "$.workspace_id",
+        "$.work_id",
+        "$.thread_id",
+        "$.parent_request_id",
+        "$.from.alias",
+        "$.from.roles",
+        "$.from.agent_kind",
+        "$.from.pane",
+        "$.from.agent_session_id",
+        "$.from.tmux_session_name",
+        "$.from.window_name",
+        "$.to.alias",
+        "$.to.roles",
+        "$.to.agent_kind",
+        "$.to.pane",
+        "$.to.agent_session_id",
+        "$.to.tmux_session_name",
+        "$.to.window_name",
+    ]
+}
+
+fn collaboration_search_text(request: &CollaborationRequest, bodies: bool) -> String {
+    let value = serde_json::to_value(request).expect("collaboration request serializes");
+    let mut fields = collaboration_search_paths()
+        .iter()
+        .filter_map(|path| {
+            value.pointer(&format!(
+                "/{}",
+                path.trim_start_matches("$.").replace('.', "/")
+            ))
+        })
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .map_or_else(|| value.to_string(), str::to_string)
+        })
+        .collect::<Vec<_>>();
+    if bodies {
+        fields.push(request.body.clone());
+        if let Some(reply) = &request.reply {
+            fields.push(reply.body.clone());
+        }
+        fields.extend(request.updates.iter().map(|update| update.body.clone()));
+    }
+    fields.join(" ")
+}
+
+fn append_search_query_filters(
+    query: &CollaborationQuery,
+    clauses: &mut Vec<String>,
+    values: &mut Vec<Value>,
+) -> Result<(), CollaborationError> {
+    for (operator, instant) in [(">=", query.since), ("<=", query.until)] {
+        if let Some(instant) = instant {
+            clauses.push(format!("created_at_ns {operator} ?"));
+            values.push(Value::Integer(timestamp_nanos(instant)?));
+        }
+    }
+    if let Some(search) = &query.search {
+        let mut fields = collaboration_search_paths()
+            .iter()
+            .map(|path| format!("COALESCE(CAST(json_extract(payload, '{path}') AS TEXT), '')"))
+            .collect::<Vec<_>>();
+        if query.search_bodies {
+            fields.extend(
+                ["$.body", "$.reply.body"]
+                    .iter()
+                    .map(|path| format!("COALESCE(json_extract(payload, '{path}'), '')")),
+            );
+            fields.push("COALESCE((SELECT group_concat(json_extract(value, '$.body'), ' ') FROM json_each(payload, '$.updates')), '')".to_string());
+        }
+        clauses.push(format!(
+            "instr(lower({}), lower(?)) > 0",
+            fields.join(" || ' ' || ")
+        ));
+        values.push(Value::Text(search.clone()));
+    }
+    Ok(())
+}
+
 fn query_database(
     path: &Path,
     caller: &Participant,
@@ -1425,23 +1567,21 @@ fn query_database(
     if let Some(clause) = request_access_clause(caller, mailbox, scope, &mut values) {
         clauses.push(clause);
     }
-    if let Some(since) = query.since {
-        clauses.push("created_at_ns >= ?".to_string());
-        values.push(Value::Integer(timestamp_nanos(since)?));
-    }
+    append_search_query_filters(query, &mut clauses, &mut values)?;
     for (column, value) in [
+        ("id", query.request_id.as_ref()),
         ("workspace_id", query.workspace_id.as_ref()),
         ("work_id", query.work_id.as_ref()),
         ("thread_id", query.thread_id.as_ref()),
         ("parent_request_id", query.parent_request_id.as_ref()),
         ("anchor_tmux_session_id", query.tmux_session_id.as_ref()),
-        ("anchor_tmux_session_name", query.tmux_session_name.as_ref()),
     ] {
         if let Some(value) = value {
             clauses.push(format!("{column} = ?"));
             values.push(Value::Text(value.clone()));
         }
     }
+    append_session_query_filters(&connection, query, &mut clauses, &mut values)?;
     if let Some(kind) = query.kind {
         clauses.push("kind = ?".to_string());
         values.push(Value::Text(request_kind_name(kind).to_string()));
@@ -1550,6 +1690,13 @@ fn request_matches_query(request: &CollaborationRequest, query: &CollaborationQu
         &request.from
     };
     query.since.is_none_or(|since| request.created_at >= since)
+        && query.until.is_none_or(|until| request.created_at <= until)
+        && query.request_id.as_ref().is_none_or(|id| request.id == *id)
+        && query.search.as_ref().is_none_or(|search| {
+            collaboration_search_text(request, query.search_bodies)
+                .to_ascii_lowercase()
+                .contains(&search.to_ascii_lowercase())
+        })
         && query
             .workspace_id
             .as_ref()
@@ -1577,7 +1724,20 @@ fn request_matches_query(request: &CollaborationRequest, query: &CollaborationQu
             .as_ref()
             .is_none_or(|session_id| session_anchor.tmux_session_id.as_ref() == Some(session_id))
         && query.tmux_session_name.as_ref().is_none_or(|session_name| {
-            session_anchor.tmux_session_name.as_ref() == Some(session_name)
+            session_anchor
+                .tmux_session_name
+                .as_deref()
+                .is_some_and(|name| {
+                    crate::tmux::base_session_name(name)
+                        == crate::tmux::base_session_name(session_name)
+                })
+        })
+        && query.tmux_socket.as_ref().is_none_or(|socket| {
+            session_anchor
+                .socket
+                .as_ref()
+                .or(session_anchor.room.socket.as_ref())
+                == Some(socket)
         })
 }
 
@@ -2534,6 +2694,47 @@ impl CollaborationStore {
         Ok(request_ids.len())
     }
 
+    /// Operator housekeeping: mark every request still `Queued` (never
+    /// claimed) and created before `cutoff` as `Expired`, and return them.
+    /// Covers what nobody else can close: a sender may cancel only its own
+    /// request, and the sender of a request stuck for weeks is usually an
+    /// agent session that no longer exists. `dry_run` reports without
+    /// writing.
+    pub async fn expire_queued_before(
+        &self,
+        cutoff: OffsetDateTime,
+        dry_run: bool,
+    ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
+        self.ensure_enabled()?;
+        let _transaction = self.transaction_lock.lock().await;
+        let previous = self.requests.read().await.clone();
+        let mut expired: Vec<CollaborationRequest> = {
+            let mut requests = self.requests.write().await;
+            requests
+                .values_mut()
+                .filter(|request| {
+                    request.status == RequestStatus::Queued && request.created_at < cutoff
+                })
+                .map(|request| {
+                    if !dry_run {
+                        request.status = RequestStatus::Expired;
+                    }
+                    request.clone()
+                })
+                .collect()
+        };
+        expired.sort_by_key(|request| request.created_at);
+        if dry_run || expired.is_empty() {
+            return Ok(expired);
+        }
+        if let Err(error) = self.persist_requests(&expired) {
+            *self.requests.write().await = previous;
+            return Err(error);
+        }
+        self.publish_change();
+        Ok(expired)
+    }
+
     pub async fn cancel_for(
         &self,
         caller: &Participant,
@@ -2565,6 +2766,24 @@ impl CollaborationStore {
         }
         self.publish_change();
         Ok(cancelled)
+    }
+
+    /// One-way notices still unread in `recipient`'s mailbox. They never wake
+    /// anyone on their own, so a wake sent for something else is where the
+    /// recipient learns they exist; otherwise they wait until it happens to
+    /// read its inbox, however long that takes.
+    pub async fn quiet_notices_waiting(&self, recipient: &Participant) -> usize {
+        self.requests
+            .read()
+            .await
+            .values()
+            .filter(|request| {
+                request.status == RequestStatus::Queued
+                    && request.notified_at.is_none()
+                    && !request.should_notify()
+                    && addresses(&request.to, recipient)
+            })
+            .count()
     }
 
     pub async fn pending_unnotified(&self) -> Vec<CollaborationRequest> {
@@ -2773,6 +2992,9 @@ impl CollaborationStore {
 
 /// Correlate live agent rows with pane topology, keeping the newest live
 /// agent when adapter/synthetic rows briefly overlap on the same pane.
+/// Muxa-launched CLIs without a real hook become pending peers when process
+/// discovery confirms their provider. Wrapper discovery reads the process
+/// table, so async callers must run this on a blocking worker.
 pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participant> {
     let mut resolved: HashMap<(Option<String>, String), (OffsetDateTime, Participant)> =
         HashMap::new();
@@ -2838,6 +3060,37 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
         .into_values()
         .map(|(_, participant)| participant)
         .collect();
+    // A launcher-marked process is a peer before its first hook. Keep its
+    // recipient pane-scoped until a real session can adopt queued requests.
+    // Process evidence is required: launch marks can outlive a CLI in a pane.
+    let launched = panes
+        .iter()
+        .filter(|pane| {
+            pane.agent_program.is_some()
+                && !participants
+                    .iter()
+                    .any(|peer| peer.pane == pane.pane_id && peer.socket == pane.socket)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for discovered in crate::discovery::discover_from_panes(&launched) {
+        let pane = &discovered.pane;
+        if pane
+            .agent_program
+            .as_deref()
+            .and_then(crate::discovery::classify_command)
+            != Some(discovered.kind)
+            || participants
+                .iter()
+                .any(|peer| peer.pane == pane.pane_id && peer.socket == pane.socket)
+        {
+            continue;
+        }
+        let row = live_pane_row(&pane.pane_id, pane.socket.as_deref(), agents);
+        let mut pending = pane_participant(pane, pane.socket.clone(), row);
+        pending.agent_kind = discovered.kind;
+        participants.push(pending);
+    }
     participants.sort_by(|left, right| left.pane.cmp(&right.pane));
     participants
 }
@@ -3041,14 +3294,12 @@ fn select_target(
 
 /// Resolve an explicit `pane:%N` target whose agent has not registered yet.
 ///
-/// This is the fallback [`resolve_target`] cannot serve: `participants_from`
-/// only admits real, session-pinned rows, so a pane muxa launched a moment ago
-/// is invisible until its agent's first hook — which, for codex, never comes
-/// unaided (see [`PENDING_SESSION_PREFIX`]).
+/// Launcher-backed pending peers are normally served by [`resolve_target`].
+/// This narrower fallback covers explicitly addressed panes with role/alias
+/// marks or discovery evidence that do not yet appear in the peer topology.
 ///
 /// Deliberately narrow. It requires all of:
-/// * an **explicit pane selector** — `peer`, `@alias` and `role:` stay
-///   registered-peer concepts, so no automatic routing can land here;
+/// * an **explicit pane selector** — automatic routing uses the peer topology;
 /// * a pane muxa itself marked as an agent launch (`@muxa_agent_role` /
 ///   `@muxa_agent_alias`) or that discovery already classified as an agent
 ///   CLI, so a request can never be typed at a human's shell;
@@ -3239,7 +3490,15 @@ fn muxa_launched_agent_pane(pane: &PaneInfo, row: Option<&Agent>) -> bool {
 /// Build the pane-scoped participant a pending recipient is addressed as.
 fn pane_participant(pane: &PaneInfo, socket: Option<String>, row: Option<&Agent>) -> Participant {
     Participant {
-        agent_kind: row.map_or(AgentKind::Unknown, |row| row.kind),
+        agent_kind: row.map_or_else(
+            || {
+                pane.agent_program
+                    .as_deref()
+                    .and_then(crate::discovery::classify_command)
+                    .unwrap_or(AgentKind::Unknown)
+            },
+            |row| row.kind,
+        ),
         agent_session_id: pending_session_id(&pane.pane_id, socket.as_deref()),
         pane: pane.pane_id.clone(),
         socket: socket.clone(),
@@ -3411,6 +3670,105 @@ fn valid_identity_token(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn history_search_filters_before_pagination_in_memory_and_sqlite() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mailbox = if durable {
+                CollaborationStore::load(CollaborationOptions {
+                    path: Some(dir.path().join("history.sqlite3")),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+            } else {
+                CollaborationStore::in_memory(CollaborationOptions::default())
+            };
+            let sender = participant("%123456", "sender");
+            let recipient = participant("%2", "recipient");
+            let root = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "hidden needle %_ 한글".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            mailbox
+                .update_request(&sender, &root.id, "progress needle".into())
+                .await
+                .unwrap();
+            mailbox
+                .reply(
+                    &recipient,
+                    &root.id,
+                    RequestStatus::Completed,
+                    "reply needle".into(),
+                    vec![],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            mailbox
+                .create(
+                    sender,
+                    recipient,
+                    NewRequest {
+                        body: "newer unrelated".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let console = Participant::console(root.from.room.clone());
+            for text in ["hidden needle %_ 한글", "progress needle", "reply needle"] {
+                let query = CollaborationQuery {
+                    search: Some(text.into()),
+                    search_bodies: true,
+                    limit: Some(1),
+                    ..Default::default()
+                };
+                let page = mailbox
+                    .query_for(&console, RequestMailbox::All, MailboxScope::All, &query)
+                    .await
+                    .unwrap();
+                assert_eq!(page.total, 1);
+                assert_eq!(page.requests[0].id, root.id);
+                let public = mailbox
+                    .query_for(
+                        &console,
+                        RequestMailbox::All,
+                        MailboxScope::All,
+                        &CollaborationQuery {
+                            search_bodies: false,
+                            ..query
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(public.total, 0);
+            }
+            let page = mailbox
+                .query_for(
+                    &console,
+                    RequestMailbox::All,
+                    MailboxScope::All,
+                    &CollaborationQuery {
+                        request_id: Some(root.id.clone()),
+                        until: Some(root.created_at),
+                        search: Some("%123456".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.total, 1);
+        }
+    }
+
     use super::*;
     use crate::config::CollaborationScope;
 
@@ -3605,6 +3963,7 @@ mod tests {
     fn pane_info(pane_id: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -3653,6 +4012,7 @@ mod tests {
 
     fn managed_pane(pane_id: &str, role: &str, alias: &str) -> PaneInfo {
         PaneInfo {
+            agent_program: None,
             agent_role: Some(role.into()),
             agent_alias: Some(alias.into()),
             ..pane_info(pane_id)
@@ -4208,6 +4568,110 @@ mod tests {
         let participants = participants_from(&store.snapshot().await, &panes);
         assert_eq!(participants.len(), 1);
         assert_eq!(participants[0].agent_session_id, "real-session");
+    }
+
+    #[tokio::test]
+    async fn launched_peers_are_visible_before_first_prompt_and_adopt_requests() {
+        for (program, kind) in [
+            ("codex", AgentKind::Codex),
+            ("claude", AgentKind::ClaudeCode),
+        ] {
+            let mut pane = pane_info("%2");
+            pane.current_command = program.into();
+            pane.agent_program = Some(program.into());
+            pane.agent_alias = Some("review".into());
+            pane.agent_role = Some("reviewer".into());
+            let panes = vec![pane.clone()];
+            let pending = participants_from(&[], &panes).remove(0);
+            assert_eq!(pending.agent_kind, kind);
+            assert_eq!(pending.state, AgentState::Starting);
+            assert!(is_pending_session(&pending.agent_session_id));
+            let sender = participant("%1", "sender");
+            for selector in ["peer", "@review", "role:reviewer", "pane:%2"] {
+                assert!(resolve_target(
+                    &sender,
+                    selector,
+                    std::slice::from_ref(&pending),
+                    CollaborationScope::Window
+                )
+                .is_ok());
+            }
+            assert!(pending_recipient_ready(&pending, &[], &panes).is_none());
+            let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+            let request = mailbox
+                .create(
+                    sender,
+                    pending.clone(),
+                    NewRequest {
+                        kind: RequestKind::Question,
+                        body: "review without an initial prompt".into(),
+                        expects_reply: true,
+                        work_mode: WorkMode::ReadOnly,
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let store = crate::Store::shared();
+            let discovered = crate::discovery::Discovered { pane, kind };
+            store
+                .apply(&crate::discovery::synthesize_started(
+                    &discovered,
+                    OffsetDateTime::now_utc(),
+                ))
+                .await;
+            let agents = store.snapshot().await;
+            let peers = participants_from(&agents, &panes);
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].agent_session_id, pending.agent_session_id);
+            assert!(pending_recipient_ready(&pending, &agents, &panes).is_some());
+            store
+                .apply(&crate::event::AgentEvent::Started {
+                    id: crate::event::AgentId {
+                        kind,
+                        session_id: "real-session".into(),
+                        surface: None,
+                        pane: Some("%2".into()),
+                        tmux_socket: Some("default".into()),
+                        cwd: None,
+                    },
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+            let real = participants_from(&store.snapshot().await, &panes);
+            assert_eq!(real.len(), 1);
+            assert_eq!(real[0].agent_session_id, "real-session");
+            assert!(addresses(&pending, &real[0]));
+            let mut other_server = real[0].clone();
+            other_server.socket = Some("other".into());
+            assert!(!addresses(&pending, &other_server));
+            assert!(mailbox.claim_for(&other_server).await.unwrap().is_empty());
+            let claimed = mailbox.claim_for(&real[0]).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].id, request.id);
+            assert_eq!(
+                mailbox
+                    .get_for(&real[0], &request.id)
+                    .await
+                    .unwrap()
+                    .to
+                    .agent_session_id,
+                "real-session"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_marks_do_not_expose_shells_or_different_processes_as_peers() {
+        let mut pane = pane_info("%2");
+        pane.agent_program = Some("codex".into());
+        for command in ["zsh", "vim", "claude"] {
+            pane.current_command = command.into();
+            assert!(participants_from(&[], &[pane.clone()]).is_empty());
+        }
+        pane.current_command = "codex".into();
+        pane.agent_program = None;
+        assert!(participants_from(&[], &[pane]).is_empty());
     }
 
     /// A reply is a terminal write, so an empty one must not spend it. This
@@ -4774,6 +5238,68 @@ mod tests {
             result,
             Err(CollaborationError::InvalidAirArtifactReference(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn expiry_closes_only_unclaimed_requests_older_than_the_cutoff() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let other = participant("%3", "other");
+        let ask = |to: &Participant, body: &str| {
+            let (mailbox, sender, to, body) =
+                (&mailbox, sender.clone(), to.clone(), body.to_string());
+            async move {
+                mailbox
+                    .create(
+                        sender,
+                        to,
+                        NewRequest {
+                            body,
+                            ..NewRequest::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let stale = ask(&recipient, "nobody claimed this").await;
+        let claimed = ask(&other, "claimed, so it is the recipient's to finish").await;
+        mailbox.claim_for(&other).await.unwrap();
+
+        // Nothing is older than an hour yet.
+        let past = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        assert!(mailbox
+            .expire_queued_before(past, false)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let future = OffsetDateTime::now_utc() + time::Duration::seconds(1);
+        let preview = mailbox.expire_queued_before(future, true).await.unwrap();
+        assert_eq!(
+            preview.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            [&stale.id]
+        );
+        assert_eq!(
+            preview[0].status,
+            RequestStatus::Queued,
+            "a dry run changes nothing"
+        );
+
+        let expired = mailbox.expire_queued_before(future, false).await.unwrap();
+        assert_eq!(
+            expired.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            [&stale.id]
+        );
+        assert_eq!(expired[0].status, RequestStatus::Expired);
+        let sent = mailbox
+            .list_for(&sender, RequestMailbox::Sent, MailboxScope::Caller)
+            .await
+            .unwrap();
+        let status = |id: &str| sent.iter().find(|r| r.id == id).unwrap().status;
+        assert_eq!(status(&stale.id), RequestStatus::Expired);
+        assert_eq!(status(&claimed.id), RequestStatus::Claimed);
     }
 
     #[tokio::test]
@@ -5918,6 +6444,75 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // one scenario proves the indexed filters and cursor boundary together
+    async fn session_scope_filters_client_views_and_socket_before_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        for database in [false, true] {
+            let mailbox = CollaborationStore::load(CollaborationOptions {
+                path: database.then(|| dir.path().join("session-scope.sqlite3")),
+                ..CollaborationOptions::default()
+            })
+            .await
+            .unwrap();
+            let caller = Participant::console(participant("%0", "caller").room);
+            for (name, socket) in [
+                ("callabo", "default"),
+                ("callabo~view~123", "default"),
+                ("junia", "default"),
+                ("callabo", "other"),
+            ] {
+                let mut from = participant("%1", &format!("sender-{name}-{socket}"));
+                from.tmux_session_name = Some(name.into());
+                from.socket = Some(socket.into());
+                from.room.socket = Some(socket.into());
+                let mut to = from.clone();
+                to.pane = "%2".into();
+                to.agent_session_id = format!("receiver-{name}-{socket}");
+                mailbox
+                    .create(
+                        from,
+                        to,
+                        NewRequest {
+                            body: "scope test".into(),
+                            ..NewRequest::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let query = CollaborationQuery {
+                tmux_session_name: Some("callabo".into()),
+                tmux_socket: Some("default".into()),
+                limit: Some(1),
+                ..CollaborationQuery::default()
+            };
+            let page = mailbox
+                .query_for(&caller, RequestMailbox::All, MailboxScope::All, &query)
+                .await
+                .unwrap();
+            assert_eq!(page.total, 2);
+            assert_eq!(page.requests.len(), 1);
+            assert!(page.has_more);
+            let second = mailbox
+                .query_for(
+                    &caller,
+                    RequestMailbox::All,
+                    MailboxScope::All,
+                    &CollaborationQuery {
+                        cursor: page.next_cursor.clone(),
+                        ..query
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(second.total, 2);
+            assert_eq!(second.requests.len(), 1);
+            assert!(!second.has_more);
+            assert_ne!(page.requests[0].id, second.requests[0].id);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one scenario proves indexed filters and cursor boundaries together
     async fn sqlite_query_filters_and_keyset_pages_use_room_and_session_anchors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("collaboration.sqlite3");

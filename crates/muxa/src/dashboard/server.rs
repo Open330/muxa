@@ -20,7 +20,7 @@
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{header, HeaderMap, Request, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
@@ -820,6 +820,9 @@ const COLLABORATION_CURSOR_ID_MAX_BYTES: usize = 128;
 /// its typed contract.
 #[derive(Debug, Default, Deserialize)]
 struct CollaborationHttpQuery {
+    until: Option<String>,
+    id: Option<String>,
+    q: Option<String>,
     /// Same grammar as the CLI timeline (`24h`, `7d`, RFC3339, `all`, ...).
     since: Option<String>,
     #[serde(alias = "work_id")]
@@ -834,6 +837,8 @@ struct CollaborationHttpQuery {
     status: Option<String>,
     /// URL-encoded JSON `RoomId`, e.g. `{"host":"tmux","window_id":"@1"}`.
     room: Option<String>,
+    session: Option<String>,
+    socket: Option<String>,
     limit: Option<String>,
     /// Opaque keyset token returned as `pagination.next_cursor`.
     cursor: Option<String>,
@@ -852,7 +857,7 @@ struct CollaborationPagination {
 struct CollaborationHttpResponse {
     #[serde(with = "time::serde::rfc3339")]
     generated_at: OffsetDateTime,
-    /// False outside authenticated `auth = "token"` mode. Topology and status
+    /// False without operator authentication. Topology and status
     /// remain useful for the graph, but message bodies and attached details
     /// are omitted.
     details_included: bool,
@@ -865,7 +870,7 @@ async fn collaboration_handler(
     headers: HeaderMap,
     Query(http): Query<CollaborationHttpQuery>,
 ) -> Response {
-    let (query, limit) = match collaboration_query_from_http(http) {
+    let (mut query, limit) = match collaboration_query_from_http(http) {
         Ok(query) => query,
         Err(error) => {
             return (
@@ -875,6 +880,7 @@ async fn collaboration_handler(
                 .into_response();
         }
     };
+    query.search_bodies = dashboard_details_authorized(&state, &headers);
     // All-scope reads are explicitly operator-only in CollaborationStore.
     // The dashboard is the operator surface; the room value is immaterial at
     // this scope but keeps the authority marker a normal console participant.
@@ -922,7 +928,7 @@ async fn collaboration_handler(
             value
         })
         .collect();
-    Json(CollaborationHttpResponse {
+    let mut response = Json(CollaborationHttpResponse {
         generated_at: OffsetDateTime::now_utc(),
         details_included,
         requests,
@@ -933,7 +939,16 @@ async fn collaboration_handler(
             next_cursor: page.next_cursor.as_ref().map(encode_collaboration_cursor),
         },
     })
-    .into_response()
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::VARY,
+        HeaderValue::from_static("Authorization, Cookie"),
+    );
+    response
 }
 
 fn collaboration_query_from_http(
@@ -946,6 +961,17 @@ fn collaboration_query_from_http(
         .map(|raw| timeline::parse_since(raw, now, "all collaboration history"))
         .transpose()?
         .and_then(|range| range.since_at);
+    let until = http
+        .until
+        .as_deref()
+        .map(|raw| {
+            OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| "until must be an RFC3339 timestamp".to_string())
+        })
+        .transpose()?;
+    if since.zip(until).is_some_and(|(start, end)| start > end) {
+        return Err("since must not be later than until".to_string());
+    }
     let limit = http
         .limit
         .as_deref()
@@ -964,6 +990,10 @@ fn collaboration_query_from_http(
         .map_err(|error| format!("invalid room; expected a JSON RoomId: {error}"))?;
     Ok((
         CollaborationQuery {
+            until,
+            request_id: non_empty_collaboration_filter("id", http.id)?,
+            search: non_empty_collaboration_filter("q", http.q)?,
+            search_bodies: false,
             since,
             work_id: non_empty_collaboration_filter("work", http.work)?,
             workspace_id: non_empty_collaboration_filter("workspace", http.workspace)?,
@@ -977,7 +1007,8 @@ fn collaboration_query_from_http(
                 .transpose()?,
             room,
             tmux_session_id: None,
-            tmux_session_name: None,
+            tmux_session_name: non_empty_collaboration_filter("session", http.session)?,
+            tmux_socket: non_empty_collaboration_filter("socket", http.socket)?,
             limit: Some(limit),
             cursor: http
                 .cursor
@@ -1066,7 +1097,10 @@ fn parse_collaboration_cursor(raw: &str) -> Result<CollaborationCursor, String> 
 }
 
 fn dashboard_details_authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    matches!(state.config.auth, DashboardAuthMode::Token) && operator_auth(state, headers).is_some()
+    matches!(
+        state.config.auth,
+        DashboardAuthMode::Token | DashboardAuthMode::PublicRead
+    ) && operator_auth(state, headers).is_some()
 }
 
 fn redact_collaboration_details(request: &mut serde_json::Value) {
@@ -1082,6 +1116,16 @@ fn redact_collaboration_details(request: &mut serde_json::Value) {
         "air_artifacts",
     ] {
         request.remove(field);
+    }
+    if let Some(updates) = request
+        .get_mut("updates")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for update in updates {
+            if let Some(update) = update.as_object_mut() {
+                update.remove("body");
+            }
+        }
     }
     if let Some(reply) = request
         .get_mut("reply")
@@ -1168,7 +1212,13 @@ struct PanesResponse {
 async fn panes_handler(State(state): State<AppState>) -> impl IntoResponse {
     let result = state.refresh_pane_scan().await;
     Json(PanesResponse {
-        panes: result.panes,
+        panes: crate::tmux::canonical_panes(&result.panes)
+            .into_iter()
+            .map(|mut pane| {
+                pane.session = crate::tmux::base_session_name(&pane.session).to_string();
+                pane
+            })
+            .collect(),
         errors: result.errors,
         fetched_at: result.fetched_at,
     })
@@ -1178,7 +1228,8 @@ async fn works_handler(State(state): State<AppState>) -> Json<WorkSnapshot> {
     let scan = state.refresh_pane_scan().await;
     let agents = state.store.snapshot().await;
     let mut work_store = state.work_store.lock().await;
-    for pane in &scan.panes {
+    // Once per pane, not once per `~view~` listing of it: each upsert writes.
+    for pane in &crate::tmux::canonical_panes(&scan.panes) {
         if let Some((identity, item)) = work::external_item_for_pane(pane, scan.fetched_at) {
             if let Err(error) = work_store.upsert_external_item(identity, item).await {
                 tracing::warn!(%error, "failed to persist discovered external work item");
@@ -1484,8 +1535,10 @@ async fn run_work_control(
             .find(|record| &record.identity == identity)
             .and_then(|record| record.legacy_binding.clone())
     });
-    let candidates = scan
-        .panes
+    // A grouped session lists each pane once per `~view~` member; typing
+    // into every listing would submit the prompt (or Ctrl-C) more than once.
+    let panes = crate::tmux::canonical_panes(&scan.panes);
+    let candidates = panes
         .iter()
         .filter(|pane| {
             identity.as_ref().is_some_and(|identity| {
@@ -1497,7 +1550,7 @@ async fn run_work_control(
                 .as_ref()
                 .is_some_and(|key| pane_matches_execution(pane, key))
         })
-        .filter(|pane| pane.muxa.managed_agent || pane_has_live_agent(pane, &scan.panes, &agents))
+        .filter(|pane| pane.muxa.managed_agent || pane_has_live_agent(pane, &panes, &agents))
         .filter_map(|pane| {
             let backend = state
                 .backends
@@ -1519,9 +1572,9 @@ async fn run_work_control(
         candidates
             .into_iter()
             .map(|(backend, socket, pane)| {
-                let sent = backend.send_text_on(Some(&socket), &pane, &text);
+                let sent = backend.send_prompt_text_on(Some(&socket), &pane, &text);
                 let submitted = if sent && submit {
-                    std::thread::sleep(crate::backend::PROMPT_SUBMIT_GRACE);
+                    std::thread::sleep(crate::backend::prompt_submit_grace(&pane));
                     backend.send_text_on(Some(&socket), &pane, "\r")
                 } else {
                     false
@@ -1800,9 +1853,9 @@ async fn pane_prompt_handler(
     let pane_for_send = pane.clone();
     let (sent, submitted) = tokio::task::spawn_blocking(move || {
         let socket = socket.as_deref();
-        let sent = backend.send_text_on(socket, &pane_for_send, &text);
+        let sent = backend.send_prompt_text_on(socket, &pane_for_send, &text);
         let submitted = if sent && submit {
-            std::thread::sleep(crate::backend::PROMPT_SUBMIT_GRACE);
+            std::thread::sleep(crate::backend::prompt_submit_grace(&pane_for_send));
             backend.send_text_on(socket, &pane_for_send, "\r")
         } else {
             false
@@ -2335,6 +2388,7 @@ struct TimelineSummary {
     days: Vec<TimelineDaySummary>,
     sources: Vec<TimelineSourceSummary>,
     human_presence_secs: u64,
+    overview: Vec<timeline::TimelineOverviewLane>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2441,10 +2495,9 @@ async fn timeline_handler(
     let agents = state.store.snapshot().await;
     let prompt_entries = state.store.recent_prompts(None, 0).await;
     let pane_scan = state.refresh_pane_scan().await;
-    let pane_sessions = pane_scan
-        .panes
-        .iter()
-        .map(|pane| (pane.pane_id.clone(), pane.session.clone()))
+    let pane_sessions = crate::tmux::canonical_panes(&pane_scan.panes)
+        .into_iter()
+        .map(|pane| (pane.pane_id, pane.session))
         .collect::<HashMap<_, _>>();
 
     let built = match build_timeline_projection(TimelineProjectionInput {
@@ -2628,6 +2681,7 @@ fn build_timeline_summary_response(
             })
             .collect(),
         human_presence_secs: projection.human_presence_secs,
+        overview: projection.overview,
     };
     TimelineSummaryResponse {
         generated_at: projection.generated_at,
@@ -3058,6 +3112,7 @@ mod tests {
     ) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -3527,6 +3582,7 @@ mod tests {
         };
         let herdr = scanner::herdr_scan_result(vec![crate::tmux::PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -3559,6 +3615,7 @@ mod tests {
             HostKind::Rmux,
             vec![crate::tmux::PaneInfo {
                 session_group: None,
+                agent_program: None,
                 agent_role: None,
                 agent_alias: None,
                 workspace_id: None,
@@ -3593,6 +3650,7 @@ mod tests {
             kind: HostKind::Rmux,
             panes: vec![crate::tmux::PaneInfo {
                 session_group: None,
+                agent_program: None,
                 agent_role: None,
                 agent_alias: None,
                 workspace_id: None,
@@ -3815,10 +3873,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_search_never_exposes_private_body_matches_to_public_readers() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+        let requests = seed_collaboration_requests(&collaboration).await;
+        let app = router(public_read_state("secret").with_collaboration(collaboration));
+        for (token, total) in [(None, 0), (Some("invalid"), 0), (Some("secret"), 1)] {
+            let mut builder = Request::builder().uri("/api/collaboration?q=round%20one&limit=1");
+            if let Some(token) = token {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response).await["pagination"]["total"], total);
+        }
+        let exact = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/collaboration?id={}", requests[0].id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(exact).await["pagination"]["total"], 1);
+        let reversed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?since=2026-10-14T00:00:00Z&until=2026-10-13T00:00:00Z")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reversed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn public_collaboration_history_redacts_message_details_without_pat() {
         let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
         let requests = seed_collaboration_requests(&collaboration).await;
         let recipient = collaboration_participant("%2", "reviewer-session", "@7");
+        collaboration
+            .update_request(
+                &requests[0].from,
+                &requests[0].id,
+                "progress-secret".to_string(),
+            )
+            .await
+            .unwrap();
         collaboration
             .reply(
                 &recipient,
@@ -3849,10 +3956,13 @@ mod tests {
         let request = &public["requests"][0];
         assert!(request.get("body").is_none());
         assert!(request.get("paths").is_none());
+        assert!(request["updates"][0].get("body").is_none());
+        assert_eq!(request["updates"][0]["sequence"], 1);
         assert!(request["reply"].get("body").is_none());
         assert!(request["reply"].get("artifacts").is_none());
 
         let public_with_pat = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/collaboration?status=completed")
@@ -3863,16 +3973,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(public_with_pat.status(), StatusCode::OK);
+        assert_eq!(
+            public_with_pat.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(
+            public_with_pat.headers()[header::VARY],
+            "Authorization, Cookie"
+        );
         let public_with_pat = body_json(public_with_pat).await;
-        assert_eq!(public_with_pat["details_included"], false);
-        assert!(public_with_pat["requests"][0].get("body").is_none());
-        assert!(public_with_pat["requests"][0]["reply"]
+        assert_eq!(public_with_pat["details_included"], true);
+        assert_eq!(
+            public_with_pat["requests"][0]["updates"][0]["body"],
+            "progress-secret"
+        );
+        assert!(public_with_pat["requests"][0]["body"].is_string());
+        assert_eq!(public_with_pat["requests"][0]["reply"]["body"], "approved");
+        assert_eq!(
+            public_with_pat["requests"][0]["reply"]["artifacts"][0],
+            "artifact-secret"
+        );
+
+        let invalid_pat = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?status=completed")
+                    .header(header::AUTHORIZATION, "Bearer invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let invalid_pat = body_json(invalid_pat).await;
+        assert_eq!(invalid_pat["details_included"], false);
+        assert!(invalid_pat["requests"][0].get("body").is_none());
+        assert!(invalid_pat["requests"][0]["updates"][0]
             .get("body")
             .is_none());
+        assert!(invalid_pat["requests"][0]["reply"].get("body").is_none());
     }
 
     #[tokio::test]
-    async fn collaboration_details_require_token_auth_mode() {
+    async fn collaboration_details_require_operator_enabled_auth_mode() {
         let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
         seed_collaboration_requests(&collaboration).await;
 

@@ -132,13 +132,6 @@ pub fn parse_collab_layout(value: &str) -> Option<CollabLayout> {
 /// hitting `K`/`R`/`c`, short enough not to mask the next interaction.
 const FOOTER_HINT_TTL: Duration = Duration::from_secs(2);
 
-/// Delay between injecting prompt text into a tmux pane and sending the
-/// submit key. Codex's TUI coalesces very fast input bursts as pasted
-/// content; without a small gap, the trailing Enter can be swallowed into
-/// that burst and the prompt stays composed until the user presses Enter
-/// again manually.
-const PROMPT_SUBMIT_GRACE: Duration = muxa::backend::PROMPT_SUBMIT_GRACE;
-
 /// Channel capacity for the wake signal sent from the input loop to the
 /// background refresh task. Capacity 1 is intentional: when the user mashes
 /// `r`, we want extra requests to coalesce into a single pending wake rather
@@ -1546,26 +1539,20 @@ impl Effects for RealEffects {
     }
 
     fn send_prompt(&mut self, pane_id: &str, text: &str) -> std::result::Result<(), String> {
-        send_prompt_to_tmux(
-            pane_id,
-            text,
-            PROMPT_SUBMIT_GRACE,
-            |args| run_status("tmux", args),
-            std::thread::sleep,
-        )
+        send_prompt_to_backend(&muxa::TmuxBackend::new(), None, pane_id, text)
     }
 
     fn send_prompt_to(&mut self, pane: &PaneKey, text: &str) -> std::result::Result<(), String> {
         let endpoint = &pane.window.session.endpoint;
-        if !crate::mux_control::supported(endpoint.host) {
-            return Err(format!("{} pane prompt is not supported", endpoint.host));
-        }
-        send_prompt_to_tmux(
-            pane.pane_id.strip_prefix("rmux:").unwrap_or(&pane.pane_id),
+        let backend = muxa::active_backends()
+            .into_iter()
+            .find(|b| b.kind() == endpoint.host)
+            .ok_or_else(|| format!("{} backend is not active", endpoint.host))?;
+        send_prompt_to_backend(
+            backend.as_ref(),
+            Some(&endpoint.socket),
+            &pane.pane_id,
             text,
-            PROMPT_SUBMIT_GRACE,
-            |args| crate::mux_control::run(endpoint, args),
-            std::thread::sleep,
         )
     }
 
@@ -1714,22 +1701,20 @@ impl Effects for RealEffects {
     }
 }
 
-fn send_prompt_to_tmux<R, S>(
-    pane_id: &str,
+fn send_prompt_to_backend(
+    backend: &dyn muxa::PaneBackend,
+    socket: Option<&str>,
+    pane: &str,
     text: &str,
-    submit_delay: Duration,
-    mut run_tmux: R,
-    mut sleep: S,
-) -> std::result::Result<(), String>
-where
-    R: FnMut(&[&str]) -> std::result::Result<(), String>,
-    S: FnMut(Duration),
-{
-    run_tmux(&["send-keys", "-t", pane_id, "-l", "--", text])?;
-    if !submit_delay.is_zero() {
-        sleep(submit_delay);
+) -> std::result::Result<(), String> {
+    if !backend.send_prompt_text_on(socket, pane, text) {
+        return Err("prompt input failed".into());
     }
-    run_tmux(&["send-keys", "-t", pane_id, "Enter"])
+    std::thread::sleep(muxa::backend::prompt_submit_grace(pane));
+    if !backend.send_text_on(socket, pane, "\r") {
+        return Err("prompt text was sent but Enter failed; do not resend text".into());
+    }
+    Ok(())
 }
 
 /// Result of attempting to spawn-and-pipe to a clipboard helper.
@@ -1904,7 +1889,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  Alt-A          attention-only filter",
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
-        "  m / M / Space  message selected or marked / mailbox / mark agent",
+        "  m / M / Alt-M  message / mailbox / move pane or window; Space marks",
         "  Alt-1/2 · W    screen topology / collab · W is the work table",
         "  v              (in collab) toggle table / sequence history",
         "  i / e          (in mailbox) claim inbox / reply",
@@ -3192,6 +3177,7 @@ pub(crate) struct App {
     /// `Some` while the `a` ask composer is open.
     ask_composer: Option<AskComposer>,
     work_composer: Option<WorkComposer>,
+    agent_move: Option<crate::agent_move::MoveMenu>,
     rename: Option<RenameComposer>,
     ask_panel: AskPanelState,
     ask_entries: Vec<muxa::ask::AskEntry>,
@@ -3479,6 +3465,7 @@ impl App {
             spawn: None,
             ask_composer: None,
             work_composer: None,
+            agent_move: None,
             rename: None,
             ask_panel: AskPanelState::default(),
             ask_entries: Vec::new(),
@@ -3569,12 +3556,15 @@ impl App {
                     || agent.session_id.clone(),
                     |_| agent_pane_display(agent, &self.panes),
                 );
-                let summary = agent
-                    .last_notification
-                    .as_deref()
-                    .or(agent.last_response.as_deref())
-                    .or(agent.last_prompt.as_deref())
-                    .unwrap_or("")
+                let summary = muxa::prompt_headline(
+                    agent
+                        .last_notification
+                        .as_deref()
+                        .or(agent.last_response.as_deref())
+                        .or(agent.last_prompt.as_deref())
+                        .unwrap_or(""),
+                );
+                let summary = summary
                     .lines()
                     .next()
                     .unwrap_or("")
@@ -5553,12 +5543,19 @@ impl<'a> SortContext<'a> {
             display_by_key.insert(s.name.as_str(), s.name.as_str());
             display_by_key.insert(s.session_id.as_str(), s.name.as_str());
         }
+        // One entry per pane per server: a grouped session lists each pane
+        // once per `~view~` member, which must not read as ambiguous.
         let mut pane_by_id: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
         for pane in panes {
-            pane_by_id
-                .entry(pane.pane_id.as_str())
-                .or_default()
-                .push(pane);
+            let entries = pane_by_id.entry(pane.pane_id.as_str()).or_default();
+            match entries.iter_mut().find(|kept| kept.socket == pane.socket) {
+                Some(kept) => {
+                    if muxa::tmux::prefer_listing(pane, *kept) {
+                        *kept = pane;
+                    }
+                }
+                None => entries.push(pane),
+            }
         }
         Self {
             pane_by_id,
@@ -6071,6 +6068,10 @@ fn build_work_rows(
     session_activity: &[SessionActivity],
     sort_keys: &[WatchSortKey],
 ) -> Vec<WatchRow> {
+    // One work row per window, not one per `~view~` member listing it. Jumps
+    // still land in the caller's own view (`resolve_jump_session`).
+    let canonical = muxa::tmux::canonical_panes(panes);
+    let panes = canonical.as_slice();
     let sort_context =
         SortContext::new(panes, sessions, session_activity, OffsetDateTime::now_utc());
 
@@ -6319,7 +6320,14 @@ fn pane_display_on(pane_id: Option<&str>, socket: Option<&str>, panes: &[PaneInf
         // failed to find a pane.
         return "(no pane)".into();
     };
-    let candidates: Vec<_> = panes.iter().filter(|pane| pane.pane_id == id).collect();
+    let candidates = muxa::tmux::canonical_panes(
+        &panes
+            .iter()
+            .filter(|pane| pane.pane_id == id)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let candidates: Vec<&PaneInfo> = candidates.iter().collect();
     let matched = match socket {
         Some(endpoint) => candidates.iter().copied().find(|pane| {
             let host =
@@ -7973,6 +7981,53 @@ pub async fn run(
                 Action::OpenWorkUp => {
                     app.work_composer = Some(WorkComposer::default());
                 }
+                Action::OpenAgentMove => {
+                    let source = selected_move_target(&app);
+                    match source {
+                        Ok((source, scope)) => {
+                            let opened = tokio::task::spawn_blocking(move || {
+                                crate::agent_move::MoveMenu::open_scope(source, scope)
+                            })
+                            .await;
+                            match opened {
+                                Ok(Ok(menu)) => app.agent_move = Some(menu),
+                                Ok(Err(error)) => app
+                                    .set_hint(format!("move unavailable: {error}"), HintLevel::Err),
+                                Err(error) => app
+                                    .set_hint(format!("move unavailable: {error}"), HintLevel::Err),
+                            }
+                        }
+                        Err(error) => app.set_hint(error, HintLevel::Warn),
+                    }
+                }
+                Action::SubmitAgentMove(request) => {
+                    let result =
+                        tokio::task::spawn_blocking(move || crate::agent_move::execute(request))
+                            .await;
+                    match result {
+                        Ok(Ok(outcome)) => {
+                            crate::agent_move::refresh_locations(client, &outcome.pane).await;
+                            app.agent_move = None;
+                            app.set_hint(outcome.message, HintLevel::Ok);
+                            request_refresh(&mut app, &wake_tx);
+                            if outcome.follow {
+                                jump_target = Some(WatchOpenTarget::Moved(outcome.pane));
+                                quit = true;
+                                break;
+                            }
+                        }
+                        error => {
+                            let error = match error {
+                                Ok(Err(error)) => error.to_string(),
+                                Err(error) => error.to_string(),
+                                _ => unreachable!(),
+                            };
+                            if let Some(menu) = app.agent_move.as_mut() {
+                                menu.error = Some(error);
+                            }
+                        }
+                    }
+                }
                 Action::SubmitRename => {
                     finish_rename(&mut app, &wake_tx, apply_rename);
                 }
@@ -8734,6 +8789,60 @@ fn mailbox_anchor(app: &App) -> Option<MailboxAnchor> {
 /// composer cannot open, `m` degrades to the keystrokes-only form against
 /// the selected pane instead of refusing outright, and the reason the
 /// contract modes are missing rides along as a warning hint.
+fn selected_move_target(
+    app: &App,
+) -> std::result::Result<(PaneKey, crate::agent_move::MoveScope), String> {
+    if app.uses_tree() {
+        if let Some(TopologyNodeRef::Session(session)) = app.selected_node() {
+            if session.windows.len() == 1 {
+                let pane = session.windows[0]
+                    .active_pane()
+                    .ok_or("selected window has no live panes")?;
+                return Ok((pane.key.clone(), crate::agent_move::MoveScope::Window));
+            }
+            return Err("select a window or pane to move".into());
+        }
+    }
+    let key = selected_move_key(app)?;
+    let scope =
+        if app.uses_tree() && matches!(app.selected_node(), Some(TopologyNodeRef::Window(_))) {
+            crate::agent_move::MoveScope::Window
+        } else {
+            crate::agent_move::MoveScope::Pane
+        };
+    Ok((key, scope))
+}
+
+fn selected_move_key(app: &App) -> std::result::Result<PaneKey, String> {
+    if app.uses_tree() {
+        if matches!(app.selected_node(), Some(TopologyNodeRef::Session(_))) {
+            return Err("select a window or pane to move".into());
+        }
+        return app
+            .selected_action_pane()
+            .map(|pane| pane.key.clone())
+            .ok_or_else(|| "select an agent pane to move".into());
+    }
+    let pane = app.selected_pane().ok_or("select an agent pane to move")?;
+    let agent = app.selected_agent();
+    let matches: Vec<_> = app
+        .panes
+        .iter()
+        .filter(|p| {
+            p.pane_id == pane
+                && agent
+                    .and_then(|a| a.tmux_socket.as_deref())
+                    .is_none_or(|s| p.socket.as_deref() == Some(s))
+        })
+        .collect();
+    let p = matches.first().ok_or("selected pane is no longer live")?;
+    if matches.iter().any(|other| other.socket != p.socket) {
+        return Err("ambiguous pane endpoint — select it in tree layout".into());
+    }
+    let host = muxa::backend::pane_id_host_kind(&pane).ok_or("unsupported pane backend")?;
+    Ok(PaneKey::from_pane(host, p))
+}
+
 fn open_prompt_only_composer(app: &mut App, reason: String) {
     let pane_key = if app.uses_tree() {
         app.selected_action_pane().map(|pane| pane.key.clone())
@@ -9628,6 +9737,8 @@ fn drain_pending_events() -> io::Result<Vec<Event>> {
 
 #[derive(Debug)]
 pub(crate) enum Action {
+    OpenAgentMove,
+    SubmitAgentMove(crate::agent_move::MoveRequest),
     /// Open the work composer (`w`).
     OpenWorkUp,
     /// Run `muxa work up` for whatever the composer holds.
@@ -9732,6 +9843,7 @@ pub(crate) enum Action {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchOpenTarget {
     Demo,
+    Moved(PaneKey),
     TopologyPane(PaneKey),
     LegacyPane(String),
 }
@@ -9743,6 +9855,10 @@ struct CommandSpec {
 }
 
 const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        command: "move",
+        description: "move selected agent without restarting",
+    },
     CommandSpec {
         command: "refresh",
         description: "refresh data now",
@@ -9871,6 +9987,7 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         "r" | "refresh" => Action::Refresh,
         "o" | "open" | "preview" => Action::OpenPreview,
         "m" | "message" => Action::OpenCollaborationMessage,
+        "move" => Action::OpenAgentMove,
         "split" => {
             app.inspector_split = app.inspector_split.next();
             Action::InspectorSplitChanged
@@ -9936,6 +10053,10 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     // Prompt/command modes keep it literal; table mode treats it as a search
     // query, matching ordinary direct typing.
     if let Event::Paste(pasted) = ev {
+        if let Some(menu) = app.agent_move.as_mut() {
+            menu.paste(&pasted);
+            return Action::None;
+        }
         if let Some(editor) = app.message_skill_editor.as_mut() {
             let pasted = pasted.replace(['\r', '\n'], " ");
             let (text, cursor) = editor.field_mut();
@@ -10010,6 +10131,17 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             // arrows) cancels. Listing them explicitly would invite
             // someone to accidentally drop one — fall through.
             _ => Action::ConfirmCancel,
+        };
+    }
+
+    if let Some(menu) = app.agent_move.as_mut() {
+        return match menu.on_key(KeyEvent::new(code, modifiers)) {
+            crate::agent_move::MenuEvent::None => Action::None,
+            crate::agent_move::MenuEvent::Cancel => {
+                app.agent_move = None;
+                Action::None
+            }
+            crate::agent_move::MenuEvent::Submit(request) => Action::SubmitAgentMove(*request),
         };
     }
 
@@ -10089,6 +10221,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
 
     if modifiers.contains(KeyModifiers::ALT) {
         return match code {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'m') => Action::OpenAgentMove,
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p') => Action::OpenPreview,
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'r') => Action::Refresh,
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') => {
@@ -12168,6 +12301,9 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     render_broadcast_report_overlay(f, chunks[1], app);
     render_work_composer_overlay(f, chunks[1], app);
     render_rename_overlay(f, chunks[1], app);
+    if let Some(menu) = app.agent_move.as_ref() {
+        menu.render(f, centered_rect(85, 80, chunks[1]));
+    }
     if app.ask_composer.is_some() {
         let skills_open = app
             .ask_composer
@@ -14903,12 +15039,14 @@ fn render_inspector(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&
             Span::styled("model ", theme.dim_style()),
             Span::raw(agent.model.as_deref().unwrap_or("—").to_string()),
         ]));
-        let summary = agent
-            .last_notification
-            .as_deref()
-            .or(agent.last_prompt.as_deref())
-            .unwrap_or("—")
-            .replace('\n', " ");
+        let summary = muxa::prompt_headline(
+            agent
+                .last_notification
+                .as_deref()
+                .or(agent.last_prompt.as_deref())
+                .unwrap_or("—"),
+        )
+        .replace('\n', " ");
         lines.push(Line::from(vec![
             Span::styled("latest ", theme.dim_style()),
             Span::raw(truncate_chars(
@@ -15010,13 +15148,15 @@ fn inspector_rule(width: u16, theme: WatchThemeSpec) -> Line<'static> {
 }
 
 fn inspector_agent_summary(agent: &Agent) -> String {
-    agent
-        .last_notification
-        .as_deref()
-        .or(agent.summary_text())
-        .or(agent.last_prompt.as_deref())
-        .unwrap_or("—")
-        .replace('\n', " ")
+    muxa::prompt_headline(
+        agent
+            .last_notification
+            .as_deref()
+            .or(agent.summary_text())
+            .or(agent.last_prompt.as_deref())
+            .unwrap_or("—"),
+    )
+    .replace('\n', " ")
 }
 
 fn inspector_latest_agent<'a>(
@@ -16367,7 +16507,10 @@ fn topology_agent_summary(agent: &Agent, layout: WatchLayout) -> String {
             .as_deref()
             .or(agent.summary_text())
             .or(agent.last_prompt.as_deref())
-            .map_or_else(|| agent.state.to_string(), str::to_string)
+            .map_or_else(
+                || agent.state.to_string(),
+                |text| muxa::prompt_headline(text).into_owned(),
+            )
     };
     let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_chars(&one_line, WINDOW_ACTIVITY_ITEM_CHARS)
@@ -16491,7 +16634,7 @@ fn swarm_topology_agent_summary(agent: &Agent) -> String {
         .as_deref()
         .or(agent.summary_text())
         .or(agent.last_prompt.as_deref())
-        .unwrap_or("waiting")
+        .map_or(std::borrow::Cow::Borrowed("waiting"), muxa::prompt_headline)
         .replace('\n', " ");
     parts.push(activity);
     parts.join(" · ")
@@ -17794,6 +17937,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&[Tr
         Span::raw(" preview  "),
         Span::styled(" m ", theme.action_badge()),
         Span::raw(" message  "),
+        Span::styled(" Alt-M ", theme.action_badge()),
+        Span::raw(" move  "),
         Span::styled(" M ", theme.action_badge()),
         Span::raw(" mailbox  "),
         Span::styled(" ? ", theme.key_badge()),
@@ -18562,6 +18707,7 @@ mod tests {
     fn fake_pane(pane: &str, session: &str, window: u32, pane_idx: u32, cmd: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -18595,6 +18741,7 @@ mod tests {
     ) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -18814,6 +18961,38 @@ mod tests {
             Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT)),
             app,
         )
+    }
+
+    #[test]
+    fn move_scope_follows_the_selected_window_or_pane() {
+        let (agents, panes) = two_window_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let session = app.topology.sessions[0].key.clone();
+        let window = app.topology.sessions[0].windows[0].key.clone();
+        let pane = app.topology.sessions[0].windows[0].panes[0].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Window(window.clone()));
+        let (key, scope) = selected_move_target(&app).unwrap();
+        assert_eq!(scope, crate::agent_move::MoveScope::Window);
+        assert_eq!(key.window, window);
+        select_tree_key(&mut app, &TopologyNodeKey::Pane(pane.clone()));
+        assert_eq!(
+            selected_move_target(&app).unwrap(),
+            (pane, crate::agent_move::MoveScope::Pane)
+        );
+        select_tree_key(&mut app, &TopologyNodeKey::Session(session));
+        assert!(selected_move_target(&app).is_err());
+    }
+
+    #[test]
+    fn a_compacted_single_window_row_moves_the_whole_window() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let session = app.topology.sessions[0].key.clone();
+        let window = app.topology.sessions[0].windows[0].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Session(session));
+        let (key, scope) = selected_move_target(&app).unwrap();
+        assert_eq!(scope, crate::agent_move::MoveScope::Window);
+        assert_eq!(key.window, window);
     }
 
     #[test]
@@ -20705,6 +20884,14 @@ mod tests {
         assert!(matches!(
             key_action(&mut app, 'M'),
             Action::OpenCollaborationMailbox
+        ));
+        assert!(matches!(
+            alt_key_action(&mut app, 'm'),
+            Action::OpenAgentMove
+        ));
+        assert!(matches!(
+            alt_key_action(&mut app, 'M'),
+            Action::OpenAgentMove
         ));
         assert!(matches!(
             key_action(&mut app, 'b'),
@@ -24306,6 +24493,7 @@ sort = ["state"]
     fn pane_display_resolves_against_cached_panes() {
         let panes = vec![PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -26757,6 +26945,8 @@ sort = ["state"]
             // encounter here is treated as "no-op" for the existing
             // preview-suite assertions.
             Action::None
+            | Action::OpenAgentMove
+            | Action::SubmitAgentMove(_)
             | Action::Quit
             | Action::TryDemo
             | Action::Refresh
@@ -28239,7 +28429,9 @@ sort = ["state"]
         assert!(body.contains("Alt-A          attention-only filter"));
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
-        assert!(body.contains("m / M / Space  message selected or marked / mailbox / mark agent"));
+        assert!(
+            body.contains("m / M / Alt-M  message / mailbox / move pane or window; Space marks")
+        );
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains(
             "a/A · Ctrl-E/n ask / conversations · new mode/draft · Enter read · d/D delete"
@@ -28398,57 +28590,6 @@ sort = ["state"]
             }
             other => panic!("expected Err, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn tmux_prompt_send_waits_before_submit_key() {
-        let mut calls: Vec<Vec<String>> = Vec::new();
-        let mut sleeps = Vec::new();
-
-        let result = send_prompt_to_tmux(
-            "%42",
-            "hello",
-            Duration::from_millis(120),
-            |args| {
-                calls.push(args.iter().map(|arg| (*arg).to_string()).collect());
-                Ok(())
-            },
-            |delay| sleeps.push(delay),
-        );
-
-        assert!(result.is_ok());
-        assert_eq!(
-            calls,
-            vec![
-                vec!["send-keys", "-t", "%42", "-l", "--", "hello"],
-                vec!["send-keys", "-t", "%42", "Enter"],
-            ]
-        );
-        assert_eq!(sleeps, vec![Duration::from_millis(120)]);
-    }
-
-    #[test]
-    fn tmux_prompt_send_skips_submit_when_literal_input_fails() {
-        let mut calls: Vec<Vec<String>> = Vec::new();
-        let mut sleeps = Vec::new();
-
-        let result = send_prompt_to_tmux(
-            "%42",
-            "hello",
-            Duration::from_millis(120),
-            |args| {
-                calls.push(args.iter().map(|arg| (*arg).to_string()).collect());
-                Err("tmux exited with 1".into())
-            },
-            |delay| sleeps.push(delay),
-        );
-
-        assert_eq!(result.unwrap_err(), "tmux exited with 1");
-        assert_eq!(
-            calls,
-            vec![vec!["send-keys", "-t", "%42", "-l", "--", "hello"]]
-        );
-        assert!(sleeps.is_empty());
     }
 
     #[test]

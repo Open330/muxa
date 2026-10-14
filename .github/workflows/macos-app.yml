@@ -69,6 +69,23 @@ jobs:
             "$RUNNER_TEMP/xcodebuild.log" | sort -u | head -200 || true
           exit "$status"
 
+      # The release builds the Release configuration (whole-module), whose
+      # actor-isolation checking is stricter than Debug's: v0.8.57 passed
+      # this job and still failed the release. Compile it here too.
+      - name: Build the Release configuration
+        working-directory: apps/muxa-macos
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Muxa.xcodeproj \
+            -scheme Muxa \
+            -configuration Release \
+            -derivedDataPath .build/DerivedDataRelease \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            build > "$RUNNER_TEMP/xcodebuild-release.log" 2>&1 && status=0 || status=$?
+          grep -E ': (error|warning): |\*\* BUILD ' "$RUNNER_TEMP/xcodebuild-release.log" | sort -u | head -200 || true
+          exit "$status"
       # The build extracts every new string into the catalog; one without a
       # Korean value means a translation was forgotten.
       - name: Check translations

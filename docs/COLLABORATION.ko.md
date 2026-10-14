@@ -12,8 +12,7 @@ request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 
   그 pane으로 돌아가 agent를 깨웁니다.
 - `muxa watch`는 agent가 아니라 **operator console**입니다. watch를 연 pane에 무엇이
   들어 있든, 발신자는 키보드 앞의 사람입니다.
-- agent를 선택하고 `m`으로 보내며 `M`으로 mailbox를 엽니다(`b`는 alias로
-  유지됩니다).
+- agent를 선택하고 `m`으로 보내며 `M`으로 mailbox를 엽니다.
 
 즉 agent 간 협업은 같은 window에 agent 둘을 두고 MCP로 주고받는 흐름이고, 사람의
 흐름은 그와 별개로 준비가 필요 없습니다. 어디서든 `prefix+s`를 누르고, 행을
@@ -193,7 +192,7 @@ muxa msg inbox
 muxa msg reply req_... "검토 완료: ..." --status completed
 
 # 발신 agent
-muxa msg wait req_... --timeout-secs 300
+muxa msg wait req_... --timeout-secs 300 --body
 
 # claim하지 않고 request/reply lifecycle 확인
 muxa msg list --mailbox sent
@@ -210,6 +209,20 @@ muxa msg list --scope all --since 7d --work CAL-7345 --kind review \
 # 아직 상대가 claim하지 않은 요청 취소
 muxa msg cancel req_...
 ```
+
+`muxa msg wait` 기본 출력은 전달 상태와 최종 답장 수신 여부를 나타내는
+간결한 JSON입니다. 작업 성공을 판정하지 않습니다. 대기 시간 초과는
+`reason: timeout` JSON과 종료 코드 2로 구분하며, 작업 결과를 판정하지 않습니다.
+`--full`도 시간 초과에는 비정상 종료하고, 전달 오류는 별도로 비정상 종료합니다.
+`--body`는 최종 답장 본문만 출력하고, `--body --output /tmp/reply.txt`는
+셸에서 JSON을 파싱하지 않고 파일에 직접 저장합니다. 최종 답장이 없으면
+`--body`도 시간 초과에는 본문이나 파일을 쓰지 않고 종료 코드 2를 반환합니다.
+답장 없이 닫힌 요청에는 오류를 반환합니다. `--full`은 기존 요청 전체 JSON을 반환합니다.
+본문의 `pending`/`timeout` 단어로 완료 여부를 판단하거나 JSON을 셸 `echo`에
+통과시키지 마세요. JSON 이스케이프가 변환될 수 있습니다. 직접 파일로 저장하거나
+명령의 표준출력을 JSON 파서에 바로 연결하세요. 진행 보고와 최종 답장은 구분하며,
+작업 결과는 답장 작성자가 선언하고 요청자가 검증합니다.
+
 
 `send`, `reply`, `cancel`은 한 줄 영수증만 출력하고, `list`와 `inbox`는 각
 요청과 (도착했다면) 그 답장을 함께 보여줍니다. 저장된 레코드 전체가 필요하면
@@ -240,7 +253,7 @@ Work 필드를 채우고 가능하면 execution binding으로 run id를 만들�
 keyword를 받습니다.
 
 tracked agent pane에서 `prefix+s`로 `muxa watch`를 열면 같은 lifecycle을 TUI로
-사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `M`/`b`는 claim
+사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `M`은 claim
 없는 mailbox 이력을 열며, `i`는 inbox를 claim하고 `e`는 응답합니다. window 행의
 `M`은 room 전체를, session 행에서는 모든 room을 window별로 모아 보여주며 두
 aggregate view는 read-only입니다. collaboration 화면은 `v` 또는

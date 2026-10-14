@@ -55,9 +55,10 @@ bound to loopback and configure the public origin as described below.
 `auth = "token"` protects all API endpoints. `auth = "public_read"` leaves
 GET/SSE endpoints public but always requires the bearer token for write/control
 actions. `auth = "none"` leaves reads public and disables writes entirely.
-Collaboration bodies and attached details are stricter: they are returned only
-in `auth = "token"` mode with a valid bearer. `public_read` and `none` expose a
-redacted topology/status summary even if a PAT is supplied.
+Collaboration bodies and attached details require an authenticated operator
+(valid PAT or operator login) in `token` or `public_read` mode. Anonymous users
+and signed-in viewers receive a redacted topology/status summary. `none` mode
+always redacts details. History responses use `Cache-Control: private, no-store`.
 Static routes are public in every mode — see "Why the HTML is public" below.
 Fleet routes always expose the in-process `local` node. `[fleet] enabled =
 true` adds outbound SSH hosts; reads reuse the daemon's per-host cache and
@@ -286,15 +287,16 @@ Selecting an entry sets the page **scope**:
   a pane that has since closed by the session name the message recorded). A
   participant without a pane — the operator console, an agent outside tmux —
   appears only through a message it exchanged with an in-scope participant.
-  The panel header reads **scoped to <name> · clear**. The collaboration API
-  has no session filter (its room filter is a single window), so this is done
-  in the browser over the loaded range; a managed workspace with no live
-  session keeps the messages filed under its Work.
+  The panel header reads **scoped to <name> · clear**. Session and socket
+  filters are applied by the API before counting and pagination; a managed
+  workspace with no live session keeps the messages filed under its Work.
+  Rooms are grouped under their durable session, and selecting a group scopes
+  the graph and sequence to it.
 
 Picking a session in the Timeline filter selects its rail entry too, and **all
 workspaces** (or ∅, or **clear** in the Collaboration header) clears the scope.
-Selecting a session, window or pane in the navigator does *not* change the
-scope; it only chooses what the navigator's detail side and the pane drawer
+Selecting a session in the navigator also changes the page scope. Selecting
+a window or pane only chooses what the navigator's detail side and pane drawer
 show. Viewers see the same rail; it carries only metadata.
 
 Scope and detail selection live in separate URL fragment parameters, so a link
@@ -360,10 +362,12 @@ The toolbar filters by time range, exact room, Work, thread, kind, and status.
 The API form is:
 
 ```text
-GET /api/collaboration?since=7d&workspace=callabo&work=CAL-7345&thread=thread-id&parent=req-id&kind=review&status=completed&limit=100&cursor=...
+GET /api/collaboration?since=7d&session=callabo&socket=%2Ftmp%2Frmux%2Fdefault&workspace=callabo&work=CAL-7345&thread=thread-id&parent=req-id&kind=review&status=completed&limit=100&cursor=...
 ```
 
-All supplied filters are conjunctive. `work_id`, `workspace_id`, `thread_id`,
+All supplied filters are conjunctive. `session` matches the durable tmux
+session name (including its numeric `~view~` aliases); `socket` pins its exact
+server endpoint. These filters apply before counts and pagination. `work_id`, `workspace_id`, `thread_id`,
 and `parent_request_id` are accepted as aliases for their short names. `room`
 is a URL-encoded JSON `RoomId` and matches host, socket, and window exactly.
 `limit` defaults to 100 and must be 1–500. Pagination is newest-first keyset
@@ -373,12 +377,30 @@ it or replace it with an offset. The response contains `generated_at`,
 `pagination { total, limit, has_more, next_cursor }`. Invalid filters return
 `400`; a disabled collaboration subsystem returns `503`.
 
-When `details_included` is false, request/reply bodies, provenance, paths,
+When `details_included` is false, request/reply/update bodies, provenance, paths,
 generic artifacts, links, and AIR references are omitted. Participant, room,
 thread/parent, Work/Run, kind, status, timestamps, and counts remain available
-for a useful summary graph. Use `auth = "token"` for private full-detail
-history; a PAT cannot unlock details while the server is configured as
-`public_read`.
+for a useful summary graph. In the Sessions panel, use the Collaboration tab
+and select a session or window to filter its history. Unlock details with the
+existing dashboard PAT control or sign in as an operator to read requests,
+replies, and artifacts. Locking access immediately clears loaded details.
+
+Collaboration opens as a message list beside a detail reader. The list shows
+participants, status, timestamps, response latency, update counts, and body
+previews for authenticated operators. Search filters retained history on the server before pagination. Public and
+viewer searches cover visible metadata; authenticated operators can also
+search request, reply, and progress bodies. Counts reflect all matching rows,
+while summaries of loaded pages are labeled when older pages remain. Custom
+period controls accept a start and end time. Graph and Sequence
+are separate views; the graph supports zoom and fit in both dimensions.
+Drag the separators (or use arrow keys while focused) to resize the navigator,
+list/detail split, and panel height. Sizes persist across reloads. Expand fills
+the viewport; restore or Escape returns to the normal layout. Narrow screens
+stack the list and detail reader and hide the desktop height handle.
+Unchanged refreshes preserve text selection and reading position. Thread and
+parent buttons open related history across rooms, and message links reopen an
+exact retained request even outside the default period. Copy-link strips all
+other URL parameters; copy-conversation is available to authenticated operators.
 
 ## Sessions, windows and panes
 
@@ -415,8 +437,8 @@ the top of the page is organized the same way.
 
 While the [workspace rail](#workspace-rail) scopes the page to a session, the
 tree shows only that session; **show all sessions** lists every session again
-without changing the scope. Selecting a session or window here only chooses
-what this panel shows; it never rescopes the page. The selection is kept in
+without changing the scope. Selecting a session also scopes diagnostics to
+that session; selecting a window remains a detail selection. The selection is kept in
 the URL fragment: `#session=<name>`, `#window=<@id>` (with `&socket=<socket>`
 when more than one tmux server is running) and `#pane=<id>` for an open
 drawer, next to the rail's `#workspace=`, so a link restores all of them.
@@ -528,6 +550,16 @@ remains false. This keeps provider sync and operator-authored workflow state
 independent.
 
 ## Timeline
+
+The all-session overview places activity on the same wall-clock axis as the
+selected session timeline. Overlapping agent intervals are unioned into rows
+for working, waiting, error, idle, and starting; interaction and tmux presence
+have their own rows. Gaps remain empty. Totals still report summed agent time
+and the shared `muxa stats` attribution, so simultaneous agents can accumulate
+more work time than the width of a wall-clock interval.
+
+Numeric client-view sessions are folded into their base session in the
+workspace rail, pane inventory, diagnostics, and retained session filters.
 
 The timeline panel calls `/api/timeline?since=7d` by default and can switch
 to `24h`, `today`, `last week`, `month`, `last month`, `30d`, `12w`, or a clicked `YYYY-MM-DD` calendar day in the

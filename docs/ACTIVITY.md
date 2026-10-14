@@ -1,7 +1,7 @@
 # Activity Ledger
 
 `muxa` keeps duration data in `activity.ndjson`. This is the source for
-`muxa stats`, `muxa report`, and the raw `muxa activity` query command.
+`muxa stats`, `muxa stats report`, and the raw `muxa stats activity` query command.
 
 ## Quick Views
 
@@ -10,14 +10,14 @@ muxa stats --since today
 muxa stats --since yesterday --group-by session
 muxa stats --since week --group-by project
 muxa stats --since month --exclude-session 'monitor*'
-muxa report --since week
-muxa report --since last-month --exclude-pane '%42'
+muxa stats report --since week
+muxa stats report --since last-month --exclude-pane '%42'
 muxa timeline --since today --session main
-muxa activity --since today --type human
-muxa activity --since today --type agent --format json
+muxa stats activity --since today --type human
+muxa stats activity --since today --type agent --format json
 ```
 
-Session groups in `muxa stats` and `muxa report` fold generated views such as
+Session groups in `muxa stats` and `muxa stats report` fold generated views such as
 `callabo~view~123` into `callabo`, including retained history. Grouping happens
 before sorting and limiting rows. Overlapping human-presence intervals and
 ACT/WACT time are not counted twice for those views; agent work remains additive.
@@ -80,7 +80,7 @@ triggers:
 - **tmux input** — the daemon samples each client's `client_activity` and records
   a `tmux_input` interaction whenever it advances (a keypress or scroll), so
   *reading* a session while attached is credited, not just typing. (Visible via
-  `muxa activity --type human`.)
+  `muxa stats activity --type human`.)
 - **Thinking** — time present while an agent is blocked on you
   (`WaitingInput`/`WaitingChoice`/`Error`): reading its question and deciding.
 
@@ -115,6 +115,43 @@ The table closes with a `TOTAL` footer row. It holds the grand total across
 every group and reflects all data even when `--limit` truncates the rows
 above it.
 
+## Stats Timeline
+
+Add `--timeline` to `muxa stats` to see *when* each project had an agent
+working, drawn on a real clock axis:
+
+```bash
+muxa stats --timeline                          # last 7 days, one block per day
+muxa stats --timeline --since today --hours 9-24
+muxa stats --timeline --layout range --since month --limit 0
+muxa stats --timeline --group-by session
+```
+
+Each row is one project (the agent's working directory name). With
+`--group-by session` or `agent`, rows are tmux sessions or agent kinds instead.
+A row is the wall-clock union of that group's WORK spans, so two agents working
+in one project at once paint one bar instead of counting twice. A cell's shade
+(`░▒▓█`) shows how much of it was covered. Background tasks such as dev
+servers are left out: they stay in Working for days. Both rules make a row's
+time differ from the `WORK` column, which sums every agent.
+
+- `--layout day` (default) prints one block per local day on a shared hour
+  axis, with projects in the order you started them. `--limit` caps rows per
+  day.
+- `--layout range` gives each project one row across the whole range, ranked
+  by work time, so a month of projects fits on one screen.
+- `--hours START-END` fixes the day layout's hour window; by default it fits
+  the recorded work.
+- `--cell MINUTES` fixes the cell width and must divide a day (5, 10, 15, 30,
+  60, 120, ...); by default it is the finest that fits the terminal. If even
+  day-wide cells do not fit, the range layout shows the most recent days.
+
+The timeline is table output only; it cannot be combined with `--graph`,
+`--format`, `--json`, `--markdown`, `--sort` or `--reverse`.
+
+`muxa timeline` (below) is the interactive per-agent view; `stats --timeline`
+is the per-project summary.
+
 ## Timeline
 
 `muxa timeline` renders the same duration source as an interactive TUI.
@@ -142,7 +179,7 @@ details, see [docs/TIMELINE.md](TIMELINE.md).
 
 ## Ledger Types
 
-`muxa activity --type ...` filters the raw ledger:
+`muxa stats activity --type ...` filters the raw ledger:
 
 | Type | Meaning |
 | ---- | ------- |

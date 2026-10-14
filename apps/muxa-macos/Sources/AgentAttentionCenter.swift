@@ -27,7 +27,7 @@ enum MuxaUnreadRules {
     /// it is idle after running a turn. A freshly started agent that has
     /// never been prompted is idle too, but has not finished anything.
     static func isNotable(_ agent: MuxaAgent) -> Bool {
-        if MuxaAttention.states.contains(agent.state) { return true }
+        if agent.status.needsAttention { return true }
         return agent.state == "idle" && agent.lastPromptAt != nil
     }
 
@@ -362,7 +362,7 @@ final class MuxaAgentAttentionCenter: ObservableObject {
             }
         }
         var needing = Set(unread.map(Self.key))
-        for hosted in snapshot.hostedAgents where MuxaAttention.states.contains(hosted.agent.state) {
+        for hosted in snapshot.hostedAgents where hosted.agent.status.needsAttention {
             needing.insert(Self.paneIdentity(for: hosted).map(Self.key) ?? "agent:\(hosted.id)")
         }
         if unreadPanes != unread { unreadPanes = unread }
@@ -377,6 +377,10 @@ final class MuxaAgentAttentionCenter: ObservableObject {
             current[hosted.id] = state
             guard let previous = previousStates[hosted.id],
                   let event = MuxaNotificationRules.event(from: previous, to: state) else { continue }
+            // A turn stopped by a rate limit reports `error`, but there is
+            // nothing to fix: the rate-limit automation, not this alert,
+            // handles it.
+            if case .attention = event, hosted.agent.status.isLimited { continue }
             let settings = settings()
             switch event {
             case .attention: guard settings.notifyAttention else { continue }

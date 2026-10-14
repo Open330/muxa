@@ -89,7 +89,7 @@
             <button class="collapse-btn" type="button" data-collapse-target="topology-panel" aria-expanded="true" aria-controls="topology-content" title="Collapse sessions">
               <span aria-hidden="true">⌄</span>
             </button>
-            <h2>Sessions</h2>
+            <h2>Sessions &amp; collaboration</h2>
             <span class="panel-meta" id="topology-meta"></span>
           </div>
           <input
@@ -109,8 +109,119 @@
               <li class="empty-block">loading…</li>
             </ul>
           </nav>
-          <section class="topology-detail" id="topology-detail" aria-label="Selection"></section>
+          <div class="layout-resizer navigator-resizer" id="collaboration-nav-resize" role="separator" aria-label="Resize session navigator" aria-orientation="vertical" tabindex="0"></div>
+          <div class="session-selection">
+            <div class="session-view-tabs" role="tablist" aria-label="Session views">
+              <button type="button" id="session-tab-execution" role="tab" data-session-view="execution" aria-selected="true" aria-controls="topology-detail">Execution</button>
+              <button type="button" id="session-tab-collaboration" role="tab" data-session-view="collaboration" aria-selected="false" aria-controls="collaboration-panel" tabindex="-1">Collaboration</button>
+            </div>
+            <section class="topology-detail" id="topology-detail" role="tabpanel" aria-labelledby="session-tab-execution" aria-label="Selection"></section>
+            <section class="panel collaboration-panel" id="collaboration-panel" role="tabpanel" aria-labelledby="session-tab-collaboration" hidden>
+              <div class="panel-header">
+                <div class="panel-title">
+                  <h2>Collaboration</h2>
+                  <span class="panel-meta" id="collaboration-meta"></span>
+                  <span class="scope-chip" id="collaboration-scope" hidden>scoped to <b id="collaboration-scope-name"></b> · <button class="scope-chip-clear" type="button" id="collaboration-scope-clear" aria-label="Clear workspace scope: show all workspaces">clear</button></span>
+                </div>
+                <div class="collaboration-header-actions">
+                  <button class="control-btn" type="button" id="collaboration-fullscreen" aria-pressed="false">expand</button>
+                  <button class="control-btn" type="button" id="collaboration-refresh">refresh</button>
+                </div>
+              </div>
+              <div class="panel-content collaboration-content" id="collaboration-content">
+                <div class="collaboration-toolbar filters">
+                  <label><span class="filter-label">range</span>
+                    <select id="collaboration-range" class="select">
+                      <option value="1h">1 hour</option>
+                      <option value="24h">24 hours</option>
+                      <option value="7d" selected>7 days</option>
+                      <option value="30d">30 days</option>
+                      <option value="all">all retained</option><option value="custom">custom period</option>
+                    </select>
+                  </label>
+                  <label><span class="filter-label">room</span>
+                    <select id="collaboration-room" class="select">
+                      <option value="">all rooms</option>
+                    </select>
+                  </label>
+                  <label><span class="filter-label">work</span>
+                    <input id="collaboration-work" class="collaboration-filter-input" type="search" list="collaboration-work-options" placeholder="all" autocomplete="off">
+                    <datalist id="collaboration-work-options"></datalist>
+                  </label>
+                  <label><span class="filter-label">thread</span>
+                    <input id="collaboration-thread" class="collaboration-filter-input" type="search" list="collaboration-thread-options" placeholder="all" autocomplete="off">
+                    <datalist id="collaboration-thread-options"></datalist>
+                  </label>
+                  <label><span class="filter-label">kind</span>
+                    <select id="collaboration-kind" class="select">
+                      <option value="">all</option>
+                      <option value="review">review</option>
+                      <option value="question">question</option>
+                      <option value="task">task</option>
+                      <option value="notice">notice</option>
+                    </select>
+                  </label>
+                  <label><span class="filter-label">status</span>
+                    <select id="collaboration-status" class="select">
+                      <option value="">all</option>
+                      <option value="queued">queued</option>
+                      <option value="claimed">claimed</option>
+                      <option value="completed">completed</option>
+                      <option value="blocked">blocked</option>
+                      <option value="declined">declined</option>
+                      <option value="failed">failed</option>
+                      <option value="expired">expired</option>
+                      <option value="cancelled">cancelled</option>
+                    </select>
+                  </label>
+                </div>
+                <div id="collaboration-custom-period" class="collaboration-custom-period" hidden><label>from <input id="collaboration-since" type="datetime-local"></label><label>to <input id="collaboration-until" type="datetime-local"></label><span id="collaboration-period-error" role="status"></span></div>
+                <details class="collaboration-room-disclosure"><summary>Sessions &amp; rooms</summary><div class="collaboration-rooms" id="collaboration-rooms" aria-label="Rooms"></div></details>
+                <div id="collaboration-summary" class="collaboration-summary" aria-label="Loaded history summary"></div>
+                <div class="collaboration-view-controls">
+                  <div role="tablist" aria-label="Collaboration views">
+                    <button class="control-btn" id="collaboration-tab-messages" role="tab" data-collaboration-view="messages" aria-controls="collaboration-messages" aria-selected="true">Messages</button>
+                    <button class="control-btn" id="collaboration-tab-graph" role="tab" data-collaboration-view="graph" aria-controls="collaboration-graph-pane" aria-selected="false" tabindex="-1">Graph</button>
+                    <button class="control-btn" id="collaboration-tab-sequence" role="tab" data-collaboration-view="sequence" aria-controls="collaboration-sequence-pane" aria-selected="false" tabindex="-1">Sequence</button>
+                  </div>
+                  <input id="collaboration-search" type="search" class="collaboration-search" placeholder="Search retained history…" aria-label="Search retained collaboration history">
+                  <button class="control-btn" type="button" id="collaboration-clear-selection" hidden>show all</button>
+                </div>
+                <div class="collaboration-reader" id="collaboration-reader">
+                  <div class="collaboration-history-pane">
+                    <div class="collaboration-messages" id="collaboration-messages" role="tabpanel" aria-labelledby="collaboration-tab-messages"></div>
+                    <section class="collaboration-graph-pane" id="collaboration-graph-pane" role="tabpanel" aria-labelledby="collaboration-tab-graph" hidden>
+                      <div class="collaboration-subhead">
+                        <span>request → · reply ⇢</span>
+                        <div class="collaboration-zoom-controls">
+                          <button class="control-btn" type="button" id="collaboration-zoom-out" aria-label="Zoom graph out">−</button>
+                          <span id="collaboration-zoom-label">100%</span>
+                          <button class="control-btn" type="button" id="collaboration-zoom-in" aria-label="Zoom graph in">+</button>
+                          <button class="control-btn" type="button" id="collaboration-zoom-fit">fit</button>
+                        </div>
+                      </div>
+                      <div class="collaboration-canvas" id="collaboration-graph"></div>
+                    </section>
+                    <section class="collaboration-sequence-pane" id="collaboration-sequence-pane" role="tabpanel" aria-labelledby="collaboration-tab-sequence" hidden>
+                      <div class="collaboration-subhead"><span>Sequence</span><small id="collaboration-sequence-meta"></small></div>
+                      <div class="collaboration-sequence" id="collaboration-sequence"></div>
+                    </section>
+                  </div>
+                  <div class="layout-resizer" id="collaboration-reader-resize" role="separator" aria-label="Resize message list and detail" aria-orientation="vertical" tabindex="0"></div>
+                  <div class="collaboration-detail-pane">
+                    <div class="collaboration-detail-empty" id="collaboration-detail-empty">Select a message to read its request, updates, reply, and artifacts.</div>
+                    <div class="collaboration-detail" id="collaboration-detail" hidden></div>
+                  </div>
+                </div>
+                <div class="collaboration-pagination">
+                  <span id="collaboration-page-meta"></span>
+                  <button class="control-btn" type="button" id="collaboration-load-more" hidden>load older messages</button>
+                </div>
+              </div>
+            </section>
+          </div>
         </div>
+        <div class="layout-resizer panel-height-resizer" id="collaboration-height-resize" role="separator" aria-label="Resize collaboration panel height" aria-orientation="horizontal" tabindex="0" hidden><span>drag to resize</span></div>
       </section>
 
       <section class="panel work-items-panel" id="work-items-panel">
@@ -168,94 +279,6 @@
           <span>Execution diagnostics</span>
           <small>secondary topology and retained activity</small>
         </div>
-      <section class="panel collaboration-panel" id="collaboration-panel" data-panel="collaboration">
-        <div class="panel-header">
-          <div class="panel-title">
-            <button class="collapse-btn" type="button" data-collapse-target="collaboration-panel" aria-expanded="true" aria-controls="collaboration-content" title="Collapse collaboration graph">
-              <span aria-hidden="true">⌄</span>
-            </button>
-            <h2>Collaboration</h2>
-            <span class="panel-meta" id="collaboration-meta"></span>
-            <span class="scope-chip" id="collaboration-scope" hidden>scoped to <b id="collaboration-scope-name"></b> · <button class="scope-chip-clear" type="button" id="collaboration-scope-clear" aria-label="Clear workspace scope: show all workspaces">clear</button></span>
-          </div>
-          <button class="control-btn" type="button" id="collaboration-refresh">refresh</button>
-        </div>
-        <div class="panel-content collaboration-content" id="collaboration-content">
-          <div class="collaboration-toolbar filters">
-            <label><span class="filter-label">range</span>
-              <select id="collaboration-range" class="select">
-                <option value="1h">1 hour</option>
-                <option value="24h">24 hours</option>
-                <option value="7d" selected>7 days</option>
-                <option value="30d">30 days</option>
-                <option value="">all retained</option>
-              </select>
-            </label>
-            <label><span class="filter-label">room</span>
-              <select id="collaboration-room" class="select">
-                <option value="">all rooms</option>
-              </select>
-            </label>
-            <label><span class="filter-label">work</span>
-              <input id="collaboration-work" class="collaboration-filter-input" type="search" list="collaboration-work-options" placeholder="all" autocomplete="off">
-              <datalist id="collaboration-work-options"></datalist>
-            </label>
-            <label><span class="filter-label">thread</span>
-              <input id="collaboration-thread" class="collaboration-filter-input" type="search" list="collaboration-thread-options" placeholder="all" autocomplete="off">
-              <datalist id="collaboration-thread-options"></datalist>
-            </label>
-            <label><span class="filter-label">kind</span>
-              <select id="collaboration-kind" class="select">
-                <option value="">all</option>
-                <option value="review">review</option>
-                <option value="question">question</option>
-                <option value="task">task</option>
-                <option value="notice">notice</option>
-              </select>
-            </label>
-            <label><span class="filter-label">status</span>
-              <select id="collaboration-status" class="select">
-                <option value="">all</option>
-                <option value="queued">queued</option>
-                <option value="claimed">claimed</option>
-                <option value="completed">completed</option>
-                <option value="blocked">blocked</option>
-                <option value="declined">declined</option>
-                <option value="failed">failed</option>
-                <option value="expired">expired</option>
-                <option value="cancelled">cancelled</option>
-              </select>
-            </label>
-          </div>
-          <div class="collaboration-rooms" id="collaboration-rooms" aria-label="Rooms"></div>
-          <div class="collaboration-split">
-            <section class="collaboration-graph-pane" aria-labelledby="collaboration-graph-title">
-              <div class="collaboration-subhead">
-                <span id="collaboration-graph-title">Participant graph</span>
-                <small>request → · reply ⇢</small>
-              </div>
-              <div class="collaboration-canvas" id="collaboration-graph">
-                <div class="empty-block">loading…</div>
-              </div>
-            </section>
-            <section class="collaboration-sequence-pane" aria-labelledby="collaboration-sequence-title">
-              <div class="collaboration-subhead">
-                <span id="collaboration-sequence-title">Sequence</span>
-                <small id="collaboration-sequence-meta">select an edge or room</small>
-                <button class="control-btn" type="button" id="collaboration-clear-selection" hidden>show all</button>
-              </div>
-              <div class="collaboration-sequence" id="collaboration-sequence">
-                <div class="empty-block">loading…</div>
-              </div>
-              <div class="collaboration-detail" id="collaboration-detail" hidden></div>
-            </section>
-          </div>
-          <div class="collaboration-pagination">
-            <span id="collaboration-page-meta"></span>
-            <button class="control-btn" type="button" id="collaboration-load-more" hidden>load older messages</button>
-          </div>
-        </div>
-      </section>
       <section class="panel timeline-panel" id="timeline-panel" data-panel="timeline">
         <div class="panel-header">
           <div class="panel-title">

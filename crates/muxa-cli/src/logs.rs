@@ -1,4 +1,4 @@
-//! `muxa logs` — tail muxad's stdout/stderr without remembering paths.
+//! `muxa daemon logs` — tail muxad's stdout/stderr without remembering paths.
 //!
 //! Default sources are `/tmp/muxad.log` and `/tmp/muxad.err` (the paths the
 //! macOS launchd plist redirects to, and where the install wizard's
@@ -228,8 +228,8 @@ async fn follow_files(paths: &[PathBuf], filter: Option<&str>, colored: bool) ->
                         //
                         // KNOWN LIMITATION: if the file is rotated (moved
                         // and replaced) we keep following the *old* inode.
-                        // Re-running `muxa logs` picks up the new file.
-                        eprintln!("muxa logs: read error on {}: {e}", path.display());
+                        // Re-running `muxa daemon logs` picks up the new file.
+                        eprintln!("muxa daemon logs: read error on {}: {e}", path.display());
                         break;
                     }
                 }
@@ -308,7 +308,23 @@ fn emit_line(line: &str, filter: Option<&str>, colored: bool) {
     if !line_matches_filter(line, filter) {
         return;
     }
-    println!("{}", colorize_line(line, colored));
+    let mut out = std::io::stdout().lock();
+    if let Err(error) = write_line(&mut out, &colorize_line(line, colored)) {
+        // The reader is gone (`muxa daemon logs | head`): stop quietly, as
+        // `tail -f | head` does. Following would otherwise write into a
+        // closed pipe until interrupted; `println!` panicked instead.
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("muxa daemon logs: cannot write output: {error}");
+        std::process::exit(1);
+    }
+}
+
+/// One line, flushed so a pipe reader sees it while following.
+fn write_line(out: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
+    writeln!(out, "{line}")?;
+    out.flush()
 }
 
 /// Case-insensitive substring match. None filter matches everything.
@@ -355,6 +371,26 @@ fn use_colors() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A closed reader surfaces as `BrokenPipe` from the write, which
+    /// `emit_line` turns into a quiet exit instead of a panic.
+    #[test]
+    fn a_closed_reader_is_reported_as_broken_pipe() {
+        struct Closed;
+        impl std::io::Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = write_line(&mut Closed, "line").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        let mut open = Vec::new();
+        write_line(&mut open, "line").unwrap();
+        assert_eq!(open, b"line\n");
+    }
     use std::io::Write as _;
 
     #[test]

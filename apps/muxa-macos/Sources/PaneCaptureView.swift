@@ -12,6 +12,9 @@ private final class PaneCaptureModel: ObservableObject {
     @Published private(set) var screenContent = AttributedString(PaneCaptureModel.openingPlaceholder)
     /// Plain text of `screenContent`, for the copy action.
     private(set) var screenText = PaneCaptureModel.openingPlaceholder
+    /// Terminal cells in the widest line of `screenContent`, for fitting the
+    /// preview font to the panel width.
+    @Published private(set) var columns = 0
     @Published private(set) var errorMessage: String?
     @Published private(set) var isRefreshing = false
 
@@ -91,8 +94,10 @@ private final class PaneCaptureModel: ObservableObject {
         case .plain(let text): formatter.render(text: text)
         case .unavailable: AttributedString(Self.unavailablePlaceholder)
         }
-        screenText = String(content.characters)
-        screenContent = content
+        let trimmed = TerminalCaptureFormatter.trimmingTrailingBlankLines(content)
+        screenText = String(trimmed.characters)
+        columns = TerminalPreviewFont.columns(in: screenText)
+        screenContent = trimmed
     }
 
     private func refresh() async -> Bool {
@@ -134,6 +139,14 @@ struct PaneCaptureView: View {
     private let showsHeader: Bool
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
+    @State private var followsBottom = true
+    /// The bottom anchor and the viewport height as last laid out.
+    @State private var lastAnchor = PaneCaptureAnchor(viewport: .zero, contentY: 0)
+    @State private var viewportHeight: CGFloat = 0
+
+    private static let bottomAnchor = "pane-capture-bottom"
+    private static let viewport = "pane-capture-viewport"
+    private static let content = "pane-capture-content"
 
     init(client: MuxaIPCClient, target: MuxaPaneTarget, showsHeader: Bool = true) {
         self.target = target
@@ -146,14 +159,14 @@ struct PaneCaptureView: View {
             if showsHeader {
                 HStack(spacing: 10) {
                     Label("Live Pane", systemImage: "terminal")
-                        .font(.caption.weight(.semibold))
+                        .font(MuxaType.detail.weight(.semibold))
                         .fixedSize()
                     Text(verbatim: "\(target.host.alias) · \(target.pane.session) › \(target.pane.windowName) › \(target.pane.paneID)")
-                        .font(.caption2.monospaced())
+                        .font(MuxaType.meta.monospaced())
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                     Text("Monitor")
-                        .font(.caption2.weight(.medium))
+                        .font(MuxaType.meta.weight(.medium))
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
@@ -172,27 +185,78 @@ struct PaneCaptureView: View {
             }
 
             GeometryReader { proxy in
-                ScrollView([.horizontal, .vertical]) {
-                    Text(model.screenContent)
-                        .font(TerminalPreviewFont.font)
-                        .foregroundStyle(TerminalCapturePalette.palette(for: colorScheme).foreground)
-                        .textSelection(.disabled)
-                        .fixedSize(horizontal: true, vertical: true)
+                let padding = (
+                    x: MuxaTerminalAppearance.paddingX,
+                    y: MuxaTerminalAppearance.paddingY
+                )
+                let font = TerminalPreviewFont.fitted(
+                    columns: model.columns,
+                    width: proxy.size.width - padding.x * 2
+                )
+                ScrollViewReader { scroller in
+                    ScrollView([.horizontal, .vertical]) {
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(model.screenContent)
+                                .font(Font(font))
+                                .foregroundStyle(TerminalCapturePalette.palette(for: colorScheme).foreground.color)
+                                .textSelection(.disabled)
+                                .fixedSize(horizontal: true, vertical: true)
+                            Color.clear
+                                .frame(height: 1)
+                                .id(Self.bottomAnchor)
+                                .background(
+                                    GeometryReader { anchor in
+                                        Color.clear.preference(
+                                            key: PaneCaptureBottomKey.self,
+                                            value: PaneCaptureAnchor(
+                                                viewport: anchor.frame(in: .named(Self.viewport)),
+                                                contentY: anchor.frame(in: .named(Self.content)).minY
+                                            )
+                                        )
+                                    }
+                                )
+                        }
+                        .coordinateSpace(name: Self.content)
                         .frame(
-                            minWidth: max(0, proxy.size.width - 24),
-                            minHeight: max(0, proxy.size.height - 24),
+                            minWidth: max(0, proxy.size.width - padding.x * 2),
+                            minHeight: max(0, proxy.size.height - padding.y * 2),
+                            // Short content starts at the top, where Ghostty
+                            // draws it after Click to Type.
                             alignment: .topLeading
                         )
-                        .padding(12)
+                        .padding(.horizontal, padding.x)
+                        .padding(.vertical, padding.y)
+                    }
+                    .coordinateSpace(name: Self.viewport)
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .onPreferenceChange(PaneCaptureBottomKey.self) { anchor in
+                        // New output, a reflow, or a resized panel moves the
+                        // newest line without the reader doing anything, and
+                        // the follow scroll that comes with it may land
+                        // before or after this report. Only a move with the
+                        // same content and viewport is the reader scrolling.
+                        let contentMoved = anchor.contentY != lastAnchor.contentY
+                            || proxy.size.height != viewportHeight
+                        lastAnchor = anchor
+                        viewportHeight = proxy.size.height
+                        guard !contentMoved else { return }
+                        updateFollowing()
+                    }
+                    .onAppear { scroller.scrollTo(Self.bottomAnchor, anchor: .bottomLeading) }
+                    .onChange(of: model.screenContent) { _ in
+                        followToBottom(scroller)
+                    }
+                    .onChange(of: proxy.size) { _ in
+                        followToBottom(scroller)
+                    }
                 }
-                .frame(width: proxy.size.width, height: proxy.size.height)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(MuxaSurfacePalette.terminal(for: colorScheme))
 
             if let errorMessage = model.errorMessage {
                 Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
                     .padding(.horizontal, 10)
                     .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
@@ -222,6 +286,20 @@ struct PaneCaptureView: View {
         }
     }
 
+    /// Follow the newest line until the reader scrolls it out of view, or
+    /// scrolls sideways to read a wide pane (a follow scroll would also snap
+    /// back to the left edge), and again once they return.
+    private func updateFollowing() {
+        let atBottom = lastAnchor.viewport.minY <= viewportHeight + 4
+        let atLeadingEdge = lastAnchor.viewport.minX >= MuxaTerminalAppearance.paddingX - 4
+        followsBottom = atBottom && atLeadingEdge
+    }
+
+    private func followToBottom(_ scroller: ScrollViewProxy) {
+        guard followsBottom else { return }
+        scroller.scrollTo(Self.bottomAnchor, anchor: .bottomLeading)
+    }
+
     private var copyButton: some View {
         Button {
             NSPasteboard.general.clearContents()
@@ -231,6 +309,23 @@ struct PaneCaptureView: View {
         }
         .buttonStyle(.plain)
         .help("Copy live screen")
+    }
+}
+
+/// Where the bottom of a pane capture sits. In the viewport, its `minY`
+/// says whether the newest line is in view and its `minX` whether the reader
+/// scrolled sideways. In the content, its `contentY` changes only when the
+/// capture itself grows or reflows.
+struct PaneCaptureAnchor: Equatable {
+    let viewport: CGRect
+    let contentY: CGFloat
+}
+
+private struct PaneCaptureBottomKey: PreferenceKey {
+    static let defaultValue = PaneCaptureAnchor(viewport: .zero, contentY: 0)
+
+    static func reduce(value: inout PaneCaptureAnchor, nextValue: () -> PaneCaptureAnchor) {
+        value = nextValue()
     }
 }
 
@@ -246,9 +341,65 @@ struct PaneCaptureView: View {
 /// not honored for system fonts, so the Nerd Font has to be the primary.
 @MainActor
 enum TerminalPreviewFont {
-    static let pointSize: CGFloat = 12
+    /// The interactive surface's size, so a Live Pane keeps its layout
+    /// when Click to Type swaps the preview for Ghostty.
+    static let pointSize: CGFloat = MuxaTerminalAppearance.fontSize
+    /// The smallest size `fitted` shrinks to before the preview scrolls
+    /// sideways instead.
+    static let minimumFittedPointSize: CGFloat = 10
 
     static let font: Font = Font(nsFont)
+
+    /// One cell's width per point of font size.
+    private static let cellWidthPerPoint: CGFloat = {
+        let width = ("M" as NSString).size(withAttributes: [.font: nsFont]).width
+        return width / pointSize
+    }()
+
+    private static var fittedFonts: [CGFloat: NSFont] = [:]
+
+    /// The preview font at the largest size, up to `pointSize`, that shows
+    /// `columns` cells in `width` points. A pane wider than the panel shrinks
+    /// to `minimumFittedPointSize` before it needs a horizontal scroll.
+    static func fitted(columns: Int, width: CGFloat) -> NSFont {
+        guard columns > 0, width > 0 else { return nsFont }
+        let fitting = width / (CGFloat(columns) * cellWidthPerPoint)
+        // Half-point steps keep a resizing panel from minting a font per pixel.
+        let size = (min(pointSize, max(minimumFittedPointSize, fitting)) * 2).rounded(.down) / 2
+        guard size < pointSize else { return nsFont }
+        if let cached = fittedFonts[size] { return cached }
+        let font = NSFont(descriptor: nsFont.fontDescriptor, size: size) ?? nsFont
+        fittedFonts[size] = font
+        return font
+    }
+
+    /// Terminal cells in the widest line of `text`: East Asian wide and
+    /// fullwidth characters (Hangul, CJK, most emoji) take two.
+    nonisolated static func columns(in text: String) -> Int {
+        var widest = 0
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            var cells = 0
+            for scalar in line.unicodeScalars {
+                cells += scalar == "\t" ? 8 - cells % 8 : cellWidth(of: scalar)
+            }
+            widest = max(widest, cells)
+        }
+        return widest
+    }
+
+    nonisolated static func cellWidth(of scalar: Unicode.Scalar) -> Int {
+        switch scalar.value {
+        case 0x0300...0x036F, 0x200B...0x200F, 0xFE00...0xFE0F:
+            0
+        case 0x1100...0x115F, 0x2E80...0x303E, 0x3041...0x33FF, 0x3400...0x4DBF,
+             0x4E00...0x9FFF, 0xA000...0xA4CF, 0xAC00...0xD7A3, 0xF900...0xFAFF,
+             0xFE30...0xFE4F, 0xFF00...0xFF60, 0xFFE0...0xFFE6, 0x1F300...0x1F64F,
+             0x1F900...0x1F9FF, 0x20000...0x3FFFD:
+            2
+        default:
+            1
+        }
+    }
 
     static let nsFont: NSFont = {
         let system = NSFont.monospacedSystemFont(ofSize: pointSize, weight: .regular)

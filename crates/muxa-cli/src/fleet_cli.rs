@@ -138,6 +138,8 @@ pub(crate) struct FleetArgs {
 
 #[derive(Debug, Subcommand)]
 enum FleetCommand {
+    /// Manage local/SSH host inventory and Kubernetes-style metadata.
+    Host(HostArgs),
     /// Print the aggregated host/session/window/pane state.
     Status {
         #[command(flatten)]
@@ -249,7 +251,7 @@ pub(crate) async fn run_host(
             validate_label_value(&alias).map_err(anyhow::Error::msg)?;
             if alias == LOCAL_HOST_ALIAS {
                 bail!(
-                    "host alias '{LOCAL_HOST_ALIAS}' is reserved for this node; use `muxa host label local` or `muxa host annotate local`"
+                    "host alias '{LOCAL_HOST_ALIAS}' is reserved for this node; use `muxa fleet host label local` or `muxa fleet host annotate local`"
                 );
             }
             if cfg.fleet.hosts.contains_key(&alias) && !overwrite {
@@ -397,6 +399,7 @@ pub(crate) async fn run_fleet(
     config_path: Option<&Path>,
 ) -> Result<()> {
     match args.command {
+        FleetCommand::Host(host) => Box::pin(run_host(host, client, cfg, config_path)).await,
         FleetCommand::Status { table } => {
             let selector = parse_selector(table.selector.as_deref())?;
             let snapshot = client

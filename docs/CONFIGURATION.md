@@ -349,7 +349,8 @@ muxa ask --agent claude --detach --json "review the deployment plan"
 muxa ask --agent anthropic "which files does the reaper touch?"
 security find-generic-password -w -s my-codex-key \
   | muxa ask --agent codex --api-key-stdin "review this repository"
-muxa ask --agent anthropic-work "…"   # a provider you added, by its id
+muxa ask --agent anthropic-work "…"   # a provider you added, by its id (until the next restart)
+muxa ask provider use codex           # make it the default; rewrites [ask] agent
 muxa ask providers [--json]           # every provider: engine, kind, model, whether a key resolves, selected
 muxa ask provider add anthropic-work --engine anthropic \
   --title "Anthropic (work)" --api-key-env WORK_ANTHROPIC_KEY
@@ -547,6 +548,14 @@ doctor` reports a daemon whose version has drifted from the CLI's.
 
 ## Reconciler
 
+Native PTY references are checked against muxad's own session registry at
+startup and on each reconciler pass. A missing session clears the reference
+and stops the agent row; an exited session stops it while retaining its output
+surface for capture. Failed session observations leave rows unchanged. A
+surviving pid-tracked task remains governed by process liveness even if its old
+PTY was lost on daemon restart. `muxa registry prune` also checks missing PTY references,
+including when periodic reconciliation is disabled, and retains its age filter.
+
 ```toml
 [reconciler]
 enabled = true
@@ -559,7 +568,7 @@ paneless_stale_timeout_secs = 86400
 
 The reconciler keeps stale states from staying misleading forever. Timeout
 values of `0` disable that timeout. The same loop also runs the pid-liveness
-sweep that flips registered background tasks (see `muxa register`) to
+sweep that flips registered background tasks (see `muxa proc register`) to
 `stopped` once their process exits.
 
 Codex rollout polling runs every two seconds independently of the full
@@ -616,8 +625,8 @@ both pane and window capture at the manager even on control hosts.
 identity, ProxyJump, and host-key policy in `~/.ssh/config`. `muxa_path` and
 `remote_socket` are validated as fixed remote command tokens. Labels implement
 Kubernetes-style selectors; annotations allow descriptive values but use the
-same namespaced key syntax. Prefer `muxa host add/label/annotate` to edit the
-inventory atomically. Use `muxa host label local` and `muxa host annotate
+same namespaced key syntax. Prefer `muxa fleet host add/label/annotate` to edit the
+inventory atomically. Use `muxa fleet host label local` and `muxa fleet host annotate
 local` for controller metadata; muxad-managed identity labels cannot be
 overridden. See [FLEET.md](FLEET.md).
 

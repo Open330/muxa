@@ -7,6 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Status rows show what an injected prompt is instead of its markup:
+  `⟳ <task summary>` for a finished Claude background task, and
+  `↳ <Kind> request from <sender>` for a muxa peer request.
+- `muxa status` shows agents as a session / window / pane tree, like
+  `muxa watch`, with each session's state counts. Grouped `~view~` sessions
+  fold onto their base, and paneless agents are listed last. `--flat` keeps
+  the previous one-row-per-agent table; `--json` is unchanged.
+
+### Fixed
+
+- `muxa stats` splits an interval that crosses midnight between its days.
+  Before, a state held overnight (an agent left waiting on a question) was
+  credited whole to the day it ended, putting 15h of WAIT on a morning that
+  was 10h old. Totals are unchanged.
+- `muxa stats` / `report` recorded no attached or hands-on time (WACT/ACT
+  `-`) for workspaces on rmux: session activity sampled only tmux and herdr.
+  rmux is sampled now. Its session ids are kept apart from tmux's
+  (`rmux:$N`), and a client is identified by its pid, so a reattach is not
+  counted as input.
+- `muxa stats` lists day rows newest first when no `--sort` is given.
+  Previously they were ranked by prompt count, which shuffled the dates.
+- `muxa panes` lists a grouped pane once, with `+N views`.
+- `muxa restore` / `muxa reload` relaunch agents correctly:
+  - **Wrapped agents.** A pane started with its command (as `muxa agent start`
+    does) is recorded as that command, wrapper included. Before, the snapshot
+    took its child: `node …/codex` without the `aas` wrapper, so the
+    account-specific resume failed.
+  - **Instruction-launched agents.** Resuming an agent that was launched with
+    its first instruction no longer sends that instruction again; flags and
+    their values are kept.
+  - **Parenthesised instructions.** An agent whose command contained
+    parentheses, such as an instruction mentioning "(commit, push)", was taken
+    for a process title and left out of the restore. When the argv was
+    captured, only the program argument is judged now; older snapshots are
+    re-judged when they are read.
+- Run from a plain terminal or a tmux shell, `muxa status` listed agents
+  living in rmux as raw `rmux:%N` ids. `status`, `dashboard` and `attend` now
+  name panes from every active host, matched to the agent's server. When no
+  live listing exists they fall back to the session muxad recorded. `muxa
+  sync` discovers agents on every active host.
+
+## [0.8.57] - 2026-10-11
+
+### Added
+
+- `muxa stats --timeline` shows when each project had an agent working, on a
+  real clock axis: one block per day by default, or `--layout range` for one
+  row per project across the whole range so many projects fit on one screen.
+  `--hours 9-24` and `--cell 15` fix the window and the cell width, and
+  `--group-by session|agent` swaps projects for sessions or agent kinds.
+
+### Changed
+
+- Muxa for Mac is easier to read. Content text no longer drops below 11pt:
+  body text is 13pt, supporting text 12pt, badges and timestamps 11pt.
+  Terminal text in the Live Pane preview and in attached panes uses one
+  high-contrast palette (bright black, red and the bright yellows were
+  1.5–3:1). Ghostty now runs with `minimum-contrast = 3` and a readable dim
+  opacity, at the same 13pt size as the preview.
+- The Live Pane preview follows the newest output unless you scroll away,
+  trims trailing blank rows, and shrinks wide panes (down to 10pt) to fit the
+  panel before it scrolls sideways.
+- An agent's status reads the same everywhere. A rate-limited agent (muxad
+  reports its stopped turn as `error`) shows **Limited** with its reset time
+  instead of **Error**, and is no longer counted, notified or badged as
+  needing attention.
+- Explore shows a status once per row and pins agents that need attention
+  above the host tree. The Work Command Center opens with a one-line summary
+  and a "Look at now" list covering every host. The agent inspector shows its
+  status once and previews long responses with Show more.
+- Editor tabs drag like VS Code's. An insertion bar marks the drop point, a
+  tab can move to the other group's strip or editor, the outer edge of an
+  editor opens a new group, and Option copies instead of moving.
+
+### Fixed
+
+- Grouped sessions (two terminals on one workspace: `name` plus `name~view~N`)
+  list every pane once per member, and Muxa treated those listings as
+  separate panes. Codex threads in a grouped session failed to bind ("not
+  bound to a pane") although their prompt was on screen. Dashboard work
+  control typed a prompt or Ctrl-C into a grouped pane once per view. Share
+  pins on grouped panes always failed, work snapshots doubled runs, and fleet
+  doubled pane counts. View names were also persisted into the activity log
+  and history, where session exclusions missed them. Every place that counts,
+  matches, persists or scans panes now sees each physical pane once, named by
+  its base session.
+- Opening an empty remote or local file showed a blank page that looked like
+  a failed load; it now says the file is empty.
+
 ## [0.8.56] - 2026-10-02
 
 ### Added
@@ -4078,7 +4169,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.56...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.57...HEAD
+[0.8.57]: https://github.com/Open330/muxa/compare/v0.8.56...v0.8.57
 [0.8.56]: https://github.com/Open330/muxa/compare/v0.8.55...v0.8.56
 [0.8.55]: https://github.com/Open330/muxa/compare/v0.8.54...v0.8.55
 [0.8.54]: https://github.com/Open330/muxa/compare/v0.8.53...v0.8.54

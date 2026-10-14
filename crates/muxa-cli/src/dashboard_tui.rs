@@ -1363,8 +1363,9 @@ async fn load_dashboard_data(
         .await
         .context("querying daemon agent snapshot")?;
 
-    let backend = muxa::default_backend();
-    let panes = backend.list_panes();
+    // Every active host, not only the one this shell runs in, so card labels
+    // resolve when the dashboard is opened from outside the agents' host.
+    let panes = crate::all_panes().await;
     let mut notes = Vec::new();
     let scan = muxa::tmux::scanner::scan().await;
     notes.extend(
@@ -1589,9 +1590,10 @@ fn build_work_dashboard_data(
     sort: DashboardSort,
     mut notes: Vec<String>,
 ) -> DashboardData {
-    let pane_by_id = panes
-        .iter()
-        .map(|pane| (pane.pane_id.clone(), pane.clone()))
+    // Grouped sessions list a pane per `~view~` member; label it by the base.
+    let pane_by_id = muxa::tmux::canonical_panes(&panes)
+        .into_iter()
+        .map(|pane| (pane.pane_id.clone(), pane))
         .collect::<HashMap<_, _>>();
     let activity_by_name = session_activities
         .into_iter()
@@ -1714,9 +1716,10 @@ fn build_dashboard_data(
     host: HostKind,
     notes: Vec<String>,
 ) -> DashboardData {
-    let pane_by_id = panes
-        .iter()
-        .map(|pane| (pane.pane_id.clone(), pane.clone()))
+    // Grouped sessions list a pane per `~view~` member; label it by the base.
+    let pane_by_id = muxa::tmux::canonical_panes(&panes)
+        .into_iter()
+        .map(|pane| (pane.pane_id.clone(), pane))
         .collect::<HashMap<_, _>>();
     let pty_by_id = sessions
         .iter()
@@ -3033,11 +3036,11 @@ fn send_to_exact_pane(pane: &PaneKey, text: &str, submit: bool) -> std::result::
     if !backend.caps().send_text {
         return Err(format!("{} pane input is not supported", endpoint.host));
     }
-    if !backend.send_text_on(Some(&endpoint.socket), &pane.pane_id, text) {
+    if !backend.send_prompt_text_on(Some(&endpoint.socket), &pane.pane_id, text) {
         return Err("input was rejected".into());
     }
     if submit {
-        std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
+        std::thread::sleep(muxa::backend::prompt_submit_grace(&pane.pane_id));
         if !backend.send_text_on(Some(&endpoint.socket), &pane.pane_id, "\r") {
             return Err("prompt text was sent but submit failed".into());
         }
@@ -5225,6 +5228,7 @@ mod tests {
     fn fake_pane(pane_id: &str, session: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,

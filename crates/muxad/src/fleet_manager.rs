@@ -794,11 +794,11 @@ async fn local_send_prompt(
     let socket = pane.window.session.endpoint.socket;
     let pane_id = pane.pane_id;
     let outcome = tokio::task::spawn_blocking(move || {
-        if !backend.send_text_on(Some(&socket), &pane_id, &text) {
+        if !backend.send_prompt_text_on(Some(&socket), &pane_id, &text) {
             return None;
         }
         let submitted = if submit {
-            std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
+            std::thread::sleep(muxa::backend::prompt_submit_grace(&pane_id));
             backend.send_text_on(Some(&socket), &pane_id, "\r")
         } else {
             false
@@ -806,6 +806,7 @@ async fn local_send_prompt(
         Some(muxa::ipc::SendPromptOutcome {
             sent: true,
             submitted,
+            submission_confirmed: None,
         })
     })
     .await

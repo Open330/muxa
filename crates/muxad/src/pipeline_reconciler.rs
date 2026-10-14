@@ -118,14 +118,12 @@ mod tests {
     use muxa::pipeline::DesiredAgent;
     use muxa::pipeline_run::PipelineRunRegistration;
     use muxa::work::WorkIdentity;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Stdio;
 
     fn script(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("muxa-worker");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        muxa::test_support::write_executable(&path, format!("#!/bin/sh\n{body}\n"), 0o700);
         path
     }
 

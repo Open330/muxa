@@ -422,7 +422,10 @@ impl FleetHostSnapshot {
 
     #[must_use]
     pub fn pane_count(&self) -> usize {
-        self.remote.as_ref().map_or(0, |remote| remote.panes.len())
+        // Physical panes: a grouped session lists each once per `~view~`.
+        self.remote.as_ref().map_or(0, |remote| {
+            crate::tmux::canonical_panes(&remote.panes).len()
+        })
     }
 
     #[must_use]

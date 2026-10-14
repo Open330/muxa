@@ -59,7 +59,7 @@ struct MuxaUsageStatusItems: View {
 private struct MuxaUsageStatusLabelStyle: LabelStyle {
     func makeBody(configuration: Configuration) -> some View {
         HStack(spacing: 4) {
-            configuration.icon.font(.system(size: 10))
+            configuration.icon.font(.system(size: 11))
             configuration.title.monospacedDigit()
         }
     }
@@ -106,14 +106,14 @@ struct MuxaUsagePopover: View {
                 Spacer(minLength: 8)
                 if let cost = group.liveCostUSD {
                     Text("\(cost.formatted(.currency(code: "USD"))) live sessions")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
             }
             if group.isShared {
                 Text("Same account on \(group.hostAliases.count) hosts · freshest reading shown")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .help("These hosts report the same reset times, so they share one account's limits.")
             }
@@ -122,7 +122,7 @@ struct MuxaUsagePopover: View {
             }
             if !group.capped.isEmpty {
                 Text("Rate limited")
-                    .font(.caption.weight(.semibold))
+                    .font(MuxaType.detail.weight(.semibold))
                     .foregroundStyle(.red)
                     .padding(.top, 2)
                 ForEach(group.capped) { capped in
@@ -138,17 +138,17 @@ struct MuxaUsagePopover: View {
     private func windowRow(_ window: MuxaUsageWindow) -> some View {
         HStack(spacing: 8) {
             Text(verbatim: window.kind.shortLabel)
-                .font(.caption.monospaced())
+                .font(MuxaType.detail.monospaced())
                 .foregroundStyle(.secondary)
                 .frame(width: 20, alignment: .leading)
             MuxaUsageBar(percent: window.percent, width: 110, height: 6)
             Text(verbatim: MuxaUsageFormat.percent(window.percent))
-                .font(.caption.monospacedDigit())
+                .font(MuxaType.detail.monospacedDigit())
                 .foregroundStyle(window.level.tint(normal: .primary))
                 .frame(width: 36, alignment: .trailing)
             if let reset = window.resetsAt {
                 Text("resets \(MuxaUsageFormat.clock(reset, now: now))")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .help(MuxaUsageFormat.relative(until: reset, now: now))
@@ -180,7 +180,7 @@ struct MuxaUsagePopover: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            .font(.caption)
+            .font(MuxaType.detail)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -220,7 +220,7 @@ struct MuxaUsagePopover: View {
                 .monospacedDigit()
                 .frame(minWidth: 56, alignment: .trailing)
         }
-        .font(.caption)
+        .font(MuxaType.detail)
     }
 
     private func capText(_ cap: MuxaRateLimitCap) -> String {
@@ -239,7 +239,7 @@ struct MuxaUsagePopover: View {
             // start an automation IPC round-trip just to label a button.
             if automations.hasLoaded, automations.isSupported {
                 Text(autoResumeConfigured ? "On" : "Not set up")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
         }
@@ -284,7 +284,7 @@ struct MuxaContextMeter: View {
                 .monospacedDigit()
                 .foregroundStyle(MuxaUsageLevel(percent: percent).tint(normal: .secondary))
         }
-        .font(.caption2)
+        .font(MuxaType.meta)
         .lineLimit(1)
         .fixedSize()
         .help("Context window \(MuxaUsageFormat.percent(percent)) used")
@@ -305,7 +305,7 @@ struct MuxaRateLimitBadge: View {
                     showsDetails.toggle()
                 } label: {
                     Label(MuxaUsageFormat.capText(cap, now: context.date), systemImage: "hourglass")
-                        .font(.caption2.weight(.medium))
+                        .font(MuxaType.meta.weight(.medium))
                         .foregroundStyle(.red)
                         .lineLimit(1)
                         .padding(.horizontal, 6)

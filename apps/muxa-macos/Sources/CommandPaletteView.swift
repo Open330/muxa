@@ -377,7 +377,7 @@ enum MuxaPaletteItems {
         let showsHosts = panes.contains { !$0.host.local }
         return panes.map { pane in
             let window = pane.pane.windowName.isEmpty ? pane.pane.windowID : pane.pane.windowName
-            let state = pane.agent.map { agentStateLabel($0.state) } ?? ""
+            let state = pane.agent.map { $0.status.label() } ?? ""
             return MuxaPaletteItem(
                 stableID: MuxaPaletteID(components: [
                     "agent-pane", pane.host.alias, pane.pane.endpointSocket, pane.pane.paneID,
@@ -392,7 +392,7 @@ enum MuxaPaletteItems {
                     ? "exclamationmark.circle.fill"
                     : unread.contains(pane.id) ? "circle.fill" : "person.crop.circle", // WS-A
                 action: .navigate(.pane(pane.id)),
-                tint: pane.agent.map { agentStateColor($0.state) },
+                tint: pane.agent.map { $0.status.color },
                 host: showsHosts ? pane.host : nil
             )
         }
@@ -499,14 +499,14 @@ struct CommandPaletteView: View {
                     }
                 )
                 Text(verbatim: modeShortcut)
-                    .font(.caption.monospaced()).foregroundStyle(.secondary)
+                    .font(MuxaType.detail.monospaced()).foregroundStyle(.secondary)
             }
             .padding(16)
             if mode == .navigation, indexing || indexStatus != nil {
                 HStack {
                     if indexing { ProgressView().controlSize(.mini) }
                     Text(indexing ? String(localized: "Searching workspace files…") : (indexStatus ?? ""))
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        .font(MuxaType.detail).foregroundStyle(.secondary).lineLimit(2)
                     Spacer()
                 }.padding(.horizontal, 16).padding(.bottom, 8)
             }
@@ -519,7 +519,7 @@ struct CommandPaletteView: View {
                                 Image(systemName: "magnifyingglass").font(.title2)
                                 Text(query.isEmpty ? "No destinations available" : "No matching results")
                                 Text(query.isEmpty ? "Sessions and work appear here when available." : "Try a name, host, socket, or a shorter query.")
-                                    .font(.caption)
+                                    .font(MuxaType.detail)
                             }
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, minHeight: 230)
@@ -550,7 +550,7 @@ struct CommandPaletteView: View {
                 Spacer()
                 Text("\(results.count) results")
             }
-            .font(.caption).foregroundStyle(.secondary).padding(12)
+            .font(MuxaType.detail).foregroundStyle(.secondary).padding(12)
         }
         .frame(width: 680, height: 430)
         .background(.regularMaterial)
@@ -588,24 +588,24 @@ struct CommandPaletteView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(item.title).font(.body).lineLimit(1)
                     if !item.subtitle.isEmpty {
-                        Text(item.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Text(item.subtitle).font(MuxaType.detail).foregroundStyle(.secondary).lineLimit(1)
                             .truncationMode(.middle)
                     }
                 }
                 Spacer(minLength: 0)
                 if let host = item.host { MuxaPaletteHostBadge(host: host) }
-                if !item.isEnabled { Image(systemName: "lock").font(.caption) }
+                if !item.isEnabled { Image(systemName: "lock").font(MuxaType.detail) }
                 if let shortcut = item.shortcut {
                     Text(verbatim: shortcut)
-                        .font(.caption.monospaced())
+                        .font(MuxaType.detail.monospaced())
                         .foregroundStyle(.secondary)
                 }
                 if item.stableID == selectedID {
-                    Image(systemName: "return").font(.caption)
+                    Image(systemName: "return").font(MuxaType.detail)
                 } else if let digit, item.shortcut == nil {
                     Text(verbatim: "⌘\(digit)")
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.tertiary)
+                        .font(MuxaType.detail.monospaced())
+                        .foregroundStyle(.secondary)
                 }
             }
             .padding(.horizontal, 10).padding(.vertical, 9)
@@ -662,7 +662,7 @@ private struct MuxaPaletteHostBadge: View {
             Text(verbatim: live ? host.alias : "\(host.alias) · \(fleetHostStateLabel(host.state))")
                 .lineLimit(1)
         }
-        .font(.caption)
+        .font(MuxaType.detail)
         .foregroundStyle(live ? Color.primary : Color.secondary)
         .padding(.leading, 3)
         .padding(.trailing, 6)

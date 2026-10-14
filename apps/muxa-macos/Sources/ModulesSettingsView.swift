@@ -90,35 +90,35 @@ private struct ModuleCard: View {
             if isEnabled {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.mini)
-                    Text("Looking for it…").font(.caption).foregroundStyle(.secondary)
+                    Text("Looking for it…").font(MuxaType.detail).foregroundStyle(.secondary)
                 }
             } else {
                 Text("Switch it on to look for it.")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.detail)
+                    .foregroundStyle(.secondary)
             }
         case .available(let version, let detail):
             Label(
                 [version, detail].compactMap { $0 }.joined(separator: " · "),
                 systemImage: "checkmark.circle.fill"
             )
-            .font(.caption)
+            .font(MuxaType.detail)
             .foregroundStyle(.green)
             .labelStyle(.titleAndIcon)
         case .missing(let hint):
             VStack(alignment: .leading, spacing: 2) {
                 Label(hint, systemImage: "exclamationmark.circle")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
                 if let homepage = module.identity.homepage {
                     Link(destination: homepage) {
-                        Text(verbatim: homepage.absoluteString).font(.caption)
+                        Text(verbatim: homepage.absoluteString).font(MuxaType.detail)
                     }
                 }
             }
         case .unusable(let reason):
             Label(reason, systemImage: "exclamationmark.triangle.fill")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.orange)
         }
     }

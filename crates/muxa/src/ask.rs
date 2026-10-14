@@ -507,6 +507,30 @@ impl AskStore {
         Ok(label)
     }
 
+    /// Make `provider` the default: select it now and write `[ask] agent`,
+    /// so the choice survives a daemon restart. [`Self::set_agent`] alone
+    /// lasts only until the daemon reads its config again.
+    pub async fn set_default_agent(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<AskProviderInfo>, AskError> {
+        let instance = self
+            .instance(provider)
+            .await
+            .ok_or_else(|| AskError::UnsupportedAgent(provider.to_string()))?;
+        let path = self
+            .opts
+            .config_path
+            .clone()
+            .ok_or_else(|| AskError::NoConfigPath(instance.id.clone()))?;
+        {
+            let _guard = self.write_lock.lock().await;
+            write_default_agent(&path, &instance.id).map_err(AskError::Io)?;
+        }
+        self.set_agent(&instance.id).await?;
+        Ok(self.providers().await)
+    }
+
     /// Every provider instance this daemon can drive, with its effective
     /// model, whether a key is already resolvable from the daemon's
     /// environment, and which one the next question goes to.
@@ -1921,9 +1945,17 @@ impl AskEngine {
             .current_dir(turn.cwd)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
+        // muxad may have been started from inside an agent session; its
+        // account and messaging socket are not this turn's.
+        for name in crate::child_env::inherited_session_vars_here() {
+            cmd.env_remove(name);
+        }
         if let Some(api_key) = turn.api_key {
             cmd.env(self.credential_env(), api_key);
         }
+        // Lets the user's own CLI hooks (prompt rewriters, coaches, loggers)
+        // recognise a headless muxa turn and stay out of the answer.
+        cmd.env(ASK_ENV_MARKER, "1");
         let output = tokio::time::timeout(turn.timeout, cmd.output())
             .await
             .map_err(|_| timeout_message(bin, turn.timeout))?
@@ -1931,7 +1963,7 @@ impl AskEngine {
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let detail = stderr.trim().lines().next_back().unwrap_or("no stderr");
+            let detail = non_zero_detail(&stdout, &stderr);
             return Err(format!("{bin} exited non-zero: {detail}"));
         }
         match self {
@@ -2508,6 +2540,32 @@ fn parse_apple_json(stdout: &str) -> Result<AskAnswer, String> {
     })
 }
 
+/// Set in the environment of every headless CLI turn muxa spawns, so the
+/// user's own hooks can tell an ask apart from an interactive session.
+pub const ASK_ENV_MARKER: &str = "MUXA_ASK";
+
+/// The one line worth keeping from a CLI that exited non-zero. stderr's
+/// last line wins; when stderr is empty (claude reports login and API
+/// failures as a JSON result on stdout with exit 1) the stdout result
+/// text, or failing that its last line, stands in. Only then "no output".
+fn non_zero_detail(stdout: &str, stderr: &str) -> String {
+    if let Some(line) = stderr.trim().lines().next_back() {
+        return line.to_string();
+    }
+    let stdout = stdout.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout) {
+        if let Some(result) = value.get("result").and_then(serde_json::Value::as_str) {
+            if !result.trim().is_empty() {
+                return result.trim().to_string();
+            }
+        }
+    }
+    stdout
+        .lines()
+        .next_back()
+        .map_or_else(|| "no output".to_string(), str::to_string)
+}
+
 /// `codex exec --json` streams one JSON event per line. The answer is the
 /// last agent message; the session id appears in a configured/session
 /// event near the top.
@@ -2677,6 +2735,15 @@ fn remove_provider_config(path: &Path, id: &str, select: Option<&str>) -> Result
     })
 }
 
+/// Point `[ask] agent` at `id`, keeping the rest of the file as written.
+fn write_default_agent(path: &Path, id: &str) -> Result<Config, String> {
+    edit_config_document(path, |document| {
+        let ask = implicit_table(document.as_table_mut(), "ask")?;
+        set_value(ask, "agent", id);
+        Ok(())
+    })
+}
+
 /// `table[key] = value`, replacing in place so a comment on the line
 /// survives.
 fn set_value(table: &mut toml_edit::Table, key: &str, value: &str) {
@@ -2822,6 +2889,22 @@ mod tests {
             builtin: true,
             configured: false,
         }
+    }
+
+    #[test]
+    fn non_zero_detail_prefers_stderr_then_stdout_result() {
+        assert_eq!(
+            non_zero_detail("", "boom\nnot logged in\n"),
+            "not logged in"
+        );
+        let json =
+            r#"{"type":"result","is_error":true,"result":"Invalid API key · Please run /login"}"#;
+        assert_eq!(
+            non_zero_detail(json, ""),
+            "Invalid API key · Please run /login"
+        );
+        assert_eq!(non_zero_detail("plain\nlast line\n", ""), "last line");
+        assert_eq!(non_zero_detail("", ""), "no output");
     }
 
     #[test]
@@ -4228,19 +4311,71 @@ mod tests {
         assert!(store.set_agent("anthropic-nope").await.is_err());
     }
 
+    /// Runs one headless turn against a fake `claude` built from `script`.
+    #[cfg(unix)]
+    async fn fake_claude_turn(script: &str) -> Result<AskAnswer, String> {
+        let directory = tempdir().unwrap();
+        let fake = directory.path().join("claude-fake");
+        crate::test_support::write_executable(&fake, format!("#!/bin/sh\n{script}\n"), 0o755);
+        let config = AskProviderConfig {
+            engine: Some("claude".into()),
+            executable: Some(fake.display().to_string()),
+            ..AskProviderConfig::default()
+        };
+        one_shot_configured(
+            OneShot {
+                agent: "claude-fake",
+                prompt: "hi",
+                cwd: directory.path(),
+                permission_mode: AskPermissionMode::Plan,
+                additional_dirs: &[],
+                timeout: Duration::from_secs(30),
+            },
+            Some(&config),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    /// The user's own CLI hooks (prompt coaches, loggers) key off this marker
+    /// to stay out of a headless answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn headless_turns_carry_the_ask_marker() {
+        let answer = fake_claude_turn(
+            "printf '{\"is_error\":false,\"result\":\"marker=%s\",\"session_id\":\"s\"}' \"$MUXA_ASK\"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer.text, "marker=1", "{ASK_ENV_MARKER} must be set");
+    }
+
+    /// claude reports login and API failures as a JSON result on stdout with
+    /// an empty stderr; that result is the reason worth showing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_turn_reports_the_reason_claude_printed_on_stdout() {
+        let error = fake_claude_turn(
+            "printf '{\"type\":\"result\",\"is_error\":true,\"result\":\"Invalid API key\"}'; exit 1",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.ends_with("exited non-zero: Invalid API key"),
+            "{error}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_cli_instance_spawns_the_binary_it_names() {
-        use std::os::unix::fs::PermissionsExt;
-
         let directory = tempdir().unwrap();
         let fake = directory.path().join("claude-work");
-        std::fs::write(
+        crate::test_support::write_executable(
             &fake,
             "#!/bin/sh\nprintf '%s' \"{\\\"is_error\\\":false,\\\"result\\\":\\\"PONG $*\\\",\\\"session_id\\\":\\\"s-1\\\"}\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            0o755,
+        );
 
         let config = AskProviderConfig {
             engine: Some("claude".into()),
@@ -4464,11 +4599,8 @@ mod tests {
     /// An executable script standing in for `muxa-afm`.
     #[cfg(target_os = "macos")]
     fn fake_apple_helper(directory: &Path, name: &str, script: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         let path = directory.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&path, format!("#!/bin/sh\n{script}\n"), 0o755);
         path
     }
 
@@ -4584,6 +4716,50 @@ mod tests {
         };
         assert!(missing.contains("helper was not found"), "{missing}");
         assert!(missing.contains("Contents/Helpers"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn the_default_provider_is_selected_and_written_to_config() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# operator notes\n[ask]\nagent = \"claude\" # keep this comment\ntimeout_secs = 60\n",
+        )
+        .unwrap();
+        let store = AskStore::in_memory(AskOptions {
+            enabled: true,
+            agent: "claude".into(),
+            config_path: Some(path.clone()),
+            ..AskOptions::default()
+        });
+
+        let infos = store.set_default_agent("codex").await.unwrap();
+        assert_eq!(store.agent().await, "codex");
+        assert!(infos.iter().any(|info| info.id == "codex" && info.selected));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# operator notes\n[ask]\n"), "{text}");
+        assert!(
+            text.contains("agent = \"codex\" # keep this comment"),
+            "{text}"
+        );
+        assert!(text.contains("timeout_secs = 60"), "{text}");
+
+        // An unknown id is refused and leaves both the file and the
+        // selection alone.
+        assert!(matches!(
+            store.set_default_agent("bard").await.unwrap_err(),
+            AskError::UnsupportedAgent(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(store.agent().await, "codex");
+
+        // A config with no `[ask]` table gains one.
+        std::fs::write(&path, "").unwrap();
+        store.set_default_agent("gemini").await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let config: Config = toml::from_str(&text).unwrap();
+        assert_eq!(config.ask.agent, "gemini", "{text}");
     }
 
     #[allow(clippy::too_many_lines)] // one add/refuse/remove lifecycle, in order

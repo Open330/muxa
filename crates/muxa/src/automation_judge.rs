@@ -337,6 +337,7 @@ mod tests {
             work: Some("work-id".into()),
             workspace: Some("workspace-id".into()),
             state: crate::AgentState::Idle,
+            last_notification: None,
             rate_limit_scope: None,
             rate_limit_source: None,
             rate_limited_until: None,

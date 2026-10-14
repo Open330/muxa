@@ -4739,6 +4739,7 @@ mod tests {
                 agents: Vec::new(),
                 panes: vec![PaneInfo {
                     session_group: None,
+                    agent_program: None,
                     agent_role: None,
                     agent_alias: None,
                     workspace_id: None,

@@ -270,3 +270,143 @@ fn a_bare_session_name_can_resolve_to_a_neighbour() {
         "expected an ambiguity refusal, got {refused:?}"
     );
 }
+
+/// Exercise the real launcher with a CLI that never emits a hook or receives
+/// an initial prompt. Its process name stays codex/claude for discovery.
+#[test]
+fn no_prompt_launch_registers_the_observed_provider_immediately() {
+    use std::time::Duration;
+    if !tmux_installed() || Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: tmux and cc are required");
+        return;
+    }
+    for program in ["codex", "claude"] {
+        let server = Server::start();
+        server.session("no-prompt");
+        server
+            .tmux(&["set-option", "-g", "default-shell", "/bin/sh"])
+            .unwrap();
+        let config = server.dir.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let stub_bin = server.dir.path().join("bin");
+        std::fs::create_dir(&stub_bin).unwrap();
+        let source = server.dir.path().join("agent.c");
+        std::fs::write(
+            &source,
+            "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
+        )
+        .unwrap();
+        assert!(Command::new("cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(stub_bin.join(program))
+            .status()
+            .unwrap()
+            .success());
+        // tmux starts the child's shell with its server-side PATH.
+        server
+            .tmux(&[
+                "set-environment",
+                "-g",
+                "PATH",
+                &format!(
+                    "{}:{}",
+                    stub_bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            ])
+            .unwrap();
+        let (recv, reader) = registration_listener(&server.dir.path().join("muxad.sock"));
+        let output = run_muxa(
+            &server,
+            &stub_bin,
+            &[
+                "--config",
+                config.to_str().unwrap(),
+                "agent",
+                "start",
+                "--host",
+                "tmux",
+                "--agent",
+                program,
+                "--placement",
+                "window",
+                "--target",
+                "no-prompt",
+                "--name",
+                "worker",
+                "--json",
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["prompt_supplied"], false);
+        let registered = recv
+            .recv_timeout(Duration::from_secs(6))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "launcher must register without waiting for a hook: {error}; panes: {}",
+                    server.query(&[
+                        "list-panes",
+                        "-a",
+                        "-F",
+                        "#{pane_id} #{pane_current_command} #{@muxa_agent} #{pane_pid}"
+                    ])
+                )
+            });
+        let event: muxa::event::AgentEvent =
+            serde_json::from_value(registered["event"].clone()).unwrap();
+        let muxa::event::AgentEvent::Started { id, .. } = event else {
+            panic!("expected Started")
+        };
+        assert_eq!(id.kind, muxa::discovery::classify_command(program).unwrap());
+        assert_eq!(id.pane.as_deref(), result["pane"].as_str());
+        assert!(id
+            .session_id
+            .starts_with(muxa::state::SYNTHETIC_SESSION_PREFIX));
+        reader.join().unwrap();
+    }
+}
+
+fn registration_listener(
+    socket: &Path,
+) -> (
+    std::sync::mpsc::Receiver<serde_json::Value>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+    let listener = UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (send, recv) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).is_err() {
+                continue;
+            }
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            writeln!(stream, "{{\"protocol\":6,\"ok\":true}}").unwrap();
+            if request["kind"] == "ingest" {
+                send.send(request).unwrap();
+                return;
+            }
+        }
+    });
+    (recv, reader)
+}

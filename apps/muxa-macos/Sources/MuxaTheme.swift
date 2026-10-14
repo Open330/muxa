@@ -6,6 +6,21 @@ import SwiftUI
 /// and these values follow the density and neutral surfaces of VS Code's
 /// "Modern" themes rather than stock AppKit controls, so every region reads as
 /// one tool instead of a stack of system panels.
+/// The workbench's type scale. macOS sets `.caption`, `.caption2`, and
+/// `.footnote` all at 10pt, a footnote size; when most of a window is set in
+/// them, nothing stands out and the GUI reads worse than the CLI it wraps.
+/// Content takes its size from these steps instead, and 11pt is the floor.
+enum MuxaType {
+    /// What the reader came for: messages, prompts, row titles. 13pt.
+    static let body = Font.body
+    /// Text that supports body text: subtitles, explanations, row details,
+    /// field help. 12pt.
+    static let detail = Font.callout
+    /// Labels that only annotate: badges, counts, timestamps, IDs, paths in
+    /// a header. 11pt.
+    static let meta = Font.subheadline
+}
+
 enum MuxaTheme {
     // MARK: Metrics
 
@@ -186,7 +201,7 @@ private struct MuxaButtonBody: View {
     var body: some View {
         configuration.label
             .labelStyle(MuxaButtonLabelStyle())
-            .font(.system(size: compact ? 11 : 12, weight: kind == .primary ? .semibold : .medium))
+            .font(.system(size: compact ? 12 : 13, weight: kind == .primary ? .semibold : .medium))
             .lineLimit(1)
             .padding(.horizontal, compact ? 8 : 10)
             .frame(minHeight: compact ? 22 : 26)
@@ -275,7 +290,7 @@ struct MuxaSegmented<Value: Hashable>: View {
                     withAnimation(.easeOut(duration: 0.15)) { selection = option }
                 } label: {
                     label(option)
-                        .font(.system(size: 11, weight: active ? .semibold : .medium))
+                        .font(.system(size: 12, weight: active ? .semibold : .medium))
                         .lineLimit(1)
                         .foregroundStyle(active ? Color.primary : Color.secondary)
                         .padding(.horizontal, 10)
@@ -319,7 +334,7 @@ private struct MuxaFieldChrome: ViewModifier {
     func body(content: Content) -> some View {
         content
             .textFieldStyle(.plain)
-            .font(.system(size: 12))
+            .font(.system(size: 13))
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
             .background(
@@ -410,7 +425,7 @@ struct MuxaFilterField<Trailing: View>: View {
                 .foregroundStyle(.secondary)
             TextField(prompt, text: $text)
                 .textFieldStyle(.plain)
-                .font(.system(size: 12))
+                .font(.system(size: 13))
                 .focused(focused)
             if !text.isEmpty {
                 Button {

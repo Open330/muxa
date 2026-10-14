@@ -595,15 +595,13 @@ mod tests {
     /// and only the allowlisted environment.
     #[tokio::test]
     async fn local_execution_runs_the_binary_with_pinned_socket_and_env() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("muxa");
-        std::fs::write(
+        crate::test_support::write_executable(
             &script,
             "#!/bin/sh\nprintf '{\"host\":\"native\",\"agent\":\"claude\",\"placement\":\"session\",\"session\":\"%s|%s|%s\",\"cwd\":\"/srv/app\"}' \"$MUXA_SOCKET\" \"$TERM\" \"$*\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            0o755,
+        );
         let mut native = request(AgentPlacement::Native);
         native.env.insert("TERM".into(), "xterm-256color".into());
         let result = execute_local(&script, &native, Some(Path::new("/tmp/app.sock")))

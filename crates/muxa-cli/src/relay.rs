@@ -386,11 +386,11 @@ async fn handle_request(
             let socket = pane.window.session.endpoint.socket.clone();
             let pane_id = pane.pane_id.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                if !backend.send_text_on(Some(&socket), &pane_id, &text) {
+                if !backend.send_prompt_text_on(Some(&socket), &pane_id, &text) {
                     return None;
                 }
                 let submitted = if submit {
-                    std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
+                    std::thread::sleep(muxa::backend::prompt_submit_grace(&pane_id));
                     backend.send_text_on(Some(&socket), &pane_id, "\r")
                 } else {
                     false
@@ -398,6 +398,7 @@ async fn handle_request(
                 Some(muxa::ipc::SendPromptOutcome {
                     sent: true,
                     submitted,
+                    submission_confirmed: None,
                 })
             })
             .await

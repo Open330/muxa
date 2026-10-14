@@ -54,7 +54,7 @@ struct InboxAgentRequestCard: View {
                     .foregroundStyle(agentStateColor(state))
                 if let since = participant.agent.stateEnteredAt {
                     Text("since \(compactTimestamp(since))")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 8)
@@ -75,13 +75,13 @@ struct InboxAgentRequestCard: View {
             } else {
                 Text("No request text was retained for this agent.")
                     .font(.subheadline)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
             }
 
             if !requests.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Open requests")
-                        .font(.caption.weight(.semibold))
+                        .font(MuxaType.detail.weight(.semibold))
                         .foregroundStyle(.secondary)
                     ForEach(requests) { message in
                         InboxAgentRequestRow(message: message)
@@ -92,7 +92,7 @@ struct InboxAgentRequestCard: View {
             if let prompt = nonEmpty(participant.agent.lastPrompt) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Latest prompt")
-                        .font(.caption.weight(.semibold))
+                        .font(MuxaType.detail.weight(.semibold))
                         .foregroundStyle(.secondary)
                     MarkdownContent(source: prompt, lineLimit: 4)
                 }
@@ -145,19 +145,19 @@ private struct InboxAgentRequestRow: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 7) {
                 Text(request.kind.capitalized)
-                    .font(.caption.weight(.semibold))
+                    .font(MuxaType.detail.weight(.semibold))
                 Text(statusText)
-                    .font(.caption2.weight(.medium))
+                    .font(MuxaType.meta.weight(.medium))
                     .foregroundStyle(statusColor)
                 if message.hasUnreadReply {
                     Label("New reply", systemImage: "arrowshape.turn.up.left.fill")
-                        .font(.caption2)
+                        .font(MuxaType.meta)
                         .foregroundStyle(.orange)
                 }
                 Spacer(minLength: 4)
                 Text(compactTimestamp(message.activityAt))
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.meta.monospaced())
+                    .foregroundStyle(.secondary)
             }
             MarkdownContent(source: request.body, lineLimit: 3)
             if let reply = request.reply, !reply.body.isEmpty {
