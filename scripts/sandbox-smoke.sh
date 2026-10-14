@@ -114,11 +114,21 @@ else
   # The whole point of the sandbox: a consumer that evaluates `env` must not be
   # able to reach the caller's daemon or the caller's tmux server.
   isolation=$(
+    # A consumer may inherit an explicit multi-host selection. Sandbox wins.
+    export MUXA_HOSTS=tmux,cmux,herdr
+    export MUXA_HOST=cmux
     eval "$env_output"
+    printf 'hosts=%s/%s\n' "$MUXA_HOSTS" "$MUXA_HOST"
+    printf 'server_hosts=%s\n' "$(tmux show-environment -g MUXA_HOSTS)"
     printf 'socket=%s\n' "$MUXA_SOCKET"
     printf 'sessions=%s\n' "$(tmux list-sessions -F '#{session_name}' 2>/dev/null | tr '\n' ',')"
     printf 'agents=%s\n' "$(muxa status 2>&1 | head -1)"
   )
+
+  case "$isolation" in
+    *'hosts=tmux/tmux'*'server_hosts=MUXA_HOSTS=tmux'*) ok "sandbox pins both consumers and pane hosts to tmux" ;;
+    *) no "sandbox pins both consumers and pane hosts to tmux" "$isolation" ;;
+  esac
 
   case "$isolation" in
     *"socket=$ROOT/muxad.sock"*) ok "MUXA_SOCKET points at the sandbox" ;;

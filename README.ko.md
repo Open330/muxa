@@ -25,13 +25,28 @@ Codex, Gemini CLI 세션을 지켜보다가 어느 에이전트가 나를 기다
 
 ```bash
 brew install open330/tap/muxa
-muxa init      # tmux와 에이전트 hook을 연결하고 데몬을 시작합니다
-muxa attend    # 가장 오래 기다린 에이전트로 이동합니다
+muxa           # 기존 에이전트 보기, 새 에이전트 시작, 데모 체험
 ```
 
 <div align="center">
   <img src="docs/demo.gif" alt="muxa watch에서 여러 agent의 상태를 한눈에 확인하고 필요한 agent로 이동하는 모습" width="900" />
 </div>
+
+`muxa`는 추적 중인 에이전트가 있으면 바로 watch를 엽니다. 처음에는 설치된
+에이전트를 골라 현재 폴더에서 시작하거나 기존 터미널을 볼 수 있습니다. 새
+에이전트의 hook·tmux 연결은 변경 미리보기와 백업을 거쳐 설정하며 MCP는 필요하지
+않습니다. 설정을 취소하면 에이전트도 실행하지 않습니다.
+
+먼저 핵심 기능만 체험하려면 tmux 밖 터미널에서 다음을 실행하세요. 연습용
+에이전트가 준비된 상태에서 **watch 열기 → 상태 확인 → 기다리는 에이전트로 이동**을
+3단계로 경험합니다. 실제 에이전트/API를 호출하지 않고 종료 시 sandbox를 삭제합니다.
+
+```bash
+muxa onboard --quick --lang ko
+```
+
+기존 16단계 상세 학습은 `muxa onboard`, 문서 체험은
+`muxa onboard --quick --print --lang ko`로 볼 수 있습니다.
 
 설치 전에 먼저 둘러보고 싶다면 일회용 tmux server에서 전체 tour를 체험할 수
 있습니다. script가 checksum을 검증한 release 바이너리로 진짜 `muxa onboard`를

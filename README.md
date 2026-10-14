@@ -25,8 +25,7 @@ Requires tmux 3.x (or herdr) and a Unix-like OS.
 
 ```bash
 brew install open330/tap/muxa
-muxa init      # wires tmux and agent hooks, starts the daemon
-muxa attend    # jump to the agent that has waited longest
+muxa           # view existing agents, start one here, or try the demo
 ```
 
 <div align="center">
@@ -34,6 +33,22 @@ muxa attend    # jump to the agent that has waited longest
   <br />
   <sub><code>muxa watch</code> — the fleet, the inspector, the swarm view, and <code>muxa attend</code>.</sub>
 </div>
+
+`muxa` opens watch directly when agents are already tracked. Otherwise, choose
+an installed agent to start in the current folder, view existing terminals, or
+try the demo. Starting an agent previews and backs up the hook/tmux changes;
+cancelling setup also cancels the launch. MCP is not required.
+
+Try the core workflow outside tmux:
+
+```bash
+muxa onboard --quick
+```
+
+The three-step demo prepares practice agents, then lets you open watch, inspect
+their states, and attend the waiting agent. It makes no agent API calls and
+removes its private sandbox on exit. `muxa onboard` keeps the full 16-step tour;
+`muxa onboard --quick --print` shows the short written guide.
 
 Not ready to install? Take the full tour in a throwaway tmux server — the
 script runs the real `muxa onboard` from a checksum-verified copy of the

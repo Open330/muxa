@@ -15,6 +15,7 @@
 #   MUXA_SOCKET        private daemon socket
 #   MUXA_CONFIG        private config
 #   XDG_DATA_HOME      private state, history, activity, mailbox
+#   MUXA_HOSTS/HOST    tmux only; prevents discovery of real cmux/rmux/herdr
 #   MUXA_TMUX_SOCKET   pins the pane scan *and* hook ingest to one tmux server
 #   PATH               a `tmux` shim so child processes land on that server too
 #
@@ -339,6 +340,10 @@ DEFAULT_CONFIG=$(cat <<'TOML'
 [discovery]
 enabled = false
 
+# Practice agents report hooks; never import the caller's Codex sessions.
+[reconciler]
+codex_rollout_enabled = false
+
 [collaboration]
 enabled = true
 wake = 'never'
@@ -429,6 +434,8 @@ EOF
   local tmux_socket
   tmux_socket=$(tm display-message -p '#{socket_path}')
   [ -n "$tmux_socket" ] || die 'could not read the sandbox tmux socket path'
+  tm set-environment -g MUXA_HOSTS tmux
+  tm set-environment -g MUXA_HOST tmux
   tm set-environment -g MUXA_TMUX_SOCKET "$tmux_socket"
   tm set-environment -g MUXA_SOCKET "$SB_SOCKET"
   tm set-environment -g MUXA_CONFIG "$SB_CONFIG"
@@ -470,6 +477,8 @@ cmd_daemon() {
   rm -f "$SB_SOCKET" "$SB_LOG"
   # `nohup` so the daemon outlives this invocation — a consumer that sets up now
   # and runs later would otherwise be left with a fixture and no daemon.
+  MUXA_HOSTS=tmux \
+  MUXA_HOST=tmux \
   MUXA_SOCKET="$SB_SOCKET" \
   MUXA_CONFIG="$SB_CONFIG" \
   XDG_DATA_HOME="$SB_DATA" \
@@ -512,6 +521,8 @@ cmd_env() {
   done
 
   cat <<EOF
+export MUXA_HOSTS='tmux'
+export MUXA_HOST='tmux'
 export MUXA_SOCKET='$SB_SOCKET'
 export MUXA_CONFIG='$SB_CONFIG'
 export XDG_DATA_HOME='$SB_DATA'

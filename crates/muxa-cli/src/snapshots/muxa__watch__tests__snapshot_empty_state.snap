@@ -7,9 +7,9 @@ j/k move  ·  / filter  ·  : commands  ·  ? help
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ┌ Agents ──────────────────────────────────────────────────────────────────────────────────────────┐
 │                                                                                                  │
-│                                                                                                  │
-│                                        No agents tracked.                                        │
-│                       Start an agent, or run `muxa doctor` to check setup.                       │
+│                                   Start your first coding agent                                  │
+│                          Enter / n: start an agent in the current folder                         │
+│                  Already running one? r: refresh · muxa doctor: check detection                  │
 │                                                                                                  │
 │                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘

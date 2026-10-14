@@ -12,7 +12,15 @@ use std::fmt::Write as _;
 pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     (
         "Everyday",
-        &["status", "watch", "dashboard", "attend", "peek", "recap"],
+        &[
+            "start",
+            "status",
+            "watch",
+            "dashboard",
+            "attend",
+            "peek",
+            "recap",
+        ],
     ),
     ("Collaborate", &["peers", "msg", "identity", "ask", "skill"]),
     ("Work & layout", &["work", "workspace", "window", "agent"]),
@@ -147,6 +155,7 @@ mod tests {
         crate::Args::try_parse_from(argv)
             .unwrap_or_else(|error| panic!("{argv:?}: {error}"))
             .cmd
+            .expect("explicit subcommand")
     }
 
     /// Commands that moved under a parent keep their old top-level name as a

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Run `muxa` with no subcommand to open tracked agents or choose an installed
+  agent to start in the current folder. First-agent setup previews the required
+  hook and tmux changes; cancelling also cancels the launch. MCP is optional.
+- `muxa onboard --quick` prepares practice agents for a three-step watch and
+  attend demo without agent API calls. The empty watch screen offers agent
+  creation and, outside tmux, the short demo.
+
 ### Changed
 
 - Status rows show what an injected prompt is instead of its markup:
@@ -18,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the previous one-row-per-agent table; `--json` is unchanged.
 
 ### Fixed
+
+- Onboarding sandboxes pin discovery to their own tmux server and disable
+  importing the caller's Codex sessions. Explicit XDG directory overrides now
+  apply on macOS too, keeping sandbox state and history out of user data.
 
 - `muxa stats` splits an interval that crosses midnight between its days.
   Before, a state held overnight (an agent left waiting on a question) was

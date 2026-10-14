@@ -28,6 +28,7 @@ mod peek;
 mod relay;
 mod reload;
 mod stale_agents;
+mod start;
 mod stats;
 mod theme;
 mod time_range;
@@ -87,11 +88,13 @@ struct Args {
     config: Option<PathBuf>,
 
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
+    /// Open Muxa: find running agents, start one, or try the short demo.
+    Start,
     /// List active agents as a human-readable table.
     Status {
         /// One-shot visual theme override.
@@ -1056,7 +1059,7 @@ fn run_workspace_cmd(action: WorkspaceCmd) -> Result<()> {
 
 fn collaboration_client_kind(command: &Cmd) -> CollaborationClientKind {
     match command {
-        Cmd::Watch { .. } => CollaborationClientKind::Watch,
+        Cmd::Start | Cmd::Watch { .. } => CollaborationClientKind::Watch,
         Cmd::Mcp => CollaborationClientKind::Mcp,
         Cmd::Dashboard(_) => CollaborationClientKind::Dashboard,
         _ => CollaborationClientKind::Cli,
@@ -1364,15 +1367,16 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
+    let cmd = args.cmd.unwrap_or(Cmd::Start);
     if let Cmd::Agent {
         action: AgentCmd::Move(move_args),
-    } = &args.cmd
+    } = &cmd
     {
         return agent_move::run(move_args.clone(), args.socket.clone()).await;
     }
     if let Cmd::Window {
         action: WindowCmd::Move(move_args),
-    } = &args.cmd
+    } = &cmd
     {
         return agent_move::run_window(move_args.clone(), args.socket.clone()).await;
     }
@@ -1380,13 +1384,17 @@ async fn main() -> Result<()> {
         popup: true,
         caller_client,
         ..
-    } = &args.cmd
+    } = &cmd
     {
         return mux_control::watch_popup(caller_client.as_deref());
     }
+    if matches!(cmd, Cmd::Start) && !start::interactive() {
+        start::print_help();
+        return Ok(());
+    }
     // Onboarding must remain available even when config.toml is malformed;
     // it is a recovery/learning surface and does not need daemon state.
-    if let Cmd::Onboard(onboard_args) = &args.cmd {
+    if let Cmd::Onboard(onboard_args) = &cmd {
         return onboarding::run(onboard_args.clone());
     }
     let config_path = args.config.clone().or_else(paths::default_config_file);
@@ -1400,7 +1408,7 @@ async fn main() -> Result<()> {
         // session — with nothing on screen naming the cause. Degrade to
         // defaults and put the reason on stderr, never stdout (stdout is
         // the verdict channel).
-        Err(e) if matches!(args.cmd, Cmd::Hook { .. }) => {
+        Err(e) if matches!(cmd, Cmd::Hook { .. }) => {
             eprintln!("muxa: config unreadable ({e:#}); this hook is using defaults");
             Config::default()
         }
@@ -1411,10 +1419,11 @@ async fn main() -> Result<()> {
         .socket
         .or_else(|| cfg.socket.clone())
         .unwrap_or_else(paths::default_socket);
-    let client = Client::new(socket.clone())
-        .with_collaboration_client_kind(collaboration_client_kind(&args.cmd));
+    let client =
+        Client::new(socket.clone()).with_collaboration_client_kind(collaboration_client_kind(&cmd));
 
-    match args.cmd {
+    match cmd {
+        Cmd::Start => start::run(&client, cfg, socket, config_path).await,
         Cmd::Status { theme, flat, json } => cmd_status(&client, &cfg, theme, flat, json).await,
         Cmd::StatusLine {
             pane,
@@ -2685,7 +2694,7 @@ async fn cmd_sync(client: &Client) -> Result<()> {
 /// One-shot per-invocation overrides for `muxa watch`, bundled so the
 /// argument list stays a description of *this run* rather than a flat
 /// parade of options.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct WatchInvocation {
     pub(crate) include_paneless: bool,
     pub(crate) view: Option<WatchViewArg>,
@@ -2799,7 +2808,7 @@ pub(crate) async fn cmd_watch(
         skills: message_skills,
         collaboration_scope: cfg.collaboration.scope,
     };
-    if let Some(target) = watch::run(
+    if let Some(target) = Box::pin(watch::run(
         client,
         watch_cfg,
         message_composer,
@@ -2807,10 +2816,14 @@ pub(crate) async fn cmd_watch(
         activity_path.clone(),
         config_path,
         caller_pane,
-    )
+    ))
     .await?
     {
         match target {
+            watch::WatchOpenTarget::Demo => onboarding::run(onboarding::Args {
+                quick: true,
+                ..Default::default()
+            })?,
             watch::WatchOpenTarget::Moved(key) => agent_move::follow(&key)?,
             watch::WatchOpenTarget::TopologyPane(key) => {
                 jump_to_topology_pane_logged(&key, activity_path.as_deref()).await;
@@ -4581,7 +4594,7 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(
-            args.cmd,
+            args.cmd.expect("explicit subcommand"),
             Cmd::Msg {
                 action: MsgCmd::Wait {
                     body: true,
@@ -4830,7 +4843,7 @@ mod tests {
             detach,
             json,
             ..
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected ask command");
         };
@@ -4845,13 +4858,16 @@ mod tests {
     #[test]
     fn ask_new_starts_a_fresh_conversation_only_when_asked() {
         let fresh = Args::try_parse_from(["muxa", "ask", "--new", "start over"]).unwrap();
-        let Cmd::Ask { new, prompt, .. } = fresh.cmd else {
+        let Cmd::Ask { new, prompt, .. } = fresh.cmd.expect("explicit subcommand") else {
             panic!("expected ask command");
         };
         assert!(new);
         assert_eq!(prompt.as_deref(), Some("start over"));
         let resumed = Args::try_parse_from(["muxa", "ask", "continue"]).unwrap();
-        assert!(matches!(resumed.cmd, Cmd::Ask { new: false, .. }));
+        assert!(matches!(
+            resumed.cmd.expect("explicit subcommand"),
+            Cmd::Ask { new: false, .. }
+        ));
     }
 
     #[test]
@@ -4900,7 +4916,7 @@ mod tests {
             .chain(["anthropic-work", "openai_personal"].iter())
         {
             let args = Args::try_parse_from(["muxa", "ask", "--agent", id, "hello"]).unwrap();
-            let Cmd::Ask { agent, .. } = args.cmd else {
+            let Cmd::Ask { agent, .. } = args.cmd.expect("explicit subcommand") else {
                 panic!("expected ask command");
             };
             assert_eq!(agent.as_deref(), Some(*id));
@@ -4911,7 +4927,7 @@ mod tests {
             action: Some(AskCmd::Providers { json }),
             prompt: None,
             ..
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected ask providers");
         };
@@ -4942,7 +4958,7 @@ mod tests {
                         },
                 }),
             ..
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected ask provider set");
         };
@@ -4953,7 +4969,7 @@ mod tests {
         assert!(clear_api_key_env);
         let args = Args::try_parse_from(["muxa", "ask", "provider", "use", "codex"]).unwrap();
         assert!(matches!(
-            args.cmd,
+            args.cmd.expect("explicit subcommand"),
             Cmd::Ask {
                 action: Some(AskCmd::Provider {
                     action: AskProviderCmd::Use { ref id, json: false },
@@ -5005,7 +5021,7 @@ mod tests {
                         },
                 }),
             ..
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected ask provider add");
         };
@@ -5038,7 +5054,7 @@ mod tests {
                     action: AskProviderCmd::Remove { id, json },
                 }),
             ..
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected ask provider remove");
         };
@@ -5051,7 +5067,7 @@ mod tests {
             action: None,
             prompt,
             ..
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected a plain ask");
         };
@@ -5074,7 +5090,7 @@ mod tests {
         .unwrap();
         let Cmd::Work {
             action: WorkCmd::Compose(compose),
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected work compose");
         };
@@ -5188,7 +5204,7 @@ mod tests {
             let cli = Args::try_parse_from(args).unwrap();
             let Cmd::Msg {
                 action: MsgCmd::Send { notify, .. },
-            } = cli.cmd
+            } = cli.cmd.expect("explicit subcommand")
             else {
                 panic!("expected message send");
             };
@@ -5428,7 +5444,7 @@ mod tests {
             let args = Args::try_parse_from(["muxa", "watch", "--sort", raw]).unwrap();
             let Cmd::Watch {
                 sort: Some(sort), ..
-            } = args.cmd
+            } = args.cmd.expect("explicit subcommand")
             else {
                 panic!("expected watch sort arg");
             };
@@ -5468,7 +5484,7 @@ mod tests {
             layout: Some(WatchLayoutArg::Tree),
             collab_layout: Some(collab_layout),
             ..
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected independent topology and collaboration layouts");
         };
@@ -5485,7 +5501,10 @@ mod tests {
             "ask codex to review our changes",
         ])
         .unwrap();
-        assert!(matches!(args.cmd, Cmd::Skill(_)));
+        assert!(matches!(
+            args.cmd.expect("explicit subcommand"),
+            Cmd::Skill(_)
+        ));
         assert!(Args::try_parse_from(["muxa", "skill", "list"]).is_ok());
         assert!(Args::try_parse_from(["muxa", "skill", "remove", "agent-review"]).is_ok());
     }
@@ -5535,7 +5554,7 @@ mod tests {
                     json,
                     ..
                 },
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected msg list");
         };
@@ -5588,7 +5607,7 @@ mod tests {
                     links,
                     ..
                 },
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected msg send");
         };
@@ -5720,7 +5739,7 @@ mod tests {
         .unwrap();
         let Cmd::Agent {
             action: AgentCmd::Start(start),
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected agent start");
         };
@@ -5753,7 +5772,7 @@ mod tests {
         .unwrap();
         let Cmd::Work {
             action: WorkCmd::Start(start),
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected work start");
         };
@@ -5785,7 +5804,7 @@ mod tests {
         .unwrap();
         let Cmd::Work {
             action: WorkCmd::Up(up),
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected work up");
         };
@@ -5805,7 +5824,7 @@ mod tests {
             Args::try_parse_from(["muxa", "work", "up", "cal-1234", "--prompt", "do it"]).unwrap();
         let Cmd::Work {
             action: WorkCmd::Up(up),
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected work up");
         };
@@ -5817,7 +5836,7 @@ mod tests {
         let args = Args::try_parse_from(["muxa", "work", "down", "cal-1234", "-y"]).unwrap();
         let Cmd::Work {
             action: WorkCmd::Down(down),
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected work down");
         };
@@ -5839,7 +5858,7 @@ mod tests {
         .unwrap();
         let Cmd::Window {
             action: WindowCmd::Rename(rename),
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected window rename");
         };
@@ -5852,7 +5871,7 @@ mod tests {
         let args = Args::try_parse_from(["muxa", "window", "rename", "--window", "@42", "--auto"])
             .unwrap();
         assert!(matches!(
-            args.cmd,
+            args.cmd.expect("explicit subcommand"),
             Cmd::Window {
                 action: WindowCmd::Rename(tmux_work::WindowRenameArgs { auto: true, .. })
             }
@@ -5874,7 +5893,7 @@ mod tests {
         .unwrap();
         let Cmd::Window {
             action: WindowCmd::Rename(rename),
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected buffered window rename");
         };
@@ -5887,7 +5906,7 @@ mod tests {
         let args = Args::try_parse_from(["muxa", "workspace", "show", "muxa", "--json"]).unwrap();
         let Cmd::Workspace {
             action: WorkspaceCmd::Show(show),
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected workspace show");
         };
@@ -5909,7 +5928,7 @@ mod tests {
         .unwrap();
         let Cmd::Agent {
             action: AgentCmd::Control(control),
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected agent control");
         };
@@ -5929,7 +5948,7 @@ mod tests {
         .unwrap();
         let Cmd::Agent {
             action: AgentCmd::Control(control),
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("expected native agent control");
         };
@@ -5950,7 +5969,7 @@ mod tests {
         .is_err());
 
         let args = Args::try_parse_from(["muxa", "onboard", "--print", "--no-quiz"]).unwrap();
-        let Cmd::Onboard(onboard) = args.cmd else {
+        let Cmd::Onboard(onboard) = args.cmd.expect("explicit subcommand") else {
             panic!("expected onboard");
         };
         assert!(onboard.print);
@@ -5958,6 +5977,25 @@ mod tests {
         assert_eq!(onboard.tour, onboarding::Tour::Live);
         assert!(Args::try_parse_from(["muxa", "onboard", "--tour", "live"]).is_ok());
         assert!(Args::try_parse_from(["muxa", "onboard", "--tour", "simulated"]).is_err());
+    }
+
+    #[test]
+    fn bare_cli_and_explicit_start_share_the_entry_point() {
+        assert!(Args::try_parse_from(["muxa"]).unwrap().cmd.is_none());
+        assert!(matches!(
+            Args::try_parse_from(["muxa", "start"]).unwrap().cmd,
+            Some(Cmd::Start)
+        ));
+        let args = Args::try_parse_from(["muxa", "onboard", "--quick", "--print"]).unwrap();
+        assert!(matches!(
+            args.cmd,
+            Some(Cmd::Onboard(onboarding::Args {
+                quick: true,
+                print: true,
+                ..
+            }))
+        ));
+        assert!(Args::try_parse_from(["muxa", "onboard", "--quick", "--tour", "live"]).is_err());
     }
 
     #[test]
@@ -5991,7 +6029,7 @@ mod tests {
             let args = Args::try_parse_from(["muxa", "watch", "--theme", raw]).unwrap();
             let Cmd::Watch {
                 theme: Some(theme), ..
-            } = args.cmd
+            } = args.cmd.expect("explicit subcommand")
             else {
                 panic!("expected watch theme arg");
             };
@@ -6004,7 +6042,7 @@ mod tests {
         for command in ["status", "stats", "timeline", "activity"] {
             let args = Args::try_parse_from(["muxa", command, "--theme", "high-contrast"])
                 .unwrap_or_else(|err| panic!("{command} should accept --theme: {err}"));
-            let theme = match args.cmd {
+            let theme = match args.cmd.expect("explicit subcommand") {
                 Cmd::Status {
                     theme: Some(theme), ..
                 } => theme,
@@ -6021,7 +6059,7 @@ mod tests {
     fn status_json_cli_flag_parses_and_conflicts_with_theme() {
         let args = Args::try_parse_from(["muxa", "status", "--json"]).unwrap();
         assert!(matches!(
-            args.cmd,
+            args.cmd.expect("explicit subcommand"),
             Cmd::Status {
                 json: true,
                 theme: None,
@@ -6032,7 +6070,8 @@ mod tests {
         assert!(matches!(
             Args::try_parse_from(["muxa", "status", "--flat"])
                 .unwrap()
-                .cmd,
+                .cmd
+                .expect("explicit subcommand"),
             Cmd::Status { flat: true, .. }
         ));
         assert!(Args::try_parse_from(["muxa", "status", "--json", "--flat"]).is_err());

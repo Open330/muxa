@@ -352,7 +352,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.hosts.len(), 1);
-        assert_eq!(report.hosts[0].control_socket, socket);
+        assert_eq!(
+            report.hosts[0].control_socket,
+            socket.canonicalize().unwrap()
+        );
         assert!(is_control_socket(&report.hosts[0].control_socket));
     }
 

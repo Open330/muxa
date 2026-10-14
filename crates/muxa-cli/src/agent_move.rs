@@ -1993,7 +1993,7 @@ mod tests {
         assert_eq!(args.socket.unwrap().to_str(), Some("/tmp/daemon"));
         let crate::Cmd::Agent {
             action: crate::AgentCmd::Move(args),
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("move expected")
         };
@@ -2017,7 +2017,7 @@ mod tests {
         .unwrap();
         let crate::Cmd::Window {
             action: crate::WindowCmd::Move(args),
-        } = args.cmd
+        } = args.cmd.expect("explicit subcommand")
         else {
             panic!("window move expected")
         };
