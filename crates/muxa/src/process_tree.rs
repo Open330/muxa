@@ -107,6 +107,15 @@ pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummar
     out
 }
 
+/// A running agent explicitly started on a known session, and the one pane it
+/// runs in.
+#[derive(Debug, Clone)]
+pub struct ResumeBinding {
+    pub session_id: String,
+    pub kind: AgentKind,
+    pub pane: PaneInfo,
+}
+
 /// Live Codex evidence from one walk of every pane's process tree.
 #[derive(Debug, Default)]
 pub struct CodexPaneScan {
@@ -114,7 +123,7 @@ pub struct CodexPaneScan {
     /// the one pane each runs in. A multiplexer restart renumbers panes and
     /// `muxa reload` relaunches agents this way, so this is how a registry row
     /// finds its new pane before the agent's next hook.
-    pub resume_bindings: Vec<(String, PaneInfo)>,
+    pub resume_bindings: Vec<ResumeBinding>,
     /// Panes running an interactive Codex, resumed or fresh. A thread behind
     /// the shared app-server reports no pane, and the screen detector can
     /// claim the pane's placeholder row as `Unknown`, so this — not a registry
@@ -171,14 +180,16 @@ fn is_interactive_codex(process: &ProcessInfo) -> bool {
 
 fn unique_resume_bindings<'a>(
     scanned: impl Iterator<Item = (&'a PaneInfo, Vec<ProcessInfo>)>,
-) -> Vec<(String, PaneInfo)> {
-    let mut candidates: HashMap<String, Vec<PaneInfo>> = HashMap::new();
+) -> Vec<ResumeBinding> {
+    let mut candidates: HashMap<String, (AgentKind, Vec<PaneInfo>)> = HashMap::new();
     for (pane, processes) in scanned {
         for process in processes {
-            let Some(sid) = resume_id(&process) else {
+            let (Some(sid), Some(kind)) = (resume_id(&process), agent_kind(&process)) else {
                 continue;
             };
-            let matches = candidates.entry(sid.to_owned()).or_default();
+            let (_, matches) = candidates
+                .entry(sid.to_owned())
+                .or_insert_with(|| (kind, Vec::new()));
             if !matches
                 .iter()
                 .any(|p| p.pane_id == pane.pane_id && p.socket == pane.socket)
@@ -189,7 +200,13 @@ fn unique_resume_bindings<'a>(
     }
     candidates
         .into_iter()
-        .filter_map(|(sid, mut panes)| (panes.len() == 1).then(|| (sid, panes.remove(0))))
+        .filter_map(|(session_id, (kind, mut panes))| {
+            (panes.len() == 1).then(|| ResumeBinding {
+                session_id,
+                kind,
+                pane: panes.remove(0),
+            })
+        })
         .collect()
 }
 
@@ -499,7 +516,8 @@ mod tests {
         let bindings = unique_resume_bindings(std::iter::once((&a, processes.clone())));
         assert!(processes.iter().all(is_interactive_codex));
         assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].0, sid);
+        assert_eq!(bindings[0].session_id, sid);
+        assert_eq!(bindings[0].kind, AgentKind::Codex);
         let b = a.clone();
         a.socket = Some("other-server".into());
         assert!(

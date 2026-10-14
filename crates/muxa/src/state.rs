@@ -2278,11 +2278,15 @@ impl Store {
     /// Repair a binding using an explicit running resume (`codex resume
     /// <session>`, `claude --resume <session>`) beneath a known pane. This does
     /// not manufacture user activity.
-    pub(crate) async fn rebind_resumes(&self, bindings: &[(String, PaneInfo)]) -> usize {
+    pub(crate) async fn rebind_resumes(
+        &self,
+        bindings: &[crate::process_tree::ResumeBinding],
+    ) -> usize {
         let mut agents = self.agents.write().await;
         let mut changed = 0;
-        for (sid, pane) in bindings {
-            let Some(agent) = agents.get_mut(sid) else {
+        for binding in bindings {
+            let pane = &binding.pane;
+            let Some(agent) = agents.get_mut(&binding.session_id) else {
                 continue;
             };
             if !matches!(agent.kind, AgentKind::Codex | AgentKind::ClaudeCode)
@@ -2304,6 +2308,53 @@ impl Store {
             self.changes.send_replace(());
         }
         changed
+    }
+
+    /// Register a running resumed agent that has no row at all. A multiplexer
+    /// restart reaps the rows of panes that disappeared, and the agents that
+    /// `muxa reload` relaunched by resume id then have nothing for
+    /// [`Self::rebind_resumes`] to move: until their next hook they show only
+    /// as uncorrelated placeholders, and collaboration cannot identify them.
+    /// The explicit resume id is the session's own id, so the row is minted
+    /// under it (a real `Started`, which also retires the pane's placeholder).
+    /// A pane that a live real session already holds is left alone.
+    pub(crate) async fn adopt_unrowed_resumes(
+        &self,
+        bindings: &[crate::process_tree::ResumeBinding],
+    ) -> usize {
+        let adoptable: Vec<&crate::process_tree::ResumeBinding> = {
+            let agents = self.agents.read().await;
+            bindings
+                .iter()
+                .filter(|b| matches!(b.kind, AgentKind::Codex | AgentKind::ClaudeCode))
+                .filter(|b| !agents.contains_key(&b.session_id))
+                .filter(|b| {
+                    !agents.values().any(|a| {
+                        a.state != AgentState::Stopped
+                            && !is_synthetic(&a.session_id)
+                            && same_pane_identity(a, &b.pane.pane_id, b.pane.socket.as_deref())
+                    })
+                })
+                .collect()
+        };
+        let at = OffsetDateTime::now_utc();
+        for binding in &adoptable {
+            let cwd =
+                (!binding.pane.current_path.is_empty()).then(|| binding.pane.current_path.clone());
+            self.apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: binding.kind,
+                    session_id: binding.session_id.clone(),
+                    surface: None,
+                    pane: Some(binding.pane.pane_id.clone()),
+                    tmux_socket: binding.pane.socket.clone(),
+                    cwd,
+                },
+                at,
+            })
+            .await;
+        }
+        adoptable.len()
     }
 
     /// Adopt paneless codex hook rows onto the tmux/herdr pane they actually
@@ -5663,7 +5714,11 @@ mod tests {
         let mut actual = pane("%181");
         actual.session = "muxa".into();
         actual.socket = Some("default".into());
-        let bindings = vec![(sid.to_owned(), actual)];
+        let bindings = vec![crate::process_tree::ResumeBinding {
+            session_id: sid.to_owned(),
+            kind: AgentKind::Codex,
+            pane: actual,
+        }];
         assert_eq!(store.rebind_resumes(&bindings).await, 1);
         assert!(changes.has_changed().unwrap());
         changes.borrow_and_update();
@@ -5704,8 +5759,16 @@ mod tests {
         store.apply(&started(AgentKind::ClaudeCode, claude)).await;
         store.apply(&started(AgentKind::GeminiCli, gemini)).await;
         let bindings = vec![
-            (claude.to_owned(), pane("rmux:%8")),
-            (gemini.to_owned(), pane("rmux:%9")),
+            crate::process_tree::ResumeBinding {
+                session_id: claude.to_owned(),
+                kind: AgentKind::ClaudeCode,
+                pane: pane("rmux:%8"),
+            },
+            crate::process_tree::ResumeBinding {
+                session_id: gemini.to_owned(),
+                kind: AgentKind::GeminiCli,
+                pane: pane("rmux:%9"),
+            },
         ];
         assert_eq!(store.rebind_resumes(&bindings).await, 1);
         let snap = store.snapshot().await;
@@ -5716,6 +5779,64 @@ mod tests {
         };
         assert_eq!(pane_of(claude).as_deref(), Some("rmux:%8"));
         assert_eq!(pane_of(gemini).as_deref(), Some("rmux:%66"));
+    }
+
+    /// After a multiplexer restart reaped its row, a resumed agent that has
+    /// fired no hook yet is registered under its own resume id, replacing the
+    /// pane's placeholder. A pane held by another live session is left alone.
+    #[tokio::test]
+    async fn a_running_resume_with_no_row_is_registered_under_its_own_id() {
+        let store = Store::shared();
+        let at = OffsetDateTime::now_utc();
+        let started = |kind, sid: &str, pane: &str| AgentEvent::Started {
+            id: AgentId {
+                kind,
+                session_id: sid.into(),
+                surface: None,
+                pane: Some(pane.into()),
+                tmux_socket: None,
+                cwd: None,
+            },
+            at,
+        };
+        // Discovery's placeholder for the resumed pane, and a live session
+        // that owns another pane.
+        store
+            .apply(&started(AgentKind::Codex, "synthetic-%30", "rmux:%30"))
+            .await;
+        store
+            .apply(&started(AgentKind::ClaudeCode, "owner", "rmux:%31"))
+            .await;
+        let binding = |sid: &str, kind, pane_id: &str| crate::process_tree::ResumeBinding {
+            session_id: sid.into(),
+            kind,
+            pane: pane(pane_id),
+        };
+        let thread = "01a12f38-89b3-7370-b0e3-39875fb23fc2";
+        let bindings = vec![
+            binding(thread, AgentKind::Codex, "rmux:%30"),
+            binding(
+                "01a12f38-0000-7000-8000-000000000001",
+                AgentKind::Codex,
+                "rmux:%31",
+            ),
+        ];
+        assert_eq!(store.adopt_unrowed_resumes(&bindings).await, 1);
+        let snap = store.snapshot().await;
+        let on = |pane: &str| {
+            snap.iter()
+                .filter(|a| a.pane.as_deref() == Some(pane))
+                .map(|a| a.session_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(on("rmux:%30"), [thread], "the placeholder is replaced");
+        assert_eq!(
+            on("rmux:%31"),
+            ["owner"],
+            "a live session's pane is not taken"
+        );
+        // Once registered there is nothing left to adopt.
+        assert_eq!(store.adopt_unrowed_resumes(&bindings).await, 0);
     }
 
     fn pane(id: &str) -> PaneInfo {

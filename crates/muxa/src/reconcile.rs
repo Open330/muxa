@@ -589,17 +589,25 @@ impl<L: LivenessSource> Reconciler<L> {
         // ancestry outrank the stored binding, so an idle resumed agent is not
         // left on an id that now belongs to another pane until its next hook.
         let mut codex_hosts = Vec::new();
-        if !union_panes.is_empty()
-            && self.store.snapshot().await.iter().any(|agent| {
-                matches!(agent.kind, AgentKind::Codex | AgentKind::ClaudeCode)
-                    && !agent.session_id.starts_with("synthetic-")
-            })
-        {
+        // Not gated on an existing real row: right after a multiplexer
+        // restart the resumed agents may have none, and adopting them is the
+        // point.
+        if !union_panes.is_empty() {
             let panes = union_panes.clone();
             let scan = tokio::task::spawn_blocking(move || process_tree::scan_codex_panes(&panes))
                 .await
                 .unwrap_or_default();
             self.store.rebind_resumes(&scan.resume_bindings).await;
+            let adopted = self
+                .store
+                .adopt_unrowed_resumes(&scan.resume_bindings)
+                .await;
+            if adopted > 0 {
+                tracing::info!(
+                    sessions = adopted,
+                    "registered running resumed agents that had no row"
+                );
+            }
             codex_hosts = scan.hosts;
         }
         let reconcile_started = Instant::now();
