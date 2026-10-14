@@ -637,18 +637,8 @@ impl<L: LivenessSource> Reconciler<L> {
         let agentless_stopped = if complete_kinds.is_empty() {
             0
         } else {
-            let scanned: std::collections::HashSet<String> = union_panes
-                .iter()
-                .filter(|pane| pane.pane_pid != 0)
-                .map(|pane| pane.pane_id.clone())
-                .collect();
             self.store
-                .stop_rows_without_agent_process(
-                    &workloads,
-                    &scanned,
-                    &complete_kinds,
-                    AGENTLESS_PANE_IDLE,
-                )
+                .stop_rows_without_agent_process(&workloads, &complete_kinds, AGENTLESS_PANE_IDLE)
                 .await
         };
         if agentless_stopped > 0 {

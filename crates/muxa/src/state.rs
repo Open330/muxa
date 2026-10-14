@@ -1699,13 +1699,10 @@ impl Store {
     /// collaboration could type into it. The idle floor keeps a launching or
     /// briefly-hidden agent safe; a live agent's next hook revives its row.
     /// Only panes this tick actually scanned count, only on complete hosts,
-    /// and only for kinds whose process the scan recognizes. `by_pane` omits a
-    /// scanned pane whose workload is empty (just its shell), so `scanned`
-    /// is what tells "nothing runs there" apart from "not looked at".
+    /// and only for kinds whose process the scan recognizes.
     pub async fn stop_rows_without_agent_process(
         &self,
         by_pane: &HashMap<String, WorkloadSummary>,
-        scanned: &HashSet<String>,
         complete_kinds: &[HostKind],
         min_idle: Duration,
     ) -> usize {
@@ -1736,11 +1733,10 @@ impl Store {
             {
                 continue;
             }
-            if !scanned.contains(pane_id)
-                || by_pane
-                    .get(pane_id)
-                    .is_some_and(|workload| workload.primary_pid.is_some())
-            {
+            let Some(workload) = by_pane.get(pane_id) else {
+                continue;
+            };
+            if workload.primary_pid.is_some() {
                 continue;
             }
             let prev = agent.state;
@@ -3200,22 +3196,24 @@ mod tests {
         store
             .apply(&started("unscanned", "rmux:%70", long_ago))
             .await;
+        let shell_only = WorkloadSummary {
+            shell_count: 1,
+            ..WorkloadSummary::default()
+        };
         let with_agent = WorkloadSummary {
             primary_pid: Some(42),
             ..WorkloadSummary::default()
         };
-        // The scan leaves a pane running only its shell out of the map, as
-        // `scan_pane_workloads` does; `scanned` still lists it.
-        let by_pane = HashMap::from([("rmux:%68".to_string(), with_agent)]);
-        let scanned: HashSet<String> = ["rmux:%67", "rmux:%68", "rmux:%69"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let by_pane = HashMap::from([
+            ("rmux:%67".to_string(), shell_only.clone()),
+            ("rmux:%68".to_string(), with_agent),
+            ("rmux:%69".to_string(), shell_only),
+        ]);
         let floor = Duration::from_secs(60 * 60);
         let complete = [HostKind::Rmux];
         assert_eq!(
             store
-                .stop_rows_without_agent_process(&by_pane, &scanned, &complete, floor)
+                .stop_rows_without_agent_process(&by_pane, &complete, floor)
                 .await,
             1
         );
@@ -3236,7 +3234,7 @@ mod tests {
         // Not repeated once stopped, and an incomplete host is left alone.
         assert_eq!(
             store
-                .stop_rows_without_agent_process(&by_pane, &scanned, &[HostKind::Tmux], floor)
+                .stop_rows_without_agent_process(&by_pane, &[HostKind::Tmux], floor)
                 .await,
             0
         );
