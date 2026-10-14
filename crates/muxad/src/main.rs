@@ -1995,15 +1995,23 @@ fn ready_collaboration_recipient(
     if !muxa::collaboration::is_pending_session(&request.to.agent_session_id) {
         return None;
     }
-    participants
-        .iter()
-        .find(|participant| {
-            participant.pane == request.to.pane
-                && participant.socket == request.to.socket
-                && participant.state == muxa::AgentState::Idle
-        })
+    idle_pending_recipient(participants, &request.to)
         .cloned()
         .or_else(|| muxa::collaboration::pending_recipient_ready(&request.to, agents, panes))
+}
+
+/// The idle agent that may adopt a request still addressed to a launching
+/// pane. Uses the same predicate delivery reserves with: matching on pane and
+/// socket alone picked whatever agent later reused that pane id in another
+/// window, and the refused reservation then repeated on every tick.
+fn idle_pending_recipient<'a>(
+    participants: &'a [muxa::collaboration::Participant],
+    to: &muxa::collaboration::Participant,
+) -> Option<&'a muxa::collaboration::Participant> {
+    participants.iter().find(|participant| {
+        participant.state == muxa::AgentState::Idle
+            && muxa::collaboration::addresses(to, participant)
+    })
 }
 
 fn idle_collaboration_participant<'a>(
@@ -3249,6 +3257,50 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
+
+    fn room_participant(
+        pane: &str,
+        session: &str,
+        window: &str,
+    ) -> muxa::collaboration::Participant {
+        muxa::collaboration::Participant {
+            agent_kind: AgentKind::Codex,
+            agent_session_id: session.into(),
+            pane: pane.into(),
+            socket: Some("/tmp/rmux-1/default".into()),
+            room: muxa::collaboration::RoomId {
+                host: "rmux".into(),
+                socket: Some("/tmp/rmux-1/default".into()),
+                window_id: window.into(),
+            },
+            tmux_session_id: None,
+            tmux_session_name: None,
+            window_name: None,
+            state: muxa::AgentState::Idle,
+            cwd: None,
+            alias: None,
+            roles: Vec::new(),
+            console: false,
+        }
+    }
+
+    /// A request still waiting on a launching agent must not be offered to
+    /// whatever agent later reuses that pane id in another window: delivery
+    /// refuses it, so picking it only repeats a failing reservation forever.
+    #[test]
+    fn a_pending_request_is_offered_only_to_its_own_room() {
+        let to = room_participant(
+            "rmux:%75",
+            "pending-pane:/tmp/rmux-1/default:rmux:%75",
+            "@42",
+        );
+        let elsewhere = room_participant("rmux:%75", "thread-other", "@13");
+        assert!(idle_pending_recipient(std::slice::from_ref(&elsewhere), &to).is_none());
+
+        let launched = room_participant("rmux:%75", "thread-launched", "@42");
+        let found = idle_pending_recipient(&[elsewhere, launched.clone()], &to).cloned();
+        assert_eq!(found, Some(launched));
+    }
 
     #[test]
     fn dashboard_auth_parser_accepts_public_read_aliases() {

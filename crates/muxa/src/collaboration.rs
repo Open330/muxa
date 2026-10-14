@@ -97,7 +97,12 @@ fn pending_session_id(pane: &str, socket: Option<&str>) -> String {
 /// recipient: the request was addressed to a pane before any session existed
 /// there, so the real agent that registered on that pane — and only on that
 /// exact pane and control endpoint — owns it too.
-fn addresses(to: &Participant, caller: &Participant) -> bool {
+/// Whether `caller` may receive a request addressed to `to`: the exact
+/// session, or, for a request still waiting on a launching agent, the agent
+/// that now occupies that pane *in the same room*. Delivery reserves the
+/// request through this predicate, so anything picking a recipient must use
+/// it too: a candidate it rejects can never be served.
+pub fn addresses(to: &Participant, caller: &Participant) -> bool {
     if to.same_endpoint(caller) {
         return true;
     }
