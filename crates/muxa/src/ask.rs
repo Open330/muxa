@@ -1945,6 +1945,11 @@ impl AskEngine {
             .current_dir(turn.cwd)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
+        // muxad may have been started from inside an agent session; its
+        // account and messaging socket are not this turn's.
+        for name in crate::child_env::inherited_session_vars_here() {
+            cmd.env_remove(name);
+        }
         if let Some(api_key) = turn.api_key {
             cmd.env(self.credential_env(), api_key);
         }

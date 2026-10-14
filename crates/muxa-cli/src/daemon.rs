@@ -175,6 +175,25 @@ fn describe(socket: &Path, hello: &Hello) -> String {
     )
 }
 
+/// The detached `muxad` invocation, minus its stdio.
+fn muxad_command(muxad: &Path, socket: &Path, config_path: Option<&Path>) -> Command {
+    let mut command = Command::new("nohup");
+    command
+        .arg(muxad)
+        .arg("--socket")
+        .arg(socket)
+        .env_remove("MUXA_RESTART_GENERATION");
+    // A daemon started from an agent's shell must not run as that agent's
+    // session: every process it spawns would inherit its account and socket.
+    for name in muxa::child_env::inherited_session_vars_here() {
+        command.env_remove(name);
+    }
+    if let Some(path) = config_path {
+        command.arg("--config").arg(path);
+    }
+    command
+}
+
 /// Spawn the selected muxad as a background process with stdio detached from
 /// the caller. Kept crate-visible so `muxa init` and `muxa daemon start` cannot
 /// drift into different socket probing or process-launch behaviour.
@@ -196,18 +215,11 @@ pub(crate) fn start_detached(
         .with_context(|| format!("opening {}", log_path.display()))?;
     let stderr = log.try_clone().context("cloning muxad log handle")?;
 
-    let mut command = Command::new("nohup");
+    let mut command = muxad_command(&muxad, socket, config_path);
     command
-        .arg(muxad)
-        .arg("--socket")
-        .arg(socket)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(stderr))
-        .env_remove("MUXA_RESTART_GENERATION");
-    if let Some(path) = config_path {
-        command.arg("--config").arg(path);
-    }
+        .stderr(Stdio::from(stderr));
     let mut child = command.spawn().context("spawning detached muxad")?;
 
     let started = Instant::now();
@@ -281,6 +293,27 @@ async fn wait_for_new_generation(client: &Client, before: u64, timeout: Duration
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+
+    #[test]
+    fn the_detached_daemon_drops_agent_session_variables() {
+        let command = super::muxad_command(
+            std::path::Path::new("/usr/bin/muxad"),
+            std::path::Path::new("/tmp/muxa.sock"),
+            None,
+        );
+        let removed: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in muxa::child_env::SESSION_VARS {
+            assert!(
+                removed.iter().any(|r| r == name),
+                "{name} must not reach muxad"
+            );
+        }
+        assert!(removed.iter().any(|r| r == "MUXA_RESTART_GENERATION"));
+    }
 
     #[test]
     fn daemon_subcommands_parse_at_the_expected_surface() {

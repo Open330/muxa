@@ -42,6 +42,7 @@ pub mod automation_choice;
 pub mod automation_defaults;
 pub mod automation_judge;
 pub mod backend;
+pub mod child_env;
 mod codex_binding;
 pub mod collaboration;
 pub mod collaboration_audit;
