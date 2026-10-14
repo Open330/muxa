@@ -502,6 +502,10 @@ owner-only socket 모델도 그대로입니다.
 session의 incoming/sent/all 이력을 보여줍니다. `room_context`는 새 incoming
 request 수와 아직 확인하지 않은 reply 수를 각각 반환합니다.
 
+등록된 agent는 같은 host와 control socket에서 pane·window를 이동해도 자신의
+이전 요청을 조회할 수 있습니다. pane을 재사용한 다른 session에는 권한이 넘어가지
+않으며, 등록 전 pending 요청은 원래 pane과 room에 고정됩니다.
+
 발신자는 요청이 `queued`인 동안만 취소할 수 있습니다. 수신자가 inbox를 읽어
 `claimed`가 된 뒤에는 이미 작업이 시작됐을 수 있으므로 취소를 거부합니다.
 

@@ -501,6 +501,10 @@ unacknowledged replies separately. `muxa_list_messages` is non-claiming history;
 the sender may cancel only while a request remains `queued`, before the
 recipient has claimed it.
 
+Registered agents retain their own mailbox across pane/window moves on the same
+host and control socket. Another session cannot inherit it by reusing a pane.
+Requests addressed to a pending launch stay pinned to that pane and room.
+
 Every collaboration IPC operation (context, identity, send, inbox, list,
 reply, get, wait, and cancel) is also appended to
 `$XDG_DATA_HOME/muxa/collaboration-audit.ndjson`. The `0600` ledger records the
