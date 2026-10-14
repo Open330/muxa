@@ -517,6 +517,11 @@ request 수와 아직 확인하지 않은 reply 수를 각각 반환합니다.
 수정해야 하는 작업에는 별도 git worktree를 권장합니다.
 
 
+CLI 목록의 기본 `--scope auto`는 추적된 agent에서는 자신의 우편함을,
+일반 터미널에서는 operator console로 현재 room의 메시지를 조회합니다.
+`--scope caller`는 agent 신원을 요구하며, `--scope all`은 모든 room을 조회합니다.
+명시된 agent session의 신원 오류는 조회 범위를 자동으로 넓히지 않습니다.
+
 CLI `muxa msg list`는 기본 20건의 메타데이터를 출력합니다. 본문·답변·진행 기록·
 provenance는 `--full`로 명시할 때 포함합니다. JSON 배열의 `id`와 저장된 `status`는
 유지하며, `--limit`·`--offset`으로 페이지를 지정합니다.

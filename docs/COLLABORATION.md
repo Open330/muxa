@@ -519,6 +519,11 @@ host-scoped explicit-pane routing and the existing high-authority owner-only
 socket workflow remain unchanged.
 
 
+CLI lists use `--scope auto` by default: a tracked agent reads its own mailbox;
+an ordinary untracked terminal reads the current room as the operator console.
+Use `--scope caller` to require an agent mailbox, or `--scope all` for every room.
+Pinned agent identity failures remain errors and never broaden the scope.
+
 CLI message lists default to 20 metadata rows, without original instructions,
 reply bodies, updates or provenance. `--json` retains an array with `id`, stored
 `status`, endpoints and transport receipt fields. Use `--full` to restore full

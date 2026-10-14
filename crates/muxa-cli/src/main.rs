@@ -538,10 +538,10 @@ enum MsgCmd {
     List {
         #[arg(long, default_value = "all")]
         mailbox: String,
-        /// How wide to look: `caller` (this pane's own mailbox), `room` (every
-        /// participant in this window), or `all` (every room this daemon
-        /// holds). Anything past `caller` speaks as the operator console.
-        #[arg(long, default_value = "caller")]
+        /// `auto`: own mailbox for a tracked agent, current window for an
+        /// ordinary terminal. `caller`: own mailbox; `room`: current window;
+        /// `all`: every room. Room/all reads speak as the operator console.
+        #[arg(long, default_value = "auto")]
         scope: String,
         /// Only messages in this time range. Accepts durations such as `2h`
         /// and `7d`, dates, RFC 3339 timestamps, and calendar keywords.
@@ -2158,6 +2158,14 @@ async fn cmd_msg_expire(
     Ok(())
 }
 
+// Only an unpinned, untracked pane can be an ordinary operator terminal.
+// A missing pinned agent or a transport/permission failure must stay an error.
+fn is_operator_list_origin(origin: &CollaborationOrigin, error: &muxa::ipc::RuntimeError) -> bool {
+    origin.agent_session_id.is_none()
+        && matches!(error, muxa::ipc::RuntimeError::Daemon(message)
+            if message.starts_with("collaboration origin is not a hook-correlated tracked pane agent:"))
+}
+
 #[allow(clippy::too_many_arguments)] // CLI scope, filters and output flags
 async fn cmd_msg_list(
     client: &Client,
@@ -2169,7 +2177,15 @@ async fn cmd_msg_list(
     full: bool,
     json: bool,
 ) -> Result<()> {
-    let scope = collaboration_list_scope(scope)?;
+    let scope = if scope == "auto" {
+        match client.collaboration_context(origin).await {
+            Ok(_) => MailboxScope::Caller,
+            Err(error) if is_operator_list_origin(origin, &error) => MailboxScope::Room,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        collaboration_list_scope(scope)?
+    };
     // A widened listing is the operator asking what the fleet is saying, not
     // the pane agent asking after its own inbox — so it goes out under the
     // console identity the daemon requires for it.
@@ -2181,7 +2197,11 @@ async fn cmd_msg_list(
     let requests = if let Some(id) = request_id {
         let request = client.collaboration_get(&listing_origin, id).await?;
         if matches!(scope, MailboxScope::Room) {
-            let room = client.collaboration_context(origin).await?.current.room;
+            let room = client
+                .collaboration_context(&listing_origin)
+                .await?
+                .current
+                .room;
             if request.from.room != room && request.to.room != room {
                 anyhow::bail!("request {id} is outside the selected room");
             }
@@ -4589,6 +4609,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_untracked_unpinned_terminal_lists_use_operator_identity() {
+        use muxa::ipc::RuntimeError;
+        let mut origin = CollaborationOrigin {
+            pane: "rmux:%71".into(),
+            socket: Some("/tmp/rmux/default".into()),
+            console: false,
+            agent_session_id: None,
+        };
+        let untracked = RuntimeError::Daemon("collaboration origin is not a hook-correlated tracked pane agent: rmux:%71; trigger an agent event or restart the agent".into());
+        assert!(is_operator_list_origin(&origin, &untracked));
+        origin.agent_session_id = Some("missing-agent".into());
+        assert!(!is_operator_list_origin(&origin, &untracked));
+        origin.agent_session_id = None;
+        assert!(!is_operator_list_origin(
+            &origin,
+            &RuntimeError::Daemon("permission denied".into())
+        ));
+        assert!(!is_operator_list_origin(
+            &origin,
+            &RuntimeError::Timeout(std::time::Duration::from_secs(1))
+        ));
+    }
+
+    #[test]
     fn message_list_defaults_are_bounded_and_full_output_is_explicit() {
         let parsed = Args::try_parse_from(["muxa", "msg", "list", "--json"]).unwrap();
         let Cmd::Msg {
@@ -4597,12 +4641,14 @@ mod tests {
                     limit,
                     full,
                     request_id,
+                    scope,
                     ..
                 },
         } = parsed.cmd
         else {
             panic!("expected list")
         };
+        assert_eq!(scope, "auto");
         assert_eq!(limit, Some(20));
         assert!(!full);
         assert!(request_id.is_none());
