@@ -10,6 +10,7 @@ mod config_cmd;
 mod daemon;
 mod dashboard_tui;
 mod doctor;
+mod doctor_report;
 mod fleet_cli;
 mod fleet_watch;
 mod help_groups;
@@ -354,7 +355,11 @@ enum Cmd {
     /// non-interactive installs.
     Init(init::Args),
     /// Run end-to-end diagnostics and report any setup issues.
-    Doctor,
+    Doctor {
+        /// List every check, including the ones that pass.
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Start, stop, restart, or inspect the local muxad process.
     Daemon {
         #[command(subcommand)]
@@ -1553,7 +1558,7 @@ async fn main() -> Result<()> {
         Cmd::Attend(attend_args) => cmd_attend(&client, attend_args).await,
         Cmd::Sync => cmd_sync(&client).await,
         Cmd::Init(init_args) => init::run(init_args, socket, config_path).await,
-        Cmd::Doctor => doctor::run(socket, config_path.as_deref()).await,
+        Cmd::Doctor { verbose } => doctor::run(socket, config_path.as_deref(), verbose).await,
         Cmd::Daemon { action } => {
             daemon::run(action, &client, &socket, config_path.as_deref()).await
         }
