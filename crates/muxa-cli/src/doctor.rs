@@ -461,9 +461,7 @@ fn check_systemctl() -> CheckResult {
     // probe is meaningless. `muxa init` already falls back to the
     // shellrc autostart there, and doctor should match that posture.
     if !systemd_files::systemd_available() {
-        return CheckResult::Warn(
-            "systemd: user manager not usable on this host — relying on shellrc autostart".into(),
-        );
+        return shellrc_autostart_verdict(shellrc_autostart().as_deref());
     }
     let out = Command::new("systemctl")
         .args(["--user", "is-active", SYSTEMD_UNIT])
@@ -489,6 +487,40 @@ fn check_systemctl() -> CheckResult {
             }
         }
         Err(e) => CheckResult::Warn(format!("systemd: could not run systemctl ({e})")),
+    }
+}
+
+/// The shell rc file that starts muxad on a host with no usable service
+/// manager, if any. `muxa init` writes a managed block, but a hand-written
+/// `muxa daemon start` line works just as well, so any is accepted.
+fn shellrc_autostart() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    [
+        ".zshrc",
+        ".zshenv",
+        ".zprofile",
+        ".bashrc",
+        ".bash_profile",
+        ".profile",
+    ]
+    .iter()
+    .map(|name| home.join(name))
+    .find(|path| std::fs::read_to_string(path).is_ok_and(|text| text.contains("muxa daemon start")))
+}
+
+/// Without systemd, a shell rc autostart is the supported setup, not a
+/// degraded one: only its absence is worth a warning.
+fn shellrc_autostart_verdict(rc: Option<&Path>) -> CheckResult {
+    match rc {
+        Some(rc) => CheckResult::Ok(format!(
+            "systemd: user manager not usable here — muxad autostarts from {}",
+            rc.display()
+        )),
+        None => CheckResult::Warn(
+            "systemd: user manager not usable here, and no shell rc starts muxad — run \
+             `muxa init --component muxad-shellrc`"
+                .into(),
+        ),
     }
 }
 
@@ -518,8 +550,8 @@ fn check_unit_file() -> CheckResult {
             // usable, an absent unit file isn't an issue — it's
             // expected, because no manager will ever consume it.
             if !systemd_files::systemd_available() {
-                return CheckResult::Warn(
-                    "Service unit — systemd user manager not usable, no unit needed here".into(),
+                return CheckResult::Ok(
+                    "Service unit — not used without a systemd user manager".into(),
                 );
             }
             check_systemd_unit_file()
@@ -1176,6 +1208,21 @@ fn uid_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shell rc autostart is the supported setup without systemd.
+    #[test]
+    fn a_shellrc_autostart_is_healthy_without_systemd() {
+        let rc = PathBuf::from("/home/u/.zshrc");
+        let found = shellrc_autostart_verdict(Some(&rc));
+        assert!(matches!(found, CheckResult::Ok(_)));
+        let CheckResult::Warn(missing) = shellrc_autostart_verdict(None) else {
+            panic!("no autostart at all is a warning");
+        };
+        assert!(
+            missing.contains("muxa init --component muxad-shellrc"),
+            "{missing}"
+        );
+    }
 
     fn test_participant(pane: &str, session: &str) -> muxa::collaboration::Participant {
         muxa::collaboration::Participant {
