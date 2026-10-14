@@ -611,6 +611,19 @@ enum MsgCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Operator cleanup: expire every request nobody claimed within the
+    /// given age, whoever sent it, including senders that no longer exist.
+    Expire {
+        /// Age past which an unclaimed request expires (e.g. `24h`, `7d`).
+        #[arg(long, value_name = "AGE")]
+        older_than: String,
+        /// List what would expire without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the affected requests as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The closed set of engines an instance can be built on. Adding a
@@ -1926,6 +1939,16 @@ fn participant_matches_window(participant: &Participant, wanted: &str) -> bool {
 
 #[allow(clippy::too_many_lines)] // explicit message subcommand dispatch keeps output compatibility visible
 async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
+    // Housekeeping acts on the whole store, not as a participant, so it must
+    // not require the caller to be a tracked agent.
+    if let MsgCmd::Expire {
+        older_than,
+        dry_run,
+        json,
+    } = action
+    {
+        return cmd_msg_expire(client, &older_than, dry_run, json).await;
+    }
     let origin = collaboration_origin(client).await?;
     match action {
         MsgCmd::Send {
@@ -2069,7 +2092,41 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             let request = client.collaboration_cancel(&origin, &request_id).await?;
             print_collaboration_receipt(&request, json)?;
         }
+        MsgCmd::Expire { .. } => unreachable!("handled before resolving an origin"),
     }
+    Ok(())
+}
+
+async fn cmd_msg_expire(
+    client: &Client,
+    older_than: &str,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    require_capability(client, "collaboration_expire_v1", "msg expire").await?;
+    let secs = parse_duration_secs(older_than)?;
+    anyhow::ensure!(secs > 0, "--older-than must be greater than zero");
+    let requests = client.collaboration_expire(secs, dry_run).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&requests)?);
+        return Ok(());
+    }
+    let verb = if dry_run { "would expire" } else { "expired" };
+    if requests.is_empty() {
+        println!("nothing unclaimed is older than {older_than}");
+        return Ok(());
+    }
+    for request in &requests {
+        println!(
+            "{verb}  {}  {:?}  {} -> {}  (queued since {})",
+            request.id,
+            request.kind,
+            request.from.label(),
+            request.to.label(),
+            request.created_at.date(),
+        );
+    }
+    println!("{} request(s) {verb}", requests.len());
     Ok(())
 }
 

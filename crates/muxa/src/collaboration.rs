@@ -2694,6 +2694,47 @@ impl CollaborationStore {
         Ok(request_ids.len())
     }
 
+    /// Operator housekeeping: mark every request still `Queued` (never
+    /// claimed) and created before `cutoff` as `Expired`, and return them.
+    /// Covers what nobody else can close: a sender may cancel only its own
+    /// request, and the sender of a request stuck for weeks is usually an
+    /// agent session that no longer exists. `dry_run` reports without
+    /// writing.
+    pub async fn expire_queued_before(
+        &self,
+        cutoff: OffsetDateTime,
+        dry_run: bool,
+    ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
+        self.ensure_enabled()?;
+        let _transaction = self.transaction_lock.lock().await;
+        let previous = self.requests.read().await.clone();
+        let mut expired: Vec<CollaborationRequest> = {
+            let mut requests = self.requests.write().await;
+            requests
+                .values_mut()
+                .filter(|request| {
+                    request.status == RequestStatus::Queued && request.created_at < cutoff
+                })
+                .map(|request| {
+                    if !dry_run {
+                        request.status = RequestStatus::Expired;
+                    }
+                    request.clone()
+                })
+                .collect()
+        };
+        expired.sort_by_key(|request| request.created_at);
+        if dry_run || expired.is_empty() {
+            return Ok(expired);
+        }
+        if let Err(error) = self.persist_requests(&expired) {
+            *self.requests.write().await = previous;
+            return Err(error);
+        }
+        self.publish_change();
+        Ok(expired)
+    }
+
     pub async fn cancel_for(
         &self,
         caller: &Participant,
@@ -5179,6 +5220,68 @@ mod tests {
             result,
             Err(CollaborationError::InvalidAirArtifactReference(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn expiry_closes_only_unclaimed_requests_older_than_the_cutoff() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let other = participant("%3", "other");
+        let ask = |to: &Participant, body: &str| {
+            let (mailbox, sender, to, body) =
+                (&mailbox, sender.clone(), to.clone(), body.to_string());
+            async move {
+                mailbox
+                    .create(
+                        sender,
+                        to,
+                        NewRequest {
+                            body,
+                            ..NewRequest::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let stale = ask(&recipient, "nobody claimed this").await;
+        let claimed = ask(&other, "claimed, so it is the recipient's to finish").await;
+        mailbox.claim_for(&other).await.unwrap();
+
+        // Nothing is older than an hour yet.
+        let past = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        assert!(mailbox
+            .expire_queued_before(past, false)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let future = OffsetDateTime::now_utc() + time::Duration::seconds(1);
+        let preview = mailbox.expire_queued_before(future, true).await.unwrap();
+        assert_eq!(
+            preview.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            [&stale.id]
+        );
+        assert_eq!(
+            preview[0].status,
+            RequestStatus::Queued,
+            "a dry run changes nothing"
+        );
+
+        let expired = mailbox.expire_queued_before(future, false).await.unwrap();
+        assert_eq!(
+            expired.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            [&stale.id]
+        );
+        assert_eq!(expired[0].status, RequestStatus::Expired);
+        let sent = mailbox
+            .list_for(&sender, RequestMailbox::Sent, MailboxScope::Caller)
+            .await
+            .unwrap();
+        let status = |id: &str| sent.iter().find(|r| r.id == id).unwrap().status;
+        assert_eq!(status(&stale.id), RequestStatus::Expired);
+        assert_eq!(status(&claimed.id), RequestStatus::Claimed);
     }
 
     #[tokio::test]
