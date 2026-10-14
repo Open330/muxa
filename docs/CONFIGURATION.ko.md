@@ -249,7 +249,8 @@ muxa ask --agent claude --detach --json "배포 계획을 검토해줘"
 muxa ask --agent anthropic "reaper가 건드리는 파일은?"
 security find-generic-password -w -s my-codex-key \
   | muxa ask --agent codex --api-key-stdin "이 저장소를 검토해줘"
-muxa ask --agent anthropic-work "…"   # 직접 추가한 provider를 id로 지정
+muxa ask --agent anthropic-work "…"   # 직접 추가한 provider를 id로 지정 (다음 재시작 전까지)
+muxa ask provider use codex           # 기본 provider로 지정하고 [ask] agent에 저장
 muxa ask providers [--json]           # 모든 provider: engine, 종류, 모델, 키 확보 여부, 선택 상태
 muxa ask provider add anthropic-work --engine anthropic \
   --title "Anthropic (work)" --api-key-env WORK_ANTHROPIC_KEY

@@ -507,6 +507,30 @@ impl AskStore {
         Ok(label)
     }
 
+    /// Make `provider` the default: select it now and write `[ask] agent`,
+    /// so the choice survives a daemon restart. [`Self::set_agent`] alone
+    /// lasts only until the daemon reads its config again.
+    pub async fn set_default_agent(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<AskProviderInfo>, AskError> {
+        let instance = self
+            .instance(provider)
+            .await
+            .ok_or_else(|| AskError::UnsupportedAgent(provider.to_string()))?;
+        let path = self
+            .opts
+            .config_path
+            .clone()
+            .ok_or_else(|| AskError::NoConfigPath(instance.id.clone()))?;
+        {
+            let _guard = self.write_lock.lock().await;
+            write_default_agent(&path, &instance.id).map_err(AskError::Io)?;
+        }
+        self.set_agent(&instance.id).await?;
+        Ok(self.providers().await)
+    }
+
     /// Every provider instance this daemon can drive, with its effective
     /// model, whether a key is already resolvable from the daemon's
     /// environment, and which one the next question goes to.
@@ -2706,6 +2730,15 @@ fn remove_provider_config(path: &Path, id: &str, select: Option<&str>) -> Result
     })
 }
 
+/// Point `[ask] agent` at `id`, keeping the rest of the file as written.
+fn write_default_agent(path: &Path, id: &str) -> Result<Config, String> {
+    edit_config_document(path, |document| {
+        let ask = implicit_table(document.as_table_mut(), "ask")?;
+        set_value(ask, "agent", id);
+        Ok(())
+    })
+}
+
 /// `table[key] = value`, replacing in place so a comment on the line
 /// survives.
 fn set_value(table: &mut toml_edit::Table, key: &str, value: &str) {
@@ -4678,6 +4711,50 @@ mod tests {
         };
         assert!(missing.contains("helper was not found"), "{missing}");
         assert!(missing.contains("Contents/Helpers"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn the_default_provider_is_selected_and_written_to_config() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# operator notes\n[ask]\nagent = \"claude\" # keep this comment\ntimeout_secs = 60\n",
+        )
+        .unwrap();
+        let store = AskStore::in_memory(AskOptions {
+            enabled: true,
+            agent: "claude".into(),
+            config_path: Some(path.clone()),
+            ..AskOptions::default()
+        });
+
+        let infos = store.set_default_agent("codex").await.unwrap();
+        assert_eq!(store.agent().await, "codex");
+        assert!(infos.iter().any(|info| info.id == "codex" && info.selected));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# operator notes\n[ask]\n"), "{text}");
+        assert!(
+            text.contains("agent = \"codex\" # keep this comment"),
+            "{text}"
+        );
+        assert!(text.contains("timeout_secs = 60"), "{text}");
+
+        // An unknown id is refused and leaves both the file and the
+        // selection alone.
+        assert!(matches!(
+            store.set_default_agent("bard").await.unwrap_err(),
+            AskError::UnsupportedAgent(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(store.agent().await, "codex");
+
+        // A config with no `[ask]` table gains one.
+        std::fs::write(&path, "").unwrap();
+        store.set_default_agent("gemini").await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let config: Config = toml::from_str(&text).unwrap();
+        assert_eq!(config.ask.agent, "gemini", "{text}");
     }
 
     #[allow(clippy::too_many_lines)] // one add/refuse/remove lifecycle, in order

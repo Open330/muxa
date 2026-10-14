@@ -349,7 +349,8 @@ muxa ask --agent claude --detach --json "review the deployment plan"
 muxa ask --agent anthropic "which files does the reaper touch?"
 security find-generic-password -w -s my-codex-key \
   | muxa ask --agent codex --api-key-stdin "review this repository"
-muxa ask --agent anthropic-work "…"   # a provider you added, by its id
+muxa ask --agent anthropic-work "…"   # a provider you added, by its id (until the next restart)
+muxa ask provider use codex           # make it the default; rewrites [ask] agent
 muxa ask providers [--json]           # every provider: engine, kind, model, whether a key resolves, selected
 muxa ask provider add anthropic-work --engine anthropic \
   --title "Anthropic (work)" --api-key-env WORK_ANTHROPIC_KEY

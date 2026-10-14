@@ -535,6 +535,11 @@ enum RequestBody {
     AskProviderRemove {
         id: String,
     },
+    /// Select `provider` and write it to `[ask] agent`, so the choice
+    /// survives a restart. Answers with the updated list.
+    AskProviderDefault {
+        provider: String,
+    },
     // --- automation_v1 ---------------------------------------------------
     /// Every `[[automation.rule]]` with its effective timing, its guards,
     /// and how often it has fired lately, plus the engine's master switch
@@ -787,6 +792,7 @@ const CAPABILITIES: &[&str] = &[
     "ask_send_new_v1",
     "ask_subscribe",
     "ask_providers_v1",
+    "ask_provider_default_v1",
     "work_compose_v1",
     "automation_v1",
     "automation_ask_v1",
@@ -4080,6 +4086,13 @@ async fn handle(
                         Err(error) => Response::err(error.to_string()),
                     }
                 }
+                RequestBody::AskProviderDefault { provider } => {
+                    kind = "ask_provider_default";
+                    match ask.set_default_agent(&provider).await {
+                        Ok(providers) => Response::with_ask_providers(providers),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
                 RequestBody::AskProviderRemove { id } => {
                     kind = "ask_provider_remove";
                     match ask.remove_provider(&id).await {
@@ -5917,6 +5930,21 @@ impl Client {
 
     /// Remove an `[ask.providers.<id>]` instance and read back the updated
     /// list. Requires the `ask_providers_v1` capability.
+    /// Select `provider` and persist it as `[ask] agent`. Requires the
+    /// `ask_provider_default_v1` capability.
+    pub async fn ask_provider_default(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<AskProviderInfo>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_provider_default",
+            "provider": provider,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_providers"].clone()).map_err(RuntimeError::Json)
+    }
+
     pub async fn ask_provider_remove(
         &self,
         id: &str,
@@ -8477,6 +8505,7 @@ mod tests {
         assert!(caps.contains(&"ask_conversations_v1"));
         assert!(caps.contains(&"ask_send_new_v1"));
         assert!(caps.contains(&"ask_providers_v1"));
+        assert!(caps.contains(&"ask_provider_default_v1"));
         assert!(caps.contains(&"work_compose_v1"));
         assert!(!caps.contains(&RESTART_CAPABILITY));
         assert!(!caps.contains(&STOP_CAPABILITY));
@@ -8864,6 +8893,16 @@ mod tests {
         .unwrap();
         match remove {
             RequestBody::AskProviderRemove { id } => assert_eq!(id, "anthropic-work"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let default: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "ask_provider_default",
+            "provider": "codex",
+        }))
+        .unwrap();
+        match default {
+            RequestBody::AskProviderDefault { provider } => assert_eq!(provider, "codex"),
             other => panic!("unexpected {other:?}"),
         }
 

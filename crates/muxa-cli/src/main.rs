@@ -668,6 +668,16 @@ enum AskProviderCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Make a provider the default: questions go to it from now on, and
+    /// `[ask] agent` is rewritten so a daemon restart keeps the choice.
+    /// `muxa ask --agent` switches only until the next restart.
+    Use {
+        /// Provider id from `muxa ask providers`.
+        id: String,
+        /// Print the updated provider list as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a provider instance. A built-in id keeps its row and only
     /// loses the settings you gave it.
     Remove {
@@ -1094,6 +1104,24 @@ async fn cmd_ask_admin(client: &Client, action: AskCmd) -> Result<()> {
             };
             let providers = client.ask_provider_add(&request).await?;
             report_provider_change(&providers, &id, json)?;
+        }
+        AskCmd::Provider {
+            action: AskProviderCmd::Use { id, json },
+        } => {
+            require_capability(client, "ask_provider_default_v1", "ask provider use").await?;
+            let providers = client.ask_provider_default(&id).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&providers)?);
+            } else {
+                let selected = providers
+                    .iter()
+                    .find(|provider| provider.selected)
+                    .context("the daemon reported no selected provider")?;
+                println!(
+                    "{}: now the default ask provider ({} on {}); saved as [ask] agent",
+                    selected.id, selected.title, selected.engine
+                );
+            }
         }
         AskCmd::Provider {
             action: AskProviderCmd::Remove { id, json },
@@ -4687,6 +4715,16 @@ mod tests {
         assert_eq!(api_key_env, None);
         assert!(!clear_model);
         assert!(clear_api_key_env);
+        let args = Args::try_parse_from(["muxa", "ask", "provider", "use", "codex"]).unwrap();
+        assert!(matches!(
+            args.cmd,
+            Cmd::Ask {
+                action: Some(AskCmd::Provider {
+                    action: AskProviderCmd::Use { ref id, json: false },
+                }),
+                ..
+            } if id == "codex"
+        ));
         // Setting and clearing the same key at once is a contradiction.
         assert!(Args::try_parse_from([
             "muxa",
