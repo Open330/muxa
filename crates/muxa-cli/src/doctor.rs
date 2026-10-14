@@ -69,6 +69,9 @@ pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Resul
             None,
             check_synthetic_agents(&snapshot),
         );
+        if let Some(result) = check_stale_requests(&socket).await {
+            add(&mut report, "muxad", None, result);
+        }
     }
     add(&mut report, "muxad", None, check_service_manager());
     add(&mut report, "muxad", None, check_unit_file());
@@ -303,6 +306,68 @@ async fn check_muxad(socket: &Path) -> CheckResult {
 /// One-shot snapshot fetch shared by the post-IPC checks. Returns
 /// `None` when muxad is unreachable so callers can skip rather than
 /// double-reporting the daemon-down condition `check_muxad` owns.
+/// Requests nobody has claimed for a day. Only the sender can cancel one, the
+/// sender is often an agent that has since exited, and one-way notices never
+/// wake their recipient, so these accumulate silently. `None` when the daemon
+/// predates `msg expire` or does not answer.
+async fn check_stale_requests(socket: &Path) -> Option<CheckResult> {
+    const DAY: u64 = 24 * 60 * 60;
+    let client = Client::new(socket.to_path_buf());
+    let hello = timeout(
+        Duration::from_millis(1500),
+        client.hello(Duration::from_millis(1500)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !hello
+        .capabilities
+        .iter()
+        .any(|c| c == "collaboration_expire_v1")
+    {
+        return None;
+    }
+    let stale = timeout(
+        Duration::from_millis(1500),
+        client.collaboration_expire(DAY, true),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some(stale_requests_verdict(&stale))
+}
+
+fn stale_requests_verdict(stale: &[muxa::collaboration::CollaborationRequest]) -> CheckResult {
+    if stale.is_empty() {
+        return CheckResult::Ok("no request has waited unclaimed over 24h".into());
+    }
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let quiet = stale
+        .iter()
+        .filter(|request| !request.should_notify())
+        .count();
+    let quiet = if quiet == 0 {
+        String::new()
+    } else {
+        format!(
+            " ({quiet} one-way notice{} that never wake their recipient)",
+            plural(quiet)
+        )
+    };
+    let oldest = stale
+        .iter()
+        .map(|request| request.created_at.date())
+        .min()
+        .map_or_else(String::new, |date| format!(", oldest from {date}"));
+    CheckResult::Warn(format!(
+        "{} request{} unclaimed for over 24h{quiet}{oldest}. Review with \
+         `muxa msg expire --older-than 24h --dry-run`; close with \
+         `muxa msg expire --older-than 24h`",
+        stale.len(),
+        plural(stale.len()),
+    ))
+}
+
 async fn fetch_snapshot(socket: &Path) -> Option<Vec<Agent>> {
     let client = Client::new(socket.to_path_buf());
     match timeout(Duration::from_millis(1500), client.snapshot()).await {
@@ -1106,6 +1171,67 @@ fn uid_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_participant(pane: &str, session: &str) -> muxa::collaboration::Participant {
+        muxa::collaboration::Participant {
+            agent_kind: muxa::AgentKind::Codex,
+            agent_session_id: session.into(),
+            pane: pane.into(),
+            socket: None,
+            room: muxa::collaboration::RoomId {
+                host: "tmux".into(),
+                socket: None,
+                window_id: "@1".into(),
+            },
+            tmux_session_id: None,
+            tmux_session_name: None,
+            window_name: None,
+            state: muxa::AgentState::Idle,
+            cwd: None,
+            alias: None,
+            roles: Vec::new(),
+            console: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_requests_are_counted_with_their_quiet_notices() {
+        use muxa::collaboration::{
+            CollaborationOptions, CollaborationStore, NewRequest, RequestKind,
+        };
+        assert!(matches!(stale_requests_verdict(&[]), CheckResult::Ok(_)));
+
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (from, to) = (test_participant("%1", "a"), test_participant("%2", "b"));
+        for kind in [RequestKind::Question, RequestKind::Notice] {
+            store
+                .create(
+                    from.clone(),
+                    to.clone(),
+                    NewRequest {
+                        kind,
+                        body: "x".into(),
+                        expects_reply: kind != RequestKind::Notice,
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let cutoff = time::OffsetDateTime::now_utc() + time::Duration::seconds(1);
+        let stale = store.expire_queued_before(cutoff, true).await.unwrap();
+        let CheckResult::Warn(message) = stale_requests_verdict(&stale) else {
+            panic!("stale requests are a warning");
+        };
+        assert!(
+            message.starts_with("2 requests unclaimed for over 24h (1 one-way notice "),
+            "{message}"
+        );
+        assert!(
+            message.contains("muxa msg expire --older-than 24h --dry-run"),
+            "{message}"
+        );
+    }
 
     /// A server the user owns: their `~/.tmux.conf` was read, and a
     /// terminal client is showing it.

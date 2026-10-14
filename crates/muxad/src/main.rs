@@ -1687,10 +1687,17 @@ async fn wake_idle_collaboration_peers_with_inflight(
         if wake_inflight.contains(&wake_key) {
             continue;
         }
+        let quiet = collaboration.quiet_notices_waiting(recipient).await;
         let direct_wake = collaboration_wake_includes_body(wake_payload, &request);
         if direct_wake && direct_wake_body_is_terminal_safe(&request.body) {
-            if deliver_full_collaboration_request(collaboration, recipient, &request, backends)
-                .await
+            if deliver_full_collaboration_request(
+                collaboration,
+                recipient,
+                &request,
+                backends,
+                quiet,
+            )
+            .await
             {
                 wake_inflight.insert(wake_key);
             }
@@ -1702,7 +1709,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
                 "direct wake body contains terminal control characters; using mailbox notice",
             );
         }
-        let prompt = mailbox_collaboration_request_prompt(&request);
+        let prompt = with_quiet_notices(mailbox_collaboration_request_prompt(&request), quiet);
         let (sent, submitted) = send_collaboration_wake(recipient, &prompt, backends, store).await;
         if submitted {
             wake_inflight.insert(wake_key);
@@ -1783,6 +1790,7 @@ async fn deliver_full_collaboration_request(
     recipient: &muxa::collaboration::Participant,
     pending: &CollaborationRequest,
     backends: &[muxa::SharedBackend],
+    quiet: usize,
 ) -> bool {
     let (request, newly_prepared) = if pending.status == muxa::collaboration::RequestStatus::Queued
     {
@@ -1807,11 +1815,14 @@ async fn deliver_full_collaboration_request(
 
     match request.wake_delivery {
         Some(WakeDeliveryState::Prepared) => {
-            let prompt = if newly_prepared {
-                full_collaboration_request_prompt(&request)
-            } else {
-                interrupted_collaboration_request_prompt(&request)
-            };
+            let prompt = with_quiet_notices(
+                if newly_prepared {
+                    full_collaboration_request_prompt(&request)
+                } else {
+                    interrupted_collaboration_request_prompt(&request)
+                },
+                quiet,
+            );
             if !send_collaboration_text(recipient, &prompt, backends).await {
                 return false;
             }
@@ -1901,6 +1912,21 @@ fn full_collaboration_request_prompt(request: &CollaborationRequest) -> String {
         request.body.len(),
         request.body,
     )
+}
+
+/// Mention unread one-way notices in a wake that is going out anyway: the
+/// recipient hears about them without a terminal write of their own.
+fn with_quiet_notices(mut prompt: String, quiet: usize) -> String {
+    if quiet > 0 {
+        let _ = std::fmt::Write::write_fmt(
+            &mut prompt,
+            format_args!(
+            "\n[muxa] Also waiting: {quiet} one-way notice{} (no reply expected); read with muxa_inbox or `muxa msg inbox --json`.",
+            if quiet == 1 { "" } else { "s" },
+            ),
+        );
+    }
+    prompt
 }
 
 fn interrupted_collaboration_request_prompt(request: &CollaborationRequest) -> String {
@@ -3525,6 +3551,11 @@ mod tests {
                     "one prompt and one submit, no duplicate wake"
                 );
                 assert!(delivered[0].1.contains(&handoff.id));
+                assert!(
+                    delivered[0].1.contains("Also waiting: 39 one-way notices"),
+                    "a wake that goes out anyway names the quiet notices: {}",
+                    delivered[0].1
+                );
                 assert!(progress_ids.iter().all(|id| !delivered[0].1.contains(id)));
                 assert!(delivered[0].1.contains("No reply is expected"));
             }
