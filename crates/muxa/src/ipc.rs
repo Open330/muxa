@@ -638,6 +638,13 @@ enum RequestBody {
         origin: CollaborationOrigin,
         request_id: String,
     },
+    /// Operator housekeeping: expire never-claimed requests older than
+    /// `older_than_secs`. Answers with the affected requests.
+    CollaborationExpire {
+        older_than_secs: u64,
+        #[serde(default)]
+        dry_run: bool,
+    },
 
     /// Wholesale pane-metadata snapshot pushed by an out-of-process
     /// backend source — today the zellij WASM plugin forwarding
@@ -766,6 +773,7 @@ const CAPABILITIES: &[&str] = &[
     "needs_choice",
     "rate_limited",
     "collaboration_mailbox",
+    "collaboration_expire_v1",
     "collaboration_lifecycle",
     "collaboration_wait",
     "collaboration_subscribe",
@@ -4516,6 +4524,21 @@ async fn handle(
                     .await;
                     response
                 }
+                RequestBody::CollaborationExpire {
+                    older_than_secs,
+                    dry_run,
+                } => {
+                    kind = "collaboration_expire";
+                    let age =
+                        time::Duration::seconds(i64::try_from(older_than_secs).unwrap_or(i64::MAX));
+                    let cutoff = time::OffsetDateTime::now_utc()
+                        .checked_sub(age)
+                        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+                    match collaboration.expire_queued_before(cutoff, dry_run).await {
+                        Ok(requests) => Response::with_collaboration_requests(requests),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
                 RequestBody::CollaborationCancel { origin, request_id } => {
                     kind = "collaboration_cancel";
                     collaboration_actor.observe_pane(&backends).await;
@@ -6291,6 +6314,23 @@ impl Client {
             )
             .await;
         }
+    }
+
+    /// Expire never-claimed requests older than `older_than_secs`, or list
+    /// them with `dry_run`. Requires the `collaboration_expire_v1` capability.
+    pub async fn collaboration_expire(
+        &self,
+        older_than_secs: u64,
+        dry_run: bool,
+    ) -> Result<Vec<CollaborationRequest>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_expire",
+            "older_than_secs": older_than_secs,
+            "dry_run": dry_run,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
     }
 
     pub async fn collaboration_cancel(
