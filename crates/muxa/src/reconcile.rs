@@ -48,11 +48,6 @@ use crate::tmux::PaneInfo;
 /// tree when locating a live session's rollout file. Older `UUIDv7` sessions
 /// are also found using their creation date. The scan looks one day forward
 /// to cover local rollout dates ahead of UTC.
-/// How long a row's pane may run no agent process before the row is stopped.
-/// Long enough to cover a launch or a restart in place; a live agent's next
-/// hook revives a stopped row anyway.
-const AGENTLESS_PANE_IDLE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-
 const ROLLOUT_LOOKBACK_DAYS: u16 = 1;
 
 /// Keep hook fallback responsive without repeatedly scanning all pane hosts.
@@ -634,29 +629,6 @@ impl<L: LivenessSource> Reconciler<L> {
                 .update_workloads(&workloads, &complete_kinds)
                 .await
         };
-        let agentless_stopped = if complete_kinds.is_empty() {
-            0
-        } else {
-            let scanned: std::collections::HashSet<String> = union_panes
-                .iter()
-                .filter(|pane| pane.pane_pid != 0)
-                .map(|pane| pane.pane_id.clone())
-                .collect();
-            self.store
-                .stop_rows_without_agent_process(
-                    &workloads,
-                    &scanned,
-                    &complete_kinds,
-                    AGENTLESS_PANE_IDLE,
-                )
-                .await
-        };
-        if agentless_stopped > 0 {
-            tracing::info!(
-                rows = agentless_stopped,
-                "stopped agent rows whose pane runs no agent process"
-            );
-        }
         let store_update_us =
             u64::try_from(reconcile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         if let Some(sessions) = &self.native_sessions {
