@@ -2161,6 +2161,29 @@ impl Store {
         report
     }
 
+    /// Refresh physical session names after a live pane move. A partial scan
+    /// can update names, but must never reap agents or manufacture activity.
+    pub async fn refresh_pane_locations(&self, live_panes: &[PaneInfo]) {
+        let mut agents = self.agents.write().await;
+        let before: HashMap<_, _> = agents
+            .iter()
+            .map(|(id, a)| (id.clone(), (a.tmux_session.clone(), a.tmux_socket.clone())))
+            .collect();
+        let mut by_id: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
+        for pane in live_panes {
+            by_id.entry(&pane.pane_id).or_default().push(pane);
+        }
+        Self::backfill_tmux_names(&mut agents, &by_id);
+        let changed = agents.iter().any(|(id, a)| {
+            before.get(id) != Some(&(a.tmux_session.clone(), a.tmux_socket.clone()))
+        });
+        drop(agents);
+        if changed {
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
+    }
+
     /// Repair a binding using an explicit running `codex resume <session>`
     /// beneath a known pane. This does not manufacture user activity.
     pub(crate) async fn rebind_codex_resumes(&self, bindings: &[(String, PaneInfo)]) -> usize {
@@ -5675,6 +5698,31 @@ mod tests {
         let untagged = store.by_session("untagged").await.expect("agent kept");
         assert_eq!(untagged.tmux_session.as_deref(), Some("main"));
         assert_eq!(untagged.tmux_socket.as_deref(), Some("default"));
+
+        let before = store.by_session("on-amux").await.unwrap();
+        let mut moved = pane("%1");
+        moved.socket = Some("amux".into());
+        moved.session = "moved-session".into();
+        // A partial observation cannot age out the unobserved default row.
+        store.refresh_pane_locations(&[moved]).await;
+        let after = store.by_session("on-amux").await.unwrap();
+        let mut expected = before;
+        expected.tmux_session = Some("moved-session".into());
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            store
+                .by_session("untagged")
+                .await
+                .unwrap()
+                .tmux_session
+                .as_deref(),
+            Some("main")
+        );
+        store.refresh_pane_locations(&[]).await;
+        assert_eq!(store.snapshot().await.len(), 2);
     }
 
     /// A socket-tagged agent whose server no longer has its pane is reaped

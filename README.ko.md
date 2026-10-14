@@ -204,7 +204,14 @@ GitHub PR을 의미하지 않습니다. `@peer`는 같은 window의 정상 agent
 1. 같은 tmux window의 두 pane에서 agent를 각각 실행합니다.
 2. 메시지를 보낼 agent pane을 선택하고 `prefix+s`를 누릅니다.
 3. watch에서 상대 agent를 선택하고 `m`을 눌러 메시지를 보냅니다. 받은 메시지와
-   응답은 `M` mailbox에서 확인합니다(`b`는 alias로 유지됩니다).
+   응답은 `M` mailbox에서 확인합니다.
+
+agent pane에서 `prefix+M`, 또는 로컬 watch의 agent 행에서 `Alt-M`을 누르면
+실행을 유지한 채 새 session/window나 기존 window로 이동합니다. 같은 메뉴에서
+목적지 검색, 따라가기/현재 화면 유지, 분할 방향, 이전 위치 복귀를 선택합니다.
+window 행에서 `Alt-M`을 누르면 모든 pane과 레이아웃을 함께 옮기며,
+popup의 `Ctrl-W`로 pane/window 범위를 전환할 수 있습니다.
+[agent 이동 안내](docs/WATCH.ko.md#실행-중인-agent-이동)를 참고하세요.
 
 window에서 `M`을 누르면 room 전체를, session에서는 모든 window를 window별로 묶은
 read-only 이력을 봅니다. collaboration 화면의 `v`는 최신순 table과 시간순 sequence를

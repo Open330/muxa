@@ -102,6 +102,35 @@ fn popup_shell_command(words: &[std::ffi::OsString]) -> anyhow::Result<String> {
         .map(|words| words.join(" "))
 }
 
+/// Capture the source pane in the binding, before the popup has a pane of its own.
+pub fn agent_move_popup(
+    endpoint: &BackendEndpoint,
+    client: Option<&str>,
+    pane: &str,
+    add_pane: bool,
+) -> anyhow::Result<()> {
+    let mut words = vec![std::env::current_exe()?.into_os_string()];
+    words.extend(std::env::args_os().skip(1).filter(|arg| arg != "--popup"));
+    if add_pane {
+        words.extend(["--pane".into(), pane.into()]);
+    }
+    let shell_command = popup_shell_command(&words)?;
+    let mut command = command(endpoint).map_err(anyhow::Error::msg)?;
+    command.arg("display-popup");
+    if let Some(client) = client {
+        command.args(["-c", client]);
+    }
+    let status = command
+        .args(["-E", "-w", "80%", "-h", "75%"])
+        .arg(shell_command)
+        .status()?;
+    anyhow::ensure!(
+        status.success(),
+        "could not open agent move popup: {status}"
+    );
+    Ok(())
+}
+
 #[derive(Clone)]
 pub enum Control {
     Ambient,

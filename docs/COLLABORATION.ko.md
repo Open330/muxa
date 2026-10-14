@@ -12,8 +12,7 @@ request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 
   그 pane으로 돌아가 agent를 깨웁니다.
 - `muxa watch`는 agent가 아니라 **operator console**입니다. watch를 연 pane에 무엇이
   들어 있든, 발신자는 키보드 앞의 사람입니다.
-- agent를 선택하고 `m`으로 보내며 `M`으로 mailbox를 엽니다(`b`는 alias로
-  유지됩니다).
+- agent를 선택하고 `m`으로 보내며 `M`으로 mailbox를 엽니다.
 
 즉 agent 간 협업은 같은 window에 agent 둘을 두고 MCP로 주고받는 흐름이고, 사람의
 흐름은 그와 별개로 준비가 필요 없습니다. 어디서든 `prefix+s`를 누르고, 행을
@@ -254,7 +253,7 @@ Work 필드를 채우고 가능하면 execution binding으로 run id를 만들�
 keyword를 받습니다.
 
 tracked agent pane에서 `prefix+s`로 `muxa watch`를 열면 같은 lifecycle을 TUI로
-사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `M`/`b`는 claim
+사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `M`은 claim
 없는 mailbox 이력을 열며, `i`는 inbox를 claim하고 `e`는 응답합니다. window 행의
 `M`은 room 전체를, session 행에서는 모든 room을 window별로 모아 보여주며 두
 aggregate view는 read-only입니다. collaboration 화면은 `v` 또는

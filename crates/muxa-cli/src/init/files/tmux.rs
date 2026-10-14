@@ -33,6 +33,7 @@ pub const POPUP_BODY: &str = r#"# Muxa popups: local watch, Fleet watch, and das
 # Reserve the bottom row for rmux's status bar.
 bind-key s run-shell -b "muxa watch --popup --caller-client '#{client_name}' --caller-pane '#{pane_id}'"
 bind-key S run-shell -b "muxa watch --popup --fleet --caller-client '#{client_name}' --caller-pane '#{pane_id}'"
+bind-key M run-shell -b "muxa agent move --popup --pane '#{pane_id}' --caller-client '#{client_name}'"
 bind-key D display-popup -E -w 95% -h 90% "muxa dashboard""#;
 
 /// The body that goes inside the `tmux-peek` marker block.
@@ -215,6 +216,10 @@ mod tests {
         assert!(after.contains("display-popup"));
         assert!(after.contains("muxa watch"));
         assert!(after.contains("bind-key S"));
+        assert!(after.contains("bind-key M run-shell -b"));
+        assert!(after.contains(
+            "muxa agent move --popup --pane '#{pane_id}' --caller-client '#{client_name}'"
+        ));
         assert!(after.contains("muxa watch --popup --fleet"));
         assert!(after.contains("bind-key D"));
         assert!(after.contains("muxa dashboard"));

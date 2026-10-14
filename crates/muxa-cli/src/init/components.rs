@@ -112,7 +112,9 @@ impl Component {
     /// One-line label shown in the multi-select.
     pub fn label(self) -> &'static str {
         match self {
-            Component::TmuxPopup => "tmux: prefix+s watch + prefix+S Fleet + prefix+D dashboard",
+            Component::TmuxPopup => {
+                "tmux: prefix+s watch + prefix+S Fleet + prefix+M move + prefix+D dashboard"
+            }
             Component::TmuxStatusLine => "tmux: per-pane agent glyphs in status-right",
             Component::TmuxPeek => "tmux: prefix+Q overlays each pane with its agent",
             Component::TmuxWindowNames => "tmux: muxa owns window names (prefix+, renames)",

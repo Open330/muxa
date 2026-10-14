@@ -706,6 +706,81 @@ pub fn run_workspace_view(args: WorkspaceViewArgs) -> Result<()> {
     Ok(())
 }
 
+/// Focus a moved agent for one client. Reuse its grouped view when possible;
+/// otherwise create a private destination view if another client is there.
+pub(crate) fn focus_moved_pane(
+    control: &Control,
+    client: &str,
+    session: &str,
+    window: &str,
+    pane: &str,
+) -> Result<()> {
+    let current = resolve_view_session(control, client)?;
+    let linked = control.output(&["list-windows", "-t", &current.id, "-F", "#{window_id}"])?;
+    let target = if linked.lines().any(|id| id == window) {
+        current.clone()
+    } else {
+        resolve_view_session(control, session)?
+    };
+    let others = target
+        .attached
+        .saturating_sub(u32::from(target.id == current.id));
+    let session = if others > 0 {
+        let sessions = list_view_sessions(control)?;
+        let source = canonical_view_source(&target, &sessions);
+        let suffix = client_suffix(control, client)?;
+        let view = prepare_view(control, client, &source, &suffix, &sessions)?;
+        activate_view(control, client, &current.id, &view)?;
+        view.id
+    } else {
+        target.id
+    };
+    let target = format!("{session}:{window}");
+    control.run(&["switch-client", "-c", client, "-t", &target])?;
+    control.run(&["select-window", "-t", &target])?;
+    control.run(&[
+        "select-pane",
+        "-t",
+        &format!("{target}.{}", pane.strip_prefix("rmux:").unwrap_or(pane)),
+    ])
+}
+
+pub(crate) struct MoveFollowView {
+    pub session: String,
+    pub private: bool,
+    pub created: bool,
+}
+
+/// Prepare a destination view without switching away from the popup. Whole
+/// window moves can close that popup, so its switch must join the move queue.
+pub(crate) fn prepare_window_move_follow(
+    control: &Control,
+    client: &str,
+    session: &str,
+) -> Result<MoveFollowView> {
+    let current = resolve_view_session(control, client)?;
+    let target = resolve_view_session(control, session)?;
+    let others = target
+        .attached
+        .saturating_sub(u32::from(target.id == current.id));
+    if others == 0 {
+        return Ok(MoveFollowView {
+            session: target.id,
+            private: false,
+            created: false,
+        });
+    }
+    let sessions = list_view_sessions(control)?;
+    let source = canonical_view_source(&target, &sessions);
+    let suffix = client_suffix(control, client)?;
+    let view = prepare_view(control, client, &source, &suffix, &sessions)?;
+    Ok(MoveFollowView {
+        session: view.id,
+        private: true,
+        created: view.created,
+    })
+}
+
 fn client_suffix(control: &Control, client: &str) -> Result<String> {
     let listing = control.output(&["list-clients", "-F", "#{client_name}\t#{client_pid}"])?;
     listing

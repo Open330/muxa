@@ -134,7 +134,8 @@ row는 tmux window를, 펼친 child row는 agent pane을 나타냅니다.
 - Enter: 선택한 pane으로 이동
 - n: 새 work와 첫 agent 생성, 또는 기존 work에 agent 추가
 - m: 선택한 agent에 collaboration 메시지 작성
-- M: mailbox 열기
+- M / b: mailbox 열기
+- Alt-M: 선택한 agent 이동
 - a: headless ask
 - A: 선택한 Ask conversation
 - o 또는 Alt-P: pane preview

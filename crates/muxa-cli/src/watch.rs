@@ -1889,7 +1889,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  Alt-A          attention-only filter",
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
-        "  m / M / Space  message selected or marked / mailbox / mark agent",
+        "  m / M / Alt-M  message / mailbox / move pane or window; Space marks",
         "  Alt-1/2 · W    screen topology / collab · W is the work table",
         "  v              (in collab) toggle table / sequence history",
         "  i / e          (in mailbox) claim inbox / reply",
@@ -3177,6 +3177,7 @@ pub(crate) struct App {
     /// `Some` while the `a` ask composer is open.
     ask_composer: Option<AskComposer>,
     work_composer: Option<WorkComposer>,
+    agent_move: Option<crate::agent_move::MoveMenu>,
     rename: Option<RenameComposer>,
     ask_panel: AskPanelState,
     ask_entries: Vec<muxa::ask::AskEntry>,
@@ -3463,6 +3464,7 @@ impl App {
             spawn: None,
             ask_composer: None,
             work_composer: None,
+            agent_move: None,
             rename: None,
             ask_panel: AskPanelState::default(),
             ask_entries: Vec::new(),
@@ -7972,6 +7974,53 @@ pub async fn run(
                 Action::OpenWorkUp => {
                     app.work_composer = Some(WorkComposer::default());
                 }
+                Action::OpenAgentMove => {
+                    let source = selected_move_target(&app);
+                    match source {
+                        Ok((source, scope)) => {
+                            let opened = tokio::task::spawn_blocking(move || {
+                                crate::agent_move::MoveMenu::open_scope(source, scope)
+                            })
+                            .await;
+                            match opened {
+                                Ok(Ok(menu)) => app.agent_move = Some(menu),
+                                Ok(Err(error)) => app
+                                    .set_hint(format!("move unavailable: {error}"), HintLevel::Err),
+                                Err(error) => app
+                                    .set_hint(format!("move unavailable: {error}"), HintLevel::Err),
+                            }
+                        }
+                        Err(error) => app.set_hint(error, HintLevel::Warn),
+                    }
+                }
+                Action::SubmitAgentMove(request) => {
+                    let result =
+                        tokio::task::spawn_blocking(move || crate::agent_move::execute(request))
+                            .await;
+                    match result {
+                        Ok(Ok(outcome)) => {
+                            crate::agent_move::refresh_locations(client, &outcome.pane).await;
+                            app.agent_move = None;
+                            app.set_hint(outcome.message, HintLevel::Ok);
+                            request_refresh(&mut app, &wake_tx);
+                            if outcome.follow {
+                                jump_target = Some(WatchOpenTarget::Moved(outcome.pane));
+                                quit = true;
+                                break;
+                            }
+                        }
+                        error => {
+                            let error = match error {
+                                Ok(Err(error)) => error.to_string(),
+                                Err(error) => error.to_string(),
+                                _ => unreachable!(),
+                            };
+                            if let Some(menu) = app.agent_move.as_mut() {
+                                menu.error = Some(error);
+                            }
+                        }
+                    }
+                }
                 Action::SubmitRename => {
                     finish_rename(&mut app, &wake_tx, apply_rename);
                 }
@@ -8733,6 +8782,60 @@ fn mailbox_anchor(app: &App) -> Option<MailboxAnchor> {
 /// composer cannot open, `m` degrades to the keystrokes-only form against
 /// the selected pane instead of refusing outright, and the reason the
 /// contract modes are missing rides along as a warning hint.
+fn selected_move_target(
+    app: &App,
+) -> std::result::Result<(PaneKey, crate::agent_move::MoveScope), String> {
+    if app.uses_tree() {
+        if let Some(TopologyNodeRef::Session(session)) = app.selected_node() {
+            if session.windows.len() == 1 {
+                let pane = session.windows[0]
+                    .active_pane()
+                    .ok_or("selected window has no live panes")?;
+                return Ok((pane.key.clone(), crate::agent_move::MoveScope::Window));
+            }
+            return Err("select a window or pane to move".into());
+        }
+    }
+    let key = selected_move_key(app)?;
+    let scope =
+        if app.uses_tree() && matches!(app.selected_node(), Some(TopologyNodeRef::Window(_))) {
+            crate::agent_move::MoveScope::Window
+        } else {
+            crate::agent_move::MoveScope::Pane
+        };
+    Ok((key, scope))
+}
+
+fn selected_move_key(app: &App) -> std::result::Result<PaneKey, String> {
+    if app.uses_tree() {
+        if matches!(app.selected_node(), Some(TopologyNodeRef::Session(_))) {
+            return Err("select a window or pane to move".into());
+        }
+        return app
+            .selected_action_pane()
+            .map(|pane| pane.key.clone())
+            .ok_or_else(|| "select an agent pane to move".into());
+    }
+    let pane = app.selected_pane().ok_or("select an agent pane to move")?;
+    let agent = app.selected_agent();
+    let matches: Vec<_> = app
+        .panes
+        .iter()
+        .filter(|p| {
+            p.pane_id == pane
+                && agent
+                    .and_then(|a| a.tmux_socket.as_deref())
+                    .is_none_or(|s| p.socket.as_deref() == Some(s))
+        })
+        .collect();
+    let p = matches.first().ok_or("selected pane is no longer live")?;
+    if matches.iter().any(|other| other.socket != p.socket) {
+        return Err("ambiguous pane endpoint — select it in tree layout".into());
+    }
+    let host = muxa::backend::pane_id_host_kind(&pane).ok_or("unsupported pane backend")?;
+    Ok(PaneKey::from_pane(host, p))
+}
+
 fn open_prompt_only_composer(app: &mut App, reason: String) {
     let pane_key = if app.uses_tree() {
         app.selected_action_pane().map(|pane| pane.key.clone())
@@ -9627,6 +9730,8 @@ fn drain_pending_events() -> io::Result<Vec<Event>> {
 
 #[derive(Debug)]
 pub(crate) enum Action {
+    OpenAgentMove,
+    SubmitAgentMove(crate::agent_move::MoveRequest),
     /// Open the work composer (`w`).
     OpenWorkUp,
     /// Run `muxa work up` for whatever the composer holds.
@@ -9729,6 +9834,7 @@ pub(crate) enum Action {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchOpenTarget {
+    Moved(PaneKey),
     TopologyPane(PaneKey),
     LegacyPane(String),
 }
@@ -9740,6 +9846,10 @@ struct CommandSpec {
 }
 
 const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        command: "move",
+        description: "move selected agent without restarting",
+    },
     CommandSpec {
         command: "refresh",
         description: "refresh data now",
@@ -9868,6 +9978,7 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         "r" | "refresh" => Action::Refresh,
         "o" | "open" | "preview" => Action::OpenPreview,
         "m" | "message" => Action::OpenCollaborationMessage,
+        "move" => Action::OpenAgentMove,
         "split" => {
             app.inspector_split = app.inspector_split.next();
             Action::InspectorSplitChanged
@@ -9933,6 +10044,10 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     // Prompt/command modes keep it literal; table mode treats it as a search
     // query, matching ordinary direct typing.
     if let Event::Paste(pasted) = ev {
+        if let Some(menu) = app.agent_move.as_mut() {
+            menu.paste(&pasted);
+            return Action::None;
+        }
         if let Some(editor) = app.message_skill_editor.as_mut() {
             let pasted = pasted.replace(['\r', '\n'], " ");
             let (text, cursor) = editor.field_mut();
@@ -10007,6 +10122,17 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             // arrows) cancels. Listing them explicitly would invite
             // someone to accidentally drop one — fall through.
             _ => Action::ConfirmCancel,
+        };
+    }
+
+    if let Some(menu) = app.agent_move.as_mut() {
+        return match menu.on_key(KeyEvent::new(code, modifiers)) {
+            crate::agent_move::MenuEvent::None => Action::None,
+            crate::agent_move::MenuEvent::Cancel => {
+                app.agent_move = None;
+                Action::None
+            }
+            crate::agent_move::MenuEvent::Submit(request) => Action::SubmitAgentMove(*request),
         };
     }
 
@@ -10086,6 +10212,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
 
     if modifiers.contains(KeyModifiers::ALT) {
         return match code {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'m') => Action::OpenAgentMove,
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p') => Action::OpenPreview,
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'r') => Action::Refresh,
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') => {
@@ -12146,6 +12273,9 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     render_broadcast_report_overlay(f, chunks[1], app);
     render_work_composer_overlay(f, chunks[1], app);
     render_rename_overlay(f, chunks[1], app);
+    if let Some(menu) = app.agent_move.as_ref() {
+        menu.render(f, centered_rect(85, 80, chunks[1]));
+    }
     if app.ask_composer.is_some() {
         let skills_open = app
             .ask_composer
@@ -17757,6 +17887,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&[Tr
         Span::raw(" preview  "),
         Span::styled(" m ", theme.action_badge()),
         Span::raw(" message  "),
+        Span::styled(" Alt-M ", theme.action_badge()),
+        Span::raw(" move  "),
         Span::styled(" M ", theme.action_badge()),
         Span::raw(" mailbox  "),
         Span::styled(" ? ", theme.key_badge()),
@@ -18731,6 +18863,38 @@ mod tests {
             Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT)),
             app,
         )
+    }
+
+    #[test]
+    fn move_scope_follows_the_selected_window_or_pane() {
+        let (agents, panes) = two_window_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let session = app.topology.sessions[0].key.clone();
+        let window = app.topology.sessions[0].windows[0].key.clone();
+        let pane = app.topology.sessions[0].windows[0].panes[0].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Window(window.clone()));
+        let (key, scope) = selected_move_target(&app).unwrap();
+        assert_eq!(scope, crate::agent_move::MoveScope::Window);
+        assert_eq!(key.window, window);
+        select_tree_key(&mut app, &TopologyNodeKey::Pane(pane.clone()));
+        assert_eq!(
+            selected_move_target(&app).unwrap(),
+            (pane, crate::agent_move::MoveScope::Pane)
+        );
+        select_tree_key(&mut app, &TopologyNodeKey::Session(session));
+        assert!(selected_move_target(&app).is_err());
+    }
+
+    #[test]
+    fn a_compacted_single_window_row_moves_the_whole_window() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let session = app.topology.sessions[0].key.clone();
+        let window = app.topology.sessions[0].windows[0].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Session(session));
+        let (key, scope) = selected_move_target(&app).unwrap();
+        assert_eq!(scope, crate::agent_move::MoveScope::Window);
+        assert_eq!(key.window, window);
     }
 
     #[test]
@@ -20622,6 +20786,14 @@ mod tests {
         assert!(matches!(
             key_action(&mut app, 'M'),
             Action::OpenCollaborationMailbox
+        ));
+        assert!(matches!(
+            alt_key_action(&mut app, 'm'),
+            Action::OpenAgentMove
+        ));
+        assert!(matches!(
+            alt_key_action(&mut app, 'M'),
+            Action::OpenAgentMove
         ));
         assert!(matches!(
             key_action(&mut app, 'b'),
@@ -26675,6 +26847,8 @@ sort = ["state"]
             // encounter here is treated as "no-op" for the existing
             // preview-suite assertions.
             Action::None
+            | Action::OpenAgentMove
+            | Action::SubmitAgentMove(_)
             | Action::Quit
             | Action::Refresh
             | Action::AttachPane(_)
@@ -28156,7 +28330,9 @@ sort = ["state"]
         assert!(body.contains("Alt-A          attention-only filter"));
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
-        assert!(body.contains("m / M / Space  message selected or marked / mailbox / mark agent"));
+        assert!(
+            body.contains("m / M / Alt-M  message / mailbox / move pane or window; Space marks")
+        );
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains(
             "a/A · Ctrl-E/n ask / conversations · new mode/draft · Enter read · d/D delete"

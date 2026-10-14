@@ -648,6 +648,10 @@ enum RequestBody {
     BackendPaneSnapshot {
         panes: Vec<PaneInfo>,
     },
+    /// Observe locations after a move, without changing agent activity/state.
+    RefreshPaneLocations {
+        pane: String,
+    },
     SpawnSession {
         command: String,
         #[serde(default)]
@@ -3655,6 +3659,23 @@ async fn handle(
                     tracing::debug!(panes = count, "backend_pane_snapshot");
                     Response::ok()
                 }
+                RequestBody::RefreshPaneLocations { pane } => {
+                    kind = "refresh_pane_locations";
+                    match resolve_backend(&backends, &pane) {
+                        Err(error) => Response::err(format!("no active {error} backend")),
+                        Ok(target) => {
+                            let target = target.clone();
+                            match tokio::task::spawn_blocking(move || target.observe_panes()).await
+                            {
+                                Ok(observation) => {
+                                    store.refresh_pane_locations(&observation.panes).await;
+                                    Response::ok()
+                                }
+                                Err(error) => Response::err(error.to_string()),
+                            }
+                        }
+                    }
+                }
                 RequestBody::SendPrompt { pane, text, submit } => {
                     kind = "send_prompt";
                     match resolve_backend(&backends, &pane) {
@@ -5207,6 +5228,12 @@ impl Client {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "snapshot" });
         let resp = self.call(&req).await?;
         decode_agents(&resp)
+    }
+
+    pub async fn refresh_pane_locations(&self, pane: &str) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "refresh_pane_locations", "pane": pane });
+        self.call_checked(&req).await?;
+        Ok(())
     }
 
     /// Read the central physical-host cache. This is a local Unix-socket

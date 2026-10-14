@@ -15,7 +15,7 @@ mailbox, not through terminal screen scraping.
 - `muxa watch` is not an agent. It is the **operator console** — the human at
   the keyboard is the sender, whatever the pane the popup was opened from
   happens to contain.
-- Select any agent; `m` sends and `M` opens the mailbox (`b` remains an alias).
+- Select any agent; `m` sends and `M` opens the mailbox.
 
 So the normal agent-to-agent workflow is: put two agents in one window and let
 them message each other over MCP. The operator workflow is separate and needs
@@ -279,7 +279,7 @@ remains the legacy bare array. `--since` accepts durations such as `2h`/`7d`,
 local dates, RFC 3339 timestamps, and the same calendar keywords as timeline.
 
 The same lifecycle is available interactively in `muxa watch`: `m` sends to the
-selected room peer, `M`/`b` opens non-claiming mailbox history, `i` claims the
+selected room peer, `M` opens non-claiming mailbox history, `i` claims the
 inbox, and `e` replies. On a window row, `M` reads the whole room; on a session
 row it reads every room grouped by window. Those aggregate views are read-only.
 The collaboration screen toggles between a newest-first table and chronological

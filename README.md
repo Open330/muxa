@@ -253,7 +253,13 @@ Then:
 3. Press `m`, type the request, and press `Enter`. At any point in the draft,
    `/` opens reusable skills registered with `muxa skill add`; selection inserts
    at the cursor and a second `Enter` sends. Press `M` to read and reply from
-   the mailbox (`b` remains an alias).
+   the mailbox.
+
+Press `prefix+M` from an agent pane, or `Alt-M` on its row in local watch, to
+move it into a new session/window or an existing window without restarting.
+The shared menu supports destination search, follow/stay, split direction,
+and undo. On a window row, `Alt-M` moves every pane and the layout together;
+`Ctrl-W` in the popup switches pane/window scope. See [moving a running agent](docs/WATCH.md#move-a-running-agent).
 
 `M` on a window combines its room; on a session it combines all windows and
 groups the read-only history by window. On the collaboration screen, `v`

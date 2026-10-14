@@ -2,6 +2,7 @@
 
 mod activity_query;
 mod agent_launch;
+mod agent_move;
 mod attend;
 mod automation;
 mod collab_screen;
@@ -745,10 +746,14 @@ enum AgentCmd {
     Start(agent_launch::StartArgs),
     /// Interrupt or terminate one muxa-managed tmux pane or native PTY session.
     Control(tmux_work::AgentControlArgs),
+    /// Move a running agent without restarting its conversation.
+    Move(agent_move::MoveArgs),
 }
 
 #[derive(Debug, Subcommand)]
 enum WindowCmd {
+    /// Move a whole live window, including all agents and its layout.
+    Move(agent_move::MoveArgs),
     /// Set a stable display name, or restore tmux's automatic process name.
     Rename(tmux_work::WindowRenameArgs),
 }
@@ -979,12 +984,14 @@ async fn run_agent_cmd(
     match action {
         AgentCmd::Start(args) => agent_launch::run(args, client, socket_path, cfg).await,
         AgentCmd::Control(args) => tmux_work::run_agent_control(args, client).await,
+        AgentCmd::Move(args) => agent_move::run(args, Some(client.socket().to_path_buf())).await,
     }
 }
 
-fn run_window_cmd(action: WindowCmd) -> Result<()> {
+async fn run_window_cmd(action: WindowCmd) -> Result<()> {
     match action {
         WindowCmd::Rename(args) => tmux_work::run_window_rename(args),
+        WindowCmd::Move(args) => agent_move::run_window(args, None).await,
     }
 }
 
@@ -1344,6 +1351,18 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
+    if let Cmd::Agent {
+        action: AgentCmd::Move(move_args),
+    } = &args.cmd
+    {
+        return agent_move::run(move_args.clone(), args.socket.clone()).await;
+    }
+    if let Cmd::Window {
+        action: WindowCmd::Move(move_args),
+    } = &args.cmd
+    {
+        return agent_move::run_window(move_args.clone(), args.socket.clone()).await;
+    }
     if let Cmd::Watch {
         popup: true,
         caller_client,
@@ -1436,7 +1455,7 @@ async fn main() -> Result<()> {
             .await
         }
         Cmd::Agent { action } => run_agent_cmd(action, &client, &socket, &cfg).await,
-        Cmd::Window { action } => run_window_cmd(action),
+        Cmd::Window { action } => run_window_cmd(action).await,
         Cmd::Work { action } => run_work_cmd(action, &cfg, config_path, &client).await,
         Cmd::Workspace { action } => run_workspace_cmd(action),
         Cmd::Identity { action } => cmd_identity(&client, action).await,
@@ -2735,6 +2754,7 @@ pub(crate) async fn cmd_watch(
     .await?
     {
         match target {
+            watch::WatchOpenTarget::Moved(key) => agent_move::follow(&key)?,
             watch::WatchOpenTarget::TopologyPane(key) => {
                 jump_to_topology_pane_logged(&key, activity_path.as_deref()).await;
             }
