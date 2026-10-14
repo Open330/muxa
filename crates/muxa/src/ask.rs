@@ -1924,6 +1924,9 @@ impl AskEngine {
         if let Some(api_key) = turn.api_key {
             cmd.env(self.credential_env(), api_key);
         }
+        // Lets the user's own CLI hooks (prompt rewriters, coaches, loggers)
+        // recognise a headless muxa turn and stay out of the answer.
+        cmd.env(ASK_ENV_MARKER, "1");
         let output = tokio::time::timeout(turn.timeout, cmd.output())
             .await
             .map_err(|_| timeout_message(bin, turn.timeout))?
@@ -1931,7 +1934,7 @@ impl AskEngine {
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let detail = stderr.trim().lines().next_back().unwrap_or("no stderr");
+            let detail = non_zero_detail(&stdout, &stderr);
             return Err(format!("{bin} exited non-zero: {detail}"));
         }
         match self {
@@ -2508,6 +2511,32 @@ fn parse_apple_json(stdout: &str) -> Result<AskAnswer, String> {
     })
 }
 
+/// Set in the environment of every headless CLI turn muxa spawns, so the
+/// user's own hooks can tell an ask apart from an interactive session.
+pub const ASK_ENV_MARKER: &str = "MUXA_ASK";
+
+/// The one line worth keeping from a CLI that exited non-zero. stderr's
+/// last line wins; when stderr is empty (claude reports login and API
+/// failures as a JSON result on stdout with exit 1) the stdout result
+/// text, or failing that its last line, stands in. Only then "no output".
+fn non_zero_detail(stdout: &str, stderr: &str) -> String {
+    if let Some(line) = stderr.trim().lines().next_back() {
+        return line.to_string();
+    }
+    let stdout = stdout.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout) {
+        if let Some(result) = value.get("result").and_then(serde_json::Value::as_str) {
+            if !result.trim().is_empty() {
+                return result.trim().to_string();
+            }
+        }
+    }
+    stdout
+        .lines()
+        .next_back()
+        .map_or_else(|| "no output".to_string(), str::to_string)
+}
+
 /// `codex exec --json` streams one JSON event per line. The answer is the
 /// last agent message; the session id appears in a configured/session
 /// event near the top.
@@ -2822,6 +2851,22 @@ mod tests {
             builtin: true,
             configured: false,
         }
+    }
+
+    #[test]
+    fn non_zero_detail_prefers_stderr_then_stdout_result() {
+        assert_eq!(
+            non_zero_detail("", "boom\nnot logged in\n"),
+            "not logged in"
+        );
+        let json =
+            r#"{"type":"result","is_error":true,"result":"Invalid API key · Please run /login"}"#;
+        assert_eq!(
+            non_zero_detail(json, ""),
+            "Invalid API key · Please run /login"
+        );
+        assert_eq!(non_zero_detail("plain\nlast line\n", ""), "last line");
+        assert_eq!(non_zero_detail("", ""), "no output");
     }
 
     #[test]
@@ -4226,6 +4271,61 @@ mod tests {
         // The built-in engine id is still selectable next to them.
         assert_eq!(store.set_agent("anthropic").await.unwrap(), "anthropic");
         assert!(store.set_agent("anthropic-nope").await.is_err());
+    }
+
+    /// Runs one headless turn against a fake `claude` built from `script`.
+    #[cfg(unix)]
+    async fn fake_claude_turn(script: &str) -> Result<AskAnswer, String> {
+        let directory = tempdir().unwrap();
+        let fake = directory.path().join("claude-fake");
+        crate::test_support::write_executable(&fake, format!("#!/bin/sh\n{script}\n"), 0o755);
+        let config = AskProviderConfig {
+            engine: Some("claude".into()),
+            executable: Some(fake.display().to_string()),
+            ..AskProviderConfig::default()
+        };
+        one_shot_configured(
+            OneShot {
+                agent: "claude-fake",
+                prompt: "hi",
+                cwd: directory.path(),
+                permission_mode: AskPermissionMode::Plan,
+                additional_dirs: &[],
+                timeout: Duration::from_secs(30),
+            },
+            Some(&config),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    /// The user's own CLI hooks (prompt coaches, loggers) key off this marker
+    /// to stay out of a headless answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn headless_turns_carry_the_ask_marker() {
+        let answer = fake_claude_turn(
+            "printf '{\"is_error\":false,\"result\":\"marker=%s\",\"session_id\":\"s\"}' \"$MUXA_ASK\"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer.text, "marker=1", "{ASK_ENV_MARKER} must be set");
+    }
+
+    /// claude reports login and API failures as a JSON result on stdout with
+    /// an empty stderr; that result is the reason worth showing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_turn_reports_the_reason_claude_printed_on_stdout() {
+        let error = fake_claude_turn(
+            "printf '{\"type\":\"result\",\"is_error\":true,\"result\":\"Invalid API key\"}'; exit 1",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.ends_with("exited non-zero: Invalid API key"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
