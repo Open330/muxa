@@ -1039,28 +1039,33 @@ fn check_muxa_socket_env(daemon_socket: &Path, env: &TmuxEnvironment) -> CheckRe
 /// needed at all: a pane with no pin falls back to the default socket
 /// path, which is the right answer whenever muxad is listening there.
 /// Only a daemon on a *non-default* socket makes the missing pin bite.
+///
+/// That holds on every server, not just config-isolated ones: `muxa init`
+/// deliberately writes no pin for the default socket (`needs_socket_pin`),
+/// so telling a default-socket user to run it promised a fix that never
+/// came, and the warning returned after every multiplexer restart.
 fn muxa_socket_unset(daemon_socket: &Path, env: &TmuxEnvironment) -> CheckResult {
-    if !env.isolated() {
-        return CheckResult::Warn(
-            "tmux: MUXA_SOCKET not set — run `muxa init` to repair socket propagation".into(),
-        );
-    }
     let shown = daemon_socket.display();
     if same_path(daemon_socket, &muxa::paths::default_socket()) {
-        CheckResult::Ok(format!(
-            "tmux: MUXA_SOCKET unset on {}, which reads no `~/.tmux.conf` — harmless, since \
-             panes fall back to the default socket muxad already listens on ({shown})",
+        return CheckResult::Ok(format!(
+            "tmux: MUXA_SOCKET unset on {} — harmless, since panes fall back to the default \
+             socket muxad already listens on ({shown})",
             env.server_label()
-        ))
-    } else {
-        CheckResult::Warn(format!(
-            "tmux: MUXA_SOCKET unset on {}, which reads no `~/.tmux.conf`, and muxad listens on \
-             the non-default {shown} — panes there will fall back to the default path and fail \
-             to reach it; pin it on that server with `tmux set-environment -g MUXA_SOCKET \
-             {shown}`",
-            env.server_label()
-        ))
+        ));
     }
+    if !env.isolated() {
+        return CheckResult::Warn(format!(
+            "tmux: MUXA_SOCKET not set and muxad listens on the non-default {shown} — run \
+             `muxa init` to pin it in `~/.tmux.conf`"
+        ));
+    }
+    CheckResult::Warn(format!(
+        "tmux: MUXA_SOCKET unset on {}, which reads no `~/.tmux.conf`, and muxad listens on \
+         the non-default {shown} — panes there will fall back to the default path and fail \
+         to reach it; pin it on that server with `tmux set-environment -g MUXA_SOCKET \
+         {shown}`",
+        env.server_label()
+    ))
 }
 
 /// Whether two socket paths name the same file, tolerating the `/tmp` →
@@ -1366,11 +1371,22 @@ mod tests {
         assert!(!msg.contains("muxa init"), "{msg}");
     }
 
+    /// `muxa init` writes no pin for the default socket, so on the user's
+    /// own server too a missing pin is fine; only a moved socket needs init.
     #[test]
-    fn an_unset_socket_pin_on_the_users_own_server_still_points_at_init() {
+    fn an_unset_socket_pin_on_the_users_own_server_needs_init_only_off_default() {
         let result = muxa_socket_unset(&muxa::paths::default_socket(), &user_owned_server());
+        assert!(is_ok(&result), "{}", message(&result));
+        assert!(!message(&result).contains("muxa init"));
+
+        let moved = PathBuf::from("/tmp/muxa-elsewhere.sock");
+        let result = muxa_socket_unset(&moved, &user_owned_server());
         assert!(matches!(result, CheckResult::Warn(_)));
-        assert!(message(&result).contains("muxa init"));
+        assert!(
+            message(&result).contains("muxa init"),
+            "{}",
+            message(&result)
+        );
     }
 
     #[test]
