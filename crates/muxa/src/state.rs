@@ -2210,16 +2210,19 @@ impl Store {
         }
     }
 
-    /// Repair a binding using an explicit running `codex resume <session>`
-    /// beneath a known pane. This does not manufacture user activity.
-    pub(crate) async fn rebind_codex_resumes(&self, bindings: &[(String, PaneInfo)]) -> usize {
+    /// Repair a binding using an explicit running resume (`codex resume
+    /// <session>`, `claude --resume <session>`) beneath a known pane. This does
+    /// not manufacture user activity.
+    pub(crate) async fn rebind_resumes(&self, bindings: &[(String, PaneInfo)]) -> usize {
         let mut agents = self.agents.write().await;
         let mut changed = 0;
         for (sid, pane) in bindings {
             let Some(agent) = agents.get_mut(sid) else {
                 continue;
             };
-            if agent.kind != AgentKind::Codex || agent.surface.is_some() {
+            if !matches!(agent.kind, AgentKind::Codex | AgentKind::ClaudeCode)
+                || agent.surface.is_some()
+            {
                 continue;
             }
             if agent.pane.as_deref() == Some(&pane.pane_id) && agent.tmux_socket == pane.socket {
@@ -5527,7 +5530,7 @@ mod tests {
         actual.session = "muxa".into();
         actual.socket = Some("default".into());
         let bindings = vec![(sid.to_owned(), actual)];
-        assert_eq!(store.rebind_codex_resumes(&bindings).await, 1);
+        assert_eq!(store.rebind_resumes(&bindings).await, 1);
         assert!(changes.has_changed().unwrap());
         changes.borrow_and_update();
         let agent = store
@@ -5539,8 +5542,46 @@ mod tests {
         assert_eq!(agent.pane.as_deref(), Some("%181"));
         assert_eq!(agent.tmux_session.as_deref(), Some("muxa"));
         assert_eq!(agent.last_activity_at, at);
-        assert_eq!(store.rebind_codex_resumes(&bindings).await, 0);
+        assert_eq!(store.rebind_resumes(&bindings).await, 0);
         assert!(!changes.has_changed().unwrap());
+    }
+
+    /// `muxa reload` relaunches Claude as `claude --resume <id>` in a pane whose
+    /// id the restart renumbered. The process tree is the evidence, so an idle
+    /// resumed Claude is moved before it fires any hook. Other kinds have no
+    /// resume evidence and are left to their hooks.
+    #[tokio::test]
+    async fn a_claude_resume_moves_its_row_without_waiting_for_a_hook() {
+        let store = Store::shared();
+        let at = datetime!(2026-10-14 08:42:00 UTC);
+        let started = |kind, sid: &str| AgentEvent::Started {
+            id: AgentId {
+                kind,
+                session_id: sid.into(),
+                surface: None,
+                pane: Some("rmux:%66".into()),
+                tmux_socket: None,
+                cwd: None,
+            },
+            at,
+        };
+        let claude = "9e48c8ff-1b70-4a3e-9f32-1581a05f0f75";
+        let gemini = "5b1c2d3e-0000-4000-8000-000000000001";
+        store.apply(&started(AgentKind::ClaudeCode, claude)).await;
+        store.apply(&started(AgentKind::GeminiCli, gemini)).await;
+        let bindings = vec![
+            (claude.to_owned(), pane("rmux:%8")),
+            (gemini.to_owned(), pane("rmux:%9")),
+        ];
+        assert_eq!(store.rebind_resumes(&bindings).await, 1);
+        let snap = store.snapshot().await;
+        let pane_of = |sid: &str| {
+            snap.iter()
+                .find(|a| a.session_id == sid)
+                .and_then(|a| a.pane.clone())
+        };
+        assert_eq!(pane_of(claude).as_deref(), Some("rmux:%8"));
+        assert_eq!(pane_of(gemini).as_deref(), Some("rmux:%66"));
     }
 
     fn pane(id: &str) -> PaneInfo {

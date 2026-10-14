@@ -77,7 +77,7 @@ pub(crate) async fn bind_paneless_codex(
     let scan = tokio::task::spawn_blocking(move || crate::process_tree::scan_codex_panes(&scanned))
         .await
         .unwrap_or_default();
-    let mut bound = store.rebind_codex_resumes(&scan.resume_bindings).await;
+    let mut bound = store.rebind_resumes(&scan.resume_bindings).await;
 
     // Screen evidence before elimination: after `/new` the thread runs in a
     // pane its predecessor owns, and elimination would hand it any idle Codex
