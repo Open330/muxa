@@ -2860,7 +2860,7 @@ async fn enrich_from_history(
             .map(|scan| {
                 scan.resume_bindings
                     .into_iter()
-                    .map(|(session, pane)| (session, pane.pane_id))
+                    .map(|binding| (binding.session_id, binding.pane.pane_id))
                     .collect()
             })
             .unwrap_or_default()
