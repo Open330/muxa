@@ -2768,6 +2768,24 @@ impl CollaborationStore {
         Ok(cancelled)
     }
 
+    /// One-way notices still unread in `recipient`'s mailbox. They never wake
+    /// anyone on their own, so a wake sent for something else is where the
+    /// recipient learns they exist; otherwise they wait until it happens to
+    /// read its inbox, however long that takes.
+    pub async fn quiet_notices_waiting(&self, recipient: &Participant) -> usize {
+        self.requests
+            .read()
+            .await
+            .values()
+            .filter(|request| {
+                request.status == RequestStatus::Queued
+                    && request.notified_at.is_none()
+                    && !request.should_notify()
+                    && addresses(&request.to, recipient)
+            })
+            .count()
+    }
+
     pub async fn pending_unnotified(&self) -> Vec<CollaborationRequest> {
         let _transaction = self.transaction_lock.lock().await;
         let mut requests: Vec<_> = self
