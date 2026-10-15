@@ -6,18 +6,35 @@
 
 래퍼도, 새 터미널도 필요 없습니다. 이미 tmux에서 돌리고 있는 Claude Code,
 Codex, Gemini CLI 세션을 지켜보다가 어느 에이전트가 나를 기다리는지 알려 주고
-그 pane으로 옮겨 줍니다.
+그 pane으로 옮겨 줍니다. watch에서 동료에게 리뷰를 요청하고 답장을 확인할 수도 있습니다.
 
 [![CI](https://github.com/Open330/muxa/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/muxa/actions/workflows/ci.yml)
 ![MSRV](https://img.shields.io/badge/MSRV-1.89-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-beta-yellow)
 
-[English](README.md) · **한국어**
+[미리 써보기](https://open330.github.io/muxa/learn/) · [웹사이트](https://open330.github.io/muxa/) · [English](README.md) · **한국어**
 
 </div>
 
 ---
+
+## 미리 써보기
+
+설치 없이 [브라우저에서 Muxa를 미리 써보세요](https://open330.github.io/muxa/learn/).
+터미널에 직접 입력하고, 지금 필요한 키를 한 단계씩 안내받습니다.
+
+| 어디서 시작할까요? | 해볼 수 있는 것 |
+| --- | --- |
+| [tmux 기본부터](https://open330.github.io/muxa/learn/?track=basics) | 일반 셸에서 준비된 session에 연결하고 session → window → pane 구조, pane 이동·확대, window 전환을 익힙니다. |
+| [watch에서 협업까지](https://open330.github.io/muxa/learn/?track=attention) | 기다리는 에이전트에 답하고 리뷰를 요청한 뒤 mailbox에서 답장을 읽습니다. |
+| [작업공간 이동](https://open330.github.io/muxa/learn/?track=workspace) | watch의 트리와 검색으로 session·window·pane을 찾아 이동합니다. |
+| [화면 살펴보기](https://open330.github.io/muxa/learn/?track=inspect) | 미리보기, 터미널 원문, inspector 비율, 도움말을 사용합니다. |
+| [자유 탐색](https://open330.github.io/muxa/learn/?track=free) | 전체 단축키를 보며 여러 session과 window를 자유롭게 둘러봅니다. |
+
+안내를 바꿔도 같은 터미널과 요청 기록이 이어집니다. 브라우저 안에서 동작하는
+시뮬레이션으로, 실제 셸 명령이나 에이전트/API를 실행하지 않습니다. 실제 tmux에서
+익히려면 설치 후 아래의 `muxa onboard`를 사용하세요.
 
 ## 시작하기
 
@@ -48,7 +65,7 @@ muxa onboard --quick --lang ko
 기존 16단계 상세 학습은 `muxa onboard`, 문서 체험은
 `muxa onboard --quick --print --lang ko`로 볼 수 있습니다.
 
-설치 전에 먼저 둘러보고 싶다면 일회용 tmux server에서 전체 tour를 체험할 수
+실제 CLI를 설치 없이 실행해보려면 일회용 tmux server에서 전체 tour를 체험할 수
 있습니다. script가 checksum을 검증한 release 바이너리로 진짜 `muxa onboard`를
 실행하고, 끝나면 지웁니다. 기존 tmux server는 건드리지 않습니다. 지원되는
 release 플랫폼과 network가 필요하고 live tour에는 tmux도 필요합니다.
@@ -69,6 +86,8 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
   알림으로 보여 줍니다.
 - **그 자리로 데려다 줍니다.** `muxa attend`는 가장 오래 막혀 있는 pane으로
   이동하고, `--cycle`은 나를 기다리는 에이전트를 차례로 돕니다.
+- **리뷰와 답장을 한곳에 남깁니다.** watch에서 `m`으로 동료에게 요청하고
+  `M`으로 요청·답장 이력을 확인합니다.
 - **한 에이전트가 나머지를 움직이게 합니다.** `muxa mcp`로 코딩 에이전트에게
   같은 상태 정보와 prompt 전송, 변화 대기 도구를 줍니다.
 
@@ -217,9 +236,25 @@ GitHub PR을 의미하지 않습니다. `@peer`는 같은 window의 정상 agent
 평소에는:
 
 1. 같은 tmux window의 두 pane에서 agent를 각각 실행합니다.
-2. 메시지를 보낼 agent pane을 선택하고 `prefix+s`를 누릅니다.
-3. watch에서 상대 agent를 선택하고 `m`을 눌러 메시지를 보냅니다. 받은 메시지와
-   응답은 `M` mailbox에서 확인합니다.
+2. 어느 pane에서든 `prefix`를 누르고 놓은 뒤 `s`로 watch를 엽니다.
+   트리에서 session·window·pane을 찾거나 `/`로 검색합니다.
+3. 상대 agent를 선택하고 `m`으로 요청을 작성한 뒤 `Enter`로 보냅니다.
+   `M` mailbox에서 받은 메시지와 보낸 요청·답장을 확인합니다.
+
+기본 prefix는 **Ctrl과 b를 함께 누른 뒤 두 키를 놓는 것**입니다. 이후 `s`를
+누릅니다. watch 안에서는 prefix 없이 아래 키를 사용합니다.
+
+| 키 | 동작 |
+| --- | --- |
+| `j` / `↓`, `k` / `↑` | 다음 / 이전 항목 선택 |
+| `h` / `l`, `←` / `→` | 상위·하위 항목으로 이동 |
+| `/` | 에이전트·작업공간 검색 |
+| `Enter` | 선택한 대상으로 연결 |
+| `o` | 선택한 pane 미리보기 |
+| `m` | 메시지 작성 |
+| `M` | mailbox 열기 |
+| `?` | 전체 도움말 |
+| `q` | watch를 닫고 원래 pane으로 복귀 |
 
 agent pane에서 `prefix+M`, 또는 로컬 watch의 agent 행에서 `Alt-M`을 누르면
 실행을 유지한 채 새 session/window나 기존 window로 이동합니다. 같은 메뉴에서
