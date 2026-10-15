@@ -16,29 +16,44 @@
   The page is the dashboard's landing view in "site" mode, so the project
   page and the page a daemon shows to visitors without access share one
   design and one copy. The pages workflow copies landing.mjs,
-  landing-film.mjs, landing.css and the screens in from
+  the shared landing/onboarding modules, landing.css and the screens from
   crates/muxa/src/dashboard/web at deploy time.
 -->
+<style>
+  html { background: #f7f7f5; color: #1a1d21; color-scheme: light dark; }
+  body { margin: 0; }
+  html[data-page-loading] #landing { visibility: hidden; }
+  @media (prefers-color-scheme: dark) { html { background: #111315; color: #e5e9e2; } }
+</style>
+<script>document.documentElement.setAttribute("data-page-loading", "");</script>
+<link rel="modulepreload" href="landing.mjs" />
 <link rel="stylesheet" href="landing.css" />
 <style>
-  body { margin: 0; }
   .fallback { max-width: 640px; margin: 64px auto; padding: 0 20px; font: 16px/1.6 system-ui, sans-serif; }
 </style>
 </head>
 <body data-view="landing">
 <div class="landing" id="landing">
-  <div class="fallback">
+  <div class="fallback" data-page-fallback>
     <h1>Muxa</h1>
     <p>Know which coding agent is waiting on you — and jump to it. Muxa watches the Claude Code, Codex, and Gemini CLI sessions you already run in tmux, tells you the moment one stops for input, a choice, or an error, and takes you straight to its pane. No wrapper, no new terminal.</p>
     <pre>brew install open330/tap/muxa
 muxa init
 muxa attend</pre>
-    <p><a href="https://github.com/Open330/muxa">github.com/Open330/muxa</a></p>
+    <p><a href="learn/?track=attention">Try muxa</a> · <a href="https://github.com/Open330/muxa">github.com/Open330/muxa</a></p>
   </div>
 </div>
 <script type="module">
-  import { renderLanding } from "./landing.mjs";
-  renderLanding(document.getElementById("landing"), { mode: "site", assetBase: "./" });
+  const root = document.getElementById("landing"), fallback = root.innerHTML;
+  try {
+    const { renderLanding } = await import("./landing.mjs");
+    renderLanding(root, { mode: "site", assetBase: "./" });
+  } catch (error) {
+    root.innerHTML = fallback;
+    console.error("Muxa landing could not load", error);
+  } finally {
+    document.documentElement.removeAttribute("data-page-loading");
+  }
 </script>
 </body>
 </html>

@@ -12,6 +12,27 @@ Muxa는 다음 작업 단위 tmux workflow에 맞춰 설계되고 최적화되�
 work와 다른 cwd를 지정하면 조용히 재사용하지 않고 오류를 냅니다. 한 workspace
 session에는 서로 다른 cwd/worktree를 가진 여러 work window가 공존할 수 있습니다.
 
+## 설치 전에 미리 써보기
+
+[브라우저 실습](https://open330.github.io/muxa/learn/)에서는 설치 없이 키보드로
+Muxa의 기본 흐름을 익힐 수 있습니다.
+
+- [tmux 기본](https://open330.github.io/muxa/learn/?track=basics): 일반 셸에서 session에 연결하고 window·pane을 이동하거나 확대합니다.
+- [기다림·리뷰](https://open330.github.io/muxa/learn/?track=attention): 기다리는 에이전트에 답하고 리뷰를 보낸 뒤 mailbox에서 확인합니다.
+- [작업공간 이동](https://open330.github.io/muxa/learn/?track=workspace): watch의 트리와 검색으로 다른 session·window·pane에 연결합니다.
+- [화면 살펴보기](https://open330.github.io/muxa/learn/?track=inspect): 미리보기·터미널 원문·inspector·도움말을 사용합니다.
+- [자유 탐색](https://open330.github.io/muxa/learn/?track=free): 전체 단축키를 보며 준비된 작업공간을 둘러봅니다.
+
+지금 누를 키를 하나씩 안내합니다. 기본 tmux prefix는 Ctrl과 b를 함께 누른 뒤
+놓는 것입니다. 이후 s로 watch를 열며, watch 안에서는 prefix 없이 이동·검색·메시지
+키를 사용합니다. 안내와 언어를 바꿔도 현재 터미널과 입력·요청 기록이 이어집니다.
+“직접 조작해보기”나 다음 실습 안내가 나타나면 `Alt + Enter`(Mac: `⌥ + ↵`)로
+진행할 수 있습니다. 터미널의 일반 Enter 입력과는 별개입니다.
+환경 초기화 버튼을 누르면 처음으로 돌아갑니다.
+
+브라우저 실습은 로컬 시뮬레이션이며 실제 셸이나 에이전트/API에 연결하지 않습니다.
+아래 CLI tour는 별도의 실제 tmux sandbox에서 실행됩니다.
+
 ## 첫 실행
 
 설치 후 `muxa`만 실행합니다. 추적 중인 에이전트가 있으면 watch로 바로 들어가고,

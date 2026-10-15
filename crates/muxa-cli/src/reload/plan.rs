@@ -721,6 +721,7 @@ mod tests {
         claude.agent = Some(AgentShape {
             kind: "claude_code".into(),
             session_id: "abc".into(),
+            working: false,
         });
         Snapshot {
             version: 1,
@@ -812,6 +813,7 @@ mod tests {
         uncaptured.panes[0].agent = Some(AgentShape {
             kind: "codex".into(),
             session_id: "xyz".into(),
+            working: false,
         });
         let sessions = plan(&uncaptured, &BTreeSet::new(), true, false);
         let pane = &sessions[0].windows[0].panes[0];
