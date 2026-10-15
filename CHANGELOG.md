@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-15
+
 ### Added
 
 - `muxa reload` tells agents it cut off mid-turn to carry on: once each
@@ -22,6 +24,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `[swap]`. See docs/ACCOUNT_SWAP.md.
 - Automation action `swap_account`: on a usage cap, switch accounts right away
   instead of waiting for the reset.
+- Human decision requests and interrupted-peer recovery preserve the original
+  request and its authority. Agents discover optional human-action support
+  before using it; an interruption or timeout does not close the work.
+- `muxa msg update REQUEST BODY` sends quiet guidance or progress on an existing
+  request. `muxa msg list --request-id REQUEST --after-update SEQUENCE --json`
+  reads only newer updates without repeating the task or final reply.
+- Browser onboarding provides a continuous interactive terminal walkthrough,
+  with keyboard navigation and a unified landing-page design.
+
+### Changed
+
+- MCP prompt history defaults to 20 entries, with a normal maximum of 100;
+  `full=true` explicitly requests larger or complete history. Fleet status
+  defaults to compact health, counts and at most 20 active agents per host.
+- MCP request-body reads require an exact request ID unless `full=true` is
+  explicit. Follow-up MCP mutation receipts for replies, progress and
+  cancellations omit repeated task and routing data; delivery and reply receipt
+  remain distinct from a recipient's declared work result.
+- Collaboration guidance favors completion notifications and checkpoints over
+  repeated short polls. Fleet reply waits default to 30 seconds, and MCP
+  initialization explains exact tool discovery and schema reuse.
+- CLI inbox text includes the reply obligation, permitted paths, attachments and
+  progress updates. `muxa msg wait --timeout` aliases `--timeout-secs`, and a
+  bare `muxa msg send --notify` enables notifications.
+
+### Fixed
+
+- MCP agent creation, Work startup, peer spawning and pane control resolve the
+  target's tmux or rmux server before running lifecycle commands. rmux pane IDs
+  retain their namespace in agent-facing responses; ambiguous servers are
+  rejected instead of falling back to another host. Confirmation and managed
+  ownership checks remain required for destructive actions.
+- `muxa daemon start` uses the installed service manager when appropriate,
+  avoiding a second manually launched daemon alongside the managed service.
+- Screen detection reapplies unchanged terminal evidence when an agent's
+  recorded state has drifted, allowing restored sessions to recover correctly.
+- The website avoids an initial fallback flash and supports keyboard
+  continuation through browser onboarding.
 
 ## [0.8.58] - 2026-10-15
 
@@ -4257,7 +4297,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.58...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/Open330/muxa/compare/v0.8.58...v0.9.0
 [0.8.58]: https://github.com/Open330/muxa/compare/v0.8.57...v0.8.58
 [0.8.57]: https://github.com/Open330/muxa/compare/v0.8.56...v0.8.57
 [0.8.56]: https://github.com/Open330/muxa/compare/v0.8.55...v0.8.56
