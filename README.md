@@ -347,7 +347,7 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa restore [DIR] [--run]` | Rebuild a workspace from a snapshot. Prints the plan unless `--run`, because restoring into a server that still has those sessions adds panes rather than replacing them. |
 | `muxa reload mcp [--codex-home DIR]` | Ask the existing Codex app-server to refresh all configured MCP connections for that profile. It reports queued acceptance and connection verification; exit 2 means refresh is pending or unverified. It does not restart panes or app-server. `--all` targets discovered stale shared Codex profiles; `--dry-run` previews scope. |
 | `muxa reload mux [--snapshot DIR]` | Explicit name for the full multiplexer reload below. |
-| `muxa reload [--snapshot DIR]` | Snapshot, restart the multiplexer, and put the workspace back — the way to pick up a new tmux/rmux build without rebuilding thirty panes by hand. Run it from outside the server it restarts; a pane muxa tracked comes back on its own conversation. |
+| `muxa reload [--snapshot DIR]` | Snapshot, restart the multiplexer, and put the workspace back — the way to pick up a new tmux/rmux build without rebuilding thirty panes by hand. Run it from outside the server it restarts; a pane muxa tracked comes back on its own conversation, and an agent the reload cut off mid-turn is sent `continue` once it has resumed (`--continue TEXT` to change it, `--no-continue` to skip). |
 | `muxa init` | Interactive install/uninstall wizard. |
 | `muxad` | Daemon process. |
 

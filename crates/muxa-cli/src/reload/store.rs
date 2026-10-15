@@ -167,6 +167,7 @@ mod tests {
                 agent: Some(AgentShape {
                     kind: "claude_code".into(),
                     session_id: "abc".into(),
+                    working: false,
                 }),
             }],
         }

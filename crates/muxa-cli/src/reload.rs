@@ -45,6 +45,14 @@ const SHELL_READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// as busy rather than as a shell still starting up.
 const BUSY_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a resumed agent gets to draw its screen before the follow-up.
+const CONTINUE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// The screen must hold still this long to count as drawn.
+const CONTINUE_READY_QUIET: Duration = Duration::from_millis(1500);
+/// Between typing the follow-up and pressing Enter, so a TUI that pastes in
+/// bursts has the whole line before it is submitted.
+const CONTINUE_SUBMIT_GRACE: Duration = Duration::from_millis(300);
+
 #[derive(Debug, Parser)]
 pub struct SnapshotArgs {
     /// Directory to write the snapshot into. Defaults to a timestamped
@@ -107,6 +115,14 @@ pub struct RestoreArgs {
     #[arg(long)]
     only_missing: bool,
 
+    /// After the relaunch, type this (default `continue`) into every agent
+    /// that was mid-turn when the snapshot was taken. Off by default: an old
+    /// snapshot's turn may no longer be wanted. Name the snapshot first —
+    /// `muxa restore DIR --run --continue` — or the directory is read as the
+    /// text.
+    #[arg(long = "continue", value_name = "TEXT", num_args = 0..=1, default_missing_value = DEFAULT_CONTINUE)]
+    continue_text: Option<String>,
+
     /// Print the plan — and with `--run` the per-pane results — as JSON.
     #[arg(long)]
     json: bool,
@@ -148,7 +164,19 @@ struct MultiplexerReloadArgs {
     /// `--socket`.
     #[arg(long)]
     mux_socket: Option<String>,
+
+    /// What to type into each agent the reload cut off mid-turn, once it
+    /// has resumed.
+    #[arg(long = "continue", value_name = "TEXT", default_value = DEFAULT_CONTINUE)]
+    continue_text: String,
+
+    /// Resume interrupted agents without telling them to carry on.
+    #[arg(long)]
+    no_continue: bool,
 }
+
+/// The follow-up a reload sends to agents it interrupted.
+const DEFAULT_CONTINUE: &str = "continue";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -217,6 +245,10 @@ struct AgentShape {
     /// The provider's own conversation id, which is what makes a resume
     /// possible at all.
     session_id: String,
+    /// Mid-turn when the snapshot was taken. A reload cuts that turn off, so
+    /// the resumed agent is told to carry on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    working: bool,
 }
 
 pub async fn snapshot(client: &Client, args: SnapshotArgs) -> Result<()> {
@@ -526,7 +558,13 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
         report.say("nothing to restore: every session in the snapshot already exists");
         Ok(())
     } else {
-        apply(&endpoint, &target, args.layout_only, &mut report)
+        apply(
+            &endpoint,
+            &target,
+            args.layout_only,
+            args.continue_text.as_deref(),
+            &mut report,
+        )
     };
     if args.json {
         plan::attach_results(&mut sessions, &report);
@@ -621,10 +659,13 @@ async fn reload_multiplexer(client: &Client, args: MultiplexerReloadArgs) -> Res
         wait_for_sessions_to_settle(&endpoint);
     }
 
+    let follow_up = (!args.no_continue && !args.continue_text.trim().is_empty())
+        .then_some(args.continue_text.as_str());
     apply(
         &endpoint,
         &snapshot,
         args.layout_only,
+        follow_up,
         &mut RestoreReport::new(true),
     )?;
     println!(
@@ -822,6 +863,7 @@ fn agents_by_pane(agents: &[muxa::Agent], socket: &str) -> HashMap<String, Agent
                 AgentShape {
                     kind: kind.to_owned(),
                     session_id: agent.session_id.clone(),
+                    working: agent.state == muxa::event::AgentState::Working,
                 },
             ))
         })
@@ -833,14 +875,91 @@ fn apply(
     endpoint: &BackendEndpoint,
     snapshot: &Snapshot,
     layout_only: bool,
+    follow_up: Option<&str>,
     report: &mut RestoreReport,
 ) -> Result<()> {
     rebuild_shape(endpoint, snapshot, report)?;
     if layout_only {
         return Ok(());
     }
-    replay_commands(endpoint, snapshot, report);
+    let relaunched = replay_commands(endpoint, snapshot, report);
+    if let Some(text) = follow_up {
+        continue_interrupted(endpoint, snapshot, &relaunched, text, report);
+    }
     Ok(())
+}
+
+/// The panes whose agent was mid-turn, among those that relaunched.
+fn interrupted_targets(snapshot: &Snapshot, relaunched: &BTreeSet<String>) -> Vec<String> {
+    snapshot
+        .panes
+        .iter()
+        .filter(|pane| pane.agent.as_ref().is_some_and(|agent| agent.working))
+        .map(pane_target)
+        .filter(|target| relaunched.contains(target))
+        .collect()
+}
+
+/// Tell every agent the reload cut off mid-turn to carry on, once its
+/// resumed screen has stopped redrawing.
+fn continue_interrupted(
+    endpoint: &BackendEndpoint,
+    snapshot: &Snapshot,
+    relaunched: &BTreeSet<String>,
+    text: &str,
+    report: &mut RestoreReport,
+) {
+    let targets = interrupted_targets(snapshot, relaunched);
+    if targets.is_empty() {
+        return;
+    }
+    let mut continued = 0;
+    for target in targets {
+        if !screen_settled(endpoint, &target) {
+            report.say(&plan::manual_line(
+                &target,
+                "was mid-turn; resumed screen never settled, so nothing was sent",
+            ));
+            continue;
+        }
+        let sent = mux_control::run(endpoint, &["send-keys", "-t", &target, "-l", "--", text])
+            .and_then(|()| {
+                std::thread::sleep(CONTINUE_SUBMIT_GRACE);
+                mux_control::run(endpoint, &["send-keys", "-t", &target, "Enter"])
+            });
+        match sent {
+            Ok(()) => continued += 1,
+            Err(error) => report.say(&plan::manual_line(
+                &target,
+                &format!("was mid-turn; could not send {text:?}: {error}"),
+            )),
+        }
+    }
+    if continued > 0 {
+        report.say(&format!(
+            "sent {text:?} to {continued} agent(s) the reload interrupted mid-turn"
+        ));
+    }
+}
+
+/// Wait for a resumed agent's screen to hold still, so the follow-up lands in
+/// its input box rather than in its startup.
+fn screen_settled(endpoint: &BackendEndpoint, target: &str) -> bool {
+    let started = Instant::now();
+    let mut last = String::new();
+    let mut quiet_since = Instant::now();
+    while started.elapsed() < CONTINUE_READY_TIMEOUT {
+        let screen = mux_control::capture(endpoint, &["capture-pane", "-p", "-t", target])
+            .unwrap_or_default();
+        if screen != last {
+            last = screen;
+            quiet_since = Instant::now();
+        } else if !last.trim().is_empty() && quiet_since.elapsed() >= CONTINUE_READY_QUIET {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    false
 }
 
 /// Sessions, windows, panes, geometry, working directories.
@@ -1078,7 +1197,12 @@ fn window_indexes(endpoint: &BackendEndpoint, session_target: &str) -> Vec<Strin
 }
 
 /// Type each pane's own command line back into it.
-fn replay_commands(endpoint: &BackendEndpoint, snapshot: &Snapshot, report: &mut RestoreReport) {
+/// Returns the panes whose program came back up.
+fn replay_commands(
+    endpoint: &BackendEndpoint,
+    snapshot: &Snapshot,
+    report: &mut RestoreReport,
+) -> BTreeSet<String> {
     let mut sent = Vec::new();
     let mut manual = Vec::new();
     for pane in &snapshot.panes {
@@ -1110,6 +1234,10 @@ fn replay_commands(endpoint: &BackendEndpoint, snapshot: &Snapshot, report: &mut
     let unconfirmed = confirm_launches(endpoint, sent.clone());
     let replayed = sent.len() - unconfirmed.len();
     report.say(&plan::relaunched_line(replayed));
+    let relaunched = sent
+        .into_iter()
+        .filter(|target| !unconfirmed.contains(target))
+        .collect();
     for target in unconfirmed {
         report.say(&plan::manual_line(&target, launch::UNCONFIRMED_NOTE));
         report.pane_unconfirmed(target, launch::UNCONFIRMED_NOTE.to_owned());
@@ -1118,6 +1246,7 @@ fn replay_commands(endpoint: &BackendEndpoint, snapshot: &Snapshot, report: &mut
         report.say(&plan::manual_line(&target, &note));
         report.pane_left(target, note);
     }
+    relaunched
 }
 
 /// What to tell a human about an agent pane whose command line was not
@@ -1865,12 +1994,140 @@ mod tests {
         assert!(!is_replayable_command(Some(&joined), None));
     }
 
+    fn snapshot_of(panes: Vec<PaneShape>) -> Snapshot {
+        Snapshot {
+            version: SNAPSHOT_VERSION,
+            taken_at: String::new(),
+            origin: SnapshotOrigin::Reload,
+            host: "tmux".into(),
+            socket: "/tmp/tmux-501/default".into(),
+            windows: Vec::new(),
+            panes,
+        }
+    }
+
+    #[test]
+    fn only_relaunched_agents_that_were_mid_turn_are_told_to_continue() {
+        let agent = |working| {
+            Some(AgentShape {
+                kind: "claude_code".into(),
+                session_id: "sid".into(),
+                working,
+            })
+        };
+        let mut busy = pane("work", "0", "0", Some("claude"));
+        busy.agent = agent(true);
+        let mut idle = pane("work", "0", "1", Some("claude"));
+        idle.agent = agent(false);
+        let mut busy_but_failed = pane("work", "1", "0", Some("claude"));
+        busy_but_failed.agent = agent(true);
+        let shell = pane("work", "1", "1", None);
+        let snapshot = snapshot_of(vec![busy, idle, busy_but_failed, shell]);
+        let relaunched: BTreeSet<String> = ["=work:0.0", "=work:0.1"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            interrupted_targets(&snapshot, &relaunched),
+            vec!["=work:0.0".to_owned()]
+        );
+    }
+
+    /// The follow-up against a private tmux server: a pane running `cat`
+    /// echoes what was typed once Enter commits it.
+    #[test]
+    #[ignore = "drives a private tmux server; run with --ignored"]
+    fn continue_types_the_follow_up_into_a_live_pane() {
+        let dir = std::env::temp_dir().join(format!("mrc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("s").display().to_string();
+        std::process::Command::new("tmux")
+            .args([
+                "-S",
+                &socket,
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "work",
+            ])
+            .args(["-x", "120", "-y", "30", "cat"])
+            .status()
+            .unwrap();
+        let endpoint = endpoint_for("tmux", socket.clone()).unwrap();
+        let mut agent = pane("work", "0", "0", Some("cat"));
+        agent.agent = Some(AgentShape {
+            kind: "claude_code".into(),
+            session_id: "sid".into(),
+            working: true,
+        });
+        let snapshot = snapshot_of(vec![agent]);
+        let target = pane_target(&snapshot.panes[0]);
+        // A first line so the screen is not blank.
+        mux_control::run(
+            &endpoint,
+            &["send-keys", "-t", &target, "-l", "--", "ready"],
+        )
+        .unwrap();
+        let relaunched = BTreeSet::from([target.clone()]);
+        let mut report = RestoreReport::new(false);
+        continue_interrupted(&endpoint, &snapshot, &relaunched, "carry on", &mut report);
+        std::thread::sleep(Duration::from_millis(300));
+        let screen = mux_control::capture(&endpoint, &["capture-pane", "-p", "-t", &target]);
+        let _ = mux_control::run(&endpoint, &["kill-server"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let screen = screen.unwrap();
+        assert!(
+            screen.contains("readycarry on\nreadycarry on"),
+            "{screen:?}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_from_before_the_working_flag_reads_as_idle() {
+        let shape: AgentShape =
+            serde_json::from_str(r#"{"kind":"codex","session_id":"sid"}"#).unwrap();
+        assert!(!shape.working);
+        let written = serde_json::to_string(&shape).unwrap();
+        assert!(!written.contains("working"), "{written}");
+    }
+
+    #[test]
+    fn reload_continues_by_default_and_restore_only_when_asked() {
+        #[derive(Parser)]
+        struct Reload {
+            #[command(flatten)]
+            args: MultiplexerReloadArgs,
+        }
+        let parse = |argv: &[&str]| {
+            Reload::parse_from(std::iter::once("reload").chain(argv.iter().copied())).args
+        };
+        let args = parse(&[]);
+        assert_eq!(args.continue_text, DEFAULT_CONTINUE);
+        assert!(!args.no_continue);
+        assert_eq!(
+            parse(&["--continue", "keep going"]).continue_text,
+            "keep going"
+        );
+        assert!(parse(&["--no-continue"]).no_continue);
+
+        let restore = |argv: &[&str]| {
+            RestoreArgs::parse_from(std::iter::once("restore").chain(argv.iter().copied()))
+                .continue_text
+        };
+        assert_eq!(restore(&[]), None);
+        assert_eq!(restore(&["--continue"]).as_deref(), Some(DEFAULT_CONTINUE));
+        assert_eq!(restore(&["--continue", "go on"]).as_deref(), Some("go on"));
+    }
+
     #[test]
     fn a_tracked_claude_pane_comes_back_on_its_own_conversation() {
         let mut claude = pane("work", "0", "0", Some("aas e june@claude"));
         claude.agent = Some(AgentShape {
             kind: "claude_code".into(),
             session_id: "abc-123".into(),
+            working: false,
         });
         assert_eq!(
             relaunch_command(&claude).as_deref(),
@@ -1884,6 +2141,7 @@ mod tests {
         claude.agent = Some(AgentShape {
             kind: "claude_code".into(),
             session_id: "other-id".into(),
+            working: false,
         });
         assert_eq!(
             relaunch_command(&claude).as_deref(),
@@ -1899,6 +2157,7 @@ mod tests {
         codex.agent = Some(AgentShape {
             kind: "codex".into(),
             session_id: "synthetic-7".into(),
+            working: false,
         });
         assert_eq!(relaunch_command(&codex).as_deref(), Some("codex --yolo"));
     }
@@ -1934,6 +2193,7 @@ mod tests {
             pane.agent = Some(AgentShape {
                 kind: kind.into(),
                 session_id: session.into(),
+                working: false,
             });
             pane
         };
@@ -2002,6 +2262,7 @@ mod tests {
         claude.agent = Some(AgentShape {
             kind: "claude_code".into(),
             session_id: "abc-123".into(),
+            working: false,
         });
         assert_eq!(relaunch_command(&claude), None);
         assert!(resume_hint(&claude)
