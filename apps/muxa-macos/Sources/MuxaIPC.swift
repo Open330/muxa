@@ -418,6 +418,15 @@ struct MuxaAgentSubagent: Decodable, Hashable, Identifiable, Sendable {
 }
 
 struct MuxaPaneInfo: Decodable, Hashable, Sendable {
+    /// A console routing envelope, never a terminal target. Operator-only
+    /// mailbox reads/replies work even after a host's last pane has closed.
+    static let operatorRoute = MuxaPaneInfo(
+        paneID: "console", sessionID: "console", session: "", windowID: "console",
+        windowName: "", windowIndex: "0", paneIndex: "0", currentCommand: "",
+        title: "", currentPath: "", socket: "default", workspaceID: nil,
+        workID: nil, agentRole: nil, agentAlias: nil
+    )
+
     let paneID: String
     let sessionID: String
     let session: String
@@ -1531,12 +1540,14 @@ actor MuxaIPCClient {
 
     func collaborationMailbox(
         host: MuxaFleetHostIdentity,
-        pane: MuxaPaneInfo
+        pane: MuxaPaneInfo,
+        operatorOnly: Bool = false
     ) async throws -> MuxaCollaborationMailbox {
         let result = try await fleetCommand(
             host: host,
             operation: [
                 "kind": "collaboration_mailbox",
+                "operator_only": operatorOnly,
                 "pane": Self.paneKey(pane),
             ],
             requestTransport: fleetReadTransport(for: host.alias)

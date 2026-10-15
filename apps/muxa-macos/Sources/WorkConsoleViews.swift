@@ -522,11 +522,32 @@ struct WorkCommandCenterView: View {
 
                 CommandCenterStatusLine(
                     working: workingCount,
-                    attention: attentionAgents.count,
+                    attention: attentionAgents.count + model.operatorMessages.filter { $0.isHumanRequest && $0.needsHumanDecision }.count,
                     limited: limitedAgents.count,
                     work: model.workGroups.count,
                     hosts: model.fleetHosts.count
                 )
+
+                let humanRequests = model.operatorMessages.filter { $0.isHumanRequest && $0.needsHumanDecision }
+                if !humanRequests.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Your decision needed", systemImage: "person.crop.circle.badge.exclamationmark")
+                            .font(.headline)
+                        ForEach(humanRequests) { message in
+                            Button {
+                                model.pendingOperatorMessageID = message.id
+                                model.show(.inbox)
+                            } label: {
+                                HStack {
+                                    Text(verbatim: "\(message.host.alias) · \(message.counterpart.label)").fontWeight(.medium)
+                                    Text(message.request.body).lineLimit(1)
+                                    Spacer()
+                                    Image(systemName: "arrow.right")
+                                }
+                            }.buttonStyle(.muxaSecondary)
+                        }
+                    }
+                }
 
                 CommandCenterAttentionList(
                     attention: attentionAgents,
@@ -2071,8 +2092,11 @@ struct MuxaOperatorInboxView: View {
             reconcileMessageSelection()
         }
         .onChange(of: visibleMessages.map(\.id)) { _ in reconcileMessageSelection() }
+        .onChange(of: model.pendingOperatorMessageID) { _ in reconcileMessageSelection() }
         .onChange(of: scope) { _ in
-            compactShowingDetail = false
+            if !visibleMessages.contains(where: { $0.id == selectedMessageID }) {
+                compactShowingDetail = false
+            }
             reconcileMessageSelection()
         }
     }
@@ -2227,6 +2251,15 @@ struct MuxaOperatorInboxView: View {
     }
 
     private func reconcileMessageSelection() {
+        if let pending = model.pendingOperatorMessageID,
+           model.operatorMessages.contains(where: { $0.id == pending }) {
+            scope = .all
+            search = ""
+            selectedMessageID = pending
+            compactShowingDetail = true
+            model.pendingOperatorMessageID = nil
+            return
+        }
         if let selectedMessageID,
            visibleMessages.contains(where: { $0.id == selectedMessageID }) {
             return
@@ -2258,6 +2291,7 @@ private struct OperatorMessageRow: View {
 
     private var request: MuxaCollaborationRequest { message.request }
     private var statusColor: Color {
+        if request.needsHumanResponse { return .orange }
         if request.reply?.status == "completed" { return .green }
         if ["blocked", "failed", "declined", "expired", "cancelled"].contains(request.status) {
             return .red
@@ -2270,11 +2304,11 @@ private struct OperatorMessageRow: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 7) {
                 Circle().fill(statusColor).frame(width: 7, height: 7)
-                Text(request.to.label)
+                Text(message.counterpart.label)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
                 Spacer(minLength: 6)
-                Text(collaborationStatusLabel(request.reply?.status ?? request.status))
+                Text(request.needsHumanResponse ? String(localized: "Needs Action") : collaborationStatusLabel(request.reply?.status ?? request.status))
                     .font(MuxaType.detail.weight(.semibold))
                     .foregroundStyle(statusColor)
                 Text(compactInboxTimestamp(request.createdAt))
@@ -2328,6 +2362,9 @@ private struct OperatorMessageRow: View {
                     (message.hasUnreadReply ? Color.orange : Color.primary).opacity(0.06),
                     in: RoundedRectangle(cornerRadius: 8)
                 )
+            } else if request.needsHumanResponse {
+                Label("Your response is required", systemImage: "person.crop.circle.badge.exclamationmark")
+                    .font(.callout).foregroundStyle(.orange)
             } else if message.needsHumanDecision {
                 // The request itself is blocked/declined/failed and no reply
                 // will arrive, so name the decision instead of a wait.
@@ -2367,6 +2404,7 @@ private struct OperatorMessageRow: View {
 private struct OperatorMessageDetail: View {
     let message: MuxaOperatorMessage
     @ObservedObject var model: AppModel
+    @State private var replying = false
 
     private var request: MuxaCollaborationRequest { message.request }
     private var openDestination: MuxaSidebarSelection? {
@@ -2383,6 +2421,7 @@ private struct OperatorMessageDetail: View {
         }
     }
     private var statusColor: Color {
+        if request.needsHumanResponse { return .orange }
         if request.reply?.status == "completed" { return .green }
         if ["blocked", "failed", "declined", "expired", "cancelled"].contains(request.status) {
             return .red
@@ -2392,7 +2431,7 @@ private struct OperatorMessageDetail: View {
     }
 
     private var location: String {
-        [request.to.sessionName, request.to.windowName, request.to.pane]
+        [message.counterpart.sessionName, message.counterpart.windowName, message.counterpart.pane]
             .compactMap { $0?.isEmpty == false ? $0 : nil }
             .joined(separator: " › ")
     }
@@ -2402,7 +2441,7 @@ private struct OperatorMessageDetail: View {
             HStack(spacing: 9) {
                 Circle().fill(statusColor).frame(width: 8, height: 8)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(request.to.label)
+                    Text(message.counterpart.label)
                         .font(.headline)
                         .lineLimit(1)
                     Text(verbatim: "\(message.host.alias) · \(compactInboxTimestamp(request.createdAt))")
@@ -2447,7 +2486,7 @@ private struct OperatorMessageDetail: View {
                     .foregroundStyle(.secondary)
 
                     OperatorMessageDetailSection(
-                        title: "Sent",
+                        title: message.isHumanRequest ? "Request for you" : "Sent",
                         icon: "paperplane.fill",
                         timestamp: compactInboxTimestamp(request.createdAt),
                         source: request.body,
@@ -2462,6 +2501,8 @@ private struct OperatorMessageDetail: View {
                             source: reply.body,
                             tint: message.hasUnreadReply ? .orange : .green
                         )
+                    } else if request.needsHumanResponse {
+                        Button("Respond…") { replying = true }.buttonStyle(.muxaPrimary)
                     } else if message.needsHumanDecision {
                         Label(
                             "Needs your decision: \(inboxStatusTitle(request.status)). The agent will not reply to this request.",
@@ -2487,6 +2528,16 @@ private struct OperatorMessageDetail: View {
             }
         }
         .background(Color(nsColor: .textBackgroundColor).opacity(0.28))
+        .sheet(isPresented: $replying) {
+            CollaborationReplyView(
+                request: request,
+                pane: MuxaWatchPane(host: message.host, pane: message.routePane, agent: nil),
+                client: model.client
+            ) {
+                replying = false
+                Task { await model.refreshOperatorInbox(force: true, hostAliases: [message.host.alias]) }
+            }
+        }
     }
 }
 

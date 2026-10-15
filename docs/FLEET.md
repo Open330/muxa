@@ -22,6 +22,28 @@ This is distinct from Muxa's historical “pane host” terminology. A Fleet hos
 is a physical node. tmux, cmux, rmux, herdr, and zellij remain backend kinds inside
 that node.
 
+## Human attention across clients
+
+An agent can explicitly request a required decision with
+`muxa msg attention "Approve staging deployment?" --action approval`, or call
+`muxa_request_attention` with `body` and `action` (`approval`, `choice`, or
+`information`). Retain the request ID and wait with `muxa_wait_reply`; reuse a
+UUID `dispatch_id` for retries. Read the response body: completion is not consent.
+
+The source host stores the durable request and response. Each connected Mac
+aggregates operator requests from all its Fleet hosts into Attention and Inbox,
+posts a local macOS notification, and keeps a Dock badge until answered. Another
+Mac reading that source sees the same resolution. Notification deduplication is
+per device; dismissing or reading a notification never answers a request.
+
+Register the other machines in Fleet on **each** Mac you use; `local` is included
+automatically. Registration is not bidirectional or an automatic mesh. Read-only
+hosts can be viewed; replying needs a control connection. Keep the app, CLI,
+daemon and relay on the same version with this feature, enable collaboration,
+and refresh agents' MCP connections. Existing `msg send human --human-action`
+requests work too. A disconnected host retains its last known messages; initial
+reads and replies require that source to be reachable.
+
 ## Prerequisites
 
 - Install the same Muxa version on the controller and every remote host.

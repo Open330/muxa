@@ -13,6 +13,11 @@ Treat one-way notices as information, not new reply obligations. Never acknowled
 receipt or send unchanged status. Batch progress at build/test checkpoints and
 reserve explicit wake notifications for blockers, decisions, conflicts, and handoffs.
 
+For a required human approval, choice or missing information, use
+`muxa_request_attention` and retain its request ID; connected Fleet operator
+clients receive it. Read the actual reply before acting; do not request already
+authorized routine actions or send duplicate questions.
+
 For interrupted peers or real human decisions, read the recovery workflow in
 the collaboration guide (workflows=true). Reuse request IDs; an interruption
 keeps work open, and an answer is not automatic approval.

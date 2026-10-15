@@ -497,6 +497,14 @@ struct PruneArgs {
 
 #[derive(Debug, Subcommand)]
 enum MsgCmd {
+    /// Ask for required human attention; shown in connected Fleet operator inboxes.
+    Attention {
+        body: String,
+        #[arg(long, default_value = "information", value_parser = ["approval", "choice", "information"])]
+        action: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Send to `peer`, `%N`, `@alias`, or `role:<role>`.
     Send {
         target: String,
@@ -2029,6 +2037,26 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
     }
     let origin = collaboration_origin(client).await?;
     match action {
+        MsgCmd::Attention { body, action, json } => {
+            mcp_output::require_human_actions(client)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let request = client
+                .collaboration_send(
+                    &origin,
+                    "human",
+                    &NewRequest {
+                        body,
+                        human_action: Some(serde_json::from_value(serde_json::Value::String(
+                            action,
+                        ))?),
+                        notify: Some(true),
+                        ..NewRequest::default()
+                    },
+                )
+                .await?;
+            print_collaboration_receipt(&request, json)?;
+        }
         MsgCmd::Send {
             target,
             body,
@@ -4998,6 +5026,27 @@ mod tests {
     use muxa::AgentKind;
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn attention_command_requires_a_human_action_not_a_notice() {
+        let args = Args::try_parse_from([
+            "muxa",
+            "msg",
+            "attention",
+            "Approve staging?",
+            "--action",
+            "approval",
+            "--json",
+        ])
+        .unwrap();
+        assert!(
+            matches!(args.cmd, Some(Cmd::Msg { action: MsgCmd::Attention { action, json: true, .. } }) if action == "approval")
+        );
+        assert!(
+            Args::try_parse_from(["muxa", "msg", "attention", "Test", "--action", "notice"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn registry_forget_requires_exact_session_argument() {

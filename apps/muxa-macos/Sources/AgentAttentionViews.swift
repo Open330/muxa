@@ -68,6 +68,7 @@ struct MuxaAttentionTracking: ViewModifier {
                 updateVisibility()
                 openPending()
             }
+            .onChange(of: attention.pendingHumanMessageID) { _ in openHumanPending() }
             .onChange(of: attention.pendingOpen) { _ in openPending() }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 updateVisibility()
@@ -98,7 +99,15 @@ struct MuxaAttentionTracking: ViewModifier {
 
     /// A click can arrive before the pane's host has reported in (the click
     /// that launched Muxa); the request waits for the next snapshot.
+    private func openHumanPending() {
+        guard let id = attention.pendingHumanMessageID else { return }
+        attention.pendingHumanMessageID = nil
+        model.pendingOperatorMessageID = id
+        model.show(.inbox)
+    }
+
     private func openPending() {
+        openHumanPending()
         guard let pane = attention.pendingOpen else { return }
         if let at = attention.pendingOpenAt,
            Date().timeIntervalSince(at) > MuxaAgentAttentionCenter.pendingOpenLifetime {

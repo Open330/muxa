@@ -147,6 +147,7 @@ struct MuxaAgentNotification: Equatable, Sendable {
     let sound: Bool
     /// A `MuxaNotificationActions` category, or nil for no buttons.
     let category: String?
+    var humanMessageID: String? = nil
 }
 
 @MainActor
@@ -168,6 +169,10 @@ final class MuxaAgentAttentionCenter: ObservableObject {
     @Published private(set) var unreadPanes: Set<MuxaWatchPaneIdentity> = []
     /// Agents needing attention plus unread panes, for the Dock badge.
     @Published private(set) var dockCount = 0
+    @Published var pendingHumanMessageID: String?
+    private var humanRequests: Set<String> = []
+    private var humanNotified: [String: Date] = [:]
+    static let humanPersistenceKey = "muxa.attention.human-notified.v1"
     /// A pane a notification click asked to open; the workbench consumes it.
     @Published var pendingOpen: MuxaWatchPaneIdentity? {
         didSet { pendingOpenAt = pendingOpen == nil ? nil : Date() }
@@ -209,6 +214,10 @@ final class MuxaAgentAttentionCenter: ObservableObject {
         self.poster = poster
         self.settings = settings
         self.now = now
+        if let data = defaults?.data(forKey: Self.humanPersistenceKey),
+           let stored = try? JSONDecoder().decode([String: Date].self, from: data) {
+            humanNotified = stored
+        }
         if let data = defaults?.data(forKey: Self.persistenceKey),
            let stored = try? JSONDecoder().decode([String: MuxaSeenRecord].self, from: data) {
             seen = stored
@@ -252,6 +261,39 @@ final class MuxaAgentAttentionCenter: ObservableObject {
         if changed || !stale.isEmpty { persist() }
 
         postTransitions(in: snapshot, at: date)
+        recompute()
+    }
+
+    /// Explicit human decisions are durable requests, independent of agent state
+    /// and the pane currently visible. Every Fleet client can read the same
+    /// request; notification receipts are local to this Mac.
+    func ingestHumanRequests(_ messages: [MuxaOperatorMessage]) {
+        let pending = messages.filter { $0.isHumanRequest && $0.request.needsHumanResponse }
+        let active = Set(pending.map(\.id))
+        poster?.removeDelivered(identifiers: humanRequests.subtracting(active).map { "human:\($0)" })
+        humanRequests = active
+        let preferences = settings(), date = now()
+        if preferences.notifyAttention {
+            for message in pending where humanNotified[message.id] == nil {
+                let notification = MuxaAgentNotification(
+                    identifier: "human:\(message.id)",
+                    title: String(localized: "\(message.request.from.label) needs your decision"),
+                    subtitle: [message.host.alias, message.request.from.sessionName, message.request.from.windowName].compactMap { $0 }.joined(separator: " · "),
+                    body: MuxaNotificationRules.body(message.request.body),
+                    pane: nil,
+                    sound: preferences.sound,
+                    category: nil,
+                    humanMessageID: message.id
+                )
+                poster?.post(notification)
+                humanNotified[message.id] = date
+            }
+        }
+        // Bound local receipts without re-alerting unresolved requests.
+        humanNotified = humanNotified.filter { active.contains($0.key) || date.timeIntervalSince($0.value) < Self.pruneAfter }
+        if let data = try? JSONEncoder().encode(humanNotified) {
+            defaults?.set(data, forKey: Self.humanPersistenceKey)
+        }
         recompute()
     }
 
@@ -362,6 +404,7 @@ final class MuxaAgentAttentionCenter: ObservableObject {
             }
         }
         var needing = Set(unread.map(Self.key))
+        needing.formUnion(humanRequests.map { "human:\($0)" })
         for hosted in snapshot.hostedAgents where hosted.agent.status.needsAttention {
             needing.insert(Self.paneIdentity(for: hosted).map(Self.key) ?? "agent:\(hosted.id)")
         }

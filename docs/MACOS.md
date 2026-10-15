@@ -508,7 +508,7 @@ are coalesced for 75 ms and capped at four snapshot reads per second. A slow
 not the primary freshness path. Collaboration revisions travel per host, so
 the operator inbox and an open Collaborate module re-read only the affected
 host rather than polling every mailbox every two seconds. Inbox safety
-reconciliation runs at most once per minute while it is visible, and equal
+reconciliation runs at most once per minute even when Inbox is not visible, and equal
 mailboxes do not republish SwiftUI state.
 
 Execution snapshots build the host/session/window/pane tree, agent-to-pane
@@ -623,3 +623,19 @@ be revealed in Finder or opened in their default application.
 preview has keyboard focus. It keeps an empty workbench open. **⇧⌘W** closes the
 window, **⇧⌘T** reopens the last closed tab, and **⌃Tab / ⌃⇧Tab** move between
 tabs. Live Watch uses **⌃⌘W** so it does not conflict with Close Window.
+
+## Explicit requests for a person
+
+Agents use `muxa msg attention "..." --action approval` or the
+`muxa_request_attention` MCP tool for a required approval, choice, or missing
+information. These requests do not fabricate a waiting agent state. The app
+reads the human incoming queue as well as operator-sent requests from every
+registered Fleet host, including hosts with no remaining terminal panes.
+
+They appear in Work Attention, Inbox > Needs Action, and the Dock badge. A
+notification opens the exact host/request in Inbox, where Respond records a
+human reply through the existing durable collaboration protocol. There is no
+notification action that blindly types an approval into the terminal. Reading,
+opening or dismissing the banner does not resolve the request. Each Mac keeps
+its own notification receipts, while all connected clients see the response
+stored on the source host. See [Fleet setup](FLEET.md#human-attention-across-clients).

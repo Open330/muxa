@@ -67,6 +67,10 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
             for (route, pane) in responses {
                 Task { await self.perform(route, for: pane, in: attention) }
             }
+            if let human = pendingHumanMessageID {
+                pendingHumanMessageID = nil
+                attention.pendingHumanMessageID = human
+            }
             guard let pending = pendingPane else { return }
             pendingPane = nil
             attention.pendingOpen = pending
@@ -75,6 +79,8 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
     /// A click that arrived before the app model existed, e.g. the one that
     /// launched the app.
     private var pendingPane: MuxaWatchPaneIdentity?
+    private var pendingHumanMessageID: String?
+    private var postGenerations: [String: UUID] = [:]
     /// Mark as Read and Reply… that arrived before the app model existed; a
     /// background action can launch the app just like a click.
     private var pendingResponses: [(MuxaNotificationActions.Route, MuxaWatchPaneIdentity)] = []
@@ -147,6 +153,8 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
     }
 
     func post(_ notification: MuxaAgentNotification) {
+        let generation = UUID()
+        postGenerations[notification.identifier] = generation
         let content = UNMutableNotificationContent()
         content.title = notification.title
         content.subtitle = notification.subtitle
@@ -157,6 +165,7 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
         if let pane = notification.pane {
             content.userInfo = ["host": pane.hostAlias, "socket": pane.socket, "pane": pane.paneID]
         }
+        if let human = notification.humanMessageID { content.userInfo["human_message"] = human }
         let request = UNNotificationRequest(identifier: notification.identifier, content: content, trigger: nil)
         Task {
             switch await authorization() {
@@ -164,6 +173,9 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
             case .notDetermined: guard await requestAuthorization() else { return }
             case .allowed: break
             }
+            // A human response may arrive on another device while the first
+            // permission prompt is open. Do not post an already-resolved alert.
+            guard postGenerations[notification.identifier] == generation else { return }
             center.add(request) { @Sendable error in
                 guard let error else { return }
                 MuxaLog.app.warning("notification post failed: \(error.localizedDescription, privacy: .public)")
@@ -172,6 +184,8 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
     }
 
     func removeDelivered(identifiers: [String]) {
+        for id in identifiers { postGenerations.removeValue(forKey: id) }
+        center.removePendingNotificationRequests(withIdentifiers: identifiers)
         center.removeDeliveredNotifications(withIdentifiers: identifiers)
     }
 
@@ -180,7 +194,14 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
         if NSApp.dockTile.badgeLabel != label { NSApp.dockTile.badgeLabel = label }
     }
 
-    fileprivate func respond(_ route: MuxaNotificationActions.Route, pane: MuxaWatchPaneIdentity?) async {
+    fileprivate func respond(_ route: MuxaNotificationActions.Route, pane: MuxaWatchPaneIdentity?, humanMessageID: String? = nil) async {
+        if let humanMessageID {
+            guard route == .open else { return }
+            if let attention { attention.pendingHumanMessageID = humanMessageID }
+            else { pendingHumanMessageID = humanMessageID }
+            MuxaWorkbenchPresenter.present()
+            return
+        }
         if route == .open {
             open(pane)
             return
@@ -233,7 +254,7 @@ extension MuxaUserNotifications: UNUserNotificationCenterDelegate {
         } else {
             nil
         }
-        await MuxaUserNotifications.shared.respond(route, pane: pane)
+        await MuxaUserNotifications.shared.respond(route, pane: pane, humanMessageID: info["human_message"] as? String)
     }
 
     /// The center already skips the pane being looked at, so anything that

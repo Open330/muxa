@@ -194,6 +194,14 @@ muxa registry forget <agent_session_id>
 지정한 registry 기록 하나만 삭제하며 프로세스나 터미널은 종료하지 않습니다.
 실행 중인 에이전트는 이후 hook이나 scan으로 다시 등록될 수 있습니다. 프롬프트 이력은 보존됩니다.
 
+### 에이전트가 사람의 확인을 요청하기
+
+에이전트는 `muxa msg attention "staging 배포를 승인해 주세요" --action approval`
+또는 MCP `muxa_request_attention`을 호출할 수 있습니다. 승인·선택·정보가 꼭 필요한
+요청을 연결된 Fleet 호스트 전체에서 모아 Mac 앱의 Attention·Inbox·Dock 배지·알림으로
+보여줍니다. 어느 기기에서 답하든 같은 요청의 처리 상태를 다른 연결된 기기에서도
+확인할 수 있습니다. [여러 기기 연결 방법](docs/FLEET.ko.md#여러-기기에서-같은-사람-확인-요청-받기)을 참고하세요.
+
 ### `muxa watch`에서 바로 협업합니다
 
 기억할 규칙은 하나입니다. **tmux window 하나가 협업 room 하나**입니다.

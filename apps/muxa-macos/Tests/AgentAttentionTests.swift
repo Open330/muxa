@@ -359,3 +359,48 @@ private final class Harness {
     #expect(sent == 0)
     #expect(h.poster.posted.last?.subtitle == "Not connected: gpu")
 }
+
+private func humanAttentionMessage(host: String, answered: Bool = false) throws -> MuxaOperatorMessage {
+    let execution = try snapshot([AgentFixture()], host: host)
+    let pane = try #require(execution.watchHosts.first?.sessions.first?.windows.first?.panes.first)
+    let participant: [String: Any] = ["agent_kind": "codex", "agent_session_id": "requester", "pane": "%1", "room": ["host": "tmux", "window_id": "@1"]]
+    var human = participant
+    human["console"] = true
+    human["pane"] = "console"
+    var wire: [String: Any] = ["id": "decision", "from": participant, "to": human, "kind": "question", "body": "Approve staging deployment?", "human_action": "approval", "expects_reply": true, "work_mode": "read_only", "status": answered ? "declined" : "queued", "created_at": "2026-10-15T10:00:00Z"]
+    if answered { wire["reply"] = ["body": "No", "status": "declined", "at": "2026-10-15T10:01:00Z"] }
+    let request = try JSONDecoder().decode(MuxaCollaborationRequest.self, from: JSONSerialization.data(withJSONObject: wire))
+    return MuxaOperatorMessage(host: pane.host, routePane: pane.pane, request: request)
+}
+
+@Test @MainActor
+func humanAttentionNotifiesOncePerHostAndSurvivesRelaunchUntilAnswered() throws {
+    let h = Harness()
+    let local = try humanAttentionMessage(host: "local"), remote = try humanAttentionMessage(host: "rtzr")
+    h.center.ingestHumanRequests([local, remote])
+    #expect(h.poster.posted.count == 2)
+    #expect(h.center.dockCount == 2)
+    #expect(h.poster.posted.allSatisfy { $0.humanMessageID != nil && $0.pane == nil && $0.category == nil })
+    h.center.ingestHumanRequests([local, remote])
+    h.relaunch()
+    h.center.ingestHumanRequests([local, remote])
+    #expect(h.poster.posted.count == 2)
+    h.center.markAllRead()
+    #expect(h.center.dockCount == 2)
+    h.center.ingestHumanRequests([local, try humanAttentionMessage(host: "rtzr", answered: true)])
+    #expect(h.center.dockCount == 1)
+    #expect(h.poster.removed.contains("human:rtzr:decision"))
+}
+
+@Test @MainActor
+func humanAttentionHonorsPreferencesWithoutHidingThePendingDecision() throws {
+    let h = Harness()
+    h.settings.notifyAttention = false
+    let message = try humanAttentionMessage(host: "jiun-mbp")
+    h.center.ingestHumanRequests([message])
+    #expect(h.poster.posted.isEmpty)
+    #expect(h.center.dockCount == 1)
+    h.settings.notifyAttention = true
+    h.center.ingestHumanRequests([message])
+    #expect(h.poster.posted.count == 1)
+}

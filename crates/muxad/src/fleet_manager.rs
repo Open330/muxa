@@ -448,14 +448,26 @@ impl LocalTask {
                     .map(FleetCommandResult::collaboration_request)
                     .map_err(|error| error.to_string())
             }
-            FleetOperation::CollaborationMailbox { pane } => {
-                exact_local_backend(&self.backends, &pane).await?;
+            FleetOperation::CollaborationMailbox {
+                pane,
+                operator_only,
+            } => {
+                if !operator_only {
+                    exact_local_backend(&self.backends, &pane).await?;
+                }
                 audit_operation(LOCAL_HOST_ALIAS, "collaboration_mailbox", 0);
                 let agent = fleet_collaboration_origin(&pane, false);
                 let console = fleet_collaboration_origin(&pane, true);
                 let (mut incoming, sent, human) = tokio::try_join!(
-                    self.client
-                        .collaboration_list(&agent, RequestMailbox::Incoming),
+                    async {
+                        if operator_only {
+                            Ok(Vec::new())
+                        } else {
+                            self.client
+                                .collaboration_list(&agent, RequestMailbox::Incoming)
+                                .await
+                        }
+                    },
                     self.client
                         .collaboration_list(&console, RequestMailbox::Sent),
                     self.client
@@ -504,13 +516,15 @@ impl LocalTask {
                 status,
                 body,
             } => {
-                exact_local_backend(&self.backends, &pane).await?;
                 audit_operation(LOCAL_HOST_ALIAS, "collaboration_reply", body.len());
                 let request = self
                     .client
                     .collaboration_get(&fleet_collaboration_origin(&pane, true), &request_id)
                     .await
                     .map_err(|error| error.to_string())?;
+                if !request.to.console {
+                    exact_local_backend(&self.backends, &pane).await?;
+                }
                 self.client
                     .collaboration_reply(
                         &fleet_collaboration_origin(&pane, request.to.console),
@@ -1342,13 +1356,13 @@ impl HostTask {
                             );
                             RelayRequest::CollaborationSend { request_id: id, pane, request }
                         }
-                        FleetOperation::CollaborationMailbox { pane } => {
+                        FleetOperation::CollaborationMailbox { pane, operator_only } => {
                             audit_operation(&self.alias, "collaboration_mailbox", 0);
                             pending.insert(
                                 id.clone(),
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
-                            RelayRequest::CollaborationMailbox { request_id: id, pane }
+                            RelayRequest::CollaborationMailbox { request_id: id, pane, operator_only }
                         }
                         FleetOperation::CollaborationGet { pane, request_id } => {
                             audit_operation(&self.alias, "collaboration_get", 0);
