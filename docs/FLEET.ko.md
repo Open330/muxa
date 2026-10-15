@@ -21,6 +21,47 @@ host마다 독립적인 OpenSSH process 하나를 유지합니다. 원격에서�
 여기서 Fleet host는 물리 node입니다. 기존 문서에서 사용하던 tmux/cmux/rmux/herdr/
 zellij “pane host”는 각 node 내부의 backend kind로 그대로 유지됩니다.
 
+## 여러 기기에서 같은 사람 확인 요청 받기
+
+에이전트는 실행 중인 호스트에서 다음 명령이나 MCP 도구를 사용합니다.
+
+```sh
+muxa msg attention "staging 배포를 승인해 주세요. 테스트는 통과했고 production은 변경하지 않습니다." --action approval
+```
+
+MCP에서는 `muxa_request_attention`에 `body`와 `action`(`approval`, `choice`,
+`information`)을 전달합니다. `dispatch_id`에 같은 UUID를 재사용하면 전송 재시도로
+같은 질문이 중복 생성되지 않습니다. 반환된 요청 ID로 `muxa_wait_reply`를 기다립니다.
+완료 상태 자체가 승인을 의미하지 않으므로 실제 답장 본문을 확인해야 합니다.
+
+요청과 답장은 **에이전트가 있는 원본 호스트**의 durable mailbox에 저장됩니다.
+Muxa for Mac은 연결된 모든 Fleet 호스트의 사람용 수신함을 모아 Work의 Attention,
+Inbox의 Needs Action, Dock 배지와 macOS 알림에 표시합니다. 한 Mac에서 답하면
+같은 호스트를 읽는 다른 Mac에도 답장과 처리 상태가 반영됩니다. 알림 수신 여부는
+각 Mac의 알림 설정을 따르며, 같은 요청의 배너는 기기별로 한 번만 보냅니다.
+연결이 끊긴 호스트의 마지막 요청은 유지하고, 재연결하면 다시 동기화합니다.
+
+예를 들어 `june-mba`에서는 나머지 호스트를 등록합니다. SSH alias는 먼저
+`~/.ssh/config`에 준비합니다.
+
+```sh
+muxa fleet host add rtzr rtzr --mode control
+muxa fleet host add jiun-mbp jiun-mbp --mode control
+muxa fleet host add jiun-mini jiun-mini --mode control
+```
+
+`jiun-mbp`를 사용하는 경우에는 `june-mba`, `rtzr`, `jiun-mini`를 그 기기의
+Fleet에도 등록합니다. 현재 기기는 항상 `local`로 포함됩니다. Fleet 등록은
+기기별 설정이므로 자동으로 양방향 등록되지는 않습니다. 읽기 전용 호스트의
+요청은 볼 수 있지만 답하려면 `control` 연결이 필요합니다.
+
+모든 호스트의 CLI·데몬·relay와 Mac 앱을 이 기능이 포함된 같은 버전으로 맞추고,
+에이전트의 MCP 연결도 새 도구 목록으로 갱신해야 합니다. 기존
+`muxa msg send human --human-action approval "..."` 경로도 유지됩니다.
+`[collaboration] enabled = true`가 필요하며, 알림을 닫거나 요청을 읽는 동작은
+승인이나 답장이 아닙니다. 원본 호스트가 오프라인인 동안 다른 Mac은 마지막으로
+가져온 내용만 보여주며, 답장 전송에는 원본 호스트 연결이 필요합니다.
+
 ## 준비
 
 - controller와 모든 remote host에 같은 Muxa version을 설치합니다.

@@ -1786,14 +1786,16 @@ private final class InboxMailboxProbe: @unchecked Sendable {
     private let lock = NSLock()
     private let base = IPCProbe()
     private var sentByHost: [String: [[String: Any]]] = [:]
+    private var incomingByHost: [String: [[String: Any]]] = [:]
     private var failureByHost: [String: String] = [:]
     private var mailboxReads: [String] = []
     private var getReads: [String] = []
 
-    func setMailbox(host: String, sent: [[String: Any]]) {
+    func setMailbox(host: String, sent: [[String: Any]], incoming: [[String: Any]] = []) {
         lock.lock()
         defer { lock.unlock() }
         sentByHost[host] = sent
+        incomingByHost[host] = incoming
     }
 
     /// `nil` restores a healthy host.
@@ -1846,7 +1848,7 @@ private final class InboxMailboxProbe: @unchecked Sendable {
                 "ok": true,
                 "fleet_result": [
                     "accepted": true,
-                    "collaboration_incoming": [],
+                    "collaboration_incoming": incomingByHost[host] ?? [],
                     "collaboration_sent": sentByHost[host] ?? [],
                 ],
             ])
@@ -5917,5 +5919,74 @@ struct MuxaPeerRecoveryTests {
         #expect(request.status == "claimed")
         #expect(request.reply == nil)
         #expect(request.interruption?.resetAt == nil)
+    }
+}
+
+private func humanInboxRequest(id: String = "decision", answered: Bool = false) -> [String: Any] {
+    var object = inboxSentRequest(id: id, createdAt: "2026-10-15T10:00:00Z")
+    let sender = object["to"]
+    object["to"] = object["from"]
+    object["from"] = sender
+    object["kind"] = "question"
+    object["human_action"] = "approval"
+    if answered {
+        object["status"] = "completed"
+        object["reply"] = ["status": "completed", "body": "Approved for staging only", "at": "2026-10-15T10:01:00Z"]
+    }
+    return object
+}
+
+struct MuxaHumanAttentionInboxTests {
+    @Test @MainActor
+    func humanInboxRemainsAvailableAfterTheLastTerminalCloses() async throws {
+        let probe = InboxMailboxProbe()
+        probe.setMailbox(host: "local", sent: [], incoming: [humanInboxRequest()])
+        let model = try await makeInboxModel(probe: probe)
+        let host = try JSONDecoder().decode(MuxaFleetHost.self, from: JSONSerialization.data(withJSONObject: [
+            "alias": "local", "local": true, "mode": "control", "state": "online"
+        ]))
+        model.ingestExecutionSnapshotForTesting(MuxaExecutionSnapshot(hosts: [host]))
+        await model.refreshOperatorInbox(force: true)
+        #expect(model.operatorMessages.count == 1)
+        #expect(model.operatorMessages.first?.routePane.paneID == "console")
+        #expect(model.attention.dockCount == 1)
+    }
+
+    @Test @MainActor
+    func fleetDecisionsAppearOnEveryClientAndResolveTogether() async throws {
+        let probe = InboxMailboxProbe()
+        probe.setMailbox(host: "local", sent: [], incoming: [humanInboxRequest()])
+        probe.setMailbox(host: "dev", sent: [], incoming: [humanInboxRequest()])
+        let laptop = try await makeInboxModel(probe: probe)
+        let desktop = try await makeInboxModel(probe: probe)
+        await laptop.refreshOperatorInbox(force: true)
+        await desktop.refreshOperatorInbox(force: true)
+        #expect(laptop.operatorMessages.map(\.id) == desktop.operatorMessages.map(\.id))
+        #expect(Set(laptop.operatorMessages.map(\.id)) == ["local:decision", "dev:decision"])
+        #expect(laptop.operatorMessages.allSatisfy { $0.needsHumanDecision && !$0.isAwaitingAgentReply && $0.counterpart.agentSessionID == "agent-17" })
+        #expect(laptop.attention.dockCount == 2)
+        probe.setFailure(host: "dev", message: "SSH disconnected")
+        await desktop.refreshOperatorInbox(force: true)
+        #expect(desktop.operatorMessages.count == 2)
+        probe.setFailure(host: "dev", message: nil)
+        probe.setMailbox(host: "dev", sent: [], incoming: [humanInboxRequest(answered: true)])
+        await laptop.refreshOperatorInbox(force: true)
+        await desktop.refreshOperatorInbox(force: true)
+        for client in [laptop, desktop] {
+            let resolved = try #require(client.operatorMessages.first { $0.host.alias == "dev" })
+            #expect(!resolved.needsHumanDecision && !resolved.needsReply && !resolved.hasUnreadReply)
+            #expect(resolved.request.reply?.body == "Approved for staging only")
+            #expect(client.attention.dockCount == 1)
+        }
+    }
+
+    @Test @MainActor
+    func unrelatedAgentIncomingMessagesDoNotLeakIntoOperatorInbox() async throws {
+        let probe = InboxMailboxProbe()
+        let peer = inboxSentRequest(id: "peer-only", createdAt: "2026-10-15T10:00:00Z")
+        probe.setMailbox(host: "local", sent: [], incoming: [peer])
+        let model = try await makeInboxModel(probe: probe)
+        await model.refreshOperatorInbox(force: true)
+        #expect(model.operatorMessages.isEmpty)
     }
 }

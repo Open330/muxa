@@ -158,9 +158,15 @@ struct MuxaOperatorMessage: Identifiable, Hashable, Sendable {
     let request: MuxaCollaborationRequest
 
     var id: String { "\(host.alias):\(request.id)" }
-    var needsReply: Bool { request.expectsReply && request.reply == nil }
-    var hasUnreadReply: Bool { request.reply != nil && request.replyReadAt == nil }
+    var isHumanRequest: Bool { request.to.console == true && request.from.console != true }
+    var counterpart: MuxaCollaborationParticipant { isHumanRequest ? request.from : request.to }
+    var needsReply: Bool {
+        if isHumanRequest { return request.needsHumanResponse }
+        return request.expectsReply && request.reply == nil && !["completed", "cancelled", "expired"].contains(request.status)
+    }
+    var hasUnreadReply: Bool { !isHumanRequest && request.reply != nil && request.replyReadAt == nil }
     var needsHumanDecision: Bool {
+        if isHumanRequest { return request.needsHumanResponse }
         let terminalStatus = request.reply?.status ?? request.status
         return ["blocked", "declined", "failed"].contains(terminalStatus)
     }

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Agents can explicitly request required human attention with `muxa msg attention`
+  or `muxa_request_attention`. Muxa for Mac aggregates these durable operator
+  requests across Fleet hosts, displays pending decisions in Attention/Inbox and
+  the Dock badge, and posts per-device deduplicated notifications that open the
+  exact request. Replies resolve on every connected client, including after the
+  originating terminal closes; disconnected hosts retain their last messages.
+
 ### Fixed
 
 - Muxa.app builds with Xcode 27: the embedded `muxad`/`muxa` build no longer

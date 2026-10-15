@@ -2,6 +2,14 @@
 
 ## Human decision during peer work
 
+The dedicated `muxa_request_attention` tool accepts `body` and `action` (approval,
+choice, information). Preserve causal Work IDs and reuse a UUID `dispatch_id`
+for retries. The source host stores one durable request; connected Fleet Mac
+clients show it in Attention/Inbox and notify the human. The equivalent CLI is
+`muxa msg attention "..." --action choice`. Continue independent work and wait
+for the returned request ID using `muxa_wait_reply`. The full send form below
+remains compatible.
+
 While handling `req_review`, a reviewer discovers two mutually exclusive product
 requirements that the authorized task does not resolve. Send:
 

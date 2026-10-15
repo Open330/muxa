@@ -154,6 +154,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var askError: String?
     @Published private(set) var askSettingsStatus: String?
     @Published private(set) var askSettingsError: String?
+    @Published var pendingOperatorMessageID: String?
     @Published private(set) var operatorMessages: [MuxaOperatorMessage] = []
     @Published private(set) var mailboxRevisions: [String: UInt64] = [:]
     @Published private(set) var isRefreshingInbox = false
@@ -391,8 +392,7 @@ final class AppModel: ObservableObject {
                 if askEnabled != listedAskStatus { askEnabled = listedAskStatus }
                 if listedAskStatus { askConfigurationPendingReload = false }
             }
-            if sidebarMode == .inbox,
-               Date().timeIntervalSince(lastInboxRefresh) >= 60,
+            if Date().timeIntervalSince(lastInboxRefresh) >= 60,
                !isRefreshingInbox {
                 Task { [weak self] in await self?.refreshOperatorInbox() }
             }
@@ -1388,8 +1388,9 @@ final class AppModel: ObservableObject {
         inboxError = nil
         defer { isRefreshingInbox = false }
 
-        let allTargets = executionSnapshot.watchHosts.compactMap { host -> MuxaWatchPane? in
+        let allTargets = executionSnapshot.watchHosts.map { host -> MuxaWatchPane in
             host.sessions.flatMap(\.windows).flatMap(\.panes).first
+                ?? MuxaWatchPane(host: host.host.identity, pane: .operatorRoute, agent: nil)
         }
         let targets = hostAliases.map { aliases in
             allTargets.filter { aliases.contains($0.host.alias) }
@@ -1413,7 +1414,8 @@ final class AppModel: ObservableObject {
                     do {
                         let mailbox = try await client.collaborationMailbox(
                             host: target.host,
-                            pane: target.pane
+                            pane: target.pane,
+                            operatorOnly: true
                         )
                         return MuxaInboxFetch(target: target, mailbox: mailbox, error: nil)
                     } catch {
@@ -1434,7 +1436,8 @@ final class AppModel: ObservableObject {
             let target = result.target
             if let mailbox = result.mailbox {
                 var seen = Set<String>()
-                messagesByHost[target.host.alias] = mailbox.sent.compactMap { request in
+                let humanRequests = mailbox.incoming.filter { $0.to.console == true && $0.from.console != true }
+                messagesByHost[target.host.alias] = (humanRequests + mailbox.sent).compactMap { request in
                     guard seen.insert(request.id).inserted else { return nil }
                     return MuxaOperatorMessage(
                         host: target.host,
@@ -1459,6 +1462,7 @@ final class AppModel: ObservableObject {
                 return lhs.id < rhs.id
             }
         if operatorMessages != updatedMessages { operatorMessages = updatedMessages }
+        attention.ingestHumanRequests(updatedMessages)
         if inboxHostFailures != failures { inboxHostFailures = failures }
     }
 
@@ -1467,7 +1471,7 @@ final class AppModel: ObservableObject {
             for: message,
             in: executionSnapshot
         ) else {
-            inboxError = String(localized: "\(message.request.to.label) is no longer present on \(message.host.alias). The conversation is still available, but its live agent cannot be opened.")
+            inboxError = String(localized: "\(message.counterpart.label) is no longer present on \(message.host.alias). The conversation is still available, but its live agent cannot be opened.")
             return
         }
         inboxError = nil
@@ -1487,7 +1491,7 @@ final class AppModel: ObservableObject {
         for message: MuxaOperatorMessage,
         in snapshot: MuxaExecutionSnapshot
     ) -> MuxaSidebarSelection? {
-        let participant = message.request.to
+        let participant = message.counterpart
         let agents = snapshot.hostedAgents.filter {
             $0.host.alias == message.host.alias && $0.agent.state != "stopped"
         }

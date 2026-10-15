@@ -792,6 +792,25 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             },
         }),
         json!({
+            "name": "muxa_request_attention",
+            "description": "Request a required human approval, choice, or missing information. Creates one durable operator request on this host, visible in every connected Fleet client including the Muxa Mac app. Explain what decision is needed, why, options and recommendation. Reuse the returned request ID and wait via muxa_wait_reply; never treat timeout or delivery as approval. Use only when a person is required, not for routine progress or peer work.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "body": { "type": "string" },
+                    "action": { "type": "string", "enum": ["approval", "choice", "information"], "default": "information" },
+                    "dispatch_id": { "type": "string", "description": "A UUID. Reuse for retries of the same decision to avoid duplicate requests." },
+                    "parent_request_id": { "type": "string" },
+                    "thread_id": { "type": "string" },
+                    "workspace_id": { "type": "string" },
+                    "work_id": { "type": "string" },
+                    "run_id": { "type": "string" }
+                },
+                "required": ["body"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "muxa_send_message",
             "description": "Send a durable request to a same-window peer. Use review + read_only for an independent critique before finalizing important work; question + read_only for focused analysis; task + execute + narrow paths for bounded, non-overlapping delegated edits. Attach typed air_artifacts when a validated AIR workflow, plan, or trace is the shared review context. Continue useful work, wait for the structured reply, and verify the result yourself. Targets: peer (only one peer), pane:%N, @alias, or role:<name> (only one matching role).",
             "inputSchema": {
@@ -907,10 +926,28 @@ async fn call_tool(
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
-    let args = params
+    let mut args = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+
+    let name = if name == "muxa_request_attention" {
+        let Some(object) = args.as_object_mut() else {
+            return Ok(error_result("attention arguments must be an object"));
+        };
+        let action = object
+            .remove("action")
+            .unwrap_or_else(|| json!("information"));
+        object.insert("human_action".into(), action);
+        object.insert("target".into(), json!("human"));
+        object.insert("kind".into(), json!("question"));
+        object.insert("expects_reply".into(), json!(true));
+        object.insert("notify".into(), json!(true));
+        object.insert("work_mode".into(), json!("read_only"));
+        "muxa_send_message"
+    } else {
+        name
+    };
 
     match name {
         "muxa_status" => {
@@ -4850,6 +4887,67 @@ mod tests {
             serde_json::to_vec(&cancelled).unwrap().len()
         );
 
+        let attention_args = json!({"body":"Approve staging deployment?", "action":"approval", "dispatch_id":"a20fa7e0-5f79-4f9b-b172-049154f305cf"});
+        let first = decode(
+            dispatch(
+                &client,
+                &tool("muxa_request_attention", attention_args.clone()),
+            )
+            .await
+            .unwrap(),
+        );
+        let retry = decode(
+            dispatch(&client, &tool("muxa_request_attention", attention_args))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(first["request_id"], retry["request_id"]);
+        let id = first["request_id"].as_str().unwrap();
+        let human_request = client.collaboration_get(&origin, id).await.unwrap();
+        assert!(human_request.needs_human_response());
+        assert_eq!(
+            human_request.human_action,
+            Some(muxa::collaboration::HumanAction::Approval)
+        );
+        assert_eq!(human_request.notify, Some(true));
+        let mut other_room = room.current.room.clone();
+        other_room.window_id = "@999".into();
+        let operator = muxa::collaboration::Participant::console(other_room);
+        assert!(mailbox
+            .list_for(
+                &operator,
+                RequestMailbox::Incoming,
+                muxa::collaboration::MailboxScope::Caller
+            )
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.id == id));
+        mailbox
+            .reply(
+                &operator,
+                id,
+                RequestStatus::Completed,
+                "Approved for staging only".into(),
+                vec![],
+                vec![],
+            )
+            .await
+            .unwrap();
+        let resolved = client.collaboration_get(&origin, id).await.unwrap();
+        assert!(!resolved.needs_human_response());
+        assert_eq!(resolved.reply.unwrap().body, "Approved for staging only");
+        let invalid = dispatch(
+            &client,
+            &tool(
+                "muxa_request_attention",
+                json!({"body":"Test", "action":"notice"}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid["result"]["isError"], true);
+
         shutdown.send(()).unwrap();
         daemon.await.unwrap();
     }
@@ -4993,6 +5091,7 @@ mod tests {
                 "muxa_call_peer",
                 "muxa_peer_report",
                 "muxa_set_identity",
+                "muxa_request_attention",
                 "muxa_send_message",
                 "muxa_inbox",
                 "muxa_list_messages",

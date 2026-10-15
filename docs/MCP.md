@@ -202,6 +202,7 @@ it:
 | `muxa_call_peer` | `target?`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?`, `spawn_if_missing?`, `spawn_agent?`, `spawn_timeout_secs?`, `air_artifacts?` | Expand a registered skill, select a peer, send a durable request, optionally wait for its reply, and explicitly spawn an agent when no peer exists. |
 | `muxa_peer_report` | `target?`, `request_id?`, `full?` | Read a received final reply without repeating the original request. `full=true` returns the legacy full record. |
 | `muxa_set_identity` | `alias?`, `roles?` | Replace this exact session's room-local alias and role set; empty input clears it. |
+| `muxa_request_attention` | `body`, `action?`, `dispatch_id?`, `parent_request_id?` | Request required human approval, choice or information; delivered to connected Fleet operator clients. Reuse a UUID dispatch ID on retry; wait for and read the actual human reply. |
 | `muxa_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?`, `air_artifacts?` | Create a durable same-window peer request. |
 | `muxa_inbox` | `full?` | Claim and read instructions, authority, paths and attachments addressed to this session. `full=true` includes audit metadata. |
 | `muxa_list_messages` | `mailbox?`, `request_id?`, `limit?`, `offset?`, `include_body?`, `after_update?`, `full?` | List newest metadata records without claiming (default 20, max 100). Read an exact request or incremental progress explicitly. |

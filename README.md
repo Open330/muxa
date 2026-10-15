@@ -222,6 +222,14 @@ muxa registry forget <agent_session_id>
 This removes exactly one registry row without stopping its process or terminal.
 Later hooks or scans may register an active agent again. Prompt history is kept.
 
+### Ask for human attention
+
+An agent can run `muxa msg attention "Approve staging deployment?" --action approval`,
+or use the `muxa_request_attention` MCP tool. Required approval, choice, and
+information requests appear in Muxa for Mac's Attention, Inbox, Dock badge, and
+notifications across connected Fleet hosts. A response on one client resolves
+the same durable request on other connected clients. See [Fleet setup](docs/FLEET.md#human-attention-across-clients).
+
 ### Collaborate from `muxa watch`
 
 <div align="center">

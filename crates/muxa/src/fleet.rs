@@ -511,6 +511,9 @@ pub enum RelayRequest {
     CollaborationMailbox {
         request_id: String,
         pane: PaneKey,
+        /// Console-only reads do not require this pane to host an agent.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        operator_only: bool,
     },
     CollaborationGet {
         request_id: String,
@@ -625,6 +628,8 @@ pub enum FleetOperation {
     },
     CollaborationMailbox {
         pane: PaneKey,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        operator_only: bool,
     },
     CollaborationGet {
         pane: PaneKey,

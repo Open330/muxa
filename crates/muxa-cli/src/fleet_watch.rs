@@ -2244,7 +2244,13 @@ fn refresh_mailbox(
     app.mailbox.loading = true;
     tokio::spawn(async move {
         let result = client
-            .fleet_execute(&host, &FleetOperation::CollaborationMailbox { pane })
+            .fleet_execute(
+                &host,
+                &FleetOperation::CollaborationMailbox {
+                    pane,
+                    operator_only: false,
+                },
+            )
             .await
             .map_err(|error| error.to_string());
         let _ = background.send(BackgroundResult::Mailbox(result));

@@ -18445,6 +18445,61 @@
           }
         }
       }
+    },
+    "%@ needs your decision" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@에서 확인을 요청합니다"
+          }
+        }
+      }
+    },
+    "Your decision needed" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "사람의 확인이 필요합니다"
+          }
+        }
+      }
+    },
+    "Your response is required" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "답변이 필요합니다"
+          }
+        }
+      }
+    },
+    "Request for you" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "나에게 온 요청"
+          }
+        }
+      }
+    },
+    "Respond…" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "답변하기…"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"
