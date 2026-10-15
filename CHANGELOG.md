@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `muxa reload` tells agents it cut off mid-turn to carry on: once each
+  resumed agent's screen settles, it types `continue` (change it with
+  `--continue TEXT`, skip it with `--no-continue`). Only agents that were
+  working when the snapshot was taken get it. `muxa restore` does the same only
+  with `--continue`, since an old snapshot's turn may no longer be wanted.
 - `muxa swap` moves agents onto another `aas` account and resumes each
   conversation in its own pane: every rate-limited agent by default, named
   panes, or `--all` (`--force` for mid-turn agents). The account is the next
