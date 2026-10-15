@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Muxa.app builds with Xcode 27: the embedded `muxad`/`muxa` build no longer
+  hands Xcode's `MACOSX_DEPLOYMENT_TARGET` to the host proc-macros, which then
+  failed to load (`can't find crate for tokio_macros`). The deployment target
+  still applies to the shipped binaries.
 - `muxa reload` resumes the right conversation on macOS. It reads each pane's
   argv with its argument boundaries instead of the joined `ps` line, so an
   initial prompt is no longer replayed word by word (a Codex argument error)
