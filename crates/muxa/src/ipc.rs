@@ -728,6 +728,10 @@ enum RequestBody {
         #[serde(default)]
         command: Option<String>,
     },
+    /// Explicitly forget one exact agent session without terminating its host.
+    ForgetAgent {
+        session_id: String,
+    },
     /// Delete fully orphaned rows (no pane, surface, or pid) idle longer than
     /// `max_age_secs`. Backs `muxa prune` — the on-demand cleanup of
     /// remote/detached ghost rows the reconciler would otherwise only age out
@@ -3274,6 +3278,10 @@ async fn handle(
                         Err(e) => Response::err(e),
                     }
                 }
+                RequestBody::ForgetAgent { session_id } => {
+                    kind = "forget_agent";
+                    Response::with_pruned(usize::from(store.forget_agent(&session_id).await))
+                }
                 RequestBody::Prune { max_age_secs } => {
                     kind = "prune";
                     store
@@ -5647,6 +5655,19 @@ impl Client {
         Ok(())
     }
 
+    /// Forget one exact agent session. Returns false when it is already absent.
+    /// Does not terminate the agent or its pane; later activity may recreate it.
+    pub async fn forget_agent(&self, session_id: &str) -> Result<bool, RuntimeError> {
+        let resp = self
+            .call_checked(&serde_json::json!({
+                "protocol": PROTOCOL_VERSION,
+                "kind": "forget_agent",
+                "session_id": session_id,
+            }))
+            .await?;
+        Ok(resp["pruned"].as_u64() == Some(1))
+    }
+
     /// Ask the daemon to delete fully orphaned rows (no pane, surface, or
     /// pid) idle longer than `max_age`. `max_age = Duration::ZERO` removes
     /// every orphan regardless of age. Returns the number removed. Backs
@@ -7755,6 +7776,82 @@ mod tests {
                     == Some(collaboration::CONSOLE_SESSION_ID)
         }));
 
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forget_agent_removes_exact_cmux_record_and_notifies_watch() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("forget.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let client = Client::new(sock);
+        let target = AgentId {
+            kind: AgentKind::Codex,
+            session_id: "old-cmux".into(),
+            pane: Some("cmux:surface-1".into()),
+            tmux_socket: Some("/tmp/cmux.sock".into()),
+            surface: Some(crate::event::SurfaceRef {
+                kind: crate::event::SurfaceKind::Cmux,
+                id: "surface-1".into(),
+                workspace: Some("workspace-1".into()),
+            }),
+            cwd: None,
+        };
+        for id in [
+            target.clone(),
+            AgentId {
+                session_id: "old-cmux-other".into(),
+                pane: Some("cmux:surface-2".into()),
+                surface: None,
+                ..target.clone()
+            },
+        ] {
+            client
+                .ingest(&AgentEvent::Started {
+                    id,
+                    at: OffsetDateTime::now_utc() - time::Duration::days(10),
+                })
+                .await
+                .unwrap();
+        }
+        // Ordinary orphan pruning cannot remove either pane-bound record.
+        assert_eq!(client.prune(std::time::Duration::ZERO).await.unwrap(), 0);
+        let mut changes = store.subscribe_changes();
+        let dirty = store.dirty();
+        // Consume notifications from fixture setup before checking deletion.
+        dirty.notified().await;
+        assert!(!client.forget_agent("old").await.unwrap());
+        assert!(!changes.has_changed().unwrap());
+        assert!(client.forget_agent("old-cmux").await.unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(1), changes.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), dirty.notified())
+            .await
+            .unwrap();
+        assert!(store.by_session("old-cmux").await.is_none());
+        assert!(store.by_session("old-cmux-other").await.is_some());
+        assert!(!client.forget_agent("old-cmux").await.unwrap());
+        // Forget is cleanup, not a persistent block against a live agent.
+        client
+            .ingest(&AgentEvent::Started {
+                id: target,
+                at: OffsetDateTime::now_utc(),
+            })
+            .await
+            .unwrap();
+        assert!(store.by_session("old-cmux").await.is_some());
         tx.send(()).unwrap();
         handle.await.unwrap();
     }

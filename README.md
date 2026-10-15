@@ -206,6 +206,22 @@ start sandboxed agents, and use the real Muxa watch, attend, and messaging
 workflow. It never touches your existing tmux server and removes the sandbox on
 exit.
 
+### Clear a stale agent record
+
+Reinstalling Muxa preserves its registry. A cmux record can outlive the agent
+because cmux observation is partial; an unseen surface does not prove an exit.
+`muxa registry prune` only removes orphan rows without a pane, surface, or pid.
+For a stale record that still carries a pane, find its `agent_session_id` in
+`muxa status --json`, then run:
+
+```sh
+muxa registry forget <agent_session_id>
+# Add --yes to skip the confirmation.
+```
+
+This removes exactly one registry row without stopping its process or terminal.
+Later hooks or scans may register an active agent again. Prompt history is kept.
+
 ### Collaborate from `muxa watch`
 
 <div align="center">
@@ -358,7 +374,7 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa stats report --since week` | All breakdowns (day/project/agent/session) as focused ACT/WACT tables; add `--json` or `--markdown` to export. |
 | `muxa timeline --since today` | Interactive session-grouped timeline; filter with `--session main` / `--agent codex`, sort with `--sort waiting`, or use `--view heatmap`. |
 | `muxa stats activity --type agent\|tmux\|human` | Raw activity ledger intervals. |
-| `muxa registry sync` / `prune` / `panes` | Backfill the registry from active pane hosts, drop orphan rows, or list pane hosts. |
+| `muxa registry sync` / `prune` / `forget` / `panes` | Backfill the registry, drop orphan rows, forget an exact agent session, or list pane hosts. |
 | `muxa proc register --name X [--pid N]` | Surface an arbitrary background process (script, game, automation loop) as a pid-tracked row in `muxa status`. |
 | `muxa proc run --detach --name X -- <cmd>` | Run a command in a muxa-owned PTY; it also appears in `muxa status` as a task. `muxa proc attach/detach X` reconnects or leaves it. |
 | `muxa agent start --agent codex [--host auto\|native\|tmux]` | Start an allowlisted agent. `auto` uses tmux inside tmux and a muxa-owned PTY in a plain terminal. |
