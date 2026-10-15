@@ -230,6 +230,9 @@ fn render_rules(rules: &AutomationRules) -> String {
             rule.only_if_still,
         );
         let _ = writeln!(out, "\tfilters {}", rule.filters);
+        if let Some(account) = &rule.account {
+            let _ = writeln!(out, "\taccount {account}");
+        }
         if let Some(payload) = rule.text.as_ref().or(rule.message.as_ref()) {
             let _ = writeln!(out, "\tpayload {payload:?}");
         }
@@ -447,6 +450,7 @@ mod tests {
             text: Some("continue".into()),
             message: None,
             submit: true,
+            account: None,
             max_per_hour: 2,
             only_if_still: AutomationCondition::RateLimited,
             filters: "agent=claude_code".into(),

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `muxa swap` moves agents onto another `aas` account and resumes each
+  conversation in its own pane: every rate-limited agent by default, named
+  panes, or `--all` (`--force` for mid-turn agents). The account is the next
+  eligible one from `aas candidates`, a named one (`--to`), or round-robin
+  (`--spread`); a follow-up prompt carries the cut-off turn on. Defaults live
+  in `[swap]`. See docs/ACCOUNT_SWAP.md.
+- Automation action `swap_account`: on a usage cap, switch accounts right away
+  instead of waiting for the reset.
+
 ## [0.8.58] - 2026-10-15
 
 ### Added

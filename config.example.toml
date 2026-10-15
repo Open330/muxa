@@ -205,6 +205,14 @@
 # path        = "/home/$USER/.local/share/muxa/state.json"
 # debounce_ms = 200                  # coalesce window between dirty signal and write
 
+# Moving agents onto another `aas` account (`muxa swap`, and the
+# `swap_account` automation action). See docs/ACCOUNT_SWAP.md.
+[swap]
+# bare          = "skip"             # skip | wrap: agents started without aas
+# continue_text = "continue"         # follow-up after the resume; "" sends none
+# continue_when = "limited"          # limited | always | never
+# aas           = "aas"              # aas binary (also found in /opt/homebrew/bin, ~/.cargo/bin)
+
 # Workspace snapshots. muxad takes an automatic one every
 # `auto_interval_minutes` when the workspace changed since the last snapshot
 # of its server, and keeps the newest `keep_auto` of them. Snapshots taken by

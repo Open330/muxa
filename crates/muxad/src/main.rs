@@ -323,6 +323,7 @@ async fn main() -> Result<()> {
         ask.clone(),
         store.clone(),
         backends.clone(),
+        cfg.swap.clone(),
         &shutdown_tx,
     );
 
@@ -812,6 +813,7 @@ fn spawn_automation_task(
     ask: Arc<AskStore>,
     store: muxa::SharedStore,
     backends: Vec<muxa::SharedBackend>,
+    swap: muxa::account_swap::SwapConfig,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -822,6 +824,7 @@ fn spawn_automation_task(
     tokio::spawn(async move {
         let mut engine = AutomationEngine::new(automation, store, backends);
         engine.ask = Some(ask);
+        engine.swap = swap;
         engine.rescan().await;
         let mut reconcile =
             tokio::time::interval(std::time::Duration::from_secs(AUTOMATION_RECONCILE_SECONDS));
@@ -885,6 +888,8 @@ struct AutomationEngine {
     panes_read_at: Option<std::time::Instant>,
     ask: Option<Arc<AskStore>>,
     judgments: tokio::task::JoinSet<JudgedFiring>,
+    /// `[swap]` defaults for the `swap_account` action.
+    swap: muxa::account_swap::SwapConfig,
 }
 
 struct JudgedFiring {
@@ -913,6 +918,7 @@ impl AutomationEngine {
             panes_read_at: None,
             ask: None,
             judgments: tokio::task::JoinSet::new(),
+            swap: muxa::account_swap::SwapConfig::default(),
         }
     }
 
@@ -1359,7 +1365,47 @@ impl AutomationEngine {
             AutomationAction::Interrupt => {
                 send_automation_text(&self.backends, firing, "\u{3}").await
             }
+            AutomationAction::SwapAccount => self.swap_account(firing).await,
         }
+    }
+
+    /// Move the capped agent onto another `aas` account and resume it. The
+    /// firing was re-checked just before this, so the agent is the one the
+    /// rule armed on; `force` only lets a cap that reads as `Starting` through.
+    async fn swap_account(&self, firing: &PlannedFiring) -> bool {
+        use muxa::account_swap::{self, AccountChoice, SwapRequest, SwapScope, SwapStatus};
+        let Some(agent) = self.store.by_session(&firing.agent_session_id).await else {
+            return false;
+        };
+        let mut request = SwapRequest::new(
+            SwapScope::Targets(vec![firing.agent_session_id.clone()]),
+            &self.swap,
+        );
+        request.to = AccountChoice::parse(firing.account.as_deref().unwrap_or("auto"));
+        request.force = true;
+        if let Some(text) = firing.text.clone() {
+            request.continue_text = Some(text).filter(|text| !text.trim().is_empty());
+        }
+        let backends = self.backends.clone();
+        let config = self.swap.clone();
+        let outcomes = tokio::task::spawn_blocking(move || {
+            account_swap::run(&request, std::slice::from_ref(&agent), &backends, &config)
+        })
+        .await
+        .unwrap_or_default();
+        let Some(outcome) = outcomes.into_iter().next() else {
+            return false;
+        };
+        tracing::info!(
+            rule = %firing.rule,
+            pane = %firing.pane,
+            from = outcome.from.as_deref().unwrap_or("?"),
+            to = outcome.to.as_deref().unwrap_or("?"),
+            status = %outcome.status,
+            note = %outcome.note,
+            "automation account swap",
+        );
+        outcome.status == SwapStatus::Swapped
     }
 
     /// Capture immediately before Enter; a waiting state alone cannot identify

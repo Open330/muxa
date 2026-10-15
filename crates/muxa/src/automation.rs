@@ -354,6 +354,11 @@ pub enum AutomationAction {
     Interrupt,
     /// Press Enter only on a visibly selected Yes/Proceed confirmation.
     PressEnter,
+    /// Move the agent onto another `aas` account (`account`, default the
+    /// best-ranked one with quota left) and resume its conversation; then
+    /// type `text`, or the `[swap]` follow-up, so the cut-off turn carries
+    /// on. See [`crate::account_swap`].
+    SwapAccount,
 }
 
 /// The live-state predicate re-checked at fire time.
@@ -563,6 +568,10 @@ pub struct AutomationRule {
     /// Whether `send_prompt` commits the line with Enter. Default `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submit: Option<bool>,
+    /// `swap_account` target: an `aas` account name, or `auto` (the
+    /// default) for the best-ranked account with quota left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 
     // --- guards: a rule cannot opt out of these, only tune them ---
     /// Firings allowed per hour, per pane. Default 3, capped at 60, and
@@ -607,6 +616,7 @@ impl AutomationRule {
             text: None,
             message: None,
             submit: None,
+            account: None,
             max_per_hour: None,
             cooldown: None,
             only_if_still: None,
@@ -616,6 +626,11 @@ impl AutomationRule {
     #[must_use]
     pub fn wait(&self) -> WaitSpec {
         self.wait.unwrap_or(match self.on {
+            // Another account is the way around the cap, not a reason to
+            // wait it out.
+            _ if self.action == AutomationAction::SwapAccount => {
+                WaitSpec::after_event(time::Duration::ZERO)
+            }
             // A cap that names its reset time is the whole point of the
             // anchor, so that is the default for `rate_limited`.
             AutomationEvent::RateLimited => WaitSpec::after_reset(time::Duration::ZERO),
@@ -786,6 +801,11 @@ impl AutomationRule {
             }
         }
 
+        if self.account.is_some() && self.action != AutomationAction::SwapAccount {
+            return Err(named(
+                "`account` belongs to `action = \"swap_account\"`".into(),
+            ));
+        }
         match self.action {
             AutomationAction::SendPrompt => {
                 let text = self
@@ -845,6 +865,36 @@ impl AutomationRule {
                     return Err(named(
                         "`action = \"interrupt\"` takes no `text`, `message`, or `submit`".into(),
                     ));
+                }
+            }
+            AutomationAction::SwapAccount => {
+                if self.message.is_some() || self.submit.is_some() {
+                    return Err(named(
+                        "`action = \"swap_account\"` takes `account` and `text`, \
+                         not `message` or `submit`"
+                            .into(),
+                    ));
+                }
+                if let Some(account) = &self.account {
+                    if account.trim().is_empty() || account.contains(char::is_whitespace) {
+                        return Err(named(format!(
+                            "account {account:?} is not an aas account name"
+                        )));
+                    }
+                }
+                if let Some(text) = &self.text {
+                    if text.len() > MAX_ACTION_TEXT_BYTES {
+                        return Err(named(format!(
+                            "text cannot exceed {MAX_ACTION_TEXT_BYTES} bytes"
+                        )));
+                    }
+                    if !text_is_terminal_safe(text) {
+                        return Err(named(
+                            "text contains terminal control characters; only printable \
+                             text, tabs, and newlines are accepted"
+                                .into(),
+                        ));
+                    }
                 }
             }
         }
@@ -1200,6 +1250,9 @@ pub struct PlannedFiring {
     pub text: Option<String>,
     pub submit: bool,
     pub only_if_still: AutomationCondition,
+    /// `swap_account`'s target account; `None` means `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 /// Ordered by fire time so a `BinaryHeap<Reverse<_>>` pops the next one
@@ -1301,12 +1354,13 @@ impl Scheduler {
             fire_at,
             action: rule.action,
             text: match rule.action {
-                AutomationAction::SendPrompt => rule.text.clone(),
+                AutomationAction::SendPrompt | AutomationAction::SwapAccount => rule.text.clone(),
                 AutomationAction::Notify => rule.message.clone(),
                 AutomationAction::Interrupt | AutomationAction::PressEnter => None,
             },
             submit: rule.submit(),
             only_if_still: rule.only_if_still(),
+            account: rule.account.clone(),
         }))
     }
 
@@ -1785,6 +1839,8 @@ pub struct AutomationRuleView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub submit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 
     // --- effective timing and guards, defaults already resolved ---
     /// `reset+2m` / `5m`.
@@ -1979,6 +2035,7 @@ impl AutomationStore {
                     text: rule.text.clone(),
                     message: rule.message.clone(),
                     submit: rule.submit(),
+                    account: rule.account.clone(),
                     wait: rule.wait().to_string(),
                     fallback: render_duration(rule.fallback()),
                     jitter: render_duration(rule.jitter()),
@@ -2393,6 +2450,58 @@ mod tests {
             state_entered_at: NOW,
             last_activity_at: NOW,
         }
+    }
+
+    // --- swap_account ------------------------------------------------------
+
+    #[test]
+    fn swap_account_fires_on_the_cap_not_its_reset_and_carries_the_account() {
+        let toml = r#"
+            [[rule]]
+            name = "swap-on-limit"
+            on = "rate_limited"
+            action = "swap_account"
+            account = "jelly@claude"
+            text = "pick up where you left off"
+        "#;
+        let config: AutomationConfig = toml::from_str(toml).unwrap();
+        config.validate().unwrap();
+        let rule = &config.rule[0];
+        assert_eq!(rule.wait(), WaitSpec::after_event(time::Duration::ZERO));
+        let mut rule = rule.clone();
+        rule.jitter = Some(DurationSpec::seconds(0));
+        let decision = Scheduler::arm(
+            &config,
+            &rule,
+            &capped_subject(),
+            GuardState::default(),
+            NOW,
+            0.0,
+        );
+        let firing = decision.firing().expect("fires");
+        assert_eq!(firing.fire_at, NOW, "no waiting out the cap");
+        assert_eq!(firing.account.as_deref(), Some("jelly@claude"));
+        assert_eq!(firing.text.as_deref(), Some("pick up where you left off"));
+    }
+
+    #[test]
+    fn swap_account_rejects_foreign_payloads_and_account_elsewhere() {
+        let mut rule = AutomationRule::new(
+            "swap",
+            AutomationEvent::RateLimited,
+            AutomationAction::SwapAccount,
+        );
+        rule.validate().expect("account and text are optional");
+        rule.submit = Some(false);
+        assert!(rule.validate().is_err());
+        rule.submit = None;
+        rule.account = Some("two words".into());
+        assert!(rule.validate().is_err());
+
+        let mut prompt = resume_rule();
+        prompt.account = Some("jelly@claude".into());
+        let error = prompt.validate().unwrap_err();
+        assert!(error.contains("swap_account"), "{error}");
     }
 
     // --- duration / wait parsing ------------------------------------------
@@ -3695,6 +3804,7 @@ waaait = "5m"
             text: Some("continue".into()),
             message: None,
             submit: true,
+            account: None,
             wait: "reset+2m".into(),
             fallback: "20m".into(),
             jitter: "30s".into(),

@@ -159,6 +159,9 @@ pub struct Config {
     /// one is written.
     #[serde(default)]
     pub automation: crate::automation::AutomationConfig,
+    /// Defaults for moving agents onto another `aas` account: `muxa swap`
+    /// and the `swap_account` automation action.
+    pub swap: crate::account_swap::SwapConfig,
     pub orchestration: crate::orchestration::OrchestrationConfig,
     pub history: HistoryConfig,
     pub activity: ActivityConfig,
