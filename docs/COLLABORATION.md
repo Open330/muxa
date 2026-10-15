@@ -537,3 +537,23 @@ short timeout waits.
 the CLI prints the total and next offset on stderr. Default JSON remains an
 array, but diagnostic fields such as bodies, replies, wake delivery and
 provenance now require `--full`; existing diagnostic scripts should add it.
+
+### Quiet updates and efficient reads
+
+Use `muxa msg update REQUEST "guidance or progress" [--json]` to append to an
+existing open request. Updates preserve its authority and paths, do not create a
+child request, and do not wake the recipient. Both participants may update;
+terminal requests reject updates. Repeating the same latest update is idempotent.
+The JSON acknowledgement includes the request id and `next_after_update`.
+
+`muxa msg send ... --notify` is shorthand for `--notify true`; explicit
+`--notify false` remains supported. Preserve command exit status and stderr;
+piping through `grep` can hide argument errors as empty output. Read replies with
+`muxa msg wait REQUEST --body [--output FILE]` rather than guessing JSON fields.
+Use completion wakes or substantive checkpoints instead of repeated one-second
+probes. Foreground MCP waits should use 30–60 seconds; the Fleet default is 30.
+Retain resolved tool schemas until a capability/version change or an actual
+unknown-tool/argument error calls for rediscovery.
+
+Read incremental CLI guidance with `muxa msg list --request-id REQUEST --after-update SEQUENCE --json`; resume from `next_after_update`. This returns
+only newer updates and omits the original task and final reply bodies.

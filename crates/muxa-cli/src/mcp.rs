@@ -683,7 +683,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_fleet_wait_reply",
-            "description": "Continue waiting for the structured reply to a prior muxa_fleet_call_peer request. Pass the exact host, pane_key, and request_id returned by that call. The durable remote request remains readable even if the target pane has since exited. Remote hosts must remain explicitly configured mode='control'. Use <=60-second waits and check fresh recipient/host health after timeout; follow peer_interruption in muxa_collaboration_guide.",
+            "description": "Continue waiting for the structured reply to a prior muxa_fleet_call_peer request. Pass the exact host, pane_key, and request_id returned by that call. The durable remote request remains readable even if the target pane has since exited. Remote hosts must remain explicitly configured mode='control'. Prefer completion wakes/checkpoints; use 30-60 seconds for a foreground wait, not repeated 1-second probes. Check fresh recipient/host health after timeout; follow peer_interruption in muxa_collaboration_guide.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -694,7 +694,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     },
                     "request_id": { "type": "string", "description": "Exact collaboration request id returned by muxa_fleet_call_peer." },
                     "after_update": {"type":"integer", "minimum":0, "description":"Optionally return when a progress/guidance sequence newer than this value is available, without waiting for terminal completion. Start at 0; resume with next_after_update."},
-                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." }
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": DEFAULT_WAIT_SECS, "description": "Reply wait timeout. Default 30 seconds." }
                 },
                 "required": ["host", "pane_key", "request_id"],
                 "additionalProperties": false
@@ -867,7 +867,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_wait_reply",
-            "description": "Wait for a final reply or explicit cancellation/expiry. final_reply_received records receipt; reported_status is declared by the recipient. Timeout leaves work unchanged. An explicit peer_interrupted result keeps the work open; consult the opt-in recovery workflow. Default 30 seconds, max 600.",
+            "description": "Wait for a final reply or explicit cancellation/expiry. final_reply_received records receipt; reported_status is declared by the recipient. Timeout leaves work unchanged. An explicit peer_interrupted result keeps the work open; consult the opt-in recovery workflow. Prefer completion wakes or checkpoints over repeated 1-second probes. Default 30 seconds, max 600.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1443,7 +1443,9 @@ async fn call_tool(
                         .await
                     {
                         Ok(result) => match result.collaboration_request {
-                            Some(request) => json_result(&request_update_ack(&request)),
+                            Some(request) => json_result(
+                                &crate::collaboration_output::mutation_receipt(&request),
+                            ),
                             None => error_result("update returned no request"),
                         },
                         Err(error) => error_result(&error.to_string()),
@@ -1456,7 +1458,9 @@ async fn call_tool(
             };
             Ok(
                 match client.collaboration_update(&origin, request_id, body).await {
-                    Ok(request) => json_result(&request_update_ack(&request)),
+                    Ok(request) => {
+                        json_result(&crate::collaboration_output::mutation_receipt(&request))
+                    }
                     Err(error) => error_result(&error.to_string()),
                 },
             )
@@ -1493,7 +1497,9 @@ async fn call_tool(
                     )
                     .await
                 {
-                    Ok(request) => json_result(&request_ack(&request)),
+                    Ok(request) => {
+                        json_result(&crate::collaboration_output::mutation_receipt(&request))
+                    }
                     Err(error) => error_result(&format!("reply failed: {error}")),
                 },
             )
@@ -1671,14 +1677,14 @@ fn collaboration_guide(
         "user_launch_preferences": launch_guide_value(config),
         "message_skills": config.message.skills.keys().collect::<Vec<_>>(),
         "transport_contract": {
-            "discovery": "Find exact tool names, not shared descriptions. Read only needed schemas once; refresh after a capability/version change.",
+            "discovery": "Resolve exact tool names and retain their handles/schema for the session. Do not print ALL_TOOLS again for a known tool; refresh only after a version/capability change or unknown-tool/argument error.",
             "bounded_reads": "Prompt history defaults to 20 entries. Fleet status is a summary; full=true explicitly requests large data. Inbox already includes task instructions. include_body requires an exact request_id unless full=true.",
             "final_reply_received": "Only reports that a recipient submitted a final reply; never proves success.",
             "reported_status": "Recipient-declared completed/blocked/declined/failed. Muxa does not judge the work.",
-            "timeout": "The wait ended; the work remains unchanged.",
-            "progress": "Use update_request for progress and reply for a final response. No receipt acknowledgements or unchanged status messages.",
+            "timeout": "The wait ended; work is unchanged. Prefer completion wakes or substantive checkpoints. If waiting in the foreground, use 30-60 seconds; a 1-second probe is for an expected result, not a polling loop. Do not renew waits blindly.",
+            "progress": "Use update_request (CLI: msg update REQUEST BODY) for consolidated guidance/progress on the same request; reply once at the end. No receipt acknowledgements or unchanged status messages.",
             "reads": "Reports omit original requests. Lists default to 20 metadata records; request_id + include_body reads instructions, full=true opts into legacy records.",
-            "cli": "muxa msg wait REQUEST --body [--output FILE] prints the reply directly. Never inspect body keywords to decide completion or pass JSON through shell echo.",
+            "cli": "muxa msg wait REQUEST --body [--output FILE] prints the reply directly. Keep exit status/stderr; do not hide errors with grep or retry sends after empty filtered output. --notify means true; --notify false is quiet. Never judge completion from body keywords.",
             "authority": "execute=true and bypass-permission spawning require existing explicit authorization. Preserve request identity on retry; a timeout never authorizes duplicate work.",
             "fleet": "Use exact returned host/pane_key/request_id. Observe hosts cannot execute. Resume yielded host tool cells instead of duplicating waits."
         },
@@ -2341,7 +2347,7 @@ async fn fleet_wait_reply(client: &Client, args: &Value) -> Value {
     let timeout_secs = args
         .get("timeout_secs")
         .and_then(Value::as_u64)
-        .unwrap_or(300)
+        .unwrap_or(DEFAULT_WAIT_SECS)
         .clamp(1, MAX_WAIT_SECS);
     match await_fleet_collaboration_reply(
         client,
@@ -3913,15 +3919,7 @@ fn text_result(text: &str) -> Value {
     json!({ "content": [ { "type": "text", "text": text } ] })
 }
 
-/// A compact acknowledgement for mutations. The caller already supplied the
-/// request body and attachments, so echoing the full durable record only
-/// consumes context; retain the correlation and routing fields it needs next.
-fn request_update_ack(request: &CollaborationRequest) -> Value {
-    let mut value = request_ack(request);
-    value["next_after_update"] = json!(request.updates.last().map(|u| u.sequence));
-    value
-}
-
+/// Initial send receipts retain routing; subsequent mutations use `mutation_receipt`.
 fn request_ack(request: &CollaborationRequest) -> Value {
     let mut value = crate::collaboration_output::receipt(request);
     value["notify"] = json!(request.should_notify());
@@ -4415,6 +4413,98 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(unchanged["updates"], json!([]));
+        for _ in 0..2 {
+            crate::cmd_msg(
+                &client,
+                crate::MsgCmd::Update {
+                    request_id: request.id.clone(),
+                    body: "guidance 2".into(),
+                    json: true,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let updated = client
+            .collaboration_get(&origin, &request.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.updates.len(),
+            2,
+            "retry must not duplicate an update"
+        );
+        assert_eq!(updated.updates[1].sequence, 2);
+        assert_eq!(updated.updates[1].body, "guidance 2");
+        assert_eq!(updated.paths, request.paths);
+        assert_eq!(updated.work_mode, request.work_mode);
+        assert_eq!(updated.body, request.body);
+        let ack = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "muxa_update_request",
+                    json!({
+                        "request_id":request.id,"body":"guidance 3"
+                    }),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(ack["request_id"], request.id);
+        assert_eq!(ack["next_after_update"], 3);
+        eprintln!(
+            "mutation_receipt_bytes: initial={}, follow_up={}",
+            serde_json::to_vec(&request_ack(&updated)).unwrap().len(),
+            serde_json::to_vec(&ack).unwrap().len()
+        );
+
+        for field in ["from", "to", "initiator", "body", "notify"] {
+            assert!(ack.get(field).is_none(), "unexpected {field}");
+        }
+        let progress = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "muxa_list_messages",
+                    json!({
+                        "request_id":request.id,"after_update":2
+                    }),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(progress["updates"].as_array().unwrap().len(), 1);
+        assert_eq!(progress["updates"][0]["body"], "guidance 3");
+        let parsed = <crate::Args as clap::Parser>::try_parse_from([
+            "muxa",
+            "msg",
+            "list",
+            "--request-id",
+            request.id.as_str(),
+            "--after-update",
+            "2",
+            "--json",
+            "--scope",
+            "caller",
+        ])
+        .unwrap();
+        let Some(crate::Cmd::Msg { action }) = parsed.cmd else {
+            panic!("expected msg list")
+        };
+        crate::cmd_msg(&client, action).await.unwrap();
+
+        assert_eq!(
+            client
+                .collaboration_list(&origin, RequestMailbox::All)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
         let invalid = dispatch(
             &client,
             &tool("muxa_list_messages", json!({"after_update":0})),
@@ -4451,6 +4541,21 @@ mod tests {
         );
         assert_eq!(reply["final_reply_received"], true);
         assert_eq!(reply["reported_status"], "failed");
+        assert!(reply.get("from").is_none());
+        assert!(reply.get("to").is_none());
+        assert!(reply.get("initiator").is_none());
+        let late = crate::cmd_msg(
+            &client,
+            crate::MsgCmd::Update {
+                request_id: request.id.clone(),
+                body: "too late".into(),
+                json: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(late.to_string().contains("terminal"), "{late}");
+
         let report = decode(
             dispatch(
                 &client,

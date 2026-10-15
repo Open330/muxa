@@ -18,8 +18,9 @@ have changed. Report your location from `self`; never derive it from `$TMUX_PANE
 tmux commands, which can name another pane (Codex's shared app-server). Tool
 schemas and returned IDs describe the currently installed capabilities. Discover
 exact tool names (for example a name ending in `__muxa_inbox`), not matches in
-shared descriptions. Read only needed schemas and reuse them within the session;
-refresh after a version/capability change, not before every call.
+shared descriptions. Retain resolved tool handles and schemas within the session;
+do not print `ALL_TOOLS` again for a known tool. Refresh only after a version/
+capability change or an unknown-tool/argument error.
 
 ## Execution layout
 
@@ -44,8 +45,9 @@ refresh after a version/capability change, not before every call.
    Review and question requests are read-only. Editing requires `intent=task`
    and `execute=true` within the user's authorized delegation scope.
 3. Prefer `wait=false` while independent local work remains. Read the result after
-   its completion wake or a substantive work checkpoint; avoid short timeout polling. Keep the returned
-   `request_id`; retrieve the structured reply with `muxa_wait_reply`. For an
+   its completion wake or a substantive work checkpoint. When waiting in the
+   foreground, use 30–60 seconds. Reserve 1-second probes for an expected result;
+   do not repeat unchanged probes. Keep the returned `request_id`; retrieve the structured reply with `muxa_wait_reply`. For an
    existing report or feedback request, use `muxa_peer_report` before sending work.
 4. A timeout or `peer_pending` is not proof that the peer can still work.
    Wait in slices of at most 60 seconds, then follow **Interrupted peers and human decisions**
@@ -79,10 +81,15 @@ ID unless `full=true` explicitly requests full history. Inbox preserves the cont
 Prompt history defaults to 20 entries (ordinary maximum 100). Fleet status is a
 compact summary; use `full=true` only when the complete data is needed.
 For CLI replies use `muxa msg wait REQUEST --body --output FILE` or `--body`
-for stdout. This avoids shell JSON parsing; never pass JSON through `echo`.
+for stdout. Keep the command's exit status and stderr; filtering with `grep`
+can hide an option error as empty output. Do not resend after an empty filtered
+receipt. Avoid shell JSON parsing; never pass JSON through `echo`.
 CLI `muxa msg list --json` defaults to 20 metadata rows. Use
 `--request-id REQUEST --full` for one original request, or `--full` for explicit
 full history pages. Use `--offset` for another page, not a repeated whole list.
+For incremental CLI guidance use
+`muxa msg list --request-id REQUEST --after-update SEQUENCE --json` and resume
+from `next_after_update`; original task and final reply bodies are omitted.
 Default CLI wait prints timeout JSON and exits 2 without changing work state.
 `--full` also exits nonzero on timeout. Resume the same request, not new work.
 
@@ -92,13 +99,14 @@ Agree on reporting checkpoints when dispatching work. Omit receipt confirmations
 "in progress", and unchanged status. Consolidate intermediate findings at meaningful
 build/test or review checkpoints; check the inbox then instead of polling for notices.
 Never update a terminal request; use a new request with `parent_request_id` for new work.
-If the installed tools support `muxa_update_request`, record progress on the original
-request. Otherwise send one consolidated `kind="notice"`, `expects_reply=false`
+Use `muxa_update_request` or `muxa msg update REQUEST BODY [--json]` for
+consolidated guidance/progress on the original request. Updates are quiet and
+preserve its authority and paths. If neither is available, send one consolidated `kind="notice"`, `expects_reply=false`
 message with `parent_request_id` referencing the original request.
 
 One-way notices are durable but do not wake recipients by default. Use `notify=true`
 only when a blocker, decision, edit-scope conflict, or resource handoff requires the
-recipient's attention. This respects idle-only delivery and global wake settings;
+recipient's attention (CLI: `--notify` or `--notify true`; `--notify false` is quiet). This respects idle-only delivery and global wake settings;
 it never authorizes interrupting a busy agent. `notify=false` explicitly records a
 message without waking. Wake delivery and `expects_reply` are independent.
 Terminal replies already wake the requester; do not send a second completion notice.

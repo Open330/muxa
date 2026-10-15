@@ -532,3 +532,23 @@ provenance는 `--full`로 명시할 때 포함합니다. JSON 배열의 `id`와 
 `--limit 0`은 일치하는 전체 기록을 요청합니다. 페이지가 잘리면 CLI가 전체 건수와
 다음 offset을 stderr에 표시합니다. JSON 배열은 유지하지만 본문·답변·wake 전달·
 provenance를 읽던 기존 진단 스크립트에는 `--full`을 추가해야 합니다.
+
+### 기존 요청 갱신과 호출 절약
+
+`muxa msg update REQUEST "추가 안내 또는 진행 상황" [--json]`으로 열린 요청에
+안내를 추가할 수 있습니다. 원래 권한·경로 범위를 유지하며, 새 요청을 만들거나
+수신자를 깨우지 않습니다. 양쪽 참여자가 사용할 수 있고 종료된 요청은 거절합니다.
+같은 참여자가 마지막 안내를 그대로 재전송하면 중복 추가하지 않습니다.
+JSON 확인 응답에는 요청 ID와 `next_after_update`가 포함됩니다.
+
+`muxa msg send ... --notify`는 `--notify true`와 같습니다. `--notify false`도
+유지됩니다. 오류와 종료 코드를 보존하세요. `grep`으로 출력을 거르면 옵션 오류가
+빈 응답처럼 보일 수 있습니다. 답변 본문은 JSON 필드를 추측하는 대신
+`muxa msg wait REQUEST --body [--output FILE]`로 읽습니다.
+완료 알림이나 의미 있는 작업 체크포인트에서 결과를 읽고, 1초 확인을 반복하지
+않습니다. 전면 MCP 대기는 30~60초를 권장하며 Fleet 기본값은 30초입니다.
+이미 확인한 도구 스키마는 버전·기능 변경이나 실제 도구/인자 오류가 생길 때까지
+재사용합니다.
+
+CLI에서 추가 안내는 `muxa msg list --request-id REQUEST --after-update SEQUENCE --json`으로
+읽고 `next_after_update`부터 이어갑니다. 원래 작업·최종 답변 본문은 반복하지 않습니다.

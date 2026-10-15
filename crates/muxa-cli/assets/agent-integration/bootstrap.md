@@ -18,5 +18,5 @@ the collaboration guide (workflows=true). Reuse request IDs; an interruption
 keeps work open, and an answer is not automatic approval.
 
 Discover exact tool names; shared descriptions can match unrelated tools.
-Read only the schemas needed for the next action, and reuse them until the
-capabilities change. Check guide capabilities before using optional protocols.
+Retain needed tool handles/schemas; do not rediscover a known tool until its
+version/capabilities change or an unknown-tool/argument error occurs. Check guide capabilities before using optional protocols.

@@ -303,7 +303,10 @@ Progress uses `muxa_update_request`; `muxa_reply` is the explicit final response
 Process idle/stopped observations and words in a reply body never establish task
 completion. Muxa performs no model call to judge a reply.
 
-Mutation receipts and waits omit the original body and audit metadata.
+Mutation receipts and waits omit the original body and audit metadata. Initial
+send receipts retain routing. Follow-up update/reply/cancel acknowledgements
+return correlation, transport state and any progress cursor or interruption;
+read an exact request with `full=true` when its complete record is needed.
 `muxa_peer_report` returns `result` with a receipt and the new reply; it does not
 repeat the prompt. `full=true` opts into the legacy full stored request under `request`.
 Inbox retains the entire instruction/authority/path/artifact contract.

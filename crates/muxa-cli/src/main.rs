@@ -530,10 +530,20 @@ enum MsgCmd {
         #[arg(long)]
         no_reply: bool,
         /// Override recipient wake delivery (true for urgent notices, false for quiet records).
+        /// Bare `--notify` means true; `--notify false` keeps it quiet.
         /// Defaults to quiet for notice, enabled for other kinds; still respects idle-only wake.
-        #[arg(long, action = clap::ArgAction::Set)]
+        #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
         notify: Option<bool>,
         /// Print the stored request instead of a one-line receipt.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Append quiet guidance/progress to an existing open request, preserving its scope.
+    Update {
+        request_id: String,
+        /// Guidance/progress within the existing scope, at most 8192 UTF-8 bytes.
+        body: String,
+        /// Print a compact acknowledgement; read the full record with `msg list --request-id`.
         #[arg(long)]
         json: bool,
     },
@@ -582,6 +592,9 @@ enum MsgCmd {
         /// Read one exact request instead of retrieving mailbox history.
         #[arg(long, conflicts_with_all = ["mailbox", "since", "work", "workspace", "thread", "kind", "status", "window", "limit", "offset"])]
         request_id: Option<String>,
+        /// Read only updates newer than this sequence, without the original task body.
+        #[arg(long, requires = "request_id", conflicts_with = "full")]
+        after_update: Option<u64>,
         /// Include full original requests and replies; default is metadata only.
         #[arg(long)]
         full: bool,
@@ -2037,6 +2050,28 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                 .await?;
             print_collaboration_receipt(&request, json)?;
         }
+        MsgCmd::Update {
+            request_id,
+            body,
+            json,
+        } => {
+            require_capability(client, "collaboration_update", "msg update").await?;
+            let request = client
+                .collaboration_update(&origin, &request_id, &body)
+                .await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&collaboration_output::mutation_receipt(&request))?
+                );
+            } else {
+                println!(
+                    "updated  {}  sequence {}",
+                    request.id,
+                    request.updates.last().map_or(0, |update| update.sequence)
+                );
+            }
+        }
         MsgCmd::Inbox { json } => {
             let requests = client.collaboration_inbox(&origin).await?;
             if json {
@@ -2068,6 +2103,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             window,
             limit,
             request_id,
+            after_update,
             full,
             offset,
             json,
@@ -2090,6 +2126,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                 &scope,
                 &filters,
                 request_id.as_deref(),
+                after_update,
                 full,
                 json,
             )
@@ -2192,6 +2229,7 @@ async fn cmd_msg_list(
     scope: &str,
     filters: &CollaborationListFilters,
     request_id: Option<&str>,
+    after_update: Option<u64>,
     full: bool,
     json: bool,
 ) -> Result<()> {
@@ -2223,6 +2261,23 @@ async fn cmd_msg_list(
             if request.from.room != room && request.to.room != room {
                 anyhow::bail!("request {id} is outside the selected room");
             }
+        }
+        if let Some(after) = after_update {
+            if json {
+                let mut value = collaboration_output::mutation_receipt(&request);
+                value["updates"] = collaboration_output::updates(&request, after);
+                value["first_retained_sequence"] =
+                    serde_json::json!(request.updates.first().map(|u| u.sequence));
+                println!("{}", serde_json::to_string(&value)?);
+            } else {
+                if !request.updates.iter().any(|u| u.sequence > after) {
+                    println!("No new updates.");
+                }
+                for update in request.updates.iter().filter(|u| u.sequence > after) {
+                    println!("{}  {}", update.sequence, update.body);
+                }
+            }
+            return Ok(());
         }
         vec![request]
     } else {
@@ -5379,11 +5434,49 @@ mod tests {
     }
 
     #[test]
-    fn message_notify_cli_requires_an_explicit_boolean() {
+    fn message_progress_read_requires_an_exact_request() {
+        for extra in [vec![], vec!["--full"], vec!["--limit", "10"]] {
+            let mut args = vec!["muxa", "msg", "list", "--after-update", "2"];
+            if !extra.is_empty() {
+                args.extend(["--request-id", "req-1"]);
+            }
+            args.extend(extra);
+            assert!(Args::try_parse_from(args).is_err());
+        }
+        let cli = Args::try_parse_from([
+            "muxa",
+            "msg",
+            "list",
+            "--request-id",
+            "req-1",
+            "--after-update",
+            "2",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Msg {
+                action: MsgCmd::List {
+                    request_id: Some(_),
+                    after_update: Some(2),
+                    full: false,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn message_notify_cli_accepts_shorthand_and_explicit_booleans() {
         for (extra, expected) in [
             (vec![], None),
             (vec!["--notify", "true"], Some(true)),
             (vec!["--notify", "false"], Some(false)),
+            (vec!["--notify"], Some(true)),
+            (vec!["--notify=true"], Some(true)),
+            (vec!["--notify=false"], Some(false)),
+            (vec!["--notify", "--json"], Some(true)),
         ] {
             let mut args = vec![
                 "muxa",
@@ -5404,10 +5497,16 @@ mod tests {
             };
             assert_eq!(notify, expected);
         }
-        assert!(
-            Args::try_parse_from(["muxa", "msg", "send", "@peer", "checkpoint", "--notify"])
-                .is_err()
-        );
+        assert!(Args::try_parse_from([
+            "muxa",
+            "msg",
+            "send",
+            "@peer",
+            "checkpoint",
+            "--notify",
+            "maybe"
+        ])
+        .is_err());
     }
 
     #[test]

@@ -15,8 +15,8 @@ fn endpoint(participant: &Participant) -> Value {
     value
 }
 
-pub(crate) fn receipt(request: &CollaborationRequest) -> Value {
-    let delivery_state = match request.status {
+fn delivery_state(request: &CollaborationRequest) -> &'static str {
+    match request.status {
         RequestStatus::Queued => "queued",
         RequestStatus::Cancelled => "cancelled",
         RequestStatus::Expired => "expired",
@@ -24,14 +24,13 @@ pub(crate) fn receipt(request: &CollaborationRequest) -> Value {
         RequestStatus::Completed if !request.expects_reply => "delivered",
         status if status.is_terminal() => "closed",
         _ => "claimed",
-    };
-    let mut value = json!({
-        "request_id": request.id,
-        "delivery_state": delivery_state,
-        "final_reply_received": request.reply.is_some(),
-        "expects_reply": request.expects_reply,
-        "from": endpoint(&request.from), "to": endpoint(&request.to),
-    });
+    }
+}
+
+pub(crate) fn receipt(request: &CollaborationRequest) -> Value {
+    let mut value = mutation_receipt(request);
+    value["from"] = endpoint(&request.from);
+    value["to"] = endpoint(&request.to);
     for (key, field) in [
         ("thread_id", &request.thread_id),
         ("parent_request_id", &request.parent_request_id),
@@ -43,9 +42,6 @@ pub(crate) fn receipt(request: &CollaborationRequest) -> Value {
             value[key] = json!(field);
         }
     }
-    if let Some(reply) = &request.reply {
-        value["reported_status"] = json!(reply.status);
-    }
     if let Some(initiator) = &request.initiator {
         value["initiator"] = endpoint(initiator);
     }
@@ -54,6 +50,23 @@ pub(crate) fn receipt(request: &CollaborationRequest) -> Value {
     }
     if let Some(parent) = &request.delegation_parent {
         value["delegation_parent"] = json!(parent);
+    }
+    value
+}
+
+/// A subsequent mutation needs correlation and transport state, not repeated routing.
+pub(crate) fn mutation_receipt(request: &CollaborationRequest) -> Value {
+    let mut value = json!({
+        "request_id": request.id,
+        "delivery_state": delivery_state(request),
+        "final_reply_received": request.reply.is_some(),
+        "expects_reply": request.expects_reply,
+    });
+    if let Some(reply) = &request.reply {
+        value["reported_status"] = json!(reply.status);
+    }
+    if let Some(update) = request.updates.last() {
+        value["next_after_update"] = json!(update.sequence);
     }
     if let Some(action) = request.human_action {
         value["human_action"] = json!(action);
@@ -156,6 +169,12 @@ mod tests {
         assert!(observed.get("body").is_none());
         assert!(observed.get("completed").is_none());
         assert!(observed.get("reported_status").is_none());
+        let mutation = mutation_receipt(&request);
+        assert_eq!(
+            mutation["interruption"]["action_request_id"],
+            "human-choice"
+        );
+        assert_eq!(mutation["final_reply_received"], false);
         let listed = receipt(&request);
         assert!(listed["interruption"].get("decision").is_none());
         assert!(listed["interruption"].get("observed_at").is_none());
@@ -178,6 +197,12 @@ mod tests {
                 air_artifacts: vec![],
                 at: OffsetDateTime::UNIX_EPOCH,
             });
+            let mutation = mutation_receipt(&request);
+            assert_eq!(mutation["final_reply_received"], true);
+            assert_eq!(mutation["reported_status"], json!(status));
+            for field in ["from", "to", "initiator", "body", "reply", "completed"] {
+                assert!(mutation.get(field).is_none(), "unexpected {field}");
+            }
             let result = outcome(&request);
             assert_eq!(result["final_reply_received"], true);
             assert_eq!(result["reported_status"], json!(status));
