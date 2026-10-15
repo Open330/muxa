@@ -17,9 +17,12 @@ name: tap-bump
 #     automated publish did not run.
 #
 # Pushing to Open330/homebrew-tap needs a credential of its own (the default
-# GITHUB_TOKEN cannot push to a sibling repo). Preferred: the `TAP_DEPLOY_KEY`
-# repo secret, the private half of an SSH deploy key with write access on
-# homebrew-tap. A deploy key is scoped to that one repo and never expires.
+# GITHUB_TOKEN cannot push to a sibling repo). Preferred: the
+# `HOMEBREW_TAP_DEPLOY_KEY` **organization** secret, the private half of an SSH
+# deploy key with write access on homebrew-tap. The tap serves several Open330
+# projects (aas, agt, barshelf, amux, muxa), so one org-wide key serves every
+# release workflow that publishes there. A deploy key is scoped to that one
+# repo and never expires.
 # Fallback: `TAP_GITHUB_TOKEN`, a fine-grained PAT with Contents read/write.
 # PATs expire (30 days by default), which silently broke the tap twice.
 # With neither secret the job exits early with a notice instead of failing,
@@ -98,7 +101,7 @@ jobs:
 
       - name: Render and push formula
         env:
-          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
           VERSION: ${{ steps.ref.outputs.version }}
           MAC_ARM: ${{ steps.sums.outputs.mac_arm }}
@@ -120,7 +123,7 @@ jobs:
             git clone --depth 1 \
               "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/Open330/homebrew-tap.git" tap
           else
-            echo "::notice::Neither TAP_DEPLOY_KEY nor TAP_GITHUB_TOKEN is configured — skipping the tap bump. Update Open330/homebrew-tap manually or add a deploy key."
+            echo "::notice::Neither HOMEBREW_TAP_DEPLOY_KEY nor TAP_GITHUB_TOKEN is configured — skipping the tap bump. Update Open330/homebrew-tap manually or add a deploy key."
             exit 0
           fi
           cat > tap/Formula/muxa.rb <<EOF
