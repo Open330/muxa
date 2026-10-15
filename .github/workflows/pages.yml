@@ -13,6 +13,7 @@ on:
       - "site/**"
       - "crates/muxa/src/dashboard/web/landing*"
       - "crates/muxa/src/dashboard/web/landing/**"
+      - "crates/muxa/src/dashboard/web/landing-terminal/**"
       - "crates/muxa/src/dashboard/web/icon.svg"
       - "docs/demo.gif"
       - ".github/workflows/pages.yml"
@@ -40,7 +41,8 @@ jobs:
           mkdir -p _site
           cp -r site/. _site/
           web=crates/muxa/src/dashboard/web
-          cp "$web"/landing.mjs "$web"/landing-film.mjs "$web"/landing-frames.mjs "$web"/landing.css "$web"/icon.svg _site/
+          cp "$web"/landing.mjs "$web"/landing-film.mjs "$web"/landing-frames.mjs "$web"/landing-learn.mjs "$web"/landing-onboarding.mjs "$web"/landing-shared.mjs "$web"/landing-shell.mjs "$web"/landing-watch.mjs "$web"/landing-practice.mjs "$web"/landing.css "$web"/icon.svg _site/
+          cp -r "$web"/landing-terminal _site/landing-terminal
           cp -r "$web"/landing _site/landing
           cp docs/demo.gif _site/
           touch _site/.nojekyll

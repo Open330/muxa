@@ -6,18 +6,35 @@
 
 No wrapper, no new terminal. Muxa watches the Claude Code, Codex, and
 Gemini CLI sessions you already run in tmux, tells you which one needs
-you, and takes you there.
+you, and takes you there. Ask a peer for a review and read its reply in watch.
 
 [![CI](https://github.com/Open330/muxa/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/muxa/actions/workflows/ci.yml)
 ![MSRV](https://img.shields.io/badge/MSRV-1.89-informational)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![status](https://img.shields.io/badge/status-beta-yellow)
 
-**English** · [한국어](README.ko.md)
+[Try muxa](https://open330.github.io/muxa/learn/) · [Website](https://open330.github.io/muxa/) · **English** · [한국어](README.ko.md)
 
 </div>
 
 ---
+
+## Try muxa
+
+[Try muxa in your browser](https://open330.github.io/muxa/learn/) before installing.
+Type directly in the terminal and follow one key at a time.
+
+| Start here | What you can try |
+| --- | --- |
+| [tmux basics](https://open330.github.io/muxa/learn/?track=basics) | Attach to a prepared session from a normal shell, learn session → window → pane, move and zoom panes, and switch windows. |
+| [Watch and collaboration](https://open330.github.io/muxa/learn/?track=attention) | Answer a waiting agent, request a review, and read the reply in the mailbox. |
+| [Workspace navigation](https://open330.github.io/muxa/learn/?track=workspace) | Browse and search the watch tree to connect to sessions, windows, and panes. |
+| [Inspect a screen](https://open330.github.io/muxa/learn/?track=inspect) | Use previews, raw terminal output, inspector sizing, and help. |
+| [Free exploration](https://open330.github.io/muxa/learn/?track=free) | Explore several sessions and windows with the shortcut reference alongside. |
+
+Switching guides keeps the same terminal and request history. This is a
+browser-local simulation; it runs no real shell commands or agent API calls.
+For practice in real tmux, install Muxa and use `muxa onboard` below.
 
 ## Get started
 
@@ -50,8 +67,8 @@ their states, and attend the waiting agent. It makes no agent API calls and
 removes its private sandbox on exit. `muxa onboard` keeps the full 16-step tour;
 `muxa onboard --quick --print` shows the short written guide.
 
-Not ready to install? Take the full tour in a throwaway tmux server — the
-script runs the real `muxa onboard` from a checksum-verified copy of the
+To try the actual CLI without installing it, take the full tour in a throwaway
+tmux server. The script runs the real `muxa onboard` from a checksum-verified copy of the
 release binary, deletes it on exit, and never touches your existing tmux
 server. It needs network access and a supported release platform; the live
 tour also needs tmux. `muxa onboard --print` gives a non-interactive guide.
@@ -73,6 +90,8 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
   and desktop notifications.
 - **Takes you there.** `muxa attend` focuses the pane blocked longest;
   `--cycle` tabs through every agent that needs you.
+- **Keeps reviews and replies together.** Press `m` in watch to send a peer
+  request, then `M` to read requests and replies in the mailbox.
 - **Lets one agent drive the rest.** `muxa mcp` gives a coding agent the
   same view, plus send-prompt and wait-for-change tools.
 
@@ -191,7 +210,7 @@ exit.
 <div align="center">
   <img src="docs/demo-collab.gif" alt="muxa watch: the collaboration mailbox, messaging the session under the cursor, and asking claude a headless question" width="900" />
   <br />
-  <sub><code>b</code> mailbox · <code>m</code> message the row under the cursor · <code>a</code>/<code>A</code> headless ask.</sub>
+  <sub><code>M</code> mailbox · <code>m</code> message the row under the cursor · <code>a</code>/<code>A</code> headless ask.</sub>
 </div>
 
 The model is simple: **one tmux window is one room**. Interactive watch and
@@ -276,6 +295,21 @@ move it into a new session/window or an existing window without restarting.
 The shared menu supports destination search, follow/stay, split direction,
 and undo. On a window row, `Alt-M` moves every pane and the layout together;
 `Ctrl-W` in the popup switches pane/window scope. See [moving a running agent](docs/WATCH.md#move-a-running-agent).
+
+The default tmux prefix is **Ctrl and b together, then release both keys**.
+Press `s` next to open watch. Inside watch, use these keys without the prefix:
+
+| Key | Action |
+| --- | --- |
+| `j` / `↓`, `k` / `↑` | Select the next / previous item |
+| `h` / `l`, `←` / `→` | Move to a parent or child |
+| `/` | Search agents and workspaces |
+| `Enter` | Connect to the selected target |
+| `o` | Preview the selected pane |
+| `m` | Compose a message |
+| `M` | Open the mailbox |
+| `?` | Show all keyboard shortcuts |
+| `q` | Close watch and return to the original pane |
 
 `M` on a window combines its room; on a session it combines all windows and
 groups the read-only history by window. On the collaboration screen, `v`
