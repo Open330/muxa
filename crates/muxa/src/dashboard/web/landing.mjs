@@ -9,15 +9,17 @@
 // scripts/landing-shots/capture.mjs from made-up data.
 
 import { mountFilm } from "./landing-film.mjs";
+import { LANDING_LANG_KEY, pickLanguage, publicHeader } from "./landing-shared.mjs";
+export { LANDING_LANGUAGES, pickLanguage } from "./landing-shared.mjs";
 
-const LANG_KEY = "muxa.landing.lang";
+const LANG_KEY = LANDING_LANG_KEY;
 const GITHUB = "https://github.com/Open330/muxa";
 
 const COPY = {
   en: {
     badge: "tmux · Claude Code · Codex · Gemini CLI",
-    title: "Four agents.<br>Which one is <em>waiting on you</em>?",
-    lead: "Muxa watches the coding agents you already run in tmux, tells you the moment one stops for input, a choice, or an error, and takes you straight to its pane. No wrapper, no new terminal.",
+    title: "Know which agent<br>is <em>waiting on you.</em>",
+    lead: "See which coding agent needs you, connect to its pane, and ask a peer to review the work. Start with the agents and tmux sessions you already use.",
     how: "How it works",
     private: "<b>{host}</b> is a private muxa dashboard.",
     privateSignIn: "Sign in to open it.",
@@ -42,14 +44,11 @@ const COPY = {
     howTitle: "How it works",
     howLede: "Muxa observes the agents you already run. You can also start agents and pipelines from the CLI or Mac app.",
     flow: [
-      ["Observe", "Agent hooks report state; Codex session logs fill in activity and turn completion every two seconds. Screen detection covers missing signals."],
-      ["Model", "One daemon keeps every agent's state: working, waiting for input or a choice, error, idle."],
-      ["Notify", "The tmux status line, desktop notifications, this dashboard, and the Mac app show who is waiting."],
-      ["Jump", "<code>muxa attend</code> focuses the pane that has waited longest; <code>--cycle</code> goes through the rest."],
-      ["Group", "Panes and runs roll up into Work, linked to GitHub or Linear issues, on one board."],
-      ["Delegate", "<code>muxa mcp</code> and <code>muxa msg</code> let one agent prompt its peers and wait for replies."],
+      ["Find who needs you", "Open <code>muxa watch</code> to see agent states across sessions and windows. Browse the tree or search for a workspace."],
+      ["Connect and answer", "Select a pane and press Enter. Answer the agent in its own terminal, with the surrounding work still there."],
+      ["Ask for a review", "Press <code>m</code> in watch to send a question, review, task or notice. <code>M</code> opens requests and replies in the mailbox."],
     ],
-    shotsTitle: "The dashboard",
+    shotsTitle: "From terminal to dashboard",
     shotsLede: "Real screens with a made-up fleet: three services, ten agents, eight Works.",
     shots: [
       ["board", "Work board", "Work grouped by stage. Cards that need you carry a signal; each lists its agents and their state."],
@@ -120,8 +119,8 @@ const COPY = {
   },
   ko: {
     badge: "tmux · Claude Code · Codex · Gemini CLI",
-    title: "에이전트 넷.<br><em>누가 나를 기다리는지</em> 아시나요?",
-    lead: "muxa는 tmux에서 이미 돌리고 있는 코딩 에이전트를 지켜보다가, 입력이나 선택을 기다리거나 오류로 멈추는 순간 알려 주고 그 pane으로 바로 데려다 줍니다. 래퍼도, 새 터미널도 필요 없습니다.",
+    title: "어느 에이전트가<br><em>답을 기다릴까요?</em>",
+    lead: "나를 기다리는 코딩 에이전트를 찾고, 그 pane에 연결하고, 동료에게 리뷰를 요청하세요. 지금 쓰는 tmux와 에이전트에서 시작합니다.",
     how: "어떻게 동작하나",
     private: "<b>{host}</b>는 비공개 muxa 대시보드입니다.",
     privateSignIn: "로그인하면 열 수 있습니다.",
@@ -146,14 +145,11 @@ const COPY = {
     howTitle: "어떻게 동작하나",
     howLede: "muxa는 이미 실행 중인 에이전트를 관찰합니다. CLI나 Mac 앱에서 에이전트와 파이프라인을 시작할 수도 있습니다.",
     flow: [
-      ["관찰", "에이전트 hook으로 상태를 받고, Codex 세션 로그에서 활동과 턴 완료를 2초마다 보완합니다. 부족한 신호는 화면 감지로 읽습니다."],
-      ["상태 모델", "데몬 하나가 모든 에이전트의 상태를 들고 있습니다. 작업 중, 입력·선택 대기, 오류, 유휴."],
-      ["알림", "tmux status line, 데스크톱 알림, 이 대시보드, Mac 앱이 누가 기다리는지 보여 줍니다."],
-      ["이동", "<code>muxa attend</code>는 가장 오래 기다린 pane으로 포커스를 옮기고, <code>--cycle</code>은 나머지를 차례로 돕니다."],
-      ["묶기", "pane과 실행은 Work로 묶이고, GitHub·Linear 이슈와 연결되어 한 보드에 모입니다."],
-      ["위임", "<code>muxa mcp</code>와 <code>muxa msg</code>로 에이전트 하나가 동료에게 지시하고 답을 기다립니다."],
+      ["기다리는 에이전트 찾기", "<code>muxa watch</code>에서 session·window에 걸친 에이전트 상태를 확인합니다. 계층을 탐색하거나 작업공간을 검색하세요."],
+      ["연결해서 답하기", "pane을 선택하고 Enter를 누르면 해당 터미널에 연결됩니다. 작업 맥락을 보면서 에이전트의 질문에 답하세요."],
+      ["리뷰 요청하고 확인하기", "watch에서 <code>m</code>으로 질문·리뷰·작업·공지를 보냅니다. <code>M</code>을 누르면 mailbox에서 요청과 답장을 확인할 수 있습니다."],
     ],
-    shotsTitle: "대시보드",
+    shotsTitle: "터미널에서 대시보드까지",
     shotsLede: "가상의 팀(서비스 셋, 에이전트 열, Work 여덟)으로 채운 실제 화면입니다.",
     shots: [
       ["board", "Work 보드", "단계별로 모인 Work. 내가 봐야 할 카드에는 신호가 붙고, 각 카드에 에이전트와 상태가 보입니다."],
@@ -227,18 +223,6 @@ const COPY = {
 const AGENTS = ["Claude Code", "Codex", "Gemini CLI", "Antigravity", "opencode"];
 const HOSTS = ["tmux", "rmux", "herdr"];
 
-export const LANDING_LANGUAGES = Object.keys(COPY);
-
-/** Saved choice first, then the browser's preferred languages, then English. */
-export function pickLanguage(saved, preferred = []) {
-  if (LANDING_LANGUAGES.includes(saved)) return saved;
-  for (const tag of preferred) {
-    const base = String(tag || "").toLowerCase().split("-")[0];
-    if (LANDING_LANGUAGES.includes(base)) return base;
-  }
-  return "en";
-}
-
 /**
  * Which ways in to offer. `login` is the dashboard's normalized login state;
  * `tokenRejected` is true when a stored token was sent and refused.
@@ -303,17 +287,26 @@ function shotPicture(name, alt) {
   </picture></a>`;
 }
 
-/** The screens tabs: the public site leads with the TUI recording. */
-const shotsFor = (t) => (view.mode === "site" ? [t.site.watchShot, ...t.shots] : t.shots);
+/** The gallery opens on the board, alongside the actual TUI recording. */
+const shotsFor = (t) => (view.mode === "site" ? [t.shots[0], t.site.watchShot, ...t.shots.slice(1)] : t.shots);
+
+function learningEntry(lang,base) {
+  const ko=lang==="ko";
+  const paths=ko?[
+    ["처음이라면","tmux 기본부터","일반 셸에서 session에 연결하고, window와 pane을 직접 다뤄봅니다.","basics","tmux 기본 시작하기"],
+    ["tmux가 익숙하다면","watch에서 협업까지","기다리는 에이전트에 답하고, 리뷰 요청과 mailbox를 사용해봅니다.","attention","muxa 미리 써보기"],
+  ]:[
+    ["New to tmux","Start with the basics","Connect from a normal shell, then try sessions, windows and panes.","basics","Learn tmux basics"],
+    ["Already using tmux","From watch to collaboration","Answer a waiting agent, request a review and read the mailbox.","attention","Try muxa watch"],
+  ];
+  return `<section class="l-section l-wrap l-learn-entry" id="learn"><div><p class="l-eyebrow">${ko?"브라우저 온보딩":"Browser onboarding"}</p><h2>${ko?"설치 전에 직접 익혀보세요":"Learn it before you install"}</h2><p class="l-lede">${ko?"실제 키 입력으로 한 단계씩 진행합니다. 작업공간 이동·검색, 미리보기, 자유 탐색까지 같은 터미널에서 이어집니다.":"Learn one key at a time. Continue through workspace search, inspection and free play in the same terminal."}</p><p class="l-fineprint">${ko?"브라우저 안의 데모 환경이며, 실제 셸이나 에이전트에 연결하지 않습니다.":"A browser-local demo, without a connection to a real shell or agent."}</p></div><div class="l-learning-paths">${paths.map(([label,title,body,track,cta])=>`<a class="l-learning-path" href="${base}learn/?track=${track}"><span class="l-eyebrow">${label}</span><h3>${title}</h3><p>${body}</p><span class="l-path-cta">${cta} <span aria-hidden="true">→</span></span></a>`).join("")}</div></section>`;
+}
 
 function markup(t, access, { host, email, shot }) {
   const notices = [
     access.signedInNoAccess ? `<p class="l-notice">${fill(t.signedInNoAccess, { email: email || "" })}</p>` : "",
     access.tokenRejected ? `<p class="l-notice">${t.tokenRejected}</p>` : "",
   ].join("");
-  const langs = LANDING_LANGUAGES.map((lang) =>
-    `<button type="button" data-landing-lang="${lang}" aria-pressed="${t === COPY[lang]}">${lang === "ko" ? "한국어" : "EN"}</button>`
-  ).join("");
   const flow = t.flow.map(([heading, body], i) =>
     `<li class="l-step" style="--i:${i}"><b><span>${i + 1}</span>${escapeText(heading)}</b><p>${body}</p></li>`
   ).join("");
@@ -332,21 +325,7 @@ function markup(t, access, { host, email, shot }) {
   const chips = (items) => items.map((item) => `<span class="l-chip">${escapeText(item)}</span>`).join("");
 
   return `
-    <header class="l-nav">
-      <div class="l-wrap">
-        <span class="l-brand"><img src="${asset("icon.svg")}" width="26" height="26" alt="">muxa</span>
-        ${site ? "" : `<span class="l-host" title="${escapeText(host)}">${LOCK_ICON}${escapeText(host)}</span>`}
-        <nav class="l-nav-actions">
-          <div class="l-lang" role="group" aria-label="Language">${langs}</div>
-          <a class="l-btn ghost sm l-hide-sm" href="${GITHUB}" rel="noopener">GitHub</a>
-          ${site
-            ? `<a class="l-btn dark sm" href="#install">${escapeText(t.site.install)}</a>`
-            : access.signIn
-              ? `<button class="l-btn dark sm" type="button" data-landing-action="sign-in">${escapeText(t.signIn)}</button>`
-              : ""}
-        </nav>
-      </div>
-    </header>
+    ${publicHeader({lang:view.lang,homeHref:site?"./":"/",iconSrc:asset("icon.svg"),context:site?"":`<span class="l-host" title="${escapeText(host)}">${LOCK_ICON}${escapeText(host)}</span>`,links:`<a class="l-nav-link l-hide-sm" href="${GITHUB}" rel="noopener">GitHub</a>${site?`<a class="l-nav-link" href="#install">${escapeText(t.site.install)}</a><a class="l-btn dark sm" href="${view.base}learn/">${view.lang==="ko"?"미리 써보기":"Try muxa"}</a>`:access.signIn?`<button class="l-btn dark sm" type="button" data-landing-action="sign-in">${escapeText(t.signIn)}</button>`:""}`})}
 
     <main>
       <section class="l-hero l-wrap">
@@ -356,10 +335,11 @@ function markup(t, access, { host, email, shot }) {
           <p class="l-lead">${escapeText(t.lead)}</p>
           <div class="l-actions">
             ${site
-              ? `<a class="l-btn primary lg" href="#install">${escapeText(t.site.install)}</a>
-                 <a class="l-btn ghost lg" href="${GITHUB}" rel="noopener">${GITHUB_ICON}<span>${escapeText(t.github)}</span></a>`
+              ? `<a class="l-btn primary lg" href="${view.base}learn/">${view.lang === "ko" ? "미리 써보기" : "Try muxa"}</a>
+                 <a class="l-btn ghost lg" href="#install">${escapeText(t.site.install)}</a>
+                 <span class="l-action-note">${view.lang==="ko"?"설치 없이 · tmux 기본부터":"No installation · tmux basics included"}</span>`
               : accessButtons(t, access, "lg")}
-            <a class="l-btn ${site || access.signIn ? "ghost" : "primary"} lg" href="#how">${escapeText(t.how)} ↓</a>
+            ${site?"":`<a class="l-btn ${access.signIn?"ghost":"primary"} lg" href="#how">${escapeText(t.how)} ↓</a>`}
           </div>
           ${site ? "" : `<div class="l-private">
             ${LOCK_ICON}
@@ -369,6 +349,8 @@ function markup(t, access, { host, email, shot }) {
         </div>
         <div class="l-film" data-landing-film></div>
       </section>
+
+      ${site ? learningEntry(view.lang,view.base) : ""}
 
       <section class="l-section l-wrap" id="how" data-reveal>
         <h2>${escapeText(t.howTitle)}</h2>
@@ -495,6 +477,7 @@ function draw() {
     boardSrc: asset(`landing/board-${dark ? "dark" : "light"}.webp`),
   });
   view.reveal = revealOnScroll(view.root);
+
 }
 
 function showShot(index) {
