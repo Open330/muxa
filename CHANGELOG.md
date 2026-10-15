@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `muxa reload` resumes the right conversation on macOS. It reads each pane's
+  argv with its argument boundaries instead of the joined `ps` line, so an
+  initial prompt is no longer replayed word by word (a Codex argument error)
+  and a quoted `--append-system-prompt` value survives. The agent and its id
+  now come from the pane's own command line: a stale registry row no longer
+  puts a Claude id on a Codex pane, a screen-detected row takes the id its
+  command names, and a Codex pane with no id is matched to the one thread
+  begun in its directory after it started. An agent started with an
+  instruction whose conversation is still unknown is left for a person
+  instead of being relaunched as the same task again, and `continue` goes
+  only to agents whose conversation actually came back.
+
 ## [0.9.0] - 2026-10-15
 
 ### Added
