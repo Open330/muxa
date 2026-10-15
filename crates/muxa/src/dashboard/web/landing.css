@@ -1,5 +1,3 @@
-@import url("./landing-terminal/xterm.css");
-
 /* Landing view for visitors without access (landing.mjs, landing-film.mjs).
    Landing and onboarding share these tokens, with a system dark palette.
    Terminal surfaces keep their own stable, dark palette. */

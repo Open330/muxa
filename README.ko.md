@@ -32,7 +32,8 @@ Codex, Gemini CLI 세션을 지켜보다가 어느 에이전트가 나를 기다
 | [화면 살펴보기](https://open330.github.io/muxa/learn/?track=inspect) | 미리보기, 터미널 원문, inspector 비율, 도움말을 사용합니다. |
 | [자유 탐색](https://open330.github.io/muxa/learn/?track=free) | 전체 단축키를 보며 여러 session과 window를 자유롭게 둘러봅니다. |
 
-안내를 바꿔도 같은 터미널과 요청 기록이 이어집니다. 브라우저 안에서 동작하는
+다음 안내가 표시되면 **Alt + Enter**(Mac에서는 Option + Return)로 클릭 없이
+진행할 수 있습니다. 안내를 바꿔도 같은 터미널과 요청 기록이 이어집니다. 브라우저 안에서 동작하는
 시뮬레이션으로, 실제 셸 명령이나 에이전트/API를 실행하지 않습니다. 실제 tmux에서
 익히려면 설치 후 아래의 `muxa onboard`를 사용하세요.
 
