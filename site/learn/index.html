@@ -7,12 +7,38 @@
   <title>Learn muxa · From tmux basics to collaboration</title>
   <meta name="description" content="Learn tmux basics, find waiting agents, navigate with muxa watch, and request reviews in an interactive browser demo.">
   <link rel="icon" href="../icon.svg" type="image/svg+xml">
+<style>
+  html { background: #f7f7f5; color: #1a1d21; color-scheme: light dark; }
+  body { margin: 0; }
+  html[data-page-loading] #landing { visibility: hidden; }
+  @media (prefers-color-scheme: dark) { html { background: #111315; color: #e5e9e2; } }
+</style>
+<script>document.documentElement.setAttribute("data-page-loading", "");</script>
+  <link rel="modulepreload" href="../landing-onboarding.mjs">
+  <link rel="modulepreload" href="../landing-terminal/xterm.mjs">
+  <link rel="modulepreload" href="../landing-terminal/fit.mjs">
   <link rel="stylesheet" href="../landing.css">
+  <link rel="stylesheet" href="../landing-terminal/xterm.css">
 </head>
 <body data-view="landing" style="margin:0">
   <div class="landing learn-page" id="landing" data-home="../">
-    <div class="l-wrap l-section"><h1>Learn muxa in your browser</h1><p>From tmux basics to working with agents, one step at a time.</p><noscript>This interactive practice needs JavaScript. <a href="https://github.com/Open330/muxa/tree/main/docs">Read the muxa guide.</a></noscript></div>
+    <div class="l-wrap l-section" data-page-fallback><h1>Learn muxa in your browser</h1><p>From tmux basics to working with agents, one step at a time.</p><noscript>This interactive practice needs JavaScript. <a href="https://github.com/Open330/muxa/tree/main/docs">Read the muxa guide.</a></noscript></div>
   </div>
-  <script type="module" src="../landing-onboarding.mjs"></script>
+  <script type="module">
+    const root = document.getElementById("landing"), fallback = root.innerHTML;
+    let loaded = false;
+    try {
+      const { ready } = await import("../landing-onboarding.mjs");
+      await ready;
+      await new Promise(requestAnimationFrame);
+      loaded = true;
+    } catch (error) {
+      root.innerHTML = fallback;
+      console.error("Muxa practice could not load", error);
+    } finally {
+      document.documentElement.removeAttribute("data-page-loading");
+    }
+    if (loaded) root.querySelector(".lp-pane.is-active .xterm-helper-textarea")?.focus({ preventScroll: true });
+  </script>
 </body>
 </html>

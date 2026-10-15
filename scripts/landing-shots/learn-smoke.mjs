@@ -98,7 +98,7 @@ try {
     await page.keyboard.press("M"); assert.equal(await page.locator("[data-mode]").textContent(), "inbox");
     await page.keyboard.press("Tab"); await screenHas("messages"); await page.screenshot({ path: join(output, `${locale}-inbox.png`), fullPage: true });
     const completedMode=await page.locator("[data-mode]").textContent(),completedPane=await page.locator(".lp-workspace").getAttribute("data-active-pane");
-    await page.locator('.lp-continue[data-exercise="workspace"]').click();
+    await page.keyboard.press("Alt+Enter");
     assert.equal(await page.locator("[data-mode]").textContent(),completedMode);
     assert.equal(await page.locator(".lp-workspace").getAttribute("data-active-pane"),completedPane);
     assert.match(await page.locator("[data-status]").textContent(),/1 reply/);
@@ -233,7 +233,8 @@ try {
     assert.equal(await basicsPage.locator('.lp-live').getAttribute('data-structure'),"session");
     await basicsPage.keyboard.type("echo beginner-draft");
     await basicsPage.screenshot({path:join(output,`${locale}-tmux-basics.png`),fullPage:true});
-    await basicsPage.locator('[data-demo="basics-start"]').click();
+    assert.equal(await basicsPage.locator('[data-demo="basics-start"]').getAttribute("aria-keyshortcuts"),"Alt+Enter");
+    await basicsPage.keyboard.press("Alt+Enter");
     assert.equal(await basicsPage.locator('.lp-live').getAttribute('data-structure'),"");
     const sameTerminal=await basicsPage.locator('[data-pane="shell"] .xterm').elementHandle();
     for(const [index,k] of ["o","z","z","n","p"].entries()){
@@ -248,7 +249,7 @@ try {
       if(index===4)assert.equal(await basicsPage.locator('.lp-workspace').getAttribute('data-window'),"retry");
     }
     assert.match(await basicsPage.locator('[data-lesson] h3').textContent(),/완료|Done/);
-    await basicsPage.locator('.lp-continue[data-exercise="attention"]').click();
+    await basicsPage.keyboard.press("Alt+Enter");
     assert.equal(await basicsPage.locator('.lp-workspace').getAttribute('data-active-pane'),"claude");
     assert.equal(await sameTerminal.evaluate(node=>node===document.querySelector('[data-pane="shell"] .xterm')),true);
     await basicsPage.locator('[data-pane="shell"] .lp-pane-label').click();

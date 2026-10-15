@@ -20,6 +20,7 @@ updateMetadata();
 const practice=mountPractice(root.querySelector("#practice"),{lang,installHref:`${home}#install`,initialTrack,autofocus:true,onTrackChange(track){
   const url=new URL(location.href);url.searchParams.set("track",track);history.replaceState(null,"",url);
 }});
+export const ready=practice.ready.catch(error=>{practice.destroy();throw error;});
 root.addEventListener("click",event=>{
   const button=event.target.closest("[data-landing-lang]");
   if(!button||button.dataset.landingLang===lang)return;

@@ -32,8 +32,9 @@ Type directly in the terminal and follow one key at a time.
 | [Inspect a screen](https://open330.github.io/muxa/learn/?track=inspect) | Use previews, raw terminal output, inspector sizing, and help. |
 | [Free exploration](https://open330.github.io/muxa/learn/?track=free) | Explore several sessions and windows with the shortcut reference alongside. |
 
-Switching guides keeps the same terminal and request history. This is a
-browser-local simulation; it runs no real shell commands or agent API calls.
+When a continue action appears, press **Alt + Enter** (Option + Return on Mac)
+to advance without clicking. Switching guides keeps the same terminal and
+request history. This is a browser-local simulation; it runs no real shell commands or agent API calls.
 For practice in real tmux, install Muxa and use `muxa onboard` below.
 
 ## Get started
