@@ -407,7 +407,7 @@ fn command_name(s: &str) -> &str {
 }
 
 #[cfg(target_os = "linux")]
-fn read_descendants(root: u32) -> Vec<ProcessInfo> {
+pub(crate) fn read_descendants(root: u32) -> Vec<ProcessInfo> {
     let mut out = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
     let mut q: VecDeque<(u32, u8)> = read_children(root)
@@ -473,7 +473,7 @@ fn parse_ppid(status: &str) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_descendants(root: u32) -> Vec<ProcessInfo> {
+pub(crate) fn read_descendants(root: u32) -> Vec<ProcessInfo> {
     crate::process_snapshot::read_current_process_table().descendants(root, MAX_DEPTH, MAX_NODES)
 }
 

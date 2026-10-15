@@ -31,6 +31,7 @@ mod reload;
 mod stale_agents;
 mod start;
 mod stats;
+mod swap;
 mod theme;
 mod time_range;
 mod timeline;
@@ -390,6 +391,9 @@ enum Cmd {
 
     /// Reload MCP connections or snapshot/restart/restore the multiplexer
     Reload(reload::ReloadArgs),
+
+    /// Move agents onto another `aas` account and resume them in place
+    Swap(swap::Args),
 
     /// Update muxa from the source repo: `git pull` → cargo install
     /// `muxad` + `muxa-cli` → restart the daemon → verify the IPC
@@ -1616,6 +1620,7 @@ async fn main() -> Result<()> {
         Cmd::Snapshot(snapshot_args) => reload::snapshot(&client, snapshot_args).await,
         Cmd::Restore(restore_args) => reload::restore(restore_args),
         Cmd::Reload(reload_args) => reload::reload(&client, reload_args).await,
+        Cmd::Swap(swap_args) => swap::run(&client, swap_args, &cfg.swap).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
         Cmd::Prune(prune) => cmd_prune(&client, &prune.older_than, prune.all, prune.yes).await,
     }

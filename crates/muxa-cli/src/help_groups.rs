@@ -27,7 +27,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     ("Analytics", &["stats", "timeline"]),
     ("Save & restore", &["snapshot", "restore", "reload"]),
     ("Fleet", &["fleet"]),
-    ("Run & automate", &["proc", "automation"]),
+    ("Run & automate", &["proc", "automation", "swap"]),
     (
         "Setup",
         &[
