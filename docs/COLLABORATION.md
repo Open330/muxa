@@ -236,6 +236,8 @@ muxa msg list --scope all --since 7d --work CAL-7345 --kind review \
 muxa msg cancel req_... # queued requests only
 ```
 
+`muxa msg inbox` text output includes the reply obligation, permitted paths and attachments alongside the task. `muxa msg wait --timeout SECONDS` is an alias for `--timeout-secs SECONDS`.
+
 `muxa msg wait` defaults to compact JSON describing delivery and final reply
 receipt, not work success. A timeout is a JSON observation (`reason: timeout`)
 with exit code 2; this describes the wait, not the work result. Transport errors remain nonzero. Use `--body` to print only the

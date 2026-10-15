@@ -1788,7 +1788,7 @@ fn resolve_window_identity(target: Option<&str>) -> Result<WindowIdentity> {
         .ok_or_else(|| {
             anyhow::anyhow!("window target is required outside tmux; pass --window @N")
         })?;
-    if muxa::backend::rmux::endpoint_from_env().is_some() {
+    if crate::mux_control::rmux_endpoint().is_some() {
         // A grouped @window may be linked into a different session from the
         // caller. rmux 0.10's display-message can then report empty identity
         // fields; enumeration gives each link its explicit session context.
@@ -2040,8 +2040,17 @@ pub fn mark_agent(
         // launch against any other socket reserved the name in the wrong
         // room, and against a host with no default daemon it failed outright
         // and took the launch down with it.
-        muxa::ipc::blocking_reserve_handle(socket, pane, &alias, RESERVE_TIMEOUT)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        muxa::ipc::blocking_reserve_handle(
+            socket,
+            &if crate::mux_control::rmux_endpoint().is_some() {
+                format!("rmux:{pane}")
+            } else {
+                pane.to_string()
+            },
+            &alias,
+            RESERVE_TIMEOUT,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
         set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
     }
     if let Some(generation) = generation {

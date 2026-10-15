@@ -210,6 +210,8 @@ muxa msg list --scope all --since 7d --work CAL-7345 --kind review \
 muxa msg cancel req_...
 ```
 
+`muxa msg inbox`의 텍스트 출력에는 작업 본문과 함께 답변 의무, 허용 경로, 첨부 자료가 표시됩니다. `muxa msg wait --timeout SECONDS`는 `--timeout-secs SECONDS`의 별칭입니다.
+
 `muxa msg wait` 기본 출력은 전달 상태와 최종 답장 수신 여부를 나타내는
 간결한 JSON입니다. 작업 성공을 판정하지 않습니다. 대기 시간 초과는
 `reason: timeout` JSON과 종료 코드 2로 구분하며, 작업 결과를 판정하지 않습니다.

@@ -67,7 +67,8 @@ const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// workflow rather than a capability the model has to infer from tool names.
 const MCP_SERVER_INSTRUCTIONS: &str =
     "Muxa routes durable agent messages. Read muxa_collaboration_guide \
-    once for identity and protocol. Delivery and reply receipt do not prove work success; \
+    once for identity and protocol. Discover tools by exact name/suffix, never shared descriptions. \
+    Read instructions before choosing discovery calls; retain resolved handles/schemas. Delivery and reply receipt do not prove work success; \
     reported_status is the recipient's declaration. Use mailbox tools, not terminal scraping.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
@@ -481,7 +482,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "agent": { "type": "string", "enum": ["claude", "codex", "gemini", "agy", "opencode"], "description": "Agent provider. May be omitted when mcp.guide.agent is configured." },
                     "options": { "type": "array", "items": { "type": "string" }, "description": "Additional provider CLI arguments. Overrides mcp.guide.options when present; Muxa shell-quotes every argument." },
                     "placement": { "type": "string", "enum": ["pane", "window", "session"], "description": "Defaults to mcp.guide.placement (pane when unconfigured). Managed work always uses its workspace window." },
-                    "target": { "type": "string", "description": "tmux target for pane/window placement. Defaults to TMUX_PANE." },
+                    "target": { "type": "string", "description": "Target for pane/window placement. Use the exact room pane including rmux:; defaults to the identified caller pane." },
                     "cwd": { "type": "string", "description": "Existing working directory. Defaults to the MCP process cwd." },
                     "prompt": { "type": "string", "description": "Optional first task; omit for an empty interactive agent." },
                     "name": { "type": "string", "description": "Optional window/session name." },
@@ -540,7 +541,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                         "type": "string",
                         "enum": ["list_workspace", "show_workspace", "list_work", "show_work", "interrupt_agent", "terminate_agent", "close_work", "close_workspace"]
                     },
-                    "pane": { "type": "string", "description": "Exact pane id for agent actions, for example %42." },
+                    "pane": { "type": "string", "description": "Exact pane id from room context for agent actions, for example rmux:%42 or %42. The server must resolve uniquely." },
                     "workspace": { "type": "string", "description": "Workspace/project id for workspace actions or to disambiguate work." },
                     "work": { "type": "string", "description": "Muxa Work id for Work actions, for example TEST-0001." },
                     "confirm": { "type": "boolean", "description": "Must be true for terminate_agent, close_work, and close_workspace." }
@@ -1040,15 +1041,21 @@ async fn call_tool(
                 "options": args.get("options").is_none() && !reported_options.is_empty(),
                 "direction": args.get("direction").is_none(),
             });
+            let (endpoint, target) =
+                match lifecycle_target(client, args.get("target").and_then(Value::as_str)).await {
+                    Ok(value) => value,
+                    Err(error) => return Ok(error_result(&format!("start_agent failed: {error}"))),
+                };
             let request = crate::agent_launch::StartRequest {
                 socket: client.socket().to_path_buf(),
                 agent,
                 options,
                 placement,
-                target: args
-                    .get("target")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                target: if args.get("work").is_some() && args.get("target").is_none() {
+                    None
+                } else {
+                    target
+                },
                 cwd: args
                     .get("cwd")
                     .and_then(Value::as_str)
@@ -1072,11 +1079,26 @@ async fn call_tool(
                 generation: None,
                 direction,
             };
+            let is_rmux = endpoint
+                .as_ref()
+                .is_some_and(|e| e.host == muxa::HostKind::Rmux);
             Ok(
-                match tokio::task::spawn_blocking(move || crate::agent_launch::start(request)).await
+                match tokio::task::spawn_blocking(move || {
+                    crate::mux_control::with_endpoint(endpoint, || {
+                        crate::agent_launch::start(request)
+                    })
+                })
+                .await
                 {
                     Ok(Ok(result)) => {
                         let mut result = json!(result);
+                        if is_rmux {
+                            result["host"] = json!("rmux");
+                            result["pane"] = json!(format!(
+                                "rmux:{}",
+                                result["pane"].as_str().unwrap_or_default()
+                            ));
+                        }
                         result["options"] = json!(reported_options);
                         result["defaults_applied"] = defaults_applied;
                         json_result(&result)
@@ -1087,6 +1109,7 @@ async fn call_tool(
             )
         }
         "muxa_manage_tmux" => {
+            use crate::tmux_work::ManageAction;
             let Some(action) = args.get("action").and_then(Value::as_str) else {
                 return Ok(error_result("manage_tmux requires an action argument"));
             };
@@ -1094,9 +1117,35 @@ async fn call_tool(
                 Ok(action) => action,
                 Err(error) => return Ok(error_result(&error)),
             };
+            if matches!(
+                action,
+                ManageAction::TerminateAgent
+                    | ManageAction::CloseWork
+                    | ManageAction::CloseWorkspace
+            ) && !args
+                .get("confirm")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Ok(error_result(
+                    "manage_tmux destructive action requires confirm=true",
+                ));
+            }
+            if matches!(
+                action,
+                ManageAction::TerminateAgent | ManageAction::InterruptAgent
+            ) && args.get("pane").and_then(Value::as_str).is_none()
+            {
+                return Ok(error_result("manage_tmux agent action requires pane"));
+            }
+            let (endpoint, pane) =
+                match lifecycle_target(client, args.get("pane").and_then(Value::as_str)).await {
+                    Ok(value) => value,
+                    Err(error) => return Ok(error_result(&format!("manage_tmux failed: {error}"))),
+                };
             let request = crate::tmux_work::ManageRequest {
                 action,
-                pane: args.get("pane").and_then(Value::as_str).map(str::to_string),
+                pane,
                 workspace: args
                     .get("workspace")
                     .and_then(Value::as_str)
@@ -1107,9 +1156,24 @@ async fn call_tool(
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
             };
+            let reported_pane = args.get("pane").cloned();
             Ok(
-                match tokio::task::spawn_blocking(move || crate::tmux_work::manage(request)).await {
-                    Ok(Ok(result)) => json_result(&json!(result)),
+                match tokio::task::spawn_blocking(move || {
+                    crate::mux_control::with_endpoint(endpoint, || {
+                        crate::tmux_work::manage(request)
+                    })
+                })
+                .await
+                {
+                    Ok(Ok(result)) => {
+                        let mut result = json!(result);
+                        if result.get("pane").is_some() {
+                            if let Some(pane) = reported_pane {
+                                result["pane"] = pane;
+                            }
+                        }
+                        json_result(&result)
+                    }
                     Ok(Err(error)) => error_result(&format!("manage_tmux failed: {error}")),
                     Err(error) => error_result(&format!("manage_tmux worker failed: {error}")),
                 },
@@ -1526,6 +1590,82 @@ async fn call_tool(
         }
         other => Ok(error_result(&format!("unknown tool: {other}"))),
     }
+}
+
+/// Resolve namespace and server together before entering synchronous lifecycle
+/// code. A namespaced pane must never fall back onto a different ambient host.
+async fn lifecycle_target(
+    client: &Client,
+    target: Option<&str>,
+) -> Result<(Option<muxa::BackendEndpoint>, Option<String>), String> {
+    let resolved_origin = resolve_collaboration_origin(client).await;
+    if target.is_none_or(|t| muxa::backend::pane_id_host_kind(t).is_none())
+        && pane_env_is_borrowed()
+    {
+        let origin = resolved_origin.as_ref().map_err(Clone::clone)?;
+        if origin.pane.is_empty() || origin.socket.is_none() {
+            return Err("lifecycle caller is not bound to a server yet; refresh room context before retrying".into());
+        }
+    }
+    let origin = resolved_origin.ok();
+    let target = target.map(str::to_string).or_else(|| {
+        origin
+            .as_ref()
+            .map(|o| o.pane.clone())
+            .filter(|p| !p.is_empty())
+    });
+    let Some(pane) = target.as_deref() else {
+        return Ok((None, None));
+    };
+    let Some(host) = muxa::backend::pane_id_host_kind(pane) else {
+        // Session names belong to the caller's server, not the app-server's.
+        let endpoint = origin.and_then(|o| {
+            let host = muxa::backend::pane_id_host_kind(&o.pane)?;
+            crate::mux_control::supported(host).then_some(())?;
+            Some(muxa::BackendEndpoint {
+                host,
+                socket: o.socket?,
+            })
+        });
+        return Ok((endpoint, target));
+    };
+    if !crate::mux_control::supported(host) {
+        return Err(format!("{host} does not support this lifecycle operation"));
+    }
+    let agents = client
+        .by_pane(pane)
+        .await
+        .map_err(|e| format!("resolve lifecycle endpoint: {e}"))?;
+    let mut endpoints: Vec<_> = agents
+        .iter()
+        .filter_map(|a| a.tmux_socket.clone())
+        .collect();
+    if let Some(origin) = origin.filter(|o| o.pane == pane) {
+        if let Some(socket) = origin.socket {
+            endpoints.push(socket);
+        }
+    }
+    let endpoint = select_lifecycle_endpoint(host, endpoints)?;
+    Ok((
+        Some(endpoint),
+        Some(pane.strip_prefix("rmux:").unwrap_or(pane).to_string()),
+    ))
+}
+
+fn select_lifecycle_endpoint(
+    host: muxa::HostKind,
+    mut sockets: Vec<String>,
+) -> Result<muxa::BackendEndpoint, String> {
+    sockets.retain(|s| !s.trim().is_empty());
+    sockets.sort();
+    sockets.dedup();
+    if sockets.len() != 1 {
+        return Err("cannot resolve a unique lifecycle server for this pane; refresh room context and use an exact tracked target".into());
+    }
+    Ok(muxa::BackendEndpoint {
+        host,
+        socket: sockets.remove(0),
+    })
 }
 
 /// Keep the default fleet view useful for routing without embedding every
@@ -2562,8 +2702,16 @@ async fn start_work(client: &Client, args: &Value, config: &muxa::config::Config
         Ok(resolved) => resolved,
         Err(error) => return error_result(&format!("{error:#}")),
     };
+    let (endpoint, _) = match lifecycle_target(client, None).await {
+        Ok(value) => value,
+        Err(error) => return error_result(&format!("muxa_start_work failed: {error}")),
+    };
     let result = if up.dry_run {
-        match tokio::task::spawn_blocking(move || crate::work_up::apply(resolved, true)).await {
+        match tokio::task::spawn_blocking(move || {
+            crate::mux_control::with_endpoint(endpoint, || crate::work_up::apply(resolved, true))
+        })
+        .await
+        {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => return error_result(&format!("{error:#}")),
             Err(error) => return error_result(&format!("muxa_start_work worker failed: {error}")),
@@ -2572,7 +2720,9 @@ async fn start_work(client: &Client, args: &Value, config: &muxa::config::Config
         let runtime = tokio::runtime::Handle::current();
         let client = client.clone();
         match tokio::task::spawn_blocking(move || {
-            runtime.block_on(crate::work_up::apply_durable(resolved, &client))
+            crate::mux_control::with_endpoint(endpoint, || {
+                runtime.block_on(crate::work_up::apply_durable(resolved, &client))
+            })
         })
         .await
         {
@@ -2898,15 +3048,22 @@ async fn spawn_peer(
     program: crate::agent_launch::AgentProgram,
     config: &muxa::config::Config,
 ) -> std::result::Result<(PeerSelection, crate::agent_launch::StartResult), String> {
-    if room.current.room.host != "tmux" || !room.current.pane.starts_with('%') {
-        return Err("call_peer automatic spawn currently requires a native tmux agent pane".into());
-    }
+    let host = muxa::backend::pane_id_host_kind(&room.current.pane)
+        .filter(|host| crate::mux_control::supported(*host))
+        .ok_or("call_peer automatic spawn requires a tmux or rmux agent pane")?;
+    let endpoint =
+        select_lifecycle_endpoint(host, room.current.socket.clone().into_iter().collect())?;
+    let native_pane = room
+        .current
+        .pane
+        .strip_prefix("rmux:")
+        .unwrap_or(&room.current.pane);
     let request = crate::agent_launch::StartRequest {
         socket: client.socket().to_path_buf(),
         agent: program,
         options: config.launch_options(program.label(), None),
         placement: crate::agent_launch::Placement::Pane,
-        target: Some(room.current.pane.clone()),
+        target: Some(native_pane.to_string()),
         cwd: room.current.cwd.as_deref().map(std::path::PathBuf::from),
         prompt: None,
         name: None,
@@ -2932,10 +3089,15 @@ async fn spawn_peer(
         .subscribe()
         .await
         .map_err(|error| format!("call_peer could not watch peer registration: {error}"))?;
-    let started = tokio::task::spawn_blocking(move || crate::agent_launch::start(request))
-        .await
-        .map_err(|error| format!("call_peer spawn worker failed: {error}"))?
-        .map_err(|error| format!("call_peer spawn failed: {error}"))?;
+    let mut started = tokio::task::spawn_blocking(move || {
+        crate::mux_control::with_endpoint(Some(endpoint), || crate::agent_launch::start(request))
+    })
+    .await
+    .map_err(|error| format!("call_peer spawn worker failed: {error}"))?
+    .map_err(|error| format!("call_peer spawn failed: {error}"))?;
+    if host == muxa::HostKind::Rmux {
+        started.pane = format!("rmux:{}", started.pane);
+    }
     let timeout_secs = args
         .get("spawn_timeout_secs")
         .and_then(Value::as_u64)
@@ -4004,6 +4166,59 @@ fn error_result(message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn lifecycle_target_keeps_rmux_namespace_bound_to_registered_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("routing.sock");
+        let store = Store::shared();
+        let register = |session: &str, endpoint: &str| AgentEvent::Started {
+            id: muxa::event::AgentId {
+                kind: AgentKind::Codex,
+                session_id: session.into(),
+                surface: None,
+                pane: Some("rmux:%42".into()),
+                tmux_socket: Some(endpoint.into()),
+                cwd: None,
+            },
+            at: time::OffsetDateTime::now_utc(),
+        };
+        store
+            .apply(&register("routing-a", "/tmp/routing-a.sock"))
+            .await;
+        let server = Server::new(socket.clone(), store.clone()).with_backends(vec![]);
+        let (shutdown, rx) = broadcast::channel(1);
+        let daemon = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let (endpoint, target) = lifecycle_target(&client, Some("rmux:%42")).await.unwrap();
+        assert_eq!(
+            endpoint.unwrap(),
+            muxa::BackendEndpoint {
+                host: HostKind::Rmux,
+                socket: "/tmp/routing-a.sock".into()
+            }
+        );
+        assert_eq!(target.as_deref(), Some("%42"));
+        assert!(lifecycle_target(&client, Some("rmux:%999")).await.is_err());
+        store
+            .apply(&register("routing-b", "/tmp/routing-b.sock"))
+            .await;
+        assert!(lifecycle_target(&client, Some("rmux:%42")).await.is_err());
+        let _ = shutdown.send(());
+        daemon.await.unwrap();
+    }
+
+    #[test]
+    fn lifecycle_resolution_rejects_unknown_or_ambiguous_servers() {
+        use muxa::HostKind;
+        assert!(select_lifecycle_endpoint(HostKind::Rmux, vec![]).is_err());
+        assert!(select_lifecycle_endpoint(HostKind::Rmux, vec!["/a".into(), "/b".into()]).is_err());
+        let endpoint =
+            select_lifecycle_endpoint(HostKind::Rmux, vec!["/a".into(), "/a".into()]).unwrap();
+        assert_eq!(endpoint.host, HostKind::Rmux);
+        assert_eq!(endpoint.socket, "/a");
+    }
 
     #[test]
     fn message_pages_are_bounded_ordered_and_do_not_repeat_bodies() {

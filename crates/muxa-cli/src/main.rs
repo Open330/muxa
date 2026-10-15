@@ -623,7 +623,7 @@ enum MsgCmd {
     Wait {
         request_id: String,
         /// Maximum wait in seconds (clamped to 600).
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, visible_alias = "timeout", default_value_t = 300)]
         timeout_secs: u64,
         /// Print only the final reply body, without shell-side JSON parsing.
         #[arg(long, conflicts_with = "full")]
@@ -2080,14 +2080,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                 println!("Inbox is empty.");
             } else {
                 for request in requests {
-                    println!(
-                        "{}  {:?} from {}  {:?}\n  {}",
-                        request.id,
-                        request.kind,
-                        request.from.label(),
-                        request.work_mode,
-                        request.body,
-                    );
+                    println!("{}", render_inbox_request(&request));
                 }
             }
         }
@@ -2294,6 +2287,38 @@ async fn cmd_msg_list(
         eprintln!("Showing {} of {total} matching messages; next page: --offset {} (or --limit 0 for all).", requests.len(), filters.offset.saturating_add(requests.len()));
     }
     print_collaboration_messages(&requests, json, full, origin, scope)
+}
+
+fn render_inbox_request(request: &muxa::collaboration::CollaborationRequest) -> String {
+    let mut text = format!(
+        "{}  {:?} from {}  {:?}  expects_reply={}\n  {}",
+        request.id,
+        request.kind,
+        request.from.label(),
+        request.work_mode,
+        request.expects_reply,
+        request.body
+    );
+    // Preserve the complete execution contract without requiring another full read.
+    let contract = collaboration_output::message(request, true);
+    for key in [
+        "paths",
+        "artifacts",
+        "links",
+        "air_artifacts",
+        "updates",
+        "human_action",
+        "interruption",
+    ] {
+        if let Some(value) = contract
+            .get(key)
+            .filter(|v| !v.is_null() && !v.as_array().is_some_and(Vec::is_empty))
+        {
+            use std::fmt::Write as _;
+            let _ = write!(text, "\n  {key}: {value}");
+        }
+    }
+    text
 }
 
 async fn cmd_msg_wait(
@@ -4826,6 +4851,34 @@ mod tests {
         assert_eq!(value["final_reply_received"], false);
         assert!(value.get("reported_status").is_none());
         assert!(render_reply_output(&request, true, false).is_err());
+    }
+
+    #[test]
+    fn inbox_text_preserves_contract_and_wait_accepts_timeout_alias() {
+        let mut request = collaboration_output::fixture();
+        request.paths = vec!["src/permitted.rs".into()];
+        request.artifacts = vec!["review.txt".into()];
+        request.expects_reply = false;
+        let text = render_inbox_request(&request);
+        for required in [
+            "src/permitted.rs",
+            "review.txt",
+            "expects_reply=false",
+            &request.body,
+        ] {
+            assert!(text.contains(required), "{text}");
+        }
+        let args =
+            Args::try_parse_from(["muxa", "msg", "wait", "req-test", "--timeout", "60"]).unwrap();
+        assert!(matches!(
+            args.cmd,
+            Some(Cmd::Msg {
+                action: MsgCmd::Wait {
+                    timeout_secs: 60,
+                    ..
+                }
+            })
+        ));
     }
 
     #[test]

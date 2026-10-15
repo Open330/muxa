@@ -1,15 +1,50 @@
 //! Endpoint-aware control for the tmux-compatible hosts. Never send an rmux
 //! socket to the native tmux binary, even when both expose the same ids.
 use muxa::{BackendEndpoint, HostKind};
+use std::cell::RefCell;
 use std::path::Path;
 use std::process::Command;
+
+// Legacy lifecycle helpers share one synchronous transaction. Keep its selected
+// endpoint on this worker only; mutating process environment would race other
+// MCP requests. The guard also restores it after nested calls or unwinding.
+thread_local! {
+    static ENDPOINT: RefCell<Option<BackendEndpoint>> = const { RefCell::new(None) };
+}
+
+pub fn with_endpoint<T>(endpoint: Option<BackendEndpoint>, operation: impl FnOnce() -> T) -> T {
+    struct Restore(Option<BackendEndpoint>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ENDPOINT.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+    let _restore = Restore(ENDPOINT.with(|slot| slot.replace(endpoint)));
+    operation()
+}
+
+fn selected_endpoint() -> Option<BackendEndpoint> {
+    ENDPOINT.with(|slot| slot.borrow().clone())
+}
+
+pub fn rmux_endpoint() -> Option<String> {
+    match selected_endpoint() {
+        Some(endpoint) => (endpoint.host == HostKind::Rmux).then_some(endpoint.socket),
+        None => muxa::backend::rmux::endpoint_from_env(),
+    }
+}
 
 pub fn supported(host: HostKind) -> bool {
     matches!(host, HostKind::Tmux | HostKind::Rmux)
 }
 
 pub fn ambient_command() -> Command {
-    if let Some(socket) = muxa::backend::rmux::endpoint_from_env() {
+    if let Some(endpoint) = selected_endpoint() {
+        return command(&endpoint).expect("lifecycle endpoint must support mux control");
+    }
+    if let Some(socket) = rmux_endpoint() {
         muxa::RmuxBackend::with_endpoint(socket).command(None)
     } else {
         muxa::tmux::tmux_command_scoped()
@@ -18,7 +53,7 @@ pub fn ambient_command() -> Command {
 
 pub fn ambient_command_with_args<S: AsRef<str>>(args: &[S]) -> anyhow::Result<Command> {
     let args: Vec<_> = args.iter().map(AsRef::as_ref).collect();
-    if let Some(socket) = muxa::backend::rmux::endpoint_from_env() {
+    if let Some(socket) = rmux_endpoint() {
         return muxa::RmuxBackend::with_endpoint(socket)
             .control_command(&args)
             .map_err(anyhow::Error::msg);
@@ -140,7 +175,7 @@ pub enum Control {
 impl Control {
     pub fn is_rmux(&self) -> bool {
         match self {
-            Self::Ambient => muxa::backend::rmux::endpoint_from_env().is_some(),
+            Self::Ambient => rmux_endpoint().is_some(),
             Self::Endpoint(endpoint) => endpoint.host == HostKind::Rmux,
         }
     }
@@ -149,7 +184,10 @@ impl Control {
         match self {
             Self::Endpoint(endpoint) => capture(endpoint, args).map_err(anyhow::Error::msg),
             Self::Ambient => {
-                if let Some(socket) = muxa::backend::rmux::endpoint_from_env() {
+                if let Some(endpoint) = selected_endpoint() {
+                    return capture(&endpoint, args).map_err(anyhow::Error::msg);
+                }
+                if let Some(socket) = rmux_endpoint() {
                     return muxa::RmuxBackend::with_endpoint(socket)
                         .capture_control(args)
                         .map_err(anyhow::Error::msg);
@@ -173,6 +211,113 @@ impl Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_commands_use_one_rmux_server_and_keep_termination_guards() {
+        use std::os::unix::fs::PermissionsExt;
+        const PROBE: &str = "MUXA_TEST_LIFECYCLE_ROUTING";
+        if std::env::var_os(PROBE).is_some() {
+            use crate::tmux_work::{ManageAction, ManageRequest};
+            let endpoint = BackendEndpoint {
+                host: HostKind::Rmux,
+                socket: "/tmp/selected-server.sock".into(),
+            };
+            with_endpoint(Some(endpoint), || {
+                let request = |confirm| ManageRequest {
+                    action: ManageAction::TerminateAgent,
+                    pane: Some("%42".into()),
+                    workspace: None,
+                    work: None,
+                    confirm,
+                };
+                assert!(crate::tmux_work::manage(request(false))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("confirm=true"));
+                let mut unmanaged = request(true);
+                unmanaged.pane = Some("%43".into());
+                assert!(crate::tmux_work::manage(unmanaged)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not a muxa-managed"));
+                crate::tmux_work::manage(request(true)).unwrap();
+                let output = ambient_command_with_args(&["split-window", "-t", "%42"])
+                    .unwrap()
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "%99");
+            });
+            let log =
+                std::fs::read_to_string(std::env::var("MUXA_TEST_ROUTING_LOG").unwrap()).unwrap();
+            assert!(
+                log.contains("-S /tmp/selected-server.sock kill-pane -t $1:@1.%42"),
+                "{log}"
+            );
+            assert!(
+                log.contains("-S /tmp/selected-server.sock split-window -t $1:@1.%42"),
+                "{log}"
+            );
+            assert!(!log.contains("rmux:%"), "{log}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let rmux = dir.path().join("rmux");
+        std::fs::write(
+            &rmux,
+            r#"#!/bin/sh
+if [ "$1" = "-V" ]; then exit 0; fi
+printf '%s\n' "$*" >> "$MUXA_TEST_ROUTING_LOG"
+shift 2
+case "$1" in
+list-panes) printf '$1\t@1\t%%42\n';;
+display-message) case "$*" in *%43*) printf '0\t\n';; *) printf '1\tclaude\n';; esac;;
+split-window) printf '%%99\n';;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&rmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "mux_control::tests::lifecycle_commands_use_one_rmux_server_and_keep_termination_guards", "--nocapture"])
+            .env(PROBE, "1").env("PATH", dir.path())
+            .env("MUXA_TEST_ROUTING_LOG", dir.path().join("commands.log"))
+            .env_remove("RMUX").env_remove("RMUX_PANE").env_remove("TMUX").env_remove("TMUX_PANE")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn lifecycle_scope_is_thread_local_nested_and_restored_after_unwind() {
+        let selected = BackendEndpoint {
+            host: HostKind::Rmux,
+            socket: "/tmp/selected-rmux.sock".into(),
+        };
+        let before = selected_endpoint();
+        with_endpoint(Some(selected.clone()), || {
+            assert_eq!(selected_endpoint(), Some(selected.clone()));
+            assert_eq!(rmux_endpoint().as_deref(), Some("/tmp/selected-rmux.sock"));
+            let args: Vec<_> = ambient_command()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                args.iter().any(|a| a == "/tmp/selected-rmux.sock"),
+                "{args:?}"
+            );
+            std::thread::spawn(|| assert!(selected_endpoint().is_none()))
+                .join()
+                .unwrap();
+            let _ = std::panic::catch_unwind(|| with_endpoint(None, || panic!("rollback")));
+            assert_eq!(selected_endpoint(), Some(selected));
+        });
+        assert_eq!(selected_endpoint(), before);
+    }
 
     #[test]
     fn popup_arguments_survive_shell_metacharacters() {

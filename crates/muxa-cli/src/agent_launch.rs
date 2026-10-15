@@ -784,7 +784,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
 
 fn register_launched_agent(request: &StartRequest, pane: &str) {
     use muxa::backend::PaneBackend;
-    let observed = if let Some(endpoint) = muxa::backend::rmux::endpoint_from_env() {
+    let observed = if let Some(endpoint) = crate::mux_control::rmux_endpoint() {
         muxa::RmuxBackend::with_endpoint(endpoint).resolve_pane(&format!("rmux:{pane}"))
     } else {
         muxa::TmuxBackend::new().resolve_pane(pane)
