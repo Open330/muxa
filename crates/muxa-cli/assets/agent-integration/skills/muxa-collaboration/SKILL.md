@@ -44,9 +44,10 @@ schemas and returned IDs describe the currently installed capabilities.
    its completion wake or a substantive work checkpoint; avoid short timeout polling. Keep the returned
    `request_id`; retrieve the structured reply with `muxa_wait_reply`. For an
    existing report or feedback request, use `muxa_peer_report` before sending work.
-4. A timeout or `peer_pending` means the request may still be active. Continue
-   waiting on the same request rather than dispatching duplicate work. When a
-   host yields a running tool cell, resume that cell with the host's wait tool.
+4. A timeout or `peer_pending` is not proof that the peer can still work.
+   Wait in slices of at most 60 seconds, then follow **Peer interruption recovery**
+   before repeating the same request. Never dispatch duplicate work. Resume a
+   yielded tool cell with the host's wait tool instead of starting another wait.
 5. Inspect replies against the actual files and relevant checks. Apply valid
    findings, explain rejected findings when material, and integrate the result.
 
@@ -96,6 +97,25 @@ message without waking. Wake delivery and `expects_reply` are independent.
 Terminal replies already wake the requester; do not send a second completion notice.
 The coordinator reports meaningful outcomes and needed decisions to the user, not
 an update for every peer message. Inspect installed schemas before using `notify`.
+
+## Interrupted peers and human decisions
+
+For an explicit `reason="peer_interrupted"`, read `interruption` and reuse its
+`action_request_id`; do not dispatch duplicate work or repeatedly wait blindly.
+A timeout alone proves neither interruption nor completion. Check fresh recipient
+identity/health once at a checkpoint. If no interruption was recorded, consult
+`muxa_collaboration_guide(workflows=true)` or the recovery reference for options.
+Record one recovery update on the original open request. Reassignment needs a
+verified stop/handoff or an isolated worktree so the old worker cannot overlap.
+
+For a real approval, choice, or missing information, use `target="human"`,
+`kind="question"`, `expects_reply=true`, and the supported `human_action`.
+Include the existing parent request when applicable and reuse the returned ID.
+Continue independent authorized work while awaiting the actual answer; timeout
+is not consent, and a submitted answer may be a refusal. Existing authorization
+counts. Keep the parent open until its work ends. Never impersonate the console
+or answer a human request as an agent. Use the existing user conversation when
+this protocol is unavailable. Keep remote host/request identity together.
 
 ## Authority and unavailable capabilities
 

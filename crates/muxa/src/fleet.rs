@@ -1500,6 +1500,7 @@ mod tests {
                 dispatch_id: None,
                 source_node_id: None,
                 delegation_parent: None,
+                human_action: None,
                 initiator: None,
                 kind: crate::collaboration::RequestKind::Review,
                 body: "review this change".into(),

@@ -338,6 +338,7 @@ async fn main() -> Result<()> {
     // Desktop notifier: spawned only when opted in. We subscribe BEFORE
     // the server starts accepting events so no early transition is lost.
     if cfg.notifier.enabled && matches!(cfg.notifier.backend, NotifierBackend::Libnotify) {
+        tokio::spawn(Notifier::new().run_human_requests(collaboration.clone()));
         let rx = store.subscribe();
         tokio::spawn(async move {
             if let Err(e) = Notifier::new().run(rx).await {
@@ -1536,7 +1537,7 @@ fn spawn_collaboration_waker_task(
     backends: Vec<muxa::SharedBackend>,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if !cfg.collaboration.enabled || cfg.collaboration.wake == CollaborationWake::Never {
+    if !cfg.collaboration.enabled {
         return None;
     }
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -1546,16 +1547,25 @@ fn spawn_collaboration_waker_task(
     let mut mailbox_changes = collaboration.subscribe();
     let mut agent_transitions = store.subscribe();
     let wake_payload = cfg.collaboration.wake_payload;
+    let wake_enabled = cfg.collaboration.wake != CollaborationWake::Never;
     Some(tokio::spawn(async move {
         let mut wake_inflight = HashSet::new();
-        wake_idle_collaboration_peers_with_inflight(
-            &collaboration,
-            &store,
-            &backends,
-            wake_payload,
-            &mut wake_inflight,
-        )
-        .await;
+        if let Err(error) = collaboration
+            .reconcile_peer_interruptions(&store.snapshot().await)
+            .await
+        {
+            tracing::warn!(%error, "initial peer interruption reconciliation failed");
+        }
+        if wake_enabled {
+            wake_idle_collaboration_peers_with_inflight(
+                &collaboration,
+                &store,
+                &backends,
+                wake_payload,
+                &mut wake_inflight,
+            )
+            .await;
+        }
         let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(
             COLLABORATION_WAKE_RECONCILE_SECONDS,
         ));
@@ -1602,14 +1612,22 @@ fn spawn_collaboration_waker_task(
                 _ = shutdown_rx.recv() => break,
             };
             if should_scan {
-                wake_idle_collaboration_peers_with_inflight(
-                    &collaboration,
-                    &store,
-                    &backends,
-                    wake_payload,
-                    &mut wake_inflight,
-                )
-                .await;
+                if let Err(error) = collaboration
+                    .reconcile_peer_interruptions(&store.snapshot().await)
+                    .await
+                {
+                    tracing::warn!(%error, "peer interruption reconciliation failed");
+                }
+                if wake_enabled {
+                    wake_idle_collaboration_peers_with_inflight(
+                        &collaboration,
+                        &store,
+                        &backends,
+                        wake_payload,
+                        &mut wake_inflight,
+                    )
+                    .await;
+                }
             }
         }
     }))
@@ -3576,6 +3594,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_recovery_runs_when_terminal_wake_is_disabled() {
+        let store = muxa::Store::shared();
+        add_capped_agent(&store, "%1", "sender").await;
+        add_capped_agent(&store, "%2", "recipient").await;
+        let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let sender = participants
+            .iter()
+            .find(|p| p.pane == "%1")
+            .unwrap()
+            .clone();
+        let recipient = participants
+            .iter()
+            .find(|p| p.pane == "%2")
+            .unwrap()
+            .clone();
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        mailbox
+            .create(
+                sender,
+                recipient,
+                NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut cfg = Config::default();
+        cfg.collaboration.enabled = true;
+        cfg.collaboration.wake = CollaborationWake::Never;
+        let (shutdown, _) = broadcast::channel(1);
+        let worker =
+            spawn_collaboration_waker_task(&cfg, mailbox.clone(), store, vec![], &shutdown)
+                .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if mailbox.pending_human_notifications().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.send(()).unwrap();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn collaboration_waker_reacts_to_mailbox_revision() {
         let store = muxa::Store::shared();
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
@@ -3619,6 +3687,7 @@ mod tests {
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Question,
                     body: "wake from revision".into(),
@@ -3766,6 +3835,7 @@ mod tests {
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Review,
                     body: "review the pending diff".into(),
@@ -3847,6 +3917,7 @@ mod tests {
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "change only the authorized file".into(),
@@ -3907,6 +3978,7 @@ mod tests {
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "unsafe\u{1b}[201~\rsubmit".into(),
@@ -3972,6 +4044,7 @@ mod tests {
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "operator request body".into(),
@@ -4058,6 +4131,7 @@ mod tests {
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "agent delegated body".into(),
@@ -4132,6 +4206,7 @@ mod tests {
                         dispatch_id: None,
                         source_node_id: None,
                         delegation_parent: None,
+                        human_action: None,
                         initiator: None,
                         kind: RequestKind::Task,
                         body: body.into(),
@@ -4224,6 +4299,8 @@ mod tests {
                 sender.clone(),
                 recipient.clone(),
                 NewRequest {
+                    human_action: None,
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "do not inject this twice".into(),
                     work_mode: WorkMode::Execute,
@@ -4270,6 +4347,7 @@ mod tests {
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "the prompt text is already buffered".into(),
@@ -4336,6 +4414,7 @@ mod tests {
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Review,
                     body: "secret request body".into(),
@@ -4462,6 +4541,7 @@ mod tests {
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
+                    human_action: None,
                     initiator: None,
                     kind: RequestKind::Task,
                     body: "dispatched by a human".into(),

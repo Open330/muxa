@@ -35,6 +35,7 @@ import {
 } from "./workspace-rail.mjs";
 import {
   collaborationSequence,
+  needsHumanResponse,
   dominantCount,
   normalizeCollaborationPayload,
   participantIdentity,
@@ -3889,7 +3890,7 @@ function renderCollaboration() {
   const projection = projectCollaboration(scoped);
   store.cache.collaborationProjection = projection;
   const page = data.pagination;
-  dom.collaborationMeta.textContent = `${projection.nodes.length} participants · ${scoped.length} messages`
+  dom.collaborationMeta.textContent = `${projection.humanCount} need your response (loaded) · ${projection.nodes.length} participants · ${scoped.length} messages`
     + (scoped.length !== data.requests.length ? ` of ${data.requests.length}` : "");
   renderCollaborationScope();
   dom.collaborationPageMeta.textContent = page.has_more
@@ -4053,7 +4054,7 @@ function renderCollaborationGraph(projection) {
         <title>${edge.count} requests · ${edge.replyCount} replies · ${dominant}</title>
       </path>
       ${replyPath}
-      <text class="collaboration-edge-label" x="${midpoint.x}" y="${midpoint.y}">${edge.count} req${edge.replyCount ? ` · ${edge.replyCount} reply` : ""}</text>
+      <text class="collaboration-edge-label" x="${midpoint.x}" y="${midpoint.y}">${edge.count} req${edge.replyCount ? ` · ${edge.replyCount} reply` : ""}${edge.humanCount ? ` · ${edge.humanCount} need you` : ""}</text>
     </g>`;
   }).join("");
   const nodes = projection.nodes.map((node) => {
@@ -4207,6 +4208,8 @@ function renderCollaborationDetail(request) {
     </div>
     <div class="collaboration-detail-actions"><button class="control-btn" type="button" data-copy-collaboration-link>copy link</button>${detailsIncluded ? '<button class="control-btn" type="button" data-copy-collaboration-message>copy conversation</button>' : ""}</div>
     <dl class="collaboration-detail-meta">
+      <dt>response needed</dt><dd>${needsHumanResponse(request) ? `you · ${esc(request.human_action || "information")}` : ["queued", "claimed"].includes(request.status) && request.expects_reply ? "agent" : "none"}</dd>
+      ${request.interruption ? `<dt>peer recovery</dt><dd>${esc(request.interruption.reason)} · ${request.interruption.active ? "active" : "cleared"}</dd><dt>original request</dt><dd>${esc(request.interruption.request_id)}</dd><dt>reset</dt><dd>${esc(request.interruption.reset_at || "unknown")}</dd><dt>action request</dt><dd>${esc(request.interruption.action_request_id || "coordinator notified")}</dd>` : ""}
       <dt>id</dt><dd>${esc(request.id)}</dd>
       <dt>room</dt><dd>${esc(roomLabel(request))}</dd>
       <dt>from</dt><dd>${esc(request.from?.console ? "operator console" : `${request.from?.agent_kind || "agent"} · ${request.from?.pane || "—"}`)}</dd>

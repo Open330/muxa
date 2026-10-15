@@ -81,7 +81,9 @@ impl FleetRuntime {
             let current = rx.borrow_and_update().clone();
             match current {
                 Some(Err(error)) => return Err(error),
-                Some(Ok(request)) if request.status.is_terminal() => return Ok(Some(request)),
+                Some(Ok(request)) if request.status.is_terminal() || request.peer_interrupted() => {
+                    return Ok(Some(request))
+                }
                 Some(Ok(request))
                     if after_update.is_some_and(|seen| {
                         request.updates.last().is_some_and(|u| u.sequence > seen)
@@ -145,7 +147,7 @@ impl FleetRuntime {
             let mut disconnected = false;
             match result {
                 Ok(request) => {
-                    let terminal = request.status.is_terminal();
+                    let terminal = request.status.is_terminal() || request.peer_interrupted();
                     sender.send_replace(Some(Ok(request)));
                     if terminal {
                         tracing::debug!(request_id = %key.2, reads, "fleet reply wait completed");
@@ -258,6 +260,32 @@ mod tests {
                 .wait_for_reply("local".into(), pane, id, Duration::from_secs(seconds), None)
                 .await
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interruption_releases_shared_wait_without_fabricating_reply() {
+        let (runtime, mut commands, pane, mut request) = fixture(true).await;
+        let waiting = wait(runtime.clone(), pane, &request, 300);
+        request.interruption = Some(crate::collaboration::PeerInterruption {
+            request_id: request.id.clone(),
+            reason: "rate_limited".into(),
+            active: true,
+            observed_at: time::OffsetDateTime::now_utc(),
+            reset_at: None,
+            action_request_id: Some("human-action".into()),
+            decision: None,
+        });
+        commands
+            .recv()
+            .await
+            .unwrap()
+            .reply
+            .send(Ok(FleetCommandResult::collaboration_request(request)))
+            .unwrap();
+        let result = waiting.await.unwrap().unwrap().unwrap();
+        assert!(result.peer_interrupted());
+        assert!(!result.status.is_terminal());
+        assert!(result.reply.is_none());
     }
 
     #[tokio::test(start_paused = true)]
