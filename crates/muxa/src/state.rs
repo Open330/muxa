@@ -1594,6 +1594,18 @@ impl Store {
         changed
     }
 
+    /// Forget one exact agent session, including rows on partially observed
+    /// hosts. This only changes the registry: no process or pane is stopped.
+    /// A later hook or inventory scan can register the agent again.
+    pub async fn forget_agent(&self, session_id: &str) -> bool {
+        let removed = self.agents.write().await.remove(session_id).is_some();
+        if removed {
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
+        removed
+    }
+
     /// Immediately delete fully orphaned rows (no pane, surface, or pid)
     /// whose last activity predates `cutoff`. The on-demand analogue of the
     /// reconciler's `mark_stale_paneless_stopped` age-out — backs `muxa

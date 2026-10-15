@@ -179,6 +179,21 @@ Linear/GitHub/Jira issue는 Work에 연결되는 선택적 외부 참조이며 W
 workflow까지 하나의 시나리오로 익히게 합니다. 기존 tmux server는 건드리지 않고
 종료할 때 sandbox 전체를 삭제합니다.
 
+### 오래된 에이전트 기록 삭제
+
+Muxa를 재설치해도 registry는 보존됩니다. cmux는 일부 surface만 관측하므로
+에이전트가 종료되어도 pane 정보가 있는 기록이 남을 수 있습니다.
+`muxa registry prune`은 pane, surface, pid가 없는 orphan 기록만 삭제합니다.
+`muxa status --json`에서 해당 기록의 `agent_session_id`를 확인한 뒤 실행합니다.
+
+```sh
+muxa registry forget <agent_session_id>
+# 확인을 생략하려면 --yes를 추가합니다.
+```
+
+지정한 registry 기록 하나만 삭제하며 프로세스나 터미널은 종료하지 않습니다.
+실행 중인 에이전트는 이후 hook이나 scan으로 다시 등록될 수 있습니다. 프롬프트 이력은 보존됩니다.
+
 ### `muxa watch`에서 바로 협업합니다
 
 기억할 규칙은 하나입니다. **tmux window 하나가 협업 room 하나**입니다.
@@ -307,7 +322,7 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 | `muxa stats report --since week` | day/project/agent/session 모든 breakdown을 ACT/WACT 중심 테이블로 표시 (`--json` / `--markdown`로 export). |
 | `muxa timeline --since today` | session별로 묶은 interactive timeline. `--session main`, `--agent codex`로 필터링하고 `--sort waiting` 정렬이나 `--view heatmap`을 사용할 수 있음. |
 | `muxa stats activity --type agent\|tmux\|human` | raw activity ledger interval 조회. |
-| `muxa registry sync` / `prune` / `panes` | pane scan으로 registry backfill, orphan row 정리, pane host 목록. |
+| `muxa registry sync` / `prune` / `forget` / `panes` | registry backfill, orphan 정리, 정확한 agent session ID로 기록 삭제, pane host 목록. |
 | `muxa agent start --agent codex [--host auto\|native\|tmux]` | allowlist agent 실행. `auto`는 실제 tmux 셸에서는 tmux를, 일반 터미널에서는 muxa-owned PTY를 사용. |
 | `muxa work start muxa-onboarding --workspace muxa --agent codex ...` | workspace session과 work window를 만들거나 재사용하고 agent pane을 추가. |
 | `muxa workspace list/show/close` | workspace/project session을 조회하거나 명시적으로 종료. |

@@ -466,6 +466,17 @@ enum RegistryCmd {
     /// tmux sessions are never touched. The daemon also ages these out on
     /// its own after `[reconciler] paneless_stale_timeout_secs` (24h default).
     Prune(PruneArgs),
+    /// Forget one agent registry row by its exact session id.
+    ///
+    /// Use `muxa status --json` to find `agent_session_id`. Useful for stale
+    /// cmux records that prune cannot remove. Leaves the process and pane
+    /// running; a later hook or scan can register the agent again.
+    Forget {
+        session_id: String,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Debug: print the active pane-host inventory.
     Panes,
 }
@@ -1521,6 +1532,9 @@ async fn main() -> Result<()> {
             RegistryCmd::Prune(prune) => {
                 cmd_prune(&client, &prune.older_than, prune.all, prune.yes).await
             }
+            RegistryCmd::Forget { session_id, yes } => {
+                cmd_forget_agent(&client, &session_id, yes).await
+            }
             RegistryCmd::Panes => cmd_panes(),
         },
         Cmd::Peek(peek_args) => peek::run(&client, peek_args).await,
@@ -1712,6 +1726,32 @@ async fn cmd_prune(client: &Client, older_than: &str, all: bool, yes: bool) -> R
     }
     let pruned = client.prune(Duration::from_secs(max_age_secs)).await?;
     println!("Pruned {pruned} orphan agent row(s).");
+    Ok(())
+}
+
+async fn cmd_forget_agent(client: &Client, session_id: &str, yes: bool) -> Result<()> {
+    let agent = client.snapshot().await?.into_iter()
+        .find(|agent| agent.session_id == session_id)
+        .with_context(|| format!("No agent with exact session id {session_id:?}. Use muxa status --json to find agent_session_id."))?;
+    if !yes {
+        let proceed = cliclack::confirm(format!(
+            "Forget {} session {} ({})? Only its registry row is removed; later activity can register it again.",
+            agent.kind,
+            agent.session_id,
+            agent.pane.as_deref().unwrap_or("no pane"),
+        ))
+        .initial_value(false)
+        .interact()?;
+        if !proceed {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+    if client.forget_agent(session_id).await? {
+        println!("Forgot agent session {session_id}.");
+    } else {
+        println!("Agent session {session_id} was already absent.");
+    }
     Ok(())
 }
 
@@ -4958,6 +4998,59 @@ mod tests {
     use muxa::AgentKind;
     use time::macros::datetime;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn registry_forget_requires_exact_session_argument() {
+        let args =
+            Args::try_parse_from(["muxa", "registry", "forget", "exact-session", "--yes"]).unwrap();
+        assert!(matches!(args.cmd, Some(Cmd::Registry {
+            action: RegistryCmd::Forget { session_id, yes: true }
+        }) if session_id == "exact-session"));
+        assert!(Args::try_parse_from(["muxa", "registry", "forget"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn registry_forget_rejects_prefix_and_removes_selected_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("forget-cli.sock");
+        let store = muxa::Store::shared();
+        let server = muxa::ipc::Server::new(socket.clone(), store.clone());
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let client = Client::new(socket);
+        for name in ["ghost-exact", "ghost-other"] {
+            client
+                .ingest(&muxa::AgentEvent::Started {
+                    id: muxa::AgentId {
+                        kind: AgentKind::Codex,
+                        session_id: name.into(),
+                        surface: None,
+                        pane: Some(format!("cmux:{name}")),
+                        tmux_socket: Some("/tmp/cmux.sock".into()),
+                        cwd: None,
+                    },
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await
+                .unwrap();
+        }
+        let err = cmd_forget_agent(&client, "ghost", true).await.unwrap_err();
+        assert!(err.to_string().contains("exact session id"));
+        assert_eq!(store.snapshot().await.len(), 2);
+        cmd_forget_agent(&client, "ghost-exact", true)
+            .await
+            .unwrap();
+        assert!(store.by_session("ghost-exact").await.is_none());
+        assert!(store.by_session("ghost-other").await.is_some());
+        shutdown.send(()).unwrap();
+        handle.await.unwrap();
+    }
 
     #[tokio::test]
     async fn prune_command_includes_missing_native_session_in_preview() {
