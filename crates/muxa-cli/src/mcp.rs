@@ -1517,7 +1517,9 @@ async fn call_tool(
             };
             Ok(
                 match client.collaboration_cancel(&origin, request_id).await {
-                    Ok(request) => json_result(&request_ack(&request)),
+                    Ok(request) => {
+                        json_result(&crate::collaboration_output::mutation_receipt(&request))
+                    }
                     Err(error) => error_result(&format!("cancel_message failed: {error}")),
                 },
             )
@@ -4581,6 +4583,58 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(legacy["request"]["body"], request.body);
+        let queued = mailbox
+            .create(
+                room.current.clone(),
+                room.peers[0].clone(),
+                new_request_from_args(
+                    &json!({}),
+                    RequestKind::Question,
+                    "private cancellation instructions".into(),
+                    true,
+                    WorkMode::ReadOnly,
+                    vec![],
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cancelled = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "muxa_cancel_message",
+                    json!({
+                        "request_id":queued.id
+                    }),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(cancelled["request_id"], queued.id);
+        assert_eq!(cancelled["delivery_state"], "cancelled");
+        assert_eq!(cancelled["final_reply_received"], false);
+        for field in [
+            "from",
+            "to",
+            "initiator",
+            "body",
+            "notify",
+            "reported_status",
+        ] {
+            assert!(cancelled.get(field).is_none(), "unexpected {field}");
+        }
+        let stored = client.collaboration_get(&origin, &queued.id).await.unwrap();
+        assert_eq!(stored.body, queued.body);
+        assert_eq!(stored.status, RequestStatus::Cancelled);
+        eprintln!(
+            "cancel_receipt_bytes: initial={}, follow_up={}",
+            serde_json::to_vec(&request_ack(&queued)).unwrap().len(),
+            serde_json::to_vec(&cancelled).unwrap().len()
+        );
+
         shutdown.send(()).unwrap();
         daemon.await.unwrap();
     }
