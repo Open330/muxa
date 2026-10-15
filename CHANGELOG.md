@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.58] - 2026-10-15
+
 ### Added
 
 - Run `muxa` with no subcommand to open tracked agents or choose an installed
@@ -15,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `muxa onboard --quick` prepares practice agents for a three-step watch and
   attend demo without agent API calls. The empty watch screen offers agent
   creation and, outside tmux, the short demo.
+- `muxa msg expire --older-than <age> [--dry-run]` expires requests nobody
+  claimed, whoever sent them, including senders that no longer exist.
+- `muxa reload mcp [--codex-home DIR | --all]` refreshes a shared Codex
+  app-server's Muxa MCP connections without restarting it or starting a turn:
+  it writes a binary revision into the owned MCP entry, reloads, and verifies
+  each loaded connection (exit 2 while a refresh is still pending).
+- `muxa ask --new` starts a fresh provider conversation, and
+  `muxa ask provider use <id>` makes a provider the default (`[ask] agent`).
+- `muxa agent move` / `muxa window move` relocate live agents and whole windows
+  without restarting them.
+- Automation starter rules (disabled by default) installed by `muxa init`.
+- The dashboard collaboration reader is resizable, keeps its reading position,
+  and navigates retained history.
 
 ### Changed
 
@@ -25,6 +40,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `muxa watch`, with each session's state counts. Grouped `~view~` sessions
   fold onto their base, and paneless agents are listed last. `--flat` keeps
   the previous one-row-per-agent table; `--json` is unchanged.
+- `muxa --help` groups commands by purpose. Several commands moved under a
+  parent; the old names still work as hidden aliases:
+  `logs` → `daemon logs`, `sync`/`prune`/`panes` → `registry …`,
+  `run`/`attach`/`detach`/`register` → `proc …`,
+  `report`/`activity` → `stats report`/`stats activity` (`--since`/`--theme`
+  work on either side of the view), `host` → `fleet host`.
+- Agent-facing collaboration output is compact. `muxa msg wait` and the MCP
+  wait/report tools report `delivery_state`, `final_reply_received` and
+  `reported_status`, a wait timeout exits 2, and `--body [--output FILE]`
+  prints only the reply. `muxa msg list` shows 20 metadata rows by default
+  (`--limit 0` for all, `--full` for bodies, `--request-id` for one request).
+  `--full` / `full=true` return the previous complete records.
+- `muxa doctor` groups checks into a tree (muxad, Hooks, Agent integration,
+  tmux, Config). Passing sections fold to one line; `-v` lists every check.
+  It also warns about requests left unclaimed for over a day.
+- A wake that goes out anyway names the recipient's unread one-way notices.
 
 ### Fixed
 
@@ -62,6 +93,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name panes from every active host, matched to the agent's server. When no
   live listing exists they fall back to the session muxad recorded. `muxa
   sync` discovers agents on every active host.
+- After a multiplexer restart (`muxa reload`, an rmux upgrade), agents keep
+  their identity. A resumed session moves to the pane its hook reports. An
+  idle resumed agent is rebound, or registered if its row was reaped, from its
+  `--resume` / `codex resume` id. A dead session left on a reused pane id is
+  stopped once its pane has run no agent for an hour. Before, collaboration
+  could address another agent's pane, or a service pane, under a stale id.
+- The workload scan dropped panes whose agent had no child processes, losing
+  most idle agents' workload.
+- Screen detection no longer flips a restored Codex pane between idle and
+  stopped every few seconds until its first hook.
+- A pending request is offered only to a recipient delivery accepts. A reused
+  pane id in another window made muxad retry a refused wake on every tick and
+  flood the log.
+- muxad and headless `muxa ask` turns no longer inherit the session env
+  (`CLAUDE_CONFIG_DIR`, messaging socket) of the agent that started muxad, so
+  asks run as the configured account. Headless turns set `MUXA_ASK=1` for
+  user hooks, and a failed turn shows the reason the CLI printed on stdout.
+- `muxa doctor` no longer starts a stray rmux server on the default tmux
+  socket when scoped by `MUXA_TMUX_SOCKET`. It also no longer warns about a
+  missing `MUXA_SOCKET` pin on the default socket, or about systemd when a
+  shell rc starts muxad.
+- `muxa daemon logs | head` exits quietly instead of panicking on a closed
+  pipe.
+- Security: rustls 0.23.46 (RUSTSEC-2026-0346 and three related advisories:
+  TLS secrets in `Debug` output, data sent after ECH rejection, unbounded
+  brotli certificate decompression, ServerHello key-exchange downgrade).
+- Prompts sent to agents use explicit bracketed-paste boundaries before
+  submitting, and multiline text survives.
 
 ## [0.8.57] - 2026-10-11
 
@@ -4182,7 +4241,8 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.57...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.58...HEAD
+[0.8.58]: https://github.com/Open330/muxa/compare/v0.8.57...v0.8.58
 [0.8.57]: https://github.com/Open330/muxa/compare/v0.8.56...v0.8.57
 [0.8.56]: https://github.com/Open330/muxa/compare/v0.8.55...v0.8.56
 [0.8.55]: https://github.com/Open330/muxa/compare/v0.8.54...v0.8.55
