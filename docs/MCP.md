@@ -182,14 +182,14 @@ it:
 | Tool | Arguments | Does |
 | --- | --- | --- |
 | `muxa_status` | `pane?`, `full?`, `include_capture?`, `history_limit?`, `max_capture_lines?` | Return a compact fleet/agent summary by default, the complete topology with `full=true`, or one focused pane. |
-| `muxa_recent_prompts` | `pane?`, `limit?` | Recent prompt-history entries (newest first), optionally scoped to one pane. |
+| `muxa_recent_prompts` | `pane?`, `limit?`, `full?` | Recent prompts (newest first): default 20, maximum 100. `full=true` explicitly permits larger limits or all retained history. |
 | `muxa_guide` | — | Return the user's configured surface, agent, option, direction, and free-form orchestration preferences. |
 | `muxa_start_agent` | `agent?`, `options?`, `workspace?`, `work?`, `role?`, `task?`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Create/reuse a workspace session and work window, or start an allowlisted agent in a lower-level tmux surface. `agent` is optional only when configured in `[mcp.guide]`. |
 | `muxa_start_work` | `work`, `pipeline?`, `workspace?`, `cwd?`, `body?`, `skill?`, `context?`, `no_ticket?`, `refresh?`, `dry_run?` | Bring a work item's window to the state its pipeline declares: resolve the ticket, route it, create the missing agent panes, and deliver `body` to the ones already running. |
 | `muxa_manage_tmux` | `action`, `pane?`, `workspace?`, `work?`, `confirm?` | List/show/close managed workspaces and work; interrupt/terminate an agent pane. |
 | `muxa_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
 | `muxa_capture_pane` | `pane` | Capture the visible contents of a pane. |
-| `muxa_fleet_status` | `selector?` | Read the cached local/remote physical-host hierarchy and capabilities. |
+| `muxa_fleet_status` | `selector?`, `full?` | Cached host health, capabilities, counts and up to 20 active agent identities per host. `full=true` returns the complete hierarchy. |
 | `muxa_fleet_capture` | `host`, `pane` | Capture one exact pane on a named Fleet host. |
 | `muxa_fleet_send_prompt` | `host`, `pane`, `text`, `submit?` | Inject literal text into one exact Fleet pane on a control-authorized host. |
 | `muxa_fleet_call_peer` | `host`, `pane`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?` | Send durable structured work to one explicitly selected Fleet agent and optionally wait for its reply. |
@@ -197,7 +197,7 @@ it:
 | `muxa_fleet_update_request` | `host`, `pane_key`, `request_id`, `body` | Add guidance to the original Fleet request without prompt injection. |
 | `muxa_fleet_wait_reply` | `host`, `pane_key`, `request_id`, `timeout_secs?`, `after_update?` | Continue an exact remote durable reply wait, including after the target pane exits. |
 | `muxa_wait_for_change` | `timeout_secs?`, `pane?`, `until?`, `include_capture?` | Wait for any change or a focused settled/idle/blocked/stopped state, optionally returning the screen. |
-| `muxa_collaboration_guide` | `workflows?` | Return identity, preferences and guardrails. `workflows=true` adds detailed reviewer/subagent/AIR examples. |
+| `muxa_collaboration_guide` | `workflows?` | Return identity, preferences, guardrails and running-daemon capabilities. `workflows=true` adds detailed examples; human-action guidance requires `capabilities.human_actions=true`. |
 | `muxa_room_context` | — | Identify self, list same-window peers, and report unread request/reply counts. |
 | `muxa_call_peer` | `target?`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?`, `spawn_if_missing?`, `spawn_agent?`, `spawn_timeout_secs?`, `air_artifacts?` | Expand a registered skill, select a peer, send a durable request, optionally wait for its reply, and explicitly spawn an agent when no peer exists. |
 | `muxa_peer_report` | `target?`, `request_id?`, `full?` | Read a received final reply without repeating the original request. `full=true` returns the legacy full record. |
@@ -308,7 +308,7 @@ Mutation receipts and waits omit the original body and audit metadata.
 repeat the prompt. `full=true` opts into the legacy full stored request under `request`.
 Inbox retains the entire instruction/authority/path/artifact contract.
 Lists return at most 20 metadata records by default, with `has_more` and
-`next_offset`; set `include_body=true` for instructions. An exact `request_id`
+`next_offset`; set `include_body=true` with an exact `request_id` for instructions (or explicitly use `full=true` for bulk diagnostics). An exact `request_id`
 read also returns an existing reply. For progress, use that ID with
 `after_update`, then resume with `next_after_update`; `first_retained_sequence`
 identifies the beginning of retained progress. `full=true` returns legacy records.

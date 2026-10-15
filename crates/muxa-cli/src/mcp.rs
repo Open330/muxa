@@ -461,7 +461,8 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "pane": { "type": "string", "description": "Pane id to filter to (e.g. %12, rmux:%12, or herdr:p1). Omit for all panes." },
-                    "limit": { "type": "integer", "minimum": 0, "description": "Max entries. 0 or omitted = all retained." },
+                    "limit": { "type": "integer", "minimum": 0, "description": "Default 20; normal range 1..100. Larger limits or 0 require full=true." },
+                    "full": { "type": "boolean", "description": "Explicit full-history read; omitted limit or limit=0 returns all retained entries. Default false." },
                 },
                 "additionalProperties": false,
             },
@@ -580,11 +581,12 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_fleet_status",
-            "description": "Read the cached physical-host Fleet hierarchy and health, including the always-present local controller node. Optionally filter hosts with a Kubernetes-style label selector. This does not open a new SSH connection per call.",
+            "description": "Read compact cached physical-host Fleet health, including the local controller. Full topology requires full=true. Optionally filter hosts with a Kubernetes-style label selector. This does not open a new SSH connection per call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "selector": { "type": "string", "description": "Optional label selector, for example environment=production,region in (icn,nrt)." }
+                    "selector": { "type": "string", "description": "Optional label selector, for example environment=production,region in (icn,nrt)." },
+                    "full": { "type": "boolean", "description": "Return complete cached host snapshots and topology. Default false: host health/counts and at most 20 active agents per host, without prompts." }
                 },
                 "additionalProperties": false
             }
@@ -822,7 +824,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_inbox",
-            "description": "Claim and read pending collaboration requests addressed to this exact agent session. Call promptly when muxa notifies you, honor each request's kind/work_mode/paths contract, and finish it with muxa_reply.",
+            "description": "Claim and read pending collaboration requests addressed to this exact agent session. Instructions are included by default; full=true is for diagnostics. Call promptly when muxa notifies you, honor each request's kind/work_mode/paths contract, and finish it with muxa_reply.",
             "inputSchema": { "type": "object", "properties": {"full": {"type":"boolean", "description":"Return legacy full records. Default false."}}, "additionalProperties": false },
         }),
         json!({
@@ -835,7 +837,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "request_id": {"type":"string", "description":"Read one exact request without claiming it."},
                     "limit": {"type":"integer", "minimum":1, "maximum":100, "description":"Newest records to return. Default 20."},
                     "offset": {"type":"integer", "minimum":0, "description":"Skip this many records. Default 0."},
-                    "include_body": {"type":"boolean", "description":"Include instructions and attachments. Default false."},
+                    "include_body": {"type":"boolean", "description":"Include instructions and attachments for an exact request_id; bulk reads require full=true. Default false."},
                     "after_update": {"type":"integer", "minimum":0, "description":"Include only progress after this sequence; use with request_id."},
                     "full": {"type":"boolean", "description":"Return legacy full records. Default false."}
                 },
@@ -991,17 +993,12 @@ async fn call_tool(
             }
             Ok(json_result(&payload))
         }
-        "muxa_recent_prompts" => {
-            let pane = args.get("pane").and_then(Value::as_str);
-            let limit = args
-                .get("limit")
-                .and_then(Value::as_u64)
-                .and_then(|n| usize::try_from(n).ok());
-            Ok(match client.recent_prompts(pane, limit).await {
-                Ok(prompts) => json_result(&json!({ "prompts": prompts })),
-                Err(e) => error_result(&format!("recent_prompts failed: {e}")),
-            })
-        }
+        "muxa_recent_prompts" => Ok(
+            match crate::mcp_output::recent_prompts(client, &args).await {
+                Ok(value) => json_result(&value),
+                Err(error) => error_result(&format!("recent_prompts failed: {error}")),
+            },
+        ),
         "muxa_guide" => Ok(json_result(&launch_guide_value(config))),
         "muxa_start_agent" => {
             let explicit_agent = args.get("agent").and_then(Value::as_str);
@@ -1159,7 +1156,10 @@ async fn call_tool(
         "muxa_fleet_status" => {
             let selector = args.get("selector").and_then(Value::as_str);
             Ok(match client.fleet_snapshot(selector).await {
-                Ok(snapshot) => json_result(&json!(snapshot)),
+                Ok(snapshot) => json_result(&crate::mcp_output::fleet_view(
+                    &snapshot,
+                    args.get("full").and_then(Value::as_bool).unwrap_or(false),
+                )),
                 Err(error) => error_result(&format!("fleet status failed: {error}")),
             })
         }
@@ -1287,6 +1287,7 @@ async fn call_tool(
                     args.get("workflows")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    crate::mcp_output::human_actions_supported(client).await,
                 )),
                 Err(error) => error_result(&format!("collaboration guide failed: {error}")),
             })
@@ -1325,6 +1326,11 @@ async fn call_tool(
             let Some(target) = args.get("target").and_then(Value::as_str) else {
                 return Ok(error_result("send_message requires a `target` argument"));
             };
+            if target.eq_ignore_ascii_case("human") {
+                if let Err(error) = crate::mcp_output::require_human_actions(client).await {
+                    return Ok(error_result(&error));
+                }
+            }
             let Some(body) = args.get("body").and_then(Value::as_str) else {
                 return Ok(error_result("send_message requires a `body` argument"));
             };
@@ -1382,8 +1388,8 @@ async fn call_tool(
             })
         }
         "muxa_list_messages" => {
-            if args.get("after_update").is_some() && args.get("request_id").is_none() {
-                return Ok(error_result("after_update requires an exact request_id"));
+            if let Err(error) = crate::mcp_output::validate_message_read(&args) {
+                return Ok(error_result(error));
             }
             let mailbox = match parse_mailbox(args.get("mailbox").and_then(Value::as_str)) {
                 Ok(mailbox) => mailbox,
@@ -1649,6 +1655,7 @@ fn collaboration_guide(
     room: RoomContext,
     config: &muxa::config::Config,
     include_workflows: bool,
+    human_actions: bool,
 ) -> Value {
     let next_step = match room.peers.len() {
         0 => "No peer is available. Continue locally or run another agent in this tmux window.",
@@ -1658,11 +1665,14 @@ fn collaboration_guide(
         }
     };
     let mut guide = json!({
+        "capabilities": {"human_actions":human_actions},
         "purpose": "Use another live agent as an independent reviewer or a bounded delegated subagent to improve important work.",
         "room": room,
         "user_launch_preferences": launch_guide_value(config),
         "message_skills": config.message.skills.keys().collect::<Vec<_>>(),
         "transport_contract": {
+            "discovery": "Find exact tool names, not shared descriptions. Read only needed schemas once; refresh after a capability/version change.",
+            "bounded_reads": "Prompt history defaults to 20 entries. Fleet status is a summary; full=true explicitly requests large data. Inbox already includes task instructions. include_body requires an exact request_id unless full=true.",
             "final_reply_received": "Only reports that a recipient submitted a final reply; never proves success.",
             "reported_status": "Recipient-declared completed/blocked/declined/failed. Muxa does not judge the work.",
             "timeout": "The wait ended; the work remains unchanged.",
@@ -1767,6 +1777,14 @@ fn collaboration_guide(
             "Do not delegate merely for ceremony or recursively bounce work without a concrete benefit."
         ]
     });
+    if !human_actions {
+        guide["workflows"]
+            .as_object_mut()
+            .unwrap()
+            .remove("human_feedback");
+        guide["workflows"]["peer_interruption"]["limitation"] = json!("The running daemon has not advertised human-action support. Use bounded health checks and the existing user conversation for required decisions.");
+        guide["workflows"]["peer_interruption"]["human"] = json!("Human-action support is unverified on the running daemon. Ask through the existing user conversation; do not retry peer aliases.");
+    }
     if !include_workflows {
         guide.as_object_mut().unwrap().remove("workflows");
     }
@@ -4241,6 +4259,8 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(PROBE, "1")
+                .env_remove("MUXA_HOST")
+                .env_remove("MUXA_HOSTS")
                 .env_remove("RMUX")
                 .env_remove("RMUX_PANE")
                 .env_remove("CMUX_SOCKET_PATH")
@@ -4347,6 +4367,28 @@ mod tests {
                 .unwrap(),
         );
         assert!(listing["requests"][0].get("body").is_none());
+        let bulk = dispatch(
+            &client,
+            &tool("muxa_list_messages", json!({"include_body":true})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bulk["result"]["isError"], true);
+        let body = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "muxa_list_messages",
+                    json!({
+                        "request_id":request.id,"include_body":true
+                    }),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(body["body"], request.body);
+
         let exact = decode(
             dispatch(
                 &client,
@@ -4738,7 +4780,11 @@ mod tests {
         }))
         .unwrap();
 
-        let guide = collaboration_guide(room, &muxa::config::Config::default(), true);
+        let legacy =
+            collaboration_guide(room.clone(), &muxa::config::Config::default(), true, false);
+        assert_eq!(legacy["capabilities"]["human_actions"], false);
+        assert!(legacy["workflows"].get("human_feedback").is_none());
+        let guide = collaboration_guide(room, &muxa::config::Config::default(), true, true);
         let recovery = &guide["workflows"]["peer_interruption"];
         assert_eq!(recovery["wait_slice_secs"], 60);
         assert!(recovery["health"]
@@ -4817,7 +4863,7 @@ mod tests {
             "self":request.from, "peers":[request.to], "unread":0, "unread_replies":0
         }))
         .unwrap();
-        let guide = collaboration_guide(room, &config, false);
+        let guide = collaboration_guide(room, &config, false, true);
         assert!(guide.get("workflows").is_none());
         for rule in [
             "TMUX_PANE",

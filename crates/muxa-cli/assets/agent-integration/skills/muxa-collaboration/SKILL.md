@@ -16,7 +16,10 @@ via `muxa_collaboration_guide(workflows=true)`.
 Later, refresh peers and unread counts with `muxa_room_context` only when they may
 have changed. Report your location from `self`; never derive it from `$TMUX_PANE` or
 tmux commands, which can name another pane (Codex's shared app-server). Tool
-schemas and returned IDs describe the currently installed capabilities.
+schemas and returned IDs describe the currently installed capabilities. Discover
+exact tool names (for example a name ending in `__muxa_inbox`), not matches in
+shared descriptions. Read only needed schemas and reuse them within the session;
+refresh after a version/capability change, not before every call.
 
 ## Execution layout
 
@@ -45,7 +48,7 @@ schemas and returned IDs describe the currently installed capabilities.
    `request_id`; retrieve the structured reply with `muxa_wait_reply`. For an
    existing report or feedback request, use `muxa_peer_report` before sending work.
 4. A timeout or `peer_pending` is not proof that the peer can still work.
-   Wait in slices of at most 60 seconds, then follow **Peer interruption recovery**
+   Wait in slices of at most 60 seconds, then follow **Interrupted peers and human decisions**
    before repeating the same request. Never dispatch duplicate work. Resume a
    yielded tool cell with the host's wait tool instead of starting another wait.
 5. Inspect replies against the actual files and relevant checks. Apply valid
@@ -67,10 +70,14 @@ is the recipient's declaration. Progress uses `muxa_update_request`; final repli
 use `muxa_reply`. A timeout or process idle/stopped observation is not completion.
 Do not decide status by searching words in the reply body.
 
+Inbox already includes required instructions; reserve `full=true` for diagnostics.
 Reports omit original requests. Lists default to 20 metadata records; retrieve
 instructions with `request_id` + `include_body=true`, and progress with that ID
 + `after_update` (resume with `next_after_update`). Use `full=true` only when
-legacy full records are necessary. Inbox preserves the instruction contract.
+legacy full records are necessary. `include_body=true` requires an exact request
+ID unless `full=true` explicitly requests full history. Inbox preserves the contract.
+Prompt history defaults to 20 entries (ordinary maximum 100). Fleet status is a
+compact summary; use `full=true` only when the complete data is needed.
 For CLI replies use `muxa msg wait REQUEST --body --output FILE` or `--body`
 for stdout. This avoids shell JSON parsing; never pass JSON through `echo`.
 CLI `muxa msg list --json` defaults to 20 metadata rows. Use
@@ -96,7 +103,7 @@ it never authorizes interrupting a busy agent. `notify=false` explicitly records
 message without waking. Wake delivery and `expects_reply` are independent.
 Terminal replies already wake the requester; do not send a second completion notice.
 The coordinator reports meaningful outcomes and needed decisions to the user, not
-an update for every peer message. Inspect installed schemas before using `notify`.
+an update for every peer message. Inspect only the relevant installed schema before using an unfamiliar option.
 
 ## Interrupted peers and human decisions
 
@@ -108,7 +115,10 @@ identity/health once at a checkpoint. If no interruption was recorded, consult
 Record one recovery update on the original open request. Reassignment needs a
 verified stop/handoff or an isolated worktree so the old worker cannot overlap.
 
-For a real approval, choice, or missing information, use `target="human"`,
+For a real approval, choice, or missing information, first verify
+`guide.capabilities.human_actions=true` and the relevant schema has
+`human_action`. Otherwise ask in the existing user conversation; do not retry
+`human`/`console` aliases. When supported, use `target="human"`,
 `kind="question"`, `expects_reply=true`, and the supported `human_action`.
 Include the existing parent request when applicable and reuse the returned ID.
 Continue independent authorized work while awaiting the actual answer; timeout

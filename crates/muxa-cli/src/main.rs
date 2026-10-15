@@ -19,6 +19,7 @@ mod init;
 mod interactive_child;
 mod logs;
 mod mcp;
+mod mcp_output;
 mod mcp_reload;
 mod mcp_revision;
 mod message_skill;
@@ -1994,6 +1995,11 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             notify,
             json,
         } => {
+            if target.eq_ignore_ascii_case("human") {
+                mcp_output::require_human_actions(client)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+            }
             let kind = collaboration_request_kind(&kind)?;
             let air_artifacts = collaboration_air_references(&air_refs)?;
             let request = client

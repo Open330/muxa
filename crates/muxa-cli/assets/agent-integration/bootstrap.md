@@ -16,3 +16,7 @@ reserve explicit wake notifications for blockers, decisions, conflicts, and hand
 For interrupted peers or real human decisions, read the recovery workflow in
 the collaboration guide (workflows=true). Reuse request IDs; an interruption
 keeps work open, and an answer is not automatic approval.
+
+Discover exact tool names; shared descriptions can match unrelated tools.
+Read only the schemas needed for the next action, and reuse them until the
+capabilities change. Check guide capabilities before using optional protocols.

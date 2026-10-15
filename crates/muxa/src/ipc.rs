@@ -788,6 +788,7 @@ const CAPABILITIES: &[&str] = &[
     "fleet_wait_reply",
     "collaboration_update",
     "collaboration_peer_recovery",
+    collaboration::HUMAN_ACTIONS_CAPABILITY,
     "pipeline_runs_v1",
     "pipeline_subscribe",
     "work_control_v1",

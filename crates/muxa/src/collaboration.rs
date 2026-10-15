@@ -49,6 +49,9 @@ impl Default for CollaborationOptions {
     }
 }
 
+/// Explicit daemon support for the human decision protocol.
+pub const HUMAN_ACTIONS_CAPABILITY: &str = "collaboration_human_actions_v1";
+
 /// The stable pane-shaped identity of the operator console. It is not a real
 /// pane id — `pane_id_host_kind` rejects it, which is what keeps the wake path
 /// from ever trying to type at a human.
