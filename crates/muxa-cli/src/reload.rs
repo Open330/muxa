@@ -25,8 +25,11 @@ use std::time::{Duration, Instant};
 
 use crate::mux_control;
 
+mod agent;
 mod launch;
 mod plan;
+#[cfg(not(target_os = "linux"))]
+mod process;
 mod store;
 
 use plan::RestoreReport;
@@ -709,7 +712,12 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
         .unwrap_or_default();
 
     let (windows, keep) = fold_window_groups(&windows);
+    #[cfg(not(target_os = "linux"))]
+    let processes = process::ProcessTable::read();
+    #[cfg(not(target_os = "linux"))]
+    let child_command = |pid: u32| processes.child_command(pid);
     let mut shapes = Vec::new();
+    let mut pane_pids = Vec::new();
     for line in panes.lines() {
         let f: Vec<&str> = line.split('\t').collect();
         let [session, window_index, window_id, pane_index, pane_id, shell_pid, path] = f[..] else {
@@ -718,21 +726,28 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
         if keep.get(window_id).map(String::as_str) != Some(session) {
             continue;
         }
-        let (command, argv) = match shell_pid.parse().ok().and_then(child_command) {
+        let process: Option<u32> = shell_pid.parse().ok();
+        let (command, argv) = match process.and_then(child_command) {
             Some(child) => (Some(child.command), child.argv),
             None => (None, None),
         };
+        let recorded = agents.get(&namespaced(endpoint.host, pane_id)).cloned();
         shapes.push(PaneShape {
             session: session.to_owned(),
             window_index: window_index.to_owned(),
             pane_index: pane_index.to_owned(),
             path: path.to_owned(),
             replayable: is_replayable_command(command.as_deref(), argv.as_deref()),
+            agent: agent::reconcile(recorded, argv.as_deref()),
             command,
             argv,
-            agent: agents.get(&namespaced(endpoint.host, pane_id)).cloned(),
         });
+        pane_pids.push(process);
     }
+    #[cfg(not(target_os = "linux"))]
+    recover_codex_threads(&mut shapes, &pane_pids, &processes);
+    #[cfg(target_os = "linux")]
+    let _ = pane_pids;
 
     Ok(Snapshot {
         version: SNAPSHOT_VERSION,
@@ -844,6 +859,53 @@ fn control_endpoint(endpoint: &BackendEndpoint) -> BackendEndpoint {
 /// to a pane of the same number elsewhere — and resume its conversation
 /// there. An agent without a recorded server is taken to be on the default
 /// one, which is what muxad assumes when it records nothing.
+/// Give each Codex pane muxa holds no thread id for the one thread begun in
+/// its directory after its agent started. Ambiguous panes stay unknown, and
+/// are left for a person to resume rather than relaunched as a new
+/// conversation.
+#[cfg(not(target_os = "linux"))]
+fn recover_codex_threads(
+    shapes: &mut [PaneShape],
+    pane_pids: &[Option<u32>],
+    processes: &process::ProcessTable,
+) {
+    let mut orphans = BTreeMap::new();
+    for (at, (shape, pane_pid)) in shapes.iter().zip(pane_pids).enumerate() {
+        let Some(agent) = &shape.agent else { continue };
+        if agent.kind != "codex" || agent::resumable(&agent.session_id) {
+            continue;
+        }
+        let Some(started) = pane_pid.and_then(|pid| processes.agent_started(pid, "codex")) else {
+            continue;
+        };
+        orphans.insert(
+            at,
+            agent::Orphan {
+                cwd: PathBuf::from(&shape.path),
+                started: i64::try_from(started).unwrap_or(i64::MAX),
+            },
+        );
+    }
+    let (Some(earliest), Some(sessions)) = (
+        orphans.values().map(|orphan| orphan.started).min(),
+        agent::codex_sessions_dir(),
+    ) else {
+        return;
+    };
+    let claimed: BTreeSet<String> = shapes
+        .iter()
+        .filter_map(|shape| shape.agent.as_ref())
+        .filter(|agent| agent.kind == "codex" && agent::resumable(&agent.session_id))
+        .map(|agent| agent.session_id.clone())
+        .collect();
+    let threads = agent::threads_since(&sessions, earliest - 60);
+    for (at, id) in agent::match_orphans(&orphans, &threads, &claimed) {
+        if let Some(agent) = shapes[at].agent.as_mut() {
+            agent.session_id = id;
+        }
+    }
+}
+
 fn agents_by_pane(agents: &[muxa::Agent], socket: &str) -> HashMap<String, AgentShape> {
     agents
         .iter()
@@ -894,7 +956,13 @@ fn interrupted_targets(snapshot: &Snapshot, relaunched: &BTreeSet<String>) -> Ve
     snapshot
         .panes
         .iter()
-        .filter(|pane| pane.agent.as_ref().is_some_and(|agent| agent.working))
+        // A conversation that did not come back has no turn to continue: a
+        // fresh agent told "continue" acts on nothing it knows.
+        .filter(|pane| {
+            pane.agent
+                .as_ref()
+                .is_some_and(|agent| agent.working && agent::resumable(&agent.session_id))
+        })
         .map(pane_target)
         .filter(|target| relaunched.contains(target))
         .collect()
@@ -1254,8 +1322,20 @@ fn replay_commands(
 /// because the wrapper it was launched through is unknown.
 fn resume_hint(pane: &PaneShape) -> Option<String> {
     let agent = pane.agent.as_ref()?;
-    if agent.session_id.is_empty() || agent.session_id.starts_with("synthetic") {
-        return None;
+    if !agent::resumable(&agent.session_id) {
+        if !starts_with_instruction(pane) {
+            return None;
+        }
+        let picker = match agent.kind.as_str() {
+            "claude_code" => "claude --resume",
+            "codex" => "codex resume",
+            _ => return None,
+        };
+        return Some(format!(
+            "started with an instruction, and its conversation id is unknown; \
+             relaunching would run the instruction again as a new task. Pick the \
+             conversation with `{picker}` (through the same wrapper)"
+        ));
     }
     let resume = match agent.kind.as_str() {
         "claude_code" => format!("claude --resume {}", agent.session_id),
@@ -1272,6 +1352,14 @@ fn resume_hint(pane: &PaneShape) -> Option<String> {
 /// conversation id spliced in when muxa knows one and the command does not
 /// already carry it.
 fn relaunch_command(pane: &PaneShape) -> Option<String> {
+    if starts_with_instruction(pane)
+        && pane
+            .agent
+            .as_ref()
+            .is_some_and(|agent| !agent::resumable(&agent.session_id))
+    {
+        return None;
+    }
     let resuming = pane.agent.as_ref().and_then(|agent| {
         (!agent.session_id.is_empty() && !agent.session_id.starts_with("synthetic"))
             .then_some(agent.kind.as_str())
@@ -1304,6 +1392,16 @@ fn relaunch_command(pane: &PaneShape) -> Option<String> {
         }
         _ => Some(command),
     }
+}
+
+/// An agent pane whose command carries an initial instruction: dropping the
+/// prompt changes its argv.
+fn starts_with_instruction(pane: &PaneShape) -> bool {
+    let (Some(agent), Some(argv)) = (pane.agent.as_ref(), pane.argv.as_deref()) else {
+        return false;
+    };
+    matches!(agent.kind.as_str(), "claude_code" | "codex")
+        && without_initial_prompt(argv, &agent.kind).len() != argv.len()
 }
 
 /// An agent launched with its first instruction (`claude … 'Read ISSUE.md
@@ -1824,53 +1922,6 @@ fn child_command(pane_pid: u32) -> Option<ChildCommand> {
     })
 }
 
-/// BSD `ps` has no `--ppid`, so every process is listed with its parent and
-/// the shell's children are picked out here. macOS only reports a command
-/// line joined; the original argument boundaries are not recoverable without
-/// `sysctl` (`KERN_PROCARGS2`), which needs unsafe code this workspace
-/// forbids, so an argument that contained a space replays split on it.
-#[cfg(not(target_os = "linux"))]
-fn child_command(pane_pid: u32) -> Option<ChildCommand> {
-    let output = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,command="])
-        .output()
-        .ok()?;
-    pane_command_of(&String::from_utf8_lossy(&output.stdout), pane_pid).map(|command| {
-        ChildCommand {
-            command,
-            argv: None,
-        }
-    })
-}
-
-/// What a pane runs, from a `ps -axo pid=,ppid=,command=` listing: the
-/// pane's own process when it is not a shell (a pane started with its
-/// command), else the first non-shell command among its children.
-#[cfg(any(not(target_os = "linux"), test))]
-fn pane_command_of(listing: &str, pane: u32) -> Option<String> {
-    let rows: Vec<(u32, u32, &str)> = listing
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse().ok()?;
-            let parent = fields.next()?.parse().ok()?;
-            let rest = line.trim_start();
-            let rest = rest[rest.find(char::is_whitespace)?..].trim_start();
-            let command = rest[rest.find(char::is_whitespace)?..].trim();
-            Some((pid, parent, command))
-        })
-        .collect();
-    let usable = |command: &str| !command.is_empty() && !is_shell(command);
-    if let Some((_, _, own)) = rows.iter().find(|(pid, _, _)| *pid == pane) {
-        if usable(own) {
-            return Some((*own).to_owned());
-        }
-    }
-    rows.iter()
-        .find(|(_, parent, command)| *parent == pane && usable(command))
-        .map(|(_, _, command)| (*command).to_owned())
-}
-
 /// `/proc/<pid>/cmdline` is NUL-terminated arguments. Only the final NUL is
 /// a terminator; an empty string between two NULs is a real argument
 /// (`--title ""`) and must survive, or the replay shifts every argument
@@ -2163,24 +2214,38 @@ mod tests {
     }
 
     #[test]
-    fn a_pane_command_is_its_own_process_unless_that_is_a_shell() {
-        let listing = "    1     0 /sbin/launchd\n\
-                       4242     1 -zsh\n\
-                       4250  4242 aas e june@claude\n\
-                       4300     1 aas exec e-ed@codex -- --yolo\n\
-                       4301  4300 node /bin/codex --yolo\n";
-        // A shell pane runs its child.
+    fn an_instruction_launch_with_no_known_conversation_is_left_for_a_person() {
+        let line = ["codex", "--yolo", "Review the qqg kitchen deck"];
+        let mut codex = pane("work", "0", "0", Some(&line.join(" ")));
+        codex.argv = Some(line.iter().map(|word| (*word).to_owned()).collect());
+        codex.replayable = true;
+        codex.agent = Some(AgentShape {
+            kind: "codex".into(),
+            session_id: "synthetic-7:default:%74".into(),
+            working: false,
+        });
+        assert_eq!(relaunch_command(&codex), None, "would start the task over");
+        let hint = resume_hint(&codex).unwrap();
+        assert!(hint.contains("codex resume"), "{hint}");
+
+        codex.agent.as_mut().unwrap().session_id = "01a13353-ba8c-70f3-a502-2a33f3521878".into();
         assert_eq!(
-            pane_command_of(listing, 4242).as_deref(),
-            Some("aas e june@claude")
+            relaunch_command(&codex).as_deref(),
+            Some("codex --yolo resume 01a13353-ba8c-70f3-a502-2a33f3521878")
         );
-        // A pane started with its command runs that command, wrapper and all —
-        // not the program the wrapper launched.
-        assert_eq!(
-            pane_command_of(listing, 4300).as_deref(),
-            Some("aas exec e-ed@codex -- --yolo")
-        );
-        assert_eq!(pane_command_of(listing, 7), None);
+    }
+
+    #[test]
+    fn an_agent_that_came_back_as_a_new_conversation_is_not_told_to_continue() {
+        let mut fresh = pane("work", "0", "0", Some("codex --yolo"));
+        fresh.agent = Some(AgentShape {
+            kind: "codex".into(),
+            session_id: "synthetic-7:default:%19".into(),
+            working: true,
+        });
+        let snapshot = snapshot_of(vec![fresh]);
+        let relaunched = BTreeSet::from(["=work:0.0".to_owned()]);
+        assert!(interrupted_targets(&snapshot, &relaunched).is_empty());
     }
 
     /// The panes found in a real snapshot: a Claude started with its task

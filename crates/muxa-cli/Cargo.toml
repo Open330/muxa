@@ -70,6 +70,12 @@ unicode-width = "0.2"
 # Cryptographically-strong dashboard tokens via the OS RNG.
 rand = "0.8"
 
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+# `muxa reload` reads each pane's argv with its argument boundaries (macOS
+# `ps` only reports them joined) and when the agent in it started. Linux
+# reads both from `/proc`.
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
+
 [dev-dependencies]
 tempfile = "3"
 # `test-util` enables `tokio::time::pause`/`advance`, which the watch
