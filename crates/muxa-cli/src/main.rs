@@ -489,6 +489,9 @@ enum MsgCmd {
     Send {
         target: String,
         body: String,
+        /// Decision required from the operator; use with target `human`.
+        #[arg(long, value_parser = ["approval", "choice", "information"])]
+        human_action: Option<String>,
         #[arg(long, default_value = "question")]
         kind: String,
         /// Stable conversation id used to group related requests and replies.
@@ -1975,6 +1978,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
         MsgCmd::Send {
             target,
             body,
+            human_action,
             kind,
             thread,
             parent,
@@ -2000,6 +2004,9 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                         dispatch_id: None,
                         source_node_id: None,
                         delegation_parent: None,
+                        human_action: human_action
+                            .map(|value| serde_json::from_value(serde_json::Value::String(value)))
+                            .transpose()?,
                         initiator: None,
                         kind,
                         body,
@@ -5332,6 +5339,8 @@ mod tests {
             dispatch_id: None,
             source_node_id: None,
             delegation_parent: None,
+            interruption: None,
+            human_action: None,
             initiator: None,
             updates: Vec::new(),
             id: id.into(),

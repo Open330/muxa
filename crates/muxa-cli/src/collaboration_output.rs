@@ -55,6 +55,13 @@ pub(crate) fn receipt(request: &CollaborationRequest) -> Value {
     if let Some(parent) = &request.delegation_parent {
         value["delegation_parent"] = json!(parent);
     }
+    if let Some(action) = request.human_action {
+        value["human_action"] = json!(action);
+    }
+    if let Some(interruption) = &request.interruption {
+        value["interruption"] = json!({"active":interruption.active,
+            "reason":interruption.reason, "action_request_id":interruption.action_request_id});
+    }
     value
 }
 
@@ -62,6 +69,12 @@ pub(crate) fn outcome(request: &CollaborationRequest) -> Value {
     let mut value = receipt(request);
     if let Some(reply) = &request.reply {
         value["reply"] = json!(reply);
+    }
+    if let Some(interruption) = &request.interruption {
+        value["interruption"] = json!(interruption);
+    }
+    if request.peer_interrupted() {
+        value["reason"] = json!("peer_interrupted");
     }
     value
 }
@@ -120,6 +133,33 @@ mod tests {
     use super::*;
     use muxa::collaboration::{CollaborationReply, CollaborationUpdate};
     use time::OffsetDateTime;
+
+    #[test]
+    fn interruption_keeps_compact_transport_and_parent_work_open() {
+        let mut request = fixture();
+        request.interruption = Some(muxa::collaboration::PeerInterruption {
+            request_id: request.id.clone(),
+            reason: "stopped".into(),
+            active: true,
+            observed_at: OffsetDateTime::UNIX_EPOCH,
+            reset_at: None,
+            action_request_id: Some("human-choice".into()),
+            decision: None,
+        });
+        let observed = outcome(&request);
+        assert_eq!(observed["reason"], "peer_interrupted");
+        assert_eq!(observed["final_reply_received"], false);
+        assert_eq!(
+            observed["interruption"]["action_request_id"],
+            "human-choice"
+        );
+        assert!(observed.get("body").is_none());
+        assert!(observed.get("completed").is_none());
+        assert!(observed.get("reported_status").is_none());
+        let listed = receipt(&request);
+        assert!(listed["interruption"].get("decision").is_none());
+        assert!(listed["interruption"].get("observed_at").is_none());
+    }
 
     #[test]
     fn receipt_reports_reply_arrival_without_asserting_work_success() {

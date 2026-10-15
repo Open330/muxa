@@ -590,6 +590,8 @@ mod tests {
             dispatch_id: None,
             source_node_id: None,
             delegation_parent: None,
+            interruption: None,
+            human_action: None,
             initiator: None,
             updates: Vec::new(),
             id: id.into(),
