@@ -3313,17 +3313,15 @@ pub fn resolve_target(
     participants: &[Participant],
     scope: crate::config::CollaborationScope,
 ) -> Result<Participant, CollaborationError> {
-    // Host scope widens *explicit pane* targets only. `peer`, `@alias` and
-    // `role:` remain room concepts: a pane id is unique on the host, but an
-    // alias is only unique among live peers of one room, and matching it
-    // host-wide would deliver to whichever unrelated agent happens to share
-    // the name.
+    // Host scope widens *explicit pane* targets only, including namespaced
+    // backend ids. Reject ambiguous pane ids across servers. `peer`, `@alias`
+    // and `role:` remain room concepts: aliases are unique only in one room.
     if selector == "human" {
         return Ok(Participant::console(sender.room.clone()));
     }
     if scope == crate::config::CollaborationScope::Host {
         let pane = selector.strip_prefix("pane:").unwrap_or(selector);
-        if pane.starts_with('%') {
+        if crate::backend::pane_id_host_kind(pane).is_some() {
             let pane = in_sender_namespace(pane, sender);
             let matches: Vec<_> = participants
                 .iter()
@@ -6154,6 +6152,61 @@ mod tests {
                 .pane,
             "%2"
         );
+    }
+
+    #[test]
+    fn host_scope_reaches_namespaced_panes_in_other_sessions_only_by_exact_id() {
+        for (host, from, to) in [
+            ("rmux", "rmux:%1", "rmux:%99"),
+            ("cmux", "cmux:surface-1", "cmux:surface-99"),
+        ] {
+            let mut sender = participant(from, "sender");
+            sender.room.host = host.into();
+            let mut recipient = participant(to, "recipient");
+            recipient.room.host = host.into();
+            recipient.room.window_id = "@other".into();
+            recipient.tmux_session_id = Some("$2".into());
+            recipient.tmux_session_name = Some("other-session".into());
+            recipient.alias = Some("reviewer".into());
+            recipient.roles = vec!["reviewer".into()];
+            let peers = [sender.clone(), recipient.clone()];
+            for selector in [to.to_string(), format!("pane:{to}")] {
+                assert_eq!(
+                    resolve_target(&sender, &selector, &peers, CollaborationScope::Host).unwrap(),
+                    recipient
+                );
+                assert!(
+                    resolve_target(&sender, &selector, &peers, CollaborationScope::Window).is_err()
+                );
+            }
+            for selector in ["peer", "@reviewer", "alias:reviewer", "role:reviewer"] {
+                assert!(
+                    resolve_target(&sender, selector, &peers, CollaborationScope::Host).is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_scope_rejects_ambiguous_namespaced_panes_on_different_servers() {
+        let mut sender = participant("rmux:%1", "sender");
+        sender.room.host = "rmux".into();
+        let mut first = participant("rmux:%99", "first");
+        first.room.host = "rmux".into();
+        first.room.window_id = "@other".into();
+        let mut second = first.clone();
+        second.agent_session_id = "second".into();
+        second.socket = Some("/tmp/other-rmux.sock".into());
+        second.room.socket.clone_from(&second.socket);
+        assert!(matches!(
+            resolve_target(
+                &sender,
+                "rmux:%99",
+                &[first, second],
+                CollaborationScope::Host
+            ),
+            Err(CollaborationError::AmbiguousTarget(_))
+        ));
     }
 
     /// The bug this whole console notion exists for: pressing `m` on the row
