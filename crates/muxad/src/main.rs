@@ -113,6 +113,13 @@ struct Args {
     /// `::1`.
     #[arg(long)]
     allow_public: bool,
+
+    /// Append logs to this file instead of writing them to stderr. The file
+    /// is opened shared, so a successor can append while its predecessor
+    /// still holds it — what `muxa daemon start` relies on on Windows, where
+    /// the daemon has no stderr worth keeping.
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -127,21 +134,48 @@ async fn main() -> Result<()> {
     // and those warnings were silently swallowed on the daemon path. The
     // log filter comes from `RUST_LOG` (env), not config, so there's no
     // chicken-and-egg.
+    let log_file = args
+        .log_file
+        .as_deref()
+        .map(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("opening log file {}", path.display()))
+        })
+        .transpose()?;
+    let to_file = log_file.is_some();
+    let writer = match log_file {
+        Some(file) => {
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::sync::Mutex::new(file))
+        }
+        // Daemon logs go to stderr — stdout is reserved for any future
+        // tool-friendly output, and external tooling (systemd, e2e
+        // tests) expects logs on stderr.
+        None => tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr),
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "muxa=info".into()),
         )
-        // Daemon logs go to stderr — stdout is reserved for any future
-        // tool-friendly output, and external tooling (systemd, e2e
-        // tests) expects logs on stderr.
-        .with_writer(std::io::stderr)
+        .with_writer(writer)
         // Disable ANSI escapes when stderr isn't a TTY. systemd-journald
         // captures the bytes verbatim; without this, `journalctl -u muxad`
         // is full of literal `\e[1m` debris. Same logic helps anything
         // grep-ing piped logs (the e2e tests included).
-        .with_ansi(std::io::stderr().is_terminal())
+        .with_ansi(!to_file && std::io::stderr().is_terminal())
         .init();
+    if to_file {
+        // A panic message goes to stderr, which a file-logging daemon does
+        // not keep; record it where the rest of the log is.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!(%info, "muxad panicked");
+            previous(info);
+        }));
+    }
 
     let config_path = args.config.clone().or_else(paths::default_config_file);
     let mut cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;

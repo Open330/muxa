@@ -324,13 +324,11 @@ mod windows_detach {
     pub(super) fn spawn(command: &Command, log: &Path) -> Result<()> {
         let mut words = vec![quote(&command.get_program().to_string_lossy())];
         words.extend(command.get_args().map(|arg| quote(&arg.to_string_lossy())));
-        // `/s` strips exactly the outer quotes, leaving each inner quoted
-        // path intact; the redirection makes cmd the daemon's stdout/stderr.
-        let command_line = format!(
-            "cmd.exe /d /s /c \"{} >> {} 2>&1\"",
-            words.join(" "),
-            quote(&log.to_string_lossy())
-        );
+        // The daemon writes its own log, opened shared. A `cmd /c … >> log`
+        // redirection opens it exclusively, and the next daemon to start —
+        // a restart overlapping its predecessor — then could not start.
+        words.extend(["--log-file".to_owned(), quote(&log.to_string_lossy())]);
+        let command_line = words.join(" ");
         let mut environment: std::collections::BTreeMap<String, String> =
             std::env::vars().collect();
         for (name, value) in command.get_envs() {
