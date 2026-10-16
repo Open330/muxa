@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keys Xcode cannot generate from INFOPLIST_KEY_* build settings. The build
+  merges them with the generated Info.plist (GENERATE_INFOPLIST_FILE).
+-->
+<plist version="1.0">
+<dict>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<!-- An editor tab being dragged inside Muxa. Private so a tab is
+			     never dropped into a text field or another app as text. -->
+			<key>UTTypeIdentifier</key>
+			<string>dev.muxa.editor-tab</string>
+			<key>UTTypeDescription</key>
+			<string>Muxa editor tab</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

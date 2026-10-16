@@ -1363,8 +1363,9 @@ async fn load_dashboard_data(
         .await
         .context("querying daemon agent snapshot")?;
 
-    let backend = muxa::default_backend();
-    let panes = backend.list_panes();
+    // Every active host, not only the one this shell runs in, so card labels
+    // resolve when the dashboard is opened from outside the agents' host.
+    let panes = crate::all_panes().await;
     let mut notes = Vec::new();
     let scan = muxa::tmux::scanner::scan().await;
     notes.extend(
@@ -1516,6 +1517,7 @@ fn dashboard_collaboration_origin_from(
         pane: pane.unwrap_or_default(),
         socket,
         console: true,
+        agent_session_id: None,
     }
 }
 
@@ -1558,6 +1560,7 @@ fn dashboard_mailbox_anchor(app: &DashboardApp) -> Option<CollaborationAnchor> {
             pane,
             socket,
             console: false,
+            agent_session_id: None,
         },
         label,
     })
@@ -1587,9 +1590,10 @@ fn build_work_dashboard_data(
     sort: DashboardSort,
     mut notes: Vec<String>,
 ) -> DashboardData {
-    let pane_by_id = panes
-        .iter()
-        .map(|pane| (pane.pane_id.clone(), pane.clone()))
+    // Grouped sessions list a pane per `~view~` member; label it by the base.
+    let pane_by_id = muxa::tmux::canonical_panes(&panes)
+        .into_iter()
+        .map(|pane| (pane.pane_id.clone(), pane))
         .collect::<HashMap<_, _>>();
     let activity_by_name = session_activities
         .into_iter()
@@ -1712,9 +1716,10 @@ fn build_dashboard_data(
     host: HostKind,
     notes: Vec<String>,
 ) -> DashboardData {
-    let pane_by_id = panes
-        .iter()
-        .map(|pane| (pane.pane_id.clone(), pane.clone()))
+    // Grouped sessions list a pane per `~view~` member; label it by the base.
+    let pane_by_id = muxa::tmux::canonical_panes(&panes)
+        .into_iter()
+        .map(|pane| (pane.pane_id.clone(), pane))
         .collect::<HashMap<_, _>>();
     let pty_by_id = sessions
         .iter()
@@ -2909,9 +2914,15 @@ async fn collaboration_send(
     work_id: Option<String>,
 ) -> ActionOutcome {
     let request = NewRequest {
+        dispatch_id: None,
+        source_node_id: None,
+        delegation_parent: None,
+        human_action: None,
+        initiator: None,
         kind,
         body,
         expects_reply: kind != RequestKind::Notice,
+        notify: None,
         work_mode,
         thread_id: None,
         parent_request_id: None,
@@ -3026,11 +3037,11 @@ fn send_to_exact_pane(pane: &PaneKey, text: &str, submit: bool) -> std::result::
     if !backend.caps().send_text {
         return Err(format!("{} pane input is not supported", endpoint.host));
     }
-    if !backend.send_text_on(Some(&endpoint.socket), &pane.pane_id, text) {
+    if !backend.send_prompt_text_on(Some(&endpoint.socket), &pane.pane_id, text) {
         return Err("input was rejected".into());
     }
     if submit {
-        std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
+        std::thread::sleep(muxa::backend::prompt_submit_grace(&pane.pane_id));
         if !backend.send_text_on(Some(&endpoint.socket), &pane.pane_id, "\r") {
             return Err("prompt text was sent but submit failed".into());
         }
@@ -5218,6 +5229,7 @@ mod tests {
     fn fake_pane(pane_id: &str, session: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -5287,6 +5299,13 @@ mod tests {
         now: OffsetDateTime,
     ) -> CollaborationRequest {
         CollaborationRequest {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
+            interruption: None,
+            human_action: None,
+            initiator: None,
+            updates: Vec::new(),
             id: id.into(),
             from,
             to,
@@ -5294,6 +5313,7 @@ mod tests {
             kind: RequestKind::Review,
             body: "review the auth change".into(),
             expects_reply: true,
+            notify: None,
             work_mode: WorkMode::ReadOnly,
             thread_id: None,
             parent_request_id: None,
@@ -5327,6 +5347,7 @@ mod tests {
                 pane: current.pane.clone(),
                 socket: None,
                 console: false,
+                agent_session_id: None,
             },
             label: current.label(),
         };
@@ -5335,6 +5356,7 @@ mod tests {
                 pane: current.pane.clone(),
                 socket: current.socket.clone(),
                 console: true,
+                agent_session_id: None,
             }),
             room: Some(RoomContext {
                 current,
@@ -5657,6 +5679,7 @@ mod tests {
                 pane: "%9".into(),
                 socket: None,
                 console: false,
+                agent_session_id: None,
             },
             label: "codex@%9".into(),
         });

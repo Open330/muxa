@@ -4,7 +4,7 @@ README를 짧게 유지하기 위해 자세한 설치와 wiring 절차는 이 �
 
 ## 필요 조건
 
-- Rust 1.89+
+- Rust 1.89+ (소스 빌드에만 필요)
 - tmux 3.x
 - Unix-like OS
 - Claude Code, OpenAI Codex, Google Gemini CLI, Google Antigravity CLI(`agy`) 중 하나
@@ -57,6 +57,40 @@ muxa init
 ```
 
 `cargo install`은 `~/.cargo/bin`에 설치합니다. 해당 경로가 `PATH`에 있어야 합니다.
+
+## Homebrew
+
+```bash
+brew install open330/tap/muxa
+muxa init
+```
+
+macOS와 Linux의 arm64/x86_64용 사전 빌드 `muxa`·`muxad`를 설치합니다.
+CLI formula와 Mac 앱 cask는 별도이며 함께 설치할 수 있습니다.
+
+### Muxa for Mac
+
+```bash
+brew install --cask open330/tap/muxa-app
+```
+
+공증된 `Muxa.app`을 `/Applications`에 설치합니다. 앱은
+`Contents/Helpers`에 `muxa`와 `muxad`를 포함하므로 CLI formula 없이도 실행할 수
+있습니다. 터미널의 `PATH`에서도 CLI를 쓰려면 formula를 함께 설치하세요.
+
+앱 자체 업데이트 기능은 없습니다. 다음 명령으로 업데이트합니다.
+
+```bash
+brew update
+brew upgrade --cask open330/tap/muxa-app
+```
+
+[릴리즈 페이지](https://github.com/Open330/muxa/releases)에서 DMG를 직접 받을
+수도 있으며 이 경우 앱을 직접 교체해야 합니다. `brew uninstall --cask muxa-app`은
+앱을 제거하고, `--zap`은 설정과 캐시도 제거합니다. 데몬·CLI가 공유하는
+`~/Library/Application Support/muxa`는 유지합니다.
+
+소스 빌드와 네이티브 터미널 구조는 [Muxa for Mac](MACOS.md)을 참고하세요.
 
 ## Pre-Built Binary
 
@@ -176,7 +210,7 @@ tmux source-file ~/.tmux.conf
 | Agent | Config |
 | --- | --- |
 | Claude Code | `examples/claude-settings.json`을 `~/.claude/settings.json`에 merge. |
-| OpenAI Codex | `crates/muxa/src/adapters/codex.rs`의 module doc에 있는 `[[hooks.*]]` block 추가. |
+| OpenAI Codex | 호환되는 hook은 `muxa init`으로 연결합니다. 데몬은 로컬 세션 rollout 로그도 2초마다 읽어 lifecycle을 복구합니다. |
 | Google Gemini CLI | `crates/muxa/src/adapters/gemini.rs`의 hook block을 `~/.gemini/settings.json`에 merge. |
 | Google Antigravity CLI | `crates/muxa/src/adapters/antigravity.rs`의 `muxa` block을 `~/.gemini/config/hooks.json`에 추가. Gemini CLI의 `settings.json`이 **아니라** agy 전용 `hooks.json`입니다. |
 
@@ -188,6 +222,39 @@ muxa status-line --pane "$TMUX_PANE"
 muxa watch
 ```
 
+## 업그레이드
+
+`muxa upgrade`는 설치 채널(소스 체크아웃, Homebrew, 릴리스 바이너리)에 맞게
+제자리 업데이트하고 muxad를 다시 실행합니다. 교체 전후로 다음도 처리합니다.
+
+1. **먼저 작업 공간을 스냅샷합니다.** 경로는
+   `pre-upgrade snapshot: …/snapshots/<id>`로 출력됩니다.
+2. **아직 옛 빌드로 도는 것을 알려 줍니다.** hook은 다음 이벤트부터 새
+   `muxa`를 씁니다. 에이전트가 띄운 `muxa mcp` 서버는 그 에이전트가
+   재시작할 때까지 옛 코드로 돕니다. `muxa upgrade`가 끝날 때(그리고 나중에
+   `muxa doctor`로) 이런 서버를 소유자별로 보여 주고, 각각 실행할 명령을
+   알려 줍니다.
+   - **Codex 공유 app-server**(Codex 0.160+는 모든 스레드에 하나를 공유):
+     해당 세션들이 쉬고 있을 때
+     `CODEX_HOME=<home> codex app-server daemon restart`를 실행합니다.
+   - **pane 안의 에이전트:** 각 에이전트를 재시작하면 대화가 이어집니다.
+     모든 pane을 한 번에 재시작하려면 멀티플렉서 밖에서 `muxa reload`를
+     실행합니다. 스냅샷 → 서버 재시작 → 각 에이전트를 resume 명령으로 다시
+     실행합니다.
+
+   `muxa mcp`를 직접 종료해서 교체하려고 하지 마세요. 에이전트가 다시 띄우지
+   않아서, 그 에이전트가 재시작될 때까지 muxa 도구가 실패합니다.
+3. **작업 공간을 복원할 수 있게 합니다.** 재시작 중에 pane이 사라졌다면
+   업그레이드 전 상태로 되돌립니다.
+
+   ```bash
+   muxa restore ~/.local/share/muxa/snapshots/<id>         # 계획만 출력
+   muxa restore ~/.local/share/muxa/snapshots/<id> --run   # 없는 것만 다시 생성
+   ```
+
+   이미 있는 세션, window, pane은 그대로 두고 없는 것만 만들기 때문에, 여러
+   번 실행해도 안전합니다.
+
 ## Rollback
 
 ```bash
@@ -197,3 +264,10 @@ tmux source-file ~/.tmux.conf
 ```
 
 수동 rollback이 필요하면 `.muxa-backup-<unix_ts>` 파일을 복원합니다.
+
+`muxa init`은 capacity 재시도, 사용량 제한 후 재개, 입력 대기 알림,
+오류 지속 알림, 선택된 Yes/Proceed 확인 규칙 다섯 개를 비활성 상태로 설치합니다.
+`muxa automation enable <name>`으로 필요한 규칙을 켤 수 있습니다.
+같은 이름의 기존 규칙은 설정과 활성 상태를 유지합니다. 바이너리만
+업데이트한 경우에도 다음 muxad 시작 시 빠진 규칙을 추가합니다.
+자세한 내용은 [Automation](AUTOMATION.md)을 참고하세요.

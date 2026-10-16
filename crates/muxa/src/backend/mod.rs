@@ -56,7 +56,6 @@ pub mod cmux;
 pub mod herdr;
 pub mod rmux;
 pub mod tmux;
-pub(crate) mod unix_socket;
 pub mod zellij;
 
 use std::collections::HashMap;
@@ -65,12 +64,17 @@ use std::time::Duration;
 
 use crate::tmux::PaneInfo;
 
-/// Grace period between literal prompt injection and the submit key.
-/// Codex's TUI treats an immediate trailing Enter as part of a pasted burst,
-/// leaving the prompt composed but unsubmitted. All control-plane send paths
-/// use the same delay so dashboard sends, MCP sends, and collaboration wakes
-/// behave consistently.
-pub const PROMPT_SUBMIT_GRACE: Duration = Duration::from_millis(120);
+/// Fallback for hosts without an explicit paste boundary. This is best effort,
+/// not an application submission acknowledgement. Native tmux/rmux prompt
+/// injection uses bracketed paste and does not need a timing heuristic.
+pub const PROMPT_SUBMIT_GRACE: Duration = Duration::from_millis(250);
+
+pub fn prompt_submit_grace(pane: &str) -> Duration {
+    match pane_id_host_kind(pane) {
+        Some(HostKind::Tmux | HostKind::Rmux) => Duration::ZERO,
+        _ => PROMPT_SUBMIT_GRACE,
+    }
+}
 
 /// Whether a pane observation is authoritative enough for destructive use.
 ///
@@ -518,6 +522,14 @@ pub trait PaneBackend: Send + Sync + 'static {
         self.send_text(pane_id, text)
     }
 
+    /// Inject a prompt with an explicit paste boundary when supported. Unlike
+    /// raw `send_text_on`, this never sends prompt text as simulated typing.
+    /// Empty text is a no-op, allowing an Enter-only operation without clearing
+    /// the application's paste state. Control keys must use `send_text_on`.
+    fn send_prompt_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+        text.is_empty() || self.send_text_on(socket, pane_id, text)
+    }
+
     /// Like [`Self::capture_pane`] but targeting the pane on the specific host
     /// server named by `socket` — the control-plane `capture` counterpart to
     /// [`Self::send_text_on`]. The default impl ignores `socket` and delegates
@@ -525,6 +537,21 @@ pub trait PaneBackend: Send + Sync + 'static {
     /// shared pane id can't capture the wrong screen.
     fn capture_pane_on(&self, _socket: Option<&str>, pane_id: &str) -> Option<String> {
         self.capture_pane(pane_id)
+    }
+
+    /// Like [`Self::capture_pane_on`] but also asks for up to `history` lines
+    /// of scrollback above the visible screen, so a dashboard reader sees
+    /// what an agent printed a moment ago, not only what still fits on
+    /// screen. The default impl ignores `history` and returns the visible
+    /// screen; tmux overrides it.
+    fn capture_pane_history_on(
+        &self,
+        socket: Option<&str>,
+        pane_id: &str,
+        history: usize,
+    ) -> Option<String> {
+        let _ = history;
+        self.capture_pane_on(socket, pane_id)
     }
 
     /// Static capability descriptor. Default impl returns "everything
@@ -588,8 +615,19 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
     fn send_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
         (**self).send_text_on(socket, pane_id, text)
     }
+    fn send_prompt_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+        (**self).send_prompt_text_on(socket, pane_id, text)
+    }
     fn capture_pane_on(&self, socket: Option<&str>, pane_id: &str) -> Option<String> {
         (**self).capture_pane_on(socket, pane_id)
+    }
+    fn capture_pane_history_on(
+        &self,
+        socket: Option<&str>,
+        pane_id: &str,
+        history: usize,
+    ) -> Option<String> {
+        (**self).capture_pane_history_on(socket, pane_id, history)
     }
     fn caps(&self) -> BackendCaps {
         (**self).caps()
@@ -1101,6 +1139,7 @@ mod tests {
     fn fake_pane(id: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,

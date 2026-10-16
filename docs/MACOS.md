@@ -15,7 +15,13 @@ and encodes user input.
 - attaches a libghostty surface to an existing session;
 - sends input, resize, and attach state over the owner-only Unix socket;
 - reconnects terminal output by byte offset;
-- keeps the PTY alive when its native window closes; and
+- keeps the PTY alive when its native window closes;
+- saves and restores workspace snapshots (Explore "…" → Save Snapshot /
+  Restore Snapshot…) through muxad's `mux_snapshot_v1` requests, which run
+  `muxa snapshot` / `muxa restore --only-missing --json`; the restore
+  preview compares the snapshot with what runs now, and with
+  `mux_snapshot_plan_v1` "Only missing sessions" can be turned off to also
+  fill in running sessions; and
 - provides both a main window and a menu-bar control.
 
 External tmux, cmux, rmux, herdr, and zellij surfaces remain execution
@@ -29,10 +35,11 @@ The native workspace follows two proven desktop navigation patterns:
 
 - VS Code's Activity Bar switches one contextual sidebar at a time while the
   editor area remains stable. Muxa applies that to **Work**, **Explore**,
-  **Inbox**, and **Shells**, with a filter scoped to the active context.
-  Explore owns topology and host registration, while Inbox owns the operator's
-  sent commands, durable replies, global Ask, and agents that require operator
-  attention. Explore already uses hosts as its
+  **Inbox**, **Ask**, **Shells**, and **Files**, with a filter scoped to the active
+  context. Explore owns topology and host registration; Inbox owns the
+  operator's sent commands, durable replies, and agents that require operator
+  attention; Ask owns Global Ask conversations, which are questions to a
+  provider rather than requests from an agent. Explore already uses hosts as its
   roots, so it does not duplicate them in a separate Hosts activity.
 - Lens separates resource navigation from contextual details and supports
   drilling into a resource without flattening infrastructure identity. Muxa
@@ -59,9 +66,13 @@ The detail area is deliberately task-oriented:
   indistinguishable pane rows.
 - **Inbox** is an operator queue rather than another agent list. It reads the
   console's sent mailbox once per reachable host, deduplicates requests,
-  and exposes waiting, replied, and unread states together with Global Ask
-  history. Opening a command returns to its exact agent pane; reading a reply
-  uses the durable collaboration get operation.
+  and exposes waiting, replied, and unread states. Opening a command returns
+  to its exact agent pane; reading a reply uses the durable collaboration get
+  operation.
+- **Ask** lists the selected provider's Global Ask conversations, newest
+  activity first; picking one opens it in the editor, where each exchange and
+  the whole conversation can be copied as Markdown or as a prompt, and a
+  conversation saved as a Markdown file.
 - **Shell** is the interactive native Ghostty surface owned by a muxad PTY.
   It also has a read-only **Raw** mode for the bounded PTY output stream.
 
@@ -165,9 +176,11 @@ for the Inbox and Ask conversations. The user-facing vocabulary is **Hosts**;
 Selecting a new item opens it as a replaceable preview tab. Pinning preserves
 the tab while another Work, Agent, Host, or Shell is inspected. `Command-Shift-P`
 opens the workspace command palette, and each sidebar context supports text and
-status filters (`All`, `Attention`, `Active`). The Inbox activity badge keeps
-agent attention, waiting commands, unread replies, and running Ask counts
-visible even when another context is selected. Editor tab
+status filters (`All`, `Attention`, `Active`); in Ask, Active is a
+conversation still being answered and Attention one whose last turn failed.
+The Inbox activity badge keeps agent attention, waiting commands, and unread
+replies visible even when another context is selected, and the Ask badge
+counts questions still being answered. Editor tab
 close controls and all Explorer disclosure/row targets use full-size hit areas
 rather than relying on the visible glyph alone.
 
@@ -190,13 +203,18 @@ Requirements:
 - macOS 13 or newer;
 - Xcode 26 or another Xcode capable of Swift 6;
 - `xcodegen` (`brew install xcodegen`);
-- Git, curl, tar, and a Rust 1.88+ toolchain.
+- Git, curl, tar, and a Rust 1.89+ toolchain.
 
 From the repository root:
 
 ```bash
 apps/muxa-macos/Scripts/build-app.sh --open
 ```
+
+The build reads the app version from the workspace `Cargo.toml` and rebuilds
+the bundled `muxa` and `muxad`. `MUXA_SKIP_EMBED=1` is only for local UI
+iteration: it keeps the existing helpers, so it can leave their versions and
+behavior behind the app. Rebuild without it when checking runtime changes.
 
 The first build downloads source dependencies and can take a while. Zig does
 not need to be installed globally: the build downloads the exact compiler
@@ -307,8 +325,10 @@ which release a user is running.
 
 ## Headless providers and API keys
 
-Global Ask uses the installed `claude` and `codex` CLIs in their structured
-non-interactive modes. The app augments a GUI-launched muxad PATH with
+Global Ask uses the installed `claude`, `codex`, and `gemini` CLIs in their
+structured non-interactive modes, the Anthropic and OpenAI APIs with a key, or
+Apple Intelligence through the bundled `muxa-afm` helper on macOS 26 or later
+(see [Configuration](CONFIGURATION.md)). The app augments a GUI-launched muxad PATH with
 `~/.local/bin`, `~/.cargo/bin`, and Homebrew locations, while preserving
 normal Claude Code/Codex CLI sign-in.
 
@@ -488,7 +508,7 @@ are coalesced for 75 ms and capped at four snapshot reads per second. A slow
 not the primary freshness path. Collaboration revisions travel per host, so
 the operator inbox and an open Collaborate module re-read only the affected
 host rather than polling every mailbox every two seconds. Inbox safety
-reconciliation runs at most once per minute while it is visible, and equal
+reconciliation runs at most once per minute even when Inbox is not visible, and equal
 mailboxes do not republish SwiftUI state.
 
 Execution snapshots build the host/session/window/pane tree, agent-to-pane
@@ -552,3 +572,70 @@ Their repositories and exact commits remain visible in `Dependencies.lock`.
 The host-managed I/O API is a maintained downstream patch until the equivalent
 public upstream embedding API is stable; all calls stay isolated behind
 `GhosttyTerminal` and `TerminalPaneModel`.
+
+## Files and artifact previews
+
+The Files activity-bar item opens a read-only file tree. Use **⇧⌘E** to show
+Files for the active agent or Work folder, or **⌘O** to choose a local file or
+folder. The host picker also browses registered SSH Fleet hosts; remote reads
+use the configured SSH target with batch authentication and require Python 3.
+
+The native outline supports arrow-key navigation, folder disclosure, and
+type-to-select. Click the workspace folder name (or **⇧⌘G**) for **Go to Folder**: paths
+complete after a short debounce, **Tab** completes a suggested directory, and
+**Return** opens the path. Relative paths resolve from the current workspace.
+Invalid paths leave the workspace unchanged.
+
+A single click keeps focus in the tree and opens a preview tab; another file replaces that preview.
+Double-click the file or pin its tab to keep it open. File tabs share the
+workbench's split groups, persistence, close/reopen history and **⌘P** search
+(recent files plus recursive filename search in the selected local or SSH folder).
+The index is rebuilt when Quick Open opens. It scans at most 20,000 entries or
+8 seconds, skips symlink directories and `.git`, `.build`, `node_modules`,
+`target`, `vendor`, `__pycache__`, `.venv`, and displays up to 200 ranked results.
+Incomplete or unreadable folders are reported in the palette; select a narrower
+folder to search further. This searches filenames/paths, not file contents.
+
+The visible tree polls locally every 2 seconds and over SSH every 10 seconds,
+refreshing at most 32 expanded folders per pass while preserving existing nodes
+and selection. Failed reads show an error row and are retried automatically.
+Activating a file tab reveals its ancestors and selects its row without taking
+keyboard focus. Files outside the current host/folder switch to their parent
+folder; hidden files still require Show Hidden Files.
+
+Markdown (`.md`, `.markdown`, `.mdown`, `.mkd`, `.mkdn`) renders headings, tables,
+lists, code blocks and links. PNG, JPEG, GIF, WebP, HEIC/HEIF, TIFF, BMP and
+ICO/ICNS icons render as images. SVG renders as an inert image with a Source
+switch; SVG scripts and external resources do not execute. Images and
+PDFs have native previews, and Office documents use macOS Quick Look. Markdown
+and HTML offer a Source switch; HTML is a static preview with scripts and
+network resources disabled. Relative document links and images resolve on the
+same host as the document. Embedded images are limited to the document folder.
+Text, Markdown, HTML and PDF previews support **⌘F**. Visible previews poll file
+metadata every 2 seconds locally or 10 seconds over SSH, and reread contents
+only after a change. Refresh is also available manually.
+
+Preview reads are limited to 16 MB, text display to 2 MB, and each folder listing
+to 1,000 entries. Files are never modified by the viewer. Local files can also
+be revealed in Finder or opened in their default application.
+
+**⌘W** closes the focused tab, including when a terminal, text view or web
+preview has keyboard focus. It keeps an empty workbench open. **⇧⌘W** closes the
+window, **⇧⌘T** reopens the last closed tab, and **⌃Tab / ⌃⇧Tab** move between
+tabs. Live Watch uses **⌃⌘W** so it does not conflict with Close Window.
+
+## Explicit requests for a person
+
+Agents use `muxa msg attention "..." --action approval` or the
+`muxa_request_attention` MCP tool for a required approval, choice, or missing
+information. These requests do not fabricate a waiting agent state. The app
+reads the human incoming queue as well as operator-sent requests from every
+registered Fleet host, including hosts with no remaining terminal panes.
+
+They appear in Work Attention, Inbox > Needs Action, and the Dock badge. A
+notification opens the exact host/request in Inbox, where Respond records a
+human reply through the existing durable collaboration protocol. There is no
+notification action that blindly types an approval into the terminal. Reading,
+opening or dismissing the banner does not resolve the request. Each Mac keeps
+its own notification receipts, while all connected clients see the response
+stored on the source host. See [Fleet setup](FLEET.md#human-attention-across-clients).

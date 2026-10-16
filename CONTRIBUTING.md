@@ -4,6 +4,7 @@
 
 - Rust `1.89+` (workspace-pinned via `rust-version`)
 - `cargo fmt`, `cargo clippy`, `cargo test` — all three are gated in CI
+- Node.js 22+ for the dashboard's JavaScript tests (also gated in CI)
 
 ## Development
 
@@ -13,6 +14,10 @@ cargo build --workspace
 
 # run the full test suite
 cargo test --workspace
+
+# dashboard JavaScript tests (node's built-in runner; pass the files, since
+# `node --test <directory>` does not pick them up)
+node --test crates/muxa/tests-js/*.test.mjs
 
 # lint (CI-equivalent)
 cargo fmt --all -- --check
@@ -30,6 +35,52 @@ echo '{"session_id":"sess-1","prompt":"hi"}' \
   | cargo run --bin muxa -- hook claude --event user_prompt_submit
 cargo run --bin muxa -- status
 ```
+
+## Real-world topology: rules that keep biting
+
+Most regressions in agent identity, binding and collaboration came from code
+that was right for the simple test setup and wrong for real ones. Hold these
+invariants:
+
+- **A pane listing repeats a pane once per member of a session group.** Two
+  terminals on one workspace (`callabo` plus `callabo~view~N`) make
+  `list-panes -a` report every pane two or more times. A view row can also
+  lack session-level workspace metadata. Before you count panes, require
+  "exactly one" match, key anything by session, persist a session name, or do
+  per-pane work (process scans, captures, IPC, typing into a pane), pass the
+  listing through `muxa::tmux::canonical_panes`. Use
+  `muxa::tmux::base_session_name` for durable labels. Keep raw rows only for
+  actions taken on behalf of one client, such as moving that terminal's view.
+- **Codex 0.160+ shares one `codex app-server` across TUIs.** Its hooks, MCP
+  servers and shell commands carry the pane variables of whichever pane
+  started it, so never trust `TMUX_PANE`/`RMUX_PANE` under it. Identify a
+  thread by its thread id (`_meta.threadId`, `$CODEX_THREAD_ID`). Bind it
+  only from evidence (see `crates/muxa/src/codex_binding.rs`).
+- **Agents keep long-lived `muxa mcp` processes.** A fix to them reaches
+  running agents only after the agents restart.
+
+Before merging changes in these areas, verify them live as well as with unit
+tests. The live checks must cover:
+
+1. A grouped session with at least one `~view~` client, not only a plain
+   session.
+2. Two agents in the same cwd, `/new` inside a running TUI, and a muxad
+   restart.
+3. For each regression test: revert the fix and confirm that the test fails.
+4. A throwaway `muxad` with its own `XDG_DATA_HOME`/`XDG_STATE_HOME`/
+   `TMUX_TMPDIR`. Without them it writes the real history and scans the real
+   multiplexer.
+
+Tests that execute a fixture script must create it with
+`muxa::test_support::write_executable`, not `fs::write` followed by `chmod`.
+Tests run in parallel threads. A child forked by another test inherits the
+open write handle until it execs, and the fixture then fails to start with
+ETXTBSY ("Text file busy"), which looks like a random flake. Likewise, query
+a test's own tmux through `muxa::tmux::tmux_binary()`: a bare `tmux` can be
+rmux's shim.
+
+CI runs clippy on unpinned stable, so run `rustup update stable` before
+pushing. New lints otherwise appear in CI on code you did not touch.
 
 ## Adding a new agent adapter
 
@@ -61,9 +112,15 @@ for the deferred stub.
 
 1. Bump `version` in the workspace `Cargo.toml`, run a build so `Cargo.lock`
    follows, and open a `## [X.Y.Z] - date` section in `CHANGELOG.md`.
+   For user-facing app changes, add highlights to `MuxaWhatsNew.catalog` in
+   `apps/muxa-macos/Sources/OnboardingLogic.swift` and their Korean translations.
+   Check Welcome, install docs, and landing copy against the release; regenerate
+   dashboard screenshots with `scripts/landing-shots/capture.mjs` after UI changes.
 2. Reinstall locally first (`cargo install --path crates/muxa-cli --force
    --locked`, same for `crates/muxad`, then restart muxad) — shipping a
-   version you have not run is how a broken release gets tagged.
+   version you have not run is how a broken release gets tagged. For Mac app
+   changes, run `apps/muxa-macos/Scripts/build-app.sh` without `MUXA_SKIP_EMBED`
+   and verify the app's bundle version and both helpers' `--version` agree.
 3. Commit as `release: vX.Y.Z`, push `main`, then push the annotated tag.
 
 Pushing the tag is the whole trigger, and everything after it is automatic.
@@ -94,18 +151,22 @@ than after.
    publishes by hand.
 
    Either way it needs the `TAP_GITHUB_TOKEN` secret (a fine-grained PAT with
-   Contents read/write on `Open330/homebrew-tap`). Without it — including when
-   the token expires — the job still *succeeds*, with a "skipping" notice, and
-   the formula quietly stays behind: if `brew` keeps offering the old version
-   after a release, suspect the token first. Recover with `scripts/bump-tap.sh
-   vX.Y.Z`, which is idempotent and prints "nothing to push" on a current tap.
+   Contents read/write on `Open330/homebrew-tap`). A missing token skips the
+   update with a notice; an expired or invalid token fails authentication.
+   In either case, check the remote formula and `muxa-app` cask versions after
+   publication. Recover the CLI formula with `scripts/bump-tap.sh vX.Y.Z`,
+   which is idempotent. That script does not update the Mac cask: update its
+   version and DMG checksum separately, or repair the secret and rerun the
+   `tap-bump` workflow for the published tag.
 
 ## Project layout
 
-- `crates/muxa-core`     — types, state, config, paths, errors (no I/O)
-- `crates/muxa-runtime`  — unix-socket IPC + tmux CLI wrapper
-- `crates/muxa-adapters` — per-agent adapters
-- `crates/muxad`         — daemon binary
-- `crates/muxa`          — CLI binary
+- `crates/muxa` — shared library: state, config, IPC, backends, agent adapters,
+  dashboard, and notifications
+- `crates/muxad` — daemon binary
+- `crates/muxa-cli` — CLI binary and terminal UIs
+- `crates/muxa-zellij-plugin` — zellij plugin
+- `apps/muxa-macos` — native Mac app and bundled runtime build scripts
+- `site` — GitHub Pages entry point using the dashboard's shared landing assets
 
 See `PROTOCOL.md` for the wire protocol spec.

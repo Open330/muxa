@@ -1,7 +1,7 @@
 # Activity Ledger
 
 `muxa`의 duration 데이터는 `activity.ndjson`에 저장됩니다. 이 파일은
-`muxa stats`, `muxa report`, raw 조회 명령인 `muxa activity`의 기준입니다.
+`muxa stats`, `muxa stats report`, raw 조회 명령인 `muxa stats activity`의 기준입니다.
 
 ## 빠른 조회
 
@@ -10,14 +10,14 @@ muxa stats --since today
 muxa stats --since yesterday --group-by session
 muxa stats --since week --group-by project
 muxa stats --since month --exclude-session 'monitor*'
-muxa report --since week
-muxa report --since last-month --exclude-pane '%42'
+muxa stats report --since week
+muxa stats report --since last-month --exclude-pane '%42'
 muxa timeline --since today --session main
-muxa activity --since today --type human
-muxa activity --since today --type agent --format json
+muxa stats activity --since today --type human
+muxa stats activity --since today --type agent --format json
 ```
 
-`muxa stats`와 `muxa report`의 세션별 집계는 `callabo~view~123` 같은 view를
+`muxa stats`와 `muxa stats report`의 세션별 집계는 `callabo~view~123` 같은 view를
 `callabo`로 합칩니다. 과거 기록에도 적용되며, 합친 뒤 정렬과 행 수 제한을
 적용합니다. view 사이에 겹치는 사용자 체류 시간과 ACT/WACT는 중복 계산하지
 않으며, agent 작업 시간은 기존처럼 합산합니다.
@@ -96,6 +96,43 @@ thinking에서 온 경우에만 셉니다. scrollback tick은 engaged `ACT`에�
 표 마지막에는 `TOTAL` 푸터 행이 붙습니다. 모든 그룹의 총합을 담으며,
 `--limit`로 위쪽 행이 잘려도 전체 데이터를 반영합니다.
 
+## Stats 타임라인
+
+`muxa stats`에 `--timeline`을 추가하면 프로젝트마다 에이전트가 *언제*
+일했는지 실제 시계 축 위에 그려 보여줍니다.
+
+```bash
+muxa stats --timeline                          # 최근 7일, 하루에 한 블록
+muxa stats --timeline --since today --hours 9-24
+muxa stats --timeline --layout range --since month --limit 0
+muxa stats --timeline --group-by session
+```
+
+한 행은 한 프로젝트(에이전트 작업 디렉터리 이름)입니다. `--group-by session`
+또는 `agent`를 주면 tmux 세션이나 에이전트 종류별 행이 됩니다. 행은 그
+그룹의 WORK 구간을 wall-clock으로 합친 것이라, 한 프로젝트에서 에이전트 둘이
+동시에 일해도 두 번 세지 않고 막대 하나로 그립니다. 칸의 진하기(`░▒▓█`)는
+그 칸이 얼마나 채워졌는지입니다. dev 서버 같은 백그라운드 task는 며칠씩
+Working 상태로 남기 때문에 제외합니다. 두 규칙 때문에 행의 시간은 모든
+에이전트를 더하는 `WORK` 컬럼과 다를 수 있습니다.
+
+- `--layout day`(기본값)는 로컬 날짜마다 한 블록을 같은 시간 축에 출력하고,
+  프로젝트는 시작한 순서대로 나옵니다. `--limit`은 하루당 행 수입니다.
+- `--layout range`는 프로젝트마다 전체 범위에 걸친 한 행을 작업 시간 순으로
+  보여줘서, 한 달치 프로젝트가 한 화면에 들어갑니다.
+- `--hours START-END`는 day 레이아웃의 시간 범위를 고정합니다. 기본값은 기록된
+  작업 범위에 맞춥니다.
+- `--cell MINUTES`는 칸 하나의 분을 고정하며 하루를 나누어떨어지게 하는
+  값(5, 10, 15, 30, 60, 120, ...)이어야 합니다. 기본값은 터미널 폭에 맞는
+  가장 촘촘한 값이고, 하루 단위 칸도 들어가지 않으면 range 레이아웃은 최근
+  날짜만 보여줍니다.
+
+타임라인은 표 출력 전용이라 `--graph`, `--format`, `--json`, `--markdown`,
+`--sort`, `--reverse`와 함께 쓸 수 없습니다.
+
+아래 `muxa timeline`은 에이전트별 인터랙티브 화면이고, `stats --timeline`은
+프로젝트별 요약입니다.
+
 ## Timeline
 
 `muxa timeline`은 같은 duration 데이터를 interactive TUI로 표시합니다.
@@ -123,7 +160,7 @@ TUI keybinding, grouping mode, dashboard 동작, JSON export 설명은
 
 ## Ledger 타입
 
-`muxa activity --type ...` 은 raw ledger 를 타입별로 필터링합니다:
+`muxa stats activity --type ...` 은 raw ledger 를 타입별로 필터링합니다:
 
 | Type | 의미 |
 | ---- | ---- |

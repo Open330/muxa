@@ -83,12 +83,14 @@ The herdr work landed the key enablers:
       on every host at once (a per-host pass could otherwise adopt a row
       whose codex actually lives in the other host's pane at the same cwd)
       while this tick's dedup still demotes the redundant synthetic.
-    - The cross-host age-out (`mark_stale_cross_host_stopped`) receives the
-      complete-this-tick kinds plus hosts whose contract is structurally
-      **partial**. Complete hosts govern their own rows; partial hosts such as
-      cmux protect hook-authoritative rows outside their visible subset. A row
-      on a host *not* in the set — or a normally-authoritative host that cannot
-      answer past the (24h-default) inactivity window — ages out.
+    - The cross-host age-out (`mark_stale_cross_host_stopped`) receives every
+      host that answered complete — or with a structurally **partial**
+      contract — at any point within the inactivity window (24h default;
+      hosts count as answered at daemon start). Complete hosts govern their
+      own rows; partial hosts such as cmux protect hook-authoritative rows
+      outside their visible subset. A single timed-out scan changes nothing;
+      a row on a host *not* in the set — or on a
+      normally-authoritative host silent for the whole window — ages out.
   - **Discovery**: startup + periodic passes iterate the set and concat
     pane scans (`run_discovery` per backend, reports summed).
   - **Session activity**: a **single** tracker samples one source per
@@ -132,8 +134,8 @@ With the set in place, the CLI reads aggregate across it:
   *first* — a `herdr:` row focuses via a herdr backend even when the
   process-global host is tmux — falling back to the process-global
   backend's kind for unrecognized ids (`dispatch_kind`).
-- **Other surfaces**: `muxa panes`, `stats`, and `timeline` enumerate
-  via `all_panes()` (concat across the set); `muxa panes` prints a
+- **Other surfaces**: `muxa registry panes`, `stats`, and `timeline` enumerate
+  via `all_panes()` (concat across the set); `muxa registry panes` prints a
   per-host empty hint for any host in the set that contributed zero.
   Live pane captures (`watch` preview, `dashboard`) resolve the backend
   by pane-id namespace (`backend_for_pane`). `current_pane`/status-line

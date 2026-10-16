@@ -113,6 +113,8 @@ impl Metrics {
     /// Decrement the live SSE subscriber gauge. Saturates at zero so a
     /// double-disconnect (shouldn't happen, but cheap to defend) can't
     /// underflow.
+    // `try_update` (the 1.99 rename) needs Rust 1.95; MSRV is 1.89.
+    #[allow(deprecated)]
     pub fn sse_disconnect(&self) -> u64 {
         let prev = self
             .inner

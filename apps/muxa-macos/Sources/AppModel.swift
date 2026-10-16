@@ -12,13 +12,18 @@ enum MuxaSidebarSelection: Codable, Hashable, Sendable {
     case fleetWindow(MuxaWatchWindowIdentity)
     case shell(String)
     case pane(MuxaWatchPaneIdentity)
+    case file(MuxaFileLocation)
 }
 
 enum MuxaSidebarMode: String, CaseIterable, Identifiable {
     case work
     case watch
     case inbox
+    /// Global Ask and its conversations. Its own container: a question to a
+    /// provider is not a request from an agent, which is what Inbox holds.
+    case ask
     case shells
+    case files
 
     var id: Self { self }
 
@@ -27,7 +32,9 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
         case .work: String(localized: "Work")
         case .watch: String(localized: "Explore")
         case .inbox: String(localized: "Inbox")
+        case .ask: String(localized: "Ask")
         case .shells: String(localized: "Shells")
+        case .files: String(localized: "Files")
         }
     }
 
@@ -37,7 +44,9 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
         case .work: String(localized: "Filter work")
         case .watch: String(localized: "Filter Explore")
         case .inbox: String(localized: "Filter inbox")
+        case .ask: String(localized: "Filter conversations")
         case .shells: String(localized: "Filter shells")
+        case .files: String(localized: "Filter files")
         }
     }
 
@@ -46,7 +55,9 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
         case .work: "square.stack.3d.up"
         case .watch: "sidebar.left"
         case .inbox: "tray.full"
+        case .ask: "sparkles"
         case .shells: "terminal"
+        case .files: "folder"
         }
     }
 }
@@ -69,6 +80,9 @@ private struct MuxaInboxFetch: Sendable {
 
 @MainActor
 final class AppModel: ObservableObject {
+    @Published var fileRoot: MuxaFileLocation?
+    @Published var browsedFiles: [MuxaFileLocation] = []
+
     enum ConnectionState: Equatable {
         case connecting
         case connected
@@ -78,7 +92,10 @@ final class AppModel: ObservableObject {
 
     @Published private(set) var sessions: [MuxaSession] = []
     @Published private(set) var pipelineRuns: [MuxaPipelineRun] = []
-    @Published private(set) var executionSnapshot = MuxaExecutionSnapshot.empty
+    @Published private(set) var executionSnapshot = MuxaExecutionSnapshot.empty {
+        // WS-A: every snapshot, from either refresh path, updates unread state.
+        didSet { attention.ingest(executionSnapshot) }
+    }
     @Published private(set) var workGroups: [MuxaWorkGroup] = []
     @Published private(set) var hostedAgents: [MuxaHostedAgent] = []
     @Published private(set) var workspaceRevision: UInt64 = 0
@@ -90,7 +107,11 @@ final class AppModel: ObservableObject {
     @Published private(set) var isTerminatingSession = false
     @Published private(set) var isAttachingPane = false
     @Published private(set) var attachError: String?
+    @Published var isPresentingFleetDispatch = false
+    @Published private(set) var askUsesSnapshots = false
     @Published var isPresentingWorkStart = false
+    /// The Save / Restore snapshot sheet, when one is up. WS-F: snapshot
+    @Published var sessionSnapshotSheet: MuxaSessionSnapshotSheet?
     /// Pipeline the Start Work sheet should preselect when opened from a
     /// pipeline card; nil leaves the route default.
     @Published var workStartPreselectedPipeline: String?
@@ -112,6 +133,10 @@ final class AppModel: ObservableObject {
     /// Whether the connected daemon can run Work commands on fleet hosts.
     @Published private(set) var supportsHostWorkCommands = false
     @Published private(set) var isStartingWork = false
+    // WS-B: new agent — the launcher holds the sheet's state; this mirror
+    // lets menu items (which observe AppModel only) disable while starting.
+    let agentLauncher = MuxaAgentLauncher()
+    @Published var isStartingAgent = false
     /// The last dry-run result, shown in the sheet so the operator sees the
     /// exact agents and prompts before launching for real.
     @Published private(set) var workStartPlan: MuxaWorkStartResult?
@@ -129,6 +154,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var askError: String?
     @Published private(set) var askSettingsStatus: String?
     @Published private(set) var askSettingsError: String?
+    @Published var pendingOperatorMessageID: String?
     @Published private(set) var operatorMessages: [MuxaOperatorMessage] = []
     @Published private(set) var mailboxRevisions: [String: UInt64] = [:]
     @Published private(set) var isRefreshingInbox = false
@@ -146,6 +172,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var hostRegistrationError: String?
 
     let client: MuxaIPCClient
+    // WS-A: unread state and macOS notifications for agent transitions.
+    let attention: MuxaAgentAttentionCenter
     private let daemon = DaemonManager()
     private var refreshTask: Task<Void, Never>?
     private var fleetRefreshTask: Task<Void, Never>?
@@ -189,6 +217,20 @@ final class AppModel: ObservableObject {
 
     init(client: MuxaIPCClient = MuxaIPCClient()) {
         self.client = client
+        // WS-A: tests get an in-memory center that never touches
+        // UserDefaults, the notification center, or the Dock.
+        if Self.isRunningTests() {
+            attention = MuxaAgentAttentionCenter(defaults: nil)
+        } else {
+            attention = MuxaAgentAttentionCenter(
+                poster: MuxaUserNotifications.shared,
+                settings: { MuxaNotificationPreferences.current() }
+            )
+            attention.sendPrompt = { [client] host, pane, text in
+                try await client.sendFleetPrompt(host: host, pane: pane, text: text)
+            }
+            MuxaUserNotifications.shared.attention = attention
+        }
     }
 
     /// Test seam. The app ingests execution snapshots through `refresh`, which
@@ -350,8 +392,7 @@ final class AppModel: ObservableObject {
                 if askEnabled != listedAskStatus { askEnabled = listedAskStatus }
                 if listedAskStatus { askConfigurationPendingReload = false }
             }
-            if sidebarMode == .inbox,
-               Date().timeIntervalSince(lastInboxRefresh) >= 60,
+            if Date().timeIntervalSince(lastInboxRefresh) >= 60,
                !isRefreshingInbox {
                 Task { [weak self] in await self?.refreshOperatorInbox() }
             }
@@ -414,9 +455,23 @@ final class AppModel: ObservableObject {
     }
 
     private func runReconciliation(ifGeneration generation: UInt64) async {
+        // A read failure is never replayed by the IPC layer, so a muxad
+        // restart always lands as `.failed` and this loop is what clears it.
+        // muxad re-execs in well under a second, so poll quickly at first —
+        // then back off to the steady-state period, because a daemon that is
+        // genuinely down should not be probed eighty times a minute.
+        var pollsWhileDisconnected = 0
         while !Task.isCancelled, connectionGeneration == generation {
+            let delay: Duration
+            if isDisconnected {
+                delay = .milliseconds(min(15_000, 750 << min(pollsWhileDisconnected, 5)))
+                pollsWhileDisconnected += 1
+            } else {
+                delay = .seconds(15)
+                pollsWhileDisconnected = 0
+            }
             do {
-                try await Task.sleep(for: .seconds(15))
+                try await Task.sleep(for: delay)
             } catch {
                 return
             }
@@ -424,7 +479,13 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private var isDisconnected: Bool {
+        if case .failed = connectionState { return true }
+        return false
+    }
+
     private func runAskSubscription(ifGeneration generation: UInt64) async {
+        askUsesSnapshots = false
         guard await client.supports(MuxaIPCClient.askSubscribeCapability) else { return }
         while !Task.isCancelled, connectionGeneration == generation {
             do {
@@ -437,6 +498,10 @@ final class AppModel: ObservableObject {
                 return
             } catch {
                 guard connectionGeneration == generation else { return }
+                if MuxaAskSubscriptionPolicy.usesSnapshots(error) {
+                    askUsesSnapshots = true
+                    return // Regular reconciliation reads shared history; do not retry an unsupported stream.
+                }
                 MuxaLog.app.warning(
                     "Ask invalidation stream reconnecting: \(error.localizedDescription, privacy: .public)"
                 )
@@ -631,8 +696,8 @@ final class AppModel: ObservableObject {
         hostedAgents = executionSnapshot.hostedAgents
             .filter { $0.agent.state != "stopped" }
             .sorted { left, right in
-                let leftPriority = Self.agentPriority(left.agent.state)
-                let rightPriority = Self.agentPriority(right.agent.state)
+                let leftPriority = left.agent.status.priority
+                let rightPriority = right.agent.status.priority
                 if leftPriority != rightPriority { return leftPriority < rightPriority }
                 if left.host.local != right.host.local { return left.host.local }
                 if left.host.alias != right.host.alias { return left.host.alias < right.host.alias }
@@ -642,6 +707,13 @@ final class AppModel: ObservableObject {
     }
 
     func createShell() {
+        createShell(typing: nil)
+    }
+
+    /// A new shell tab with `text` typed at its prompt but not run: the
+    /// operator reads it and presses Return (the Welcome guide's install
+    /// commands).
+    func createShell(typing text: String?) {
         guard isConnected, !isCreatingSession else { return }
         isCreatingSession = true
         Task {
@@ -674,6 +746,18 @@ final class AppModel: ObservableObject {
                 shellNumber += 1
                 registerSpawnedSession(session)
                 await refresh()
+                if let text, !text.isEmpty {
+                    // Give the shell a moment to draw its prompt so the
+                    // text lands after it rather than above it.
+                    try? await Task.sleep(for: .milliseconds(600))
+                    do {
+                        try await client.writeSession(id: session.id, bytes: Data(text.utf8))
+                    } catch {
+                        MuxaLog.app.warning(
+                            "typing into the new shell failed: \(error.localizedDescription, privacy: .public)"
+                        )
+                    }
+                }
             } catch {
                 MuxaLog.app.error(
                     "session creation failed: \(error.localizedDescription, privacy: .public)"
@@ -1304,8 +1388,9 @@ final class AppModel: ObservableObject {
         inboxError = nil
         defer { isRefreshingInbox = false }
 
-        let allTargets = executionSnapshot.watchHosts.compactMap { host -> MuxaWatchPane? in
+        let allTargets = executionSnapshot.watchHosts.map { host -> MuxaWatchPane in
             host.sessions.flatMap(\.windows).flatMap(\.panes).first
+                ?? MuxaWatchPane(host: host.host.identity, pane: .operatorRoute, agent: nil)
         }
         let targets = hostAliases.map { aliases in
             allTargets.filter { aliases.contains($0.host.alias) }
@@ -1329,7 +1414,8 @@ final class AppModel: ObservableObject {
                     do {
                         let mailbox = try await client.collaborationMailbox(
                             host: target.host,
-                            pane: target.pane
+                            pane: target.pane,
+                            operatorOnly: true
                         )
                         return MuxaInboxFetch(target: target, mailbox: mailbox, error: nil)
                     } catch {
@@ -1350,7 +1436,8 @@ final class AppModel: ObservableObject {
             let target = result.target
             if let mailbox = result.mailbox {
                 var seen = Set<String>()
-                messagesByHost[target.host.alias] = mailbox.sent.compactMap { request in
+                let humanRequests = mailbox.incoming.filter { $0.to.console == true && $0.from.console != true }
+                messagesByHost[target.host.alias] = (humanRequests + mailbox.sent).compactMap { request in
                     guard seen.insert(request.id).inserted else { return nil }
                     return MuxaOperatorMessage(
                         host: target.host,
@@ -1375,6 +1462,7 @@ final class AppModel: ObservableObject {
                 return lhs.id < rhs.id
             }
         if operatorMessages != updatedMessages { operatorMessages = updatedMessages }
+        attention.ingestHumanRequests(updatedMessages)
         if inboxHostFailures != failures { inboxHostFailures = failures }
     }
 
@@ -1383,7 +1471,7 @@ final class AppModel: ObservableObject {
             for: message,
             in: executionSnapshot
         ) else {
-            inboxError = String(localized: "\(message.request.to.label) is no longer present on \(message.host.alias). The conversation is still available, but its live agent cannot be opened.")
+            inboxError = String(localized: "\(message.counterpart.label) is no longer present on \(message.host.alias). The conversation is still available, but its live agent cannot be opened.")
             return
         }
         inboxError = nil
@@ -1403,7 +1491,7 @@ final class AppModel: ObservableObject {
         for message: MuxaOperatorMessage,
         in snapshot: MuxaExecutionSnapshot
     ) -> MuxaSidebarSelection? {
-        let participant = message.request.to
+        let participant = message.counterpart
         let agents = snapshot.hostedAgents.filter {
             $0.host.alias == message.host.alias && $0.agent.state != "stopped"
         }
@@ -1504,6 +1592,16 @@ final class AppModel: ObservableObject {
 
     func prepareHostRegistration() {
         hostRegistrationError = nil
+    }
+
+    func setHostLabel(host: String, key: String, value: String?) async throws {
+        let document = try await client.readDaemonConfig()
+        let change = value.map { "\(key)=\($0)" } ?? "\(key)-"
+        _ = try await Self.runBundledMuxa(
+            arguments: ["--config", document.path, "host", "label", host, change, "--overwrite"],
+            socketPath: client.socketPath
+        )
+        beginConnection(replacingExistingDaemon: false)
     }
 
     func registerHost(_ request: MuxaHostRegistrationRequest) async -> Bool {
@@ -1660,6 +1758,7 @@ final class AppModel: ObservableObject {
     func show(_ mode: MuxaSidebarMode) {
         // Like VS Code's Activity Bar, this changes the visible view
         // container without replacing whichever editor tab is active.
+        if mode == .files, sidebarMode != .files, let directory = activeFileDirectory { fileRoot = directory }
         sidebarMode = mode
         if mode == .inbox, isConnected {
             Task { [weak self] in await self?.refreshOperatorInbox() }
@@ -1684,7 +1783,7 @@ final class AppModel: ObservableObject {
         case .workBoard: sidebarMode = .work
         case .watch: sidebarMode = .watch
         case .inbox: sidebarMode = .inbox
-        case .ask: sidebarMode = .inbox
+        case .ask: sidebarMode = .ask
         case .work: sidebarMode = .work
         case .agent: sidebarMode = .inbox
         case .host: sidebarMode = .watch
@@ -1692,6 +1791,9 @@ final class AppModel: ObservableObject {
         case .fleetWindow: sidebarMode = .watch
         case .shell: sidebarMode = .shells
         case .pane: sidebarMode = .watch
+        case .file(let location):
+            if fileRoot?.contains(location) != true { fileRoot = location.parent }
+            sidebarMode = .files
         }
         sidebarSelection = selection
     }
@@ -1704,13 +1806,18 @@ final class AppModel: ObservableObject {
         // execution navigator. Returning to an already-open pane tab must
         // restore its Explorer highlight as well as the editor content.
         switch selection {
+        case .file(let location):
+            if fileRoot?.contains(location) != true { fileRoot = location.parent }
+            sidebarMode = .files
         case .pane(let id):
             watchSelection = id
             sidebarMode = .watch
         case .watch, .fleetSession, .fleetWindow:
             sidebarMode = .watch
-        case .inbox, .ask, .agent:
+        case .inbox, .agent:
             sidebarMode = .inbox
+        case .ask:
+            sidebarMode = .ask
         default:
             break
         }
@@ -1738,7 +1845,7 @@ final class AppModel: ObservableObject {
             // Nothing selected: the Shells tab may legitimately be empty (or
             // show only exited shells); every other mode falls back to the
             // Work board.
-            if sidebarMode != .shells {
+            if sidebarMode != .shells && sidebarMode != .files {
                 sidebarMode = .work
                 self.sidebarSelection = .workBoard
             }
@@ -1777,16 +1884,13 @@ final class AppModel: ObservableObject {
             return
         }
         watchSelection = panes.first(where: { pane in
-            pane.agent.map {
-                ["waiting_input", "waiting_choice", "blocked", "error", "failed"]
-                    .contains($0.state)
-            } ?? false
+            pane.needsAttention
         })?.id ?? panes.first?.id
     }
 
     func isSelectionAvailable(_ selection: MuxaSidebarSelection) -> Bool {
         switch selection {
-        case .workBoard, .watch, .inbox, .ask:
+        case .workBoard, .watch, .inbox, .ask, .file:
             true
         case .work(let key):
             workGroups.contains { $0.identity == key }
@@ -1805,12 +1909,4 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private static func agentPriority(_ state: String) -> Int {
-        switch state {
-        case "waiting_input", "waiting_choice", "error", "failed", "blocked": 0
-        case "working", "starting": 1
-        case "idle": 2
-        default: 3
-        }
-    }
 }

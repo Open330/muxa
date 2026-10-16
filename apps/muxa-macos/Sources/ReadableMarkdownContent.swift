@@ -320,7 +320,7 @@ private struct ReadableCodeBlock: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 Text(language?.uppercased() ?? "CODE")
-                    .font(.caption2.weight(.semibold))
+                    .font(MuxaType.meta.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button {
@@ -331,7 +331,7 @@ private struct ReadableCodeBlock: View {
                         .labelStyle(.titleAndIcon)
                 }
                 .buttonStyle(.plain)
-                .font(.caption)
+                .font(MuxaType.detail)
             }
             .padding(.horizontal, 10)
             .frame(height: 30)

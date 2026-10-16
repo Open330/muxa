@@ -220,6 +220,7 @@ impl RmuxBackend {
         let Ok(paste) = scoped.control_command(&[
             "paste-buffer",
             "-p",
+            "-r",
             "-b",
             &buffer,
             "-t",
@@ -307,8 +308,37 @@ impl PaneBackend for RmuxBackend {
             .is_ok()
     }
 
+    fn send_prompt_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+        text.is_empty() || self.paste_text_on(socket, pane_id, text)
+    }
+
     fn capture_pane_on(&self, endpoint: Option<&str>, pane_id: &str) -> Option<String> {
         self.capture_on(endpoint, pane_id)
+    }
+
+    fn capture_pane_history_on(
+        &self,
+        endpoint: Option<&str>,
+        pane_id: &str,
+        history: usize,
+    ) -> Option<String> {
+        let scoped = Self {
+            endpoint: endpoint
+                .map(str::to_string)
+                .or_else(|| self.endpoint.clone()),
+        };
+        let start = format!("-{history}");
+        let command = scoped
+            .control_command(&[
+                "capture-pane",
+                "-ep",
+                "-S",
+                &start,
+                "-t",
+                strip_prefix(pane_id),
+            ])
+            .ok()?;
+        successful_stdout(command)
     }
 }
 
@@ -388,6 +418,36 @@ fn rmux_command(endpoint: Option<&str>) -> Command {
         command.arg("-S").arg(endpoint);
     }
     command
+}
+
+/// `list-sessions` and `list-clients` stdout from the default rmux server, for
+/// session-activity sampling. `Ok(None)` when no server is running (the tmux
+/// "no server running" analog); `Err` for any other failure, so the caller
+/// leaves its open intervals alone.
+pub(crate) fn activity_listing(
+    session_format: &str,
+    client_format: &str,
+) -> Result<Option<(String, String)>, String> {
+    let run = |args: &[&str]| -> Result<Option<String>, String> {
+        let mut command = rmux_command(None);
+        command.args(args);
+        let output = command_output(command, None).map_err(|error| error.to_string())?;
+        if output.status.success() {
+            return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("Error connecting") || stderr.contains("no server running") {
+            return Ok(None);
+        }
+        Err(stderr.trim().to_owned())
+    };
+    let Some(sessions) = run(&["list-sessions", "-F", session_format])? else {
+        return Ok(None);
+    };
+    let Some(clients) = run(&["list-clients", "-F", client_format])? else {
+        return Ok(None);
+    };
+    Ok(Some((sessions, clients)))
 }
 
 fn rmux_binary() -> &'static Path {
@@ -514,6 +574,7 @@ mod tests {
             "editor",
         ]);
         cols[12] = "workspace-is-not-a-socket";
+        cols[18] = "codex";
         cols[32] = "alpha-group";
         cols.push(socket);
         cols.join("\t")
@@ -541,6 +602,7 @@ mod tests {
         assert_eq!(pane.session_group.as_deref(), Some("alpha-group"));
         assert_eq!(pane.current_path, "/tmp/project");
         assert_eq!(pane.pane_pid, 4242);
+        assert_eq!(pane.agent_program.as_deref(), Some("codex"));
         assert_eq!(pane.socket.as_deref(), Some("/tmp/rmux.sock"));
     }
 

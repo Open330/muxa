@@ -70,7 +70,8 @@ children keep their aggregate state markers.
 | `a` / `A` | Continue Ask / open the selected conversation. In the composer, `Ctrl-E` switches to a new conversation; in the panel, `n` drafts one. |
 | `m` / `M` | Message the resolved agent — or every marked one — / open history for the selected topology scope. |
 | `Space` | Mark or unmark the agent under the cursor. With marks set, `m` composes once and sends one ordinary request to each; the result popup keeps a row per recipient. |
-| `b` | Legacy alias for `M`; `i` claims and `e` replies inside the mailbox. |
+| `b` | Alias for `M`; `i` claims and `e` replies inside the mailbox. |
+| `Alt-M` / `:move` | Move the selected agent without restarting. `Tab` toggles follow/stay. |
 | `v` | On the collaboration screen, toggle table / chronological sequence. |
 | `o` / `Alt-P` | Open live preview. |
 | `:` | Open the command palette; `Tab` completes the first match. |
@@ -107,6 +108,54 @@ does not.
 Every `Alt` binding also has an `Alt`-free equivalent in the command palette
 (`:inspector`, `:events`, `:preview`, …), which works regardless of terminal
 configuration.
+
+### Move a running agent
+
+Press `prefix+M` from the agent pane, or select it in local `muxa watch` and
+press `Alt-M` (`:move` also works). Both open the same searchable session → window tree:
+new window in the current session, new session, or another session/window.
+Choose a destination and press Enter; a new session asks only for its name.
+`Tab` toggles follow/stay. Left/right folds or expands a session; Enter on a
+session toggles it. `Ctrl-Left`/`Ctrl-Right` cycles the split direction for an
+existing window. Matching windows retain their session heading during search.
+The current session and source window are marked, and + New window appears
+inside each session. Escape backs out without moving.
+
+Select a **window** row in watch and press `Alt-M` to move the whole window.
+Select a **pane** row to move only that agent. A session row compacted with
+its sole window also moves that whole window. `Ctrl-W` in the popup switches
+between the two scopes; its title explicitly shows whole-window mode.
+Whole-window destinations are new or existing sessions. The original window ID,
+all pane processes, their conversations, and the pane layout stay together.
+Existing windows are never replaced; a duplicate window name gets a numeric
+suffix. Work IDs stay, workspace membership follows the destination, and an
+old pipeline generation is cleared when the workspace changes. Undo restores
+the previous session, window name, and pane metadata. A final source window
+leaves a shell window behind to keep its clients connected.
+
+For scripts: `muxa window move --source-window @13 --session dev --stay`,
+`muxa window move --source-window @13 --new-session review`, or
+`muxa window move --source-window @13 --undo`.
+
+The pane, process, working directory, conversation, and terminal history remain
+alive. Moving the final pane leaves a shell in the original session so its
+clients and undo location survive. Moves stay on the same tmux/rmux server.
+The destination Work replaces
+the pane's previous Work association; alias and role stay, while the old pipeline
+generation is cleared. Pending messages keep their agent/request identities,
+and room peers change with the destination window.
+
+Open the menu again and choose **Undo previous move** to return. If the source
+window disappeared, it is recreated in its surviving session. If the source
+session was closed, choose a destination manually. Following uses a private
+grouped session view when another client is already attached. Mailbox history
+keeps its existing `M` binding (`b` remains an alias), including in Fleet watch.
+
+Install or refresh the binding with `muxa init --component tmux-popup --yes`.
+For scripts, use `muxa agent move --pane %42 --new-session review --stay`, or
+`--session NAME --new-window NAME`, `--window @ID`, or `--undo`.
+`--server-socket` and `--host tmux|rmux` pin the terminal server; the global
+`--socket` continues to name the Muxa daemon.
 
 ## Filter, Inspector, and Events
 
@@ -352,8 +401,8 @@ file changes. This is a contract delivered to the receiving agent, not a
 command that muxa executes immediately. Watch has no separate path-scope
 field, so include the intended edit scope in an execute request's body.
 
-Press `M` for history (`b` remains an alias). In a pane mailbox, `m` opens a
-new message and `M` closes the mailbox. `Tab` switches mailbox, `j`/`k`
+Press `M` for history. In a pane mailbox, `m` opens a
+new message and `M` or `b` closes the mailbox. `Tab` switches mailbox, `j`/`k`
 selects a request, `i` claims pending incoming work, and `e` replies. Aggregate
 window/session history has one combined stream, so `Tab`, `m`, `i`, and `e`
 are disabled there. A watch opened from a normal shell still collaborates as
@@ -542,6 +591,11 @@ activity, and these updates do not rescan multiplexer topology. A five-second
 full refresh still reconciles topology; older daemons use polling. A refresh or
 re-sort keeps the selected session, window, or pane selected by its stable key,
 even when another window in the same session moves ahead of it.
+
+For Codex, the daemon reads lifecycle and quota evidence from session logs
+every two seconds. `latest` uses the event timestamp, so replaying old logs or
+refreshing quota telemetry does not make a session newly active. `AGE` measures
+time in the current state; it is not the activity timestamp used for sorting.
 
 ## Detail Row
 

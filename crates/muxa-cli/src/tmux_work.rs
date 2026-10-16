@@ -706,6 +706,81 @@ pub fn run_workspace_view(args: WorkspaceViewArgs) -> Result<()> {
     Ok(())
 }
 
+/// Focus a moved agent for one client. Reuse its grouped view when possible;
+/// otherwise create a private destination view if another client is there.
+pub(crate) fn focus_moved_pane(
+    control: &Control,
+    client: &str,
+    session: &str,
+    window: &str,
+    pane: &str,
+) -> Result<()> {
+    let current = resolve_view_session(control, client)?;
+    let linked = control.output(&["list-windows", "-t", &current.id, "-F", "#{window_id}"])?;
+    let target = if linked.lines().any(|id| id == window) {
+        current.clone()
+    } else {
+        resolve_view_session(control, session)?
+    };
+    let others = target
+        .attached
+        .saturating_sub(u32::from(target.id == current.id));
+    let session = if others > 0 {
+        let sessions = list_view_sessions(control)?;
+        let source = canonical_view_source(&target, &sessions);
+        let suffix = client_suffix(control, client)?;
+        let view = prepare_view(control, client, &source, &suffix, &sessions)?;
+        activate_view(control, client, &current.id, &view)?;
+        view.id
+    } else {
+        target.id
+    };
+    let target = format!("{session}:{window}");
+    control.run(&["switch-client", "-c", client, "-t", &target])?;
+    control.run(&["select-window", "-t", &target])?;
+    control.run(&[
+        "select-pane",
+        "-t",
+        &format!("{target}.{}", pane.strip_prefix("rmux:").unwrap_or(pane)),
+    ])
+}
+
+pub(crate) struct MoveFollowView {
+    pub session: String,
+    pub private: bool,
+    pub created: bool,
+}
+
+/// Prepare a destination view without switching away from the popup. Whole
+/// window moves can close that popup, so its switch must join the move queue.
+pub(crate) fn prepare_window_move_follow(
+    control: &Control,
+    client: &str,
+    session: &str,
+) -> Result<MoveFollowView> {
+    let current = resolve_view_session(control, client)?;
+    let target = resolve_view_session(control, session)?;
+    let others = target
+        .attached
+        .saturating_sub(u32::from(target.id == current.id));
+    if others == 0 {
+        return Ok(MoveFollowView {
+            session: target.id,
+            private: false,
+            created: false,
+        });
+    }
+    let sessions = list_view_sessions(control)?;
+    let source = canonical_view_source(&target, &sessions);
+    let suffix = client_suffix(control, client)?;
+    let view = prepare_view(control, client, &source, &suffix, &sessions)?;
+    Ok(MoveFollowView {
+        session: view.id,
+        private: true,
+        created: view.created,
+    })
+}
+
 fn client_suffix(control: &Control, client: &str) -> Result<String> {
     let listing = control.output(&["list-clients", "-F", "#{client_name}\t#{client_pid}"])?;
     listing
@@ -719,12 +794,12 @@ fn client_suffix(control: &Control, client: &str) -> Result<String> {
 
 /// Choose a private destination before changing the selected window. This
 /// avoids even a transient window switch in another terminal's session.
-pub(crate) fn private_jump_session(
+pub(crate) fn prepare_jump_view(
     control: &Control,
     client: &str,
     session: &str,
     window: &str,
-) -> Result<String> {
+) -> Result<AttachView> {
     let current = resolve_view_session(control, client)?;
     let linked = control.output(&["list-windows", "-t", &current.id, "-F", "#{window_id}"])?;
     let target = if linked.lines().any(|id| id == window) {
@@ -736,25 +811,41 @@ pub(crate) fn private_jump_session(
         .attached
         .saturating_sub(u32::from(current.id == target.id));
     if others == 0 {
-        return Ok(target.id);
+        return Ok(AttachView {
+            id: target.id,
+            control: control.clone(),
+            created: false,
+        });
     }
     let opted_out = control
         .output(&["show-options", "-v", "-t", &target.id, "@no_auto_view"])
         .unwrap_or_default();
     if !opted_out.trim().is_empty() {
-        return Ok(target.id);
+        return Ok(AttachView {
+            id: target.id,
+            control: control.clone(),
+            created: false,
+        });
     }
     let sessions = list_view_sessions(control)?;
     let source = canonical_view_source(&target, &sessions);
     let suffix = client_suffix(control, client)?;
     let view = prepare_view(control, client, &source, &suffix, &sessions)?;
-    activate_view(control, client, &current.id, &view)?;
-    Ok(view.id)
+    let view = AttachView {
+        id: view.id,
+        control: control.clone(),
+        created: view.created,
+    };
+    // A popup's process is terminated by switch-client. Arm cleanup on the
+    // server before switching, and keep preparation free of client moves.
+    arm_view_cleanup(control, &view.id, "client-session-changed[9001]")?;
+    Ok(view)
 }
 
-/// Keep a bare-terminal attach private as well. The owner is retained until
-/// attach exits; unlike destroy-unattached, this cannot reap a view before
-/// the interactive client has connected.
+/// Keep a bare-terminal attach private as well. The guard cleans up failed
+/// attaches; a server-side client-attached hook arms destroy-unattached only
+/// after the first client arrives, so abrupt client/parent exits are covered
+/// without reaping the view before it can be attached.
 pub(crate) struct AttachView {
     pub id: String,
     control: Control,
@@ -804,11 +895,27 @@ pub(crate) fn prepare_attach_view(control: &Control, target: &str) -> Result<Att
         "-s",
         &name,
     ])?;
-    Ok(AttachView {
+    let view = AttachView {
         id: id.trim().to_string(),
         control: control.clone(),
         created: true,
-    })
+    };
+    // Stable server-generated session ids are quoted to keep tmux from
+    // interpreting the leading '$' as an environment expansion in the hook.
+    // Retain the guard before installing the hook so an installation failure
+    // also removes this newly created, unattached view.
+    arm_view_cleanup(control, &view.id, "client-attached[9001]")?;
+    Ok(view)
+}
+
+fn arm_view_cleanup(control: &Control, session: &str, hook: &str) -> Result<()> {
+    control.run(&[
+        "set-hook",
+        "-t",
+        session,
+        hook,
+        &format!("set-option -t '{session}' destroy-unattached on"),
+    ])
 }
 
 pub async fn run_agent_control(args: AgentControlArgs, client: &Client) -> Result<()> {
@@ -1681,7 +1788,7 @@ fn resolve_window_identity(target: Option<&str>) -> Result<WindowIdentity> {
         .ok_or_else(|| {
             anyhow::anyhow!("window target is required outside tmux; pass --window @N")
         })?;
-    if muxa::backend::rmux::endpoint_from_env().is_some() {
+    if crate::mux_control::rmux_endpoint().is_some() {
         // A grouped @window may be linked into a different session from the
         // caller. rmux 0.10's display-message can then report empty identity
         // fields; enumeration gives each link its explicit session context.
@@ -1933,8 +2040,17 @@ pub fn mark_agent(
         // launch against any other socket reserved the name in the wrong
         // room, and against a host with no default daemon it failed outright
         // and took the launch down with it.
-        muxa::ipc::blocking_reserve_handle(socket, pane, &alias, RESERVE_TIMEOUT)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        muxa::ipc::blocking_reserve_handle(
+            socket,
+            &if crate::mux_control::rmux_endpoint().is_some() {
+                format!("rmux:{pane}")
+            } else {
+                pane.to_string()
+            },
+            &alias,
+            RESERVE_TIMEOUT,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
         set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
     }
     if let Some(generation) = generation {
@@ -2613,7 +2729,9 @@ fn tmux_output_allow_no_server(args: &[&str]) -> Result<String> {
         Ok(output) => Ok(output),
         Err(error)
             if error.to_string().contains("no server running")
-                || error.to_string().contains("no sessions") =>
+                || error.to_string().contains("no sessions")
+                || (error.to_string().contains("error connecting to ")
+                    && error.to_string().contains("(No such file or directory)")) =>
         {
             Ok(String::new())
         }

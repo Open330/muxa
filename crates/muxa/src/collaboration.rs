@@ -49,6 +49,9 @@ impl Default for CollaborationOptions {
     }
 }
 
+/// Explicit daemon support for the human decision protocol.
+pub const HUMAN_ACTIONS_CAPABILITY: &str = "collaboration_human_actions_v1";
+
 /// The stable pane-shaped identity of the operator console. It is not a real
 /// pane id — `pane_id_host_kind` rejects it, which is what keeps the wake path
 /// from ever trying to type at a human.
@@ -97,8 +100,13 @@ fn pending_session_id(pane: &str, socket: Option<&str>) -> String {
 /// recipient: the request was addressed to a pane before any session existed
 /// there, so the real agent that registered on that pane — and only on that
 /// exact pane and control endpoint — owns it too.
-fn addresses(to: &Participant, caller: &Participant) -> bool {
-    if to.same_endpoint(caller) {
+/// Whether `caller` may receive a request addressed to `to`: the exact
+/// session, or, for a request still waiting on a launching agent, the agent
+/// that now occupies that pane *in the same room*. Delivery reserves the
+/// request through this predicate, so anything picking a recipient must use
+/// it too: a candidate it rejects can never be served.
+pub fn addresses(to: &Participant, caller: &Participant) -> bool {
+    if to.same_session(caller) {
         return true;
     }
     is_pending_session(&to.agent_session_id)
@@ -117,6 +125,59 @@ fn addresses(to: &Participant, caller: &Participant) -> bool {
 
 fn same_endpoint_in_room(left: &Participant, right: &Participant) -> bool {
     left.same_endpoint(right) && left.room == right.room
+}
+
+fn dispatch_request_id(
+    input: &NewRequest,
+    now: OffsetDateTime,
+) -> Result<String, CollaborationError> {
+    let id = if let Some(dispatch_id) = input.dispatch_id.as_deref() {
+        let uuid = uuid::Uuid::parse_str(dispatch_id).map_err(|_| {
+            CollaborationError::InvalidDispatch("dispatch_id must be a UUID".into())
+        })?;
+        format!("dispatch-{uuid}")
+    } else {
+        next_request_id(now)
+    };
+    if let Some(parent) = &input.delegation_parent {
+        if parent.request_id.is_empty() || parent.request_id.len() > 256 {
+            return Err(CollaborationError::InvalidDispatch(
+                "parent request id must be 1..256 bytes".into(),
+            ));
+        }
+    }
+    Ok(id)
+}
+
+fn dispatch_matches(
+    existing: &CollaborationRequest,
+    from: &Participant,
+    to: &Participant,
+    input: &NewRequest,
+    body: &str,
+) -> bool {
+    existing.from.same_endpoint(from)
+        && (existing.to.same_endpoint(to) || addresses(&existing.to, to))
+        && existing.kind == input.kind
+        && existing.body == body
+        && existing.expects_reply == input.expects_reply
+        && existing.notify == input.notify
+        && existing.human_action == input.human_action
+        && existing.work_mode == input.work_mode
+        && existing.source_node_id == input.source_node_id
+        && existing.delegation_parent == input.delegation_parent
+        && existing.parent_request_id == normalize_optional_id(input.parent_request_id.clone())
+        && input
+            .thread_id
+            .as_ref()
+            .is_none_or(|v| existing.thread_id.as_ref() == Some(v))
+        && existing.workspace_id == normalize_optional_id(input.workspace_id.clone())
+        && existing.work_id == normalize_optional_id(input.work_id.clone())
+        && existing.run_id == normalize_optional_id(input.run_id.clone())
+        && existing.paths == input.paths
+        && existing.artifacts == input.artifacts
+        && existing.links == input.links
+        && existing.air_artifacts == input.air_artifacts
 }
 
 fn same_participant_pair(
@@ -168,6 +229,15 @@ pub struct CollaborationOrigin {
     /// longer supplies the identity, so the console can address that pane too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub console: bool,
+    /// The calling agent's own session id, when its host supplies one
+    /// (Codex stamps a thread id on every MCP call and shell command).
+    ///
+    /// It is the exact identity: a pane can be claimed by more than one
+    /// registry row, or by the wrong one when the caller's pane variables were
+    /// inherited from another pane (Codex's shared app-server). A participant
+    /// with this session wins over a pane match; without one, `pane` decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
 }
 
 /// Local IPC surface that initiated a collaboration call. This describes the
@@ -340,6 +410,22 @@ impl Participant {
             || format!("{}@{}", self.agent_kind, self.pane),
             |alias| format!("{alias}@{}", self.pane),
         )
+    }
+
+    /// Durable mailbox ownership follows a registered session across pane/window
+    /// moves on the same host and control socket. Pending recipients remain
+    /// pinned to their endpoint until a real session adopts them.
+    fn same_session(&self, other: &Self) -> bool {
+        if self.console
+            || other.console
+            || self.agent_session_id.is_empty()
+            || is_pending_session(&self.agent_session_id)
+        {
+            return self.same_endpoint(other);
+        }
+        self.agent_session_id == other.agent_session_id
+            && self.socket == other.socket
+            && self.room.host == other.room.host
     }
 
     fn same_endpoint(&self, other: &Self) -> bool {
@@ -531,11 +617,48 @@ pub struct CollaborationReply {
     pub at: OffsetDateTime,
 }
 
+/// A progress report or guidance update, separate from the one terminal reply.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CollaborationUpdate {
+    pub sequence: u64,
+    pub author: Participant,
+    pub body: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+}
+
+/// Cross-node causal link. Metadata only; it grants no participant authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationRef {
+    pub node_id: crate::fleet::NodeId,
+    pub request_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CollaborationRequest {
+    /// Caller-generated UUID, reused for retries of the same immutable request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<crate::fleet::NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_parent: Option<DelegationRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption: Option<PeerInterruption>,
+    /// Explicit operator decision. Never inferred from prose or the sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_action: Option<HumanAction>,
     pub id: String,
     pub from: Participant,
     pub to: Participant,
+    /// Advisory identity of the agent initiating a Fleet console request;
+    /// never used for authorization or participant matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<Box<Participant>>,
+    /// Bounded nonterminal conversation on this exact request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub updates: Vec<CollaborationUpdate>,
     /// How the request entered muxad. `from` remains the represented agent;
     /// this field identifies the local caller that exercised that authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -543,6 +666,10 @@ pub struct CollaborationRequest {
     pub kind: RequestKind,
     pub body: String,
     pub expects_reply: bool,
+    /// Override recipient wake delivery. None keeps one-way notices quiet and
+    /// wakes actionable requests. This never changes the reply contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<bool>,
     pub work_mode: WorkMode,
     /// Stable id shared by every request in one causal conversation.
     ///
@@ -611,6 +738,29 @@ pub struct CollaborationRequest {
     pub reply: Option<CollaborationReply>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanAction {
+    Approval,
+    Choice,
+    Information,
+}
+
+impl CollaborationRequest {
+    /// Whether the recipient needs a wake; terminal replies use their own path.
+    pub fn should_notify(&self) -> bool {
+        self.notify
+            .unwrap_or(self.kind != RequestKind::Notice || self.expects_reply)
+    }
+
+    pub fn needs_human_response(&self) -> bool {
+        self.to.console
+            && self.expects_reply
+            && self.kind != RequestKind::Notice
+            && matches!(self.status, RequestStatus::Queued | RequestStatus::Claimed)
+    }
+}
+
 /// A handle the daemon has promised to one pane, pending the scan that will
 /// show the pane holding it.
 #[derive(Debug, Clone)]
@@ -654,9 +804,24 @@ pub struct RoomContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewRequest {
+    /// Caller-generated UUID, reused for retries of the same immutable request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<crate::fleet::NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_parent: Option<DelegationRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_action: Option<HumanAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<Box<Participant>>,
     pub kind: RequestKind,
     pub body: String,
     pub expects_reply: bool,
+    /// Override recipient wake delivery. None keeps one-way notices quiet and
+    /// wakes actionable requests. This never changes the reply contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<bool>,
     pub work_mode: WorkMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
@@ -680,9 +845,15 @@ pub struct NewRequest {
 impl Default for NewRequest {
     fn default() -> Self {
         Self {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
+            human_action: None,
+            initiator: None,
             kind: RequestKind::Question,
             body: String::new(),
             expects_reply: true,
+            notify: None,
             work_mode: WorkMode::ReadOnly,
             thread_id: None,
             parent_request_id: None,
@@ -714,6 +885,18 @@ pub struct CollaborationQuery {
         skip_serializing_if = "Option::is_none",
         with = "time::serde::rfc3339::option"
     )]
+    pub until: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub search_bodies: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
     pub since: Option<OffsetDateTime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
@@ -736,6 +919,8 @@ pub struct CollaborationQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_session_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_socket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<CollaborationCursor>,
@@ -754,6 +939,10 @@ pub struct CollaborationPage {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CollaborationError {
+    #[error("invalid dispatch metadata: {0}")]
+    InvalidDispatch(String),
+    #[error("dispatch {0} already exists with a different recipient or payload")]
+    DispatchConflict(String),
     #[error("agent collaboration is disabled; enable [collaboration].enabled")]
     Disabled,
     #[error(
@@ -962,6 +1151,8 @@ fn open_database(path: &Path) -> Result<Connection, CollaborationError> {
                  to_room_host, to_room_socket, to_room_window_id,
                  created_at_ns DESC, id DESC
              );
+         CREATE INDEX IF NOT EXISTS collab_from_session_idx ON collaboration_requests(from_agent_session_id, from_socket, from_room_host, created_at_ns DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS collab_to_session_idx ON collaboration_requests(to_agent_session_id, to_socket, to_room_host, created_at_ns DESC, id DESC);
          CREATE INDEX IF NOT EXISTS collab_from_endpoint_idx
              ON collaboration_requests(
                  from_pane, from_socket, from_agent_session_id,
@@ -1223,10 +1414,24 @@ fn push_endpoint_values(values: &mut Vec<Value>, participant: &Participant) {
     values.push(Value::Text(participant.agent_session_id.clone()));
 }
 
+fn session_caller_clause(prefix: &str, caller: &Participant, values: &mut Vec<Value>) -> String {
+    if caller.console
+        || caller.agent_session_id.is_empty()
+        || is_pending_session(&caller.agent_session_id)
+    {
+        push_endpoint_values(values, caller);
+        return format!(
+            "({prefix}_pane = ? AND {prefix}_socket IS ? AND {prefix}_agent_session_id = ?)"
+        );
+    }
+    values.push(nullable_text(caller.socket.as_ref()));
+    values.push(Value::Text(caller.agent_session_id.clone()));
+    values.push(Value::Text(caller.room.host.clone()));
+    format!("({prefix}_socket IS ? AND {prefix}_agent_session_id = ? AND {prefix}_room_host = ?)")
+}
+
 fn incoming_caller_clause(caller: &Participant, values: &mut Vec<Value>) -> String {
-    let mut alternatives =
-        vec!["(to_pane = ? AND to_socket IS ? AND to_agent_session_id = ?)".to_string()];
-    push_endpoint_values(values, caller);
+    let mut alternatives = vec![session_caller_clause("to", caller, values)];
     if !caller.console && !is_pending_session(&caller.agent_session_id) {
         alternatives.push(
             "(to_agent_session_id LIKE 'pending-pane:%' AND to_pane = ? AND to_socket IS ?
@@ -1267,23 +1472,139 @@ fn request_access_clause(
                 }
             }
         }
-        MailboxScope::Caller => {
-            let sent =
-                "(from_pane = ? AND from_socket IS ? AND from_agent_session_id = ?)".to_string();
-            match mailbox {
-                RequestMailbox::Incoming => Some(incoming_caller_clause(caller, values)),
-                RequestMailbox::Sent => {
-                    push_endpoint_values(values, caller);
-                    Some(sent)
-                }
-                RequestMailbox::All => {
-                    let incoming = incoming_caller_clause(caller, values);
-                    push_endpoint_values(values, caller);
-                    Some(format!("({incoming} OR {sent})"))
-                }
+        MailboxScope::Caller => match mailbox {
+            RequestMailbox::Incoming => Some(incoming_caller_clause(caller, values)),
+            RequestMailbox::Sent => Some(session_caller_clause("from", caller, values)),
+            RequestMailbox::All => {
+                let incoming = incoming_caller_clause(caller, values);
+                let sent = session_caller_clause("from", caller, values);
+                Some(format!("({incoming} OR {sent})"))
             }
+        },
+    }
+}
+
+fn append_session_query_filters(
+    connection: &Connection,
+    query: &CollaborationQuery,
+    clauses: &mut Vec<String>,
+    values: &mut Vec<Value>,
+) -> Result<(), CollaborationError> {
+    if let Some(name) = &query.tmux_session_name {
+        // Include retained records made through a numeric client view, while
+        // keeping the filter before pagination/counting and index-backed.
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT anchor_tmux_session_name FROM collaboration_requests WHERE anchor_tmux_session_name IS NOT NULL",
+        )?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|candidate| {
+                crate::tmux::base_session_name(candidate) == crate::tmux::base_session_name(name)
+            })
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            clauses.push("0".to_string());
+        } else {
+            clauses.push(format!(
+                "anchor_tmux_session_name IN ({})",
+                vec!["?"; names.len()].join(",")
+            ));
+            values.extend(names.into_iter().map(Value::Text));
         }
     }
+    if let Some(socket) = &query.tmux_socket {
+        clauses.push("(CASE WHEN json_extract(payload, '$.from.console') THEN COALESCE(to_socket, to_room_socket) ELSE COALESCE(from_socket, from_room_socket) END) = ?".to_string());
+        values.push(Value::Text(socket.clone()));
+    }
+    Ok(())
+}
+
+fn collaboration_search_paths() -> &'static [&'static str] {
+    &[
+        "$.id",
+        "$.kind",
+        "$.status",
+        "$.workspace_id",
+        "$.work_id",
+        "$.thread_id",
+        "$.parent_request_id",
+        "$.from.alias",
+        "$.from.roles",
+        "$.from.agent_kind",
+        "$.from.pane",
+        "$.from.agent_session_id",
+        "$.from.tmux_session_name",
+        "$.from.window_name",
+        "$.to.alias",
+        "$.to.roles",
+        "$.to.agent_kind",
+        "$.to.pane",
+        "$.to.agent_session_id",
+        "$.to.tmux_session_name",
+        "$.to.window_name",
+    ]
+}
+
+fn collaboration_search_text(request: &CollaborationRequest, bodies: bool) -> String {
+    let value = serde_json::to_value(request).expect("collaboration request serializes");
+    let mut fields = collaboration_search_paths()
+        .iter()
+        .filter_map(|path| {
+            value.pointer(&format!(
+                "/{}",
+                path.trim_start_matches("$.").replace('.', "/")
+            ))
+        })
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .map_or_else(|| value.to_string(), str::to_string)
+        })
+        .collect::<Vec<_>>();
+    if bodies {
+        fields.push(request.body.clone());
+        if let Some(reply) = &request.reply {
+            fields.push(reply.body.clone());
+        }
+        fields.extend(request.updates.iter().map(|update| update.body.clone()));
+    }
+    fields.join(" ")
+}
+
+fn append_search_query_filters(
+    query: &CollaborationQuery,
+    clauses: &mut Vec<String>,
+    values: &mut Vec<Value>,
+) -> Result<(), CollaborationError> {
+    for (operator, instant) in [(">=", query.since), ("<=", query.until)] {
+        if let Some(instant) = instant {
+            clauses.push(format!("created_at_ns {operator} ?"));
+            values.push(Value::Integer(timestamp_nanos(instant)?));
+        }
+    }
+    if let Some(search) = &query.search {
+        let mut fields = collaboration_search_paths()
+            .iter()
+            .map(|path| format!("COALESCE(CAST(json_extract(payload, '{path}') AS TEXT), '')"))
+            .collect::<Vec<_>>();
+        if query.search_bodies {
+            fields.extend(
+                ["$.body", "$.reply.body"]
+                    .iter()
+                    .map(|path| format!("COALESCE(json_extract(payload, '{path}'), '')")),
+            );
+            fields.push("COALESCE((SELECT group_concat(json_extract(value, '$.body'), ' ') FROM json_each(payload, '$.updates')), '')".to_string());
+        }
+        clauses.push(format!(
+            "instr(lower({}), lower(?)) > 0",
+            fields.join(" || ' ' || ")
+        ));
+        values.push(Value::Text(search.clone()));
+    }
+    Ok(())
 }
 
 fn query_database(
@@ -1299,23 +1620,21 @@ fn query_database(
     if let Some(clause) = request_access_clause(caller, mailbox, scope, &mut values) {
         clauses.push(clause);
     }
-    if let Some(since) = query.since {
-        clauses.push("created_at_ns >= ?".to_string());
-        values.push(Value::Integer(timestamp_nanos(since)?));
-    }
+    append_search_query_filters(query, &mut clauses, &mut values)?;
     for (column, value) in [
+        ("id", query.request_id.as_ref()),
         ("workspace_id", query.workspace_id.as_ref()),
         ("work_id", query.work_id.as_ref()),
         ("thread_id", query.thread_id.as_ref()),
         ("parent_request_id", query.parent_request_id.as_ref()),
         ("anchor_tmux_session_id", query.tmux_session_id.as_ref()),
-        ("anchor_tmux_session_name", query.tmux_session_name.as_ref()),
     ] {
         if let Some(value) = value {
             clauses.push(format!("{column} = ?"));
             values.push(Value::Text(value.clone()));
         }
     }
+    append_session_query_filters(&connection, query, &mut clauses, &mut values)?;
     if let Some(kind) = query.kind {
         clauses.push("kind = ?".to_string());
         values.push(Value::Text(request_kind_name(kind).to_string()));
@@ -1401,9 +1720,9 @@ fn request_visible(
     match scope {
         MailboxScope::Caller => match mailbox {
             RequestMailbox::Incoming => addresses(&request.to, caller),
-            RequestMailbox::Sent => request.from.same_endpoint(caller),
+            RequestMailbox::Sent => request.from.same_session(caller),
             RequestMailbox::All => {
-                request.from.same_endpoint(caller) || addresses(&request.to, caller)
+                request.from.same_session(caller) || addresses(&request.to, caller)
             }
         },
         MailboxScope::Room => match mailbox {
@@ -1424,6 +1743,13 @@ fn request_matches_query(request: &CollaborationRequest, query: &CollaborationQu
         &request.from
     };
     query.since.is_none_or(|since| request.created_at >= since)
+        && query.until.is_none_or(|until| request.created_at <= until)
+        && query.request_id.as_ref().is_none_or(|id| request.id == *id)
+        && query.search.as_ref().is_none_or(|search| {
+            collaboration_search_text(request, query.search_bodies)
+                .to_ascii_lowercase()
+                .contains(&search.to_ascii_lowercase())
+        })
         && query
             .workspace_id
             .as_ref()
@@ -1451,7 +1777,20 @@ fn request_matches_query(request: &CollaborationRequest, query: &CollaborationQu
             .as_ref()
             .is_none_or(|session_id| session_anchor.tmux_session_id.as_ref() == Some(session_id))
         && query.tmux_session_name.as_ref().is_none_or(|session_name| {
-            session_anchor.tmux_session_name.as_ref() == Some(session_name)
+            session_anchor
+                .tmux_session_name
+                .as_deref()
+                .is_some_and(|name| {
+                    crate::tmux::base_session_name(name)
+                        == crate::tmux::base_session_name(session_name)
+                })
+        })
+        && query.tmux_socket.as_ref().is_none_or(|socket| {
+            session_anchor
+                .socket
+                .as_ref()
+                .or(session_anchor.room.socket.as_ref())
+                == Some(socket)
         })
 }
 
@@ -1841,6 +2180,7 @@ impl CollaborationStore {
         self.create_with_provenance(from, to, input, None).await
     }
 
+    #[allow(clippy::too_many_lines)] // request construction and persistence rollback form one transaction
     pub async fn create_with_provenance(
         &self,
         from: Participant,
@@ -1850,6 +2190,13 @@ impl CollaborationStore {
     ) -> Result<CollaborationRequest, CollaborationError> {
         self.ensure_enabled()?;
         let body = input.body.trim().to_string();
+        if input.human_action.is_some()
+            && (!to.console || !input.expects_reply || input.kind == RequestKind::Notice)
+        {
+            return Err(CollaborationError::UnknownTarget(
+                "human_action requires target human and a reply-bearing request".into(),
+            ));
+        }
         if body.is_empty() {
             return Err(CollaborationError::EmptyMessage);
         }
@@ -1862,7 +2209,15 @@ impl CollaborationStore {
         let _transaction = self.transaction_lock.lock().await;
         let previous = self.requests.read().await.clone();
         let now = OffsetDateTime::now_utc();
-        let id = next_request_id(now);
+        let id = dispatch_request_id(&input, now)?;
+        if let Some(existing) = self.requests.read().await.get(&id) {
+            let same = dispatch_matches(existing, &from, &to, &input, &body);
+            return if same {
+                Ok(existing.clone())
+            } else {
+                Err(CollaborationError::DispatchConflict(id))
+            };
+        }
         let supplied_thread_id = normalize_optional_id(input.thread_id);
         let parent_request_id = normalize_optional_id(input.parent_request_id);
         let thread_id = if let Some(parent_request_id) = parent_request_id.as_deref() {
@@ -1870,7 +2225,10 @@ impl CollaborationStore {
             let parent = requests
                 .get(parent_request_id)
                 .ok_or_else(|| CollaborationError::ParentNotFound(parent_request_id.to_string()))?;
-            if !same_participant_pair(parent, &from, &to) {
+            let human_escalation = to.console
+                && input.human_action.is_some()
+                && (addresses(&parent.from, &from) || addresses(&parent.to, &from));
+            if !same_participant_pair(parent, &from, &to) && !human_escalation {
                 return Err(CollaborationError::InvalidParentScope(
                     parent_request_id.to_string(),
                 ));
@@ -1893,13 +2251,21 @@ impl CollaborationStore {
             Some(supplied_thread_id.unwrap_or_else(|| id.clone()))
         };
         let request = CollaborationRequest {
+            dispatch_id: input.dispatch_id,
+            source_node_id: input.source_node_id,
+            delegation_parent: input.delegation_parent,
+            interruption: None,
+            human_action: input.human_action,
             id,
             from,
             to,
+            initiator: input.initiator,
+            updates: Vec::new(),
             provenance,
             kind: input.kind,
             body,
             expects_reply: input.expects_reply,
+            notify: input.notify,
             work_mode: input.work_mode,
             thread_id,
             parent_request_id,
@@ -2053,6 +2419,68 @@ impl CollaborationStore {
         Ok(())
     }
 
+    /// Append bounded guidance/progress without claiming or completing work.
+    pub async fn update_request(
+        &self,
+        caller: &Participant,
+        request_id: &str,
+        body: String,
+    ) -> Result<CollaborationRequest, CollaborationError> {
+        self.ensure_enabled()?;
+        let body = body.trim().to_string();
+        if body.is_empty() {
+            return Err(CollaborationError::EmptyMessage);
+        }
+        let limit = self.opts.max_message_bytes.min(8192);
+        if body.len() > limit {
+            return Err(CollaborationError::MessageTooLarge(limit));
+        }
+        let _transaction = self.transaction_lock.lock().await;
+        let mut updated = self
+            .requests
+            .read()
+            .await
+            .get(request_id)
+            .cloned()
+            .ok_or_else(|| CollaborationError::NotFound(request_id.into()))?;
+        if !addresses(&updated.from, caller) && !addresses(&updated.to, caller) {
+            return Err(CollaborationError::NotParticipant(request_id.into()));
+        }
+        if updated.status.is_terminal() {
+            return Err(CollaborationError::AlreadyTerminal(request_id.into()));
+        }
+        // Retried identical updates from the same participant are idempotent.
+        if updated
+            .updates
+            .last()
+            .is_some_and(|last| addresses(&last.author, caller) && last.body == body)
+        {
+            return Ok(updated);
+        }
+        let sequence = updated
+            .updates
+            .last()
+            .map_or(1, |last| last.sequence.saturating_add(1));
+        updated.updates.push(CollaborationUpdate {
+            sequence,
+            author: caller.clone(),
+            body,
+            at: OffsetDateTime::now_utc(),
+        });
+        while updated.updates.len() > 32
+            || updated.updates.iter().map(|u| u.body.len()).sum::<usize>() > 32768
+        {
+            updated.updates.remove(0);
+        }
+        self.persist_requests(std::slice::from_ref(&updated))?;
+        self.requests
+            .write()
+            .await
+            .insert(request_id.into(), updated.clone());
+        self.publish_change();
+        Ok(updated)
+    }
+
     pub async fn reply(
         &self,
         caller: &Participant,
@@ -2134,11 +2562,30 @@ impl CollaborationStore {
         let mut changed = false;
         let request = {
             let mut requests = self.requests.write().await;
+            // Participants may await the daemon's linked human decision, but
+            // this grants no authority to answer/cancel the service request.
+            let recovery_observer = requests
+                .get(request_id)
+                .filter(|r| r.to.console && r.from.agent_session_id == "muxa:peer-recovery")
+                .and_then(|r| r.interruption.as_ref())
+                .filter(|i| i.action_request_id.as_deref() == Some(request_id))
+                .and_then(|i| requests.get(&i.request_id))
+                .is_some_and(|parent| {
+                    parent
+                        .interruption
+                        .as_ref()
+                        .is_some_and(|i| i.action_request_id.as_deref() == Some(request_id))
+                        && (addresses(&parent.from, caller) || addresses(&parent.to, caller))
+                });
             let request = requests
                 .get_mut(request_id)
                 .ok_or_else(|| CollaborationError::NotFound(request_id.to_string()))?;
-            let is_sender = request.from.same_endpoint(caller);
-            if !is_sender && !addresses(&request.to, caller) {
+            let is_sender = request.from.same_session(caller);
+            if !caller.console
+                && !is_sender
+                && !addresses(&request.to, caller)
+                && !recovery_observer
+            {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
             if is_sender && request.reply.is_some() && request.reply_read_at.is_none() {
@@ -2175,7 +2622,7 @@ impl CollaborationStore {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let request = self.get_for(caller, request_id).await?;
-            if request.status.is_terminal() {
+            if request.status.is_terminal() || request.peer_interrupted() {
                 return Ok(request);
             }
             match tokio::time::timeout_at(deadline, changes.changed()).await {
@@ -2209,9 +2656,9 @@ impl CollaborationStore {
             .filter(|request| match scope {
                 MailboxScope::Caller => match mailbox {
                     RequestMailbox::Incoming => addresses(&request.to, caller),
-                    RequestMailbox::Sent => request.from.same_endpoint(caller),
+                    RequestMailbox::Sent => request.from.same_session(caller),
                     RequestMailbox::All => {
-                        request.from.same_endpoint(caller) || addresses(&request.to, caller)
+                        request.from.same_session(caller) || addresses(&request.to, caller)
                     }
                 },
                 MailboxScope::Room => match mailbox {
@@ -2304,7 +2751,8 @@ impl CollaborationStore {
                 .into_values()
                 .filter(|thread| {
                     thread.iter().all(|request| {
-                        request.status.is_terminal()
+                        request.dispatch_id.is_none()
+                            && request.status.is_terminal()
                             && request.wake_delivery.is_none()
                             && request.reply.as_ref().is_none_or(|_| {
                                 request.reply_read_at.is_some() || request.from.console
@@ -2331,6 +2779,47 @@ impl CollaborationStore {
         Ok(request_ids.len())
     }
 
+    /// Operator housekeeping: mark every request still `Queued` (never
+    /// claimed) and created before `cutoff` as `Expired`, and return them.
+    /// Covers what nobody else can close: a sender may cancel only its own
+    /// request, and the sender of a request stuck for weeks is usually an
+    /// agent session that no longer exists. `dry_run` reports without
+    /// writing.
+    pub async fn expire_queued_before(
+        &self,
+        cutoff: OffsetDateTime,
+        dry_run: bool,
+    ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
+        self.ensure_enabled()?;
+        let _transaction = self.transaction_lock.lock().await;
+        let previous = self.requests.read().await.clone();
+        let mut expired: Vec<CollaborationRequest> = {
+            let mut requests = self.requests.write().await;
+            requests
+                .values_mut()
+                .filter(|request| {
+                    request.status == RequestStatus::Queued && request.created_at < cutoff
+                })
+                .map(|request| {
+                    if !dry_run {
+                        request.status = RequestStatus::Expired;
+                    }
+                    request.clone()
+                })
+                .collect()
+        };
+        expired.sort_by_key(|request| request.created_at);
+        if dry_run || expired.is_empty() {
+            return Ok(expired);
+        }
+        if let Err(error) = self.persist_requests(&expired) {
+            *self.requests.write().await = previous;
+            return Err(error);
+        }
+        self.publish_change();
+        Ok(expired)
+    }
+
     pub async fn cancel_for(
         &self,
         caller: &Participant,
@@ -2344,7 +2833,7 @@ impl CollaborationStore {
             let request = requests
                 .get_mut(request_id)
                 .ok_or_else(|| CollaborationError::NotFound(request_id.to_string()))?;
-            if !request.from.same_endpoint(caller) {
+            if !request.from.same_session(caller) {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
             match request.status {
@@ -2364,6 +2853,24 @@ impl CollaborationStore {
         Ok(cancelled)
     }
 
+    /// One-way notices still unread in `recipient`'s mailbox. They never wake
+    /// anyone on their own, so a wake sent for something else is where the
+    /// recipient learns they exist; otherwise they wait until it happens to
+    /// read its inbox, however long that takes.
+    pub async fn quiet_notices_waiting(&self, recipient: &Participant) -> usize {
+        self.requests
+            .read()
+            .await
+            .values()
+            .filter(|request| {
+                request.status == RequestStatus::Queued
+                    && request.notified_at.is_none()
+                    && !request.should_notify()
+                    && addresses(&request.to, recipient)
+            })
+            .count()
+    }
+
     pub async fn pending_unnotified(&self) -> Vec<CollaborationRequest> {
         let _transaction = self.transaction_lock.lock().await;
         let mut requests: Vec<_> = self
@@ -2372,13 +2879,27 @@ impl CollaborationStore {
             .await
             .values()
             .filter(|request| {
-                request.notified_at.is_none()
+                !request.to.console && request.notified_at.is_none()
+                    // Finish an already reserved delivery even after an upgrade.
+                    && (request.should_notify() || request.wake_delivery.is_some())
                     && (request.status == RequestStatus::Queued || request.wake_delivery.is_some())
             })
             .cloned()
             .collect();
         requests.sort_by_key(|request| request.created_at);
         requests
+    }
+
+    /// Human attention has its own delivery queue; never wake a pane for it.
+    pub async fn pending_human_notifications(&self) -> Vec<CollaborationRequest> {
+        let _transaction = self.transaction_lock.lock().await;
+        self.requests
+            .read()
+            .await
+            .values()
+            .filter(|request| request.needs_human_response() && request.notified_at.is_none())
+            .cloned()
+            .collect()
     }
 
     /// Replies still owed a wake to their sender.
@@ -2412,7 +2933,9 @@ impl CollaborationStore {
             let mut requests = self.requests.write().await;
             requests.get_mut(request_id).and_then(|request| {
                 if request.notified_at.is_none()
-                    && (request.status == RequestStatus::Queued || request.wake_delivery.is_some())
+                    && (request.status == RequestStatus::Queued
+                        || request.wake_delivery.is_some()
+                        || request.needs_human_response())
                 {
                     request.notified_at = Some(OffsetDateTime::now_utc());
                     request.wake_delivery = None;
@@ -2489,7 +3012,7 @@ impl CollaborationStore {
             .await
             .values()
             .filter(|request| {
-                request.from.same_endpoint(participant)
+                request.from.same_session(participant)
                     && request.reply.is_some()
                     && request.reply_read_at.is_none()
             })
@@ -2568,6 +3091,9 @@ impl CollaborationStore {
 
 /// Correlate live agent rows with pane topology, keeping the newest live
 /// agent when adapter/synthetic rows briefly overlap on the same pane.
+/// Muxa-launched CLIs without a real hook become pending peers when process
+/// discovery confirms their provider. Wrapper discovery reads the process
+/// table, so async callers must run this on a blocking worker.
 pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participant> {
     let mut resolved: HashMap<(Option<String>, String), (OffsetDateTime, Participant)> =
         HashMap::new();
@@ -2633,6 +3159,37 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
         .into_values()
         .map(|(_, participant)| participant)
         .collect();
+    // A launcher-marked process is a peer before its first hook. Keep its
+    // recipient pane-scoped until a real session can adopt queued requests.
+    // Process evidence is required: launch marks can outlive a CLI in a pane.
+    let launched = panes
+        .iter()
+        .filter(|pane| {
+            pane.agent_program.is_some()
+                && !participants
+                    .iter()
+                    .any(|peer| peer.pane == pane.pane_id && peer.socket == pane.socket)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for discovered in crate::discovery::discover_from_panes(&launched) {
+        let pane = &discovered.pane;
+        if pane
+            .agent_program
+            .as_deref()
+            .and_then(crate::discovery::classify_command)
+            != Some(discovered.kind)
+            || participants
+                .iter()
+                .any(|peer| peer.pane == pane.pane_id && peer.socket == pane.socket)
+        {
+            continue;
+        }
+        let row = live_pane_row(&pane.pane_id, pane.socket.as_deref(), agents);
+        let mut pending = pane_participant(pane, pane.socket.clone(), row);
+        pending.agent_kind = discovered.kind;
+        participants.push(pending);
+    }
     participants.sort_by(|left, right| left.pane.cmp(&right.pane));
     participants
 }
@@ -2714,6 +3271,21 @@ pub fn resolve_origin(
     if origin.console {
         return console_participant(origin, panes);
     }
+    if let Some(session) = origin.agent_session_id.as_deref() {
+        if let Some(participant) = participants
+            .iter()
+            .find(|participant| participant.agent_session_id == session)
+        {
+            return Ok(participant.clone());
+        }
+        if origin.pane.is_empty() {
+            return Err(CollaborationError::UnknownOrigin(format!(
+                "Codex thread {session} is not bound to a pane yet (its hooks run in the \
+                 shared Codex app-server; muxa binds it from a `codex resume <id>` process \
+                 or the one Codex pane at its cwd — use a distinct cwd or `codex --no-daemon`)"
+            )));
+        }
+    }
     let matches: Vec<_> = participants
         .iter()
         .filter(|participant| {
@@ -2744,6 +3316,9 @@ pub fn resolve_target(
     // alias is only unique among live peers of one room, and matching it
     // host-wide would deliver to whichever unrelated agent happens to share
     // the name.
+    if selector == "human" {
+        return Ok(Participant::console(sender.room.clone()));
+    }
     if scope == crate::config::CollaborationScope::Host {
         let pane = selector.strip_prefix("pane:").unwrap_or(selector);
         if pane.starts_with('%') {
@@ -2821,14 +3396,12 @@ fn select_target(
 
 /// Resolve an explicit `pane:%N` target whose agent has not registered yet.
 ///
-/// This is the fallback [`resolve_target`] cannot serve: `participants_from`
-/// only admits real, session-pinned rows, so a pane muxa launched a moment ago
-/// is invisible until its agent's first hook — which, for codex, never comes
-/// unaided (see [`PENDING_SESSION_PREFIX`]).
+/// Launcher-backed pending peers are normally served by [`resolve_target`].
+/// This narrower fallback covers explicitly addressed panes with role/alias
+/// marks or discovery evidence that do not yet appear in the peer topology.
 ///
 /// Deliberately narrow. It requires all of:
-/// * an **explicit pane selector** — `peer`, `@alias` and `role:` stay
-///   registered-peer concepts, so no automatic routing can land here;
+/// * an **explicit pane selector** — automatic routing uses the peer topology;
 /// * a pane muxa itself marked as an agent launch (`@muxa_agent_role` /
 ///   `@muxa_agent_alias`) or that discovery already classified as an agent
 ///   CLI, so a request can never be typed at a human's shell;
@@ -3019,7 +3592,15 @@ fn muxa_launched_agent_pane(pane: &PaneInfo, row: Option<&Agent>) -> bool {
 /// Build the pane-scoped participant a pending recipient is addressed as.
 fn pane_participant(pane: &PaneInfo, socket: Option<String>, row: Option<&Agent>) -> Participant {
     Participant {
-        agent_kind: row.map_or(AgentKind::Unknown, |row| row.kind),
+        agent_kind: row.map_or_else(
+            || {
+                pane.agent_program
+                    .as_deref()
+                    .and_then(crate::discovery::classify_command)
+                    .unwrap_or(AgentKind::Unknown)
+            },
+            |row| row.kind,
+        ),
         agent_session_id: pending_session_id(&pane.pane_id, socket.as_deref()),
         pane: pane.pane_id.clone(),
         socket: socket.clone(),
@@ -3191,8 +3772,467 @@ fn valid_identity_token(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn history_search_filters_before_pagination_in_memory_and_sqlite() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mailbox = if durable {
+                CollaborationStore::load(CollaborationOptions {
+                    path: Some(dir.path().join("history.sqlite3")),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+            } else {
+                CollaborationStore::in_memory(CollaborationOptions::default())
+            };
+            let sender = participant("%123456", "sender");
+            let recipient = participant("%2", "recipient");
+            let root = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "hidden needle %_ 한글".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            mailbox
+                .update_request(&sender, &root.id, "progress needle".into())
+                .await
+                .unwrap();
+            mailbox
+                .reply(
+                    &recipient,
+                    &root.id,
+                    RequestStatus::Completed,
+                    "reply needle".into(),
+                    vec![],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            mailbox
+                .create(
+                    sender,
+                    recipient,
+                    NewRequest {
+                        body: "newer unrelated".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let console = Participant::console(root.from.room.clone());
+            for text in ["hidden needle %_ 한글", "progress needle", "reply needle"] {
+                let query = CollaborationQuery {
+                    search: Some(text.into()),
+                    search_bodies: true,
+                    limit: Some(1),
+                    ..Default::default()
+                };
+                let page = mailbox
+                    .query_for(&console, RequestMailbox::All, MailboxScope::All, &query)
+                    .await
+                    .unwrap();
+                assert_eq!(page.total, 1);
+                assert_eq!(page.requests[0].id, root.id);
+                let public = mailbox
+                    .query_for(
+                        &console,
+                        RequestMailbox::All,
+                        MailboxScope::All,
+                        &CollaborationQuery {
+                            search_bodies: false,
+                            ..query
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(public.total, 0);
+            }
+            let page = mailbox
+                .query_for(
+                    &console,
+                    RequestMailbox::All,
+                    MailboxScope::All,
+                    &CollaborationQuery {
+                        request_id: Some(root.id.clone()),
+                        until: Some(root.created_at),
+                        search: Some("%123456".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.total, 1);
+        }
+    }
+
     use super::*;
     use crate::config::CollaborationScope;
+
+    #[tokio::test]
+    async fn dispatch_retries_survive_concurrency_restart_and_reject_changed_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CollaborationOptions {
+            path: Some(dir.path().join("mailbox.json")),
+            ..Default::default()
+        };
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        let from = participant("%1", "sender");
+        let to = participant("%2", "worker");
+        let input = NewRequest {
+            dispatch_id: Some(uuid::Uuid::new_v4().to_string()),
+            source_node_id: Some(crate::fleet::NodeId::generate()),
+            body: "implement once".into(),
+            delegation_parent: Some(DelegationRef {
+                node_id: crate::fleet::NodeId::generate(),
+                request_id: "external-parent".into(),
+            }),
+            ..Default::default()
+        };
+        let (a, b) = tokio::join!(
+            mailbox.create(from.clone(), to.clone(), input.clone()),
+            mailbox.create(from.clone(), to.clone(), input.clone())
+        );
+        let a = a.unwrap();
+        assert_eq!(a.id, b.unwrap().id);
+        assert_eq!(mailbox.claim_for(&to).await.unwrap().len(), 1);
+        let reloaded = CollaborationStore::load(options).await.unwrap();
+        assert_eq!(
+            reloaded
+                .create(from.clone(), to.clone(), input.clone())
+                .await
+                .unwrap()
+                .id,
+            a.id
+        );
+        let mut changed = input.clone();
+        changed.body = "different task".into();
+        assert!(matches!(
+            reloaded.create(from.clone(), to.clone(), changed).await,
+            Err(CollaborationError::DispatchConflict(_))
+        ));
+        assert!(matches!(
+            reloaded
+                .create(from, participant("%3", "other"), input)
+                .await,
+            Err(CollaborationError::DispatchConflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_retries_cannot_change_wake_or_human_decision_contract() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let human = console_in_window("@1");
+        let input = NewRequest {
+            dispatch_id: Some(uuid::Uuid::new_v4().to_string()),
+            body: "choose".into(),
+            human_action: Some(HumanAction::Choice),
+            ..Default::default()
+        };
+        let request = store
+            .create(sender.clone(), human.clone(), input.clone())
+            .await
+            .unwrap();
+        for (action, notify) in [
+            (HumanAction::Approval, None),
+            (HumanAction::Choice, Some(true)),
+        ] {
+            let mut changed = input.clone();
+            changed.human_action = Some(action);
+            changed.notify = notify;
+            assert!(matches!(
+                store.create(sender.clone(), human.clone(), changed).await,
+                Err(CollaborationError::DispatchConflict(_))
+            ));
+        }
+        assert_eq!(
+            store.create(sender, human, input).await.unwrap().id,
+            request.id
+        );
+    }
+
+    #[tokio::test]
+    async fn human_escalation_is_separate_durable_and_resolved_by_operator() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CollaborationOptions {
+            path: Some(dir.path().join("human.json")),
+            ..CollaborationOptions::default()
+        };
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        let sender = participant("%1", "sender");
+        let peer = participant("%2", "peer");
+        let human = resolve_target(&peer, "human", &[], CollaborationScope::Window).unwrap();
+        let parent = mailbox
+            .create(
+                sender.clone(),
+                peer.clone(),
+                NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!parent.needs_human_response());
+        let request = mailbox
+            .create(
+                peer.clone(),
+                human.clone(),
+                NewRequest {
+                    body: "Choose A or B; recommend A because it preserves compatibility".into(),
+                    human_action: Some(HumanAction::Choice),
+                    parent_request_id: Some(parent.id.clone()),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(request.thread_id, parent.thread_id);
+        assert!(request.needs_human_response());
+        assert_eq!(mailbox.pending_human_notifications().await.len(), 1);
+        assert!(mailbox
+            .pending_unnotified()
+            .await
+            .iter()
+            .all(|r| r.id != request.id));
+        // Reading/claiming is not an answer and must not cause repeat alerts.
+        let claimed = mailbox.claim_for(&human).await.unwrap();
+        assert!(claimed[0].needs_human_response());
+        mailbox.mark_notified(&request.id).await.unwrap();
+        let reloaded = CollaborationStore::load(options).await.unwrap();
+        assert!(reloaded.pending_human_notifications().await.is_empty());
+        assert!(reloaded
+            .reply(
+                &sender,
+                &request.id,
+                RequestStatus::Completed,
+                "spoof".into(),
+                vec![],
+                vec![]
+            )
+            .await
+            .is_err());
+        let resolved = reloaded
+            .reply(
+                &human,
+                &request.id,
+                RequestStatus::Completed,
+                "A".into(),
+                vec![],
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(!resolved.needs_human_response());
+        assert_eq!(reloaded.pending_reply_unnotified().await.len(), 1);
+        let legacy = serde_json::to_value(&parent).unwrap();
+        assert!(!serde_json::from_value::<CollaborationRequest>(legacy)
+            .unwrap()
+            .needs_human_response());
+    }
+
+    #[tokio::test]
+    async fn request_updates_are_durable_bounded_and_do_not_complete_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CollaborationOptions {
+            path: Some(dir.path().join("mailbox.json")),
+            ..CollaborationOptions::default()
+        };
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let initiator = participant("%9", "coordinator");
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "bounded task".into(),
+                    initiator: Some(Box::new(initiator.clone())),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut changes = mailbox.subscribe();
+        mailbox
+            .update_request(&recipient, &request.id, "progress".into())
+            .await
+            .unwrap();
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        let retried = mailbox
+            .update_request(&recipient, &request.id, "progress".into())
+            .await
+            .unwrap();
+        assert_eq!(retried.updates.len(), 1);
+        assert!(!changes.has_changed().unwrap());
+        // Advisory initiator metadata does not grant participant authority.
+        assert!(matches!(
+            mailbox
+                .update_request(&initiator, &request.id, "spoof".into())
+                .await,
+            Err(CollaborationError::NotParticipant(_))
+        ));
+        assert!(matches!(
+            mailbox
+                .update_request(&sender, &request.id, " ".into())
+                .await,
+            Err(CollaborationError::EmptyMessage)
+        ));
+        assert!(matches!(
+            mailbox
+                .update_request(&sender, &request.id, "x".repeat(8193))
+                .await,
+            Err(CollaborationError::MessageTooLarge(_))
+        ));
+        for i in 0..40 {
+            mailbox
+                .update_request(&sender, &request.id, format!("guidance {i}"))
+                .await
+                .unwrap();
+        }
+        let reloaded = CollaborationStore::load(options).await.unwrap();
+        let restored = reloaded.get_for(&recipient, &request.id).await.unwrap();
+        assert_eq!(restored.initiator, Some(Box::new(initiator)));
+        assert_eq!(restored.updates.len(), 32);
+        assert_eq!(restored.updates.last().unwrap().sequence, 41);
+        assert_eq!(restored.status, RequestStatus::Queued);
+        assert!(restored.reply.is_none());
+        reloaded
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "done".into(),
+                vec![],
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reloaded
+                .update_request(&sender, &request.id, "late".into())
+                .await,
+            Err(CollaborationError::AlreadyTerminal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn moved_sessions_keep_mailbox_ownership_without_cross_host_access() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mailbox = CollaborationStore::load(CollaborationOptions {
+                path: durable.then(|| dir.path().join("moved.sqlite3")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let sender = participant("%1", "sender");
+            let recipient = participant("%2", "recipient");
+            let request = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "move test".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            for (original, mailbox_kind) in [
+                (&sender, RequestMailbox::Sent),
+                (&recipient, RequestMailbox::Incoming),
+            ] {
+                let mut moved = original.clone();
+                moved.pane = "%9".into();
+                moved.room.window_id = "@9".into();
+                assert!(mailbox.get_for(&moved, &request.id).await.is_ok());
+                assert_eq!(
+                    mailbox
+                        .list_for(&moved, mailbox_kind, MailboxScope::Caller)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    mailbox
+                        .query_for(
+                            &moved,
+                            mailbox_kind,
+                            MailboxScope::Caller,
+                            &CollaborationQuery::default()
+                        )
+                        .await
+                        .unwrap()
+                        .total,
+                    1
+                );
+                let mut strangers = vec![moved.clone(); 3];
+                strangers[0].agent_session_id = "stranger".into();
+                strangers[1].socket = Some("other".into());
+                strangers[2].room.host = "other-host".into();
+                for stranger in strangers {
+                    assert!(matches!(
+                        mailbox.get_for(&stranger, &request.id).await,
+                        Err(CollaborationError::NotParticipant(_))
+                    ));
+                    assert_eq!(
+                        mailbox
+                            .query_for(
+                                &stranger,
+                                mailbox_kind,
+                                MailboxScope::Caller,
+                                &CollaborationQuery::default()
+                            )
+                            .await
+                            .unwrap()
+                            .total,
+                        0
+                    );
+                }
+            }
+            let mut moved_recipient = recipient;
+            moved_recipient.pane = "%10".into();
+            moved_recipient.room.window_id = "@10".into();
+            mailbox
+                .reply(
+                    &moved_recipient,
+                    &request.id,
+                    RequestStatus::Completed,
+                    "done".into(),
+                    vec![],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            let mut moved_sender = sender;
+            moved_sender.pane = "%11".into();
+            assert_eq!(mailbox.unread_reply_count(&moved_sender).await, 1);
+            assert!(mailbox
+                .get_for(&moved_sender, &request.id)
+                .await
+                .unwrap()
+                .reply_read_at
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn pending_session_does_not_follow_pane_move() {
+        let pending = participant("%1", "pending-pane:default:%1");
+        let mut moved = pending.clone();
+        moved.pane = "%2".into();
+        assert!(!addresses(&pending, &moved));
+    }
 
     fn participant(pane: &str, session: &str) -> Participant {
         Participant {
@@ -3216,9 +4256,39 @@ mod tests {
         }
     }
 
+    /// Codex threads behind a shared app-server once all claimed `%9`. The
+    /// caller's session id must pick its own row; an unknown id falls back
+    /// to the pane, exactly as an origin without one does.
+    #[test]
+    fn origin_session_id_wins_over_a_shared_pane() {
+        let mut stale = participant("%9", "thread-a");
+        stale.socket = None;
+        let peers = [
+            participant("%9", "junia"),
+            stale,
+            participant("%24", "thread-b"),
+        ];
+        let origin = |pane: &str, session: Option<&str>| CollaborationOrigin {
+            pane: pane.into(),
+            socket: Some("default".into()),
+            console: false,
+            agent_session_id: session.map(str::to_owned),
+        };
+        let resolved = resolve_origin(&origin("%9", Some("thread-b")), &peers, &[]).unwrap();
+        assert_eq!(resolved.agent_session_id, "thread-b");
+        assert_eq!(resolved.pane, "%24");
+        let fallback = resolve_origin(&origin("%24", Some("untracked")), &peers, &[]).unwrap();
+        assert_eq!(fallback.agent_session_id, "thread-b");
+        let by_pane = resolve_origin(&origin("%9", None), &peers, &[]).unwrap();
+        assert_eq!(by_pane.agent_session_id, "junia");
+        let unbound = resolve_origin(&origin("", Some("fresh")), &peers, &[]).unwrap_err();
+        assert!(unbound.to_string().contains("not bound"), "{unbound}");
+    }
+
     fn pane_info(pane_id: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -3267,6 +4337,7 @@ mod tests {
 
     fn managed_pane(pane_id: &str, role: &str, alias: &str) -> PaneInfo {
         PaneInfo {
+            agent_program: None,
             agent_role: Some(role.into()),
             agent_alias: Some(alias.into()),
             ..pane_info(pane_id)
@@ -3747,6 +4818,7 @@ mod tests {
             pane: "%1".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         };
         let resolved = resolve_origin(&origin, &[], &[base, view]).expect("console resolves");
         assert!(resolved.console);
@@ -3767,6 +4839,7 @@ mod tests {
             pane: "%1".into(),
             socket: None,
             console: true,
+            agent_session_id: None,
         };
         assert!(matches!(
             resolve_origin(&origin, &[], &[here, elsewhere]),
@@ -3820,6 +4893,110 @@ mod tests {
         let participants = participants_from(&store.snapshot().await, &panes);
         assert_eq!(participants.len(), 1);
         assert_eq!(participants[0].agent_session_id, "real-session");
+    }
+
+    #[tokio::test]
+    async fn launched_peers_are_visible_before_first_prompt_and_adopt_requests() {
+        for (program, kind) in [
+            ("codex", AgentKind::Codex),
+            ("claude", AgentKind::ClaudeCode),
+        ] {
+            let mut pane = pane_info("%2");
+            pane.current_command = program.into();
+            pane.agent_program = Some(program.into());
+            pane.agent_alias = Some("review".into());
+            pane.agent_role = Some("reviewer".into());
+            let panes = vec![pane.clone()];
+            let pending = participants_from(&[], &panes).remove(0);
+            assert_eq!(pending.agent_kind, kind);
+            assert_eq!(pending.state, AgentState::Starting);
+            assert!(is_pending_session(&pending.agent_session_id));
+            let sender = participant("%1", "sender");
+            for selector in ["peer", "@review", "role:reviewer", "pane:%2"] {
+                assert!(resolve_target(
+                    &sender,
+                    selector,
+                    std::slice::from_ref(&pending),
+                    CollaborationScope::Window
+                )
+                .is_ok());
+            }
+            assert!(pending_recipient_ready(&pending, &[], &panes).is_none());
+            let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+            let request = mailbox
+                .create(
+                    sender,
+                    pending.clone(),
+                    NewRequest {
+                        kind: RequestKind::Question,
+                        body: "review without an initial prompt".into(),
+                        expects_reply: true,
+                        work_mode: WorkMode::ReadOnly,
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let store = crate::Store::shared();
+            let discovered = crate::discovery::Discovered { pane, kind };
+            store
+                .apply(&crate::discovery::synthesize_started(
+                    &discovered,
+                    OffsetDateTime::now_utc(),
+                ))
+                .await;
+            let agents = store.snapshot().await;
+            let peers = participants_from(&agents, &panes);
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].agent_session_id, pending.agent_session_id);
+            assert!(pending_recipient_ready(&pending, &agents, &panes).is_some());
+            store
+                .apply(&crate::event::AgentEvent::Started {
+                    id: crate::event::AgentId {
+                        kind,
+                        session_id: "real-session".into(),
+                        surface: None,
+                        pane: Some("%2".into()),
+                        tmux_socket: Some("default".into()),
+                        cwd: None,
+                    },
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+            let real = participants_from(&store.snapshot().await, &panes);
+            assert_eq!(real.len(), 1);
+            assert_eq!(real[0].agent_session_id, "real-session");
+            assert!(addresses(&pending, &real[0]));
+            let mut other_server = real[0].clone();
+            other_server.socket = Some("other".into());
+            assert!(!addresses(&pending, &other_server));
+            assert!(mailbox.claim_for(&other_server).await.unwrap().is_empty());
+            let claimed = mailbox.claim_for(&real[0]).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].id, request.id);
+            assert_eq!(
+                mailbox
+                    .get_for(&real[0], &request.id)
+                    .await
+                    .unwrap()
+                    .to
+                    .agent_session_id,
+                "real-session"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_marks_do_not_expose_shells_or_different_processes_as_peers() {
+        let mut pane = pane_info("%2");
+        pane.agent_program = Some("codex".into());
+        for command in ["zsh", "vim", "claude"] {
+            pane.current_command = command.into();
+            assert!(participants_from(&[], &[pane.clone()]).is_empty());
+        }
+        pane.current_command = "codex".into();
+        pane.agent_program = None;
+        assert!(participants_from(&[], &[pane]).is_empty());
     }
 
     /// A reply is a terminal write, so an empty one must not spend it. This
@@ -3994,6 +5171,92 @@ mod tests {
         );
         assert_eq!(mailbox.unread_reply_count(&sender).await, 0);
         assert!(mailbox.pending_reply_unnotified().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn notification_policy_survives_reload_and_quiet_records_remain_claimable() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CollaborationOptions {
+            path: Some(dir.path().join("collaboration.json")),
+            ..CollaborationOptions::default()
+        };
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let cases = [
+            (RequestKind::Notice, false, None, false),
+            (RequestKind::Notice, false, Some(true), true),
+            (RequestKind::Notice, true, None, true),
+            (RequestKind::Question, true, Some(false), false),
+            (RequestKind::Question, true, None, true),
+            (RequestKind::Review, true, None, true),
+            (RequestKind::Task, false, None, true),
+        ];
+        let mut created = Vec::new();
+        for (kind, expects_reply, notify, wakes) in cases {
+            let request = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        kind,
+                        body: "checkpoint result".into(),
+                        expects_reply,
+                        notify,
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(request.should_notify(), wakes);
+            // Old durable records omit the optional field, preserving auto policy.
+            if notify.is_none() {
+                let value = serde_json::to_value(&request).unwrap();
+                assert!(value.get("notify").is_none());
+                let legacy: CollaborationRequest = serde_json::from_value(value).unwrap();
+                assert_eq!(legacy.should_notify(), wakes);
+            }
+            created.push(request);
+        }
+        drop(mailbox);
+        let mailbox = CollaborationStore::load(options).await.unwrap();
+        let pending = mailbox.pending_unnotified().await;
+        for (request, (_, _, _, wakes)) in created.iter().zip(cases) {
+            assert_eq!(pending.iter().any(|entry| entry.id == request.id), wakes);
+            let stored = mailbox.get_for(&recipient, &request.id).await.unwrap();
+            assert_eq!(stored.notify, request.notify);
+            assert_eq!(stored.status, RequestStatus::Queued);
+            assert!(stored.notified_at.is_none());
+        }
+        let inbox = mailbox.claim_for(&recipient).await.unwrap();
+        assert_eq!(inbox.len(), cases.len());
+        for request in inbox {
+            assert_eq!(
+                request.status,
+                if request.expects_reply {
+                    RequestStatus::Claimed
+                } else {
+                    RequestStatus::Completed
+                }
+            );
+            assert!(request.reply.is_none());
+        }
+        assert!(mailbox.pending_unnotified().await.is_empty());
+        // Suppressing a request's wake must not suppress its completion reply.
+        mailbox
+            .reply(
+                &recipient,
+                &created[3].id,
+                RequestStatus::Completed,
+                "review complete".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let replies = mailbox.pending_reply_unnotified().await;
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].id, created[3].id);
     }
 
     #[tokio::test]
@@ -4303,6 +5566,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expiry_closes_only_unclaimed_requests_older_than_the_cutoff() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let other = participant("%3", "other");
+        let ask = |to: &Participant, body: &str| {
+            let (mailbox, sender, to, body) =
+                (&mailbox, sender.clone(), to.clone(), body.to_string());
+            async move {
+                mailbox
+                    .create(
+                        sender,
+                        to,
+                        NewRequest {
+                            body,
+                            ..NewRequest::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let stale = ask(&recipient, "nobody claimed this").await;
+        let claimed = ask(&other, "claimed, so it is the recipient's to finish").await;
+        mailbox.claim_for(&other).await.unwrap();
+
+        // Nothing is older than an hour yet.
+        let past = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        assert!(mailbox
+            .expire_queued_before(past, false)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let future = OffsetDateTime::now_utc() + time::Duration::seconds(1);
+        let preview = mailbox.expire_queued_before(future, true).await.unwrap();
+        assert_eq!(
+            preview.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            [&stale.id]
+        );
+        assert_eq!(
+            preview[0].status,
+            RequestStatus::Queued,
+            "a dry run changes nothing"
+        );
+
+        let expired = mailbox.expire_queued_before(future, false).await.unwrap();
+        assert_eq!(
+            expired.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            [&stale.id]
+        );
+        assert_eq!(expired[0].status, RequestStatus::Expired);
+        let sent = mailbox
+            .list_for(&sender, RequestMailbox::Sent, MailboxScope::Caller)
+            .await
+            .unwrap();
+        let status = |id: &str| sent.iter().find(|r| r.id == id).unwrap().status;
+        assert_eq!(status(&stale.id), RequestStatus::Expired);
+        assert_eq!(status(&claimed.id), RequestStatus::Claimed);
+    }
+
+    #[tokio::test]
     async fn sender_can_list_and_cancel_only_unclaimed_requests() {
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
         let sender = participant("%1", "sender");
@@ -4561,6 +5886,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operator_exact_read_matches_all_scope_without_acknowledging_agent_reply() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = CollaborationStore::load(CollaborationOptions {
+                path: durable.then(|| dir.path().join("operator-read.sqlite3")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let sender = participant_in_window("%1", "sender", "@1");
+            let recipient = participant_in_window("%2", "recipient", "@1");
+            let request = store
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "read exactly one".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .reply(
+                    &recipient,
+                    &request.id,
+                    RequestStatus::Completed,
+                    "reply".into(),
+                    vec![],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            let console = console_in_window("@2");
+            let listed = store
+                .list_for(&console, RequestMailbox::All, MailboxScope::All)
+                .await
+                .unwrap();
+            let read = store.get_for(&console, &request.id).await.unwrap();
+            assert_eq!(read.id, listed[0].id);
+            assert!(read.reply_read_at.is_none());
+            assert_eq!(store.unread_reply_count(&sender).await, 1);
+            assert!(matches!(
+                store
+                    .get_for(&participant("%3", "stranger"), &request.id)
+                    .await,
+                Err(CollaborationError::NotParticipant(_))
+            ));
+            assert!(matches!(
+                store.get_for(&console, "missing").await,
+                Err(CollaborationError::NotFound(_))
+            ));
+            let reloaded = if durable {
+                CollaborationStore::load(CollaborationOptions {
+                    path: Some(dir.path().join("operator-read.sqlite3")),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+            } else {
+                store
+            };
+            assert!(reloaded
+                .get_for(&console, &request.id)
+                .await
+                .unwrap()
+                .reply_read_at
+                .is_none());
+            assert!(reloaded
+                .get_for(&sender, &request.id)
+                .await
+                .unwrap()
+                .reply_read_at
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn room_scope_lists_traffic_the_caller_was_never_party_to() {
         // The operator console dispatches and never receives, so its own
         // mailbox says nothing about what the agents in front of it are
@@ -4728,6 +6131,7 @@ mod tests {
             pane: "%1".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         };
         let console = resolve_origin(&origin, &peers, &[pane_info("%1")]).unwrap();
 
@@ -4768,6 +6172,7 @@ mod tests {
                 pane: "%77".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &peers,
             &[pane_info("%77")],
@@ -4786,6 +6191,7 @@ mod tests {
                 pane: String::new(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &peers,
             &[],
@@ -4813,6 +6219,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &[],
             &panes,
@@ -4827,6 +6234,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: Some("/tmp/tmux-1000/default".into()),
                 console: true,
+                agent_session_id: None,
             },
             &[],
             &panes,
@@ -4844,6 +6252,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: Some("/tmp/tmux-1000/default".into()),
                 console: false,
+                agent_session_id: None,
             },
             std::slice::from_ref(&agent),
             &[pane_info("%1")],
@@ -4863,6 +6272,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &[],
             &[pane_info("%1")],
@@ -4875,6 +6285,7 @@ mod tests {
                 pane: "%9".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &[],
             std::slice::from_ref(&elsewhere),
@@ -4935,6 +6346,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &[],
             &[pane_info("%1")],
@@ -4994,6 +6406,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &[],
             &[pane_info("%1")],
@@ -5434,6 +6847,75 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // one scenario proves the indexed filters and cursor boundary together
+    async fn session_scope_filters_client_views_and_socket_before_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        for database in [false, true] {
+            let mailbox = CollaborationStore::load(CollaborationOptions {
+                path: database.then(|| dir.path().join("session-scope.sqlite3")),
+                ..CollaborationOptions::default()
+            })
+            .await
+            .unwrap();
+            let caller = Participant::console(participant("%0", "caller").room);
+            for (name, socket) in [
+                ("callabo", "default"),
+                ("callabo~view~123", "default"),
+                ("junia", "default"),
+                ("callabo", "other"),
+            ] {
+                let mut from = participant("%1", &format!("sender-{name}-{socket}"));
+                from.tmux_session_name = Some(name.into());
+                from.socket = Some(socket.into());
+                from.room.socket = Some(socket.into());
+                let mut to = from.clone();
+                to.pane = "%2".into();
+                to.agent_session_id = format!("receiver-{name}-{socket}");
+                mailbox
+                    .create(
+                        from,
+                        to,
+                        NewRequest {
+                            body: "scope test".into(),
+                            ..NewRequest::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let query = CollaborationQuery {
+                tmux_session_name: Some("callabo".into()),
+                tmux_socket: Some("default".into()),
+                limit: Some(1),
+                ..CollaborationQuery::default()
+            };
+            let page = mailbox
+                .query_for(&caller, RequestMailbox::All, MailboxScope::All, &query)
+                .await
+                .unwrap();
+            assert_eq!(page.total, 2);
+            assert_eq!(page.requests.len(), 1);
+            assert!(page.has_more);
+            let second = mailbox
+                .query_for(
+                    &caller,
+                    RequestMailbox::All,
+                    MailboxScope::All,
+                    &CollaborationQuery {
+                        cursor: page.next_cursor.clone(),
+                        ..query
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(second.total, 2);
+            assert_eq!(second.requests.len(), 1);
+            assert!(!second.has_more);
+            assert_ne!(page.requests[0].id, second.requests[0].id);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one scenario proves indexed filters and cursor boundaries together
     async fn sqlite_query_filters_and_keyset_pages_use_room_and_session_anchors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("collaboration.sqlite3");
@@ -5831,3 +7313,6 @@ mod tests {
         );
     }
 }
+
+mod recovery;
+pub use recovery::PeerInterruption;

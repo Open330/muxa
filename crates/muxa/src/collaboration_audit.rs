@@ -32,6 +32,7 @@ pub enum CollaborationAuditOperation {
     Inbox,
     List,
     Reply,
+    Update,
     Get,
     Wait,
     Cancel,
@@ -242,6 +243,7 @@ mod tests {
                 pane: "%3".into(),
                 socket: Some("default".into()),
                 console: false,
+                agent_session_id: None,
             },
         )
         .finish(

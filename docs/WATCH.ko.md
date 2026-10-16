@@ -48,7 +48,8 @@ window였던 것처럼 보이지 않도록 전체 session → window → pane an
 | `\|` | list/inspector 분할 순환: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | 선택한 Ask 대화 이어쓰기 / 열기. 컴포저의 `Ctrl-E`와 패널의 `n`으로 새 대화 초안을 만듭니다. |
 | `m` / `M` | resolve된 agent에게 request 보내기 / 선택 topology scope 이력 열기. |
-| `b` | `M`의 이전 alias. mailbox 안에서 `i`는 claim, `e`는 reply. |
+| `b` | `M`의 alias. mailbox 안에서 `i`는 claim, `e`는 reply. |
+| `Alt-M` / `:move` | 선택한 agent를 재시작 없이 이동. `Tab`으로 따라가기/현재 화면 유지를 선택합니다. |
 | `v` | collaboration 화면에서 table / 시간순 sequence 전환. |
 | `o` / `Alt-P` | live preview 열기. |
 | `:` | 명령 팔레트 열기. `Tab`은 첫 번째 일치 명령 완성. |
@@ -85,6 +86,50 @@ U.S. Standard / U.S. International 레이아웃에서만 기본으로 Alt가 켜
 
 모든 `Alt` 바인딩은 command palette에 `Alt` 없는 대체 경로가 있습니다
 (`:inspector`, `:events`, `:preview` 등). 터미널 설정과 무관하게 동작합니다.
+
+### 실행 중인 agent 이동
+
+agent pane에서 `prefix+M`을 누르거나, 로컬 `muxa watch`에서 agent를 선택하고
+`Alt-M` 또는 `:move`를 실행합니다. 두 진입점은 같은 session → window 트리 메뉴를 엽니다.
+현재 session의 새 window, 새 session, 기존 session/window를 선택할 수 있습니다.
+목적지를 선택하고 Enter를 누르면 이동하며, 새 session은 이름만 입력하면 됩니다.
+`Tab`은 따라가기/현재 화면 유지, 좌우 방향키는 session 접기/펼치기입니다.
+session에서 Enter를 눌러도 접고 펼칠 수 있습니다. `Ctrl-Left`/`Ctrl-Right`는
+기존 window에 합칠 방향을 선택합니다. 검색해도 window의 상위 session을 표시하며,
+현재 session과 원본 window를 구분합니다. 새 window 항목은 각 session 아래에 둡니다.
+Esc로 돌아가거나 취소할 수 있습니다.
+
+watch의 **window 행**에서 `Alt-M`을 누르면 전체 window를, **pane 행**에서는
+해당 agent만 옮깁니다. window가 하나여서 session과 합쳐 표시된 행도 전체
+window 이동으로 처리합니다. popup에서 `Ctrl-W`로 두 범위를 전환할 수 있으며,
+전체 이동 모드는 제목에 표시됩니다. window 전체의 목적지는 새 session 또는
+기존 session입니다. window ID와 모든 pane의 프로세스·대화, 분할 레이아웃을
+함께 유지합니다. 기존 window를 덮어쓰지 않고, 이름이 겹치면 번호를 붙입니다.
+Work ID는 유지하고 workspace 소속은 목적지에 맞춥니다. workspace가 바뀌면
+이전 pipeline generation을 지웁니다. 복귀하면 원래 session·window 이름·pane
+메타데이터를 복원합니다. 원래 session의 마지막 window를 옮길 때는 shell
+window를 남겨 client 접속을 유지합니다.
+
+CLI는 `muxa window move --source-window @13 --session dev --stay`,
+`muxa window move --source-window @13 --new-session review`,
+`muxa window move --source-window @13 --undo`를 지원합니다.
+
+pane과 프로세스, 작업 디렉터리, 대화, 터미널 이력은 유지됩니다. 원래 session의
+마지막 pane을 옮길 때는 shell 하나를 남겨 접속과 복귀 위치를 유지합니다. 같은 tmux/rmux
+서버 안에서 이동하며, Work 소속은 목적지에 맞게 변경됩니다. alias와 역할은
+유지하고 이전 pipeline generation은 지웁니다. 진행 중인 메시지의 agent/request
+식별자는 유지되며, 같은 방의 peer 목록은 목적지 window에 따라 바뀝니다.
+
+메뉴를 다시 열어 **Undo previous move**를 선택하면 이전 위치로 돌아갑니다.
+원래 window가 사라졌다면 살아 있는 원래 session에 다시 만듭니다. 원래 session도
+닫혔다면 목적지를 직접 선택해야 합니다. 따라갈 때 목적지에 다른 client가 있으면
+별도 grouped session view를 사용합니다. mailbox는 기존처럼 `M`으로 열며(`b`도 유지), Fleet watch도 동일합니다.
+
+단축키 설치·갱신은 `muxa init --component tmux-popup --yes`로 합니다.
+스크립트에서는 `muxa agent move --pane %42 --new-session review --stay`,
+`--session NAME --new-window NAME`, `--window @ID`, `--undo`를 사용할 수 있습니다.
+`--server-socket`과 `--host tmux|rmux`는 터미널 서버를 지정하고, 전역 `--socket`은
+기존처럼 Muxa daemon을 지정합니다.
 
 ## 검색과 Attention
 
@@ -229,8 +274,8 @@ Ask는 headless session이 승인 prompt에 응답할 수 없고 무인 skill �
 additional directories, timeout은 바꾸지 않으며 daemon이 가진 기존 `[ask]` 계약을
 그대로 사용합니다.
 
-macOS 앱의 Inbox는 Ask 이력뿐 아니라 operator console이 Fleet 각 host에 보낸
-Collaboration 명령을 한곳에 모읍니다. Waiting/New reply 상태, Markdown reply,
+macOS 앱에서 Ask 대화는 사이드바의 Ask 컨테이너에 모이고, Inbox는 operator
+console이 Fleet 각 host에 보낸 Collaboration 명령을 한곳에 모읍니다. Waiting/New reply 상태, Markdown reply,
 Work와 window 위치를 함께 보여주며, 명령을 열면 정확한 대상 agent pane으로
 돌아갑니다. Provider 설정에서는 기존 CLI 로그인을 그대로 쓰거나 API key를 macOS
 login Keychain에 저장할 수 있습니다. 저장된 키는 선택한 다음 Ask child에만
@@ -293,8 +338,8 @@ tracked agent를, session은 window index와 pane index가 낮은 순서의 agen
 계약입니다. watch는 별도 path scope 입력을 제공하지 않으므로 execute 요청에는
 메시지 본문에 수정 범위를 함께 적는 것이 좋습니다.
 
-`M`은 이력을 엽니다(`b`도 alias로 유지됩니다). pane mailbox에서는 `m`으로 새
-메시지를 작성하고 `M`으로 닫습니다. `Tab`으로 mailbox를 전환하고 `j`/`k`로 요청을
+`M`은 이력을 엽니다. pane mailbox에서는 `m`으로 새
+메시지를 작성하고 `M` 또는 `b`로 닫습니다. `Tab`으로 mailbox를 전환하고 `j`/`k`로 요청을
 선택하며 `i`로 pending 요청을 claim하고 `e`로 응답합니다. window/session aggregate는
 하나의 결합 stream이므로 `Tab`, `m`, `i`, `e`가 비활성화됩니다.
 console이 발신자이므로 일반 shell pane에서 watch를 열어도 협업이 그대로
@@ -474,6 +519,11 @@ override입니다. 기본값은 attention state를 먼저 띄운 뒤 workspace�
 않습니다. 창 목록 등은 기존 5초 보정 조회로 확인하고, 구형 데몬에서는 polling으로
 동작합니다. 같은 세션의 다른 창이 앞으로 이동해도 선택한
 세션·창·pane은 고유 식별자를 기준으로 유지합니다.
+
+Codex의 lifecycle과 quota 정보는 데몬이 세션 로그에서 2초마다 확인합니다.
+`latest`는 이벤트 시각을 사용하므로 과거 로그를 다시 읽거나 사용량 정보만
+갱신해도 최신 활동으로 올라가지 않습니다. `AGE`는 현재 상태에 머문 시간으로,
+정렬에 사용하는 활동 시각과 다릅니다.
 
 ## Detail Row
 

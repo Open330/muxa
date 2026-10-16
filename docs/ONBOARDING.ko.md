@@ -12,6 +12,54 @@ Muxa는 다음 작업 단위 tmux workflow에 맞춰 설계되고 최적화되�
 work와 다른 cwd를 지정하면 조용히 재사용하지 않고 오류를 냅니다. 한 workspace
 session에는 서로 다른 cwd/worktree를 가진 여러 work window가 공존할 수 있습니다.
 
+## 설치 전에 미리 써보기
+
+[브라우저 실습](https://open330.github.io/muxa/learn/)에서는 설치 없이 키보드로
+Muxa의 기본 흐름을 익힐 수 있습니다.
+
+- [tmux 기본](https://open330.github.io/muxa/learn/?track=basics): 일반 셸에서 session에 연결하고 window·pane을 이동하거나 확대합니다.
+- [기다림·리뷰](https://open330.github.io/muxa/learn/?track=attention): 기다리는 에이전트에 답하고 리뷰를 보낸 뒤 mailbox에서 확인합니다.
+- [작업공간 이동](https://open330.github.io/muxa/learn/?track=workspace): watch의 트리와 검색으로 다른 session·window·pane에 연결합니다.
+- [화면 살펴보기](https://open330.github.io/muxa/learn/?track=inspect): 미리보기·터미널 원문·inspector·도움말을 사용합니다.
+- [자유 탐색](https://open330.github.io/muxa/learn/?track=free): 전체 단축키를 보며 준비된 작업공간을 둘러봅니다.
+
+지금 누를 키를 하나씩 안내합니다. 기본 tmux prefix는 Ctrl과 b를 함께 누른 뒤
+놓는 것입니다. 이후 s로 watch를 열며, watch 안에서는 prefix 없이 이동·검색·메시지
+키를 사용합니다. 안내와 언어를 바꿔도 현재 터미널과 입력·요청 기록이 이어집니다.
+“직접 조작해보기”나 다음 실습 안내가 나타나면 `Alt + Enter`(Mac: `⌥ + ↵`)로
+진행할 수 있습니다. 터미널의 일반 Enter 입력과는 별개입니다.
+환경 초기화 버튼을 누르면 처음으로 돌아갑니다.
+
+브라우저 실습은 로컬 시뮬레이션이며 실제 셸이나 에이전트/API에 연결하지 않습니다.
+아래 CLI tour는 별도의 실제 tmux sandbox에서 실행됩니다.
+
+## 첫 실행
+
+설치 후 `muxa`만 실행합니다. 추적 중인 에이전트가 있으면 watch로 바로 들어가고,
+없으면 현재 폴더에서 설치된 에이전트 시작, 기존 터미널 보기, 3단계 데모를 선택합니다.
+선택한 에이전트의 hook과 tmux 연결만 설정하며 MCP·협업 설정은 필수가 아닙니다.
+변경 미리보기에서 취소하면 설정과 에이전트 실행을 중단합니다. daemon은 필요할 때
+자동으로 시작합니다. 터미널 없이 실행하면 안내만 출력하며 설정을 변경하지 않습니다.
+
+짧은 첫 체험은 tmux 밖에서 실행합니다.
+
+    muxa onboard --quick --lang ko
+
+일회용 작업 공간과 연습용 에이전트 둘을 자동으로 준비합니다.
+
+1. `muxa watch`로 에이전트 상태 화면을 엽니다.
+2. 상태를 확인한 뒤 `q`로 화면을 닫습니다.
+3. `muxa attend`로 입력을 기다리는 에이전트에 이동합니다.
+
+이동한 터미널에서 질문을 확인한 뒤 `F10`으로 마치면 sandbox를 삭제합니다. 실제 에이전트/API 호출은 없습니다.
+`F12`로 단계를 건너뛸 수 있고 `F2`로 언어를 바꿉니다. 상세 tmux 학습은 아래의
+기존 `muxa onboard`를 사용합니다. `--quick --print`는 같은 3단계를 문서로 보여줍니다.
+
+watch의 빈 화면에서는 `Enter` 또는 `n`으로 에이전트 생성 폼을 엽니다. 현재 폴더를
+미리 채우고 설치된 에이전트를 기본 선택합니다. 데모 실행이 가능한 환경에서는
+`d`로 짧은 체험을 시작할 수 있습니다. 검색·필터 결과가 비었거나 숨겨진 에이전트가
+있을 때는 최초 실행 화면으로 취급하지 않습니다.
+
 ## 온보딩 실행
 
 `muxa onboard`의 기본 동작은 실제 tmux와 Muxa를 사용하는 16단계 live tour입니다.
@@ -78,10 +126,10 @@ launcher에는 network, 지원되는 release 플랫폼, checksum 도구, `tar`, 
 
 설치 직후에는 다음 순서가 권장됩니다.
 
-    muxa init
-    muxa doctor
-    muxa onboard
-    muxa watch
+    muxa
+
+설치 점검은 `muxa doctor`, 상세 설정은 `muxa init`, 전체 학습은
+`muxa onboard`로 따로 실행할 수 있습니다.
 
 tmux 설정을 설치했다면 prefix+s로 watch를 열 수 있습니다.
 
@@ -134,7 +182,8 @@ row는 tmux window를, 펼친 child row는 agent pane을 나타냅니다.
 - Enter: 선택한 pane으로 이동
 - n: 새 work와 첫 agent 생성, 또는 기존 work에 agent 추가
 - m: 선택한 agent에 collaboration 메시지 작성
-- M: mailbox 열기
+- M / b: mailbox 열기
+- Alt-M: 선택한 agent 이동
 - a: headless ask
 - A: 선택한 Ask conversation
 - o 또는 Alt-P: pane preview

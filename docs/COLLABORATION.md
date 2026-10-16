@@ -15,7 +15,7 @@ mailbox, not through terminal screen scraping.
 - `muxa watch` is not an agent. It is the **operator console** — the human at
   the keyboard is the sender, whatever the pane the popup was opened from
   happens to contain.
-- Select any agent; `m` sends and `M` opens the mailbox (`b` remains an alias).
+- Select any agent; `m` sends and `M` opens the mailbox.
 
 So the normal agent-to-agent workflow is: put two agents in one window and let
 them message each other over MCP. The operator workflow is separate and needs
@@ -104,11 +104,14 @@ Once connected, muxa's initialization instructions surface same-window peers
 as reviewers or narrowly scoped delegated subagents. An agent can call
 `muxa_collaboration_guide` to retrieve the contract again.
 
-If `muxa doctor` reports a pane as synthetic, that agent does not yet have a
-stable session identity and is omitted from room participants and request
-targets. Submit a prompt to trigger a hook event; if it remains synthetic,
-restart the agent and check again. This prevents a request from being pinned to
-a placeholder identity that the later real session could never claim.
+An agent launched through Muxa does not need `--prompt` to become a peer.
+The launcher records the provider and immediately registers the observed CLI
+through discovery. Before the first hook, a matching live process is exposed
+as a pending peer, selectable by provider, pane, alias, role, or automatic
+routing. Requests wait for an idle row; the real session adopts them when its
+first hook arrives. Launch marks alone are insufficient: an exited CLI that
+leaves a shell behind is not exposed as a pending peer. Unmanaged synthetic
+rows remain outside the peer list.
 
 Existing `prefix+s` watch bindings need no additional shortcut after upgrading.
 
@@ -118,6 +121,60 @@ registration, muxa also attempts to recover the pane from process ancestry
 across active backends. muxad validates the resolved origin against its live
 agent and pane registries; collaboration tools do not accept an arbitrary
 sender pane.
+
+Codex 0.160+ attaches every TUI to one shared `codex app-server` (its
+`daemon_auto_start` feature). That server runs hooks, MCP servers, and shell
+commands for all attached threads with the pane variables of whichever pane
+started it, so `env_vars` cannot identify the caller there. Muxa detects the
+shared server from process ancestry and identifies the thread by its exact
+session id instead: the `_meta.threadId` Codex stamps on each MCP call, or
+`$CODEX_THREAD_ID` for `muxa msg`/`muxa peers` run from a Codex shell. The
+origin carries that id and muxad matches it before the pane. Hooks from the
+shared server report no pane; muxad binds the session from its `codex resume
+<id>` process or a pane whose cwd is unique. When neither applies, the thread
+stays unbound and collaboration tools report that rather than borrow another
+pane's identity. Start such a Codex with `codex --no-daemon` to keep its pane.
+Running `muxa mcp` processes keep their old code until the app-server restarts.
+
+## Quiet progress and actionable notifications
+
+A one-way `notice` (`expects_reply=false`) is stored in the mailbox without
+waking its recipient. It remains unread until retrieved; it is not discarded
+or marked delivered by suppression. Questions, reviews, tasks, and notices that
+explicitly require a reply retain automatic wake delivery. Terminal replies
+still wake their requester independently of the original request's setting.
+
+MCP `muxa_send_message` accepts an optional `notify` boolean. CLI examples:
+
+```sh
+# Consolidated progress: read with the next checkpoint inbox pull.
+muxa msg send @reviewer "Build passed; two findings remain" --kind notice --parent REQUEST_ID
+# Resource handoff: wake the recipient without asking for acknowledgement.
+muxa msg send @reviewer "Device released; your verification can start" --kind notice --notify true
+# Explicit pull-only request: reply is still required once claimed.
+muxa msg send @reviewer "Review at the agreed checkpoint" --kind review --notify false
+```
+
+`notify=true` respects `wake="never"` and idle-only delivery; it does not type
+into a busy agent. `notify=false` suppresses recipient wakes without changing
+the reply contract. Omitted `notify` uses the defaults above, including for
+stored legacy messages. An already prepared direct delivery is recovered normally.
+This policy requires the updated daemon; older daemons do not enforce `notify`.
+`wake_payload="notice"` only selects prompt formatting and is unrelated to
+message `kind="notice"` or whether a wake is sent.
+
+Agree on checkpoints at dispatch. Omit acknowledgements and unchanged status;
+record progress on the original request where `muxa_update_request` is available,
+or use one consolidated quiet child notice with `--parent`. Read notices as a
+batch with `muxa_inbox` / `muxa msg inbox` at build/test or review checkpoints.
+Urgent blockers, decisions, edit conflicts, and handoffs use explicit notification.
+Completion uses the original request's terminal reply, with no duplicate notice.
+
+For before/after evaluation, compare actual recipient wake prompts and mailbox
+handling calls over comparable work intervals, plus blocker-to-resolution time.
+Message count alone does not measure interruption cost. Existing request creation,
+claim, notification, and reply timestamps support delivery-latency inspection;
+`notified_at` alone is not proof of successful execution or useful work.
 
 ## Addressing and CLI
 
@@ -170,7 +227,7 @@ muxa msg send peer "review the risks in this plan" --kind review \
   --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"CAL-6924 plan","locator":{"display":".air/cal-6924-plan.air.json","disclosure":"local-only"}}'
 muxa msg inbox
 muxa msg reply req_... "review complete" --status completed
-muxa msg wait req_... --timeout-secs 300
+muxa msg wait req_... --timeout-secs 300 --body
 muxa msg list --mailbox sent
 muxa msg list --scope room     # every participant in this window
 muxa msg list --scope all      # every room this daemon holds
@@ -178,6 +235,20 @@ muxa msg list --scope all --since 7d --work CAL-7345 --kind review \
   --status completed --limit 50 --offset 0
 muxa msg cancel req_... # queued requests only
 ```
+
+`muxa msg inbox` text output includes the reply obligation, permitted paths and attachments alongside the task. `muxa msg wait --timeout SECONDS` is an alias for `--timeout-secs SECONDS`.
+
+`muxa msg wait` defaults to compact JSON describing delivery and final reply
+receipt, not work success. A timeout is a JSON observation (`reason: timeout`)
+with exit code 2; this describes the wait, not the work result. Transport errors remain nonzero. Use `--body` to print only the
+final reply, or `--body --output /tmp/reply.txt` to write it directly without
+shell-side JSON parsing. `--body` also exits 2 on timeout without writing a body/file; a closed request
+with no final reply is an error.
+`--full` opts into the legacy complete request JSON. Do not grep the reply for
+`pending`/`timeout` to decide completion, or pass JSON through shell `echo`:
+it can expand JSON escapes. Use direct stdout/file output, or pipe directly to
+a JSON parser. Progress and final replies remain distinct; a final reply's
+status is declared by its author and verified by the requester.
 
 `send`, `reply`, and `cancel` print a one-line receipt; `list` and `inbox`
 print each request followed by its reply, when one has come back. Add `--json`
@@ -210,7 +281,7 @@ remains the legacy bare array. `--since` accepts durations such as `2h`/`7d`,
 local dates, RFC 3339 timestamps, and the same calendar keywords as timeline.
 
 The same lifecycle is available interactively in `muxa watch`: `m` sends to the
-selected room peer, `M`/`b` opens non-claiming mailbox history, `i` claims the
+selected room peer, `M` opens non-claiming mailbox history, `i` claims the
 inbox, and `e` replies. On a window row, `M` reads the whole room; on a session
 row it reads every room grouped by window. Those aggregate views are read-only.
 The collaboration screen toggles between a newest-first table and chronological
@@ -385,15 +456,14 @@ both files before any downgrade.
 ## Wake-up safety
 
 With `idle_only`, muxad injects only when the exact
-hook-authoritative participant is `Idle`. It never injects into `Working`,
-`WaitingInput`, `WaitingChoice`, or `Error` panes. Synthetic screen-detected
-agents have no stable session identity, so they are not room participants and
-are never selected automatically.
+participant is `Idle`. It never injects into `Working`, `WaitingInput`,
+`WaitingChoice`, or `Error` panes. Unmanaged synthetic screen-detected agents
+are not room participants and are never selected automatically.
 
-The single exception is a request explicitly addressed to a pane Muxa launched
-whose agent has not registered yet. Such a request carries a *pending pane*
-recipient, and the pane's synthetic row serves only as the idle gate for
-delivering it. Safety is unchanged where it matters: a startup approval gate
+A Muxa-launched CLI with a matching live process is exposed as a pending peer
+before its first prompt. Such a request carries a *pending pane* recipient,
+and the pane's synthetic row supplies the idle gate for delivering it. A startup
+approval gate
 still blocks delivery, because the bundled screen manifests classify it as
 `WaitingInput`/`WaitingChoice` rather than `Idle`. A pane with no muxa launch
 mark and no classified agent process is never addressable this way, so a
@@ -433,15 +503,59 @@ unacknowledged replies separately. `muxa_list_messages` is non-claiming history;
 the sender may cancel only while a request remains `queued`, before the
 recipient has claimed it.
 
+Registered agents retain their own mailbox across pane/window moves on the same
+host and control socket. Another session cannot inherit it by reusing a pane.
+Requests addressed to a pending launch stay pinned to that pane and room.
+
 Every collaboration IPC operation (context, identity, send, inbox, list,
 reply, get, wait, and cancel) is also appended to
 `$XDG_DATA_HOME/muxa/collaboration-audit.ndjson`. The `0600` ledger records the
 represented origin/session, OS-observed caller, target/request id, and outcome,
-but never duplicates message or reply bodies. `muxa msg list --json` and
-`muxa_list_messages` expose the creation provenance stored on each request;
+but never duplicates message or reply bodies. `muxa msg list --json --full` and
+`muxa_list_messages` with `full=true` expose the creation provenance stored on each request;
 requests created before this field existed simply omit it.
 
 Provenance remains audit evidence, not a permission gate. An observed/asserted
 pane mismatch is recorded as `mismatched` but does not block the operation, so
 host-scoped explicit-pane routing and the existing high-authority owner-only
 socket workflow remain unchanged.
+
+
+CLI lists use `--scope auto` by default: a tracked agent reads its own mailbox;
+an ordinary untracked terminal reads the current room as the operator console.
+Use `--scope caller` to require an agent mailbox, or `--scope all` for every room.
+Pinned agent identity failures remain errors and never broaden the scope.
+
+CLI message lists default to 20 metadata rows, without original instructions,
+reply bodies, updates or provenance. `--json` retains an array with `id`, stored
+`status`, endpoints and transport receipt fields. Use `--full` to restore full
+records; `--limit` and `--offset` explicitly control history pages.
+`muxa msg list --request-id REQUEST --full --json` fetches one authorized request
+directly instead of downloading mailbox history. For the final reply alone use
+`muxa msg wait REQUEST --body --output FILE`. Prefer completion wakes to repeated
+short timeout waits.
+
+`--limit 0` explicitly requests all matching rows. When a page is truncated,
+the CLI prints the total and next offset on stderr. Default JSON remains an
+array, but diagnostic fields such as bodies, replies, wake delivery and
+provenance now require `--full`; existing diagnostic scripts should add it.
+
+### Quiet updates and efficient reads
+
+Use `muxa msg update REQUEST "guidance or progress" [--json]` to append to an
+existing open request. Updates preserve its authority and paths, do not create a
+child request, and do not wake the recipient. Both participants may update;
+terminal requests reject updates. Repeating the same latest update is idempotent.
+The JSON acknowledgement includes the request id and `next_after_update`.
+
+`muxa msg send ... --notify` is shorthand for `--notify true`; explicit
+`--notify false` remains supported. Preserve command exit status and stderr;
+piping through `grep` can hide argument errors as empty output. Read replies with
+`muxa msg wait REQUEST --body [--output FILE]` rather than guessing JSON fields.
+Use completion wakes or substantive checkpoints instead of repeated one-second
+probes. Foreground MCP waits should use 30–60 seconds; the Fleet default is 30.
+Retain resolved tool schemas until a capability/version change or an actual
+unknown-tool/argument error calls for rediscovery.
+
+Read incremental CLI guidance with `muxa msg list --request-id REQUEST --after-update SEQUENCE --json`; resume from `next_after_update`. This returns
+only newer updates and omits the original task and final reply bodies.

@@ -132,13 +132,6 @@ pub fn parse_collab_layout(value: &str) -> Option<CollabLayout> {
 /// hitting `K`/`R`/`c`, short enough not to mask the next interaction.
 const FOOTER_HINT_TTL: Duration = Duration::from_secs(2);
 
-/// Delay between injecting prompt text into a tmux pane and sending the
-/// submit key. Codex's TUI coalesces very fast input bursts as pasted
-/// content; without a small gap, the trailing Enter can be swallowed into
-/// that burst and the prompt stays composed until the user presses Enter
-/// again manually.
-const PROMPT_SUBMIT_GRACE: Duration = muxa::backend::PROMPT_SUBMIT_GRACE;
-
 /// Channel capacity for the wake signal sent from the input loop to the
 /// background refresh task. Capacity 1 is intentional: when the user mashes
 /// `r`, we want extra requests to coalesce into a single pending wake rather
@@ -1546,26 +1539,20 @@ impl Effects for RealEffects {
     }
 
     fn send_prompt(&mut self, pane_id: &str, text: &str) -> std::result::Result<(), String> {
-        send_prompt_to_tmux(
-            pane_id,
-            text,
-            PROMPT_SUBMIT_GRACE,
-            |args| run_status("tmux", args),
-            std::thread::sleep,
-        )
+        send_prompt_to_backend(&muxa::TmuxBackend::new(), None, pane_id, text)
     }
 
     fn send_prompt_to(&mut self, pane: &PaneKey, text: &str) -> std::result::Result<(), String> {
         let endpoint = &pane.window.session.endpoint;
-        if !crate::mux_control::supported(endpoint.host) {
-            return Err(format!("{} pane prompt is not supported", endpoint.host));
-        }
-        send_prompt_to_tmux(
-            pane.pane_id.strip_prefix("rmux:").unwrap_or(&pane.pane_id),
+        let backend = muxa::active_backends()
+            .into_iter()
+            .find(|b| b.kind() == endpoint.host)
+            .ok_or_else(|| format!("{} backend is not active", endpoint.host))?;
+        send_prompt_to_backend(
+            backend.as_ref(),
+            Some(&endpoint.socket),
+            &pane.pane_id,
             text,
-            PROMPT_SUBMIT_GRACE,
-            |args| crate::mux_control::run(endpoint, args),
-            std::thread::sleep,
         )
     }
 
@@ -1714,22 +1701,20 @@ impl Effects for RealEffects {
     }
 }
 
-fn send_prompt_to_tmux<R, S>(
-    pane_id: &str,
+fn send_prompt_to_backend(
+    backend: &dyn muxa::PaneBackend,
+    socket: Option<&str>,
+    pane: &str,
     text: &str,
-    submit_delay: Duration,
-    mut run_tmux: R,
-    mut sleep: S,
-) -> std::result::Result<(), String>
-where
-    R: FnMut(&[&str]) -> std::result::Result<(), String>,
-    S: FnMut(Duration),
-{
-    run_tmux(&["send-keys", "-t", pane_id, "-l", "--", text])?;
-    if !submit_delay.is_zero() {
-        sleep(submit_delay);
+) -> std::result::Result<(), String> {
+    if !backend.send_prompt_text_on(socket, pane, text) {
+        return Err("prompt input failed".into());
     }
-    run_tmux(&["send-keys", "-t", pane_id, "Enter"])
+    std::thread::sleep(muxa::backend::prompt_submit_grace(pane));
+    if !backend.send_text_on(socket, pane, "\r") {
+        return Err("prompt text was sent but Enter failed; do not resend text".into());
+    }
+    Ok(())
 }
 
 /// Result of attempting to spawn-and-pipe to a clipboard helper.
@@ -1904,7 +1889,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  Alt-A          attention-only filter",
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
-        "  m / M / Space  message selected or marked / mailbox / mark agent",
+        "  m / M / Alt-M  message / mailbox / move pane or window; Space marks",
         "  Alt-1/2 · W    screen topology / collab · W is the work table",
         "  v              (in collab) toggle table / sequence history",
         "  i / e          (in mailbox) claim inbox / reply",
@@ -2529,6 +2514,7 @@ fn persist_watch_collab_layout(
 
 #[derive(Debug, Clone, Default)]
 struct WatchCollaboration {
+    human: Vec<CollaborationRequest>,
     origin: Option<CollaborationOrigin>,
     room: Option<RoomContext>,
     /// The agent whose inbox `incoming` holds — the row under the cursor when
@@ -2630,6 +2616,7 @@ impl WatchCollaboration {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum CollaborationMailboxTab {
     #[default]
+    Human,
     Incoming,
     Sent,
 }
@@ -3192,6 +3179,7 @@ pub(crate) struct App {
     /// `Some` while the `a` ask composer is open.
     ask_composer: Option<AskComposer>,
     work_composer: Option<WorkComposer>,
+    agent_move: Option<crate::agent_move::MoveMenu>,
     rename: Option<RenameComposer>,
     ask_panel: AskPanelState,
     ask_entries: Vec<muxa::ask::AskEntry>,
@@ -3210,6 +3198,7 @@ pub(crate) struct App {
     /// popup listing every keybinding — the same pattern as `confirm`,
     /// just with a static body and no follow-up dispatch.
     pub help_open: bool,
+    demo_available: bool,
     /// Transient footer hint set after a quick action runs. The
     /// renderer hides the default keybinding strip while this is fresh
     /// (`set_at.elapsed() < FOOTER_HINT_TTL`). The run loop never
@@ -3478,6 +3467,7 @@ impl App {
             spawn: None,
             ask_composer: None,
             work_composer: None,
+            agent_move: None,
             rename: None,
             ask_panel: AskPanelState::default(),
             ask_entries: Vec::new(),
@@ -3487,6 +3477,7 @@ impl App {
             ask_agent: "claude".into(),
             command_palette: None,
             help_open: false,
+            demo_available: std::env::var_os("TMUX").is_none() && which::which("tmux").is_ok(),
             footer_hint: None,
         }
     }
@@ -3567,12 +3558,15 @@ impl App {
                     || agent.session_id.clone(),
                     |_| agent_pane_display(agent, &self.panes),
                 );
-                let summary = agent
-                    .last_notification
-                    .as_deref()
-                    .or(agent.last_response.as_deref())
-                    .or(agent.last_prompt.as_deref())
-                    .unwrap_or("")
+                let summary = muxa::prompt_headline(
+                    agent
+                        .last_notification
+                        .as_deref()
+                        .or(agent.last_response.as_deref())
+                        .or(agent.last_prompt.as_deref())
+                        .unwrap_or(""),
+                );
+                let summary = summary
                     .lines()
                     .next()
                     .unwrap_or("")
@@ -5551,12 +5545,19 @@ impl<'a> SortContext<'a> {
             display_by_key.insert(s.name.as_str(), s.name.as_str());
             display_by_key.insert(s.session_id.as_str(), s.name.as_str());
         }
+        // One entry per pane per server: a grouped session lists each pane
+        // once per `~view~` member, which must not read as ambiguous.
         let mut pane_by_id: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
         for pane in panes {
-            pane_by_id
-                .entry(pane.pane_id.as_str())
-                .or_default()
-                .push(pane);
+            let entries = pane_by_id.entry(pane.pane_id.as_str()).or_default();
+            match entries.iter_mut().find(|kept| kept.socket == pane.socket) {
+                Some(kept) => {
+                    if muxa::tmux::prefer_listing(pane, *kept) {
+                        *kept = pane;
+                    }
+                }
+                None => entries.push(pane),
+            }
         }
         Self {
             pane_by_id,
@@ -6069,6 +6070,10 @@ fn build_work_rows(
     session_activity: &[SessionActivity],
     sort_keys: &[WatchSortKey],
 ) -> Vec<WatchRow> {
+    // One work row per window, not one per `~view~` member listing it. Jumps
+    // still land in the caller's own view (`resolve_jump_session`).
+    let canonical = muxa::tmux::canonical_panes(panes);
+    let panes = canonical.as_slice();
     let sort_context =
         SortContext::new(panes, sessions, session_activity, OffsetDateTime::now_utc());
 
@@ -6317,7 +6322,14 @@ fn pane_display_on(pane_id: Option<&str>, socket: Option<&str>, panes: &[PaneInf
         // failed to find a pane.
         return "(no pane)".into();
     };
-    let candidates: Vec<_> = panes.iter().filter(|pane| pane.pane_id == id).collect();
+    let candidates = muxa::tmux::canonical_panes(
+        &panes
+            .iter()
+            .filter(|pane| pane.pane_id == id)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let candidates: Vec<&PaneInfo> = candidates.iter().collect();
     let matched = match socket {
         Some(endpoint) => candidates.iter().copied().find(|pane| {
             let host =
@@ -7094,16 +7106,18 @@ fn merge_agent_for_ui(prior: &Agent, incoming: &Agent) -> Agent {
     if merged.cost_usd.is_none() {
         merged.cost_usd = prior.cost_usd;
     }
-    if merged.rate_limit_5h_pct.is_none() {
+    // Codex rollout quota snapshots are complete: None can deliberately
+    // clear a missing window, rather than mean a partial statusline reading.
+    if merged.kind != AgentKind::Codex && merged.rate_limit_5h_pct.is_none() {
         merged.rate_limit_5h_pct = prior.rate_limit_5h_pct;
     }
-    if merged.rate_limit_5h_resets_at.is_none() {
+    if merged.kind != AgentKind::Codex && merged.rate_limit_5h_resets_at.is_none() {
         merged.rate_limit_5h_resets_at = prior.rate_limit_5h_resets_at;
     }
-    if merged.rate_limit_7d_pct.is_none() {
+    if merged.kind != AgentKind::Codex && merged.rate_limit_7d_pct.is_none() {
         merged.rate_limit_7d_pct = prior.rate_limit_7d_pct;
     }
-    if merged.rate_limit_7d_resets_at.is_none() {
+    if merged.kind != AgentKind::Codex && merged.rate_limit_7d_resets_at.is_none() {
         merged.rate_limit_7d_resets_at = prior.rate_limit_7d_resets_at;
     }
     // NOTE: rate_limited_until, rate_limit_scope, and
@@ -7680,6 +7694,7 @@ pub async fn run(
     // forces the first in-loop frame; `Instant::now()` seeds the cadence.
     let mut needs_render = true;
     let mut last_render = std::time::Instant::now();
+    let mut last_mailbox_refresh = std::time::Instant::now();
 
     loop {
         // Animate on a fast cadence only while there's something to move:
@@ -7744,6 +7759,11 @@ pub async fn run(
         let mut quit = false;
         for ev in events {
             match handle_event(ev, &mut app) {
+                Action::TryDemo => {
+                    jump_target = Some(WatchOpenTarget::Demo);
+                    quit = true;
+                    break;
+                }
                 Action::Quit => {
                     quit = true;
                     break;
@@ -7963,6 +7983,53 @@ pub async fn run(
                 }
                 Action::OpenWorkUp => {
                     app.work_composer = Some(WorkComposer::default());
+                }
+                Action::OpenAgentMove => {
+                    let source = selected_move_target(&app);
+                    match source {
+                        Ok((source, scope)) => {
+                            let opened = tokio::task::spawn_blocking(move || {
+                                crate::agent_move::MoveMenu::open_scope(source, scope)
+                            })
+                            .await;
+                            match opened {
+                                Ok(Ok(menu)) => app.agent_move = Some(menu),
+                                Ok(Err(error)) => app
+                                    .set_hint(format!("move unavailable: {error}"), HintLevel::Err),
+                                Err(error) => app
+                                    .set_hint(format!("move unavailable: {error}"), HintLevel::Err),
+                            }
+                        }
+                        Err(error) => app.set_hint(error, HintLevel::Warn),
+                    }
+                }
+                Action::SubmitAgentMove(request) => {
+                    let result =
+                        tokio::task::spawn_blocking(move || crate::agent_move::execute(request))
+                            .await;
+                    match result {
+                        Ok(Ok(outcome)) => {
+                            crate::agent_move::refresh_locations(client, &outcome.pane).await;
+                            app.agent_move = None;
+                            app.set_hint(outcome.message, HintLevel::Ok);
+                            request_refresh(&mut app, &wake_tx);
+                            if outcome.follow {
+                                jump_target = Some(WatchOpenTarget::Moved(outcome.pane));
+                                quit = true;
+                                break;
+                            }
+                        }
+                        error => {
+                            let error = match error {
+                                Ok(Err(error)) => error.to_string(),
+                                Err(error) => error.to_string(),
+                                _ => unreachable!(),
+                            };
+                            if let Some(menu) = app.agent_move.as_mut() {
+                                menu.error = Some(error);
+                            }
+                        }
+                    }
                 }
                 Action::SubmitRename => {
                     finish_rename(&mut app, &wake_tx, apply_rename);
@@ -8417,6 +8484,14 @@ pub async fn run(
             }
         }
 
+        if app.collaboration_mailbox.open
+            && last_mailbox_refresh.elapsed() >= Duration::from_secs(2)
+        {
+            refresh_watch_collaboration(client, &mut app).await;
+            last_mailbox_refresh = std::time::Instant::now();
+            needs_render = true;
+        }
+
         if quit {
             break;
         }
@@ -8496,6 +8571,7 @@ fn watch_collaboration_origin_from(
         pane: pane.unwrap_or_default(),
         socket,
         console: true,
+        agent_session_id: None,
     }
 }
 
@@ -8606,6 +8682,10 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
                 | None => None,
             };
             app.collaboration = WatchCollaboration {
+                human: requests
+                    .into_iter()
+                    .filter(CollaborationRequest::needs_human_response)
+                    .collect(),
                 origin: Some(origin),
                 room: Some(room),
                 history_scope,
@@ -8614,7 +8694,7 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
                 sent,
                 unavailable: None,
             };
-            if aggregate {
+            if aggregate && app.collaboration_mailbox.tab != CollaborationMailboxTab::Human {
                 app.collaboration_mailbox.tab = CollaborationMailboxTab::Incoming;
             }
         }
@@ -8680,6 +8760,7 @@ fn mailbox_anchor_for_pane(pane: &PaneNode) -> Option<MailboxAnchor> {
             socket: matches!(endpoint.host, muxa::HostKind::Tmux | muxa::HostKind::Rmux)
                 .then(|| endpoint.socket.clone()),
             console: false,
+            agent_session_id: None,
         },
         label: format!("{}@{}", agent.kind, pane.key.pane_id),
     })
@@ -8713,6 +8794,7 @@ fn mailbox_anchor(app: &App) -> Option<MailboxAnchor> {
             pane,
             socket,
             console: false,
+            agent_session_id: None,
         },
         label,
     })
@@ -8722,6 +8804,60 @@ fn mailbox_anchor(app: &App) -> Option<MailboxAnchor> {
 /// composer cannot open, `m` degrades to the keystrokes-only form against
 /// the selected pane instead of refusing outright, and the reason the
 /// contract modes are missing rides along as a warning hint.
+fn selected_move_target(
+    app: &App,
+) -> std::result::Result<(PaneKey, crate::agent_move::MoveScope), String> {
+    if app.uses_tree() {
+        if let Some(TopologyNodeRef::Session(session)) = app.selected_node() {
+            if session.windows.len() == 1 {
+                let pane = session.windows[0]
+                    .active_pane()
+                    .ok_or("selected window has no live panes")?;
+                return Ok((pane.key.clone(), crate::agent_move::MoveScope::Window));
+            }
+            return Err("select a window or pane to move".into());
+        }
+    }
+    let key = selected_move_key(app)?;
+    let scope =
+        if app.uses_tree() && matches!(app.selected_node(), Some(TopologyNodeRef::Window(_))) {
+            crate::agent_move::MoveScope::Window
+        } else {
+            crate::agent_move::MoveScope::Pane
+        };
+    Ok((key, scope))
+}
+
+fn selected_move_key(app: &App) -> std::result::Result<PaneKey, String> {
+    if app.uses_tree() {
+        if matches!(app.selected_node(), Some(TopologyNodeRef::Session(_))) {
+            return Err("select a window or pane to move".into());
+        }
+        return app
+            .selected_action_pane()
+            .map(|pane| pane.key.clone())
+            .ok_or_else(|| "select an agent pane to move".into());
+    }
+    let pane = app.selected_pane().ok_or("select an agent pane to move")?;
+    let agent = app.selected_agent();
+    let matches: Vec<_> = app
+        .panes
+        .iter()
+        .filter(|p| {
+            p.pane_id == pane
+                && agent
+                    .and_then(|a| a.tmux_socket.as_deref())
+                    .is_none_or(|s| p.socket.as_deref() == Some(s))
+        })
+        .collect();
+    let p = matches.first().ok_or("selected pane is no longer live")?;
+    if matches.iter().any(|other| other.socket != p.socket) {
+        return Err("ambiguous pane endpoint — select it in tree layout".into());
+    }
+    let host = muxa::backend::pane_id_host_kind(&pane).ok_or("unsupported pane backend")?;
+    Ok(PaneKey::from_pane(host, p))
+}
+
 fn open_prompt_only_composer(app: &mut App, reason: String) {
     let pane_key = if app.uses_tree() {
         app.selected_action_pane().map(|pane| pane.key.clone())
@@ -9264,9 +9400,15 @@ async fn run_watch_collaboration_broadcast(
     for (pane, label) in recipients {
         let pane = pane.clone();
         let request = NewRequest {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
+            human_action: None,
+            initiator: None,
             kind,
             body: body.clone(),
             expects_reply: kind != RequestKind::Notice,
+            notify: None,
             work_mode,
             thread_id: None,
             parent_request_id: None,
@@ -9323,9 +9465,15 @@ async fn run_watch_collaboration_single(
                 }
             };
             let request = NewRequest {
+                dispatch_id: None,
+                source_node_id: None,
+                delegation_parent: None,
+                human_action: None,
+                initiator: None,
                 kind,
                 body: composer.input,
                 expects_reply: kind != RequestKind::Notice,
+                notify: None,
                 work_mode,
                 thread_id: None,
                 parent_request_id: None,
@@ -9374,6 +9522,7 @@ async fn run_watch_collaboration_single(
 
 fn collaboration_requests(app: &App) -> &[CollaborationRequest] {
     match app.collaboration_mailbox.tab {
+        CollaborationMailboxTab::Human => &app.collaboration.human,
         CollaborationMailboxTab::Incoming => &app.collaboration.incoming,
         CollaborationMailboxTab::Sent => &app.collaboration.sent,
     }
@@ -9407,8 +9556,9 @@ fn move_collaboration_mailbox(app: &mut App, delta: isize) {
 
 fn toggle_collaboration_mailbox(app: &mut App) {
     app.collaboration_mailbox.tab = match app.collaboration_mailbox.tab {
+        CollaborationMailboxTab::Human => CollaborationMailboxTab::Incoming,
         CollaborationMailboxTab::Incoming => CollaborationMailboxTab::Sent,
-        CollaborationMailboxTab::Sent => CollaborationMailboxTab::Incoming,
+        CollaborationMailboxTab::Sent => CollaborationMailboxTab::Human,
     };
     app.collaboration_mailbox.selected = 0;
 }
@@ -9606,6 +9756,8 @@ fn drain_pending_events() -> io::Result<Vec<Event>> {
 
 #[derive(Debug)]
 pub(crate) enum Action {
+    OpenAgentMove,
+    SubmitAgentMove(crate::agent_move::MoveRequest),
     /// Open the work composer (`w`).
     OpenWorkUp,
     /// Run `muxa work up` for whatever the composer holds.
@@ -9613,6 +9765,7 @@ pub(crate) enum Action {
     SubmitRename,
     None,
     Quit,
+    TryDemo,
     Refresh,
     /// Drain and re-exec the daemon onto whatever binary is installed now.
     /// The remedy for the skew bar, reachable without leaving watch.
@@ -9708,6 +9861,8 @@ pub(crate) enum Action {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchOpenTarget {
+    Demo,
+    Moved(PaneKey),
     TopologyPane(PaneKey),
     LegacyPane(String),
 }
@@ -9719,6 +9874,10 @@ struct CommandSpec {
 }
 
 const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        command: "move",
+        description: "move selected agent without restarting",
+    },
     CommandSpec {
         command: "refresh",
         description: "refresh data now",
@@ -9847,6 +10006,7 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         "r" | "refresh" => Action::Refresh,
         "o" | "open" | "preview" => Action::OpenPreview,
         "m" | "message" => Action::OpenCollaborationMessage,
+        "move" => Action::OpenAgentMove,
         "split" => {
             app.inspector_split = app.inspector_split.next();
             Action::InspectorSplitChanged
@@ -9912,6 +10072,10 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     // Prompt/command modes keep it literal; table mode treats it as a search
     // query, matching ordinary direct typing.
     if let Event::Paste(pasted) = ev {
+        if let Some(menu) = app.agent_move.as_mut() {
+            menu.paste(&pasted);
+            return Action::None;
+        }
         if let Some(editor) = app.message_skill_editor.as_mut() {
             let pasted = pasted.replace(['\r', '\n'], " ");
             let (text, cursor) = editor.field_mut();
@@ -9986,6 +10150,17 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             // arrows) cancels. Listing them explicitly would invite
             // someone to accidentally drop one — fall through.
             _ => Action::ConfirmCancel,
+        };
+    }
+
+    if let Some(menu) = app.agent_move.as_mut() {
+        return match menu.on_key(KeyEvent::new(code, modifiers)) {
+            crate::agent_move::MenuEvent::None => Action::None,
+            crate::agent_move::MenuEvent::Cancel => {
+                app.agent_move = None;
+                Action::None
+            }
+            crate::agent_move::MenuEvent::Submit(request) => Action::SubmitAgentMove(*request),
         };
     }
 
@@ -10065,6 +10240,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
 
     if modifiers.contains(KeyModifiers::ALT) {
         return match code {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'m') => Action::OpenAgentMove,
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p') => Action::OpenPreview,
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'r') => Action::Refresh,
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') => {
@@ -10132,6 +10308,15 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             Action::None
         }
         KeyCode::Esc => Action::Quit,
+        KeyCode::Enter if onboarding_empty(app) => handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            app,
+        ),
+        KeyCode::Char('d')
+            if onboarding_empty(app) && app.browse_keys_active() && app.demo_available =>
+        {
+            Action::TryDemo
+        }
         KeyCode::Enter => quick_prompt_action(app),
         KeyCode::Down => {
             app.move_down();
@@ -10226,6 +10411,16 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
                 dir_cursor,
                 name,
                 name_cursor,
+                agent: [
+                    SpawnAgent::Claude,
+                    SpawnAgent::Codex,
+                    SpawnAgent::Gemini,
+                    SpawnAgent::Antigravity,
+                    SpawnAgent::Opencode,
+                ]
+                .into_iter()
+                .find(|agent| which::which(agent.label()).is_ok())
+                .unwrap_or_default(),
                 ..SpawnComposer::default()
             });
             Action::None
@@ -11627,10 +11822,13 @@ fn handle_collaboration_mailbox_event(code: KeyCode, app: &mut App) -> Action {
         }
         KeyCode::Char('m') => Action::OpenCollaborationMessage,
         KeyCode::Tab | KeyCode::BackTab if aggregate => {
-            app.set_hint(
-                "aggregate history already includes both directions",
-                HintLevel::Ok,
-            );
+            app.collaboration_mailbox.tab =
+                if app.collaboration_mailbox.tab == CollaborationMailboxTab::Human {
+                    CollaborationMailboxTab::Incoming
+                } else {
+                    CollaborationMailboxTab::Human
+                };
+            app.collaboration_mailbox.selected = 0;
             Action::None
         }
         KeyCode::Tab | KeyCode::BackTab => {
@@ -11652,10 +11850,19 @@ fn handle_collaboration_mailbox_event(code: KeyCode, app: &mut App) -> Action {
             app.set_hint(format!("mailbox detail: {label}"), HintLevel::Ok);
             Action::None
         }
-        KeyCode::Char('i' | 'e') if aggregate => {
+        KeyCode::Char('i' | 'e')
+            if aggregate && app.collaboration_mailbox.tab != CollaborationMailboxTab::Human =>
+        {
             app.set_hint(
                 "session/window history is read-only; select an exact recipient pane",
                 HintLevel::Warn,
+            );
+            Action::None
+        }
+        KeyCode::Char('i') if app.collaboration_mailbox.tab == CollaborationMailboxTab::Human => {
+            app.set_hint(
+                "press e to answer the selected human request",
+                HintLevel::Ok,
             );
             Action::None
         }
@@ -11670,6 +11877,25 @@ fn handle_collaboration_mailbox_event(code: KeyCode, app: &mut App) -> Action {
 }
 
 fn open_watch_collaboration_reply_composer(app: &mut App) {
+    if app.collaboration_mailbox.tab == CollaborationMailboxTab::Human {
+        if let (Some(request), Some(origin)) = (
+            selected_collaboration_request(app),
+            app.collaboration.origin.clone(),
+        ) {
+            app.collaboration_composer = Some(CollaborationComposer::new(
+                CollaborationComposeTarget::Reply {
+                    origin: CollaborationOrigin {
+                        console: true,
+                        ..origin
+                    },
+                    request_id: request.id.clone(),
+                    status: RequestStatus::Completed,
+                },
+                format!("reply to {}", request.from.label()),
+            ));
+        }
+        return;
+    }
     if app.collaboration_mailbox.tab != CollaborationMailboxTab::Incoming {
         app.set_hint("switch to incoming requests to reply", HintLevel::Err);
         return;
@@ -12125,6 +12351,9 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     render_broadcast_report_overlay(f, chunks[1], app);
     render_work_composer_overlay(f, chunks[1], app);
     render_rename_overlay(f, chunks[1], app);
+    if let Some(menu) = app.agent_move.as_ref() {
+        menu.render(f, centered_rect(85, 80, chunks[1]));
+    }
     if app.ask_composer.is_some() {
         let skills_open = app
             .ask_composer
@@ -13486,6 +13715,15 @@ fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &App) {
 
 fn collaboration_mailbox_title(app: &App, theme: WatchThemeSpec) -> Line<'static> {
     let tab = app.collaboration_mailbox.tab;
+    if tab == CollaborationMailboxTab::Human {
+        return Line::from(vec![
+            Span::styled(
+                format!(" need your response {} ", app.collaboration.human.len()),
+                theme.action_badge(),
+            ),
+            Span::raw(" Tab: agent traffic · e: reply "),
+        ]);
+    }
     let owner = app
         .collaboration
         .history_scope
@@ -13498,6 +13736,17 @@ fn collaboration_mailbox_title(app: &App, theme: WatchThemeSpec) -> Line<'static
         .is_some_and(MailboxHistoryScope::aggregate);
     let mut spans = vec![
         Span::styled(" messages ", theme.accent_badge()),
+        Span::styled(
+            format!(
+                " need you {} · Tab to switch ",
+                app.collaboration.human.len()
+            ),
+            if tab == CollaborationMailboxTab::Human {
+                theme.action_badge()
+            } else {
+                theme.dim_style()
+            },
+        ),
         Span::raw(" "),
     ];
     if read_only {
@@ -13604,6 +13853,7 @@ fn collaboration_mailbox_request_lines(
     if painted.is_empty() {
         return vec![Line::from(Span::styled(
             match tab {
+                CollaborationMailboxTab::Human => "no requests need your response",
                 CollaborationMailboxTab::Incoming => "no incoming requests",
                 CollaborationMailboxTab::Sent => "no sent requests",
             },
@@ -13697,7 +13947,9 @@ fn collaboration_mailbox_request_lines_for_request(
         format!("{} → {}", request.from.label(), request.to.label())
     } else {
         match tab {
-            CollaborationMailboxTab::Incoming => request.from.label(),
+            CollaborationMailboxTab::Human | CollaborationMailboxTab::Incoming => {
+                request.from.label()
+            }
             CollaborationMailboxTab::Sent => request.to.label(),
         }
     };
@@ -14860,12 +15112,14 @@ fn render_inspector(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&
             Span::styled("model ", theme.dim_style()),
             Span::raw(agent.model.as_deref().unwrap_or("—").to_string()),
         ]));
-        let summary = agent
-            .last_notification
-            .as_deref()
-            .or(agent.last_prompt.as_deref())
-            .unwrap_or("—")
-            .replace('\n', " ");
+        let summary = muxa::prompt_headline(
+            agent
+                .last_notification
+                .as_deref()
+                .or(agent.last_prompt.as_deref())
+                .unwrap_or("—"),
+        )
+        .replace('\n', " ");
         lines.push(Line::from(vec![
             Span::styled("latest ", theme.dim_style()),
             Span::raw(truncate_chars(
@@ -14967,13 +15221,15 @@ fn inspector_rule(width: u16, theme: WatchThemeSpec) -> Line<'static> {
 }
 
 fn inspector_agent_summary(agent: &Agent) -> String {
-    agent
-        .last_notification
-        .as_deref()
-        .or(agent.summary_text())
-        .or(agent.last_prompt.as_deref())
-        .unwrap_or("—")
-        .replace('\n', " ")
+    muxa::prompt_headline(
+        agent
+            .last_notification
+            .as_deref()
+            .or(agent.summary_text())
+            .or(agent.last_prompt.as_deref())
+            .unwrap_or("—"),
+    )
+    .replace('\n', " ")
 }
 
 fn inspector_latest_agent<'a>(
@@ -16324,7 +16580,10 @@ fn topology_agent_summary(agent: &Agent, layout: WatchLayout) -> String {
             .as_deref()
             .or(agent.summary_text())
             .or(agent.last_prompt.as_deref())
-            .map_or_else(|| agent.state.to_string(), str::to_string)
+            .map_or_else(
+                || agent.state.to_string(),
+                |text| muxa::prompt_headline(text).into_owned(),
+            )
     };
     let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_chars(&one_line, WINDOW_ACTIVITY_ITEM_CHARS)
@@ -16448,7 +16707,7 @@ fn swarm_topology_agent_summary(agent: &Agent) -> String {
         .as_deref()
         .or(agent.summary_text())
         .or(agent.last_prompt.as_deref())
-        .unwrap_or("waiting")
+        .map_or(std::borrow::Cow::Borrowed("waiting"), muxa::prompt_headline)
         .replace('\n', " ");
     parts.push(activity);
     parts.join(" · ")
@@ -17003,6 +17262,15 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
 /// state, not a rendering glitch. Distinguishes "nothing tracked at all"
 /// from "everything visible is hidden as paneless" so the hint is
 /// actionable in both cases.
+fn onboarding_empty(app: &App) -> bool {
+    app.rows.is_empty()
+        && app.search_query.is_empty()
+        && !app.attention_only
+        && app.paneless_hidden == 0
+        && app.paneless_attention == 0
+        && app.last_error.is_none()
+}
+
 fn render_empty_table(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpec) {
     let title = if app.uses_tree() {
         " Topology "
@@ -17071,11 +17339,24 @@ fn render_empty_table(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeSpe
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            "No agents tracked.",
+            "Start your first coding agent",
             Style::default().add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
-            "Start an agent, or run `muxa doctor` to check setup.",
+            "Enter / n: start an agent in the current folder",
+            theme.dim_style(),
+        )));
+    }
+
+    if onboarding_empty(app) {
+        if app.demo_available {
+            lines.push(Line::from(Span::styled(
+                "d: try the three-step demo · no API calls",
+                theme.dim_style(),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "Already running one? r: refresh · muxa doctor: check detection",
             theme.dim_style(),
         )));
     }
@@ -17729,6 +18010,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&[Tr
         Span::raw(" preview  "),
         Span::styled(" m ", theme.action_badge()),
         Span::raw(" message  "),
+        Span::styled(" Alt-M ", theme.action_badge()),
+        Span::raw(" move  "),
         Span::styled(" M ", theme.action_badge()),
         Span::raw(" mailbox  "),
         Span::styled(" ? ", theme.key_badge()),
@@ -17861,6 +18144,15 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
     }
 
     if app.collaboration_mailbox.open {
+        if app.collaboration_mailbox.tab == CollaborationMailboxTab::Human {
+            f.render_widget(
+                Paragraph::new(
+                    "j/k select · e reply as operator · Tab agent traffic · r refresh · M close",
+                ),
+                area,
+            );
+            return true;
+        }
         let aggregate = app
             .collaboration
             .history_scope
@@ -18497,6 +18789,7 @@ mod tests {
     fn fake_pane(pane: &str, session: &str, window: u32, pane_idx: u32, cmd: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -18530,6 +18823,7 @@ mod tests {
     ) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -18590,6 +18884,61 @@ mod tests {
         app
     }
 
+    #[test]
+    fn latest_session_order_updates_on_same_state_activity_snapshot() {
+        let panes = vec![
+            fake_topology_pane("default", "$1", "alpha", "@1", "WORK", 0, "%1", 0),
+            fake_topology_pane("default", "$2", "beta", "@2", "WORK", 0, "%2", 0),
+        ];
+        let alpha = topology_agent(
+            "alpha-agent",
+            "%1",
+            "default",
+            AgentState::Working,
+            "alpha",
+            1,
+        );
+        let beta = topology_agent(
+            "beta-agent",
+            "%2",
+            "default",
+            AgentState::Working,
+            "beta",
+            2,
+        );
+        let mut app = topology_watch(WatchView::Session, vec![alpha.clone(), beta.clone()], panes);
+        app.apply_sort_preset(WatchSortPreset::Latest);
+        assert_eq!(app.sorted_sessions()[0].name, "beta");
+        let selected = app.sorted_sessions()[0].node_key();
+        select_tree_key(&mut app, &selected);
+
+        let mut updated = alpha;
+        updated.last_activity_at = beta.last_activity_at + time::Duration::seconds(10);
+        apply_outcome(
+            &mut app,
+            RefreshOutcome::Agents(vec![updated.clone(), beta]),
+        );
+        assert_eq!(app.sorted_sessions()[0].name, "alpha");
+        assert_eq!(app.selected_node_key(), Some(selected));
+        assert_eq!(
+            app.sorted_sessions()[0].windows[0].panes[0]
+                .agent
+                .as_ref()
+                .unwrap()
+                .state,
+            AgentState::Working
+        );
+
+        // A legitimate clearing of Codex quota fields must survive the UI merge.
+        updated.rate_limit_7d_pct = Some(100.0);
+        let mut incoming = updated.clone();
+        incoming.rate_limit_7d_pct = None;
+        assert_eq!(
+            merge_agent_for_ui(&updated, &incoming).rate_limit_7d_pct,
+            None
+        );
+    }
+
     fn select_tree_key(app: &mut App, key: &TopologyNodeKey) {
         let index = app
             .tree_targets()
@@ -18627,6 +18976,54 @@ mod tests {
 
     /// Two windows so the single-window compaction does not fold the window
     /// row into its session — the `C` binding has to answer from either.
+    #[test]
+    fn empty_watch_enter_opens_agent_creation_without_a_selected_row() {
+        let mut app = App::with_config(WatchConfig::default());
+        assert!(onboarding_empty(&app));
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(action, Action::None));
+        let composer = app.spawn.as_ref().expect("agent creation form");
+        assert!(composer.target.is_none());
+        assert!(!composer.dir.is_empty());
+    }
+
+    #[test]
+    fn empty_watch_demo_key_requires_a_supported_environment() {
+        let mut app = App::with_config(WatchConfig::default());
+        app.demo_available = true;
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+                &mut app
+            ),
+            Action::TryDemo
+        ));
+        app.demo_available = false;
+        assert!(!matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+                &mut app
+            ),
+            Action::TryDemo
+        ));
+    }
+
+    #[test]
+    fn filters_and_hidden_agents_do_not_offer_first_run_actions() {
+        let mut app = App::with_config(WatchConfig::default());
+        app.attention_only = true;
+        assert!(!onboarding_empty(&app));
+        app.attention_only = false;
+        app.search_query = "codex".into();
+        assert!(!onboarding_empty(&app));
+        app.search_query.clear();
+        app.paneless_hidden = 1;
+        assert!(!onboarding_empty(&app));
+    }
+
     fn two_window_topology_fixture() -> (Vec<Agent>, Vec<PaneInfo>) {
         let panes = vec![
             fake_topology_pane("default", "$1", "muxa", "@1", "TEST-1", 0, "%1", 0),
@@ -18646,6 +19043,38 @@ mod tests {
             Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT)),
             app,
         )
+    }
+
+    #[test]
+    fn move_scope_follows_the_selected_window_or_pane() {
+        let (agents, panes) = two_window_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let session = app.topology.sessions[0].key.clone();
+        let window = app.topology.sessions[0].windows[0].key.clone();
+        let pane = app.topology.sessions[0].windows[0].panes[0].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Window(window.clone()));
+        let (key, scope) = selected_move_target(&app).unwrap();
+        assert_eq!(scope, crate::agent_move::MoveScope::Window);
+        assert_eq!(key.window, window);
+        select_tree_key(&mut app, &TopologyNodeKey::Pane(pane.clone()));
+        assert_eq!(
+            selected_move_target(&app).unwrap(),
+            (pane, crate::agent_move::MoveScope::Pane)
+        );
+        select_tree_key(&mut app, &TopologyNodeKey::Session(session));
+        assert!(selected_move_target(&app).is_err());
+    }
+
+    #[test]
+    fn a_compacted_single_window_row_moves_the_whole_window() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        let session = app.topology.sessions[0].key.clone();
+        let window = app.topology.sessions[0].windows[0].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Session(session));
+        let (key, scope) = selected_move_target(&app).unwrap();
+        assert_eq!(scope, crate::agent_move::MoveScope::Window);
+        assert_eq!(key.window, window);
     }
 
     #[test]
@@ -20214,6 +20643,13 @@ mod tests {
     ) -> CollaborationRequest {
         let now = OffsetDateTime::now_utc();
         CollaborationRequest {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
+            interruption: None,
+            human_action: None,
+            initiator: None,
+            updates: Vec::new(),
             id: id.into(),
             from,
             to,
@@ -20221,6 +20657,7 @@ mod tests {
             kind: RequestKind::Review,
             body: "review the auth change".into(),
             expects_reply: true,
+            notify: None,
             work_mode: WorkMode::ReadOnly,
             thread_id: None,
             parent_request_id: None,
@@ -20359,6 +20796,7 @@ mod tests {
     #[test]
     fn session_mailbox_leads_with_human_window_names_and_message_summaries() {
         let mut app = collaboration_watch_app();
+        app.collaboration_mailbox.tab = CollaborationMailboxTab::Incoming;
         app.collaboration.history_scope = Some(MailboxHistoryScope::Session {
             key: SessionKey {
                 endpoint: BackendEndpoint {
@@ -20451,6 +20889,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: Some("default".into()),
                 console: true,
+                agent_session_id: None,
             }),
             room: Some(RoomContext {
                 current,
@@ -20530,6 +20969,14 @@ mod tests {
         assert!(matches!(
             key_action(&mut app, 'M'),
             Action::OpenCollaborationMailbox
+        ));
+        assert!(matches!(
+            alt_key_action(&mut app, 'm'),
+            Action::OpenAgentMove
+        ));
+        assert!(matches!(
+            alt_key_action(&mut app, 'M'),
+            Action::OpenAgentMove
         ));
         assert!(matches!(
             key_action(&mut app, 'b'),
@@ -21115,6 +21562,7 @@ mod tests {
             answered_at: None,
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         };
         app.ask_conversations = vec![
             conversation("newer", "Newer work"),
@@ -21270,6 +21718,7 @@ mod tests {
             answered_at: Some(OffsetDateTime::now_utc()),
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         };
         app.ask_entries = vec![mk("claude", "a"), mk("codex", "b"), mk("claude", "c")];
 
@@ -21305,6 +21754,7 @@ mod tests {
             answered_at: Some(now),
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         }];
         app.ask_panel.open = true;
         app
@@ -21472,6 +21922,7 @@ mod tests {
             answered_at: (status != muxa::ask::AskStatus::Running).then_some(now),
             cost_usd: None,
             error: None,
+            workspace_tools: false,
         };
         app.ask_entries = vec![
             entry("done", muxa::ask::AskStatus::Answered),
@@ -21545,6 +21996,7 @@ mod tests {
             pane: "%1".into(),
             socket: None,
             console: true,
+            agent_session_id: None,
         });
         let pane_idx = app
             .rows
@@ -21573,6 +22025,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         let session = app.topology.sessions[0].node_key();
         let window = app.topology.sessions[0].windows[0].node_key();
@@ -21608,6 +22061,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         app.collaboration.room = Some(RoomContext {
             current: first.clone(),
@@ -21655,6 +22109,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         app.collaboration.room = Some(RoomContext {
             current: peer.clone(),
@@ -21689,6 +22144,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         app.collaboration.room = Some(RoomContext {
             current: peer.clone(),
@@ -21729,6 +22185,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         app.collaboration.room = Some(RoomContext {
             current: replacement.clone(),
@@ -21758,6 +22215,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         app.collaboration.room = Some(RoomContext {
             current: peer.clone(),
@@ -21831,6 +22289,7 @@ mod tests {
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
+            agent_session_id: None,
         });
         app.collaboration.room = Some(RoomContext {
             current: first.clone(),
@@ -21865,6 +22324,7 @@ mod tests {
             pane: "%42".into(),
             socket: None,
             console: true,
+            agent_session_id: None,
         });
         let pane_idx = app
             .rows
@@ -22294,8 +22754,36 @@ mod tests {
     }
 
     #[test]
+    fn human_mailbox_defaults_to_operator_and_replies_without_agent_claim() {
+        let mut app = collaboration_watch_app();
+        assert_eq!(
+            app.collaboration_mailbox.tab,
+            CollaborationMailboxTab::Human
+        );
+        let room = app.collaboration.room.as_ref().unwrap();
+        let mut request = fake_watch_collaboration_request(
+            "human_question",
+            room.peers[0].clone(),
+            Participant::console(room.current.room.clone()),
+            RequestStatus::Queued,
+        );
+        request.expects_reply = true;
+        app.collaboration.human.push(request);
+        open_watch_collaboration_reply_composer(&mut app);
+        assert!(
+            matches!(app.collaboration_composer.as_ref().map(|c| &c.target), Some(CollaborationComposeTarget::Reply { origin, request_id, .. }) if origin.console && request_id == "human_question")
+        );
+        toggle_collaboration_mailbox(&mut app);
+        assert_eq!(
+            app.collaboration_mailbox.tab,
+            CollaborationMailboxTab::Incoming
+        );
+    }
+
+    #[test]
     fn watch_mailbox_opens_reply_for_claimed_incoming_request() {
         let mut app = collaboration_watch_app();
+        app.collaboration_mailbox.tab = CollaborationMailboxTab::Incoming;
         let room = app.collaboration.room.as_ref().unwrap();
         app.collaboration
             .incoming
@@ -22313,6 +22801,7 @@ mod tests {
                 pane: "%1".into(),
                 socket: None,
                 console: false,
+                agent_session_id: None,
             },
             label: "codex@%1".into(),
         });
@@ -22334,6 +22823,7 @@ mod tests {
     #[test]
     fn watch_mailbox_render_contains_request_and_peer() {
         let mut app = collaboration_watch_app();
+        app.collaboration_mailbox.tab = CollaborationMailboxTab::Incoming;
         let room = app.collaboration.room.as_ref().unwrap();
         let mut request = fake_watch_collaboration_request(
             "req_watch_render_123456",
@@ -24117,6 +24607,7 @@ sort = ["state"]
     fn pane_display_resolves_against_cached_panes() {
         let panes = vec![PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -26568,7 +27059,10 @@ sort = ["state"]
             // encounter here is treated as "no-op" for the existing
             // preview-suite assertions.
             Action::None
+            | Action::OpenAgentMove
+            | Action::SubmitAgentMove(_)
             | Action::Quit
+            | Action::TryDemo
             | Action::Refresh
             | Action::AttachPane(_)
             | Action::AttachTopologyPane(_)
@@ -27415,6 +27909,13 @@ sort = ["state"]
 
     fn collab_request(to_pane: &str) -> CollaborationRequest {
         CollaborationRequest {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
+            interruption: None,
+            human_action: None,
+            initiator: None,
+            updates: Vec::new(),
             id: "req_1".into(),
             from: collab_participant("%1", "callabo", "CAL-7330"),
             to: collab_participant(to_pane, "callabo", "CAL-7330"),
@@ -27422,6 +27923,7 @@ sort = ["state"]
             kind: RequestKind::Review,
             body: COLLAB_FIXTURE_BODY.into(),
             expects_reply: true,
+            notify: None,
             work_mode: WorkMode::ReadOnly,
             thread_id: None,
             parent_request_id: None,
@@ -28043,7 +28545,9 @@ sort = ["state"]
         assert!(body.contains("Alt-A          attention-only filter"));
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
-        assert!(body.contains("m / M / Space  message selected or marked / mailbox / mark agent"));
+        assert!(
+            body.contains("m / M / Alt-M  message / mailbox / move pane or window; Space marks")
+        );
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains(
             "a/A · Ctrl-E/n ask / conversations · new mode/draft · Enter read · d/D delete"
@@ -28202,57 +28706,6 @@ sort = ["state"]
             }
             other => panic!("expected Err, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn tmux_prompt_send_waits_before_submit_key() {
-        let mut calls: Vec<Vec<String>> = Vec::new();
-        let mut sleeps = Vec::new();
-
-        let result = send_prompt_to_tmux(
-            "%42",
-            "hello",
-            Duration::from_millis(120),
-            |args| {
-                calls.push(args.iter().map(|arg| (*arg).to_string()).collect());
-                Ok(())
-            },
-            |delay| sleeps.push(delay),
-        );
-
-        assert!(result.is_ok());
-        assert_eq!(
-            calls,
-            vec![
-                vec!["send-keys", "-t", "%42", "-l", "--", "hello"],
-                vec!["send-keys", "-t", "%42", "Enter"],
-            ]
-        );
-        assert_eq!(sleeps, vec![Duration::from_millis(120)]);
-    }
-
-    #[test]
-    fn tmux_prompt_send_skips_submit_when_literal_input_fails() {
-        let mut calls: Vec<Vec<String>> = Vec::new();
-        let mut sleeps = Vec::new();
-
-        let result = send_prompt_to_tmux(
-            "%42",
-            "hello",
-            Duration::from_millis(120),
-            |args| {
-                calls.push(args.iter().map(|arg| (*arg).to_string()).collect());
-                Err("tmux exited with 1".into())
-            },
-            |delay| sleeps.push(delay),
-        );
-
-        assert_eq!(result.unwrap_err(), "tmux exited with 1");
-        assert_eq!(
-            calls,
-            vec![vec!["send-keys", "-t", "%42", "-l", "--", "hello"]]
-        );
-        assert!(sleeps.is_empty());
     }
 
     #[test]
@@ -29024,6 +29477,7 @@ sort = ["state"]
         let backend = TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = snapshot_app();
+        app.demo_available = false;
         terminal.draw(|f| render(f, &mut app)).unwrap();
         insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));
     }

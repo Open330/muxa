@@ -1,7 +1,12 @@
 # Architecture
 
-`muxa` is intentionally small: one daemon, one CLI, local files, and no
-database.
+`muxa` is intentionally small: one daemon, one CLI, local files, and an
+embedded SQLite collaboration store. No external database service is required.
+
+For the proposed execution-runtime improvements and their staged rollout, see
+[Agent runtime review and integrated plan (한국어)](AGENT_RUNTIME_PLAN.ko.md).
+That document tracks rollout progress; unfinished items are proposals rather
+than the current runtime contract.
 
 ## Work domain and execution bindings
 
@@ -62,6 +67,12 @@ the client re-reads the normal scoped API after coalescing. muxa-owned PTYs use
 `read_session_wait`, which sleeps on an output/exit condition variable with a
 bounded deadline. Control writes and resize requests use a separate client IPC
 lane, so a waiting terminal read cannot head-of-line block input.
+
+The daemon supervises the pipeline reconciliation CLI worker with a 60-second
+deadline and a 64 KiB combined output limit. Shutdown cancels an in-flight
+worker, and failed passes wait at least five seconds before retrying. This
+stops the CLI worker, not agents already launched into tmux; the durable
+pipeline store and pane adoption retain the recovery path.
 
 ## Components
 

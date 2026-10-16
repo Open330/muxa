@@ -2,7 +2,7 @@
 
 `muxa timeline`은 agent session이 work, waiting, error, human interaction,
 tmux foreground 사이를 어떻게 오갔는지 보여주는 시각화입니다. `muxa stats`,
-`muxa report`와 같은 duration 데이터를 사용합니다.
+`muxa stats report`와 같은 duration 데이터를 사용합니다.
 
 ## 빠른 시작
 

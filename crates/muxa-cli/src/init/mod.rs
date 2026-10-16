@@ -82,6 +82,15 @@ fn parse_preset(s: &str) -> Result<Preset, String> {
 }
 
 pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
+    run_for_start(args, socket, config_path).await.map(|_| ())
+}
+
+/// Whether setup completed (including an already configured installation).
+pub(crate) async fn run_for_start(
+    args: Args,
+    socket: PathBuf,
+    config_path: Option<PathBuf>,
+) -> Result<bool> {
     let mode = Mode::detect(args.yes);
     ui::intro(mode);
 
@@ -91,7 +100,7 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
         && args.component.iter().all(|component| {
             matches!(
                 component.as_str(),
-                "ask" | "agent-instructions" | "agent-skills" | "agent-mcp"
+                "ask" | "automation" | "agent-instructions" | "agent-skills" | "agent-mcp"
             )
         });
     if !preflight_ok(mode, &detect, args.uninstall, config_only) {
@@ -101,7 +110,7 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
     let chosen = pick(args.uninstall, &args, &detect, mode)?;
     if chosen.is_empty() {
         ui::outro(mode, "Nothing to do.");
-        return Ok(());
+        return Ok(false);
     }
 
     let direction = if args.uninstall {
@@ -111,6 +120,7 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
     };
     let mut plan = plan::build(direction, &chosen, &detect, &socket)?;
     integration::extend_plan(&mut plan, &detect, config_path.as_deref(), &socket)?;
+    plan::extend_automation(&mut plan, config_path.as_deref())?;
     if matches!(direction, Direction::Install) && args.start_daemon && !manages_daemon(&chosen) {
         // Append last so disk edits + service enablement happen first;
         // by the time we try to start muxad the file/socket layout it
@@ -140,7 +150,7 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
 
     if args.dry_run {
         ui::outro(mode, "Dry run — no changes written.");
-        return Ok(());
+        return Ok(false);
     }
 
     if !plan.has_changes() {
@@ -152,12 +162,12 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
                 "No managed changes to apply; see the warnings above."
             },
         );
-        return Ok(());
+        return Ok(true);
     }
 
     if !ui::confirm_apply(mode, plan.actions.len())? {
         ui::outro(mode, "Cancelled.");
-        return Ok(());
+        return Ok(false);
     }
 
     let report = apply::run(&plan, false).context("applying plan")?;
@@ -200,10 +210,10 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
     let outro_msg = if args.uninstall {
         "Uninstalled."
     } else {
-        "Done. Run `muxa onboard`, then try `prefix+s` for local watch or `prefix+S` for Fleet."
+        "Done. Run `muxa` to open your agents, or `muxa onboard --quick` to try the short demo."
     };
     ui::outro(mode, outro_msg);
-    Ok(())
+    Ok(true)
 }
 
 /// Render pre-flight, surface warnings, and signal whether we should
@@ -219,6 +229,11 @@ fn preflight_ok(
     } else {
         detect.blockers()
     };
+    // A release installation is already built; wiring it never invokes cargo.
+    let blockers: Vec<_> = blockers
+        .into_iter()
+        .filter(|blocker| !(blocker.contains("`cargo`") && which::which("muxad").is_ok()))
+        .collect();
     if !blockers.is_empty() && !uninstall {
         for b in &blockers {
             ui::error_line(mode, b);

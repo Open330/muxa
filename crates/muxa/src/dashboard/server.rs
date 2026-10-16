@@ -7,6 +7,12 @@
 //! sent in `Authorization`, never cookies, so cross-site forms cannot trigger
 //! a control action and browser clients can treat the token like a PAT.
 //!
+//! The one cookie that authorizes operator APIs is the optional OIDC operator
+//! session (`[dashboard.login]`, see [`super::operator`]). Because a browser
+//! attaches it ambiently, a cookie-authorized request that changes state must
+//! also carry `Origin: <public_url>` and `X-Muxa-Operator: 1`; reads and SSE
+//! need no extra proof. Bearer-authorized requests are unaffected.
+//!
 //! [`serve`] composes the router with the lifecycle plumbing the daemon
 //! needs: TCP bind, graceful shutdown wired to the daemon's existing
 //! shutdown channel, structured logging on bind failure.
@@ -14,7 +20,7 @@
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{header, HeaderMap, Request, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
@@ -46,7 +52,7 @@ use crate::collaboration::{
 };
 use crate::config::{DashboardAuthMode, StatsConfig};
 use crate::dashboard::work_store::WorkStore;
-use crate::dashboard::{assets, auth, DashboardConfig};
+use crate::dashboard::{assets, DashboardConfig};
 use crate::event::{AgentKind, AgentState, PROTOCOL_VERSION};
 use crate::fleet::{FleetOperation, FleetRuntime, LabelSelector};
 use crate::metrics::Metrics;
@@ -114,6 +120,10 @@ pub struct AppState {
     pub config: Arc<DashboardConfig>,
     pub pane_cache: Arc<PaneCache>,
     pub sessions: SharedSessionBackend,
+    pub(super) sharing: Arc<super::sharing::Sharing>,
+    /// OIDC operator sessions. Separate from `sharing` so a recipient
+    /// session can never be mistaken for operator access.
+    pub(super) operator: Arc<super::operator::OperatorLogin>,
     /// Primary pane backend retained for compatibility with callers that
     /// inspect it directly. Pane scans use `backends` below so every active
     /// host contributes to one dashboard inventory.
@@ -154,6 +164,8 @@ pub struct AppState {
     /// templates the CLI and `muxa_call_peer` expand. One composer, three
     /// front doors.
     message_skills: Arc<BTreeMap<String, String>>,
+    /// Shared capture loops behind `/api/panes/{pane}/output/stream`.
+    pane_streams: Arc<super::pane_stream::PaneStreamHub>,
 }
 
 #[derive(Clone, Default)]
@@ -181,6 +193,8 @@ impl AppState {
         Self {
             store,
             collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
+            sharing: super::sharing::Sharing::new(config.sharing.clone()),
+            operator: super::operator::OperatorLogin::new(config.login.clone()),
             config,
             pane_cache,
             sessions,
@@ -200,7 +214,21 @@ impl AppState {
                 TimelineSummaryCache::default(),
             )),
             message_skills: Arc::new(BTreeMap::new()),
+            pane_streams: Arc::new(super::pane_stream::PaneStreamHub::new(
+                super::pane_stream::PaneStreamLimits::default(),
+            )),
         }
+    }
+
+    /// Replace the live-output limits (tests shorten the capture interval).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_pane_stream_limits(
+        mut self,
+        limits: super::pane_stream::PaneStreamLimits,
+    ) -> Self {
+        self.pane_streams = Arc::new(super::pane_stream::PaneStreamHub::new(limits));
+        self
     }
 
     #[must_use]
@@ -369,6 +397,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents", get(agents_handler))
         .route("/api/fleet", get(fleet_handler))
         .route("/api/panes", get(panes_handler))
+        .route("/api/windows/{window}/layout", get(window_layout_handler))
         .route("/api/works", get(works_handler))
         .route("/api/work-metadata", get(work_metadata_handler))
         .route("/api/terminal-sessions", get(terminal_sessions_handler))
@@ -385,7 +414,8 @@ pub fn router(state: AppState) -> Router {
     } else {
         read_api
     };
-    let write_api = Router::new()
+    let write_api = super::sharing::admin_routes()
+        .merge(super::operator::admin_routes())
         .route("/api/panes/{pane}/prompt", post(pane_prompt_handler))
         .route("/api/fleet/{host}/command", post(fleet_command_handler))
         .route("/api/panes/{pane}/abort", post(pane_abort_handler))
@@ -403,7 +433,27 @@ pub fn router(state: AppState) -> Router {
         )
         .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES))
         .layer(write_auth_layer);
-    let api = read_api.merge(write_api).with_state(state.clone());
+    // Operator-only reads. Pane output can hold secrets the redacted read
+    // views never expose, so it sits behind the control gate even though it
+    // is a GET: a viewer session gets 403, and in `public_read` an anonymous
+    // visitor needs the token (401). Being a GET it needs no CSRF proof.
+    let operator_read_api = Router::new()
+        .route("/api/panes/{pane}/output", get(pane_output_handler))
+        .route(
+            "/api/panes/{pane}/output/stream",
+            get(pane_output_stream_handler),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            write_auth_middleware,
+        ))
+        .layer(middleware::map_response(no_store));
+    let api = read_api
+        .merge(write_api)
+        .merge(operator_read_api)
+        .merge(super::sharing::recipient_routes(state.clone()))
+        .merge(super::operator::routes())
+        .with_state(state.clone());
     // Static assets sit OUTSIDE the auth layer — see assets.rs for the
     // rationale (token bootstrap in the browser). The DNS-rebinding host
     // guard, by contrast, wraps *everything* (API + assets). The
@@ -428,7 +478,7 @@ fn make_request_span<B>(req: &Request<B>) -> tracing::Span {
     )
 }
 
-/// Render `uri` as `path[?query]` with any `token` query-parameter value
+/// Render `uri` with operator tokens and OIDC code/state query values
 /// replaced by `REDACTED`. Other parameters are preserved verbatim.
 fn scrub_token_from_uri(uri: &axum::http::Uri) -> String {
     let path = uri.path();
@@ -438,7 +488,15 @@ fn scrub_token_from_uri(uri: &axum::http::Uri) -> String {
             let scrubbed = query
                 .split('&')
                 .map(|pair| match pair.split_once('=') {
-                    Some((k, _)) if k.eq_ignore_ascii_case("token") => format!("{k}=REDACTED"),
+                    Some((k, _))
+                        if ["token", "code", "state"].iter().any(|sensitive| {
+                            url::form_urlencoded::parse(pair.as_bytes())
+                                .next()
+                                .is_some_and(|(key, _)| key.eq_ignore_ascii_case(sensitive))
+                        }) =>
+                    {
+                        format!("{k}=REDACTED")
+                    }
                     _ => pair.to_string(),
                 })
                 .collect::<Vec<_>>()
@@ -465,7 +523,9 @@ pub async fn serve(
             ..CollaborationOptions::default()
         })
     });
-    let state = AppState::new(store, config.clone(), pane_cache, sessions)
+    let sharing = super::sharing::Sharing::open(config.sharing.clone()).await?;
+    let operator = super::operator::OperatorLogin::open(config.login.clone(), None).await?;
+    let mut state = AppState::new(store, config.clone(), pane_cache, sessions)
         .with_collaboration(collaboration)
         .with_backends(backends)
         .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
@@ -473,6 +533,8 @@ pub async fn serve(
         .with_stats_config(runtime.stats_config)
         .with_message_skills(runtime.message_skills)
         .with_fleet(runtime.fleet);
+    state.sharing = sharing;
+    state.operator = operator;
     let app = router(state);
     let listener = TcpListener::bind(config.bind).await?;
     let local = listener.local_addr()?;
@@ -509,11 +571,26 @@ async fn host_guard_middleware(
             .headers()
             .get(header::HOST)
             .and_then(|h| h.to_str().ok());
-        if !host_is_loopback(host, state.config.bind.ip()) {
+        if !host_is_loopback(host, state.config.bind.ip())
+            && !host.is_some_and(|host| public_host(&state.config, host))
+        {
             return Err(StatusCode::FORBIDDEN);
         }
     }
     Ok(next.run(req).await)
+}
+
+/// Does `host` name a configured public origin? A reverse proxy or tunnel
+/// that forwards the browser's `Host` reaches a loopback bind with it.
+fn public_host(config: &DashboardConfig, host: &str) -> bool {
+    config
+        .sharing
+        .as_ref()
+        .is_some_and(|sharing| sharing.matches_host(host))
+        || config
+            .login
+            .as_ref()
+            .is_some_and(|login| login.matches_host(host))
 }
 
 /// Is `host` (a raw `Host` header value, optionally `host:port` or
@@ -576,6 +653,30 @@ fn log_access_url(config: &DashboardConfig, local: SocketAddr) {
     }
 }
 
+/// Authenticate an operator request: the bearer token, or else an OIDC
+/// operator session. Every operator gate goes through this one function so
+/// reads, writes, `/api/access` and detail redaction cannot disagree.
+fn operator_auth(state: &AppState, headers: &HeaderMap) -> Option<super::operator::OperatorAuth> {
+    super::operator::authenticate(state.config.token.as_deref(), &state.operator, headers)
+}
+
+/// Is this request authorized to act as the operator? Session-authorized
+/// state changes additionally need the CSRF proof described at the top of
+/// this module.
+fn operator_authorized(state: &AppState, req: &Request<Body>) -> Result<(), StatusCode> {
+    match operator_auth(state, req.headers()) {
+        Some(super::operator::OperatorAuth::Bearer) => Ok(()),
+        Some(super::operator::OperatorAuth::Session) => {
+            if state.operator.csrf_ok(req.method(), req.headers()) {
+                Ok(())
+            } else {
+                Err(StatusCode::FORBIDDEN)
+            }
+        }
+        None => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
 /// Read authentication for `auth = "token"`. Public-read and none modes do
 /// not install this layer on their GET/SSE router.
 async fn read_auth_middleware(
@@ -583,18 +684,16 @@ async fn read_auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let Some(expected) = state.config.token.as_deref() else {
+    if state.config.token.is_none() {
         return Ok(next.run(req).await);
-    };
-    let header_value = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
-    if auth::check_bearer(header_value, expected) {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
     }
+    match operator_authorized(&state, &req) {
+        // A signed-in viewer reads what a `public_read` visitor would; the
+        // handlers redact details for anyone who is not an operator.
+        Err(StatusCode::UNAUTHORIZED) if state.operator.viewer(req.headers()) => {}
+        result => result?,
+    }
+    Ok(next.run(req).await)
 }
 
 /// Control authentication. This layer always wraps mutation routes. A
@@ -605,18 +704,17 @@ async fn write_auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let Some(expected) = state.config.token.as_deref() else {
+    if state.config.token.is_none() {
         return Err(StatusCode::FORBIDDEN);
-    };
-    let header_value = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
-    if auth::check_bearer(header_value, expected) {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
     }
+    match operator_authorized(&state, &req) {
+        // Signed in, but only as a viewer: authenticated, not allowed.
+        Err(StatusCode::UNAUTHORIZED) if state.operator.viewer(req.headers()) => {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        result => result?,
+    }
+    Ok(next.run(req).await)
 }
 
 #[derive(Debug, Serialize)]
@@ -633,22 +731,59 @@ struct AccessResponse {
     write_available: bool,
     write_authorized: bool,
     capabilities: AccessCapabilities,
+    login: LoginStatus,
+}
+
+/// Operator sign-in state, also served unauthenticated at `/auth/session` so
+/// a signed-out browser can offer "Sign in" instead of a token prompt.
+#[derive(Debug, Serialize)]
+pub(super) struct LoginStatus {
+    available: bool,
+    signed_in: bool,
+    email: Option<String>,
+    /// What this request may do: `none`, `viewer` or `operator` (the
+    /// bearer token counts as `operator`).
+    role: super::operator::Role,
+    /// Why the signed-in account has its role: `group`, `enrollment`,
+    /// `viewer_group` or `viewer_rule`.
+    via: Option<super::operator::Via>,
+    /// Whether a token holder may enroll accounts outside `required_group`.
+    enrollment: bool,
+    /// Absolute, so a browser on another origin (e.g. `localhost`) starts
+    /// the flow on the public origin its callback and cookie belong to.
+    login_url: Option<String>,
+}
+
+pub(super) fn login_status(state: &AppState, headers: &HeaderMap) -> LoginStatus {
+    let config = state.operator.config();
+    let (signed_in, email, via) = state
+        .operator
+        .signed_in(headers)
+        .map_or((false, None, None), |(email, via)| (true, email, Some(via)));
+    let role = if operator_auth(state, headers).is_some() {
+        super::operator::Role::Operator
+    } else {
+        via.map_or(super::operator::Role::None, super::operator::Via::role)
+    };
+    LoginStatus {
+        available: config.is_some(),
+        signed_in,
+        role,
+        email,
+        via,
+        enrollment: config.is_some_and(super::operator::LoginConfig::enrollment_enabled),
+        login_url: config.map(|config| format!("{}/auth/login", config.origin())),
+    }
 }
 
 #[derive(Debug, Serialize)]
 struct AccessCapabilities {
     work_start: bool,
+    pane_sharing: bool,
 }
 
 async fn access_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let header_value = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
-    let write_authorized = state
-        .config
-        .token
-        .as_deref()
-        .is_some_and(|expected| auth::check_bearer(header_value, expected));
+    let write_authorized = operator_auth(&state, &headers).is_some();
     let mode = match state.config.auth {
         DashboardAuthMode::Token => "token",
         DashboardAuthMode::PublicRead => "public_read",
@@ -661,7 +796,9 @@ async fn access_handler(State(state): State<AppState>, headers: HeaderMap) -> im
         write_authorized,
         capabilities: AccessCapabilities {
             work_start: state.config.allow_work_start,
+            pane_sharing: state.config.sharing.is_some(),
         },
+        login: login_status(&state, &headers),
     })
 }
 
@@ -683,6 +820,9 @@ const COLLABORATION_CURSOR_ID_MAX_BYTES: usize = 128;
 /// its typed contract.
 #[derive(Debug, Default, Deserialize)]
 struct CollaborationHttpQuery {
+    until: Option<String>,
+    id: Option<String>,
+    q: Option<String>,
     /// Same grammar as the CLI timeline (`24h`, `7d`, RFC3339, `all`, ...).
     since: Option<String>,
     #[serde(alias = "work_id")]
@@ -697,6 +837,8 @@ struct CollaborationHttpQuery {
     status: Option<String>,
     /// URL-encoded JSON `RoomId`, e.g. `{"host":"tmux","window_id":"@1"}`.
     room: Option<String>,
+    session: Option<String>,
+    socket: Option<String>,
     limit: Option<String>,
     /// Opaque keyset token returned as `pagination.next_cursor`.
     cursor: Option<String>,
@@ -715,7 +857,7 @@ struct CollaborationPagination {
 struct CollaborationHttpResponse {
     #[serde(with = "time::serde::rfc3339")]
     generated_at: OffsetDateTime,
-    /// False outside authenticated `auth = "token"` mode. Topology and status
+    /// False without operator authentication. Topology and status
     /// remain useful for the graph, but message bodies and attached details
     /// are omitted.
     details_included: bool,
@@ -728,7 +870,7 @@ async fn collaboration_handler(
     headers: HeaderMap,
     Query(http): Query<CollaborationHttpQuery>,
 ) -> Response {
-    let (query, limit) = match collaboration_query_from_http(http) {
+    let (mut query, limit) = match collaboration_query_from_http(http) {
         Ok(query) => query,
         Err(error) => {
             return (
@@ -738,6 +880,7 @@ async fn collaboration_handler(
                 .into_response();
         }
     };
+    query.search_bodies = dashboard_details_authorized(&state, &headers);
     // All-scope reads are explicitly operator-only in CollaborationStore.
     // The dashboard is the operator surface; the room value is immaterial at
     // this scope but keeps the authority marker a normal console participant.
@@ -785,7 +928,7 @@ async fn collaboration_handler(
             value
         })
         .collect();
-    Json(CollaborationHttpResponse {
+    let mut response = Json(CollaborationHttpResponse {
         generated_at: OffsetDateTime::now_utc(),
         details_included,
         requests,
@@ -796,7 +939,16 @@ async fn collaboration_handler(
             next_cursor: page.next_cursor.as_ref().map(encode_collaboration_cursor),
         },
     })
-    .into_response()
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::VARY,
+        HeaderValue::from_static("Authorization, Cookie"),
+    );
+    response
 }
 
 fn collaboration_query_from_http(
@@ -809,6 +961,17 @@ fn collaboration_query_from_http(
         .map(|raw| timeline::parse_since(raw, now, "all collaboration history"))
         .transpose()?
         .and_then(|range| range.since_at);
+    let until = http
+        .until
+        .as_deref()
+        .map(|raw| {
+            OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| "until must be an RFC3339 timestamp".to_string())
+        })
+        .transpose()?;
+    if since.zip(until).is_some_and(|(start, end)| start > end) {
+        return Err("since must not be later than until".to_string());
+    }
     let limit = http
         .limit
         .as_deref()
@@ -827,6 +990,10 @@ fn collaboration_query_from_http(
         .map_err(|error| format!("invalid room; expected a JSON RoomId: {error}"))?;
     Ok((
         CollaborationQuery {
+            until,
+            request_id: non_empty_collaboration_filter("id", http.id)?,
+            search: non_empty_collaboration_filter("q", http.q)?,
+            search_bodies: false,
             since,
             work_id: non_empty_collaboration_filter("work", http.work)?,
             workspace_id: non_empty_collaboration_filter("workspace", http.workspace)?,
@@ -840,7 +1007,8 @@ fn collaboration_query_from_http(
                 .transpose()?,
             room,
             tmux_session_id: None,
-            tmux_session_name: None,
+            tmux_session_name: non_empty_collaboration_filter("session", http.session)?,
+            tmux_socket: non_empty_collaboration_filter("socket", http.socket)?,
             limit: Some(limit),
             cursor: http
                 .cursor
@@ -929,16 +1097,10 @@ fn parse_collaboration_cursor(raw: &str) -> Result<CollaborationCursor, String> 
 }
 
 fn dashboard_details_authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    if !matches!(state.config.auth, DashboardAuthMode::Token) {
-        return false;
-    }
-    let Some(expected) = state.config.token.as_deref() else {
-        return false;
-    };
-    let header_value = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    auth::check_bearer(header_value, expected)
+    matches!(
+        state.config.auth,
+        DashboardAuthMode::Token | DashboardAuthMode::PublicRead
+    ) && operator_auth(state, headers).is_some()
 }
 
 fn redact_collaboration_details(request: &mut serde_json::Value) {
@@ -955,6 +1117,23 @@ fn redact_collaboration_details(request: &mut serde_json::Value) {
     ] {
         request.remove(field);
     }
+    if let Some(updates) = request
+        .get_mut("updates")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for update in updates {
+            if let Some(update) = update.as_object_mut() {
+                update.remove("body");
+            }
+        }
+    }
+    if let Some(info) = request
+        .get_mut("interruption")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        info.remove("decision");
+    }
+    // Progress bodies are also private message content.
     if let Some(reply) = request
         .get_mut("reply")
         .and_then(serde_json::Value::as_object_mut)
@@ -1040,7 +1219,13 @@ struct PanesResponse {
 async fn panes_handler(State(state): State<AppState>) -> impl IntoResponse {
     let result = state.refresh_pane_scan().await;
     Json(PanesResponse {
-        panes: result.panes,
+        panes: crate::tmux::canonical_panes(&result.panes)
+            .into_iter()
+            .map(|mut pane| {
+                pane.session = crate::tmux::base_session_name(&pane.session).to_string();
+                pane
+            })
+            .collect(),
         errors: result.errors,
         fetched_at: result.fetched_at,
     })
@@ -1050,7 +1235,8 @@ async fn works_handler(State(state): State<AppState>) -> Json<WorkSnapshot> {
     let scan = state.refresh_pane_scan().await;
     let agents = state.store.snapshot().await;
     let mut work_store = state.work_store.lock().await;
-    for pane in &scan.panes {
+    // Once per pane, not once per `~view~` listing of it: each upsert writes.
+    for pane in &crate::tmux::canonical_panes(&scan.panes) {
         if let Some((identity, item)) = work::external_item_for_pane(pane, scan.fetched_at) {
             if let Err(error) = work_store.upsert_external_item(identity, item).await {
                 tracing::warn!(%error, "failed to persist discovered external work item");
@@ -1356,8 +1542,10 @@ async fn run_work_control(
             .find(|record| &record.identity == identity)
             .and_then(|record| record.legacy_binding.clone())
     });
-    let candidates = scan
-        .panes
+    // A grouped session lists each pane once per `~view~` member; typing
+    // into every listing would submit the prompt (or Ctrl-C) more than once.
+    let panes = crate::tmux::canonical_panes(&scan.panes);
+    let candidates = panes
         .iter()
         .filter(|pane| {
             identity.as_ref().is_some_and(|identity| {
@@ -1369,7 +1557,7 @@ async fn run_work_control(
                 .as_ref()
                 .is_some_and(|key| pane_matches_execution(pane, key))
         })
-        .filter(|pane| pane.muxa.managed_agent || pane_has_live_agent(pane, &scan.panes, &agents))
+        .filter(|pane| pane.muxa.managed_agent || pane_has_live_agent(pane, &panes, &agents))
         .filter_map(|pane| {
             let backend = state
                 .backends
@@ -1391,9 +1579,9 @@ async fn run_work_control(
         candidates
             .into_iter()
             .map(|(backend, socket, pane)| {
-                let sent = backend.send_text_on(Some(&socket), &pane, &text);
+                let sent = backend.send_prompt_text_on(Some(&socket), &pane, &text);
                 let submitted = if sent && submit {
-                    std::thread::sleep(crate::backend::PROMPT_SUBMIT_GRACE);
+                    std::thread::sleep(crate::backend::prompt_submit_grace(&pane));
                     backend.send_text_on(Some(&socket), &pane, "\r")
                 } else {
                     false
@@ -1672,9 +1860,9 @@ async fn pane_prompt_handler(
     let pane_for_send = pane.clone();
     let (sent, submitted) = tokio::task::spawn_blocking(move || {
         let socket = socket.as_deref();
-        let sent = backend.send_text_on(socket, &pane_for_send, &text);
+        let sent = backend.send_prompt_text_on(socket, &pane_for_send, &text);
         let submitted = if sent && submit {
-            std::thread::sleep(crate::backend::PROMPT_SUBMIT_GRACE);
+            std::thread::sleep(crate::backend::prompt_submit_grace(&pane_for_send));
             backend.send_text_on(socket, &pane_for_send, "\r")
         } else {
             false
@@ -1731,6 +1919,370 @@ async fn pane_abort_handler(
         );
     }
     Json(json!({ "ok": true, "pane": pane, "aborted": true })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct WindowLayoutQuery {
+    socket: Option<String>,
+}
+
+/// A tmux window id taken from a URL: `@` followed by digits.
+fn valid_window_id(window: &str) -> bool {
+    window.strip_prefix('@').is_some_and(|digits| {
+        !digits.is_empty() && digits.len() <= 12 && digits.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+/// Pick the tmux server a window lives on from the scanned inventory. A
+/// socket the request names is only ever matched against scanned sockets, so
+/// this read route never points tmux at a caller-chosen path.
+fn resolve_window_socket(
+    panes: &[PaneSummary],
+    window: &str,
+    requested: Option<&str>,
+) -> Result<String, (StatusCode, &'static str)> {
+    let mut sockets = panes
+        .iter()
+        .filter(|pane| pane.host == HostKind::Tmux && pane.window_id == window)
+        .map(|pane| pane.socket.to_string_lossy().into_owned())
+        .filter(|socket| {
+            requested.is_none_or(|requested| {
+                socket == requested
+                    || crate::tmux::socket_short_name(socket)
+                        == crate::tmux::socket_short_name(requested)
+            })
+        })
+        .collect::<Vec<_>>();
+    sockets.sort();
+    sockets.dedup();
+    match sockets.as_slice() {
+        [] => Err((StatusCode::NOT_FOUND, "window not found")),
+        [socket] => Ok(socket.clone()),
+        _ => Err((
+            StatusCode::CONFLICT,
+            "window exists on multiple tmux sockets; specify socket",
+        )),
+    }
+}
+
+/// Pane geometry for one tmux window, so the dashboard can lay its panes out
+/// the way tmux does. Metadata only (no output), hence a normal read route.
+async fn window_layout_handler(
+    State(state): State<AppState>,
+    Path(window): Path<String>,
+    Query(query): Query<WindowLayoutQuery>,
+) -> Response {
+    if !valid_window_id(&window) {
+        return control_error(StatusCode::BAD_REQUEST, "invalid window id");
+    }
+    let requested = query.socket.as_deref().filter(|s| !s.is_empty());
+    if requested.is_some_and(|socket| !valid_pane_socket(socket)) {
+        return control_error(StatusCode::BAD_REQUEST, "invalid socket");
+    }
+    let scan = state.refresh_pane_scan().await;
+    let socket = match resolve_window_socket(&scan.panes, &window, requested) {
+        Ok(socket) => socket,
+        Err((status, message)) => return control_error(status, message),
+    };
+    let target = window.clone();
+    let socket_for_query = socket.clone();
+    let (panes, zoomed) = tokio::task::spawn_blocking(move || {
+        crate::tmux::layout::window_panes_on(Some(&socket_for_query), &target)
+    })
+    .await
+    .unwrap_or_default();
+    let panes = panes
+        .into_iter()
+        .map(|pane| {
+            json!({
+                "pane_id": pane.pane_id,
+                "pane_index": pane.pane_index,
+                "left": pane.left,
+                "top": pane.top,
+                "width": pane.width,
+                "height": pane.height,
+                "active": pane.active,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({
+        "window": window,
+        "socket": socket,
+        "zoomed": zoomed,
+        "panes": panes,
+    }))
+    .into_response()
+}
+
+/// Default and maximum number of lines `/api/panes/{pane}/output` returns.
+const PANE_OUTPUT_DEFAULT_LINES: usize = 200;
+const PANE_OUTPUT_MAX_LINES: usize = 1000;
+/// Byte bound on the returned text; the newest output is kept.
+const PANE_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+const PANE_ID_MAX_LEN: usize = 128;
+const PANE_SOCKET_MAX_LEN: usize = 1024;
+
+#[derive(Debug, Deserialize)]
+struct PaneOutputQuery {
+    socket: Option<String>,
+    lines: Option<usize>,
+}
+
+async fn no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// Shape check for a pane id taken from a URL: a tmux `%N`, or a known
+/// host-prefixed id (`rmux:…`, `herdr:…`, …). Anything else never reaches a
+/// backend command line.
+fn valid_pane_id(pane: &str) -> bool {
+    if pane.is_empty()
+        || pane.len() > PANE_ID_MAX_LEN
+        || !pane.chars().all(|c| c.is_ascii_graphic())
+    {
+        return false;
+    }
+    if let Some(digits) = pane.strip_prefix('%') {
+        return !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+    }
+    crate::backend::pane_id_host_kind(pane).is_some()
+        && pane
+            .split_once(':')
+            .is_some_and(|(_, rest)| !rest.is_empty())
+}
+
+fn valid_pane_socket(socket: &str) -> bool {
+    !socket.trim().is_empty()
+        && socket.len() <= PANE_SOCKET_MAX_LEN
+        && !socket.chars().any(char::is_control)
+}
+
+/// Turn a raw capture into what the drawer shows: escapes and control bytes
+/// stripped (the same sanitizer the share view and fleet captures use), the
+/// screen's trailing blank rows dropped, the newest `lines` lines, and at
+/// most [`PANE_OUTPUT_MAX_BYTES`] bytes cut on a character boundary.
+fn pane_output_text(raw: &str, lines: usize) -> String {
+    pane_output_tail(&super::pane_stream::clean_capture(raw), lines)
+}
+
+/// The newest `lines` lines of already-sanitized output, byte-bounded.
+fn pane_output_tail(clean: &str, lines: usize) -> String {
+    let rows = clean.trim_end().lines().collect::<Vec<_>>();
+    let start = rows.len().saturating_sub(lines);
+    let mut text = rows[start..].join("\n");
+    if text.len() > PANE_OUTPUT_MAX_BYTES {
+        let mut cut = text.len() - PANE_OUTPUT_MAX_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        text.drain(..cut);
+    }
+    text
+}
+
+/// A validated capture request: which backend, which socket, how deep.
+struct PaneCaptureTarget {
+    backend: SharedBackend,
+    socket: Option<String>,
+    lines: usize,
+}
+
+/// Shared validation for the output and output-stream routes. The pane id
+/// and socket are shape-checked before any backend sees them, and the
+/// socket is resolved against the scanned inventory. The error response is
+/// boxed because `Response` is large enough to trip `result_large_err`.
+async fn resolve_pane_capture(
+    state: &AppState,
+    pane: &str,
+    query: &PaneOutputQuery,
+) -> Result<PaneCaptureTarget, Box<Response>> {
+    if !valid_pane_id(pane) {
+        return Err(Box::new(control_error(
+            StatusCode::BAD_REQUEST,
+            "invalid pane id",
+        )));
+    }
+    let requested_socket = query.socket.as_deref().filter(|s| !s.is_empty());
+    if requested_socket.is_some_and(|socket| !valid_pane_socket(socket)) {
+        return Err(Box::new(control_error(
+            StatusCode::BAD_REQUEST,
+            "invalid socket",
+        )));
+    }
+    let lines = query
+        .lines
+        .unwrap_or(PANE_OUTPUT_DEFAULT_LINES)
+        .clamp(1, PANE_OUTPUT_MAX_LINES);
+    let backend = match control_backend(state, pane) {
+        Ok(backend) if backend.caps().capture_pane => backend,
+        Ok(backend) => {
+            return Err(Box::new(control_error(
+                StatusCode::NOT_IMPLEMENTED,
+                format!("{} backend does not support pane capture", backend.kind()),
+            )));
+        }
+        Err(failure) => return Err(Box::new(failure.into_response())),
+    };
+    let socket = control_socket(state, &backend, pane, requested_socket)
+        .await
+        .map_err(|failure| Box::new(failure.into_response()))?;
+    Ok(PaneCaptureTarget {
+        backend,
+        socket,
+        lines,
+    })
+}
+
+async fn pane_output_handler(
+    State(state): State<AppState>,
+    Path(pane): Path<String>,
+    Query(query): Query<PaneOutputQuery>,
+) -> Response {
+    let PaneCaptureTarget {
+        backend,
+        socket,
+        lines,
+    } = match resolve_pane_capture(&state, &pane, &query).await {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let pane_for_capture = pane.clone();
+    let captured = tokio::task::spawn_blocking(move || {
+        backend.capture_pane_history_on(socket.as_deref(), &pane_for_capture, lines)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(raw) = captured else {
+        return control_error(
+            StatusCode::BAD_GATEWAY,
+            "pane output unavailable: pane gone or backend unreachable",
+        );
+    };
+    Json(json!({
+        "pane": pane,
+        "text": pane_output_text(&raw, lines),
+        "captured_at": super::pane_stream::now_rfc3339(),
+    }))
+    .into_response()
+}
+
+/// Live pane output over SSE, for the drawer and window tiles. Same gate
+/// and validation as [`pane_output_handler`]. The first `output` event is
+/// the current snapshot; later ones are sent only when the text changed,
+/// each carrying the full (bounded) text. `gone` means the pane closed and
+/// is the last event. The stream ends after the configured lifetime and the
+/// client reconnects.
+async fn pane_output_stream_handler(
+    State(state): State<AppState>,
+    Path(pane): Path<String>,
+    Query(query): Query<PaneOutputQuery>,
+) -> Response {
+    let PaneCaptureTarget {
+        backend,
+        socket,
+        lines,
+    } = match resolve_pane_capture(&state, &pane, &query).await {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let rx = match state
+        .pane_streams
+        .subscribe(backend, socket, pane.clone(), lines)
+    {
+        Ok(rx) => rx,
+        Err(error) => return control_error(StatusCode::TOO_MANY_REQUESTS, error.message()),
+    };
+    let lifetime = tokio::time::sleep(state.pane_streams.limits().lifetime);
+    let events = pane_output_events(rx, pane, lines)
+        .take_until(lifetime)
+        .map(Ok::<_, Infallible>);
+    Sse::new(events)
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
+        .into_response()
+}
+
+/// One subscriber's view of a pane channel: its own tail of each capture,
+/// deduplicated so an unchanged tail sends nothing.
+struct PaneOutputSubscriber {
+    rx: tokio::sync::watch::Receiver<super::pane_stream::PaneFrame>,
+    pane: String,
+    lines: usize,
+    last: Option<String>,
+    done: bool,
+}
+
+impl PaneOutputSubscriber {
+    fn event_for(&mut self, frame: super::pane_stream::PaneFrame) -> Option<SseEvent> {
+        use super::pane_stream::PaneFrame;
+        match frame {
+            PaneFrame::Pending => None,
+            PaneFrame::Output { text, captured_at } => {
+                let text = pane_output_tail(&text, self.lines);
+                if self.last.as_deref() == Some(text.as_str()) {
+                    return None;
+                }
+                let event = SseEvent::default()
+                    .event("output")
+                    .json_data(json!({
+                        "pane": self.pane,
+                        "text": text,
+                        "captured_at": &*captured_at,
+                    }))
+                    .ok()?;
+                self.last = Some(text);
+                Some(event)
+            }
+            PaneFrame::Gone => {
+                self.done = true;
+                Some(
+                    SseEvent::default()
+                        .event("gone")
+                        .json_data(json!({ "pane": self.pane }))
+                        .unwrap_or_else(|_| SseEvent::default().event("gone").data("{}")),
+                )
+            }
+        }
+    }
+}
+
+fn pane_output_events(
+    rx: tokio::sync::watch::Receiver<super::pane_stream::PaneFrame>,
+    pane: String,
+    lines: usize,
+) -> impl Stream<Item = SseEvent> + Send {
+    let subscriber = PaneOutputSubscriber {
+        rx,
+        pane,
+        lines,
+        last: None,
+        done: false,
+    };
+    stream::unfold(subscriber, |mut sub| async move {
+        if sub.done {
+            return None;
+        }
+        loop {
+            let frame = sub.rx.borrow_and_update().clone();
+            if let Some(event) = sub.event_for(frame) {
+                return Some((event, sub));
+            }
+            if sub.rx.changed().await.is_err() {
+                // The capture loop ended; report a final `gone` not yet seen.
+                let frame = sub.rx.borrow().clone();
+                return match frame {
+                    super::pane_stream::PaneFrame::Gone => {
+                        sub.event_for(frame).map(|event| (event, sub))
+                    }
+                    _ => None,
+                };
+            }
+        }
+    })
 }
 
 async fn terminal_input_handler(
@@ -1843,6 +2395,7 @@ struct TimelineSummary {
     days: Vec<TimelineDaySummary>,
     sources: Vec<TimelineSourceSummary>,
     human_presence_secs: u64,
+    overview: Vec<timeline::TimelineOverviewLane>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1949,10 +2502,9 @@ async fn timeline_handler(
     let agents = state.store.snapshot().await;
     let prompt_entries = state.store.recent_prompts(None, 0).await;
     let pane_scan = state.refresh_pane_scan().await;
-    let pane_sessions = pane_scan
-        .panes
-        .iter()
-        .map(|pane| (pane.pane_id.clone(), pane.session.clone()))
+    let pane_sessions = crate::tmux::canonical_panes(&pane_scan.panes)
+        .into_iter()
+        .map(|pane| (pane.pane_id, pane.session))
         .collect::<HashMap<_, _>>();
 
     let built = match build_timeline_projection(TimelineProjectionInput {
@@ -2136,6 +2688,7 @@ fn build_timeline_summary_response(
             })
             .collect(),
         human_presence_secs: projection.human_presence_secs,
+        overview: projection.overview,
     };
     TimelineSummaryResponse {
         generated_at: projection.generated_at,
@@ -2425,6 +2978,16 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_decisions_and_progress_are_redacted() {
+        let mut value = serde_json::json!({"interruption":{"reason":"error","decision":{"body":"private choice"}},"updates":[{"sequence":1,"body":"private progress"}]});
+        super::redact_collaboration_details(&mut value);
+        assert!(value["interruption"].get("decision").is_none());
+        assert!(value["updates"][0].get("body").is_none());
+        assert_eq!(value["updates"][0]["sequence"], 1);
+        assert_eq!(value["interruption"]["reason"], "error");
+    }
+
     use super::*;
     use crate::backend::{BackendCaps, PaneBackend};
     use crate::event::{AgentEvent, AgentId, AgentKind};
@@ -2566,6 +3129,7 @@ mod tests {
     ) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -2627,9 +3191,15 @@ mod tests {
                         from.clone(),
                         to.clone(),
                         NewRequest {
+                            dispatch_id: None,
+                            source_node_id: None,
+                            delegation_parent: None,
+                            human_action: None,
+                            initiator: None,
                             kind: RequestKind::Review,
                             body: body.to_string(),
                             expects_reply: true,
+                            notify: None,
                             work_mode: WorkMode::ReadOnly,
                             thread_id: Some("thread-cal-7345".to_string()),
                             parent_request_id: None,
@@ -2652,9 +3222,15 @@ mod tests {
                     from,
                     to,
                     NewRequest {
+                        dispatch_id: None,
+                        source_node_id: None,
+                        delegation_parent: None,
+                        human_action: None,
+                        initiator: None,
                         kind: RequestKind::Notice,
                         body: "finalize".to_string(),
                         expects_reply: false,
+                        notify: None,
                         work_mode: WorkMode::ReadOnly,
                         thread_id: Some("thread-cal-7345".to_string()),
                         parent_request_id: None,
@@ -3026,6 +3602,7 @@ mod tests {
         };
         let herdr = scanner::herdr_scan_result(vec![crate::tmux::PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -3058,6 +3635,7 @@ mod tests {
             HostKind::Rmux,
             vec![crate::tmux::PaneInfo {
                 session_group: None,
+                agent_program: None,
                 agent_role: None,
                 agent_alias: None,
                 workspace_id: None,
@@ -3092,6 +3670,7 @@ mod tests {
             kind: HostKind::Rmux,
             panes: vec![crate::tmux::PaneInfo {
                 session_group: None,
+                agent_program: None,
                 agent_role: None,
                 agent_alias: None,
                 workspace_id: None,
@@ -3314,10 +3893,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_search_never_exposes_private_body_matches_to_public_readers() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+        let requests = seed_collaboration_requests(&collaboration).await;
+        let app = router(public_read_state("secret").with_collaboration(collaboration));
+        for (token, total) in [(None, 0), (Some("invalid"), 0), (Some("secret"), 1)] {
+            let mut builder = Request::builder().uri("/api/collaboration?q=round%20one&limit=1");
+            if let Some(token) = token {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response).await["pagination"]["total"], total);
+        }
+        let exact = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/collaboration?id={}", requests[0].id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(exact).await["pagination"]["total"], 1);
+        let reversed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?since=2026-10-14T00:00:00Z&until=2026-10-13T00:00:00Z")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reversed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn public_collaboration_history_redacts_message_details_without_pat() {
         let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
         let requests = seed_collaboration_requests(&collaboration).await;
         let recipient = collaboration_participant("%2", "reviewer-session", "@7");
+        collaboration
+            .update_request(
+                &requests[0].from,
+                &requests[0].id,
+                "progress-secret".to_string(),
+            )
+            .await
+            .unwrap();
         collaboration
             .reply(
                 &recipient,
@@ -3348,10 +3976,13 @@ mod tests {
         let request = &public["requests"][0];
         assert!(request.get("body").is_none());
         assert!(request.get("paths").is_none());
+        assert!(request["updates"][0].get("body").is_none());
+        assert_eq!(request["updates"][0]["sequence"], 1);
         assert!(request["reply"].get("body").is_none());
         assert!(request["reply"].get("artifacts").is_none());
 
         let public_with_pat = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/collaboration?status=completed")
@@ -3362,16 +3993,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(public_with_pat.status(), StatusCode::OK);
+        assert_eq!(
+            public_with_pat.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(
+            public_with_pat.headers()[header::VARY],
+            "Authorization, Cookie"
+        );
         let public_with_pat = body_json(public_with_pat).await;
-        assert_eq!(public_with_pat["details_included"], false);
-        assert!(public_with_pat["requests"][0].get("body").is_none());
-        assert!(public_with_pat["requests"][0]["reply"]
+        assert_eq!(public_with_pat["details_included"], true);
+        assert_eq!(
+            public_with_pat["requests"][0]["updates"][0]["body"],
+            "progress-secret"
+        );
+        assert!(public_with_pat["requests"][0]["body"].is_string());
+        assert_eq!(public_with_pat["requests"][0]["reply"]["body"], "approved");
+        assert_eq!(
+            public_with_pat["requests"][0]["reply"]["artifacts"][0],
+            "artifact-secret"
+        );
+
+        let invalid_pat = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?status=completed")
+                    .header(header::AUTHORIZATION, "Bearer invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let invalid_pat = body_json(invalid_pat).await;
+        assert_eq!(invalid_pat["details_included"], false);
+        assert!(invalid_pat["requests"][0].get("body").is_none());
+        assert!(invalid_pat["requests"][0]["updates"][0]
             .get("body")
             .is_none());
+        assert!(invalid_pat["requests"][0]["reply"].get("body").is_none());
     }
 
     #[tokio::test]
-    async fn collaboration_details_require_token_auth_mode() {
+    async fn collaboration_details_require_operator_enabled_auth_mode() {
         let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
         seed_collaboration_requests(&collaboration).await;
 
@@ -4111,6 +4774,11 @@ mod tests {
         assert!(scrubbed.contains("since=24h"), "scrubbed: {scrubbed}");
 
         // No query → untouched path.
+        let encoded: axum::http::Uri =
+            "/share/auth/callback?co%64e=secret&sta%74e=secret&to%6ben=secret"
+                .parse()
+                .unwrap();
+        assert!(!scrub_token_from_uri(&encoded).contains("secret"));
         let plain: axum::http::Uri = "/api/health".parse().unwrap();
         assert_eq!(scrub_token_from_uri(&plain), "/api/health");
     }
@@ -4674,5 +5342,589 @@ mod tests {
         // Give the runtime a yield so the drop-side decrement settles.
         tokio::task::yield_now().await;
         assert_eq!(metrics.snapshot().sse_subscribers_current, 0);
+    }
+
+    /// A herdr-kind backend whose capture is canned, recording the history
+    /// depth each capture asked for. Tests can change the canned text (or
+    /// set it to `None`, a closed pane) while streams are open.
+    struct CaptureBackend {
+        output: Arc<Mutex<Option<String>>>,
+        history: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl PaneBackend for CaptureBackend {
+        fn kind(&self) -> HostKind {
+            HostKind::Herdr
+        }
+
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            Vec::new()
+        }
+
+        fn resolve_pane(&self, _pane_id: &str) -> Option<PaneInfo> {
+            None
+        }
+
+        fn capture_pane(&self, _pane_id: &str) -> Option<String> {
+            self.output.lock().unwrap().clone()
+        }
+
+        fn capture_pane_history_on(
+            &self,
+            _socket: Option<&str>,
+            pane_id: &str,
+            history: usize,
+        ) -> Option<String> {
+            self.history.lock().unwrap().push(history);
+            self.capture_pane(pane_id)
+        }
+
+        fn pane_pid_map(&self) -> HashMap<u32, String> {
+            HashMap::new()
+        }
+
+        fn current_pane(&self) -> Option<String> {
+            None
+        }
+
+        fn focus_pane(&self, _pane_id: &str) -> bool {
+            false
+        }
+
+        fn send_text(&self, _pane_id: &str, _text: &str) -> bool {
+            false
+        }
+    }
+
+    fn capture_state(state: AppState, output: &str) -> (AppState, Arc<Mutex<Vec<usize>>>) {
+        let (state, live) = live_capture_state(state, output);
+        (state, live.history)
+    }
+
+    /// Handles onto a [`CaptureBackend`]'s canned text and capture log.
+    struct LiveCapture {
+        output: Arc<Mutex<Option<String>>>,
+        history: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl LiveCapture {
+        fn set(&self, text: Option<&str>) {
+            *self.output.lock().unwrap() = text.map(str::to_string);
+        }
+
+        fn captures(&self) -> usize {
+            self.history.lock().unwrap().len()
+        }
+    }
+
+    fn live_capture_state(state: AppState, output: &str) -> (AppState, LiveCapture) {
+        let live = LiveCapture {
+            output: Arc::new(Mutex::new(Some(output.to_string()))),
+            history: Arc::new(Mutex::new(Vec::new())),
+        };
+        let backend: SharedBackend = Arc::new(CaptureBackend {
+            output: live.output.clone(),
+            history: live.history.clone(),
+        });
+        (state.with_backend(backend), live)
+    }
+
+    async fn get_output(state: &AppState, uri: &str, bearer: Option<&str>) -> Response {
+        let mut request = Request::builder().uri(uri);
+        if let Some(token) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        router(state.clone())
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pane_output_returns_sanitized_text_to_the_operator() {
+        let raw = "\u{1b}[1;32mready\u{1b}[0m\r\n\u{1b}]0;title\u{7}> \u{1b}[2Kprompt\u{8}\n\n\n";
+        let (state, history) = capture_state(state_with_token("op"), raw);
+        let response = get_output(&state, "/api/panes/herdr%3Ap1/output", Some("op")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = body_json(response).await;
+        assert_eq!(body["pane"], "herdr:p1");
+        assert_eq!(body["text"], "ready\n> prompt");
+        assert!(OffsetDateTime::parse(
+            body["captured_at"].as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339
+        )
+        .is_ok());
+        assert_eq!(*history.lock().unwrap(), vec![PANE_OUTPUT_DEFAULT_LINES]);
+    }
+
+    #[tokio::test]
+    async fn pane_output_clamps_the_requested_line_count() {
+        let (state, history) = capture_state(state_with_token("op"), "a\nb\nc\nd");
+        let body =
+            body_json(get_output(&state, "/api/panes/herdr%3Ap1/output?lines=2", Some("op")).await)
+                .await;
+        assert_eq!(body["text"], "c\nd");
+        get_output(
+            &state,
+            "/api/panes/herdr%3Ap1/output?lines=50000",
+            Some("op"),
+        )
+        .await;
+        get_output(&state, "/api/panes/herdr%3Ap1/output?lines=0", Some("op")).await;
+        assert_eq!(*history.lock().unwrap(), vec![2, PANE_OUTPUT_MAX_LINES, 1]);
+        let response = get_output(
+            &state,
+            "/api/panes/herdr%3Ap1/output?lines=lots",
+            Some("op"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pane_output_needs_the_token_in_every_auth_mode() {
+        // Private dashboard: no credentials is 401, a wrong token too.
+        let (state, _) = capture_state(state_with_token("op"), "secret");
+        let uri = "/api/panes/herdr%3Ap1/output";
+        assert_eq!(
+            get_output(&state, uri, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_output(&state, uri, Some("nope")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // public_read: reads are anonymous, pane output is not.
+        let (state, _) = capture_state(public_read_state("op"), "secret");
+        let anonymous = get_output(&state, uri, None).await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(anonymous.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            get_output(&state, uri, Some("op")).await.status(),
+            StatusCode::OK
+        );
+
+        // auth = "none": nobody is an operator, so nobody reads output.
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = DashboardAuthMode::None;
+        let (state, _) = capture_state(state_from(cfg), "secret");
+        assert_eq!(
+            get_output(&state, uri, None).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_output_rejects_malformed_pane_ids_and_sockets() {
+        let (state, history) = capture_state(state_with_token("op"), "x");
+        for uri in [
+            "/api/panes/abc/output",
+            "/api/panes/%25/output",
+            "/api/panes/%251x/output",
+            "/api/panes/%251%3Bkill/output",
+            "/api/panes/herdr%3A/output",
+            "/api/panes/herdr%3Ap%201/output",
+            "/api/panes/herdr%3Ap1/output?socket=a%0Ab",
+        ] {
+            let response = get_output(&state, uri, Some("op")).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert!(history.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pane_output_text_keeps_the_newest_bounded_tail() {
+        assert_eq!(pane_output_text("one\ntwo\nthree\n\n", 2), "two\nthree");
+        assert_eq!(pane_output_text("", 10), "");
+        // Byte bound: the newest bytes survive, cut on a char boundary.
+        let line = "é".repeat(100);
+        let raw = vec![line.as_str(); 1000].join("\n");
+        let text = pane_output_text(&raw, PANE_OUTPUT_MAX_LINES);
+        assert!(text.len() <= PANE_OUTPUT_MAX_BYTES);
+        assert!(text.len() > PANE_OUTPUT_MAX_BYTES - 4);
+        assert!(text.ends_with(&line));
+    }
+
+    fn window_pane(pane_id: &str, window_id: &str, socket: &str, host: HostKind) -> PaneSummary {
+        PaneSummary {
+            host,
+            pane_id: pane_id.into(),
+            session_id: "$1".into(),
+            session: "main".into(),
+            window_id: window_id.into(),
+            window_name: "main".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "zsh".into(),
+            title: String::new(),
+            current_path: "/tmp".into(),
+            socket: std::path::PathBuf::from(socket),
+            muxa: MuxaPaneMetadata::default(),
+            attach_command: String::new(),
+        }
+    }
+
+    #[test]
+    fn window_layout_resolves_only_scanned_tmux_sockets() {
+        let panes = vec![
+            window_pane("%1", "@1", "/tmp/tmux-501/default", HostKind::Tmux),
+            window_pane("%2", "@1", "/tmp/tmux-501/default", HostKind::Tmux),
+            window_pane("%3", "@2", "/tmp/tmux-501/default", HostKind::Tmux),
+            window_pane("%3", "@2", "/tmp/tmux-501/work", HostKind::Tmux),
+            window_pane("rmux:%1", "@9", "/tmp/rmux.sock", HostKind::Rmux),
+        ];
+        assert_eq!(
+            resolve_window_socket(&panes, "@1", None).unwrap(),
+            "/tmp/tmux-501/default"
+        );
+        // Short names and full paths both select a scanned socket …
+        assert_eq!(
+            resolve_window_socket(&panes, "@2", Some("work")).unwrap(),
+            "/tmp/tmux-501/work"
+        );
+        // … an ambiguous window needs one, and an unscanned path is never used.
+        assert_eq!(
+            resolve_window_socket(&panes, "@2", None).unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            resolve_window_socket(&panes, "@1", Some("/etc/evil"))
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        // Geometry comes from tmux only.
+        assert_eq!(
+            resolve_window_socket(&panes, "@9", None).unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn window_ids_are_shape_checked() {
+        assert!(valid_window_id("@0"));
+        assert!(valid_window_id("@123"));
+        for bad in ["", "@", "1", "@1x", "@-1", "@1;kill", "@1234567890123"] {
+            assert!(!valid_window_id(bad), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn window_layout_is_a_read_route() {
+        // Private: reads need the token.
+        let state = state_with_token("op");
+        let uri = "/api/windows/%40x/layout";
+        assert_eq!(
+            get_output(&state, uri, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_output(&state, uri, Some("op")).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        // public_read: layout metadata is readable anonymously, like /api/panes.
+        let state = public_read_state("op");
+        assert_eq!(
+            get_output(&state, uri, None).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let response = get_output(
+            &state,
+            "/api/windows/%40987654321/layout?socket=a%0Ab",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Live pane output (SSE) ─────────────────────────────────────────
+
+    use crate::dashboard::pane_stream::PaneStreamLimits;
+
+    const STREAM_URI: &str = "/api/panes/herdr%3Ap1/output/stream";
+
+    fn fast_limits() -> PaneStreamLimits {
+        PaneStreamLimits {
+            interval: Duration::from_millis(15),
+            max_tasks: 2,
+            max_subscribers_per_pane: 2,
+            lifetime: Duration::from_secs(60),
+            gone_after_failures: 2,
+        }
+    }
+
+    fn stream_state(output: &str) -> (AppState, LiveCapture) {
+        live_capture_state(
+            state_with_token("op").with_pane_stream_limits(fast_limits()),
+            output,
+        )
+    }
+
+    /// Reads SSE events off a streaming response body one at a time.
+    struct SseReader {
+        body: Body,
+        buf: String,
+    }
+
+    impl SseReader {
+        fn new(response: Response) -> Self {
+            Self {
+                body: response.into_body(),
+                buf: String::new(),
+            }
+        }
+
+        /// The next named event and its JSON data, skipping keep-alive
+        /// comments; `None` if nothing arrives within `wait` or the stream
+        /// ended.
+        async fn next(&mut self, wait: Duration) -> Option<(String, Value)> {
+            let deadline = tokio::time::Instant::now() + wait;
+            loop {
+                if let Some(end) = self.buf.find("\n\n") {
+                    let block = self.buf[..end].to_string();
+                    self.buf.drain(..end + 2);
+                    let mut event = String::new();
+                    let mut data = String::new();
+                    for line in block.lines() {
+                        if let Some(value) = line.strip_prefix("event:") {
+                            event = value.trim_start().to_string();
+                        } else if let Some(value) = line.strip_prefix("data:") {
+                            data.push_str(value.trim_start());
+                        }
+                    }
+                    if event.is_empty() {
+                        continue;
+                    }
+                    return Some((event, serde_json::from_str(&data).unwrap()));
+                }
+                match tokio::time::timeout_at(deadline, self.body.frame()).await {
+                    Ok(Some(Ok(frame))) => {
+                        if let Ok(bytes) = frame.into_data() {
+                            self.buf.push_str(&String::from_utf8_lossy(&bytes));
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+
+    /// Poll `check` until it holds or two seconds pass.
+    async fn eventually(mut check: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        check()
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_needs_the_token_in_every_auth_mode() {
+        let (state, live) = live_capture_state(state_with_token("op"), "secret");
+        assert_eq!(
+            get_output(&state, STREAM_URI, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_output(&state, STREAM_URI, Some("nope")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let ok = get_output(&state, STREAM_URI, Some("op")).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(ok.headers()[header::CONTENT_TYPE], "text/event-stream");
+        assert_eq!(ok.headers()[header::CACHE_CONTROL], "no-store");
+        drop(ok);
+
+        // public_read: reads are anonymous, pane output is not.
+        let (state, _) = live_capture_state(public_read_state("op"), "secret");
+        let anonymous = get_output(&state, STREAM_URI, None).await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(anonymous.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            get_output(&state, STREAM_URI, Some("op")).await.status(),
+            StatusCode::OK
+        );
+
+        // auth = "none": nobody is an operator, so nobody streams output.
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = DashboardAuthMode::None;
+        let (state, none_live) = live_capture_state(state_from(cfg), "secret");
+        assert_eq!(
+            get_output(&state, STREAM_URI, None).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        // A refused request never starts a capture loop.
+        assert_eq!(state.pane_streams.active_tasks(), 0);
+        assert_eq!(none_live.captures(), 0);
+        let _ = live;
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_validates_like_the_output_route() {
+        let (state, live) = stream_state("x");
+        for uri in [
+            "/api/panes/abc/output/stream",
+            "/api/panes/%251%3Bkill/output/stream",
+            "/api/panes/herdr%3Ap1/output/stream?socket=a%0Ab",
+        ] {
+            let response = get_output(&state, uri, Some("op")).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert_eq!(state.pane_streams.active_tasks(), 0);
+        assert_eq!(live.captures(), 0);
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_sends_a_snapshot_then_only_changes() {
+        let (state, live) = stream_state("\u{1b}[1;32mready\u{1b}[0m\nline two\n\n\n");
+        let response = get_output(&state, &format!("{STREAM_URI}?lines=5"), Some("op")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut events = SseReader::new(response);
+
+        // First event: the current (sanitized, trimmed) snapshot.
+        let (event, data) = events.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(event, "output");
+        assert_eq!(data["pane"], "herdr:p1");
+        assert_eq!(data["text"], "ready\nline two");
+        assert!(data["captured_at"]
+            .as_str()
+            .is_some_and(|at| !at.is_empty()));
+
+        // Unchanged output: the loop keeps capturing but sends nothing.
+        let seen = live.captures();
+        assert!(eventually(|| live.captures() >= seen + 3).await);
+        assert!(events.next(Duration::from_millis(60)).await.is_none());
+
+        // A change produces one new full snapshot.
+        live.set(Some("ready\nline two\nline three"));
+        let (event, data) = events.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(event, "output");
+        assert_eq!(data["text"], "ready\nline two\nline three");
+        assert!(events.next(Duration::from_millis(60)).await.is_none());
+        // Every capture asked for the subscriber's depth.
+        assert!(live.history.lock().unwrap().iter().all(|lines| *lines == 5));
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_subscribers_share_one_loop_with_their_own_tail() {
+        let (state, live) = stream_state("a\nb\nc");
+        let mut short =
+            SseReader::new(get_output(&state, &format!("{STREAM_URI}?lines=1"), Some("op")).await);
+        let (_, data) = short.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(data["text"], "c");
+        let mut long =
+            SseReader::new(get_output(&state, &format!("{STREAM_URI}?lines=3"), Some("op")).await);
+        let (_, data) = long.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(data["text"], "a\nb\nc");
+        assert_eq!(state.pane_streams.active_tasks(), 1);
+        // The shared loop now captures the deepest history anyone asked for.
+        assert!(eventually(|| live.history.lock().unwrap().last() == Some(&3)).await);
+
+        // A change outside the short tail's window is not news to it.
+        live.set(Some("z\nb\nc"));
+        let (_, data) = long.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(data["text"], "z\nb\nc");
+        assert!(short.next(Duration::from_millis(60)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_loop_stops_after_the_last_subscriber() {
+        let (state, live) = stream_state("hello");
+        let mut first = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        let mut second = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        assert!(first.next(Duration::from_secs(2)).await.is_some());
+        assert!(second.next(Duration::from_secs(2)).await.is_some());
+        assert_eq!(state.pane_streams.active_tasks(), 1);
+
+        drop(first);
+        // One subscriber left: the loop keeps running.
+        let seen = live.captures();
+        assert!(eventually(|| live.captures() >= seen + 2).await);
+        assert_eq!(state.pane_streams.active_tasks(), 1);
+
+        drop(second);
+        assert!(eventually(|| state.pane_streams.active_tasks() == 0).await);
+        let stopped_at = live.captures();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(live.captures() <= stopped_at + 1, "loop kept capturing");
+
+        // A new subscriber starts a fresh loop.
+        let mut again = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        let (_, data) = again.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(data["text"], "hello");
+        assert_eq!(state.pane_streams.active_tasks(), 1);
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_limits_answer_429() {
+        let (state, _live) = stream_state("x");
+        // Two subscribers per pane.
+        let a = get_output(&state, STREAM_URI, Some("op")).await;
+        let b = get_output(&state, STREAM_URI, Some("op")).await;
+        assert_eq!(a.status(), StatusCode::OK);
+        assert_eq!(b.status(), StatusCode::OK);
+        let refused = get_output(&state, STREAM_URI, Some("op")).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(body_json(refused).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("too many"));
+
+        // Two panes streaming at once.
+        let other = get_output(&state, "/api/panes/herdr%3Ap2/output/stream", Some("op")).await;
+        assert_eq!(other.status(), StatusCode::OK);
+        assert_eq!(state.pane_streams.active_tasks(), 2);
+        let third_pane =
+            get_output(&state, "/api/panes/herdr%3Ap3/output/stream", Some("op")).await;
+        assert_eq!(third_pane.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Capacity comes back when subscribers leave.
+        drop((a, b));
+        assert!(eventually(|| state.pane_streams.active_tasks() == 1).await);
+        let retry = get_output(&state, "/api/panes/herdr%3Ap3/output/stream", Some("op")).await;
+        assert_eq!(retry.status(), StatusCode::OK);
+        drop(other);
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_reports_a_closed_pane_and_ends() {
+        let (state, live) = stream_state("still here");
+        let mut events = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        assert_eq!(
+            events.next(Duration::from_secs(2)).await.unwrap().0,
+            "output"
+        );
+        live.set(None);
+        let (event, data) = events.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(event, "gone");
+        assert_eq!(data["pane"], "herdr:p1");
+        // `gone` is the last event: the stream closes and the loop is gone.
+        assert!(events.next(Duration::from_millis(200)).await.is_none());
+        assert_eq!(state.pane_streams.active_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_ends_after_its_lifetime() {
+        let limits = PaneStreamLimits {
+            lifetime: Duration::from_millis(100),
+            ..fast_limits()
+        };
+        let (state, _live) =
+            live_capture_state(state_with_token("op").with_pane_stream_limits(limits), "x");
+        let started = std::time::Instant::now();
+        let mut events = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        assert!(events.next(Duration::from_secs(2)).await.is_some());
+        assert!(events.next(Duration::from_secs(2)).await.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // The server drops a finished body, releasing the subscription.
+        drop(events);
+        assert!(eventually(|| state.pane_streams.active_tasks() == 0).await);
     }
 }

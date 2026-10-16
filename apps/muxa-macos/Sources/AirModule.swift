@@ -582,7 +582,7 @@ private struct AirSettingsPane: View {
                     }
                 }
                 Text("AIR has no standard install location yet, so point Muxa at the air-workbench folder of your AIR checkout — the one holding scripts/air.mjs.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -591,10 +591,10 @@ private struct AirSettingsPane: View {
                 Divider()
                 HStack(spacing: 8) {
                     Label("Workbench is running", systemImage: "dot.radiowaves.left.and.right")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.green)
                     Link(destination: url) {
-                        Text("Open the page").font(.caption)
+                        Text("Open the page").font(MuxaType.detail)
                     }
                     Spacer(minLength: 8)
                     Button("Stop") { module.stopWorkbench() }
@@ -609,12 +609,12 @@ private struct AirSettingsPane: View {
                         notice.text,
                         systemImage: notice.tone == .done ? "checkmark.circle" : "exclamationmark.triangle.fill"
                     )
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(notice.tone == .done ? Color.green : Color.orange)
                     .fixedSize(horizontal: false, vertical: true)
                     ForEach(notice.details, id: \.self) { detail in
                         Text(verbatim: detail)
-                            .font(.caption)
+                            .font(MuxaType.detail)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -622,8 +622,8 @@ private struct AirSettingsPane: View {
             }
 
             Text("Exports are copies. config.toml stays the pipeline muxa runs, and an import is checked the way the editor checks a pipeline before it reaches your config.")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
+                .font(MuxaType.detail)
+                .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

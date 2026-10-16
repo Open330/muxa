@@ -25,6 +25,7 @@
 //! could plug in a multi-server tmux scanner, a screen/zellij adapter, or
 //! a remote-host probe — all without touching `Reconciler` or `Store`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,12 +45,18 @@ use crate::state::{ReconcileReport, SharedStore};
 use crate::tmux::PaneInfo;
 
 /// How many days back from "now" to scan codex's date-partitioned sessions
-/// tree when locating a live session's rollout file. Today + yesterday
-/// covers any session a human is actively driving; older active sessions
-/// are rare enough to skip rather than pay a wider directory scan. (The
-/// scan also looks one day *forward* — see [`codex_rollout::locate_rollout`]
-/// — to cover timezones where the local rollout date is ahead of UTC.)
+/// tree when locating a live session's rollout file. Older `UUIDv7` sessions
+/// are also found using their creation date. The scan looks one day forward
+/// to cover local rollout dates ahead of UTC.
+/// How long a row's pane may run no agent process before the row is stopped.
+/// Long enough to cover a launch or a restart in place; a live agent's next
+/// hook revives a stopped row anyway.
+const AGENTLESS_PANE_IDLE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 const ROLLOUT_LOOKBACK_DAYS: u16 = 1;
+
+/// Keep hook fallback responsive without repeatedly scanning all pane hosts.
+const CODEX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A live codex row snapshotted with its current rate-limit fields, captured
 /// before the off-runtime rollout read so [`Reconciler::poll_codex_rollouts`]
@@ -64,6 +71,7 @@ struct CodexPollTarget {
     state: AgentState,
     scope: Option<RateLimitScope>,
     source: Option<RateLimitSource>,
+    last_activity_at: OffsetDateTime,
 }
 
 /// Source of truth for which panes are currently alive.
@@ -145,11 +153,15 @@ pub struct Reconciler<L: LivenessSource> {
     /// converge path governs.
     paneless_stale_timeout: Duration,
     /// Root of codex's session-rollout tree (`~/.codex/sessions`). When
-    /// `Some`, each tick reads every live codex row's rollout file and
-    /// feeds its `rate_limits` through the store — the only way muxa learns
-    /// a codex usage cap, since codex exposes no error/rate-limit hook.
+    /// `Some`, read lifecycle and quota evidence even when hooks are missing.
     /// `None` (default) disables the poll.
     codex_sessions_root: Option<PathBuf>,
+    native_sessions: Option<crate::session::SharedSessionBackend>,
+    /// When each observed host last answered well enough to protect its rows
+    /// from the cross-host age-out. Seeded with construction time, so a host
+    /// has to stay unanswered for the whole inactivity window — one timed-out
+    /// `tmux list-panes` under load must not stop every long-idle tmux agent.
+    last_protected: std::sync::Mutex<HashMap<HostKind, Instant>>,
 }
 
 impl<L: LivenessSource> Reconciler<L> {
@@ -171,6 +183,7 @@ impl<L: LivenessSource> Reconciler<L> {
     /// the daemon never constructs one that way — `active_backends()` is never
     /// empty.
     pub fn with_sources(store: SharedStore, sources: Vec<L>, interval: Duration) -> Self {
+        let kinds: Vec<HostKind> = sources.iter().map(LivenessSource::kind).collect();
         Self {
             store,
             sources: sources.into_iter().map(Arc::new).collect(),
@@ -180,6 +193,13 @@ impl<L: LivenessSource> Reconciler<L> {
             stuck_waiting_timeout: Duration::ZERO,
             paneless_stale_timeout: Duration::ZERO,
             codex_sessions_root: None,
+            native_sessions: None,
+            last_protected: std::sync::Mutex::new(
+                kinds
+                    .into_iter()
+                    .map(|kind| (kind, Instant::now()))
+                    .collect(),
+            ),
         }
     }
 
@@ -188,6 +208,12 @@ impl<L: LivenessSource> Reconciler<L> {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    #[must_use]
+    pub fn with_native_sessions(mut self, sessions: crate::session::SharedSessionBackend) -> Self {
+        self.native_sessions = Some(sessions);
         self
     }
 
@@ -229,21 +255,20 @@ impl<L: LivenessSource> Reconciler<L> {
         self
     }
 
-    /// Read every live codex row's rollout file and feed its `rate_limits`
-    /// into the store. Codex ships no error/rate-limit hook, so this poll is
-    /// muxa's only path to a codex usage cap — including the common case
-    /// where the cap blocks a turn *before it starts* and not even a `Stop`
-    /// hook fires.
+    /// Read live Codex rollout tails for lifecycle and quota evidence. Actual
+    /// event timestamps advance activity even without a state transition;
+    /// old observations cannot override more recent hooks.
     ///
     /// Two events per reading:
     /// * a `Heartbeat` carrying the 5h/7d utilization (keeps the LIMITS
-    ///   column live and gives the existing soft-saturation handling), and
+    ///   columns live without inferring a blocked turn), and
     /// * a `RateLimited` when codex stamped `rate_limit_reached_type` —
     ///   the hard signal that flips the row to `Error`.
     ///
     /// File IO runs on the blocking pool; absent files / unreadable rollouts
     /// are silently skipped (a session that hasn't written a `rate_limits`
     /// record yet just contributes nothing this tick).
+    #[allow(clippy::too_many_lines)] // One ordered pass keeps lifecycle and quota precedence explicit.
     async fn poll_codex_rollouts(&self, root: &Path) {
         let now = OffsetDateTime::now_utc();
         // Snapshot the live codex rows first (cheap, async), then do the
@@ -262,7 +287,7 @@ impl<L: LivenessSource> Reconciler<L> {
                     session_id: a.session_id,
                     surface: a.surface,
                     pane: a.pane,
-                    tmux_socket: None,
+                    tmux_socket: a.tmux_socket,
                     cwd: a.cwd,
                 },
                 cur_5h_pct: a.rate_limit_5h_pct,
@@ -272,6 +297,7 @@ impl<L: LivenessSource> Reconciler<L> {
                 state: a.state,
                 scope: a.rate_limit_scope,
                 source: a.rate_limit_source,
+                last_activity_at: a.last_activity_at,
             })
             .collect();
         if targets.is_empty() {
@@ -283,20 +309,99 @@ impl<L: LivenessSource> Reconciler<L> {
             targets
                 .into_iter()
                 .filter_map(|t| {
-                    codex_rollout::session_rate_limits(
+                    let path = codex_rollout::locate_rollout(
                         &root,
                         &t.id.session_id,
                         now,
                         ROLLOUT_LOOKBACK_DAYS,
-                    )
-                    .map(|rl| (t, rl))
+                    )?;
+                    let rl = codex_rollout::latest_rate_limits(&path);
+                    let status = codex_rollout::latest_status(&path);
+                    // Also repair old inferred caps stamped after a successful
+                    // final response by earlier muxa versions.
+                    let recovery_response = (t.state == AgentState::Error
+                        && matches!(
+                            t.source,
+                            Some(RateLimitSource::CodexRollout | RateLimitSource::Statusline)
+                        )
+                        && rl.as_ref().is_some_and(|reading| reading.reached.is_none()))
+                    .then(|| codex_rollout::latest_final_response(&path))
+                    .flatten();
+                    Some((t, rl, status, recovery_response))
                 })
                 .collect::<Vec<_>>()
         })
         .await
         .unwrap_or_default();
 
-        for (t, rl) in readings {
+        for (t, rl, status, recovery_response) in readings {
+            // Re-read after blocking IO: a newer permission/Stop hook may have
+            // arrived meanwhile. Historical rollout records must not undo it.
+            if let (Some(status), Some(current)) =
+                (status, self.store.by_session(&t.id.session_id).await)
+            {
+                if current.state != AgentState::Stopped
+                    && status.at > current.last_activity_at
+                    && status.at <= now
+                {
+                    let event = match status.event {
+                        codex_rollout::StatusEvent::Working => AgentEvent::ToolStarted {
+                            id: t.id.clone(),
+                            tool: "codex rollout activity".into(),
+                            subagent: None,
+                            at: status.at,
+                        },
+                        codex_rollout::StatusEvent::Stopped {
+                            response,
+                            interrupted: _,
+                        } => AgentEvent::TurnStopped {
+                            id: t.id.clone(),
+                            response,
+                            recap: None,
+                            ai_title: None,
+                            idle_confirmed: true,
+                            at: status.at,
+                        },
+                        codex_rollout::StatusEvent::Error { message } => {
+                            AgentEvent::NotificationFired {
+                                id: t.id.clone(),
+                                level: crate::event::NotificationLevel::Error,
+                                message,
+                                at: status.at,
+                            }
+                        }
+                    };
+                    self.store.apply(&event).await;
+                }
+            }
+            if let Some(response) = recovery_response {
+                if self
+                    .store
+                    .by_session(&t.id.session_id)
+                    .await
+                    .is_some_and(|current| {
+                        current.state == AgentState::Error
+                            && current.last_activity_at == t.last_activity_at
+                    })
+                {
+                    self.store
+                        .apply(&AgentEvent::TurnStopped {
+                            id: t.id.clone(),
+                            response: Some(response),
+                            recap: None,
+                            ai_title: None,
+                            idle_confirmed: false,
+                            // Repair state without making an old turn look recent.
+                            at: t.last_activity_at,
+                        })
+                        .await;
+                }
+            }
+            // Lifecycle signals are useful even before the first token-count
+            // record, or when large tool output pushed quota out of the tail.
+            let Some(rl) = rl else {
+                continue;
+            };
             // `Window` is `Copy`, so read each scope's fields straight off
             // `rl` rather than aliasing into similarly-named locals.
             let five = rl.five_hour;
@@ -330,6 +435,17 @@ impl<L: LivenessSource> Reconciler<L> {
             }
 
             if let Some(scope) = rl.reached {
+                let current = self.store.by_session(&t.id.session_id).await;
+                if rl.at.is_some_and(|at| {
+                    at > now
+                        || current
+                            .as_ref()
+                            .is_some_and(|agent| at <= agent.last_activity_at)
+                }) {
+                    // Old quota evidence must not undo a newer resumed/completed
+                    // turn or permission hook, nor make it appear newly active.
+                    continue;
+                }
                 // Re-assert the cap only when the row isn't already showing
                 // this exact codex cap. It persists in the store once set, so
                 // re-emitting every tick would only refresh `last_activity_at`
@@ -352,12 +468,30 @@ impl<L: LivenessSource> Reconciler<L> {
                             source: RateLimitSource::CodexRollout,
                             resets_at,
                             message: None,
-                            at: now,
+                            at: rl.at.unwrap_or(now),
                         })
                         .await;
                 }
             }
         }
+    }
+
+    /// Record this tick's protecting hosts and return every host that has
+    /// protected its rows within the inactivity window, so only a host that
+    /// stays silent for that long ages its rows out.
+    fn recently_protected(&self, answered: &[HostKind]) -> Vec<HostKind> {
+        let now = Instant::now();
+        let mut last = self
+            .last_protected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for kind in answered {
+            last.insert(*kind, now);
+        }
+        last.iter()
+            .filter(|(_, at)| now.duration_since(**at) < self.paneless_stale_timeout)
+            .map(|(kind, _)| *kind)
+            .collect()
     }
 
     /// Run a single reconciliation pass on demand. Useful for tests, for
@@ -420,6 +554,7 @@ impl<L: LivenessSource> Reconciler<L> {
             .filter(|(_, o)| o.protects_stale_rows())
             .map(|(k, _)| *k)
             .collect();
+        let stale_protected_kinds = self.recently_protected(&stale_protected_kinds);
         let total_panes: usize = observations.iter().map(|(_, o)| o.panes.len()).sum();
         // Fix 3/5: the union of panes from COMPLETE observations only. An
         // incompletely-observed host contributes no panes, so its rows are
@@ -448,6 +583,33 @@ impl<L: LivenessSource> Reconciler<L> {
         };
         let workload_scan_us =
             u64::try_from(workload_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        // Detached app-server hooks can retain another terminal's pane, and a
+        // multiplexer restart renumbers every pane while `muxa reload`
+        // relaunches agents by resume id. Explicit resume ids plus live process
+        // ancestry outrank the stored binding, so an idle resumed agent is not
+        // left on an id that now belongs to another pane until its next hook.
+        let mut codex_hosts = Vec::new();
+        // Not gated on an existing real row: right after a multiplexer
+        // restart the resumed agents may have none, and adopting them is the
+        // point.
+        if !union_panes.is_empty() {
+            let panes = union_panes.clone();
+            let scan = tokio::task::spawn_blocking(move || process_tree::scan_codex_panes(&panes))
+                .await
+                .unwrap_or_default();
+            self.store.rebind_resumes(&scan.resume_bindings).await;
+            let adopted = self
+                .store
+                .adopt_unrowed_resumes(&scan.resume_bindings)
+                .await;
+            if adopted > 0 {
+                tracing::info!(
+                    sessions = adopted,
+                    "registered running resumed agents that had no row"
+                );
+            }
+            codex_hosts = scan.hosts;
+        }
         let reconcile_started = Instant::now();
         let mut report = ReconcileReport::default();
         // Fix 5: correlate paneless codex ONCE over the union of complete panes,
@@ -459,7 +621,7 @@ impl<L: LivenessSource> Reconciler<L> {
         if !union_panes.is_empty() {
             report.paneless_correlated = self
                 .store
-                .correlate_paneless_codex_union(&union_panes)
+                .correlate_paneless_codex_union(&union_panes, &codex_hosts)
                 .await;
         }
         // Reconcile each observation against the store sequentially, under its
@@ -480,8 +642,26 @@ impl<L: LivenessSource> Reconciler<L> {
                 .update_workloads(&workloads, &complete_kinds)
                 .await
         };
+        let agentless_stopped = if complete_kinds.is_empty() {
+            0
+        } else {
+            self.store
+                .stop_rows_without_agent_process(&workloads, &complete_kinds, AGENTLESS_PANE_IDLE)
+                .await
+        };
+        if agentless_stopped > 0 {
+            tracing::info!(
+                rows = agentless_stopped,
+                "stopped agent rows whose pane runs no agent process"
+            );
+        }
         let store_update_us =
             u64::try_from(reconcile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if let Some(sessions) = &self.native_sessions {
+            self.store
+                .reconcile_native_surfaces(|id| sessions.session_liveness(id))
+                .await;
+        }
         let stuck_w = self
             .store
             .mark_stuck_idle_from(
@@ -614,11 +794,19 @@ impl<L: LivenessSource> Reconciler<L> {
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) {
         let mut tick = interval(self.interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut codex_tick = interval(CODEX_POLL_INTERVAL);
+        codex_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        codex_tick.tick().await;
         // The first tick fires immediately; skip it so the loop's cadence
         // matches the configured interval rather than running once at t=0.
         tick.tick().await;
         loop {
             tokio::select! {
+                _ = codex_tick.tick(), if self.codex_sessions_root.is_some() => {
+                    if let Some(root) = &self.codex_sessions_root {
+                        self.poll_codex_rollouts(root).await;
+                    }
+                }
                 _ = tick.tick() => {
                     // `reconcile_once` already emits a debug-level
                     // `reconciler.tick` line with timing + report
@@ -653,6 +841,7 @@ mod tests {
     use super::*;
     use crate::event::{AgentEvent, AgentId, AgentKind};
     use crate::state::Store;
+    use std::io::Write;
     use std::sync::Mutex;
     use time::macros::datetime;
 
@@ -715,9 +904,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn native_sessions_reconcile_even_when_pane_observation_fails() {
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "native-ghost".into(),
+                    surface: Some(crate::event::SurfaceRef {
+                        kind: crate::event::SurfaceKind::Pty,
+                        id: "pty:previous-daemon".into(),
+                        workspace: None,
+                    }),
+                    pane: None,
+                    tmux_socket: None,
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let runner = Reconciler::new(
+            store.clone(),
+            FakeLiveness::incomplete(Vec::new()),
+            Duration::from_secs(1),
+        )
+        .with_native_sessions(crate::session::PtySessionBackend::shared());
+        runner.reconcile_once().await;
+        let row = store.by_session("native-ghost").await.unwrap();
+        assert_eq!(row.state, AgentState::Stopped);
+        assert!(row.surface.is_none());
+    }
+
     fn pane(id: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -871,22 +1093,40 @@ mod tests {
         assert!(store.by_session("herdr-alive").await.is_some());
     }
 
-    /// Fix 4: the cross-host age-out keys off the COMPLETE-this-tick kinds, so a
-    /// chronically-incomplete host's stale rows age out (nothing else ever
-    /// reaps them) while a freshly-active row on the same host survives. tmux
-    /// answers complete; herdr times out (incomplete) every tick, so `Herdr` is
-    /// absent from `complete_kinds` and its rows are treated like a host outside
-    /// the set. A herdr row idle past the window flips to `Stopped`; a herdr row
-    /// with recent activity is spared by the last-activity threshold.
+    /// One timed-out tmux scan under load used to stop every tmux row idle
+    /// past the window — long-idle agents vanished from `muxa watch` while
+    /// their panes were alive. A single incomplete tick must not do that.
+    #[tokio::test]
+    async fn cross_host_spares_a_transiently_incomplete_host() {
+        let store = Store::shared();
+        let old = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&started("tmux-idle", "%1", old)).await;
+
+        let tmux = FakeLiveness::new(vec![pane("%1")]).with_kind(HostKind::Tmux);
+        let r = Reconciler::with_sources(store.clone(), vec![tmux], Duration::from_millis(10))
+            .with_paneless_stale_timeout(Duration::from_secs(60));
+        r.reconcile_once().await;
+        *r.sources[0].observation.lock().unwrap() = PaneObservation::incomplete(Vec::new());
+        r.reconcile_once().await;
+
+        assert_eq!(
+            store.by_session("tmux-idle").await.map(|a| a.state),
+            Some(AgentState::Idle),
+        );
+    }
+
+    /// Fix 4: a chronically-incomplete host's stale rows age out (nothing else
+    /// ever reaps them) once it has failed to answer for the whole inactivity
+    /// window, while a freshly-active row on the same host survives. tmux
+    /// answers complete; herdr times out (incomplete) every tick. Inside the
+    /// window herdr is still presumed present; past it, a herdr row idle past
+    /// the window flips to `Stopped` and a recently-active one is spared by the
+    /// last-activity threshold.
     #[tokio::test]
     async fn cross_host_ages_out_chronically_incomplete_host() {
         let store = Store::shared();
         let old = datetime!(2026-04-24 12:00:00 UTC);
-        let fresh = time::OffsetDateTime::now_utc();
         store.apply(&started("herdr-stale", "herdr:p1", old)).await;
-        store
-            .apply(&started("herdr-fresh", "herdr:p2", fresh))
-            .await;
 
         let tmux = FakeLiveness::new(vec![pane("%1")]).with_kind(HostKind::Tmux);
         // herdr never answers — incomplete, empty, every tick.
@@ -894,6 +1134,21 @@ mod tests {
         let r =
             Reconciler::with_sources(store.clone(), vec![tmux, herdr], Duration::from_millis(10))
                 .with_paneless_stale_timeout(Duration::from_secs(1));
+        // Inside the window herdr is still presumed present.
+        r.reconcile_once().await;
+        assert_eq!(
+            store.by_session("herdr-stale").await.map(|a| a.state),
+            Some(AgentState::Idle),
+            "a host is not given up on before the window elapses",
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        store
+            .apply(&started(
+                "herdr-fresh",
+                "herdr:p2",
+                time::OffsetDateTime::now_utc(),
+            ))
+            .await;
         r.reconcile_once().await;
 
         let snap = store.snapshot().await;
@@ -1361,12 +1616,10 @@ mod tests {
         assert_eq!(agent.rate_limit_5h_pct, Some(100.0));
     }
 
-    /// Credit-plan exhaustion (windows null, `credits.has_credits:false`)
-    /// must also flip the row to `Error`. This is the real shape that left a
-    /// rate-limited codex session showing `working` before the fix.
+    /// Credit telemetry alone says nothing about the active model's plan
+    /// quota and must not flip a row to Error.
     #[tokio::test]
-    async fn reconcile_flips_to_error_on_credit_exhaustion() {
-        use crate::event::{RateLimitScope, RateLimitSource};
+    async fn reconcile_codex_credit_telemetry_does_not_change_state() {
         let store = Store::shared();
         let t0 = datetime!(2026-04-24 12:00:00 UTC);
         store.apply(&codex_started("cdxc", "%11", t0)).await;
@@ -1395,9 +1648,9 @@ mod tests {
 
         let snap = store.snapshot().await;
         let agent = snap.iter().find(|a| a.session_id == "cdxc").expect("row");
-        assert_eq!(agent.state, AgentState::Error);
-        assert_eq!(agent.rate_limit_scope, Some(RateLimitScope::Unknown));
-        assert_eq!(agent.rate_limit_source, Some(RateLimitSource::CodexRollout));
+        assert_eq!(agent.state, AgentState::Idle);
+        assert_eq!(agent.rate_limit_scope, None);
+        assert_eq!(agent.rate_limit_source, None);
     }
 
     /// A rollout with utilization but no reached cap fills the percentage
@@ -1425,6 +1678,324 @@ mod tests {
         assert_eq!(agent.rate_limit_5h_pct, Some(42.0));
         assert_eq!(agent.rate_limit_7d_pct, Some(46.0));
         assert!(agent.rate_limit_scope.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_codex_saturated_weekly_plan_quota_keeps_working() {
+        let store = Store::shared();
+        let now = OffsetDateTime::now_utc();
+        let started = codex_started("credit-working", "%8", now);
+        store.apply(&started).await;
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: started.id().clone(),
+                prompt: "continue".into(),
+                at: now,
+            })
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        write_codex_rollout(root.path(), "credit-working", 100.0, "null");
+        let path = codex_rollout::locate_rollout(root.path(), "credit-working", now, 0).unwrap();
+        std::fs::write(&path, r#"{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":100.0,"window_minutes":10080,"resets_at":1791269103},"secondary":null,"credits":{"has_credits":false,"unlimited":false},"rate_limit_reached_type":null}}}
+"#).unwrap();
+        let mut p = pane("%8");
+        p.current_command = "codex".into();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            FakeLiveness::new(vec![p]),
+            Duration::from_millis(10),
+        )
+        .with_codex_sessions_root(Some(root.path().to_path_buf()));
+        reconciler.reconcile_once().await;
+        let row = store.by_session("credit-working").await.unwrap();
+        assert_eq!(row.state, AgentState::Working);
+        assert_eq!(row.rate_limit_5h_pct, None);
+        assert_eq!(row.rate_limit_7d_pct, Some(100.0));
+        assert_eq!(row.rate_limit_scope, None);
+        assert_eq!(row.rate_limit_source, None);
+        reconciler.reconcile_once().await;
+        assert_eq!(
+            store
+                .by_session("credit-working")
+                .await
+                .unwrap()
+                .last_activity_at,
+            row.last_activity_at
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_codex_rollout_recovers_quota_error_when_tool_hook_is_missing() {
+        let store = Store::shared();
+        let now = OffsetDateTime::now_utc();
+        let start = codex_started("rollout-recovery", "%8", now);
+        let capped_at = now - time::Duration::seconds(20);
+        store
+            .apply(&AgentEvent::RateLimited {
+                id: start.id().clone(),
+                scope: RateLimitScope::FiveHour,
+                source: RateLimitSource::CodexRollout,
+                resets_at: None,
+                message: None,
+                at: capped_at,
+            })
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        write_codex_rollout(root.path(), "rollout-recovery", 100.0, "null");
+        let path = codex_rollout::locate_rollout(root.path(), "rollout-recovery", now, 0).unwrap();
+        let mut p = pane("%8");
+        p.current_command = "codex".into();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            FakeLiveness::new(vec![p]),
+            Duration::from_millis(10),
+        )
+        .with_codex_sessions_root(Some(root.path().to_path_buf()));
+        for at in [
+            capped_at - time::Duration::seconds(10),
+            now - time::Duration::seconds(5),
+        ] {
+            let record = serde_json::json!({"timestamp":at.format(&time::format_description::well_known::Rfc3339).unwrap(),
+                "type":"response_item","payload":{"type":"custom_tool_call_output"}});
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
+                "{record}"
+            )
+            .unwrap();
+            reconciler.reconcile_once().await;
+            let row = store.by_session("rollout-recovery").await.unwrap();
+            if at < capped_at {
+                assert_eq!(
+                    row.state,
+                    AgentState::Error,
+                    "old execution cannot clear an error"
+                );
+            } else {
+                assert_eq!(row.state, AgentState::Working);
+                assert_eq!(row.last_activity_at, at);
+                assert_eq!(row.rate_limit_source, None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_codex_completed_turn_clears_old_inferred_error() {
+        let store = Store::shared();
+        let now = OffsetDateTime::now_utc();
+        let previous_activity = now - time::Duration::minutes(5);
+        let started = codex_started("completed-recovery", "%8", previous_activity);
+        store
+            .apply(&AgentEvent::RateLimited {
+                id: started.id().clone(),
+                scope: RateLimitScope::FiveHour,
+                source: RateLimitSource::CodexRollout,
+                resets_at: None,
+                message: None,
+                at: previous_activity,
+            })
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        write_codex_rollout(root.path(), "completed-recovery", 100.0, "null");
+        let path =
+            codex_rollout::locate_rollout(root.path(), "completed-recovery", now, 0).unwrap();
+        writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "{}", serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Done"}})).unwrap();
+        let mut p = pane("%8");
+        p.current_command = "codex".into();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            FakeLiveness::new(vec![p]),
+            Duration::from_millis(10),
+        )
+        .with_codex_sessions_root(Some(root.path().to_path_buf()));
+        reconciler.reconcile_once().await;
+        let row = store.by_session("completed-recovery").await.unwrap();
+        assert_eq!(row.state, AgentState::Idle);
+        assert_eq!(row.last_response.as_deref(), Some("Done"));
+        assert_eq!(row.last_activity_at, previous_activity);
+        assert_eq!(row.rate_limit_source, None);
+        reconciler.reconcile_once().await;
+        assert_eq!(
+            store.by_session("completed-recovery").await.unwrap().state,
+            AgentState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_codex_lifecycle_without_quota_updates_activity_and_completion() {
+        let store = Store::shared();
+        let now = OffsetDateTime::now_utc();
+        let started = codex_started("lifecycle", "%8", now - time::Duration::seconds(20));
+        store.apply(&started).await;
+        let root = tempfile::tempdir().unwrap();
+        write_codex_rollout(root.path(), "lifecycle", 20.0, "null");
+        let path = codex_rollout::locate_rollout(root.path(), "lifecycle", now, 0).unwrap();
+        let mut p = pane("%8");
+        p.current_command = "codex".into();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            FakeLiveness::new(vec![p]),
+            Duration::from_millis(10),
+        )
+        .with_codex_sessions_root(Some(root.path().to_path_buf()));
+        for (offset, kind, payload, expected) in [
+            (
+                15,
+                "response_item",
+                serde_json::json!({"type":"reasoning"}),
+                AgentState::Working,
+            ),
+            (
+                10,
+                "event_msg",
+                serde_json::json!({"type":"task_complete"}),
+                AgentState::Idle,
+            ),
+            (
+                5,
+                "event_msg",
+                serde_json::json!({"type":"task_started"}),
+                AgentState::Working,
+            ),
+            (
+                1,
+                "event_msg",
+                serde_json::json!({"type":"task_complete","error":{"message":"Request failed"}}),
+                AgentState::Error,
+            ),
+            (
+                0,
+                "event_msg",
+                serde_json::json!({"type":"task_started"}),
+                AgentState::Working,
+            ),
+        ] {
+            let at = now - time::Duration::seconds(offset);
+            let record = serde_json::json!({"timestamp":at.format(&time::format_description::well_known::Rfc3339).unwrap(),"type":kind,"payload":payload});
+            std::fs::write(&path, format!("{record}\n")).unwrap();
+            reconciler.reconcile_once().await;
+            let row = store.by_session("lifecycle").await.unwrap();
+            assert_eq!(row.state, expected);
+            assert_eq!(row.last_activity_at, at);
+            reconciler.reconcile_once().await;
+            assert_eq!(
+                store
+                    .by_session("lifecycle")
+                    .await
+                    .unwrap()
+                    .last_activity_at,
+                at,
+                "unchanged rollout must not invent activity for latest sorting"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_codex_stale_quota_cannot_undo_resumed_turn() {
+        let store = Store::shared();
+        let now = OffsetDateTime::now_utc();
+        let started = codex_started("stale-cap", "%8", now - time::Duration::minutes(2));
+        store.apply(&started).await;
+        let root = tempfile::tempdir().unwrap();
+        write_codex_rollout(root.path(), "stale-cap", 100.0, "\"primary\"");
+        let path = codex_rollout::locate_rollout(root.path(), "stale-cap", now, 0).unwrap();
+        let mut quota: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        quota["timestamp"] = serde_json::json!((now - time::Duration::minutes(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap());
+        let resumed_at = now - time::Duration::seconds(10);
+        let working = serde_json::json!({"timestamp":resumed_at
+            .format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "type":"event_msg","payload":{"type":"task_started"}});
+        std::fs::write(path, format!("{quota}\n{working}\n")).unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            FakeLiveness::new(vec![pane("%8")]),
+            Duration::from_millis(10),
+        )
+        .with_codex_sessions_root(Some(root.path().to_path_buf()));
+        for _ in 0..2 {
+            reconciler.reconcile_once().await;
+            let row = store.by_session("stale-cap").await.unwrap();
+            assert_eq!(row.state, AgentState::Working);
+            assert_eq!(row.rate_limit_source, None);
+            assert_eq!(row.last_activity_at, resumed_at);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_codex_success_without_response_clears_previous_error() {
+        let store = Store::shared();
+        let now = OffsetDateTime::now_utc();
+        let started = codex_started("empty-success", "%8", now - time::Duration::minutes(2));
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: started.id().clone(),
+                level: crate::event::NotificationLevel::Error,
+                message: "Capacity".into(),
+                at: now - time::Duration::minutes(1),
+            })
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        write_codex_rollout(root.path(), "empty-success", 20.0, "null");
+        let path = codex_rollout::locate_rollout(root.path(), "empty-success", now, 0).unwrap();
+        let at = now - time::Duration::seconds(10);
+        std::fs::write(
+            path,
+            serde_json::json!({"timestamp":at
+            .format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "type":"event_msg","payload":{"type":"task_complete","last_agent_message":null}})
+            .to_string(),
+        )
+        .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            FakeLiveness::new(vec![pane("%8")]),
+            Duration::from_millis(10),
+        )
+        .with_codex_sessions_root(Some(root.path().to_path_buf()));
+        reconciler.reconcile_once().await;
+        let row = store.by_session("empty-success").await.unwrap();
+        assert_eq!(row.state, AgentState::Idle);
+        assert_eq!(row.last_notification, None);
+        assert_eq!(row.last_activity_at, at);
+    }
+
+    #[tokio::test]
+    async fn reconcile_codex_old_rollout_does_not_override_new_permission_hook() {
+        let store = Store::shared();
+        let now = OffsetDateTime::now_utc();
+        let started = codex_started("permission", "%8", now);
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: started.id().clone(),
+                level: crate::event::NotificationLevel::NeedsInput,
+                message: "Approve command?".into(),
+                at: now,
+            })
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        write_codex_rollout(root.path(), "permission", 20.0, "null");
+        let path = codex_rollout::locate_rollout(root.path(), "permission", now, 0).unwrap();
+        let at = now - time::Duration::seconds(10);
+        std::fs::write(path, serde_json::json!({"timestamp":at.format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "type":"response_item","payload":{"type":"custom_tool_call"}}).to_string()).unwrap();
+        let mut p = pane("%8");
+        p.current_command = "codex".into();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            FakeLiveness::new(vec![p]),
+            Duration::from_millis(10),
+        )
+        .with_codex_sessions_root(Some(root.path().to_path_buf()));
+        reconciler.reconcile_once().await;
+        let row = store.by_session("permission").await.unwrap();
+        assert_eq!(row.state, AgentState::WaitingInput);
+        assert_eq!(row.last_activity_at, now);
     }
 
     /// An unchanged rollout reading must NOT re-emit events: every `apply()`

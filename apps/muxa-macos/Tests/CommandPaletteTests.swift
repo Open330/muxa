@@ -247,3 +247,66 @@ func paletteViewSelectsNewBestMatchAndRetainsManualSelectionOnRefresh(refresh: B
         #expect(selectedMode == expected)
     }
 }
+
+/// One fleet host whose panes each run one agent.
+private func agentHost(
+    _ alias: String, local: Bool, state: String = "online", agents: [(pane: String, state: String, alias: String)]
+) throws -> MuxaFleetHost {
+    let wireAgents: [[String: Any]] = agents.map { agent in
+        ["kind": "claude_code", "agent_session_id": "\(alias)-\(agent.pane)", "state": agent.state,
+         "pane": agent.pane, "tmux_socket": "default"]
+    }
+    let panes: [[String: Any]] = agents.map { agent in
+        ["pane_id": agent.pane, "title": "", "session_id": "$1", "session": "demo", "window_id": "@1",
+         "window_name": "impl", "window_index": "0", "pane_index": String(agent.pane.dropFirst()),
+         "current_command": "claude", "current_path": "/tmp", "socket": "default", "agent_alias": agent.alias]
+    }
+    return try JSONDecoder().decode(MuxaFleetHost.self, from: JSONSerialization.data(withJSONObject: [
+        "alias": alias, "local": local, "mode": "control", "state": state,
+        "remote": ["agents": wireAgents, "panes": panes],
+    ]))
+}
+
+@Test func jumpToAgentRanksAcrossHostsAndBadgesTheHost() throws {
+    let snapshot = MuxaExecutionSnapshot(hosts: [
+        try agentHost("local", local: true, agents: [("%1", "idle", "local-idle"), ("%2", "working", "local-busy")]),
+        try agentHost("jiun-mini", local: false, agents: [("%1", "waiting_input", "mini-waiting")]),
+        try agentHost("june-mbp", local: false, agents: [("%4", "blocked", "mbp-blocked"), ("%5", "idle", "mbp-idle")]),
+        try agentHost("jiun-mbp", local: false, state: "offline", agents: [("%1", "waiting_choice", "stale-waiting")]),
+    ])
+    let unread: Set = [MuxaWatchPaneIdentity(hostAlias: "june-mbp", socket: "default", paneID: "%5")]
+    let items = MuxaPaletteItems.agents(watchHosts: snapshot.watchHosts, unread: unread)
+    // Attention on every host first, a stale offline host's after the live
+    // ones, then unread, working, idle; ties keep topology order.
+    #expect(items.map(\.title) == [
+        "@mini-waiting", "@mbp-blocked", "@stale-waiting", "@mbp-idle", "@local-busy", "@local-idle",
+    ])
+    #expect(items.map { $0.host?.alias } == ["jiun-mini", "june-mbp", "jiun-mbp", "june-mbp", "local", "local"])
+    // The host is a badge rather than subtitle text, and still searchable.
+    #expect(items.allSatisfy { !$0.subtitle.contains("june-mbp") && !$0.subtitle.contains("jiun") })
+    let byHost = MuxaPaletteSearch.results(items, query: "june-mbp", recent: [])
+    #expect(byHost.map(\.title).sorted() == ["@mbp-blocked", "@mbp-idle"])
+    // A remote row opens that host's pane, the way Explore does.
+    let remote = MuxaWatchPaneIdentity(hostAlias: "jiun-mini", socket: "default", paneID: "%1")
+    #expect(items[0].action == .navigate(.pane(remote)))
+
+    // ⇧⌘J cycles through the same order across hosts.
+    let cycle = MuxaAttention.cycle(in: snapshot.watchHosts)
+    #expect(cycle.map(\.hostAlias) == ["jiun-mini", "june-mbp", "jiun-mbp"])
+    #expect(MuxaAttention.next(after: cycle[0], in: cycle) == cycle[1])
+    #expect(MuxaAttention.next(after: cycle[2], in: cycle) == cycle[0])
+}
+
+@Test func jumpToAgentOmitsTheHostBadgeWhenEverythingIsLocal() throws {
+    let snapshot = MuxaExecutionSnapshot(hosts: [
+        try agentHost("local", local: true, agents: [("%1", "idle", "a"), ("%2", "waiting_input", "b")]),
+        try agentHost("jiun-mini", local: false, agents: []),
+    ])
+    let items = MuxaPaletteItems.agents(watchHosts: snapshot.watchHosts)
+    #expect(items.map(\.title) == ["@b", "@a"])
+    #expect(items.allSatisfy { $0.host == nil })
+    let offline = MuxaFleetHostIdentity(alias: "x", local: false, state: "offline", mode: "control")
+    let degraded = MuxaFleetHostIdentity(alias: "x", local: false, state: "degraded", mode: "control")
+    #expect(!MuxaAttention.isReachable(offline))
+    #expect(MuxaAttention.isReachable(degraded))
+}

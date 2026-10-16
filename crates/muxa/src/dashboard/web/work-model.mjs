@@ -14,8 +14,12 @@ export function normalizeAgent(agent) {
   return { ...agent, session_id: agent.agent_session_id };
 }
 
+// The key travels through data-* attributes, so it must survive HTML
+// parsing: a NUL separator is rewritten to U+FFFD by the parser and the
+// clicked card then matches no Work. JSON keeps the two parts unambiguous
+// with printable characters only.
 export function logicalWorkKey(identity) {
-  return `${identity?.workspace_id || ""}\u0000${identity?.work_id || ""}`;
+  return JSON.stringify([identity?.workspace_id || "", identity?.work_id || ""]);
 }
 
 export function validateWorkSnapshot(snapshot) {

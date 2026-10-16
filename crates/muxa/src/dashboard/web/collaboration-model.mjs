@@ -1,8 +1,15 @@
+import { baseSessionName } from "./session-model.mjs";
 // Pure collaboration projections used by the dashboard graph and sequence
 // views. Keeping this module DOM-free makes the identity and aggregation rules
 // independently testable without adding a frontend build step.
 
 const SEP = "\u001f";
+
+// Recipient and live request state determine attention, never sender/prose.
+export function needsHumanResponse(request) {
+  return request?.to?.console === true && request.expects_reply === true
+    && request.kind !== "notice" && ["queued", "claimed"].includes(request.status);
+}
 
 export function normalizeCollaborationPayload(payload) {
   if (Array.isArray(payload)) {
@@ -50,7 +57,7 @@ export function roomKey(room) {
 export function roomLabel(request) {
   const participant = requestAnchor(request);
   const room = participant.room || {};
-  const session = participant.tmux_session_name || participant.tmux_session_id || room.host || "host";
+  const session = baseSessionName(participant.tmux_session_name) || participant.tmux_session_id || room.host || "host";
   const window = participant.window_name || room.window_id || "room";
   const socket = room.socket ? ` · ${shortSocket(room.socket)}` : "";
   return `${session}:${window}${socket}`;
@@ -125,6 +132,7 @@ export function projectCollaboration(requests) {
         to: to.id,
         count: 0,
         replyCount: 0,
+        humanCount: 0,
         replyStatuses: {},
         kinds: {},
         statuses: {},
@@ -134,6 +142,7 @@ export function projectCollaboration(requests) {
     }
     const edge = edges.get(key);
     edge.count += 1;
+    if (needsHumanResponse(request)) edge.humanCount += 1;
     increment(edge.kinds, request.kind || "unknown");
     increment(edge.statuses, request.status || "unknown");
     if (request.reply) {
@@ -148,6 +157,8 @@ export function projectCollaboration(requests) {
         key: room,
         room: requestAnchor(request)?.room || null,
         label: roomLabel(request),
+        session: baseSessionName(requestAnchor(request)?.tmux_session_name),
+        socket: requestAnchor(request)?.socket || requestAnchor(request)?.room?.socket || "",
         count: 0,
         latestAt: request.created_at || "",
       });
@@ -167,6 +178,7 @@ export function projectCollaboration(requests) {
 
   return {
     nodes: [...nodes.values()].sort((left, right) => left.label.localeCompare(right.label)),
+    humanCount: (requests || []).filter(needsHumanResponse).length,
     edges: [...edges.values()].sort((left, right) => right.count - left.count || left.key.localeCompare(right.key)),
     rooms: [...rooms.values()].sort((left, right) => right.count - left.count || left.label.localeCompare(right.label)),
     works: [...works].sort(),
@@ -232,6 +244,43 @@ export function sequenceParticipants(requests) {
     label: participantLabel(participant),
     subtitle: participantSubtitle(participant),
   }));
+}
+
+/// The tmux session a participant's pane lives in, `{ session, socket }`, or
+/// null. `resolvePane(paneId, socket)` is the live pane scan's answer
+/// (topology-model.mjs paneSessionResolver); a pane the scan no longer knows
+/// falls back to the session name the request recorded. The operator console
+/// and agents without a pane have no session.
+export function participantSession(participant, resolvePane = () => null) {
+  if (!participant || participant.console || !participant.pane) return null;
+  const socket = participant.socket || participant.room?.socket || null;
+  const live = resolvePane(participant.pane, socket);
+  if (live) return live;
+  const name = participant.tmux_session_name;
+  return name ? { session: baseSessionName(name), socket: socket ? shortSocket(socket) : null } : null;
+}
+
+/// Requests inside a rail scope (`{ session, socket, workspace }` from
+/// workspace-rail.mjs railScope; `null` = everything). For a session scope a
+/// request is kept when its sender or recipient pane belongs to that session,
+/// so a participant without a pane (the console, an agent outside tmux)
+/// appears only through a message exchanged with an in-scope participant. A
+/// managed workspace with no live session keeps the requests filed under its
+/// Work.
+export function scopeCollaborationRequests(requests, scope, resolvePane = () => null) {
+  const all = requests || [];
+  if (!scope) return all;
+  if (!scope.session) {
+    if (!scope.workspace) return [];
+    return all.filter((request) =>
+      (request?.workspace_id || request?.work?.workspace_id || "") === scope.workspace);
+  }
+  const inScope = (participant) => {
+    const hit = participantSession(participant, resolvePane);
+    if (!hit || baseSessionName(hit.session) !== baseSessionName(scope.session)) return false;
+    return !scope.socket || !hit.socket || hit.socket === shortSocket(scope.socket);
+  };
+  return all.filter((request) => inScope(request?.from) || inScope(request?.to));
 }
 
 export function dominantCount(counts) {

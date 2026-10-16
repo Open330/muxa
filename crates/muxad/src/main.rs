@@ -45,6 +45,7 @@ use tokio::sync::broadcast;
 mod binary_watch;
 mod fleet_manager;
 mod herdr_bridge;
+mod pipeline_reconciler;
 mod screen_detect;
 mod synthetic;
 
@@ -142,7 +143,18 @@ async fn main() -> Result<()> {
         .init();
 
     let config_path = args.config.clone().or_else(paths::default_config_file);
-    let cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
+    let mut cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
+    if let Some(path) = config_path.as_deref() {
+        match muxa::automation_defaults::install(path) {
+            Ok(true) => {
+                cfg =
+                    Config::load_or_default(Some(path)).context("reloading default automations")?;
+                tracing::info!("installed missing disabled default automations");
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "could not install disabled default automations"),
+        }
+    }
     // Daemon-only invariants — the dashboard wire-up and sink fan-out
     // checks the CLI deliberately skips. Failing here is preferable to
     // crashing mid-startup once we try to bind the dashboard socket.
@@ -185,7 +197,7 @@ async fn main() -> Result<()> {
     let store = Store::shared_with_history(history.clone());
     let collaboration = build_collaboration(&cfg).await;
     let collaboration_audit = build_collaboration_audit(&cfg);
-    let ask = build_ask(&cfg, config_path.clone()).await;
+    let ask = build_ask(&cfg, config_path.clone(), Some(socket.clone())).await;
     let automation = build_automation(&cfg, config_path.clone());
     let pipeline_runs = PipelineRunStore::load(paths::default_pipeline_run_file())
         .context("loading durable pipeline Runs")?;
@@ -221,6 +233,9 @@ async fn main() -> Result<()> {
     // spawns so the first save isn't a no-op overwrite of the file we
     // just read.
     hydrate_state(&cfg, &store).await;
+    store
+        .reconcile_native_surfaces(|id| sessions.session_liveness(id))
+        .await;
     // Capability-gated: enrichment classifies panes by foreground
     // command, which the zellij CLI baseline doesn't expose. The
     // function itself respects `caps()` so it's safe to always call;
@@ -243,6 +258,7 @@ async fn main() -> Result<()> {
         backends.clone(),
         Client::new(socket.clone()),
         restart.generation(),
+        collaboration.subscribe(),
         shutdown_tx.subscribe(),
     )
     .await;
@@ -257,7 +273,13 @@ async fn main() -> Result<()> {
     )
     .await;
     let gc_handle = spawn_gc_task(&store, &shutdown_tx);
-    let reconciler_handle = spawn_reconciler_task(&cfg, &store, &shutdown_tx, backends.clone());
+    let reconciler_handle = spawn_reconciler_task(
+        &cfg,
+        &store,
+        &shutdown_tx,
+        backends.clone(),
+        sessions.clone(),
+    );
     let binary_watch_handle = spawn_binary_watch_task(&cfg, &shutdown_tx, Arc::clone(&restart));
     // herdr event bridge (Phase 2): spawned when herdr ∈ the observed set.
     // Translates herdr's own agent-state detection into synthetic muxa rows so
@@ -301,6 +323,7 @@ async fn main() -> Result<()> {
         ask.clone(),
         store.clone(),
         backends.clone(),
+        cfg.swap.clone(),
         &shutdown_tx,
     );
 
@@ -316,6 +339,7 @@ async fn main() -> Result<()> {
     // Desktop notifier: spawned only when opted in. We subscribe BEFORE
     // the server starts accepting events so no early transition is lost.
     if cfg.notifier.enabled && matches!(cfg.notifier.backend, NotifierBackend::Libnotify) {
+        tokio::spawn(Notifier::new().run_human_requests(collaboration.clone()));
         let rx = store.subscribe();
         tokio::spawn(async move {
             if let Err(e) = Notifier::new().run(rx).await {
@@ -400,6 +424,10 @@ async fn main() -> Result<()> {
         .find(|b| b.kind() == muxa::HostKind::Zellij)
         .cloned()
         .unwrap_or_else(|| primary.clone());
+    // WS-F: snapshot
+    let mux_snapshots = muxa::mux_snapshot_control::MuxSnapshotControl::new(socket.clone());
+    let mux_snapshot_handle =
+        spawn_mux_snapshot_task(&cfg.snapshot, Arc::clone(&mux_snapshots), &shutdown_tx);
     let server = Server::new(socket.clone(), store)
         .with_backend(ipc_backend)
         // The full observed set, so control methods (`send_prompt`,
@@ -415,6 +443,7 @@ async fn main() -> Result<()> {
         .with_config_path(config_path.clone())
         .with_fleet(fleet_runtime)
         .with_pipeline_runs(pipeline_runs.clone())
+        .with_mux_snapshots(mux_snapshots) // WS-F: snapshot
         .with_restart_controller(Arc::clone(&restart));
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
@@ -436,7 +465,7 @@ async fn main() -> Result<()> {
     // Its initial authoritative scan still catches completions committed
     // between server start and subscription.
     let pipeline_reconciler_handle =
-        spawn_pipeline_reconciler_task(pipeline_runs, socket.clone(), &shutdown_tx);
+        pipeline_reconciler::spawn(pipeline_runs, socket.clone(), &shutdown_tx);
 
     // Self-heal: if a tmux server is already running, inject our socket
     // path into its environment so that every pane — including any that
@@ -478,6 +507,7 @@ async fn main() -> Result<()> {
     await_shutdown_task("pipeline reconciler", Some(pipeline_reconciler_handle)).await;
     await_shutdown_task("pipeline state projection", Some(pipeline_state_handle)).await;
     await_shutdown_task("fleet manager", Some(fleet_handle)).await;
+    await_shutdown_task("workspace snapshot", mux_snapshot_handle).await; // WS-F: snapshot
 
     let _ = activity_transition_shutdown_tx.send(());
     await_shutdown_task("activity transition", activity_transition_handle).await;
@@ -545,7 +575,11 @@ async fn await_shutdown_task(name: &'static str, handle: Option<tokio::task::Joi
 /// Resolve `[ask]` into a live store. Mirrors `build_collaboration`:
 /// the history path is only materialized when the feature is on, so a
 /// disabled ask never creates a file.
-async fn build_ask(cfg: &Config, config_path: Option<PathBuf>) -> Arc<AskStore> {
+async fn build_ask(
+    cfg: &Config,
+    config_path: Option<PathBuf>,
+    socket: Option<PathBuf>,
+) -> Arc<AskStore> {
     let options = AskOptions {
         enabled: cfg.ask.enabled,
         agent: cfg.ask.agent.clone(),
@@ -565,6 +599,7 @@ async fn build_ask(cfg: &Config, config_path: Option<PathBuf>) -> Arc<AskStore> 
         keep: cfg.ask.keep,
         providers: cfg.ask.providers.clone(),
         config_path,
+        socket,
     };
     let store = AskStore::load(options).await;
     if cfg.ask.enabled {
@@ -632,41 +667,51 @@ fn build_collaboration_audit(cfg: &Config) -> Arc<CollaborationAuditLog> {
     CollaborationAuditLog::in_memory()
 }
 
-/// Completion changes wake a daemon-owned reconciliation loop. The worker
-/// deliberately invokes the installed `muxa` binary instead of duplicating
-/// its allowlisted agent-launch policy inside muxad; the CLI atomically claims
-/// ready aliases over IPC before touching tmux, so a user-triggered `work up`
-/// racing this worker cannot launch a duplicate.
-fn spawn_pipeline_reconciler_task(
-    pipeline_runs: Arc<PipelineRunStore>,
-    socket: PathBuf,
+// WS-F: snapshot
+/// Automatic workspace snapshots (`[snapshot]`, on by default every 15
+/// minutes). The first one waits a full interval: right after a reboot the
+/// multiplexer is empty or half rebuilt, and that is the workspace nobody
+/// wants as the newest snapshot. `muxa snapshot --auto` itself skips an
+/// unchanged workspace and prunes old automatic snapshots.
+fn spawn_mux_snapshot_task(
+    config: &muxa::config::SnapshotConfig,
+    control: Arc<muxa::mux_snapshot_control::MuxSnapshotControl>,
     shutdown_tx: &broadcast::Sender<()>,
-) -> tokio::task::JoinHandle<()> {
-    let mut changes = pipeline_runs.subscribe();
+) -> Option<tokio::task::JoinHandle<()>> {
+    if config.auto_interval_minutes == 0 {
+        return None;
+    }
+    let period = std::time::Duration::from_secs(config.auto_interval_minutes.saturating_mul(60));
+    let keep = config.keep_auto;
     let mut shutdown = shutdown_tx.subscribe();
-    tokio::spawn(async move {
-        let mut safety_scan = tokio::time::interval(std::time::Duration::from_secs(30));
-        safety_scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    Some(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let ready = pipeline_runs
-                .list()
-                .await
-                .iter()
-                .any(muxa::pipeline_run::PipelineRun::has_ready_alias);
-            if ready {
-                run_pipeline_reconciler(&socket).await;
-            }
             tokio::select! {
-                revision = changes.changed() => {
-                    if revision.is_err() {
-                        break;
-                    }
-                }
-                _ = safety_scan.tick() => {}
+                _ = ticks.tick() => {}
                 _ = shutdown.recv() => break,
             }
+            match control.auto(keep).await {
+                Ok(outcome) if outcome["skipped"].as_bool() == Some(true) => {
+                    let reason = outcome["reason"].as_str().unwrap_or("skipped");
+                    if reason == "ambiguous_server" {
+                        tracing::warn!(
+                            detail = outcome["message"].as_str().unwrap_or_default(),
+                            "automatic snapshot skipped"
+                        );
+                    } else {
+                        tracing::debug!(reason, "automatic snapshot skipped");
+                    }
+                }
+                Ok(outcome) => tracing::debug!(
+                    id = outcome["id"].as_str().unwrap_or_default(),
+                    "automatic snapshot written"
+                ),
+                Err(error) => tracing::warn!(%error, "automatic snapshot failed"),
+            }
         }
-    })
+    }))
 }
 
 fn spawn_pipeline_state_task(
@@ -728,40 +773,6 @@ async fn observe_pipeline_agent(
     }
 }
 
-async fn run_pipeline_reconciler(socket: &Path) {
-    let program = std::env::var_os("MUXA_PIPELINE_CLI").map_or_else(
-        || {
-            std::env::current_exe()
-                .ok()
-                .map(|path| path.with_file_name("muxa"))
-                .filter(|path| path.exists())
-                .unwrap_or_else(|| PathBuf::from("muxa"))
-        },
-        PathBuf::from,
-    );
-    match tokio::process::Command::new(&program)
-        .args(["work", "reconcile", "--all"])
-        .env("MUXA_SOCKET", socket)
-        .output()
-        .await
-    {
-        Ok(output) if output.status.success() => {
-            tracing::debug!(program = %program.display(), "pipeline reconcile completed");
-        }
-        Ok(output) => {
-            tracing::warn!(
-                program = %program.display(),
-                status = %output.status,
-                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                "pipeline reconcile command failed",
-            );
-        }
-        Err(error) => {
-            tracing::warn!(program = %program.display(), %error, "could not start pipeline reconciler");
-        }
-    }
-}
-
 /// Resolve `[automation]` into a live store. The ledger is materialized
 /// unconditionally — the guards read from it, and an operator who adds a
 /// rule at runtime should not have to restart the daemon to get one.
@@ -803,6 +814,7 @@ fn spawn_automation_task(
     ask: Arc<AskStore>,
     store: muxa::SharedStore,
     backends: Vec<muxa::SharedBackend>,
+    swap: muxa::account_swap::SwapConfig,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -813,6 +825,7 @@ fn spawn_automation_task(
     tokio::spawn(async move {
         let mut engine = AutomationEngine::new(automation, store, backends);
         engine.ask = Some(ask);
+        engine.swap = swap;
         engine.rescan().await;
         let mut reconcile =
             tokio::time::interval(std::time::Duration::from_secs(AUTOMATION_RECONCILE_SECONDS));
@@ -876,6 +889,8 @@ struct AutomationEngine {
     panes_read_at: Option<std::time::Instant>,
     ask: Option<Arc<AskStore>>,
     judgments: tokio::task::JoinSet<JudgedFiring>,
+    /// `[swap]` defaults for the `swap_account` action.
+    swap: muxa::account_swap::SwapConfig,
 }
 
 struct JudgedFiring {
@@ -904,6 +919,7 @@ impl AutomationEngine {
             panes_read_at: None,
             ask: None,
             judgments: tokio::task::JoinSet::new(),
+            swap: muxa::account_swap::SwapConfig::default(),
         }
     }
 
@@ -1316,6 +1332,7 @@ impl AutomationEngine {
     /// place to read.
     async fn perform(&self, firing: &PlannedFiring) -> bool {
         match firing.action {
+            AutomationAction::PressEnter => self.confirm_selected_yes(firing).await,
             AutomationAction::SendPrompt => {
                 let Some(text) = firing.text.as_deref() else {
                     return false;
@@ -1326,10 +1343,9 @@ impl AutomationEngine {
                 if !firing.submit {
                     return true;
                 }
-                // Same grace the collaboration waker uses: codex's TUI reads
-                // an immediate trailing Enter as part of the pasted burst and
-                // leaves the prompt composed but unsubmitted.
-                tokio::time::sleep(muxa::backend::PROMPT_SUBMIT_GRACE).await;
+                // Native hosts use explicit paste boundaries; only hosts
+                // without that support need a best-effort fallback delay.
+                tokio::time::sleep(muxa::backend::prompt_submit_grace(&firing.pane)).await;
                 send_automation_text(&self.backends, firing, "\r").await
             }
             // A notice, not a keystroke: nothing is typed into the pane. The
@@ -1350,7 +1366,101 @@ impl AutomationEngine {
             AutomationAction::Interrupt => {
                 send_automation_text(&self.backends, firing, "\u{3}").await
             }
+            AutomationAction::SwapAccount => self.swap_account(firing).await,
         }
+    }
+
+    /// Move the capped agent onto another `aas` account and resume it. The
+    /// firing was re-checked just before this, so the agent is the one the
+    /// rule armed on; `force` only lets a cap that reads as `Starting` through.
+    async fn swap_account(&self, firing: &PlannedFiring) -> bool {
+        use muxa::account_swap::{self, AccountChoice, SwapRequest, SwapScope, SwapStatus};
+        let Some(agent) = self.store.by_session(&firing.agent_session_id).await else {
+            return false;
+        };
+        let mut request = SwapRequest::new(
+            SwapScope::Targets(vec![firing.agent_session_id.clone()]),
+            &self.swap,
+        );
+        request.to = AccountChoice::parse(firing.account.as_deref().unwrap_or("auto"));
+        request.force = true;
+        if let Some(text) = firing.text.clone() {
+            request.continue_text = Some(text).filter(|text| !text.trim().is_empty());
+        }
+        let backends = self.backends.clone();
+        let config = self.swap.clone();
+        let outcomes = tokio::task::spawn_blocking(move || {
+            account_swap::run(&request, std::slice::from_ref(&agent), &backends, &config)
+        })
+        .await
+        .unwrap_or_default();
+        let Some(outcome) = outcomes.into_iter().next() else {
+            return false;
+        };
+        tracing::info!(
+            rule = %firing.rule,
+            pane = %firing.pane,
+            from = outcome.from.as_deref().unwrap_or("?"),
+            to = outcome.to.as_deref().unwrap_or("?"),
+            status = %outcome.status,
+            note = %outcome.note,
+            "automation account swap",
+        );
+        outcome.status == SwapStatus::Swapped
+    }
+
+    /// Capture immediately before Enter; a waiting state alone cannot identify
+    /// the selected option. Recheck state/config after the blocking capture.
+    async fn confirm_selected_yes(&self, firing: &PlannedFiring) -> bool {
+        let revision = *self.automation.subscribe().borrow();
+        let Some(kind) = muxa::backend::pane_id_host_kind(&firing.pane) else {
+            return false;
+        };
+        let Some(backend) = self
+            .backends
+            .iter()
+            .find(|backend| backend.kind() == kind)
+            .cloned()
+        else {
+            return false;
+        };
+        let pane = firing.pane.clone();
+        let socket = firing.socket.clone();
+        let capture =
+            tokio::task::spawn_blocking(move || backend.capture_pane_on(socket.as_deref(), &pane));
+        let Ok(Ok(Some(screen))) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), capture).await
+        else {
+            return false;
+        };
+        if !muxa::automation_choice::affirmative_choice_visible(&screen) {
+            return false;
+        }
+        let config = self.automation.config().await;
+        let Some(rule) = config.rule_named(&firing.rule) else {
+            return false;
+        };
+        if revision != *self.automation.subscribe().borrow() {
+            return false;
+        }
+        if !config.active_at(time::OffsetDateTime::now_utc())
+            || !rule.enabled
+            || rule.action != AutomationAction::PressEnter
+        {
+            return false;
+        }
+        let Some(agent) = self.store.by_session(&firing.agent_session_id).await else {
+            return false;
+        };
+        let subject = AutomationSubject::from_agent(&agent);
+        if subject.pane.as_deref() != Some(firing.pane.as_str())
+            || subject.socket != firing.socket
+            || subject.episode() != firing.episode
+            || !subject.satisfies(muxa::automation::AutomationCondition::WaitingInput)
+        {
+            return false;
+        }
+        send_automation_text(&self.backends, firing, "\r").await
     }
 
     /// The registry row behind a firing, as the live store has it now.
@@ -1455,9 +1565,15 @@ async fn send_automation_text(
     let pane = firing.pane.clone();
     let socket = firing.socket.clone();
     let text = text.to_string();
-    tokio::task::spawn_blocking(move || backend.send_text_on(socket.as_deref(), &pane, &text))
-        .await
-        .unwrap_or(false)
+    tokio::task::spawn_blocking(move || {
+        if text == "\r" || text == "\u{3}" {
+            backend.send_text_on(socket.as_deref(), &pane, &text)
+        } else {
+            backend.send_prompt_text_on(socket.as_deref(), &pane, &text)
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 fn spawn_collaboration_waker_task(
@@ -1467,7 +1583,7 @@ fn spawn_collaboration_waker_task(
     backends: Vec<muxa::SharedBackend>,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if !cfg.collaboration.enabled || cfg.collaboration.wake == CollaborationWake::Never {
+    if !cfg.collaboration.enabled {
         return None;
     }
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -1477,16 +1593,25 @@ fn spawn_collaboration_waker_task(
     let mut mailbox_changes = collaboration.subscribe();
     let mut agent_transitions = store.subscribe();
     let wake_payload = cfg.collaboration.wake_payload;
+    let wake_enabled = cfg.collaboration.wake != CollaborationWake::Never;
     Some(tokio::spawn(async move {
         let mut wake_inflight = HashSet::new();
-        wake_idle_collaboration_peers_with_inflight(
-            &collaboration,
-            &store,
-            &backends,
-            wake_payload,
-            &mut wake_inflight,
-        )
-        .await;
+        if let Err(error) = collaboration
+            .reconcile_peer_interruptions(&store.snapshot().await)
+            .await
+        {
+            tracing::warn!(%error, "initial peer interruption reconciliation failed");
+        }
+        if wake_enabled {
+            wake_idle_collaboration_peers_with_inflight(
+                &collaboration,
+                &store,
+                &backends,
+                wake_payload,
+                &mut wake_inflight,
+            )
+            .await;
+        }
         let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(
             COLLABORATION_WAKE_RECONCILE_SECONDS,
         ));
@@ -1533,14 +1658,22 @@ fn spawn_collaboration_waker_task(
                 _ = shutdown_rx.recv() => break,
             };
             if should_scan {
-                wake_idle_collaboration_peers_with_inflight(
-                    &collaboration,
-                    &store,
-                    &backends,
-                    wake_payload,
-                    &mut wake_inflight,
-                )
-                .await;
+                if let Err(error) = collaboration
+                    .reconcile_peer_interruptions(&store.snapshot().await)
+                    .await
+                {
+                    tracing::warn!(%error, "peer interruption reconciliation failed");
+                }
+                if wake_enabled {
+                    wake_idle_collaboration_peers_with_inflight(
+                        &collaboration,
+                        &store,
+                        &backends,
+                        wake_payload,
+                        &mut wake_inflight,
+                    )
+                    .await;
+                }
             }
         }
     }))
@@ -1594,15 +1727,17 @@ async fn wake_idle_collaboration_peers_with_inflight(
     }
     let agents = store.snapshot().await;
     let listed_backends = backends.to_vec();
-    let panes = tokio::task::spawn_blocking(move || {
-        listed_backends
+    let discovery_agents = agents.clone();
+    let (panes, mut participants) = tokio::task::spawn_blocking(move || {
+        let panes = listed_backends
             .iter()
             .flat_map(|backend| backend.list_panes())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let participants = muxa::collaboration::participants_from(&discovery_agents, &panes);
+        (panes, participants)
     })
     .await
     .unwrap_or_default();
-    let mut participants = muxa::collaboration::participants_from(&agents, &panes);
     collaboration.enrich_participants(&mut participants).await;
 
     for request in requests {
@@ -1616,10 +1751,17 @@ async fn wake_idle_collaboration_peers_with_inflight(
         if wake_inflight.contains(&wake_key) {
             continue;
         }
+        let quiet = collaboration.quiet_notices_waiting(recipient).await;
         let direct_wake = collaboration_wake_includes_body(wake_payload, &request);
         if direct_wake && direct_wake_body_is_terminal_safe(&request.body) {
-            if deliver_full_collaboration_request(collaboration, recipient, &request, backends)
-                .await
+            if deliver_full_collaboration_request(
+                collaboration,
+                recipient,
+                &request,
+                backends,
+                quiet,
+            )
+            .await
             {
                 wake_inflight.insert(wake_key);
             }
@@ -1631,13 +1773,8 @@ async fn wake_idle_collaboration_peers_with_inflight(
                 "direct wake body contains terminal control characters; using mailbox notice",
             );
         }
-        let prompt = format!(
-            "[muxa:{}] New {:?} request {}. Claim/read it with muxa_inbox (MCP) or `muxa msg inbox --json`; honor kind/work_mode/paths, then respond with muxa_reply or `muxa msg reply`.",
-            request.id,
-            request.kind,
-            collaboration_request_source(&request),
-        );
-        let (sent, submitted) = send_collaboration_wake(recipient, &prompt, backends).await;
+        let prompt = with_quiet_notices(mailbox_collaboration_request_prompt(&request), quiet);
+        let (sent, submitted) = send_collaboration_wake(recipient, &prompt, backends, store).await;
         if submitted {
             wake_inflight.insert(wake_key);
         }
@@ -1660,6 +1797,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
         backends,
         replies,
         wake_inflight,
+        store,
     )
     .await;
 }
@@ -1672,6 +1810,7 @@ async fn wake_senders_of_ready_replies(
     backends: &[muxa::SharedBackend],
     replies: Vec<CollaborationRequest>,
     wake_inflight: &mut HashSet<(String, Option<String>, String)>,
+    store: &muxa::Store,
 ) {
     for request in replies {
         let Some(sender) = idle_collaboration_participant(participants, &request.from) else {
@@ -1688,7 +1827,7 @@ async fn wake_senders_of_ready_replies(
             request.to.label(),
             request.id,
         );
-        let (sent, submitted) = send_collaboration_wake(sender, &prompt, backends).await;
+        let (sent, submitted) = send_collaboration_wake(sender, &prompt, backends, store).await;
         if submitted {
             wake_inflight.insert(wake_key);
         }
@@ -1715,6 +1854,7 @@ async fn deliver_full_collaboration_request(
     recipient: &muxa::collaboration::Participant,
     pending: &CollaborationRequest,
     backends: &[muxa::SharedBackend],
+    quiet: usize,
 ) -> bool {
     let (request, newly_prepared) = if pending.status == muxa::collaboration::RequestStatus::Queued
     {
@@ -1739,11 +1879,14 @@ async fn deliver_full_collaboration_request(
 
     match request.wake_delivery {
         Some(WakeDeliveryState::Prepared) => {
-            let prompt = if newly_prepared {
-                full_collaboration_request_prompt(&request)
-            } else {
-                interrupted_collaboration_request_prompt(&request)
-            };
+            let prompt = with_quiet_notices(
+                if newly_prepared {
+                    full_collaboration_request_prompt(&request)
+                } else {
+                    interrupted_collaboration_request_prompt(&request)
+                },
+                quiet,
+            );
             if !send_collaboration_text(recipient, &prompt, backends).await {
                 return false;
             }
@@ -1754,7 +1897,7 @@ async fn deliver_full_collaboration_request(
                     "failed to persist direct wake prompt phase",
                 );
             }
-            tokio::time::sleep(muxa::backend::PROMPT_SUBMIT_GRACE).await;
+            tokio::time::sleep(muxa::backend::prompt_submit_grace(&recipient.pane)).await;
             submit_direct_collaboration_prompt(collaboration, recipient, &request.id, backends)
                 .await
         }
@@ -1787,6 +1930,27 @@ async fn mark_collaboration_request_notified(collaboration: &CollaborationStore,
     }
 }
 
+fn collaboration_reply_instruction(request: &CollaborationRequest) -> String {
+    if request.expects_reply {
+        format!(
+            "When finished, respond with muxa_reply for request {} or `muxa msg reply {0} <body>`.",
+            request.id
+        )
+    } else {
+        "No reply is expected; do not send an acknowledgement solely for this delivery.".into()
+    }
+}
+
+fn mailbox_collaboration_request_prompt(request: &CollaborationRequest) -> String {
+    format!(
+        "[muxa:{}] New {:?} request {}. Claim/read it with muxa_inbox (MCP) or `muxa msg inbox --json`; honor kind/work_mode/paths. {}",
+        request.id,
+        request.kind,
+        collaboration_request_source(request),
+        collaboration_reply_instruction(request),
+    )
+}
+
 fn full_collaboration_request_prompt(request: &CollaborationRequest) -> String {
     let paths = serde_json::to_string(&request.paths).unwrap_or_else(|_| "[]".into());
     let air_artifacts = if request.air_artifacts.is_empty() {
@@ -1797,14 +1961,7 @@ fn full_collaboration_request_prompt(request: &CollaborationRequest) -> String {
             serde_json::to_string(&request.air_artifacts).unwrap_or_else(|_| "[]".into())
         )
     };
-    let reply = if request.expects_reply {
-        format!(
-            "When finished, respond with muxa_reply for request {} or `muxa msg reply {0} <body>`.",
-            request.id
-        )
-    } else {
-        "No reply is expected; do not send an acknowledgement solely for this delivery.".into()
-    };
+    let reply = collaboration_reply_instruction(request);
     format!(
         "[muxa:{}] New {} request {}. This request is already claimed; do not call muxa_inbox for it.\nkind: {}\nwork_mode: {}\npaths: {}{}\nexpects_reply: {}\n{}\n\n--- request body ({} bytes) ---\n{}\n--- end request body ---",
         request.id,
@@ -1821,11 +1978,27 @@ fn full_collaboration_request_prompt(request: &CollaborationRequest) -> String {
     )
 }
 
+/// Mention unread one-way notices in a wake that is going out anyway: the
+/// recipient hears about them without a terminal write of their own.
+fn with_quiet_notices(mut prompt: String, quiet: usize) -> String {
+    if quiet > 0 {
+        let _ = std::fmt::Write::write_fmt(
+            &mut prompt,
+            format_args!(
+            "\n[muxa] Also waiting: {quiet} one-way notice{} (no reply expected); read with muxa_inbox or `muxa msg inbox --json`.",
+            if quiet == 1 { "" } else { "s" },
+            ),
+        );
+    }
+    prompt
+}
+
 fn interrupted_collaboration_request_prompt(request: &CollaborationRequest) -> String {
     format!(
-        "[muxa:{}] Direct {} request delivery was interrupted after it was claimed. Read it with muxa_inbox (MCP) or `muxa msg inbox --json`; honor kind/work_mode/paths, then respond as requested.",
+        "[muxa:{}] Direct {} request delivery was interrupted after it was claimed. Read it with muxa_inbox (MCP) or `muxa msg inbox --json`; honor kind/work_mode/paths. {}",
         request.id,
         collaboration_request_kind(request.kind),
+        collaboration_reply_instruction(request),
     )
 }
 
@@ -1912,15 +2085,23 @@ fn ready_collaboration_recipient(
     if !muxa::collaboration::is_pending_session(&request.to.agent_session_id) {
         return None;
     }
-    participants
-        .iter()
-        .find(|participant| {
-            participant.pane == request.to.pane
-                && participant.socket == request.to.socket
-                && participant.state == muxa::AgentState::Idle
-        })
+    idle_pending_recipient(participants, &request.to)
         .cloned()
         .or_else(|| muxa::collaboration::pending_recipient_ready(&request.to, agents, panes))
+}
+
+/// The idle agent that may adopt a request still addressed to a launching
+/// pane. Uses the same predicate delivery reserves with: matching on pane and
+/// socket alone picked whatever agent later reused that pane id in another
+/// window, and the refused reservation then repeated on every tick.
+fn idle_pending_recipient<'a>(
+    participants: &'a [muxa::collaboration::Participant],
+    to: &muxa::collaboration::Participant,
+) -> Option<&'a muxa::collaboration::Participant> {
+    participants.iter().find(|participant| {
+        participant.state == muxa::AgentState::Idle
+            && muxa::collaboration::addresses(to, participant)
+    })
 }
 
 fn idle_collaboration_participant<'a>(
@@ -1970,14 +2151,33 @@ async fn send_collaboration_wake(
     participant: &muxa::collaboration::Participant,
     prompt: &str,
     backends: &[muxa::SharedBackend],
+    store: &muxa::Store,
 ) -> (bool, bool) {
+    let agents = store.by_pane(&participant.pane).await;
+    let observer = muxa::prompt_delivery::SubmissionObserver::new(
+        store,
+        &agents,
+        participant.socket.as_deref(),
+        prompt,
+    );
     let sent = send_collaboration_text(participant, prompt, backends).await;
     let submitted = if sent {
-        tokio::time::sleep(muxa::backend::PROMPT_SUBMIT_GRACE).await;
+        tokio::time::sleep(muxa::backend::prompt_submit_grace(&participant.pane)).await;
         send_collaboration_text(participant, "\r", backends).await
     } else {
         false
     };
+    if submitted {
+        // A missing hook must not delay mailbox bookkeeping, the next peer's
+        // wake, or shutdown. This bounded observer only logs evidence and
+        // never sends keys or retries the body.
+        let pane = participant.pane.clone();
+        tokio::spawn(async move {
+            let confirmed = observer.confirm().await;
+            tracing::debug!(pane, submission_confirmed = ?confirmed,
+                "collaboration Enter delivered; application acknowledgement observed separately");
+        });
+    }
     (sent, submitted)
 }
 
@@ -1999,9 +2199,15 @@ async fn send_collaboration_text(
     let pane = participant.pane.clone();
     let socket = participant.socket.clone();
     let text = text.to_string();
-    tokio::task::spawn_blocking(move || backend.send_text_on(socket.as_deref(), &pane, &text))
-        .await
-        .unwrap_or(false)
+    tokio::task::spawn_blocking(move || {
+        if text == "\r" || text == "\u{3}" {
+            backend.send_text_on(socket.as_deref(), &pane, &text)
+        } else {
+            backend.send_prompt_text_on(socket.as_deref(), &pane, &text)
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Spawn the GC task: evicts long-stopped agents on a periodic timer.
@@ -2189,7 +2395,13 @@ async fn refresh_pane_session_cache(cache: &PaneSessionCache, backends: &[muxa::
     let mut entries = Vec::new();
     for handle in handles {
         let panes = handle.await.unwrap_or_default();
-        entries.extend(panes.into_iter().map(|pane| (pane.pane_id, pane.session)));
+        // This name is persisted into the activity log and history; a
+        // grouped session must be recorded as itself, not as a `~view~`.
+        entries.extend(
+            muxa::tmux::canonical_panes(&panes)
+                .into_iter()
+                .map(|pane| (pane.pane_id, pane.session)),
+        );
     }
     cache.replace(entries);
 }
@@ -2405,6 +2617,7 @@ fn spawn_reconciler_task(
     store: &muxa::SharedStore,
     shutdown_tx: &broadcast::Sender<()>,
     backends: Vec<muxa::SharedBackend>,
+    sessions: muxa::session::SharedSessionBackend,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.reconciler.enabled {
         tracing::info!("reconciler disabled by config");
@@ -2431,6 +2644,7 @@ fn spawn_reconciler_task(
         std::time::Duration::from_secs(cfg.reconciler.interval_secs),
     )
     .with_metrics(store.metrics())
+    .with_native_sessions(sessions)
     .with_stuck_working_timeout(std::time::Duration::from_secs(
         cfg.reconciler.stuck_working_timeout_secs,
     ))
@@ -2550,7 +2764,7 @@ fn spawn_session_activity_task(
         return None;
     };
     // One sampling source per host in the set that HAS a foreground signal:
-    // tmux (`list-clients`) and herdr (focused workspace over its socket).
+    // tmux and rmux (`list-clients`) and herdr (focused workspace over its socket).
     // zellij has no client-attach signal, so it contributes no source. A single
     // tracker polls them all into one ledger — two independent trackers writing
     // `session-activity.json` would clobber each other (each `save()` rewrites
@@ -2561,16 +2775,22 @@ fn spawn_session_activity_task(
     for backend in backends {
         match backend.kind() {
             muxa::HostKind::Tmux => sources.push(muxa::SessionActivitySource::Tmux),
+            muxa::HostKind::Rmux => sources.push(muxa::SessionActivitySource::Rmux),
             muxa::HostKind::Herdr => sources.push(muxa::SessionActivitySource::Herdr {
                 socket_path: muxa::backend::herdr::default_socket_path(),
             }),
-            muxa::HostKind::Cmux | muxa::HostKind::Rmux | muxa::HostKind::Zellij => {}
+            muxa::HostKind::Cmux | muxa::HostKind::Zellij => {}
         }
     }
     let source_kinds: Vec<muxa::HostKind> = backends
         .iter()
         .map(|b| b.kind())
-        .filter(|kind| matches!(kind, muxa::HostKind::Tmux | muxa::HostKind::Herdr))
+        .filter(|kind| {
+            matches!(
+                kind,
+                muxa::HostKind::Tmux | muxa::HostKind::Rmux | muxa::HostKind::Herdr
+            )
+        })
         .collect();
     let tracker = muxa::SessionActivityTracker::new(
         path.clone(),
@@ -2680,6 +2900,8 @@ async fn enrich_from_history(
             panes.extend(list);
         }
     }
+    // One candidate per pane, not one per `~view~` listing of it.
+    let panes = muxa::tmux::canonical_panes(&panes);
     if panes.is_empty() {
         return;
     }
@@ -2689,6 +2911,24 @@ async fn enrich_from_history(
     // agent already represents it — synthetic placeholders are the
     // exact thing this pass is trying to upgrade away from.
     let snapshot = store.snapshot().await;
+
+    // A Codex prompt's recorded pane is not evidence: behind the shared
+    // app-server it was whichever pane started the server, so seeding by it
+    // resurrects a closed thread onto a stranger's pane. Seed a Codex entry
+    // only where a live `codex resume <id>` proves it; the thread's next hook
+    // re-registers it otherwise.
+    let codex_resumes: HashSet<(String, String)> = {
+        let scanned = panes.clone();
+        tokio::task::spawn_blocking(move || muxa::process_tree::scan_codex_panes(&scanned))
+            .await
+            .map(|scan| {
+                scan.resume_bindings
+                    .into_iter()
+                    .map(|binding| (binding.session_id, binding.pane.pane_id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
 
     let mut candidates: Vec<muxa::Agent> = Vec::new();
     for pane in &panes {
@@ -2706,6 +2946,11 @@ async fn enrich_from_history(
         let Some(entry) = recents.into_iter().next() else {
             continue;
         };
+        if entry.kind == muxa::AgentKind::Codex
+            && !codex_resumes.contains(&(entry.session_id.clone(), pane.pane_id.clone()))
+        {
+            continue;
+        }
         candidates.push(muxa::Agent {
             kind: entry.kind,
             session_id: entry.session_id,
@@ -3103,6 +3348,50 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
 
+    fn room_participant(
+        pane: &str,
+        session: &str,
+        window: &str,
+    ) -> muxa::collaboration::Participant {
+        muxa::collaboration::Participant {
+            agent_kind: AgentKind::Codex,
+            agent_session_id: session.into(),
+            pane: pane.into(),
+            socket: Some("/tmp/rmux-1/default".into()),
+            room: muxa::collaboration::RoomId {
+                host: "rmux".into(),
+                socket: Some("/tmp/rmux-1/default".into()),
+                window_id: window.into(),
+            },
+            tmux_session_id: None,
+            tmux_session_name: None,
+            window_name: None,
+            state: muxa::AgentState::Idle,
+            cwd: None,
+            alias: None,
+            roles: Vec::new(),
+            console: false,
+        }
+    }
+
+    /// A request still waiting on a launching agent must not be offered to
+    /// whatever agent later reuses that pane id in another window: delivery
+    /// refuses it, so picking it only repeats a failing reservation forever.
+    #[test]
+    fn a_pending_request_is_offered_only_to_its_own_room() {
+        let to = room_participant(
+            "rmux:%75",
+            "pending-pane:/tmp/rmux-1/default:rmux:%75",
+            "@42",
+        );
+        let elsewhere = room_participant("rmux:%75", "thread-other", "@13");
+        assert!(idle_pending_recipient(std::slice::from_ref(&elsewhere), &to).is_none());
+
+        let launched = room_participant("rmux:%75", "thread-launched", "@42");
+        let found = idle_pending_recipient(&[elsewhere, launched.clone()], &to).cloned();
+        assert_eq!(found, Some(launched));
+    }
+
     #[test]
     fn dashboard_auth_parser_accepts_public_read_aliases() {
         assert_eq!(
@@ -3168,6 +3457,7 @@ mod tests {
     fn collaboration_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -3202,6 +3492,201 @@ mod tests {
                 at: OffsetDateTime::now_utc(),
             })
             .await;
+    }
+
+    async fn deliver_quiet_progress_burst(
+        mailbox: &CollaborationStore,
+        store: &muxa::SharedStore,
+        backends: &[muxa::SharedBackend],
+        payload: CollaborationWakePayload,
+        sender: &muxa::collaboration::Participant,
+        recipient: &muxa::collaboration::Participant,
+    ) -> Vec<String> {
+        let mut inflight = HashSet::new();
+        let mut progress_ids = Vec::new();
+        // Reproduce the reported volume and let the waker scan after each
+        // message, including fresh idle generations and periodic rescans.
+        for index in 0..39 {
+            let progress = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        kind: RequestKind::Notice,
+                        body: format!("checkpoint {index}"),
+                        expects_reply: false,
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            progress_ids.push(progress.id);
+            inflight.clear();
+            for _ in 0..2 {
+                wake_idle_collaboration_peers_with_inflight(
+                    mailbox,
+                    store,
+                    backends,
+                    payload,
+                    &mut inflight,
+                )
+                .await;
+            }
+        }
+        progress_ids
+    }
+
+    #[tokio::test]
+    async fn collaboration_waker_suppresses_progress_but_delivers_handoffs_without_ack() {
+        for payload in [
+            CollaborationWakePayload::Notice,
+            CollaborationWakePayload::OperatorFull,
+            CollaborationWakePayload::Full,
+        ] {
+            let store = muxa::Store::shared();
+            add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+            add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+            let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+            let participants =
+                muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+            let sender = participants
+                .iter()
+                .find(|p| p.pane == "%1")
+                .unwrap()
+                .clone();
+            let recipient = participants
+                .iter()
+                .find(|p| p.pane == "%2")
+                .unwrap()
+                .clone();
+            let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+            let sends = Arc::new(Mutex::new(Vec::new()));
+            let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+                panes,
+                sends: sends.clone(),
+            });
+            let backends = vec![backend];
+            let mut inflight = HashSet::new();
+            let progress_ids = deliver_quiet_progress_burst(
+                &mailbox, &store, &backends, payload, &sender, &recipient,
+            )
+            .await;
+            assert!(
+                sends.lock().unwrap().is_empty(),
+                "39 quiet notices must cause zero terminal writes"
+            );
+            let handoff = mailbox
+                .create(
+                    sender,
+                    recipient.clone(),
+                    NewRequest {
+                        kind: RequestKind::Notice,
+                        body: "device released".into(),
+                        expects_reply: false,
+                        notify: Some(true),
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            for prompt in [
+                mailbox_collaboration_request_prompt(&handoff),
+                full_collaboration_request_prompt(&handoff),
+                interrupted_collaboration_request_prompt(&handoff),
+            ] {
+                assert!(prompt.contains("No reply is expected"));
+                assert!(!prompt.contains("respond with muxa_reply"));
+            }
+            for _ in 0..2 {
+                wake_idle_collaboration_peers_with_inflight(
+                    &mailbox,
+                    &store,
+                    &backends,
+                    payload,
+                    &mut inflight,
+                )
+                .await;
+            }
+            {
+                let delivered = sends.lock().unwrap();
+                assert_eq!(
+                    delivered.len(),
+                    2,
+                    "one prompt and one submit, no duplicate wake"
+                );
+                assert!(delivered[0].1.contains(&handoff.id));
+                assert!(
+                    delivered[0].1.contains("Also waiting: 39 one-way notices"),
+                    "a wake that goes out anyway names the quiet notices: {}",
+                    delivered[0].1
+                );
+                assert!(progress_ids.iter().all(|id| !delivered[0].1.contains(id)));
+                assert!(delivered[0].1.contains("No reply is expected"));
+            }
+            let inbox = mailbox.claim_for(&recipient).await.unwrap();
+            assert_eq!(
+                inbox
+                    .iter()
+                    .filter(|request| progress_ids.contains(&request.id))
+                    .count(),
+                39,
+                "all quiet notices must remain readable at the checkpoint"
+            );
+            assert_eq!(
+                mailbox.pending_reply_unnotified().await,
+                [] as [muxa::collaboration::CollaborationRequest; 0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_recovery_runs_when_terminal_wake_is_disabled() {
+        let store = muxa::Store::shared();
+        add_capped_agent(&store, "%1", "sender").await;
+        add_capped_agent(&store, "%2", "recipient").await;
+        let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let sender = participants
+            .iter()
+            .find(|p| p.pane == "%1")
+            .unwrap()
+            .clone();
+        let recipient = participants
+            .iter()
+            .find(|p| p.pane == "%2")
+            .unwrap()
+            .clone();
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        mailbox
+            .create(
+                sender,
+                recipient,
+                NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut cfg = Config::default();
+        cfg.collaboration.enabled = true;
+        cfg.collaboration.wake = CollaborationWake::Never;
+        let (shutdown, _) = broadcast::channel(1);
+        let worker =
+            spawn_collaboration_waker_task(&cfg, mailbox.clone(), store, vec![], &shutdown)
+                .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if mailbox.pending_human_notifications().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.send(()).unwrap();
+        worker.await.unwrap();
     }
 
     #[tokio::test]
@@ -3245,9 +3730,15 @@ mod tests {
                 sender,
                 recipient,
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
+                    human_action: None,
+                    initiator: None,
                     kind: RequestKind::Question,
                     body: "wake from revision".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::ReadOnly,
                     thread_id: None,
                     parent_request_id: None,
@@ -3387,9 +3878,15 @@ mod tests {
                 sender,
                 pending,
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
+                    human_action: None,
+                    initiator: None,
                     kind: RequestKind::Review,
                     body: "review the pending diff".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::ReadOnly,
                     thread_id: None,
                     parent_request_id: None,
@@ -3463,9 +3960,15 @@ mod tests {
                 sender.clone(),
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
+                    human_action: None,
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "change only the authorized file".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::Execute,
                     thread_id: None,
                     parent_request_id: None,
@@ -3507,7 +4010,10 @@ mod tests {
         assert!(stored.claimed_at.is_some());
         assert!(stored.notified_at.is_some());
         assert_eq!(stored.wake_delivery, None);
-        assert!(mailbox.pending_unnotified().await.is_empty());
+        assert_eq!(
+            mailbox.pending_unnotified().await,
+            [] as [muxa::collaboration::CollaborationRequest; 0]
+        );
 
         sends.lock().unwrap().clear();
         let unsafe_request = mailbox
@@ -3515,9 +4021,15 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
+                    human_action: None,
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "unsafe\u{1b}[201~\rsubmit".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::Execute,
                     thread_id: None,
                     parent_request_id: None,
@@ -3575,9 +4087,15 @@ mod tests {
                 console,
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
+                    human_action: None,
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "operator request body".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::Execute,
                     thread_id: None,
                     parent_request_id: None,
@@ -3656,9 +4174,15 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
+                    human_action: None,
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "agent delegated body".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::Execute,
                     thread_id: None,
                     parent_request_id: None,
@@ -3725,9 +4249,15 @@ mod tests {
                     sender.clone(),
                     recipient.clone(),
                     NewRequest {
+                        dispatch_id: None,
+                        source_node_id: None,
+                        delegation_parent: None,
+                        human_action: None,
+                        initiator: None,
                         kind: RequestKind::Task,
                         body: body.into(),
                         expects_reply: true,
+                        notify: None,
                         work_mode: WorkMode::Execute,
                         thread_id: None,
                         parent_request_id: None,
@@ -3785,10 +4315,14 @@ mod tests {
         )
         .await;
         assert_eq!(sends.lock().unwrap().len(), 4);
-        assert!(mailbox.pending_unnotified().await.is_empty());
+        assert_eq!(
+            mailbox.pending_unnotified().await,
+            [] as [muxa::collaboration::CollaborationRequest; 0]
+        );
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // explicit durable request/recovery fixtures
     async fn full_wake_recovers_without_reinjecting_the_request_body() {
         let store = muxa::Store::shared();
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
@@ -3811,19 +4345,12 @@ mod tests {
                 sender.clone(),
                 recipient.clone(),
                 NewRequest {
+                    human_action: None,
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "do not inject this twice".into(),
-                    expects_reply: true,
                     work_mode: WorkMode::Execute,
-                    thread_id: None,
-                    parent_request_id: None,
-                    workspace_id: None,
-                    work_id: None,
-                    run_id: None,
-                    paths: Vec::new(),
-                    artifacts: Vec::new(),
-                    links: Vec::new(),
-                    air_artifacts: Vec::new(),
+                    ..NewRequest::default()
                 },
             )
             .await
@@ -3853,16 +4380,25 @@ mod tests {
             assert!(!delivered[0].1.contains("do not inject this twice"));
             assert_eq!(delivered[1], ("%2".into(), "\r".into()));
         }
-        assert!(mailbox.pending_unnotified().await.is_empty());
+        assert_eq!(
+            mailbox.pending_unnotified().await,
+            [] as [muxa::collaboration::CollaborationRequest; 0]
+        );
 
         let second = mailbox
             .create(
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
+                    human_action: None,
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "the prompt text is already buffered".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::Execute,
                     thread_id: None,
                     parent_request_id: None,
@@ -3890,7 +4426,10 @@ mod tests {
             sends.lock().unwrap().as_slice(),
             &[("%2".into(), "\r".into())]
         );
-        assert!(mailbox.pending_unnotified().await.is_empty());
+        assert_eq!(
+            mailbox.pending_unnotified().await,
+            [] as [muxa::collaboration::CollaborationRequest; 0]
+        );
     }
 
     #[tokio::test]
@@ -3918,9 +4457,15 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
+                    human_action: None,
+                    initiator: None,
                     kind: RequestKind::Review,
                     body: "secret request body".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::ReadOnly,
                     thread_id: None,
                     parent_request_id: None,
@@ -3993,7 +4538,10 @@ mod tests {
             assert!(!sends[0].1.contains("secret reply body"));
             assert_eq!(sends[1], ("%1".into(), "\r".into()));
         }
-        assert!(mailbox.pending_reply_unnotified().await.is_empty());
+        assert_eq!(
+            mailbox.pending_reply_unnotified().await,
+            [] as [muxa::collaboration::CollaborationRequest; 0]
+        );
         assert_eq!(
             mailbox
                 .unread_reply_count(
@@ -4024,6 +4572,7 @@ mod tests {
                 pane: "%2".into(),
                 socket: None,
                 console: true,
+                agent_session_id: None,
             },
             &participants,
             &panes,
@@ -4035,9 +4584,15 @@ mod tests {
                 console.clone(),
                 recipient.clone(),
                 NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
+                    human_action: None,
+                    initiator: None,
                     kind: RequestKind::Task,
                     body: "dispatched by a human".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: WorkMode::ReadOnly,
                     thread_id: None,
                     parent_request_id: None,
@@ -4398,6 +4953,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automation_enter_sends_one_key_only_for_an_affirmative_choice() {
+        for (screen, expected) in [
+            ("› 1. Yes, continue\n  2. No\nPress enter to continue", true),
+            ("  1. Yes\n› 2. No\nPress enter to continue", false),
+            ("› Type your reply", false),
+        ] {
+            let store = muxa::Store::shared();
+            add_agent(&store, "%1", "waiting", AgentKind::ClaudeCode).await;
+            store
+                .apply(&AgentEvent::NotificationFired {
+                    id: AgentId {
+                        kind: AgentKind::ClaudeCode,
+                        session_id: "waiting".into(),
+                        surface: None,
+                        pane: Some("%1".into()),
+                        tmux_socket: Some("default".into()),
+                        cwd: Some("/repo".into()),
+                    },
+                    level: muxa::event::NotificationLevel::NeedsChoice,
+                    message: "Confirm choice".into(),
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+            let sends = Arc::new(Mutex::new(Vec::new()));
+            let backend: muxa::SharedBackend = Arc::new(JudgmentBackend {
+                inner: CollaborationWakeBackend {
+                    panes: vec![collaboration_pane("%1", "0")],
+                    sends: sends.clone(),
+                },
+                screen: Arc::new(Mutex::new(screen.into())),
+            });
+            let mut rule = muxa::automation_defaults::rules()
+                .into_iter()
+                .find(|rule| rule.name == "confirm-selected-yes")
+                .unwrap();
+            rule.enabled = true;
+            rule.wait = Some(muxa::automation::parse_wait("0s").unwrap());
+            let config = muxa::automation::AutomationConfig {
+                rule: vec![rule],
+                ..Default::default()
+            };
+            let automation = AutomationStore::in_memory(config);
+            let mut engine = AutomationEngine::new(automation, store, vec![backend]);
+            for _ in 0..2 {
+                engine.rescan().await;
+                engine.fire_due().await;
+            }
+            let expected_sends = if expected {
+                vec![("%1".into(), "\r".into())]
+            } else {
+                vec![]
+            };
+            assert_eq!(*sends.lock().unwrap(), expected_sends, "{screen}");
+        }
+    }
+
+    #[tokio::test]
     async fn automation_resumes_a_capped_agent_by_typing_into_its_pane() {
         let store = muxa::Store::shared();
         add_capped_agent(&store, "%1", "capped").await;
@@ -4484,7 +5096,10 @@ mod tests {
         engine.fire_due().await;
 
         assert!(sends.lock().unwrap().is_empty());
-        assert!(automation.ledger().all().await.is_empty());
+        assert_eq!(
+            automation.ledger().all().await,
+            [] as [muxa::automation::AutomationLedgerEntry; 0]
+        );
     }
 
     #[tokio::test]
@@ -4500,7 +5115,10 @@ mod tests {
         engine.fire_due().await;
 
         assert!(sends.lock().unwrap().is_empty());
-        assert!(automation.ledger().all().await.is_empty());
+        assert_eq!(
+            automation.ledger().all().await,
+            [] as [muxa::automation::AutomationLedgerEntry; 0]
+        );
     }
 
     #[tokio::test]

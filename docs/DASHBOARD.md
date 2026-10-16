@@ -18,15 +18,16 @@ into the browser like a PAT.
 
 The dashboard is **off by default** and **loopback-only when on by default**.
 Token authentication is the default auth mode, and an enabled dashboard must
-have an explicit token. There is no path that exposes data beyond your local
-machine without explicit public-bind acknowledgement.
+have an explicit token. Binding directly to a non-loopback address requires explicit public-bind
+acknowledgement. For sharing through an HTTPS reverse proxy, keep the daemon
+bound to loopback and configure the public origin as described below.
 
 ## Surfaces
 
 | Path                | What it returns                                                                |
 | ------------------- | ------------------------------------------------------------------------------ |
 | `GET /`             | The dashboard HTML (loads the JS bundle).                                      |
-| `GET /static/*`     | Embedded JS/CSS assets.                                                        |
+| `GET /static/*`     | Embedded JS/CSS/font assets.                                                   |
 | `GET /api/health`   | `{ ok, version, protocol }`                                                    |
 | `GET /api/access`   | Current read/control access mode and whether the supplied PAT can edit.        |
 | `GET /api/agents`   | Current `Store` snapshot.                                                      |
@@ -38,6 +39,9 @@ machine without explicit public-bind acknowledgement.
 | `GET /api/terminal-sessions` | Muxa-owned PTY sessions.                                           |
 | `GET /api/timeline` | Timeline document from `activity.ndjson` plus currently-open agent/tmux spans. |
 | `GET /api/events`   | SSE stream: `snapshot` (initial), `transition` (live), `lagged` (backpressure)|
+| `GET /api/windows/{window}/layout?socket=` | Pane geometry (`left`/`top`/`width`/`height` in cells, `active`, `zoomed`) for one tmux window. |
+| `GET /api/panes/{pane}/output?socket=&lines=N` | Operator only: `{ pane, text, captured_at }`, the pane's newest `N` lines (default 200, max 1000; 64 KiB cap) as plain text, escapes stripped. |
+| `GET /api/panes/{pane}/output/stream?socket=&lines=N` | Operator only, SSE: `output` events (`{ pane, text, captured_at }`, the full bounded text) on connect and whenever it changes; `gone` when the pane closes. See [Live pane output](#live-pane-output). |
 | `POST /api/panes/{pane}/prompt` | Send and optionally submit text to a pane.                       |
 | `POST /api/panes/{pane}/abort` | Send Ctrl-C to a pane.                                             |
 | `POST /api/fleet/{host}/command` | Execute a serialized Fleet operation; host mode is rechecked.   |
@@ -51,9 +55,10 @@ machine without explicit public-bind acknowledgement.
 `auth = "token"` protects all API endpoints. `auth = "public_read"` leaves
 GET/SSE endpoints public but always requires the bearer token for write/control
 actions. `auth = "none"` leaves reads public and disables writes entirely.
-Collaboration bodies and attached details are stricter: they are returned only
-in `auth = "token"` mode with a valid bearer. `public_read` and `none` expose a
-redacted topology/status summary even if a PAT is supplied.
+Collaboration bodies and attached details require an authenticated operator
+(valid PAT or operator login) in `token` or `public_read` mode. Anonymous users
+and signed-in viewers receive a redacted topology/status summary. `none` mode
+always redacts details. History responses use `Cache-Control: private, no-store`.
 Static routes are public in every mode — see "Why the HTML is public" below.
 Fleet routes always expose the in-process `local` node. `[fleet] enabled =
 true` adds outbound SSH hosts; reads reuse the daemon's per-host cache and
@@ -91,6 +96,20 @@ browser profile. To revoke, clear the `muxa.token` key (DevTools → Application
 Legacy `?token=...` URLs are still accepted for compatibility and immediately
 scrubbed, but fragments are the supported bootstrap format because browsers do
 not send them in HTTP requests or `Referer` headers.
+
+A browser that can read nothing (reads return 401: no operator session and no
+working token) gets a landing page instead of an empty dashboard. It says what
+muxa is and offers the ways in: **Sign in** when
+[operator sign-in](#operator-sign-in-with-oidc) is configured, and **Use access
+token**, which stores the token like `#token=` and reloads. A stored token that
+the server rejects is reported there. `public_read` and `auth = "none"`
+dashboards never show it, since their reads succeed without credentials. The
+page is served from the daemon itself and loads nothing from other origins.
+Its dashboard screenshots show a made-up fleet; regenerate them with
+`node scripts/landing-shots/capture.mjs` (Playwright, Chrome and `cwebp`).
+The hero film is captured from a real muxa in the isolated sandbox (tmux,
+the status line, `muxa attend`, `muxa peek`) with
+`scripts/landing-shots/film.sh`, which writes `landing-frames.mjs`.
 
 ### Loopback-only without authentication (dev / single-user)
 
@@ -235,7 +254,79 @@ session name, a ticket-shaped window name, or repository cwd.
 | Agent session | daemon agent session attached to a Run pane | Runtime state, model, prompt/response, control target. |
 | Signal | attention, blocked, error | Overlay on Work; never a board lane. |
 
-The workspace rail remains flat. Selecting a workspace filters the four local
+### Workspace rail
+
+muxa's managed layout is Workspace = tmux session, Run = window, Agent = pane,
+so the **Workspaces** rail lists every live tmux session, whether or not
+anything in it was started with `muxa work up`. It is the union of the
+sessions in `/api/panes` (plus any that only appear in `unlinked_executions`)
+and the managed workspaces in `/api/works`; a managed workspace whose id equals
+a session name is the same entry. Each entry shows its window and agent
+counts, a rolled-up state (error > waiting > working > idle, as in the
+[Sessions navigator](#sessions-windows-and-panes), with a Work's error and
+attention signals counted too) and its Work count when it has any. A session
+name that exists on several tmux servers is shown as `name · socket`; a managed
+workspace with no live session keeps its own entry. The header shows the
+number of entries as a badge (its tooltip spells out sessions, managed
+workspaces and Works); the **all workspaces** row counts Works and agents. Sort by
+**priority** (rolled-up state), **latest** (last agent or Work activity) or
+**A-Z**.
+
+This is presentation only: an entry built from a session never creates Work
+and never tags a tmux window. Work still only comes from managed runs.
+
+Selecting an entry sets the page **scope**:
+
+- the Work board shows that workspace's managed Works, and **Windows not
+  tracked as Work** that session's windows;
+- the Sessions navigator tree shows only that session, expanded, with a
+  **show all sessions** switch (the filter box still works inside the scope);
+- the Agents and Panes tables and the Timeline's workspace filter follow it;
+- the Collaboration panel keeps only messages whose sender or recipient pane
+  is in that session (panes are mapped to sessions by the live pane scan, and
+  a pane that has since closed by the session name the message recorded). A
+  participant without a pane — the operator console, an agent outside tmux —
+  appears only through a message it exchanged with an in-scope participant.
+  The panel header reads **scoped to <name> · clear**. Session and socket
+  filters are applied by the API before counting and pagination; a managed
+  workspace with no live session keeps the messages filed under its Work.
+  Rooms are grouped under their durable session, and selecting a group scopes
+  the graph and sequence to it.
+
+Picking a session in the Timeline filter selects its rail entry too, and **all
+workspaces** (or ∅, or **clear** in the Collaboration header) clears the scope.
+Selecting a session in the navigator also changes the page scope. Selecting
+a window or pane only chooses what the navigator's detail side and pane drawer
+show. Viewers see the same rail; it carries only metadata.
+
+Scope and detail selection live in separate URL fragment parameters, so a link
+restores both:
+
+| Parameter | Set by | Meaning |
+| --- | --- | --- |
+| `workspace=<name>` | rail | Page scope: a tmux session name, or a managed workspace id with no live session. |
+| `wsocket=<socket>` | rail | The tmux server of the scoped session; only written when that session name exists on several servers. |
+| `session=<name>` | navigator | Detail selection: a session. |
+| `window=<@id>` | navigator, untracked-window rows | Detail selection: a window (with `session=`). |
+| `pane=<id>` | pane drawer | The open pane drawer. |
+| `socket=<socket>` | navigator, pane drawer | The tmux server of the selected session/window or open pane. |
+
+A link from before the split (`#session=<name>` with no `workspace=`) used to
+scope the whole page; on load it is migrated once to the same
+`workspace=<name>` (and `wsocket=` from its `socket=`), and the navigator
+selection is kept.
+
+When there is no managed Work at all, the six summary cards and the empty board
+collapse into one line (with the **start work** form when
+`allow_work_start` is on) and the Sessions navigator follows it directly. The
+live windows are still listed under a compact **Windows not tracked as Work
+(N)** section, collapsed by default in that case (the browser remembers when
+you expand it). It follows the rail scope, and each row opens that window in
+the navigator (`#window=`).
+
+### Work board
+
+Selecting a workspace filters the four local
 Work stages: **Queued**, **In progress**, **Review**, and **Done**. Attention,
 blocked, and error render as signal badges on the card so a waiting agent does
 not silently rewrite the operator's workflow stage. Selecting a Work opens a
@@ -252,6 +343,8 @@ Managed tmux options (`@muxa_workspace_id`, `@muxa_work_id`, agent role/task)
 link a Run to Work. `muxa work up` also stores optional external-source metadata
 on the window, which `/api/works` discovers and persists. Unmanaged windows stay
 in `unlinked_executions`; they are never guessed into Work from their names.
+Their sessions still appear as workspaces in the rail (see
+[Workspace rail](#workspace-rail)), but Work only comes from managed runs.
 
 ## Collaboration graph and history API
 
@@ -269,10 +362,12 @@ The toolbar filters by time range, exact room, Work, thread, kind, and status.
 The API form is:
 
 ```text
-GET /api/collaboration?since=7d&workspace=callabo&work=CAL-7345&thread=thread-id&parent=req-id&kind=review&status=completed&limit=100&cursor=...
+GET /api/collaboration?since=7d&session=callabo&socket=%2Ftmp%2Frmux%2Fdefault&workspace=callabo&work=CAL-7345&thread=thread-id&parent=req-id&kind=review&status=completed&limit=100&cursor=...
 ```
 
-All supplied filters are conjunctive. `work_id`, `workspace_id`, `thread_id`,
+All supplied filters are conjunctive. `session` matches the durable tmux
+session name (including its numeric `~view~` aliases); `socket` pins its exact
+server endpoint. These filters apply before counts and pagination. `work_id`, `workspace_id`, `thread_id`,
 and `parent_request_id` are accepted as aliases for their short names. `room`
 is a URL-encoded JSON `RoomId` and matches host, socket, and window exactly.
 `limit` defaults to 100 and must be 1–500. Pagination is newest-first keyset
@@ -282,12 +377,147 @@ it or replace it with an offset. The response contains `generated_at`,
 `pagination { total, limit, has_more, next_cursor }`. Invalid filters return
 `400`; a disabled collaboration subsystem returns `503`.
 
-When `details_included` is false, request/reply bodies, provenance, paths,
+When `details_included` is false, request/reply/update bodies, provenance, paths,
 generic artifacts, links, and AIR references are omitted. Participant, room,
 thread/parent, Work/Run, kind, status, timestamps, and counts remain available
-for a useful summary graph. Use `auth = "token"` for private full-detail
-history; a PAT cannot unlock details while the server is configured as
-`public_read`.
+for a useful summary graph. In the Sessions panel, use the Collaboration tab
+and select a session or window to filter its history. Unlock details with the
+existing dashboard PAT control or sign in as an operator to read requests,
+replies, and artifacts. Locking access immediately clears loaded details.
+
+Collaboration opens as a message list beside a detail reader. The list shows
+participants, status, timestamps, response latency, update counts, and body
+previews for authenticated operators. Search filters retained history on the server before pagination. Public and
+viewer searches cover visible metadata; authenticated operators can also
+search request, reply, and progress bodies. Counts reflect all matching rows,
+while summaries of loaded pages are labeled when older pages remain. Custom
+period controls accept a start and end time. Graph and Sequence
+are separate views; the graph supports zoom and fit in both dimensions.
+Drag the separators (or use arrow keys while focused) to resize the navigator,
+list/detail split, and panel height. Sizes persist across reloads. Expand fills
+the viewport; restore or Escape returns to the normal layout. Narrow screens
+stack the list and detail reader and hide the desktop height handle.
+Unchanged refreshes preserve text selection and reading position. Thread and
+parent buttons open related history across rooms, and message links reopen an
+exact retained request even outside the default period. Copy-link strips all
+other URL parameters; copy-conversation is available to authenticated operators.
+
+## Sessions, windows and panes
+
+muxa tracks every agent by where it runs: a tmux (or rmux) **session**, a
+**window** in it, and a **pane** in that window. The **Sessions** panel near
+the top of the page is organized the same way.
+
+- **Tree.** Sessions → windows → panes, built from `/api/panes` (which
+  carries the socket, session, window and pane ids) joined with the agents
+  list by pane id and socket. Each node shows its agent kinds, pane and agent
+  counts (`3p · 2a`) and a rolled-up state: the most urgent state below it,
+  in the order error, waiting (input or choice), working, starting, idle,
+  stopped. With more than one tmux server the top level is the socket. The
+  tree is keyboard navigable (↑/↓, → expands or enters, ← collapses or goes
+  up, Home/End, Enter selects). The filter box matches session and window
+  names, working directories, commands and agent kinds; several words must
+  all match along one session → window → pane path.
+- **Session view.** Selecting a session lists its windows with their rolled-up
+  state. With nothing selected, the panel lists the windows that need
+  attention.
+- **Window view.** Selecting a window draws its panes the way tmux lays them
+  out, from `GET /api/windows/{window}/layout` (tmux's own pane geometry; a
+  zoomed window shows only its zoomed pane, and other hosts or a geometry
+  that no longer matches the pane list fall back to a plain grid). Each tile shows the pane,
+  its agent kind and state, working directory and last prompt; operators also
+  see the pane's last 15 lines while the window is shown and the tab is
+  visible: up to six tiles (agent panes first) stream live, and any others
+  are polled every 3 seconds (one request per pane at a time, four at most).
+  Click a tile to open the pane drawer. **share window** invites
+  someone to every pane in the window when sharing is configured.
+- **Agents table.** Still available under Execution inventory; its pane column
+  reads `session › window › pane`, and the session and window parts jump to
+  the navigator.
+
+While the [workspace rail](#workspace-rail) scopes the page to a session, the
+tree shows only that session; **show all sessions** lists every session again
+without changing the scope. Selecting a session also scopes diagnostics to
+that session; selecting a window remains a detail selection. The selection is kept in
+the URL fragment: `#session=<name>`, `#window=<@id>` (with `&socket=<socket>`
+when more than one tmux server is running) and `#pane=<id>` for an open
+drawer, next to the rail's `#workspace=`, so a link restores all of them.
+
+The layout endpoint is metadata, so viewers and `public_read` visitors can
+read it; the socket is looked up in the scanned inventory, never used as a
+caller-supplied path. Viewers see the tree and the window layout but no
+output tails and no composer.
+
+## Talking to an agent
+
+Click a pane tile in the Sessions panel, an agent in **Execution inventory →
+Agents** (or a pane in the **Panes** tab, or a pane row in a Work card's
+execution list) to open its drawer. The **agents** chip in the header jumps to that table and shows how
+many agents are tracked. Rows are focusable: Tab to one and press Enter.
+
+The drawer shows the pane as `session:window.pane`, the agent kind, state,
+model, working directory and last activity, and below that the pane's live
+output, streamed live while the drawer is open and the tab is visible (the
+header reads `live · changed 5s ago`). Output stays pinned to the newest line unless you scroll up; then a
+**jump to latest** chip appears. Type in **Message this agent…** and press
+Enter to send it (Shift+Enter for a new line; Enter that confirms an IME
+candidate never sends). **abort (Ctrl-C)** asks first; **share** opens the
+pane-sharing dialog when [sharing](#invite-someone-to-a-pane-or-window) is
+configured. Esc or × closes the drawer.
+
+`#pane=<id>` (plus `&socket=<socket>` when the id exists on several tmux
+servers) links straight to a drawer; closing it removes the fragment.
+
+Output and sending are for operators (the token, or an operator sign-in).
+Pane output can contain anything the agent printed, including secrets, so
+`GET /api/panes/{pane}/output` is gated like a write even though it is a GET:
+a viewer gets 403, and in `public_read` an anonymous visitor needs the token.
+Viewers and signed-out visitors can still open the drawer, but it shows only
+the metadata above and never requests output. With `auth = "none"` nobody
+can read output. The live stream (below) is gated the same way.
+
+### Live pane output
+
+The drawer and the window tiles read
+`GET /api/panes/{pane}/output/stream?socket=&lines=N`, a server-sent event
+stream with the same access rules, validation and `Cache-Control: no-store` as
+`/output`.
+
+- **One capture loop per pane.** Every viewer of a pane (both tabs, the drawer
+  and a tile) shares one loop in the daemon. It runs only while someone is
+  connected: it captures the pane every 300 ms, strips escapes with the same
+  sanitizer as `/output`, and publishes only when the text changed. It stops
+  within one tick after the last viewer leaves. A capture still running when
+  the next tick comes skips that tick, so tmux calls never pile up.
+- **Events.** `event: output` carries `{ pane, text, captured_at }` with the
+  whole bounded text (newest `N` lines, 64 KiB cap), first as a snapshot on
+  connect and then on every change to that viewer's lines; an unchanged pane
+  sends nothing but a keep-alive comment every 15 seconds. `event: gone`
+  (`{ pane }`) means two captures in a row failed, usually because the pane
+  closed; it is the last event.
+- **Limits.** At most 32 panes stream at once across all clients, and 8
+  viewers per pane; beyond that the request gets `429`. A stream closes after
+  30 minutes and the client reconnects, so a revoked credential cannot hold a
+  stream open.
+- **Client.** The dashboard reads the stream with `fetch()` (like
+  `/api/events`), so bearer tokens and sign-in cookies both work. It
+  reconnects with exponential backoff (0.5 s doubling to 15 s, jittered),
+  closes streams while the tab is hidden or the drawer or window is closed,
+  and caps a window at six streaming tiles. Against an older daemon that
+  answers `404`, it falls back to polling `/output` (1.5 s in the drawer, 3 s
+  for tiles).
+
+### Nerd Font glyphs
+
+Shell prompts (powerlevel10k, starship) and agent status lines often print
+Nerd Font icons, which live in Unicode's Private Use Areas. The dashboard,
+including the shared-pane page, bundles a subset of **Symbols Nerd Font Mono**
+and lists it after the primary monospace font with a `unicode-range` of
+U+E000–U+F8FF and U+F0000–U+FFFFF, so ordinary text keeps your system's
+monospace font and browsers fetch the icon font (about 1.2 MB, served from
+`/static/fonts/`) only when output actually contains such a glyph. The
+shared-pane page's Content-Security-Policy allows it with `font-src 'self'`.
+See [Third-party notices](#third-party-notices).
 
 ## Starting work from the board
 
@@ -320,6 +550,16 @@ remains false. This keeps provider sync and operator-authored workflow state
 independent.
 
 ## Timeline
+
+The all-session overview places activity on the same wall-clock axis as the
+selected session timeline. Overlapping agent intervals are unioned into rows
+for working, waiting, error, idle, and starting; interaction and tmux presence
+have their own rows. Gaps remain empty. Totals still report summed agent time
+and the shared `muxa stats` attribution, so simultaneous agents can accumulate
+more work time than the width of a wall-clock interval.
+
+Numeric client-view sessions are folded into their base session in the
+workspace rail, pane inventory, diagnostics, and retained session filters.
 
 The timeline panel calls `/api/timeline?since=7d` by default and can switch
 to `24h`, `today`, `last week`, `month`, `last month`, `30d`, `12w`, or a clicked `YYYY-MM-DD` calendar day in the
@@ -367,6 +607,9 @@ Three event types appear on the wire:
 (`EventSource` can't carry `Authorization` headers, so the frontend uses
 `fetch()` and parses SSE frames manually. ~30 lines of JS.)
 
+Pane output has its own per-pane stream; see
+[Live pane output](#live-pane-output).
+
 ## Why the HTML is public
 
 The static HTML/JS/CSS routes intentionally sit *outside* the auth middleware.
@@ -384,17 +627,375 @@ Three reasons:
 If this tradeoff doesn't work for you, front the daemon with a reverse proxy
 that strips the carve-out (or use mTLS).
 
-## What it doesn't do (yet)
+## Scope and limits
 
 - External issue references are captured at `muxa work up` time. Continuous
   two-way Linear/GitHub/Jira synchronization, dependencies, and estimates are
   not implemented.
 - Control is intentionally narrow: Work/pane prompt and abort plus
-  Muxa-owned PTY input/terminate. Configuration, files, and arbitrary shell
-  commands are not writable through the dashboard.
+  Muxa-owned PTY input/terminate. There are no direct configuration/file editing
+  APIs. Sending a prompt to a shell pane can execute shell commands.
 - No mobile UI. The CSS scales OK to ~600 px but isn't designed for phones.
-- No multi-user auth. One token = one bearer.
+- Operator access uses a bearer token, or optionally
+  [OIDC sign-in](#operator-sign-in-with-oidc) restricted to one group. Invited
+  recipients use OIDC with access limited to their shared panes; they cannot
+  manage the dashboard.
 
-These are deliberate v1 cuts; the [`dashboard::router`](../crates/muxa/src/dashboard/server.rs)
-function is `pub` so a future PR can `.merge()` extra routes without a
-rewrite.
+The [`dashboard::router`](../crates/muxa/src/dashboard/server.rs) function is
+public for embedding and integration tests.
+
+### Third-party notices
+
+The dashboard embeds `muxa-nerd-symbols.woff2`, a subset of Symbols Nerd Font
+Mono from [Nerd Fonts](https://github.com/ryanoasis/nerd-fonts) v3.5.1 (MIT,
+copyright Ryan L McIntyre). The icon sets it contains keep their own licenses
+(Font Awesome and Codicons CC BY 4.0, Material Design Apache 2.0, Pomicons and
+Weather Icons SIL OFL 1.1, the rest MIT). The license text, source URL,
+checksums and the command that produced the subset are in
+[`crates/muxa/src/dashboard/web/fonts/`](../crates/muxa/src/dashboard/web/fonts/README.md);
+the daemon also serves the license at `/static/fonts/LICENSE-nerd-fonts-symbols.txt`.
+
+<a id="operator-sign-in-with-oidc"></a>
+
+## Operator sign-in with OIDC
+
+Instead of pasting the bearer token into every browser, the dashboard owner can
+sign in through any standards-compliant OpenID Connect provider (Keycloak,
+Authentik, Dex, and similar). Sign-in is deny by default; each verified account
+gets exactly one role, checked in this order:
+
+| Role | Granted when | Can |
+| ---- | ------------ | --- |
+| operator | the ID token's group claim contains `required_group`, or the account was **enrolled** with the dashboard token ([Enrolling an account with the token](#enrolling-an-account-with-the-token)) | everything the bearer token can |
+| viewer | the group claim contains `viewer_group`, or the account matches a [viewer rule](#viewers) | read the dashboard and its event stream, redacted exactly like an anonymous `public_read` visitor; no writes, no shares, no access management |
+| none | nothing above | nothing: no session is created. With enrollment on it gets the token page, otherwise a refusal page |
+
+Pane and window share recipients (`/share/*`) are a separate feature with their
+own sessions: a viewer session is not a share session, and neither implies the
+other.
+
+Signing in grants the same authority as the bearer token, so restrict the group
+to the people who should operate this machine's agents. Enrollment lets the
+token holder add their own account without editing the provider's groups.
+
+```toml
+[dashboard]
+enabled = true
+bind = "127.0.0.1:7878"
+auth = "token"
+# Keep the token (dashboard.token or MUXA_DASHBOARD_TOKEN). It remains the
+# API/CLI credential and the way in when the provider is unavailable.
+
+[dashboard.login]
+public_url = "https://muxa.example.com"      # origin only; HTTP only on loopback
+issuer_url = "https://login.example.com/realms/example"
+client_id = "muxa-dashboard"
+# required_group = "muxa-operators"          # optional while enrollment is on
+# enrollment = true                          # default; false = group-only sign-in
+# viewer_group = "muxa-viewers"              # optional read-only group
+# viewer_rules = ["email:*@example.com"]     # optional read-only viewer rules
+# groups_claim = "groups"                    # default "groups"
+# scopes = ["groups"]                        # requested in addition to "openid email"
+# client_secret_env = "MUXA_LOGIN_CLIENT_SECRET"  # confidential clients: env var NAME
+```
+
+Provider requirements:
+
+- Discovery at `{issuer_url}/.well-known/openid-configuration` with HTTPS
+  authorization and token endpoints.
+- Authorization code flow with **PKCE S256**. A public client
+  (`token_endpoint_auth_method = none`) works; a confidential client uses
+  `client_secret_env`.
+- The exact redirect URI `https://muxa.example.com/auth/callback`.
+- A signed ID token whose `groups_claim` holds the group names, as a JSON array
+  of strings or a single string. Some providers release it only with an extra
+  scope (add it to `scopes`) or a client/claim mapper. `email` is shown in the
+  dashboard when present but is not used for authorization and need not be
+  verified.
+
+Rules checked at startup: `required_group`, when set, is a non-empty group
+name; `required_group` is set when `enrollment = false`; `auth = "token"` with
+a token is configured; and when `[dashboard.sharing]` is also set, both
+sections use the same `public_url`. Restart the daemon after changes.
+
+Without `required_group`, the provider only proves who someone is: nobody is an
+operator until the token holder enrolls them.
+
+Flow and session contract:
+
+| Route | Purpose |
+| ----- | ------- |
+| `GET /auth/login?return_to=/path` | Starts the flow (PKCE S256, state, nonce, `prompt=select_account`). `return_to` must be a same-origin path beginning with a single `/`. |
+| `GET /auth/callback` | Verifies the ID token (signature, issuer, audience, expiry, nonce, `at_hash`), then redirects to `return_to` if the account is an operator, or to `/auth/enroll` if it is not and enrollment is on. |
+| `GET /auth/enroll` | Enrollment page for this browser's pending enrollment. |
+| `POST /auth/enroll` | JSON `{"token": "..."}`; enrolls this browser's pending account, or its signed-in viewer ("upgrade with token"), and signs it in as an operator. |
+| `GET /auth/enroll/cancel` | Discards this browser's pending enrollment. |
+| `POST /auth/logout` | Ends the session. |
+| `GET /auth/session` | Unauthenticated `{available, signed_in, role, email, via, enrollment, login_url}` so a signed-out page can offer sign-in. `role` is `none`, `viewer` or `operator` (the bearer token counts as `operator`); `via` is `group`, `enrollment`, `viewer_group`, `viewer_rule` or `null`. `/api/access` includes the same object as `login`. |
+| `GET /api/operators` | Operator only: `account` (the caller: `{role, via, email, subject}`, `via` is `token` for the bearer token) and enrolled accounts `{id, email, subject, issuer, created_at, last_seen_at, current, active}`. |
+| `POST /api/operators/{id}/remove` | Operator only: removes the account and ends its sessions. |
+| `GET /api/viewers` | Operator only: `{viewer_group, max, rules: [{id, rule, source, active, created_at}]}`; `source` is `config` (read-only, `id` null) or `dashboard`. |
+| `POST /api/viewers` | Operator only: JSON `{"rule": "email:*@example.com"}`; 201, 400 for an invalid rule, 409 for a duplicate or the 128-rule limit. |
+| `POST /api/viewers/{id}/remove` | Operator only: removes a dashboard rule and ends viewer sessions it no longer allows. |
+
+- The session cookie is `__Host-muxa-op` (`muxa-op-dev` over loopback HTTP),
+  `HttpOnly; Secure; SameSite=Strict; Path=/`, lasting 8 hours. A short-lived
+  `__Host-muxa-op-login` cookie (`SameSite=Lax`) binds the pending login to the
+  browser that started it.
+- Group membership is checked at sign-in. Removing someone from the group takes
+  effect when their session expires, they sign out, or the daemon restarts.
+  Enrollment is checked on every request, so removing an enrolled account ends
+  its sessions immediately. Sessions are in memory only and never written to
+  disk.
+- Every read route, SSE included, accepts either the bearer token or an
+  operator or viewer session cookie. Write and management routes answer a
+  viewer session with 403. A **state-changing request authorized by the cookie** must also
+  send `Origin: <public_url>` and `X-Muxa-Operator: 1`, or it is refused with
+  403. The dashboard's own JavaScript does this; bearer-token clients do not need
+  to. `POST /auth/logout` has the same requirement.
+- Sign-in state is separate from pane sharing: a recipient session never
+  authorizes operator APIs, and the operator cookie is not a recipient session.
+
+Behind a reverse proxy or tunnel, preserve the public `Host` header (the
+loopback-bound dashboard accepts the configured public host and rejects other
+names), forward cookies unchanged, and do not cache `/auth/*` or `/api/*`.
+Omit query strings on `/auth/callback` from access logs: they contain the
+authorization code. Muxa's own logs redact `code`, `state` and `token`.
+
+Opening the dashboard on another origin (for example `http://127.0.0.1:7878`)
+still works with the token; its **sign in** button sends the browser to the
+public origin, because the callback and cookie belong there.
+
+### Enrolling an account with the token
+
+With `enrollment` on (the default), an account the provider verifies but that is
+not an operator is not turned away:
+
+1. The callback holds the verified issuer, subject and email for five minutes in
+   a pending enrollment bound to this browser by an `HttpOnly; SameSite=Lax`
+   cookie, `__Host-muxa-op-enroll` (`muxa-op-enroll-dev` over loopback HTTP),
+   and redirects to `/auth/enroll`.
+2. That page shows the signed-in account and asks for the dashboard's access
+   token. Its script sends the token once, as JSON, to `POST /auth/enroll`.
+3. With the right token the account is enrolled, the pending cookie is
+   cleared, and the browser gets a normal operator session and returns to
+   where it started. From then on the account signs in directly.
+
+**Cancel** discards the pending enrollment. A signed-in viewer can enroll its own
+account the same way with **upgrade with token** in the header; the viewer
+session is replaced by an operator session. To remove an enrolled account, open
+**access** in the dashboard header (shown to an unlocked or signed-in
+operator) and choose **Remove**, or call `POST /api/operators/{id}/remove` with
+the bearer token. Removal ends that account's live sessions at once; signing in
+again leads back to the enrollment page. Group members are not listed and need
+no enrollment.
+
+Security notes:
+
+- Enrollment grants nothing beyond the token: only someone who already holds
+  the dashboard token, and so already has full operator rights, can enroll an
+  account. A pending enrollment authorizes no API route by itself.
+- `POST /auth/enroll` requires the pending cookie, `Origin: <public_url>` and
+  `X-Muxa-Operator: 1`, and a JSON body. A cross-site page can neither send the
+  `Lax` cookie on a POST nor add the header without a CORS preflight the
+  dashboard never grants. The page's CSP allows only its own same-origin script
+  and blocks native form submission, so the token cannot end up in a URL.
+- The token is compared in constant time and never logged. Each pending
+  enrollment allows five wrong tokens and is then discarded, so a new provider
+  sign-in is needed. Every wrong token also delays the next attempt from any
+  browser by one more second (up to 30 seconds). At most 16 enrollments may be
+  pending at once.
+- Enrollment is keyed on the ID token's issuer and `sub`, never the email, and
+  is pinned to the configured `issuer_url`: entries recorded for another issuer
+  are listed but never match.
+- At most 64 accounts can be enrolled. Pane-sharing recipient sessions cannot
+  enroll or reach `/api/operators`.
+- The viewer upgrade uses the same `POST /auth/enroll` checks: the `Strict`
+  session cookie plus `Origin` and `X-Muxa-Operator: 1`, the constant-time
+  comparison, the global backoff, and five wrong tokens per viewer session,
+  after which that session is ended.
+- `enrollment = false` restores group-only sign-in: the refusal page returns,
+  and previously enrolled accounts stop being honored. They are kept on disk
+  and are honored again if enrollment is turned back on.
+
+### Viewers
+
+Operators manage viewer rules in the **access** dialog. Type an email address
+(`ann@example.com`) or a domain pattern (`*@example.com`); the dialog stores
+them as `email:ann@example.com` and `email:*@example.com`. The API and
+`viewer_rules` also accept `sub:<subject>`.
+
+- Email rules match only when the ID token says `email_verified: true`, and
+  compare case-insensitively. A domain rule matches that exact domain:
+  `*@example.com` does not match `ann@sub.example.com`. There are no other
+  wildcards.
+- `sub:` rules match the subject exactly. Every rule is pinned to the configured
+  `issuer_url`; rules recorded under another issuer are listed but never match.
+- Rules are re-checked on every request, so removing one ends the viewer
+  sessions it allowed at once. `viewer_group` is checked at sign-in, like
+  `required_group`.
+- `viewer_rules` in the configuration are merged with the dashboard's rules and
+  shown read-only. At most 128 of each.
+- An account that is both an operator and a viewer signs in as an operator.
+
+Enrolled accounts and viewer rules are stored in SQLite at
+`$XDG_DATA_HOME/muxa/dashboard-operators/operators.sqlite3` (the platform data
+directory, next to the pane-sharing store): mode `0600` in a `0700` directory,
+held under an exclusive lock so a second daemon cannot open it, and refused if
+the file is not a muxa operator store. Each row holds the issuer, subject, the
+display email, and the enrollment and last sign-in times; viewer rules keep the
+rule, its issuer and when it was added. Nothing is opened when sign-in is off.
+
+<a id="invite-someone-to-a-pane"></a>
+
+## Invite someone to a pane or window
+
+Authenticated sharing gives an invited account access to a local **tmux or rmux
+pane**, or the current panes in its **window**. Choose the scope when creating
+an invitation. A window invitation pins up to 16 pane processes; panes created
+later are not included. The recipient selects a pane to view or send commands.
+If one pane ends, the other original panes remain accessible. Choose **share** on a pane, enter the recipient's email,
+choose **View output** or **View and send prompts**, then copy the generated link.
+The dashboard's **Shares** button lists and revokes invitations. The recipient
+signs in on a separate page; the operator bearer token must not be sent to them.
+
+Configure an OIDC application that supports authorization code flow with PKCE
+and returns `email` and `email_verified = true` in its ID token. Register the exact
+redirect URI `https://muxa.example.com/share/auth/callback` with that provider.
+Example configuration (replace the example host and issuer):
+
+```toml
+[dashboard]
+enabled = true
+bind = "127.0.0.1:7878"
+auth = "token"
+# Supply the operator token through MUXA_DASHBOARD_TOKEN or dashboard.token.
+
+[dashboard.sharing]
+public_url = "https://muxa.example.com"
+issuer_url = "https://login.example.com"
+client_id = "muxa-dashboard"
+# Optional for confidential clients; this is the environment variable NAME.
+client_secret_env = "MUXA_SHARING_CLIENT_SECRET"
+# Optional: absolute path on a private local filesystem.
+# storage_path = "/absolute/path/to/shares.sqlite3"
+```
+
+Terminate HTTPS at a reverse proxy forwarding to the loopback dashboard, preserve
+its public `Host`, and forward `/share/*` and the dashboard static assets. The
+configured `public_url` must be an origin without a path, query or fragment.
+HTTP is accepted only for loopback development. Sharing requires private
+`auth = "token"`; `public_read` and `none` are incompatible. Set the client secret
+in the daemon's environment when `client_secret_env` is specified. Restart after
+configuration changes. No login provider or public listener is enabled automatically.
+
+Invitations expire after 1 minute to 24 hours (the UI offers 1, 4 or 24 hours).
+Up to 256 invitations are retained until expiry, including revoked invitations;
+if the limit is reached, wait for previous invitations to expire.
+Sessions last at most 8 hours. Invitations, bound identities, revocations and command
+receipts are saved in a private SQLite database under the platform data directory
+(`muxa/dashboard-sharing/shares.sqlite3`). **Daemon restarts preserve invitations;
+recipients sign in again.** The pane process must still be the original process.
+Session cookies and pending login flows remain in memory and are never saved. The first successful
+login binds the verified invited email to the provider's subject identifier.
+Other accounts cannot use the link, and recipient cookies grant no operator API
+access. Logging out ends that browser session; use **Revoke** to end the invitation.
+Revocation waits for an already accepted prompt to finish and rejects subsequent
+prompts. It cannot undo commands already executed.
+
+Prompt access submits literal text followed by Enter to the existing process.
+A shell pane therefore permits shell commands; share only with someone who should
+have that authority and may see the pane's output. This is not a command sandbox.
+The socket, session, window, pane and process identity are checked again before
+operations; replacing the pane requires a new invitation. Remote panes, terminal resizing and raw keyboard streaming are not included.
+Tmux servers with colliding short socket names must be renamed before sharing.
+
+The recipient page polls visible output every 2 seconds and pauses while hidden.
+Output capture has a 1-second cache, a 32,768-character limit and a bounded pool
+of eight concurrent pane operations. Prompt requests are limited to 16 KiB and
+one per 500 ms per share, with at most 1,024 distinct commands per invitation.
+All invitations to the same pane serialize command delivery. Failed submissions
+are never retried automatically. The page reconnects with bounded backoff after
+network failures and disables sending until it has a fresh successful read.
+
+Operator API: `GET/POST /api/shares`, `POST /api/shares/{id}/revoke` (bearer token).
+Create body: `{"scope":"pane","pane":"%1","socket":"/path/to/tmux/socket","email":"guest@example.com","permission":"prompt","ttl_seconds":3600}`.
+Use `"scope":"window"` to include the current window members.
+Recipient API: `GET /share/api/{id}` (optional `?pane=%252` to select `%2`), `POST /share/api/{id}/prompt` with
+`{"text":"...","request_id":"a-unique-command-id","pane":"%2"}`.
+The pane must belong to the invitation; omitting it selects the original pane. Reuse the same ID, selected pane and exact
+text when checking an uncertain delivery. A confirmed receipt returns success
+without executing again; an interrupted/uncertain receipt returns 409 and is
+never replayed, including after restart. A changed payload under the same ID is
+rejected. IDs omitted by legacy callers cannot deduplicate separate requests.
+Recipient writes require the session cookie, the configured
+origin and `X-Muxa-Share: 1`.
+
+### Deployment and recovery
+
+1. Register an OIDC client with authorization code flow, PKCE S256 and the exact
+   public callback URI. The ID token must contain a verified email. Keep the
+   operator bearer token separate from the OIDC client secret.
+2. Configure `dashboard.sharing` and supply the named secret environment variable
+   to the daemon service, then restart. `storage_path` may override the database
+   location with an absolute file path on a local filesystem. Keep the database
+   and its lock file private to the daemon user; muxa creates them with mode 0600.
+3. Forward the HTTPS origin to the loopback dashboard without rewriting `Host`,
+   stripping cookies or caching `/share/*` and `/api/*` responses. Configure the
+   proxy access log to omit query strings on `/share/auth/callback`: they contain
+   authorization codes. Muxa's own HTTP logs redact code, state and operator
+   tokens, including percent-encoded parameter names.
+4. In **Shares**, choose **Check login setup**. It checks discovery and signing
+   key reachability; it cannot validate a client secret or email claim without an
+   actual login. Create a short-lived invitation and test the recipient login,
+   command, daemon restart and revocation before distributing links.
+
+`GET /api/shares/status` reports whether configuration, private storage and the
+client-secret environment variable are present. `POST /api/shares/check` checks
+provider discovery. Both require the operator bearer token. Recipients can use
+**Sign out all devices** to end their current account's browser sessions without
+revoking the invitations themselves.
+
+Muxa commits an invitation, account binding or revocation before confirming it.
+It also records command acceptance before sending input. If storage fails, the
+change is not acknowledged and a new command is not executed. If the process dies
+between acceptance and completion, the command's result is uncertain: inspect the
+pane, then explicitly start a new command if appropriate. This guarantees that
+replaying the same request ID does not intentionally execute it twice; it cannot
+make a terminal side effect transactional with the database.
+
+The database is leased to one daemon. A second daemon using the same file is
+rejected; use separate storage paths for separate instances. Corrupt data,
+unsupported storage versions, or changes to the public origin, issuer or client
+ID prevent the sharing dashboard from starting. The error is in daemon logs.
+Restore the original configuration or choose a new storage path to begin with no
+existing grants. Never silently replace a corrupt database with an empty one.
+For backups, stop the daemon before copying the database. Restoring a backup can
+restore permissions that were revoked after that backup; review invitations
+before reopening external access.
+
+The optional browser smoke test exercises an isolated daemon, test OIDC provider
+and private tmux server. It covers login, command delivery, response loss,
+reconnection, restart, recipient isolation and revocation. It needs Python's
+`cryptography`, Node's `playwright`, and a Chromium executable:
+
+```sh
+cargo build --workspace --bins
+# Configure these only if playwright/Chromium are outside their default locations.
+export MUXA_PLAYWRIGHT_PACKAGE=/path/to/playwright
+export MUXA_TEST_CHROMIUM=/path/to/chromium
+python3 scripts/dashboard-sharing-smoke.py
+```
+
+This harness creates only loopback listeners and fixture identities. Passing it
+does not replace the deployment's own HTTPS and real-provider login check.
+
+### OIDC dependency review
+
+`openidconnect` currently brings in `rsa` for ID-token signature verification.
+The dependency scanner exception for [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071.html)
+is limited to that advisory: its private-key timing disclosure does not apply to
+Muxa's public-key verification path. Muxa does not import RSA private keys, sign
+RSA client assertions or decrypt RSA messages. The upstream advisory has no
+patched version as of this review (2026-09-27). Reassess this exception before
+adding any private-key RSA operation or changing the OIDC dependency.

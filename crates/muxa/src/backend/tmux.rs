@@ -94,10 +94,23 @@ impl PaneBackend for TmuxBackend {
         crate::tmux::send_text_on(socket, pane_id, text)
     }
 
+    fn send_prompt_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+        text.is_empty() || crate::tmux::paste_text_on(socket, pane_id, text)
+    }
+
     fn capture_pane_on(&self, socket: Option<&str>, pane_id: &str) -> Option<String> {
         // Control-plane capture pinned to the pane's recorded server, so a
         // shared pane id can't read the wrong screen. Best-effort → `None`.
         crate::tmux::capture_pane_on(socket, pane_id).ok()
+    }
+
+    fn capture_pane_history_on(
+        &self,
+        socket: Option<&str>,
+        pane_id: &str,
+        history: usize,
+    ) -> Option<String> {
+        crate::tmux::capture_pane_history_on(socket, pane_id, history).ok()
     }
 
     // `caps()` uses the default impl from the trait — tmux supports

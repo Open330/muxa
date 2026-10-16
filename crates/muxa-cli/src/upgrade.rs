@@ -38,6 +38,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -97,6 +98,8 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
         return Ok(());
     }
 
+    let before = snapshot_before_upgrade(&socket).await;
+
     if plan.do_pull {
         let _ = cliclack::log::step("git pull");
         run_streaming(Command::new("git").arg("pull").current_dir(&repo)).context("git pull")?;
@@ -119,7 +122,52 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     };
 
     let head = current_head(&repo).unwrap_or_else(|| "HEAD".into());
+    report_after_upgrade(before.as_deref());
     finish(&restart, &head, &socket)
+}
+
+/// Snapshot the workspace muxa tracks before anything is replaced, so a
+/// restart of the agents (or the multiplexer) can be undone with one
+/// `muxa restore`. Best-effort: an upgrade never fails for want of one.
+async fn snapshot_before_upgrade(socket: &Path) -> Option<PathBuf> {
+    let client = muxa::ipc::Client::new(socket.to_path_buf());
+    match crate::reload::snapshot_before_upgrade(&client).await {
+        Ok((dir, summary)) => {
+            let _ = cliclack::log::info(format!(
+                "pre-upgrade snapshot: {} ({summary})",
+                dir.display()
+            ));
+            Some(dir)
+        }
+        Err(error) => {
+            let _ = cliclack::log::info(format!("pre-upgrade snapshot skipped: {error}"));
+            None
+        }
+    }
+}
+
+/// After the swap: name the agent-side processes still on the old binary
+/// and how to replace them, plus the way back to the pre-upgrade workspace.
+fn report_after_upgrade(snapshot: Option<&Path>) {
+    let stale = crate::stale_agents::installed_muxa()
+        .as_deref()
+        .map(crate::stale_agents::scan)
+        .unwrap_or_default();
+    let mut note = stale.guidance().unwrap_or_else(|| {
+        "Every running agent tool server (`muxa mcp`) already uses the new build.".to_owned()
+    });
+    if let Some(dir) = snapshot {
+        let _ = write!(
+            note,
+            "\n\nIf restarting agents or the multiplexer loses a pane, rebuild the \
+             pre-upgrade workspace (agents relaunch with their resume command):\n    \
+             muxa restore {}          # review the plan\n    \
+             muxa restore {} --run    # recreate what is missing",
+            dir.display(),
+            dir.display()
+        );
+    }
+    let _ = cliclack::note("After the upgrade", note);
 }
 
 /// Upgrade without a source checkout: Homebrew delegation or GitHub
@@ -140,11 +188,17 @@ verify IPC generation/socket",
             let _ = cliclack::outro("Dry run — no changes made.");
             return Ok(());
         }
+        let before = snapshot_before_upgrade(socket).await;
         let _ = cliclack::log::step("brew upgrade muxa");
         run_streaming(Command::new("brew").args(["upgrade", "muxa"]))
             .context("brew upgrade muxa")?;
-        return finish_with_restart(args, socket, &format!("v{}", latest_installed_version()))
-            .await;
+        return finish_with_restart(
+            args,
+            socket,
+            &format!("v{}", latest_installed_version()),
+            before.as_deref(),
+        )
+        .await;
     }
 
     let triple = release_target_triple(std::env::consts::OS, std::env::consts::ARCH)
@@ -188,6 +242,7 @@ verify IPC generation/socket",
         let _ = cliclack::outro("Dry run — no changes made.");
         return Ok(());
     }
+    let before = snapshot_before_upgrade(socket).await;
 
     let staging = std::env::temp_dir().join(format!("muxa-upgrade-{}", std::process::id()));
     std::fs::create_dir_all(&staging).context("creating staging dir")?;
@@ -228,12 +283,17 @@ verify IPC generation/socket",
     }
     let _ = std::fs::remove_dir_all(&staging);
 
-    finish_with_restart(args, socket, &latest).await
+    finish_with_restart(args, socket, &latest, before.as_deref()).await
 }
 
 /// Shared tail: restart the daemon (unless opted out), verify the
 /// socket, and close the flow with the version we ended on.
-async fn finish_with_restart(args: &Args, socket: &Path, version: &str) -> Result<()> {
+async fn finish_with_restart(
+    args: &Args,
+    socket: &Path,
+    version: &str,
+    before: Option<&Path>,
+) -> Result<()> {
     let restart = if args.no_restart {
         let _ = cliclack::log::info("daemon restart skipped (--no-restart)");
         RestartOutcome::Skipped
@@ -241,6 +301,7 @@ async fn finish_with_restart(args: &Args, socket: &Path, version: &str) -> Resul
         let _ = cliclack::log::step("restarting daemon");
         restart_daemon(socket).await
     };
+    report_after_upgrade(before);
     finish(&restart, version, socket)
 }
 

@@ -561,6 +561,8 @@ pub async fn run_reconcile(args: ReconcileArgs, client: &muxa::ipc::Client) -> R
                     && run.identity.work_id.eq_ignore_ascii_case(work)
             })
     });
+    let mut failure_count = 0;
+    let mut first_error = None;
     for run in selected {
         if let Err(error) = reconcile_run(client, &run.identity, run.generation).await {
             tracing::warn!(
@@ -569,7 +571,18 @@ pub async fn run_reconcile(args: ReconcileArgs, client: &muxa::ipc::Client) -> R
                 %error,
                 "pipeline reconciliation failed",
             );
+            failure_count += 1;
+            if first_error.is_none() {
+                first_error = Some(error.context(format!("reconcile {}", run.identity.key())));
+            }
         }
+    }
+    // Finish the other Runs, but let the supervisor apply failure backoff.
+    // A failed claim/report must not look like a successful worker pass.
+    if let Some(error) = first_error {
+        return Err(error.context(format!(
+            "{failure_count} pipeline Run(s) failed reconciliation"
+        )));
     }
     Ok(())
 }
@@ -1402,6 +1415,102 @@ fn describe(step: &PlanStep, result: &UpResult) -> (char, String, String) {
 }
 
 #[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+    use muxa::pipeline_run::PipelineRunStore;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn run_pass(first_claim_fails: bool) -> Result<()> {
+        let store = PipelineRunStore::in_memory();
+        for work in ["first", "second"] {
+            store
+                .register(PipelineRunRegistration {
+                    identity: WorkIdentity::new("ws", work),
+                    pipeline: "solo".into(),
+                    desired: vec![DesiredAgent {
+                        alias: "impl".into(),
+                        program: "codex".into(),
+                        role: None,
+                        task: None,
+                        prompt: None,
+                        options: Vec::new(),
+                        direction: None,
+                        after: Vec::new(),
+                    }],
+                    cwd: PathBuf::from("/tmp"),
+                    window_id: None,
+                    observed: Vec::new(),
+                    invalidate: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        let runs = store.list().await;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("muxa.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for expected in ["list", "first", "second"] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let hello: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(hello["kind"], "hello");
+                writer.write_all(b"{\"ok\":true}\n").await.unwrap();
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let response = if expected == "list" {
+                    assert_eq!(request["kind"], "pipeline_runs");
+                    serde_json::json!({"ok": true, "pipeline_runs": runs})
+                } else {
+                    assert_eq!(request["kind"], "pipeline_claim");
+                    assert_eq!(request["identity"]["work_id"], expected);
+                    if expected == "first" && first_claim_fails {
+                        serde_json::json!({"ok": false, "error": "claim unavailable"})
+                    } else {
+                        serde_json::json!({"ok": true, "pipeline_claims": []})
+                    }
+                };
+                let mut bytes = serde_json::to_vec(&response).unwrap();
+                bytes.push(b'\n');
+                writer.write_all(&bytes).await.unwrap();
+            }
+        });
+        let result = run_reconcile(
+            ReconcileArgs {
+                all: true,
+                workspace: None,
+                work: None,
+            },
+            &muxa::ipc::Client::new(socket),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("reconciliation skipped the second Run")
+            .unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn failure_is_returned_after_other_runs_are_reconciled() {
+        let error = run_pass(true).await.unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("1 pipeline Run(s) failed reconciliation"));
+        assert!(detail.contains("ws/first"));
+        assert!(detail.contains("claim unavailable"));
+    }
+
+    #[tokio::test]
+    async fn successful_pass_keeps_its_success_status() {
+        run_pass(false).await.unwrap();
+    }
+}
+
+#[cfg(test)]
 mod done_view_tests {
     use super::*;
 
@@ -1479,16 +1588,15 @@ fn state_label(state: AgentState) -> &'static str {
 
 fn send_prompt(pane: &str, text: &str) -> Result<()> {
     let sent = if muxa::backend::rmux::endpoint_from_env().is_some() {
-        muxa::PaneBackend::send_text(&muxa::RmuxBackend::new(), pane, text)
+        muxa::PaneBackend::send_prompt_text_on(&muxa::RmuxBackend::new(), None, pane, text)
     } else {
-        muxa::tmux::send_text(pane, text)
+        muxa::PaneBackend::send_prompt_text_on(&muxa::TmuxBackend::new(), None, pane, text)
     };
     if !sent {
         bail!("tmux refused the prompt; the pane may be gone");
     }
-    // The agent CLIs treat text and submit as separate events; typing into
-    // a TUI that is still redrawing swallows the newline.
-    std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
+    // Native hosts have an explicit paste end; other hosts use a fallback.
+    std::thread::sleep(muxa::backend::prompt_submit_grace(pane));
     let output =
         crate::mux_control::ambient_command_with_args(&["send-keys", "-t", pane, "Enter"])?
             .output()

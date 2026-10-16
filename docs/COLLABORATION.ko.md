@@ -12,8 +12,7 @@ request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 
   그 pane으로 돌아가 agent를 깨웁니다.
 - `muxa watch`는 agent가 아니라 **operator console**입니다. watch를 연 pane에 무엇이
   들어 있든, 발신자는 키보드 앞의 사람입니다.
-- agent를 선택하고 `m`으로 보내며 `M`으로 mailbox를 엽니다(`b`는 alias로
-  유지됩니다).
+- agent를 선택하고 `m`으로 보내며 `M`으로 mailbox를 엽니다.
 
 즉 agent 간 협업은 같은 window에 agent 둘을 두고 MCP로 주고받는 흐름이고, 사람의
 흐름은 그와 별개로 준비가 필요 없습니다. 어디서든 `prefix+s`를 누르고, 행을
@@ -193,7 +192,7 @@ muxa msg inbox
 muxa msg reply req_... "검토 완료: ..." --status completed
 
 # 발신 agent
-muxa msg wait req_... --timeout-secs 300
+muxa msg wait req_... --timeout-secs 300 --body
 
 # claim하지 않고 request/reply lifecycle 확인
 muxa msg list --mailbox sent
@@ -210,6 +209,22 @@ muxa msg list --scope all --since 7d --work CAL-7345 --kind review \
 # 아직 상대가 claim하지 않은 요청 취소
 muxa msg cancel req_...
 ```
+
+`muxa msg inbox`의 텍스트 출력에는 작업 본문과 함께 답변 의무, 허용 경로, 첨부 자료가 표시됩니다. `muxa msg wait --timeout SECONDS`는 `--timeout-secs SECONDS`의 별칭입니다.
+
+`muxa msg wait` 기본 출력은 전달 상태와 최종 답장 수신 여부를 나타내는
+간결한 JSON입니다. 작업 성공을 판정하지 않습니다. 대기 시간 초과는
+`reason: timeout` JSON과 종료 코드 2로 구분하며, 작업 결과를 판정하지 않습니다.
+`--full`도 시간 초과에는 비정상 종료하고, 전달 오류는 별도로 비정상 종료합니다.
+`--body`는 최종 답장 본문만 출력하고, `--body --output /tmp/reply.txt`는
+셸에서 JSON을 파싱하지 않고 파일에 직접 저장합니다. 최종 답장이 없으면
+`--body`도 시간 초과에는 본문이나 파일을 쓰지 않고 종료 코드 2를 반환합니다.
+답장 없이 닫힌 요청에는 오류를 반환합니다. `--full`은 기존 요청 전체 JSON을 반환합니다.
+본문의 `pending`/`timeout` 단어로 완료 여부를 판단하거나 JSON을 셸 `echo`에
+통과시키지 마세요. JSON 이스케이프가 변환될 수 있습니다. 직접 파일로 저장하거나
+명령의 표준출력을 JSON 파서에 바로 연결하세요. 진행 보고와 최종 답장은 구분하며,
+작업 결과는 답장 작성자가 선언하고 요청자가 검증합니다.
+
 
 `send`, `reply`, `cancel`은 한 줄 영수증만 출력하고, `list`와 `inbox`는 각
 요청과 (도착했다면) 그 답장을 함께 보여줍니다. 저장된 레코드 전체가 필요하면
@@ -240,7 +255,7 @@ Work 필드를 채우고 가능하면 execution binding으로 run id를 만들�
 keyword를 받습니다.
 
 tracked agent pane에서 `prefix+s`로 `muxa watch`를 열면 같은 lifecycle을 TUI로
-사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `M`/`b`는 claim
+사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `M`은 claim
 없는 mailbox 이력을 열며, `i`는 inbox를 claim하고 `e`는 응답합니다. window 행의
 `M`은 room 전체를, session 행에서는 모든 room을 window별로 모아 보여주며 두
 aggregate view는 read-only입니다. collaboration 화면은 `v` 또는
@@ -489,6 +504,10 @@ owner-only socket 모델도 그대로입니다.
 session의 incoming/sent/all 이력을 보여줍니다. `room_context`는 새 incoming
 request 수와 아직 확인하지 않은 reply 수를 각각 반환합니다.
 
+등록된 agent는 같은 host와 control socket에서 pane·window를 이동해도 자신의
+이전 요청을 조회할 수 있습니다. pane을 재사용한 다른 session에는 권한이 넘어가지
+않으며, 등록 전 pending 요청은 원래 pane과 room에 고정됩니다.
+
 발신자는 요청이 `queued`인 동안만 취소할 수 있습니다. 수신자가 inbox를 읽어
 `claimed`가 된 뒤에는 이미 작업이 시작됐을 수 있으므로 취소를 거부합니다.
 
@@ -498,3 +517,40 @@ request 수와 아직 확인하지 않은 reply 수를 각각 반환합니다.
 하려면 `work_mode = execute`와 path scope를 명시하세요. 현재 path scope는 agent
 간 협업 계약이며 OS sandbox는 아닙니다. 서로 다른 agent가 동시에 같은 파일을
 수정해야 하는 작업에는 별도 git worktree를 권장합니다.
+
+
+CLI 목록의 기본 `--scope auto`는 추적된 agent에서는 자신의 우편함을,
+일반 터미널에서는 operator console로 현재 room의 메시지를 조회합니다.
+`--scope caller`는 agent 신원을 요구하며, `--scope all`은 모든 room을 조회합니다.
+명시된 agent session의 신원 오류는 조회 범위를 자동으로 넓히지 않습니다.
+
+CLI `muxa msg list`는 기본 20건의 메타데이터를 출력합니다. 본문·답변·진행 기록·
+provenance는 `--full`로 명시할 때 포함합니다. JSON 배열의 `id`와 저장된 `status`는
+유지하며, `--limit`·`--offset`으로 페이지를 지정합니다.
+`muxa msg list --request-id REQUEST --full --json`은 해당 요청 하나를 직접 조회합니다.
+최종 답변만 필요하면 `muxa msg wait REQUEST --body --output FILE`을 사용합니다.
+짧은 timeout을 반복 조회하지 말고 완료 알림이나 실질적인 작업 체크포인트에서 읽습니다.
+
+`--limit 0`은 일치하는 전체 기록을 요청합니다. 페이지가 잘리면 CLI가 전체 건수와
+다음 offset을 stderr에 표시합니다. JSON 배열은 유지하지만 본문·답변·wake 전달·
+provenance를 읽던 기존 진단 스크립트에는 `--full`을 추가해야 합니다.
+
+### 기존 요청 갱신과 호출 절약
+
+`muxa msg update REQUEST "추가 안내 또는 진행 상황" [--json]`으로 열린 요청에
+안내를 추가할 수 있습니다. 원래 권한·경로 범위를 유지하며, 새 요청을 만들거나
+수신자를 깨우지 않습니다. 양쪽 참여자가 사용할 수 있고 종료된 요청은 거절합니다.
+같은 참여자가 마지막 안내를 그대로 재전송하면 중복 추가하지 않습니다.
+JSON 확인 응답에는 요청 ID와 `next_after_update`가 포함됩니다.
+
+`muxa msg send ... --notify`는 `--notify true`와 같습니다. `--notify false`도
+유지됩니다. 오류와 종료 코드를 보존하세요. `grep`으로 출력을 거르면 옵션 오류가
+빈 응답처럼 보일 수 있습니다. 답변 본문은 JSON 필드를 추측하는 대신
+`muxa msg wait REQUEST --body [--output FILE]`로 읽습니다.
+완료 알림이나 의미 있는 작업 체크포인트에서 결과를 읽고, 1초 확인을 반복하지
+않습니다. 전면 MCP 대기는 30~60초를 권장하며 Fleet 기본값은 30초입니다.
+이미 확인한 도구 스키마는 버전·기능 변경이나 실제 도구/인자 오류가 생길 때까지
+재사용합니다.
+
+CLI에서 추가 안내는 `muxa msg list --request-id REQUEST --after-update SEQUENCE --json`으로
+읽고 `next_after_update`부터 이어갑니다. 원래 작업·최종 답변 본문은 반복하지 않습니다.

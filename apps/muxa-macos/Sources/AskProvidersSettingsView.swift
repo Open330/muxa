@@ -41,7 +41,7 @@ struct AskProvidersSettingsPane: View {
 
                 if let error = store.loadError {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.orange)
                         .textSelection(.enabled)
                 }
@@ -57,11 +57,14 @@ struct AskProvidersSettingsPane: View {
 
                 HStack(spacing: 10) {
                     Text("Re-check after installing a CLI. Reload muxad only when its PATH must change too.")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                     Spacer()
                     Button {
-                        Task { await store.detectInstalledTools(force: true) }
+                        Task {
+                            await store.detectInstalledTools(force: true)
+                            await store.probeAppleModels(force: true)
+                        }
                     } label: {
                         Label("Re-check CLIs", systemImage: "arrow.clockwise")
                     }
@@ -162,7 +165,7 @@ struct AskProvidersSettingsPane: View {
                     ? "New Ask conversations start with this provider. Entries are disabled until their CLI is installed or a key is saved."
                     : "This muxad predates the provider list; only the built-in CLIs are shown. Update muxa or choose Use Bundled muxad for API providers."
             )
-            .font(.caption)
+            .font(MuxaType.detail)
             .foregroundStyle(.secondary)
         }
         .padding(14)
@@ -200,7 +203,7 @@ struct AskProvidersSettingsPane: View {
             }
             if store.configuredProviders.isEmpty {
                 Text("Nothing configured yet. Add a provider, or add one of the detected built-ins below.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
             ForEach(store.configuredProviders) { provider in
@@ -217,11 +220,11 @@ struct AskProvidersSettingsPane: View {
             Label("Detected", systemImage: "sparkle.magnifyingglass")
                 .font(.headline)
             Text("Engines muxad ships with. Add one to give it its own title, model and API key; add it twice for two accounts.")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
             if store.detectedProviders.isEmpty {
                 Text("Every built-in engine is already configured.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
             ForEach(store.detectedProviders) { provider in
@@ -239,7 +242,7 @@ struct AskProvidersSettingsPane: View {
                     "This muxad lists providers but cannot add or remove them. Update muxa or choose Use Bundled muxad to compose your own provider list.",
                     systemImage: "info.circle"
                 )
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
             }
             ForEach(store.providers) { provider in
@@ -252,23 +255,23 @@ struct AskProvidersSettingsPane: View {
     private var statusLines: some View {
         if let status = model.askSettingsStatus {
             Label(status, systemImage: "checkmark.circle.fill")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.green)
         }
         if let status = store.configureStatus {
             Label(status, systemImage: "checkmark.circle.fill")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.green)
         }
         if let error = model.askSettingsError ?? model.askError {
             Label(error, systemImage: "exclamationmark.triangle.fill")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.red)
                 .textSelection(.enabled)
         }
         if let error = store.configureError {
             Label(error, systemImage: "exclamationmark.triangle.fill")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.red)
                 .textSelection(.enabled)
         }
@@ -287,7 +290,7 @@ struct AskProviderKindBadge: View {
                 Text("API")
             }
         }
-        .font(.caption2.weight(.semibold))
+        .font(MuxaType.meta.weight(.semibold))
         .padding(.horizontal, 6)
         .padding(.vertical, 2)
         .background(Color.primary.opacity(0.08), in: Capsule())
@@ -312,7 +315,7 @@ struct AskProviderDetectedRow: View {
                     AskProviderKindBadge(kind: provider.kind)
                     if provider.id == model.askAgent {
                         Label("Default", systemImage: "checkmark")
-                            .font(.caption2.weight(.semibold))
+                            .font(MuxaType.meta.weight(.semibold))
                             .foregroundStyle(.tint)
                     }
                 }
@@ -344,31 +347,83 @@ struct AskProviderDetectedRow: View {
         if provider.kind == .api {
             if provider.credentialPresent {
                 Text("Key already in muxad's environment")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             } else {
                 Text("API key required")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
+        } else if provider.isApple {
+            AskAppleAvailabilityLine(provider: provider, store: store)
         } else {
             switch store.detection(for: provider) {
             case .probing:
                 Text("Looking for \(provider.executable) on your PATH…")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             case .installed(let tool):
                 Text("CLI found at \(tool.path)")
-                    .font(.caption.monospaced())
+                    .font(MuxaType.detail.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             case .notInstalled:
                 Text("\(provider.executable) is not on your PATH yet")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
             }
         }
+    }
+}
+
+/// Where an `apple` provider stands: the helper, then the system's verdict on
+/// the model it names. Installation is never the interesting answer for this
+/// engine — the helper ships with the app — so this replaces the PATH line.
+struct AskAppleAvailabilityLine: View {
+    let provider: MuxaAskProvider
+    @ObservedObject var store: AskProviderStore
+
+    var body: some View {
+        switch store.detection(for: provider) {
+        case .probing:
+            Text("Looking for the \(provider.executable) helper…")
+                .font(MuxaType.detail)
+                .foregroundStyle(.secondary)
+        case .notInstalled:
+            Text("The \(provider.executable) helper is missing. It ships inside Muxa.app; a development build may need it built first.")
+                .font(MuxaType.detail)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        case .installed:
+            switch store.usability(provider) {
+            case .unavailable(let message):
+                Text(verbatim: message)
+                    .font(MuxaType.detail)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            case .usable, .probing, .notInstalled, .missingKey:
+                Text(readyLine)
+                    .font(MuxaType.detail)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// "Runs on this Mac · on-device · 8,192-token context", with whatever
+    /// the probe knows; just the first part before it has answered.
+    private var readyLine: String {
+        let model = AskAppleModel(configured: provider.model) ?? .onDevice
+        var parts = [
+            model == .onDevice
+                ? String(localized: "Runs on this Mac, no key needed")
+                : String(localized: "Runs on Apple's Private Cloud Compute, no key needed"),
+        ]
+        if let contextSize = store.appleProbe?.status(of: model)?.contextSize {
+            parts.append(String(localized: "\(contextSize)-token context"))
+        }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -424,11 +479,15 @@ struct AskProviderCard: View {
         VStack(alignment: .leading, spacing: 10) {
             header
 
-            if provider.kind == .cli {
+            if provider.isApple {
+                AskAppleAvailabilityLine(provider: provider, store: store)
+            } else if provider.kind == .cli {
                 detectionLine
             }
 
-            credentialRow
+            if provider.takesCredential {
+                credentialRow
+            }
 
             if isConfigured {
                 detailsEditor
@@ -459,11 +518,11 @@ struct AskProviderCard: View {
             usabilityBadge
             if isSelected {
                 Label("Default", systemImage: "checkmark")
-                    .font(.caption2.weight(.semibold))
+                    .font(MuxaType.meta.weight(.semibold))
                     .foregroundStyle(.tint)
             }
             Spacer()
-            if provider.kind == .cli {
+            if provider.kind == .cli, provider.takesCredential {
                 Button("Log In…") {
                     Task { await model.openProviderCLI(provider) }
                 }
@@ -485,19 +544,23 @@ struct AskProviderCard: View {
         switch usability {
         case .usable:
             Label("Ready", systemImage: "checkmark.circle.fill")
-                .font(.caption2.weight(.semibold))
+                .font(MuxaType.meta.weight(.semibold))
                 .foregroundStyle(.green)
         case .probing:
             Label("Checking", systemImage: "ellipsis.circle")
-                .font(.caption2.weight(.semibold))
+                .font(MuxaType.meta.weight(.semibold))
                 .foregroundStyle(.secondary)
         case .notInstalled:
             Label("Not installed", systemImage: "xmark.circle")
-                .font(.caption2.weight(.semibold))
+                .font(MuxaType.meta.weight(.semibold))
                 .foregroundStyle(.red)
         case .missingKey:
             Label("API key required", systemImage: "key")
-                .font(.caption2.weight(.semibold))
+                .font(MuxaType.meta.weight(.semibold))
+                .foregroundStyle(.orange)
+        case .unavailable:
+            Label("Unavailable", systemImage: "exclamationmark.triangle")
+                .font(MuxaType.meta.weight(.semibold))
                 .foregroundStyle(.orange)
         }
     }
@@ -509,24 +572,24 @@ struct AskProviderCard: View {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.mini)
                 Text("Looking for \(provider.executable) on your PATH…")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
         case .installed(let tool):
             Text("Installed · \(tool.name) \(tool.version ?? "") at \(tool.path)")
-                .font(.caption.monospaced())
+                .font(MuxaType.detail.monospaced())
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .lineLimit(2)
         case .notInstalled:
             VStack(alignment: .leading, spacing: 4) {
                 Text("Install the \(provider.executable) command and make sure it is on your PATH, then re-check.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                 if let command = provider.installCommand {
                     Text(verbatim: command)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.tertiary)
+                        .font(MuxaType.detail.monospaced())
+                        .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                 }
             }
@@ -552,25 +615,25 @@ struct AskProviderCard: View {
             HStack(spacing: 8) {
                 if hasKey {
                     Label("Key saved in Keychain", systemImage: "key.fill")
-                        .font(.caption2.weight(.semibold))
+                        .font(MuxaType.meta.weight(.semibold))
                         .foregroundStyle(.blue)
                 } else if provider.credentialPresent {
                     Label("muxad already has this key in its environment", systemImage: "checkmark.seal.fill")
-                        .font(.caption2.weight(.semibold))
+                        .font(MuxaType.meta.weight(.semibold))
                         .foregroundStyle(.green)
                 } else if provider.kind == .cli {
                     Text("Optional. Without a key the CLI's own sign-in is used.")
-                        .font(.caption2)
+                        .font(MuxaType.meta)
                         .foregroundStyle(.secondary)
                 } else {
                     Text("Required. The key is sent to muxad only for each Ask, never written to config or logs.")
-                        .font(.caption2)
+                        .font(MuxaType.meta)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
                 Text(verbatim: provider.environmentKey)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
+                    .font(MuxaType.meta.monospaced())
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -598,9 +661,14 @@ struct AskProviderCard: View {
                     .textFieldStyle(.roundedBorder)
                     .font(.body.monospaced())
             }
+            if provider.isApple {
+                Text("Model: on-device, or private-cloud for Private Cloud Compute (macOS 27 or later; not working yet).")
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.secondary)
+            }
             HStack(spacing: 8) {
                 Text("Stored under this provider's id in muxa's config. Empty fields fall back to the engine's defaults.")
-                    .font(.caption2)
+                    .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
                 Spacer()
                 if store.isConfiguring {
@@ -627,7 +695,7 @@ struct AskProviderCard: View {
                 }
             }
             Text("Saved to muxad's config for this provider. Leave the field empty to use the daemon's default.")
-                .font(.caption2)
+                .font(MuxaType.meta)
                 .foregroundStyle(.secondary)
         }
     }
@@ -707,7 +775,7 @@ struct AskProviderAddSheet: View {
                 Text("Add Provider")
                     .font(.title3.weight(.semibold))
                 Text("A provider is one instance of an engine. Add the same engine twice to keep a work key and a personal key apart.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -735,12 +803,12 @@ struct AskProviderAddSheet: View {
 
             if let message = draft.validationMessage(taken: taken), !draft.trimmedID.isEmpty {
                 Label(message, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.orange)
             }
             if let error = store.configureError {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
             }
@@ -771,12 +839,17 @@ struct AskProviderAddSheet: View {
     private var footnote: some View {
         if draft.engine.kind == .api {
             Text("The key is stored in your login Keychain under this provider's id and sent to muxad only for each Ask.")
-                .font(.caption)
+                .font(MuxaType.detail)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if draft.engine == .apple {
+            Text("Runs on this Mac's own models, with no key. Leave the model empty for on-device, or enter private-cloud for Private Cloud Compute (macOS 27 or later; it does not work yet). The helper ships inside Muxa, so the executable can stay empty.")
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         } else {
             Text("Leave the executable empty to use the command on muxad's PATH. Point it at an absolute path to pin a second install.")
-                .font(.caption)
+                .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }

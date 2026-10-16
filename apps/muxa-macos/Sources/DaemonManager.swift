@@ -111,9 +111,14 @@ struct DaemonSocketOwner: Equatable, Sendable {
         try await Self.bootOutLegacyLaunchAgents()
         if let brew = homebrewExecutable {
             try await Self.stopHomebrewService(brew: brew)
-        } else if Darwin.kill(pid, SIGTERM) != 0, errno != ESRCH {
-            // ESRCH means the bootout above already reaped the daemon, which
-            // is the state this call is asking for.
+        }
+        // Signal the pid even after a Homebrew stop: `brew services stop`
+        // exits 0 with only a "not started" warning when this muxad was run
+        // by hand (`muxad --socket …` from a shell) rather than as the
+        // service, and leaves the process holding the socket.
+        if Darwin.kill(pid, SIGTERM) != 0, errno != ESRCH {
+            // ESRCH means the service stop or the bootout above already
+            // reaped the daemon, which is the state this call is asking for.
             throw MuxaIPCError.posix(operation: "kill", code: errno)
         }
 

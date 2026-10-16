@@ -54,8 +54,12 @@ pub struct WorkloadSummary {
 }
 
 impl WorkloadSummary {
+    /// Nothing at all runs in the pane: no agent, no shell, no child. An agent
+    /// with no children of its own is not empty: dropping it here once made
+    /// the per-pane scan lose 40 of 50 live agents.
     pub fn is_empty(&self) -> bool {
-        self.process_count == 0
+        self.primary_pid.is_none()
+            && self.process_count == 0
             && self.shell_count == 0
             && self.subagent_count == 0
             && self.helper_count == 0
@@ -67,18 +71,21 @@ impl WorkloadSummary {
     }
 }
 
-/// Scan every pane and return non-empty workload summaries keyed by pane id.
+/// Scan every pane and return its workload summary keyed by pane id.
 ///
-/// Empty summaries are omitted so callers can clear stale data by treating a
-/// missing key as [`WorkloadSummary::default`].
+/// Every scanned pane has an entry, empty or not, so a missing key means "not
+/// scanned this pass" and never "nothing runs there". Callers that only want
+/// to clear stale data can still treat a missing key as
+/// [`WorkloadSummary::default`].
 #[cfg(target_os = "linux")]
 pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummary> {
     let mut out = HashMap::new();
-    for pane in panes {
-        let summary = scan_pane_workload(pane);
-        if !summary.is_empty() {
-            out.insert(pane.pane_id.clone(), summary);
+    // Each pane once, not once per `~view~` listing of a grouped session.
+    for pane in &crate::tmux::canonical_panes(panes) {
+        if pane.pane_pid == 0 {
+            continue;
         }
+        out.insert(pane.pane_id.clone(), scan_pane_workload(pane));
     }
     out
 }
@@ -90,16 +97,163 @@ pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummar
     }
     let table = crate::process_snapshot::read_current_process_table();
     let mut out = HashMap::new();
-    for pane in panes {
+    for pane in &crate::tmux::canonical_panes(panes) {
         if pane.pane_pid == 0 {
             continue;
         }
         let summary = summarize(table.descendants(pane.pane_pid, MAX_DEPTH, MAX_NODES));
-        if !summary.is_empty() {
-            out.insert(pane.pane_id.clone(), summary);
-        }
+        out.insert(pane.pane_id.clone(), summary);
     }
     out
+}
+
+/// A running agent explicitly started on a known session, and the one pane it
+/// runs in.
+#[derive(Debug, Clone)]
+pub struct ResumeBinding {
+    pub session_id: String,
+    pub kind: AgentKind,
+    pub pane: PaneInfo,
+}
+
+/// Live Codex evidence from one walk of every pane's process tree.
+#[derive(Debug, Default)]
+pub struct CodexPaneScan {
+    /// Explicit resume ids (`codex resume <id>`, `claude --resume <id>`) and
+    /// the one pane each runs in. A multiplexer restart renumbers panes and
+    /// `muxa reload` relaunches agents this way, so this is how a registry row
+    /// finds its new pane before the agent's next hook.
+    pub resume_bindings: Vec<ResumeBinding>,
+    /// Panes running an interactive Codex, resumed or fresh. A thread behind
+    /// the shared app-server reports no pane, and the screen detector can
+    /// claim the pane's placeholder row as `Unknown`, so this — not a registry
+    /// placeholder — is the evidence a cwd correlation needs.
+    pub hosts: Vec<PaneInfo>,
+}
+
+/// Recover detached Codex sessions from an explicit CLI resume id and its
+/// pane ancestry, and list the panes hosting an interactive Codex. Never
+/// guesses from cwd or chooses between multiple panes itself.
+pub fn scan_codex_panes(panes: &[PaneInfo]) -> CodexPaneScan {
+    #[cfg(not(target_os = "linux"))]
+    let table = crate::process_snapshot::read_current_process_table();
+    // A grouped session lists each pane once per `~view~` client session:
+    // scan (and report) each pane once, under its base session.
+    let unique = crate::tmux::canonical_panes(panes);
+    let scanned: Vec<_> = unique
+        .iter()
+        .filter(|p| p.pane_pid != 0)
+        .map(|pane| {
+            #[cfg(not(target_os = "linux"))]
+            let processes = table.descendants(pane.pane_pid, MAX_DEPTH, MAX_NODES);
+            #[cfg(target_os = "linux")]
+            let processes = read_descendants(pane.pane_pid);
+            (pane, processes)
+        })
+        .collect();
+    let hosts = scanned
+        .iter()
+        .filter(|(_, processes)| processes.iter().any(is_interactive_codex))
+        .map(|(pane, _)| (*pane).clone())
+        .collect();
+    CodexPaneScan {
+        resume_bindings: unique_resume_bindings(scanned.into_iter()),
+        hosts,
+    }
+}
+
+/// A Codex TUI (`codex`, `codex --yolo`, `codex resume …`) rather than a
+/// headless `exec` run or an `app-server`, which serves other panes' threads.
+fn is_interactive_codex(process: &ProcessInfo) -> bool {
+    if agent_kind(process) != Some(AgentKind::Codex) {
+        return false;
+    }
+    let mut args = process.cmdline.split_whitespace();
+    if !args.any(|arg| arg.rsplit('/').next() == Some("codex")) {
+        return false;
+    }
+    !matches!(
+        args.find(|arg| !arg.starts_with('-')),
+        Some("app-server" | "exec" | "e" | "review" | "mcp-server")
+    )
+}
+
+fn unique_resume_bindings<'a>(
+    scanned: impl Iterator<Item = (&'a PaneInfo, Vec<ProcessInfo>)>,
+) -> Vec<ResumeBinding> {
+    let mut candidates: HashMap<String, (AgentKind, Vec<PaneInfo>)> = HashMap::new();
+    for (pane, processes) in scanned {
+        for process in processes {
+            let (Some(sid), Some(kind)) = (resume_id(&process), agent_kind(&process)) else {
+                continue;
+            };
+            let (_, matches) = candidates
+                .entry(sid.to_owned())
+                .or_insert_with(|| (kind, Vec::new()));
+            if !matches
+                .iter()
+                .any(|p| p.pane_id == pane.pane_id && p.socket == pane.socket)
+            {
+                matches.push(pane.clone());
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(session_id, (kind, mut panes))| {
+            (panes.len() == 1).then(|| ResumeBinding {
+                session_id,
+                kind,
+                pane: panes.remove(0),
+            })
+        })
+        .collect()
+}
+
+/// The session an agent process was explicitly started on, if any.
+fn resume_id(process: &ProcessInfo) -> Option<&str> {
+    match agent_kind(process) {
+        Some(AgentKind::Codex) => codex_resume_id(process),
+        Some(AgentKind::ClaudeCode) => claude_resume_id(process),
+        _ => None,
+    }
+}
+
+/// `claude --resume <id>` / `-r <id>` / `--resume=<id>`, and the explicit
+/// `--session-id <id>` a forked session is started with.
+fn claude_resume_id(process: &ProcessInfo) -> Option<&str> {
+    let mut args = process.cmdline.split_whitespace();
+    while let Some(arg) = args.next() {
+        let sid = match arg {
+            "--resume" | "-r" | "--session-id" => args.next()?,
+            _ => match arg
+                .strip_prefix("--resume=")
+                .or_else(|| arg.strip_prefix("--session-id="))
+            {
+                Some(sid) => sid,
+                None => continue,
+            },
+        };
+        return uuid::Uuid::parse_str(sid).ok().map(|_| sid);
+    }
+    None
+}
+
+fn codex_resume_id(process: &ProcessInfo) -> Option<&str> {
+    if agent_kind(process) != Some(AgentKind::Codex) {
+        return None;
+    }
+    let mut args = process.cmdline.split_whitespace();
+    while let Some(arg) = args.next() {
+        if matches!(arg, "exec" | "app-server" | "review" | "fork") {
+            return None;
+        }
+        if arg == "resume" {
+            let sid = args.next()?;
+            return uuid::Uuid::parse_str(sid).ok().map(|_| sid);
+        }
+    }
+    None
 }
 
 pub fn scan_pane_workload(pane: &PaneInfo) -> WorkloadSummary {
@@ -253,7 +407,7 @@ fn command_name(s: &str) -> &str {
 }
 
 #[cfg(target_os = "linux")]
-fn read_descendants(root: u32) -> Vec<ProcessInfo> {
+pub(crate) fn read_descendants(root: u32) -> Vec<ProcessInfo> {
     let mut out = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
     let mut q: VecDeque<(u32, u8)> = read_children(root)
@@ -319,13 +473,22 @@ fn parse_ppid(status: &str) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_descendants(root: u32) -> Vec<ProcessInfo> {
+pub(crate) fn read_descendants(root: u32) -> Vec<ProcessInfo> {
     crate::process_snapshot::read_current_process_table().descendants(root, MAX_DEPTH, MAX_NODES)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An agent with no child processes is a workload, not an empty pane.
+    #[test]
+    fn a_lone_agent_process_is_not_an_empty_workload() {
+        let summary = summarize(vec![proc(20, 10, 1, "claude", "claude --resume x")]);
+        assert!(summary.primary_pid.is_some());
+        assert!(!summary.is_empty());
+        assert!(WorkloadSummary::default().is_empty());
+    }
 
     fn proc(pid: u32, parent_pid: u32, depth: u8, comm: &str, cmdline: &str) -> ProcessInfo {
         ProcessInfo {
@@ -334,6 +497,108 @@ mod tests {
             depth,
             comm: comm.into(),
             cmdline: cmdline.into(),
+        }
+    }
+
+    #[test]
+    fn resume_binding_deduplicates_wrappers_and_rejects_multiple_endpoints() {
+        let sid = "01a0f231-262f-77a3-9d42-b36d645fefcd";
+        let mut a: PaneInfo = serde_json::from_value(serde_json::json!({
+            "pane_id":"%181", "session":"muxa", "window_index":"0", "pane_index":"0",
+            "tty":"", "current_command":"codex", "title":"", "pane_pid":10,
+            "socket":"default"
+        }))
+        .unwrap();
+        let processes = vec![
+            proc(20, 10, 1, "codex", &format!("codex resume {sid}")),
+            proc(21, 20, 2, "codex", &format!("codex resume {sid}")),
+        ];
+        let bindings = unique_resume_bindings(std::iter::once((&a, processes.clone())));
+        assert!(processes.iter().all(is_interactive_codex));
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].session_id, sid);
+        assert_eq!(bindings[0].kind, AgentKind::Codex);
+        let b = a.clone();
+        a.socket = Some("other-server".into());
+        assert!(
+            unique_resume_bindings([(&a, processes.clone()), (&b, processes)].into_iter())
+                .is_empty(),
+            "same session in multiple servers must remain ambiguous"
+        );
+    }
+
+    #[test]
+    fn interactive_codex_excludes_headless_and_server_runs() {
+        for (comm, args, expected) in [
+            ("codex", "/vendor/bin/codex --yolo Do this", true),
+            (
+                "codex",
+                "codex --yolo resume 01a0f231-262f-77a3-9d42-b36d645fefcd",
+                true,
+            ),
+            ("codex", "codex", true),
+            (
+                "codex",
+                "/x/bin/codex app-server --listen unix:// --managed-daemon",
+                false,
+            ),
+            ("codex", "codex exec explain this", false),
+            ("codex", "codex --yolo e explain", false),
+            ("zsh", "zsh -c codex", false),
+        ] {
+            assert_eq!(
+                is_interactive_codex(&proc(20, 10, 1, comm, args)),
+                expected,
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_resume_identity_reads_the_explicit_session_flags() {
+        let sid = "9e48c8ff-1b70-4a3e-9f32-1581a05f0f75";
+        for args in [
+            format!("/home/u/.local/bin/claude --dangerously-skip-permissions --resume {sid}"),
+            format!("claude -r {sid}"),
+            format!("claude --resume={sid}"),
+            format!("claude --fork-session --session-id {sid}"),
+        ] {
+            assert_eq!(
+                resume_id(&proc(30, 10, 2, "claude", &args)),
+                Some(sid),
+                "{args}"
+            );
+        }
+        for (comm, args) in [
+            // The launch wrapper carries the same argv but is not the agent.
+            ("aas", format!("aas exec e-ed@claude -- --resume {sid}")),
+            ("claude", "claude --resume".into()),
+            ("claude", "claude --resume my-session-title".into()),
+            ("claude", "claude --dangerously-skip-permissions".into()),
+        ] {
+            assert_eq!(resume_id(&proc(30, 10, 2, comm, &args)), None, "{args}");
+        }
+    }
+
+    #[test]
+    fn resume_identity_requires_codex_and_explicit_uuid() {
+        let sid = "01a0f231-262f-77a3-9d42-b36d645fefcd";
+        let cli = proc(
+            20,
+            10,
+            1,
+            "/bin/codex",
+            &format!("codex --yolo resume {sid}"),
+        );
+        assert_eq!(codex_resume_id(&cli), Some(sid));
+        for (comm, args) in [
+            ("zsh", format!("zsh -c codex resume {sid}")),
+            ("codex", "codex resume --last".into()),
+            ("codex", "codex resume session-title".into()),
+            ("codex", "codex app-server --listen unix://".into()),
+            ("codex", format!("codex exec explain resume {sid}")),
+        ] {
+            assert_eq!(codex_resume_id(&proc(20, 10, 1, comm, &args)), None);
         }
     }
 

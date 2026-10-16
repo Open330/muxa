@@ -634,18 +634,20 @@ def main() -> int:
             ),
             sandbox_muxa(muxa, "msg", "list", "--mailbox", "sent", "--json")[-300:],
         )
-        # The step tells them `list` shows what came back. Reading it the way
-        # they will — no `--json` — has to actually show the answer.
+        # The step tells them `list --full` shows what came back (the default
+        # list is metadata only). Reading it the way they will (no `--json`)
+        # has to actually show the answer.
         answer = {"en": "regression test", "ko": "회귀 테스트"}[args.lang]
         report.check(
             "14  `msg list` shows the reply body",
             wait(
                 terminal,
                 "the reply body",
-                lambda: answer in sandbox_muxa(muxa, "msg", "list", "--mailbox", "sent"),
+                lambda: answer
+                in sandbox_muxa(muxa, "msg", "list", "--mailbox", "sent", "--full"),
                 DAEMON_DEADLINE,
             ),
-            sandbox_muxa(muxa, "msg", "list", "--mailbox", "sent")[-300:],
+            sandbox_muxa(muxa, "msg", "list", "--mailbox", "sent", "--full")[-300:],
         )
         receipt = sandbox_muxa(muxa, "msg", "send", "@claude", "ping", "--no-reply")
         report.check(
@@ -654,7 +656,7 @@ def main() -> int:
             receipt[:200],
         )
 
-        terminal.send(b"muxa msg list\r")
+        terminal.send(b"muxa msg list --full\r")
         report.check(
             "15  reading the mailbox", wait_step(terminal, 15), failure_detail(terminal)
         )

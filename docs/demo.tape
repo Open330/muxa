@@ -54,7 +54,7 @@ Sleep 12s
 Type "clear"
 Enter
 # No `exec` — the postlude needs this shell back after the client detaches.
-Type "$MUXA_DEMO_TMUX -u -L muxa-demo attach -t ctl:0"
+Type "$MUXA_DEMO_TMUX -u -f /dev/null -S /tmp/muxa-demo-sandbox/tmux.sock attach -t ctl:0"
 Enter
 Sleep 2s
 Set TypingSpeed 45ms

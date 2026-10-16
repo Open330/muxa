@@ -50,6 +50,34 @@ interval_secs = 5
 This tmux foreground sampler remains as a compatibility source and helps
 stats while newer activity ledger intervals are accumulating.
 
+## Snapshots
+
+```toml
+[snapshot]
+auto_interval_minutes = 15   # 0 turns automatic snapshots off
+keep_auto = 10               # newest automatic snapshots kept
+```
+
+muxad takes an automatic workspace snapshot (`muxa snapshot --auto`) every
+`auto_interval_minutes`, starting one interval after it starts. Nothing is
+written when the workspace has not changed since the newest snapshot of the
+same server — the comparison covers sessions, windows, layouts, pane
+directories, commands and agent conversation ids, not timestamps or which
+window has focus. Only the newest `keep_auto` automatic snapshots are kept;
+snapshots taken with `muxa snapshot`, Save Snapshot in Muxa.app, or `muxa
+reload` are never pruned. When muxa's agents span several multiplexer servers
+the automatic snapshot is skipped with a warning in muxad's log.
+
+Snapshots live in `$XDG_DATA_HOME/muxa/snapshots/<id>/snapshot.json`
+(`~/Library/Application Support/muxa/snapshots` on macOS). `muxa snapshot
+--list` shows them, `muxa snapshot --delete <id>` removes one, and `muxa
+restore --only-missing` recreates only the sessions the server does not
+already have. `muxa restore` with no argument uses the newest snapshot,
+automatic or manual. Its dry run also lists the sessions and windows that are
+new since the snapshot, which a restore never closes; with `--json` each
+recorded session, window and pane carries a `state` of `missing` or
+`present`.
+
 ## MCP orchestration guide
 
 `muxa init` can install a canonical collaboration skill and global agent entry
@@ -198,6 +226,10 @@ title = "Anthropic (work)"          # optional; defaults to a humanized id
 model = "claude-opus-5"             # optional
 api_key_env = "WORK_ANTHROPIC_KEY"  # optional; this instance's own key
 executable = "/opt/homebrew/bin/claude"  # optional; CLI engines only
+
+[ask.providers.apple-cloud]         # Apple's models (macOS 26+): no key at all
+engine = "apple"
+model = "private-cloud"             # on-device (default) | private-cloud (macOS 27+)
 ```
 
 Opt-in headless questions from `muxa watch`: `a` composes one, `A` browses
@@ -237,24 +269,61 @@ for the schema, limits, privacy boundary, and free versus paid tests.
 
 An **engine** is the code that drives a provider: the argv a CLI takes, the
 JSON an API answers with, the environment variable its key lives in. There
-are five and they are fixed — `claude`, `codex`, and `gemini` drive the
+are six and they are fixed — `claude`, `codex`, and `gemini` drive the
 agent CLIs in print mode (`claude -p`, `codex exec --json`, `gemini -p
 --output-format json`) and resume their own sessions between questions;
 `anthropic` and `openai` call the Messages and Chat Completions APIs
-directly over HTTPS. API engines have no session to resume, so muxad
-replays the conversation's earlier turns from its own history — the most
-recent 40 turns or 60k characters — ahead of each question; `cwd`,
-`additional_dirs`, and `permission_mode` do not apply to them.
+directly over HTTPS; `apple` runs the Mac's own Foundation Models. API
+engines have no session to resume, so muxad replays the conversation's
+earlier turns from its own history — the most recent 40 turns or 60k
+characters — ahead of each question; `cwd`, `additional_dirs`, and
+`permission_mode` do not apply to them.
+
+`apple` (macOS 26 or later, with Apple Intelligence turned on) takes no key
+and sends nothing to a vendor account. `model` picks between the two system
+models: `on-device`, the default, which never leaves the Mac and has an
+8,192-token context; and `private-cloud`, Apple's Private Cloud Compute
+(macOS 27 or later, 32,768 tokens, subject to Apple's usage quota). As of
+this writing `private-cloud` does not work: it needs a helper built with the
+macOS 27 SDK, which no GitHub runner image offers yet, and even such a build,
+signed with a Developer ID, was refused by the system with
+`ModelManagerError 1046` — whatever Private Cloud Compute requires of a
+process, a command-line helper does not have it. The option stays so a
+future build can pick it up; a turn on it says why it cannot answer. The
+framework is Swift-only, so muxad reaches it through `muxa-afm`, a small
+helper that ships in `Muxa.app/Contents/Helpers`. muxad looks for it beside
+its own executable, then in `/Applications/Muxa.app`, then in
+`~/Applications/Muxa.app`, then on `PATH`;
+`executable` names another copy. Like the APIs it keeps no session, so the
+conversation is replayed — cut to 6k characters to fit the on-device
+window, and cut further by the helper if the model still reports an
+overflow. `cwd`, `additional_dirs`, and `permission_mode` do not apply:
+these models answer questions and touch no files.
+
+The agent CLIs can look at your workspace because they have a shell; a bare
+model cannot, and would answer that it has no access to other applications.
+So on a Global Ask turn the helper gives the model two read-only tools,
+answered by `muxa status --json` and `muxa recap` against the daemon the
+question came from: `list_agent_sessions` (every tracked agent — pane, state,
+title, directory, latest prompt and reply) and `read_agent_session` (one pane
+in detail). It can read; it cannot send input to an agent or change anything.
+The model decides when to call them, so nothing is read for a question that
+is not about your agents. With `on-device` what it reads never leaves the
+Mac; with `private-cloud` it is sent to Apple's Private Cloud Compute along
+with the question. One-shot turns such as `muxa work init` get no tools. The
+built-in `apple` provider is listed on every host, so one config.toml can
+serve a Mac and a Linux box; a turn on a host that cannot run it fails with a
+plain "runs only on macOS".
 
 A **provider** is an `[ask.providers.<id>]` table you compose. The id is
 yours to pick (a TOML bare key: letters, digits, `-`, `_`), and `engine`
-says which of the five drives it. Several providers may share one engine —
+says which of the six drives it. Several providers may share one engine —
 a work and a personal OpenAI account, two Anthropic keys, a second `claude`
 binary — and each keeps its own conversation, so switching between them
 resumes rather than restarts. `[ask] agent` and `muxa ask --agent` name a
 provider id, not an engine.
 
-The five engine ids are also providers of themselves, so a fresh install
+The engine ids are also providers of themselves, so a fresh install
 works with no `[ask.providers]` at all: `muxa ask providers` lists what you
 composed first, then every built-in no id of yours has taken over. A table
 named after a built-in and *without* `engine` tunes that built-in — which
@@ -280,7 +349,8 @@ muxa ask --agent claude --detach --json "review the deployment plan"
 muxa ask --agent anthropic "which files does the reaper touch?"
 security find-generic-password -w -s my-codex-key \
   | muxa ask --agent codex --api-key-stdin "review this repository"
-muxa ask --agent anthropic-work "…"   # a provider you added, by its id
+muxa ask --agent anthropic-work "…"   # a provider you added, by its id (until the next restart)
+muxa ask provider use codex           # make it the default; rewrites [ask] agent
 muxa ask providers [--json]           # every provider: engine, kind, model, whether a key resolves, selected
 muxa ask provider add anthropic-work --engine anthropic \
   --title "Anthropic (work)" --api-key-env WORK_ANTHROPIC_KEY
@@ -291,7 +361,7 @@ muxa ask provider remove anthropic-work               # a built-in id only loses
 ```
 
 `add` refuses an id that already exists, an id that is not a TOML bare key,
-an engine that is not one of the five, and a built-in id asked to run
+an engine that is not one of the six, and a built-in id asked to run
 someone else's engine. The engine is fixed once added — `set` changes the
 title, model, key variable, and binary, and to change the engine you remove
 the provider and add it again, because a live conversation cannot resume a
@@ -334,6 +404,12 @@ wakes remain body-free notifications in every mode.
 `scope = "host"` lets watch address the selected tracked agent in another
 tmux window or session by its exact pane id.
 See [COLLABORATION.md](COLLABORATION.md).
+
+Per-message `notify` is independent of `wake_payload`: one-way `kind=notice`
+messages are quiet by default. Use MCP `notify=true` or CLI `--notify true` for
+an actionable handoff; `notify=false` is pull-only. These overrides still respect
+`collaboration.wake=never` and idle-only delivery. See
+[notification discipline](COLLABORATION.md#quiet-progress-and-actionable-notifications).
 
 ## Message skills
 
@@ -472,18 +548,35 @@ doctor` reports a daemon whose version has drifted from the CLI's.
 
 ## Reconciler
 
+Native PTY references are checked against muxad's own session registry at
+startup and on each reconciler pass. A missing session clears the reference
+and stops the agent row; an exited session stops it while retaining its output
+surface for capture. Failed session observations leave rows unchanged. A
+surviving pid-tracked task remains governed by process liveness even if its old
+PTY was lost on daemon restart. `muxa registry prune` also checks missing PTY references,
+including when periodic reconciliation is disabled, and retains its age filter.
+
 ```toml
 [reconciler]
 enabled = true
 interval_secs = 30
 stuck_working_timeout_secs = 0
 stuck_waiting_timeout_secs = 0
+codex_rollout_enabled = true
+paneless_stale_timeout_secs = 86400
 ```
 
 The reconciler keeps stale states from staying misleading forever. Timeout
 values of `0` disable that timeout. The same loop also runs the pid-liveness
-sweep that flips registered background tasks (see `muxa register`) to
+sweep that flips registered background tasks (see `muxa proc register`) to
 `stopped` once their process exits.
+
+Codex rollout polling runs every two seconds independently of the full
+`interval_secs` reconciliation. It uses original event timestamps for activity
+and recovers running/completed turns and actual errors. Used percentages and
+credit balances alone do not change state. Set `codex_rollout_enabled = false`
+to disable it. `paneless_stale_timeout_secs` stops fully orphaned registry rows
+after 24 hours by default; `0` disables that cleanup.
 
 ## Fleet
 
@@ -532,8 +625,8 @@ both pane and window capture at the manager even on control hosts.
 identity, ProxyJump, and host-key policy in `~/.ssh/config`. `muxa_path` and
 `remote_socket` are validated as fixed remote command tokens. Labels implement
 Kubernetes-style selectors; annotations allow descriptive values but use the
-same namespaced key syntax. Prefer `muxa host add/label/annotate` to edit the
-inventory atomically. Use `muxa host label local` and `muxa host annotate
+same namespaced key syntax. Prefer `muxa fleet host add/label/annotate` to edit the
+inventory atomically. Use `muxa fleet host label local` and `muxa fleet host annotate
 local` for controller metadata; muxad-managed identity labels cannot be
 overridden. See [FLEET.md](FLEET.md).
 
@@ -552,6 +645,95 @@ The dashboard is loopback-only unless public binding is explicitly
 allowed. Use `auth = "public_read"` with a token to expose anonymous reads
 while keeping browser control actions PAT-gated. `auth = "none"` exposes reads
 and disables control actions entirely. See [DASHBOARD.md](DASHBOARD.md).
+
+### Operator sign-in with OIDC
+
+Optional `[dashboard.login]` lets the dashboard owner sign in through a generic
+OpenID Connect provider instead of pasting the bearer token. Sign-in is deny by
+default. An account is an **operator** when the ID token's group claim contains
+`required_group`, or when a holder of the dashboard token enrolled it. It is a
+read-only **viewer** when its groups contain `viewer_group` or it matches a
+viewer rule. Any other account gets no access. It requires `auth = "token"` with
+a token, which keeps working for API clients and as the fallback when the
+provider is unreachable.
+
+```toml
+[dashboard.login]
+public_url = "https://muxa.example.com"
+issuer_url = "https://login.example.com"
+client_id = "muxa-dashboard"
+# Optional while enrollment is on; required when enrollment = false.
+required_group = "muxa-operators"
+# Optional: let a token holder enroll accounts outside the group (default true).
+# enrollment = true
+# Optional: provider group whose members may view the dashboard read-only.
+# viewer_group = "muxa-viewers"
+# Optional: viewer rules, shown read-only next to the ones operators add in
+# the dashboard: "email:<address>", "email:*@<domain>" or "sub:<subject>".
+# viewer_rules = ["email:*@example.com"]
+# Optional: claim holding group names (default "groups").
+# groups_claim = "groups"
+# Optional: scopes requested in addition to "openid email".
+# scopes = ["groups"]
+# Optional: environment variable NAME for a confidential client's secret.
+# client_secret_env = "MUXA_LOGIN_CLIENT_SECRET"
+```
+
+Register `https://muxa.example.com/auth/callback` with the provider and enable
+authorization code flow with PKCE S256. If `[dashboard.sharing]` is also
+configured, both must use the same `public_url`. Unknown keys are rejected.
+
+With `enrollment` on, a verified account outside `required_group` (or any
+account when `required_group` is omitted) is sent to an enrollment page that
+asks for the dashboard token; entering it registers that account by issuer and
+subject in `$XDG_DATA_HOME/muxa/dashboard-operators/operators.sqlite3`. Remove
+accounts from the dashboard's **access** dialog. `enrollment = false` restores
+group-only operator sign-in and stops honoring enrolled accounts.
+
+Viewer rules match an exact email address or every address at one domain
+(`*@example.com` matches `ann@example.com`, not `ann@sub.example.com`),
+case-insensitively and only when the provider sets `email_verified: true`, or an
+exact subject. Every rule is pinned to `issuer_url`. Operators add and remove
+rules in the **access** dialog; those are stored in the same SQLite file.
+See [operator sign-in](DASHBOARD.md#operator-sign-in-with-oidc) for the cookie,
+CSRF, enrollment and reverse-proxy contract.
+
+### Authenticated pane and window sharing
+
+Optional `[dashboard.sharing]` configuration enables email invitations to local
+tmux/rmux panes or the current panes in a window. It requires dashboard
+`auth = "token"` and an operator token. Recipients use OIDC login, with view-only
+or prompt permission, expiry and revocation; do not give them the operator token.
+
+```toml
+[dashboard.sharing]
+public_url = "https://muxa.example.com"
+issuer_url = "https://login.example.com"
+client_id = "muxa-dashboard"
+# Optional: environment variable NAME, supplied to the daemon service.
+client_secret_env = "MUXA_SHARING_CLIENT_SECRET"
+# Optional: absolute path on a private local filesystem.
+# storage_path = "/absolute/path/to/shares.sqlite3"
+```
+
+`public_url` must be an origin without a path, query or fragment. Register
+`https://muxa.example.com/share/auth/callback` with the OIDC provider and enable
+verified email claims in ID tokens. Use an HTTPS reverse proxy for external
+access; HTTP is allowed only on loopback. Restart after configuration changes.
+
+Window invitations pin up to 16 existing pane processes; new panes are not
+included. Prompt permission can execute shell commands when the pane runs a shell.
+Invitations survive daemon restarts, but recipients must sign in again and the
+original pane process must still exist. Private SQLite storage defaults to
+`muxa/dashboard-sharing/shares.sqlite3` under the platform data directory. Only
+one daemon may use a given database. Browser command request IDs prevent duplicate
+delivery when checking a lost response.
+
+**Shares → Check login setup** checks provider discovery and signing keys; it
+does not validate the client secret or an actual account's claims. Test the real
+HTTPS address and recipient login before distributing links, and omit callback
+query strings from proxy access logs. See [sharing and deployment](DASHBOARD.md#invite-someone-to-a-pane)
+for limits, API details, recovery and the browser smoke test.
 
 ## External Sinks
 

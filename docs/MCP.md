@@ -25,7 +25,8 @@ muxa init --component agent-instructions,agent-skills,agent-mcp
 This installs canonical guidance beside muxa config, links the personal skill,
 and merges each detected host's user MCP registration, including Codex `env_vars`.
 See [Global agent integration](AGENT_INTEGRATION.md) for updates and removal.
-Restart running agents. The manual setup below remains available.
+Use `muxa reload mcp` for Codex MCP connections; the host queues the refresh.
+Other clients and global instructions may require an agent restart. The manual setup below remains available.
 
 Start the daemon (`muxad`) first — the MCP server **refuses to start** when
 the socket is unreachable, with a clear error, so an agent never talks to a
@@ -86,7 +87,7 @@ muxa_fleet_status      { "selector": "environment=production" }
 muxa_fleet_capture     { "host": "local", "pane": "%12" }
 muxa_fleet_capture     { "host": "dev", "pane": "%12" }
 muxa_fleet_send_prompt { "host": "dev", "pane": "%12",
-                         "text": "Summarize the result", "submit": true }
+                         "text": "Start the interactive session", "submit": true }
 muxa_fleet_call_peer   { "host": "dev", "pane": "%12",
                          "intent": "review", "body": "Review the current change" }
 muxa_fleet_wait_reply  { "host": "dev", "pane_key": { "window": { ... },
@@ -102,6 +103,43 @@ times out, pass the returned exact `pane_key` and `request_id` to
 `muxa_fleet_wait_reply`. Fleet calls use muxad's cache/control plane; the MCP
 subprocess never opens SSH itself. The remote `muxa` must advertise both
 `collaboration` and `collaboration_get`. See [FLEET.md](FLEET.md).
+
+Reply waits are shared in the controller by `(host, exact pane_key, request_id)`.
+The controller subscribes before its first read, then reconciles mailbox changes,
+stream gaps and host reconnections. An unchanged five-minute wait performs one
+request read; topology refreshes do not cause mailbox reads. The subscription is
+released when its last waiter disconnects or expires, and each waiter has its own
+deadline. Hosts advertising `mailbox_watch` use this event path; older hosts use
+1/2/4/8/16/30-second capped backoff. Older controllers also use capped backoff.
+Mailbox invalidations are host-scoped, so changes to other requests on that host
+can still trigger reads; updates from other hosts are ignored.
+
+For ongoing work, keep guidance and progress on the existing durable request:
+
+```text
+muxa_fleet_update_request { "host": "dev", "pane_key": <returned pane_key>,
+                           "request_id": "req_...", "body": "Verified guidance within the agreed scope" }
+muxa_update_request      { "request_id": "req_...", "body": "Implementation done; running tests" }
+muxa_fleet_wait_reply    { "host": "dev", "pane_key": <returned pane_key>,
+                           "request_id": "req_...", "after_update": 0 }
+```
+
+`after_update` returns `reason: "updated"` for a newer sequence without marking the
+request completed. Resume using `next_after_update`, or omit `after_update` to wait
+only for a terminal reply. Updates do not claim work, widen its execution/path
+scope, or inject terminal prompts. Recipients check their request updates through
+`muxa_list_messages` at agreed checkpoints; urgent interruption remains an explicit
+separate action. Finish with exactly one `muxa_reply`.
+
+Each update is limited to 8 KiB of UTF-8 text; a request retains at most 32 updates
+and 32 KiB of update bodies, with monotonic sequence numbers even after trimming.
+Link larger artifacts. Consecutive identical updates by the same participant are
+idempotent. Only the existing sender/recipient may update a nonterminal request.
+The optional `initiator` records the originating agent when its context resolves;
+it is advisory metadata, not additional authorization or a routable console pane.
+Fleet calls return explicit progress/guidance routes on the original request.
+Remote updates require the `collaboration_update` capability and control mode;
+there is no terminal-text fallback when that capability is absent.
 
 ## Implementation
 
@@ -144,27 +182,30 @@ it:
 | Tool | Arguments | Does |
 | --- | --- | --- |
 | `muxa_status` | `pane?`, `full?`, `include_capture?`, `history_limit?`, `max_capture_lines?` | Return a compact fleet/agent summary by default, the complete topology with `full=true`, or one focused pane. |
-| `muxa_recent_prompts` | `pane?`, `limit?` | Recent prompt-history entries (newest first), optionally scoped to one pane. |
+| `muxa_recent_prompts` | `pane?`, `limit?`, `full?` | Recent prompts (newest first): default 20, maximum 100. `full=true` explicitly permits larger limits or all retained history. |
 | `muxa_guide` | — | Return the user's configured surface, agent, option, direction, and free-form orchestration preferences. |
 | `muxa_start_agent` | `agent?`, `options?`, `workspace?`, `work?`, `role?`, `task?`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Create/reuse a workspace session and work window, or start an allowlisted agent in a lower-level tmux surface. `agent` is optional only when configured in `[mcp.guide]`. |
 | `muxa_start_work` | `work`, `pipeline?`, `workspace?`, `cwd?`, `body?`, `skill?`, `context?`, `no_ticket?`, `refresh?`, `dry_run?` | Bring a work item's window to the state its pipeline declares: resolve the ticket, route it, create the missing agent panes, and deliver `body` to the ones already running. |
 | `muxa_manage_tmux` | `action`, `pane?`, `workspace?`, `work?`, `confirm?` | List/show/close managed workspaces and work; interrupt/terminate an agent pane. |
 | `muxa_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
 | `muxa_capture_pane` | `pane` | Capture the visible contents of a pane. |
-| `muxa_fleet_status` | `selector?` | Read the cached local/remote physical-host hierarchy and capabilities. |
+| `muxa_fleet_status` | `selector?`, `full?` | Cached host health, capabilities, counts and up to 20 active agent identities per host. `full=true` returns the complete hierarchy. |
 | `muxa_fleet_capture` | `host`, `pane` | Capture one exact pane on a named Fleet host. |
 | `muxa_fleet_send_prompt` | `host`, `pane`, `text`, `submit?` | Inject literal text into one exact Fleet pane on a control-authorized host. |
 | `muxa_fleet_call_peer` | `host`, `pane`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?` | Send durable structured work to one explicitly selected Fleet agent and optionally wait for its reply. |
-| `muxa_fleet_wait_reply` | `host`, `pane_key`, `request_id`, `timeout_secs?` | Continue an exact remote durable reply wait, including after the target pane exits. |
+| `muxa_update_request` | `request_id`, `body` | Add nonterminal progress/guidance as an existing participant. |
+| `muxa_fleet_update_request` | `host`, `pane_key`, `request_id`, `body` | Add guidance to the original Fleet request without prompt injection. |
+| `muxa_fleet_wait_reply` | `host`, `pane_key`, `request_id`, `timeout_secs?`, `after_update?` | Continue an exact remote durable reply wait, including after the target pane exits. |
 | `muxa_wait_for_change` | `timeout_secs?`, `pane?`, `until?`, `include_capture?` | Wait for any change or a focused settled/idle/blocked/stopped state, optionally returning the screen. |
-| `muxa_collaboration_guide` | — | Show the recommended reviewer, question, delegated-subagent, incoming-work, and AIR handoff contracts. |
+| `muxa_collaboration_guide` | `workflows?` | Return identity, preferences, guardrails and running-daemon capabilities. `workflows=true` adds detailed examples; human-action guidance requires `capabilities.human_actions=true`. |
 | `muxa_room_context` | — | Identify self, list same-window peers, and report unread request/reply counts. |
 | `muxa_call_peer` | `target?`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?`, `spawn_if_missing?`, `spawn_agent?`, `spawn_timeout_secs?`, `air_artifacts?` | Expand a registered skill, select a peer, send a durable request, optionally wait for its reply, and explicitly spawn an agent when no peer exists. |
-| `muxa_peer_report` | `target?`, `request_id?` | Read the newest completed peer report, optionally filtered by provider/pane/alias/role, or retrieve an exact prior request. |
+| `muxa_peer_report` | `target?`, `request_id?`, `full?` | Read a received final reply without repeating the original request. `full=true` returns the legacy full record. |
 | `muxa_set_identity` | `alias?`, `roles?` | Replace this exact session's room-local alias and role set; empty input clears it. |
+| `muxa_request_attention` | `body`, `action?`, `dispatch_id?`, `parent_request_id?` | Request required human approval, choice or information; delivered to connected Fleet operator clients. Reuse a UUID dispatch ID on retry; wait for and read the actual human reply. |
 | `muxa_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?`, `air_artifacts?` | Create a durable same-window peer request. |
-| `muxa_inbox` | — | Claim and read requests addressed to this exact agent session. |
-| `muxa_list_messages` | `mailbox?` | List incoming, sent, or all requests without claiming. |
+| `muxa_inbox` | `full?` | Claim and read instructions, authority, paths and attachments addressed to this session. `full=true` includes audit metadata. |
+| `muxa_list_messages` | `mailbox?`, `request_id?`, `limit?`, `offset?`, `include_body?`, `after_update?`, `full?` | List newest metadata records without claiming (default 20, max 100). Read an exact request or incremental progress explicitly. |
 | `muxa_reply` | `request_id`, `status`, `body`, `artifacts?`, `air_artifacts?` | Return a structured terminal response. |
 | `muxa_wait_reply` | `request_id`, `timeout_secs?` | Event-driven wait for a structured peer response. |
 | `muxa_cancel_message` | `request_id` | Cancel a sent request while it is still queued. |
@@ -240,12 +281,54 @@ The MCP process reads `[message.skills]` at startup. Restart an already-running
 agent after `muxa skill add/remove`, after editing the table, or after upgrading
 Muxa so it loads the current skills and tool definitions.
 
-Mutation results are intentionally receipts, not copies of the durable request:
-they return correlation ids, status, and resolved routing, while terminal waits
-add only the new structured reply. Use `muxa_inbox`, `muxa_list_messages`, or
-`muxa_peer_report` when the stored body and history are actually needed. All
-JSON tool results are compact on the wire. This prevents a body the model just
-sent from being charged again as tool output and retained in later turns.
+### Delivery observations and declared work results
+
+Muxa stores and routes messages; it does not evaluate task success. The default
+CLI/MCP views separate transport observations from the recipient's declaration:
+
+- `delivery_state`: `queued`, `claimed`, `delivered` (one-way message),
+  `reply_received`, `cancelled`, or `expired`. `closed` covers legacy terminal records without a reply.
+- `final_reply_received`: a recipient submitted a final reply, including a
+  failure, refusal or blocker. This never asserts work success.
+- `reported_status`: the recipient's explicit `completed`, `blocked`, `declined`
+  or `failed` declaration, present only with a final reply. `reply.status` carries
+  the same declaration in the stored reply.
+- `reason: timeout`: the wait ended without a final reply or transport closure;
+  it neither fails the work nor authorizes repeating it.
+
+For `muxa_call_peer` reviews with an automatic target, Codex routes to Claude
+and Claude routes to Codex. Explicit provider/pane/alias targets take precedence;
+other intents retain their existing selection. Launch authorization still applies.
+
+Progress uses `muxa_update_request`; `muxa_reply` is the explicit final response.
+Process idle/stopped observations and words in a reply body never establish task
+completion. Muxa performs no model call to judge a reply.
+
+Mutation receipts and waits omit the original body and audit metadata. Initial
+send receipts retain routing. Follow-up update/reply/cancel acknowledgements
+return correlation, transport state and any progress cursor or interruption;
+read an exact request with `full=true` when its complete record is needed.
+`muxa_peer_report` returns `result` with a receipt and the new reply; it does not
+repeat the prompt. `full=true` opts into the legacy full stored request under `request`.
+Inbox retains the entire instruction/authority/path/artifact contract.
+Lists return at most 20 metadata records by default, with `has_more` and
+`next_offset`; set `include_body=true` with an exact `request_id` for instructions (or explicitly use `full=true` for bulk diagnostics). An exact `request_id`
+read also returns an existing reply. For progress, use that ID with
+`after_update`, then resume with `next_after_update`; `first_retained_sequence`
+identifies the beginning of retained progress. `full=true` returns legacy records.
+
+The durable store and daemon IPC keep their existing lifecycle statuses for
+compatibility. Agent-facing default views no longer expose a generic
+`completed` boolean or treat notice delivery as task success. Existing consumers
+of full records can opt into `full=true` (CLI `--full`). Consumers of the old
+wait `completed`/`status` fields must migrate to the explicit fields above.
+
+MCP initialization contains only a short routing/transport contract because
+some hosts repeat server instructions on every tool. Launch preferences,
+registered message skills and guardrails are available once through
+`muxa_collaboration_guide`; detailed workflows require `workflows=true`. This
+avoids repeating policy in every tool or returning unused workflow examples.
+All JSON tool results are compact on the wire.
 
 ### Staffing a whole ticket
 

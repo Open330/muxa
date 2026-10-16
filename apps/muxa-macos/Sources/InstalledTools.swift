@@ -121,7 +121,7 @@ enum InstalledTools {
 
     /// Runs a process with a timeout and returns its stdout; nil on failure
     /// or timeout. Never called on the main actor's thread.
-    private static func runCapturing(_ executable: String, _ arguments: [String], timeout: TimeInterval) async -> String? {
+    static func runCapturing(_ executable: String, _ arguments: [String], timeout: TimeInterval) async -> String? {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 let process = Process()

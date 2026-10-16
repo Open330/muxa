@@ -7,8 +7,10 @@
 //! `$TMUX_TMPDIR` / the `default` socket points to. For the global view —
 //! every tmux server running for this user — see [`scanner`].
 
+mod canonical;
 pub mod layout;
 pub mod scanner;
+pub use canonical::{base_session_name, canonical_panes, prefer as prefer_listing, GroupedPaneRow};
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -26,6 +28,9 @@ use crate::backend::{ObservationCompleteness, PaneObservation};
 /// daemon reconciler; without a guard, a wedged tmux server can hold the
 /// first watch refresh for many seconds.
 const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+/// A control command that may have to start the server first: sourcing a
+/// `tmux.conf` with plugins takes longer than a call on a running server.
+const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Absolute path to the `tmux` binary, resolved once per process.
 ///
@@ -265,7 +270,7 @@ pub fn tmux_command_scoped() -> Command {
 /// [`scanner::enumerate_sockets`] (which already honors `MUXA_TMUX_SOCKET`
 /// scoping and the macOS `/tmp`↔`/private/tmp` split) keeps the targeting
 /// byte-identical to how the pane was discovered in the first place.
-fn resolve_socket_path(short_name: &str) -> Option<PathBuf> {
+pub fn resolve_socket_path(short_name: &str) -> Option<PathBuf> {
     let short_name = short_name.trim();
     if short_name.is_empty() {
         return None;
@@ -275,6 +280,29 @@ fn resolve_socket_path(short_name: &str) -> Option<PathBuf> {
         .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(short_name))
 }
 
+/// Where a tmux server named `socket` listens, whether or not it is running.
+///
+/// A value carrying a `/` is already a path and is used verbatim. A short name
+/// resolves to the live socket when one exists, and otherwise to the path tmux
+/// itself would create for `-L <name>` — `$TMUX_TMPDIR/tmux-$UID/<name>`, or
+/// `/tmp/tmux-$UID/<name>`. That second case is what a restart needs: right
+/// after `kill-server` the socket file is gone, and [`resolve_socket_path`]
+/// alone would answer `None` for the very server about to be recreated.
+#[must_use]
+pub fn socket_path_or_default(socket: &str) -> PathBuf {
+    let socket = socket.trim();
+    if socket.contains('/') {
+        return PathBuf::from(socket);
+    }
+    resolve_socket_path(socket).unwrap_or_else(|| {
+        scanner::default_socket_dirs()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(socket)
+    })
+}
+
 /// Build a tmux `Command` pinned to the specific server named by `socket` (a
 /// pane row's recorded short socket name). Resolves the name to the live
 /// server's full socket path and passes `-S <path>` so the command can't leak
@@ -282,14 +310,22 @@ fn resolve_socket_path(short_name: &str) -> Option<PathBuf> {
 ///
 /// Falls back to [`tmux_command_scoped`] only when `socket` is `None`, i.e.
 /// when the caller has no recorded endpoint and explicitly requested the
-/// legacy single-server behavior. A supplied socket that no longer resolves
-/// is pinned to `/dev/null` so the command fails closed instead of leaking to
-/// the default server where the same `$N`, `@N`, or `%N` may exist.
+/// legacy single-server behavior. A full socket path is used as given. A
+/// supplied short name that no longer resolves is pinned to `/dev/null` so
+/// the command fails closed instead of leaking to the default server where
+/// the same `$N`, `@N`, or `%N` may exist.
 fn tmux_command_targeting(socket: Option<&str>) -> Command {
     if let Some(socket) = socket {
         let mut cmd = tmux_command();
-        cmd.arg("-S")
-            .arg(resolve_socket_path(socket).unwrap_or_else(|| PathBuf::from("/dev/null")));
+        // A full path names exactly one server already; only a short name
+        // needs the enumeration, which matches on basenames and so would
+        // never recognise a path.
+        let path = if socket.contains('/') {
+            PathBuf::from(socket.trim())
+        } else {
+            resolve_socket_path(socket).unwrap_or_else(|| PathBuf::from("/dev/null"))
+        };
+        cmd.arg("-S").arg(path);
         return cmd;
     }
     tmux_command_scoped()
@@ -339,6 +375,29 @@ pub fn capture_control_on(socket: Option<&str>, args: &[&str]) -> Result<String,
         cmd,
         TMUX_COMMAND_TIMEOUT,
         format!("tmux {}", args.join(" ")),
+    )?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))
+}
+
+/// Run one tmux control command against a server socket *path*, verbatim.
+///
+/// Unlike [`capture_control_on`], the path is not required to name a live
+/// server: this is how a server is brought back at the same path after a
+/// `kill-server`, where nothing is left to resolve a short name against.
+/// Bringing a server up sources the user's config, so the wait is longer
+/// than for a control command on a running one.
+pub fn capture_control_at(path: &std::path::Path, args: &[&str]) -> Result<String, TmuxError> {
+    let mut cmd = tmux_command();
+    cmd.arg("-S").arg(path).args(args);
+    let out = command_output_with_timeout(
+        cmd,
+        SERVER_START_TIMEOUT,
+        format!("tmux -S {} {}", path.display(), args.join(" ")),
     )?;
     if !out.status.success() {
         return Err(TmuxError::NonZero(
@@ -429,7 +488,7 @@ fn feed_stdin_with_timeout(
 /// [`send_text_on`] for text that [`needs_paste`] flags.
 ///
 /// Sequence: `load-buffer -b <buf> -` (payload on stdin, never in argv) →
-/// `paste-buffer -p -b <buf> -t <pane>` (`-p` = bracketed paste) →
+/// `paste-buffer -p -r -b <buf> -t <pane>` (`-p` = bracketed paste, `-r` = preserve LF) →
 /// `delete-buffer -b <buf>` (best-effort scratch cleanup).
 ///
 /// Bracketed paste is best-effort by nature: a paste-aware target (Claude
@@ -440,7 +499,7 @@ fn feed_stdin_with_timeout(
 /// submits per newline), so it's the least-surprising default for multi-line
 /// submit semantics. The trailing submit CR (`submit:true`) is sent separately
 /// as a `send-keys` Enter and is unaffected.
-fn paste_text_on(socket: Option<&str>, pane_id: &str, text: &str) -> bool {
+pub(crate) fn paste_text_on(socket: Option<&str>, pane_id: &str, text: &str) -> bool {
     let buf = paste_buffer_name();
 
     let mut load = tmux_command_targeting(socket);
@@ -457,7 +516,7 @@ fn paste_text_on(socket: Option<&str>, pane_id: &str, text: &str) -> bool {
     }
 
     let mut paste = tmux_command_targeting(socket);
-    paste.args(["paste-buffer", "-p", "-b", &buf, "-t", pane_id]);
+    paste.args(["paste-buffer", "-p", "-r", "-b", &buf, "-t", pane_id]);
     let pasted = command_output_with_timeout(
         paste,
         TMUX_COMMAND_TIMEOUT,
@@ -580,6 +639,9 @@ pub struct PaneInfo {
     /// identity; either can be absent on unmanaged or partially stamped panes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_id: Option<String>,
+    /// Provider recorded by the Muxa launcher, before the first hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_program: Option<String>,
     /// `@muxa_agent_role` — the role a muxa-managed launch stamped on this
     /// pane (`implementer`, `reviewer`, ...). Declared by the launcher, not
     /// self-registered by the agent, so it survives the window before the
@@ -714,6 +776,7 @@ pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) ->
             socket: socket.map(Into::into),
             workspace_id: first_non_empty(cols.get(22), cols.get(12)),
             work_id: first_non_empty(cols.get(23), cols.get(15)),
+            agent_program: non_empty(cols.get(18)),
             agent_role: non_empty(cols.get(19)),
             agent_alias: non_empty(cols.get(31)),
             session_group: non_empty(cols.get(32)),
@@ -1003,6 +1066,31 @@ pub fn capture_pane_on(socket: Option<&str>, pane_id: &str) -> Result<String, Tm
     String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))
 }
 
+/// Like [`capture_pane_on`] but starting `history` lines above the visible
+/// screen (`-S -N`), with wrapped lines joined (`-J`) so a reader that wraps
+/// text itself sees whole lines. Plain text (no `-e`): the only consumer is
+/// the dashboard's pane drawer, which strips escapes anyway.
+pub fn capture_pane_history_on(
+    socket: Option<&str>,
+    pane_id: &str,
+    history: usize,
+) -> Result<String, TmuxError> {
+    let start = format!("-{history}");
+    let mut cmd = tmux_command_targeting(socket);
+    cmd.args(["capture-pane", "-p", "-J", "-S", &start, "-t", pane_id]);
+    let out = command_output_with_timeout(
+        cmd,
+        TMUX_COMMAND_TIMEOUT,
+        format!("tmux capture-pane -S {start} -t {pane_id}"),
+    )?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).into(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Best-effort resolution of the user's active pane.
 ///
 /// `$TMUX_PANE` covers the common case (a shell running inside that pane).
@@ -1208,20 +1296,16 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn native_tmux_resolution_skips_rmux_shim() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let shim = dir.path().join("tmux");
         let rmux = dir.path().join("rmux");
         let native = dir.path().join("native");
-        std::fs::write(
+        crate::test_support::write_executable(
             &rmux,
             "#!/bin/sh\ncase \"$0\" in */tmux) echo 'tmux 3.4';; *) echo 'rmux 0.10.0';; esac\n",
-        )
-        .unwrap();
-        std::fs::write(&native, "#!/bin/sh\necho 'tmux 3.4'\n").unwrap();
-        for path in [&rmux, &native] {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+            0o700,
+        );
+        crate::test_support::write_executable(&native, "#!/bin/sh\necho 'tmux 3.4'\n", 0o700);
         std::os::unix::fs::symlink(&rmux, &shim).unwrap();
         assert!(Command::new(&shim)
             .arg("-V")
@@ -1355,12 +1439,46 @@ mod tests {
 
     #[test]
     fn unresolved_explicit_socket_fails_closed_instead_of_using_default_server() {
-        let command = tmux_command_targeting(Some("/__muxa_missing_socket__"));
+        let command = tmux_command_targeting(Some("__muxa_missing_socket__"));
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(args.windows(2).any(|pair| pair == ["-S", "/dev/null"]));
+    }
+
+    #[test]
+    fn an_explicit_socket_path_is_used_verbatim() {
+        // A path names one server already. Matching it against the socket
+        // enumeration (which compares basenames) could only ever miss.
+        let command = tmux_command_targeting(Some("/tmp/muxa-test/custom"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-S", "/tmp/muxa-test/custom"]));
+    }
+
+    #[test]
+    fn a_stopped_server_still_has_a_socket_path() {
+        // Right after `kill-server` the socket file is gone; the name must
+        // still point where tmux will recreate it, not at `/dev/null`.
+        let path = socket_path_or_default("__muxa_stopped_server__");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("__muxa_stopped_server__")
+        );
+        assert!(path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(|dir| dir.starts_with("tmux-")));
+        assert_eq!(
+            socket_path_or_default("/tmp/elsewhere/sock"),
+            PathBuf::from("/tmp/elsewhere/sock")
+        );
     }
 
     #[test]
@@ -1498,8 +1616,24 @@ mod tests {
         assert_eq!(pane.pane_id, "%1");
         assert_eq!(pane.agent_role, None);
         assert_eq!(pane.agent_alias, None);
+        assert_eq!(pane.agent_program, None);
         assert_eq!(pane.workspace_id, None);
         assert_eq!(pane.work_id, None);
+    }
+
+    #[test]
+    fn pane_parser_preserves_the_launched_provider_without_role_or_alias() {
+        let mut columns = vec![""; 33];
+        columns[0] = "%2";
+        columns[1] = "main";
+        columns[5] = "codex";
+        columns[7] = "42";
+        columns[18] = "codex";
+        columns[21] = "1";
+        let panes = parse_pane_lines(&columns.join("\t"));
+        assert_eq!(panes[0].agent_program.as_deref(), Some("codex"));
+        assert!(panes[0].agent_role.is_none());
+        assert!(panes[0].agent_alias.is_none());
     }
 
     /// And the reverse: an unaliased pane must not grow the payload it sends
@@ -1508,6 +1642,7 @@ mod tests {
     fn an_unaliased_pane_serializes_without_the_new_keys() {
         let pane = PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             pane_id: "%1".into(),

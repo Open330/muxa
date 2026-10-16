@@ -92,7 +92,7 @@ struct MuxaLanguageSettingsSection: View {
             if needsRelaunch {
                 HStack {
                     Label("Relaunch Muxa to apply", systemImage: "arrow.clockwise.circle")
-                        .font(.caption)
+                        .font(MuxaType.detail)
                         .foregroundStyle(.orange)
                     Spacer()
                     Button("Relaunch") { MuxaLanguagePreference.relaunch() }
@@ -100,7 +100,7 @@ struct MuxaLanguageSettingsSection: View {
                 }
             } else {
                 Text("System follows the macOS language list. Muxa is available in English and Korean.")
-                    .font(.caption)
+                    .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
             }
         }

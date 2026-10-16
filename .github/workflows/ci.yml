@@ -55,6 +55,20 @@ jobs:
       - run: cargo build --workspace --bins
       - run: cargo test --workspace
 
+  js-test:
+    name: dashboard JS tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      # The dashboard's pure modules (pane drawer, live-output stream,
+      # topology, work and collaboration models) are plain ES modules tested
+      # with node's built-in runner. `node --test <directory>` does not find
+      # these files, so name them with a glob; the job fails if any test does.
+      - run: node --test crates/muxa/tests-js/*.test.mjs
+
   onboarding-script:
     name: onboarding script
     runs-on: ubuntu-latest

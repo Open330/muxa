@@ -144,6 +144,10 @@ title = "Anthropic (work)"          # 선택. 기본값은 id를 사람이 읽�
 model = "claude-opus-5"             # 선택
 api_key_env = "WORK_ANTHROPIC_KEY"  # 선택. 이 provider 전용 키
 executable = "/opt/homebrew/bin/claude"  # 선택. CLI engine에만 적용
+
+[ask.providers.apple-cloud]         # Apple 모델 (macOS 26+): 키가 아예 없음
+engine = "apple"
+model = "private-cloud"             # on-device(기본값) | private-cloud(macOS 27+)
 ```
 
 `muxa watch`에서 보내는 headless 질의입니다. `a`로 묻고 `A`로 이력을 봅니다.
@@ -172,23 +176,57 @@ plan`). `muxa work compose`는 항상 이 모드로 초안을 만듭니다.
 ### Provider
 
 **engine**은 provider를 구동하는 코드입니다. CLI가 받는 argv, API가 돌려주는
-JSON, 키가 담긴 환경 변수가 여기에 있습니다. 다섯 개로 고정되어 있습니다.
+JSON, 키가 담긴 환경 변수가 여기에 있습니다. 여섯 개로 고정되어 있습니다.
 `claude`, `codex`, `gemini`는 agent CLI를 print 모드(`claude -p`, `codex exec
 --json`, `gemini -p --output-format json`)로 실행하고 질문 사이에 자체 세션을
 resume합니다. `anthropic`과 `openai`는 Messages API와 Chat Completions API를
-HTTPS로 직접 호출합니다. API engine은 resume할 세션이 없으므로 muxad가 자기
-이력에서 그 대화의 이전 턴(최근 40턴 또는 60k자)을 질문 앞에 다시 넣어 보내며,
+HTTPS로 직접 호출합니다. `apple`은 Mac 자체의 Foundation Models를 실행합니다.
+API engine은 resume할 세션이 없으므로 muxad가 자기 이력에서 그 대화의 이전
+턴(최근 40턴 또는 60k자)을 질문 앞에 다시 넣어 보내며,
 `cwd`·`additional_dirs`·`permission_mode`는 적용되지 않습니다.
 
+`apple`(macOS 26 이상, Apple Intelligence가 켜져 있어야 함)은 키가 필요 없고
+외부 계정으로 아무것도 보내지 않습니다. `model`로 두 시스템 모델 중 하나를
+고릅니다. 기본값 `on-device`는 Mac 밖으로 나가지 않으며 컨텍스트가 8,192
+토큰이고, `private-cloud`는 Apple의 Private Cloud Compute입니다(macOS 27 이상,
+32,768 토큰, Apple의 사용량 quota 적용). 현재 `private-cloud`는 동작하지
+않습니다. macOS 27 SDK로 빌드한 헬퍼가 필요한데 GitHub 러너 이미지에는 아직
+그 SDK가 없고, 그렇게 빌드해 Developer ID로 서명한 헬퍼조차 시스템이
+`ModelManagerError 1046`으로 거부했습니다. Private Cloud Compute가 프로세스에
+무엇을 요구하든 command-line 헬퍼에는 그것이 없는 것으로 보입니다. 옵션은 나중
+빌드에서 쓸 수 있도록 남겨 두었고, 이 모델로 턴을 보내면 왜 답할 수 없는지
+알려줍니다. 이 프레임워크는 Swift 전용이라 muxad는
+`Muxa.app/Contents/Helpers`에 포함된 작은 헬퍼 `muxa-afm`을 통해 호출합니다.
+muxad는 헬퍼를 자기 실행 파일 옆, `/Applications/Muxa.app`, `~/Applications/Muxa.app`,
+`PATH` 순서로 찾고,
+`executable`로 다른 사본을 지정할 수 있습니다. API처럼 세션이 없으므로 대화를
+다시 넣어 보내는데, on-device 컨텍스트에 맞게 6k자로 자르고, 그래도 모델이
+초과를 보고하면 헬퍼가 더 줄입니다. 이 모델들은 질문에 답할 뿐 파일을 건드리지
+않으므로 `cwd`·`additional_dirs`·`permission_mode`는 적용되지 않습니다.
+
+agent CLI는 shell이 있어서 workspace를 직접 볼 수 있지만, 모델만으로는 볼 수
+없어서 "다른 애플리케이션에 접근할 수 없다"고 답하게 됩니다. 그래서 Global Ask
+턴에서는 헬퍼가 모델에 읽기 전용 도구 두 개를 줍니다. 질문이 온 바로 그 daemon에
+`muxa status --json`과 `muxa recap`을 실행해 답하는 `list_agent_sessions`(추적
+중인 모든 agent의 pane, 상태, 제목, 디렉터리, 최근 prompt와 응답)와
+`read_agent_session`(pane 하나의 상세)입니다. 읽기만 가능하며 agent에 입력을
+보내거나 무엇을 바꿀 수는 없습니다. 도구를 부를지는 모델이 정하므로 agent와
+무관한 질문에는 아무것도 읽지 않습니다. `on-device`에서는 읽은 내용이 Mac 밖으로
+나가지 않고, `private-cloud`에서는 질문과 함께 Apple의 Private Cloud Compute로
+전송됩니다. `muxa work init` 같은 one-shot 턴에는 도구를 주지 않습니다. 내장
+`apple` provider는 모든 host에서 목록에 나오므로 config.toml 하나를 Mac과 Linux
+host가 함께 쓸 수 있고, 실행할 수 없는 host에서 턴을 보내면 "macOS에서만
+실행됩니다"라는 명확한 오류로 실패합니다.
+
 **provider**는 직접 구성하는 `[ask.providers.<id>]` 테이블입니다. id는 원하는
-대로 정하고(TOML bare key: 영숫자, `-`, `_`), `engine`이 다섯 중 무엇으로
+대로 정하고(TOML bare key: 영숫자, `-`, `_`), `engine`이 여섯 중 무엇으로
 구동할지 정합니다. 여러 provider가 같은 engine을 공유할 수 있어 업무용과 개인용
 OpenAI 계정, Anthropic 키 두 개, 두 번째 `claude` 바이너리를 나란히 둘 수
 있습니다. 각각 자기 대화를 따로 유지하므로 provider를 바꿔도 새로 시작하지 않고
 이어집니다. `[ask] agent`와 `muxa ask --agent`는 engine이 아니라 provider id를
 가리킵니다.
 
-다섯 engine id는 그 자체로도 provider라서 `[ask.providers]`가 아예 없어도 새로
+engine id는 그 자체로도 provider라서 `[ask.providers]`가 아예 없어도 새로
 설치한 muxa가 그대로 동작합니다. `muxa ask providers`는 직접 구성한 provider를
 먼저, 그다음 아직 가려지지 않은 내장 provider를 보여줍니다. 내장 id로 만든
 테이블에 `engine`이 없으면 그 내장 provider를 조정하는 뜻입니다. 예전에 쓴
@@ -211,7 +249,8 @@ muxa ask --agent claude --detach --json "배포 계획을 검토해줘"
 muxa ask --agent anthropic "reaper가 건드리는 파일은?"
 security find-generic-password -w -s my-codex-key \
   | muxa ask --agent codex --api-key-stdin "이 저장소를 검토해줘"
-muxa ask --agent anthropic-work "…"   # 직접 추가한 provider를 id로 지정
+muxa ask --agent anthropic-work "…"   # 직접 추가한 provider를 id로 지정 (다음 재시작 전까지)
+muxa ask provider use codex           # 기본 provider로 지정하고 [ask] agent에 저장
 muxa ask providers [--json]           # 모든 provider: engine, 종류, 모델, 키 확보 여부, 선택 상태
 muxa ask provider add anthropic-work --engine anthropic \
   --title "Anthropic (work)" --api-key-env WORK_ANTHROPIC_KEY
@@ -221,7 +260,7 @@ muxa ask provider set anthropic --clear-model         # 생략한 플래그의 �
 muxa ask provider remove anthropic-work               # 내장 id는 설정만 지워집니다
 ```
 
-`add`는 이미 있는 id, TOML bare key가 아닌 id, 다섯 중에 없는 engine, 그리고 다른
+`add`는 이미 있는 id, TOML bare key가 아닌 id, 여섯 중에 없는 engine, 그리고 다른
 engine을 쓰려는 내장 id를 거부합니다. engine은 추가 시점에 고정됩니다. `set`은
 title·model·키 변수·바이너리를 바꾸고, engine을 바꾸려면 provider를 제거한 뒤 다시
 추가해야 합니다. 진행 중인 대화가 `claude` 세션 id를 `codex`에서 resume할 수는
@@ -402,11 +441,20 @@ enabled = true
 interval_secs = 30
 stuck_working_timeout_secs = 0
 stuck_waiting_timeout_secs = 0
+codex_rollout_enabled = true
+paneless_stale_timeout_secs = 86400
 ```
 
 stale state가 오래 남는 것을 줄입니다. timeout 값 `0`은 해당 timeout 비활성화입니다.
-같은 루프가 pid-liveness 스윕도 돌려, 등록된 백그라운드 task(`muxa register` 참고)는
+같은 루프가 pid-liveness 스윕도 돌려, 등록된 백그라운드 task(`muxa proc register` 참고)는
 프로세스가 종료되면 `stopped`로 전환됩니다.
+
+Codex rollout 조회는 전체 `interval_secs` 보정 주기와 별개로 2초마다 실행됩니다.
+원래 이벤트 시각으로 활동을 갱신하고 실행·턴 완료·실제 오류를 복구합니다.
+사용량 비율과 credit 잔액만으로 상태를 바꾸지 않습니다.
+`codex_rollout_enabled = false`로 끌 수 있습니다.
+`paneless_stale_timeout_secs`는 pane·surface·pid가 모두 없는 레지스트리 행을
+기본 24시간 후 stopped로 전환하며, `0`이면 이 정리를 끕니다.
 
 ## Fleet
 
@@ -454,8 +502,8 @@ manager 단계에서 차단합니다.
 ProxyJump, host-key 정책은 `~/.ssh/config`에 둡니다. `muxa_path`와 `remote_socket`은
 fixed remote command token으로 검증됩니다. label은 Kubernetes-style selector에 쓰고,
 annotation은 설명형 value를 허용하지만 같은 namespaced key 문법을 사용합니다.
-inventory는 `muxa host add/label/annotate`로 atomic하게 편집하는 것을 권장합니다.
-controller metadata는 `muxa host label local`, `muxa host annotate local`로 관리하며
+inventory는 `muxa fleet host add/label/annotate`로 atomic하게 편집하는 것을 권장합니다.
+controller metadata는 `muxa fleet host label local`, `muxa fleet host annotate local`로 관리하며
 muxad가 제공하는 identity label은 덮어쓸 수 없습니다.
 [FLEET.ko.md](FLEET.ko.md)를 참고하세요.
 
@@ -475,6 +523,42 @@ dashboard는 명시적으로 public binding을 허용하기 전까지 loopback-o
 `auth = "public_read"`를 사용합니다. `auth = "none"`은 조회만 공개하고 모든
 제어 요청을 비활성화합니다.
 자세한 내용은 [DASHBOARD.md](DASHBOARD.md).
+
+### 로그인 기반 pane·window 공유
+
+`[dashboard.sharing]`에 `public_url`, `issuer_url`, `client_id`를 설정하면
+대시보드에서 특정 tmux/rmux pane 또는 window의 현재 pane들을 이메일로 초대할 수 있습니다. OIDC 로그인,
+보기 전용/프롬프트 전송 권한, 만료, 회수를 지원합니다. `auth = "token"`이
+필수이며 운영자 토큰은 공유받는 사람에게 전달하지 않습니다.
+
+```toml
+[dashboard.sharing]
+public_url = "https://muxa.example.com"
+issuer_url = "https://login.example.com"
+client_id = "muxa-dashboard"
+client_secret_env = "MUXA_SHARING_CLIENT_SECRET" # 필요한 경우 환경 변수 이름 지정
+# storage_path = "/absolute/path/to/shares.sqlite3" # 선택: 비공개 로컬 파일의 절대 경로
+```
+
+`public_url`은 경로·query·fragment가 없는 origin이어야 합니다. 설정 변경 후 daemon을 재시작하세요.
+Window 공유에는 초대 시점의 pane 프로세스가 최대 16개 포함되며, 이후 만든 pane은 포함되지 않습니다.
+
+OIDC 제공자에 `https://muxa.example.com/share/auth/callback`을 등록하고,
+ID 토큰에 검증된 이메일(`email_verified = true`)이 포함되도록 설정합니다.
+외부 접속에는 HTTPS 프록시가 필요합니다. 공유 링크·회수 상태·계정 연결·명령 처리 기록은 비공개 SQLite 파일에 저장됩니다.
+daemon 재시작 후 같은 pane 프로세스가 살아 있으면 링크를 계속 사용할 수 있고,
+공유받은 사람은 다시 로그인합니다. 프롬프트 권한은 해당 pane의 프로세스에 명령을 보낼 수 있는 권한이며, shell pane에서는 shell 명령이 실행됩니다.
+전체 설정과 제약은 [대시보드 문서](DASHBOARD.md#invite-someone-to-a-pane)를 참고하세요.
+
+운영자는 **Shares → Check login setup**에서 로그인 제공자의 discovery와 서명 키 연결을 진단할 수 있습니다.
+이 검사는 client secret이나 실제 계정의 claim을 검증하지 않습니다.
+`storage_path`로 저장 파일의 절대 경로를 지정할 수 있으며, 기본 위치는 플랫폼 데이터
+디렉터리의 `muxa/dashboard-sharing/shares.sqlite3`입니다. 같은 저장 파일을 두 daemon이
+동시에 사용할 수 없습니다. 저장 실패 시 변경을 완료했다고 응답하거나 새 명령을 실행하지
+않습니다. 브라우저는 응답이 유실된 명령을 같은 요청 ID로 확인하여 중복 실행을 막습니다.
+
+실제 외부 접속은 HTTPS 주소·OIDC client 설정과 해당 계정 로그인으로 별도 확인해야 합니다.
+프록시의 로그인 callback 접근 로그에는 query string을 남기지 않도록 설정하세요.
 
 ## External Sinks
 

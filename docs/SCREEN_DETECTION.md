@@ -4,7 +4,7 @@ Status: **implemented.** Core in `muxa::screen`, daemon task in
 `muxad::screen_detect`, shared synthetic-row machinery in `muxad::synthetic`.
 
 muxa gets authoritative agent state from **hooks** (Claude Code, Codex, Gemini,
-Antigravity)
+Antigravity), from Codex session-rollout events polled every two seconds,
 and, on herdr hosts, from **herdr's own detection** bridged into synthetic rows
 (`docs/HERDR.md`). For every *other* agent CLI — cursor-agent, amp, copilot,
 aider, goose, and anything a user declares — there is no event stream at all.
@@ -25,7 +25,7 @@ mechanics are built so it can never override a stronger one.
 ## Precedence invariant
 
 ```
-hooks  >  herdr bridge  >  screen detection
+hooks / Codex rollout  >  herdr bridge  >  screen detection
 ```
 
 Screen rows are **synthetic** (session id `synthetic-…`), which buys the whole
@@ -194,7 +194,7 @@ between Codex rendering a recap and the daemon's next detection tick.
 
 ## Manifest sources
 
-1. **Bundled** — `agy`, `cursor`, `amp`, `copilot`, `aider`, `goose` ship in the
+1. **Bundled** — `agy`, `codex`, `cursor`, `amp`, `copilot`, `aider`, `goose` ship in the
    binary via `include_str!` (`crates/muxa/src/screen/agents/*.toml`).
 2. **User overrides** — `$XDG_CONFIG_HOME/muxa/agents/*.toml`. `XDG_CONFIG_HOME`
    is honored **first and explicitly** so the path works cross-platform: on
@@ -289,8 +289,9 @@ the same registry key.
   than the pane or already scrolled away before a detection tick cannot be
   recovered from the rollout's opaque compaction item. Once observed, it is
   retained in the agent snapshot. Paneless Codex sessions have no screen source.
-- Hook-less custom launch wrappers remain undiscoverable unless their command
-  is declared in a manifest. A live hooked Codex row can still select the
+- Known wrappers, including npm shims and `aas`, use bounded process discovery.
+  Other custom launch wrappers need a matching manifest or a recognized agent
+  descendant. A live hooked Codex row can still select the
   metadata-only recap path even when the launcher owns `pane_current_command`.
 - Best-effort bundled patterns (see the confidence table).
 - Blocked notifications carry a generic `"<name> is waiting"` message; screen

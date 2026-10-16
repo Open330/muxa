@@ -20,7 +20,7 @@ if [ -z "$CARGO_BIN" ] && [ -x "${HOME:-}/.cargo/bin/cargo" ]; then
     CARGO_BIN="${HOME}/.cargo/bin/cargo"
 fi
 if [ -z "$CARGO_BIN" ]; then
-    echo "cargo was not found; install Rust 1.88+ before building Muxa.app" >&2
+    echo "cargo was not found; install Rust 1.89+ before building Muxa.app" >&2
     exit 1
 fi
 RUSTUP_BIN=$(command -v rustup || true)
@@ -41,7 +41,17 @@ for architecture in "${architectures[@]}"; do
         ! "$RUSTUP_BIN" target list --installed | grep -qx "$rust_target"; then
         "$RUSTUP_BIN" target add "$rust_target"
     fi
-    "$CARGO_BIN" build \
+    # Xcode exports MACOSX_DEPLOYMENT_TARGET to every build phase, and rustc
+    # applies it to the proc-macro dylibs it builds for the host too. With
+    # Xcode 27 those no longer load ("can't find crate for `tokio_macros`").
+    # Pass the deployment target to the target's link only.
+    deployment=()
+    if [ -n "${MACOSX_DEPLOYMENT_TARGET:-}" ]; then
+        target_var=$(printf '%s' "$rust_target" | tr 'a-z-' 'A-Z_')
+        deployment=("CARGO_TARGET_${target_var}_RUSTFLAGS=-C link-arg=-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}")
+    fi
+    env -u MACOSX_DEPLOYMENT_TARGET ${deployment[@]+"${deployment[@]}"} \
+        "$CARGO_BIN" build \
         --manifest-path "$REPO_DIR/Cargo.toml" \
         --release \
         --target "$rust_target" \

@@ -36,8 +36,13 @@ blocked = [
 working = [
     # Codex prints an elapsed-time working line while a turn runs.
     '(?m)^\s*(?i:Esc to interrupt)\b',
+    # Current Codex includes the interrupt hint inside its status line.
+    '(?m)^\s*[^\n]*\([^\n]*[•·]\s*(?i:esc to interrupt)\)',
 ]
 idle = [
     # The bare composer prompt, nothing pending.
     '(?m)^\s*[>›❯]\s*$',
+    # The empty composer now shows a placeholder (also present while working;
+    # working rules take precedence).
+    '(?m)^\s*›\s+Ask Codex to do anything\s*$',
 ]

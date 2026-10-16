@@ -1,4 +1,4 @@
-//! `OpenAI` Codex CLI rollout-file rate-limit parser.
+//! `OpenAI` Codex CLI rollout-file lifecycle and rate-limit parser.
 //!
 //! Codex has no error / rate-limit hook (its hook surface is the same five
 //! lifecycle events Claude Code ships: `SessionStart`, `UserPromptSubmit`,
@@ -29,16 +29,16 @@
 //! }
 //! ```
 //!
-//! `primary` is the 5-hour rolling window, `secondary` the 7-day one — the
-//! same two scopes Claude Code's statusline exposes, so they map straight
-//! onto muxa's `rate_limit_5h_*` / `rate_limit_7d_*` fields. The reconciler
+//! Map windows by `window_minutes`: 300 is the 5-hour window and 10080 the
+//! 7-day one. Older records use `primary` for 5h and `secondary` for 7d;
+//! newer Codex can put the weekly window in `primary` alone. The reconciler
 //! polls this via [`session_rate_limits`] and feeds the result through the
 //! existing `Heartbeat` (percentages) and `RateLimited` (hard cap) paths.
 //!
-//! Codex also has a **credit-based plan**: once the rolling windows are
-//! spent, `primary`/`secondary` go null and a `credits` object takes over
-//! (`{"has_credits":false,"unlimited":false,"balance":"0"}` = out of
-//! credits). We treat that as a cap too — see [`RateLimits::reached`].
+//! Utilization and credit balances are telemetry, not proof that the active
+//! model/plan is blocked. Only an explicit `rate_limit_reached_type` marks a
+//! cap; 100% utilization or an empty credit balance alone must not change
+//! the agent's lifecycle state.
 //!
 //! This mirrors the Claude [`transcript`](super::transcript) module: an
 //! unofficial on-disk format read best-effort, guarded by golden fixtures.
@@ -73,16 +73,14 @@ pub struct Window {
 /// The latest `rate_limits` snapshot found in a rollout file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RateLimits {
+    /// Time of the telemetry record, when supplied by Codex.
+    pub at: Option<OffsetDateTime>,
     /// `primary` window — the 5-hour rolling cap.
     pub five_hour: Option<Window>,
     /// `secondary` window — the 7-day weekly cap.
     pub seven_day: Option<Window>,
-    /// Set when codex is *blocked right now*, mapped to the scope that
-    /// tripped. Three signals feed it (see [`parse_line`]):
-    /// 1. `rate_limit_reached_type` is non-null (explicit, but codex rarely
-    ///    sets it), 2. a window reads `used_percent >= 100`, or 3. the
-    ///    account is on the credit model (`primary`/`secondary` both null)
-    ///    and its `credits` are exhausted. `None` when none apply.
+    /// Explicit blocked signal, mapped using the reported window duration.
+    /// Percentages and credit balances never imply a blocked turn.
     pub reached: Option<RateLimitScope>,
 }
 
@@ -91,6 +89,7 @@ pub struct RateLimits {
 
 #[derive(Deserialize)]
 struct Record {
+    timestamp: Option<String>,
     payload: Option<Payload>,
 }
 
@@ -103,10 +102,6 @@ struct Payload {
 struct RawRateLimits {
     primary: Option<RawWindow>,
     secondary: Option<RawWindow>,
-    /// Present (and `primary`/`secondary` null) on the credit-based plan —
-    /// codex switches an account here once its rolling windows are spent.
-    #[serde(default)]
-    credits: Option<RawCredits>,
     /// `null` normally; a window name (`"primary"` / `"secondary"`) when a
     /// cap was reached.
     #[serde(default)]
@@ -116,22 +111,10 @@ struct RawRateLimits {
 #[derive(Deserialize)]
 struct RawWindow {
     used_percent: Option<f32>,
+    window_minutes: Option<u32>,
     /// Unix epoch *seconds*. Optional even when `used_percent` is present.
     resets_at: Option<i64>,
 }
-
-#[derive(Deserialize)]
-struct RawCredits {
-    /// Whether the account currently has credits available. `false` with
-    /// `unlimited == false` is codex's "out of credits" signal.
-    #[serde(default)]
-    has_credits: Option<bool>,
-    #[serde(default)]
-    unlimited: Option<bool>,
-}
-
-/// A window counts as capped at 100% utilization (`used_percent` is 0–100).
-const SATURATED_PCT: f32 = 100.0;
 
 fn window(w: Option<RawWindow>) -> Option<Window> {
     let w = w?;
@@ -150,45 +133,49 @@ fn parse_line(line: &str) -> Option<RateLimits> {
     let rec: Record = serde_json::from_str(line.trim()).ok()?;
     let raw = rec.payload?.rate_limits?;
 
-    let five_hour = window(raw.primary);
-    let seven_day = window(raw.secondary);
-
-    // An explicit `rate_limit_reached_type` is the most authoritative signal,
-    // but codex sets it rarely. Fall back to window saturation, then — for
-    // credit-plan accounts, where the windows are absent — to credit
-    // exhaustion. The "both windows null" guard matters: an account on the
-    // window plan can carry a `credits` object with `has_credits: false`
-    // while still having window quota, and that is NOT a cap.
+    // Newer Codex can put the weekly window in `primary` with no
+    // `secondary`. Prefer the duration; keep positional defaults for older
+    // records that omitted it.
+    let primary_scope = window_scope(raw.primary.as_ref(), RateLimitScope::FiveHour);
+    let secondary_scope = window_scope(raw.secondary.as_ref(), RateLimitScope::SevenDay);
+    let primary = window(raw.primary);
+    let secondary = window(raw.secondary);
+    let mut five_hour = None;
+    let mut seven_day = None;
+    for (scope, reading) in [(primary_scope, primary), (secondary_scope, secondary)] {
+        match scope {
+            RateLimitScope::FiveHour if reading.is_some() => five_hour = reading,
+            RateLimitScope::SevenDay if reading.is_some() => seven_day = reading,
+            _ => {}
+        }
+    }
+    // A snapshot can describe an exhausted quota for a different model or
+    // limit while this turn continues on plan quota. Never infer a lifecycle
+    // error from percentages or account credit balances.
     let reached = match raw.rate_limit_reached_type.as_deref() {
-        Some("primary") => Some(RateLimitScope::FiveHour),
-        Some("secondary") => Some(RateLimitScope::SevenDay),
+        Some("primary") => Some(primary_scope),
+        Some("secondary") => Some(secondary_scope),
         Some(_) => Some(RateLimitScope::Unknown),
-        None if five_hour.is_some_and(|w| w.used_percent >= SATURATED_PCT) => {
-            Some(RateLimitScope::FiveHour)
-        }
-        None if seven_day.is_some_and(|w| w.used_percent >= SATURATED_PCT) => {
-            Some(RateLimitScope::SevenDay)
-        }
-        None if five_hour.is_none()
-            && seven_day.is_none()
-            && raw.credits.is_some_and(credits_exhausted) =>
-        {
-            Some(RateLimitScope::Unknown)
-        }
         None => None,
     };
 
     Some(RateLimits {
+        at: rec.timestamp.as_deref().and_then(|timestamp| {
+            OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339).ok()
+        }),
         five_hour,
         seven_day,
         reached,
     })
 }
 
-/// True when a `credits` object says the account is out of credits: it isn't
-/// an unlimited plan and `has_credits` is explicitly `false`.
-fn credits_exhausted(c: RawCredits) -> bool {
-    c.unlimited != Some(true) && c.has_credits == Some(false)
+fn window_scope(window: Option<&RawWindow>, fallback: RateLimitScope) -> RateLimitScope {
+    match window.and_then(|w| w.window_minutes) {
+        Some(300) => RateLimitScope::FiveHour,
+        Some(10080) => RateLimitScope::SevenDay,
+        Some(_) => RateLimitScope::Unknown,
+        None => fallback,
+    }
 }
 
 /// Read the tail of a rollout file and return the most recent `rate_limits`
@@ -213,6 +200,125 @@ pub fn latest_rate_limits(path: &Path) -> Option<RateLimits> {
     latest
 }
 
+/// Latest lifecycle evidence persisted by Codex, independent of quota telemetry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Status {
+    pub at: OffsetDateTime,
+    pub event: StatusEvent,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatusEvent {
+    Working,
+    Stopped {
+        response: Option<String>,
+        interrupted: bool,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// Read actual event timestamps so unchanged files cannot manufacture recent
+/// activity or continually reorder the watch list. Partial JSON is skipped.
+pub fn latest_status(path: &Path) -> Option<Status> {
+    let mut file = File::open(path).ok()?;
+    let start = file.metadata().ok()?.len().saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut latest = None;
+    let mut response = None;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let payload = &record["payload"];
+        let event = match (record["type"].as_str(), payload["type"].as_str()) {
+            (Some("event_msg"), Some("task_started" | "user_message")) => {
+                response = None;
+                StatusEvent::Working
+            }
+            (Some("event_msg"), Some("task_complete")) => {
+                if let Some(error) = payload.get("error").filter(|error| !error.is_null()) {
+                    StatusEvent::Error {
+                        message: super::hook::truncate(
+                            error["message"]
+                                .as_str()
+                                .unwrap_or("Codex turn failed")
+                                .to_owned(),
+                            4_000,
+                        ),
+                    }
+                } else {
+                    let final_response = payload["last_agent_message"]
+                        .as_str()
+                        .filter(|text| !text.trim().is_empty())
+                        .map(|text| super::hook::truncate(text.to_owned(), 4_000))
+                        .or_else(|| response.clone());
+                    StatusEvent::Stopped {
+                        response: final_response,
+                        interrupted: false,
+                    }
+                }
+            }
+            (Some("event_msg"), Some("turn_aborted")) => {
+                response = None;
+                StatusEvent::Stopped {
+                    response: None,
+                    interrupted: true,
+                }
+            }
+            (Some("response_item"), Some("message")) if payload["role"] == "user" => {
+                response = None;
+                StatusEvent::Working
+            }
+            (Some("response_item"), Some("message")) if payload["role"] == "assistant" => {
+                if matches!(payload["phase"].as_str(), Some("final" | "final_answer")) {
+                    let text = payload["content"].as_array().map(|parts| {
+                        parts
+                            .iter()
+                            .filter(|part| part["type"] == "output_text")
+                            .filter_map(|part| part["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    });
+                    response = text
+                        .filter(|text| !text.trim().is_empty())
+                        .map(|text| super::hook::truncate(text, 4_000));
+                    StatusEvent::Stopped {
+                        response: response.clone(),
+                        interrupted: false,
+                    }
+                } else {
+                    StatusEvent::Working
+                }
+            }
+            (
+                Some("response_item"),
+                Some(
+                    "reasoning"
+                    | "function_call"
+                    | "function_call_output"
+                    | "custom_tool_call"
+                    | "custom_tool_call_output",
+                ),
+            ) => StatusEvent::Working,
+            _ => continue,
+        };
+        let Some(at) = record["timestamp"].as_str().and_then(|value| {
+            OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+        }) else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .is_none_or(|previous: &Status| at >= previous.at)
+        {
+            latest = Some(Status { at, event });
+        }
+    }
+    latest
+}
+
 /// Read a final assistant response from the current turn only. Commentary,
 /// tool output, and a previous turn's answer must not turn a response-less
 /// Stop (for example at a permission prompt) into a successful completion.
@@ -227,7 +333,9 @@ pub fn latest_final_response(path: &Path) -> Option<String> {
         };
         let payload = &value["payload"];
         match (value["type"].as_str(), payload["type"].as_str()) {
-            (Some("event_msg"), Some("task_started" | "user_message")) => latest = None,
+            (Some("event_msg"), Some("task_started" | "user_message" | "turn_aborted")) => {
+                latest = None;
+            }
             (Some("response_item"), Some("message")) if payload["role"] == "user" => latest = None,
             (Some("response_item"), Some("message"))
                 if payload["role"] == "assistant"
@@ -244,6 +352,10 @@ pub fn latest_final_response(path: &Path) -> Option<String> {
                 latest = text.filter(|text| !text.trim().is_empty());
             }
             (Some("event_msg"), Some("task_complete")) => {
+                if payload.get("error").is_some_and(|error| !error.is_null()) {
+                    latest = None;
+                    continue;
+                }
                 if let Some(text) = payload["last_agent_message"]
                     .as_str()
                     .filter(|text| !text.trim().is_empty())
@@ -296,6 +408,30 @@ pub fn locate_rollout(
         date = prev;
     }
 
+    // Resumed sessions retain their original rollout date. Codex uses UUIDv7
+    // session IDs, whose timestamp lets us find old live sessions without a
+    // recursive history scan or expanding every poll's directory budget.
+    if let Some(created) = uuid::Uuid::parse_str(session_id)
+        .ok()
+        .filter(|id| id.get_version_num() == 7)
+        .and_then(|id| id.get_timestamp())
+        .and_then(|timestamp| i64::try_from(timestamp.to_unix().0).ok())
+        .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+    {
+        for candidate in [
+            created.date().next_day(),
+            Some(created.date()),
+            created.date().previous_day(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !dates.contains(&candidate) {
+                dates.push(candidate);
+            }
+        }
+    }
+
     for date in dates {
         let dir = sessions_root
             .join(format!("{:04}", date.year()))
@@ -342,6 +478,101 @@ mod tests {
     use time::macros::datetime;
 
     #[test]
+    fn lifecycle_tracks_reasoning_completion_errors_and_new_turns() {
+        let dir = tempdir().unwrap();
+        let mut lines = Vec::new();
+        let cases = [
+            (
+                "event_msg",
+                serde_json::json!({"type":"task_started"}),
+                StatusEvent::Working,
+            ),
+            (
+                "response_item",
+                serde_json::json!({"type":"reasoning"}),
+                StatusEvent::Working,
+            ),
+            (
+                "response_item",
+                serde_json::json!({"type":"custom_tool_call_output"}),
+                StatusEvent::Working,
+            ),
+            (
+                "event_msg",
+                serde_json::json!({"type":"task_complete","last_agent_message":"Done"}),
+                StatusEvent::Stopped {
+                    response: Some("Done".into()),
+                    interrupted: false,
+                },
+            ),
+            (
+                "event_msg",
+                serde_json::json!({"type":"task_started"}),
+                StatusEvent::Working,
+            ),
+            (
+                "event_msg",
+                serde_json::json!({"type":"task_complete"}),
+                StatusEvent::Stopped {
+                    response: None,
+                    interrupted: false,
+                },
+            ),
+            (
+                "event_msg",
+                serde_json::json!({"type":"task_complete","error":{"message":"Model request failed"}}),
+                StatusEvent::Error {
+                    message: "Model request failed".into(),
+                },
+            ),
+            (
+                "event_msg",
+                serde_json::json!({"type":"turn_aborted"}),
+                StatusEvent::Stopped {
+                    response: None,
+                    interrupted: true,
+                },
+            ),
+        ];
+        for (index, (kind, payload, expected)) in cases.into_iter().enumerate() {
+            let at = datetime!(2026-10-01 05:00:00 UTC)
+                + time::Duration::seconds(i64::try_from(index).unwrap());
+            lines.push(serde_json::json!({"timestamp":at.format(&time::format_description::well_known::Rfc3339).unwrap(),"type":kind,"payload":payload}).to_string());
+            let path = write_rollout(dir.path(), "lifecycle", &lines);
+            assert_eq!(
+                latest_status(&path),
+                Some(Status {
+                    at,
+                    event: expected
+                })
+            );
+        }
+        let path = write_rollout(dir.path(), "lifecycle", &lines);
+        let before = latest_status(&path);
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{{broken tail"
+        )
+        .unwrap();
+        assert_eq!(latest_status(&path), before);
+    }
+
+    #[test]
+    fn locate_resumed_uuid_session_outside_recent_date_window() {
+        let root = tempdir().unwrap();
+        let sid = "01a0ddac-d547-7ef1-a41a-f6b5fa5c2ded";
+        let day = root.path().join("2026/09/26");
+        let path = write_rollout(&day, sid, &[]);
+        assert_eq!(
+            locate_rollout(root.path(), sid, datetime!(2026-10-01 05:00:00 UTC), 1),
+            Some(path)
+        );
+    }
+
+    #[test]
     fn final_response_ignores_commentary_and_previous_turns() {
         let dir = tempdir().unwrap();
         let final_line = serde_json::json!({"type":"response_item", "payload":{
@@ -369,6 +600,8 @@ mod tests {
         );
         for boundary in [
             serde_json::json!({"type":"event_msg", "payload":{"type":"task_started"}}),
+            serde_json::json!({"type":"event_msg", "payload":{"type":"turn_aborted"}}),
+            serde_json::json!({"type":"event_msg", "payload":{"type":"task_complete","error":{"message":"Capacity"}}}),
             serde_json::json!({"type":"event_msg", "payload":{"type":"user_message"}}),
             serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"user"}}),
         ] {
@@ -424,20 +657,71 @@ mod tests {
     }
 
     #[test]
-    fn window_saturation_marks_reached_without_reached_type() {
-        // 100% on the 5h window with rate_limit_reached_type still null —
-        // codex rarely sets the explicit field, so saturation must suffice.
+    fn window_saturation_does_not_infer_a_blocked_turn() {
+        // 100% is telemetry; only an explicit blocked signal changes state.
         let five = parse_line(&rate_limit_line(100.0, 46.0, "null")).unwrap();
-        assert_eq!(five.reached, Some(RateLimitScope::FiveHour));
+        assert_eq!(five.reached, None);
         let seven = parse_line(&rate_limit_line(80.0, 100.0, "null")).unwrap();
-        assert_eq!(seven.reached, Some(RateLimitScope::SevenDay));
+        assert_eq!(seven.reached, None);
         // 99% is not yet capped.
         let under = parse_line(&rate_limit_line(99.0, 99.0, "null")).unwrap();
         assert!(under.reached.is_none());
     }
 
-    /// Credit-plan line: windows null, `credits.has_credits:false` → capped.
-    /// This is the real shape seen on a credit-exhausted `pro` account.
+    #[test]
+    fn weekly_primary_uses_duration_without_inferring_a_block() {
+        // Codex 0.159.2: a weekly primary window with spendable credits.
+        let mut record = serde_json::json!({"type":"event_msg", "payload":{
+            "type":"token_count", "rate_limits":{
+                "primary":{"used_percent":100.0,"window_minutes":10080,"resets_at":1_791_269_103},
+                "secondary":null,
+                "credits":{"has_credits":true,"unlimited":false,"balance":"60000"},
+                "rate_limit_reached_type":null
+            }
+        }});
+        let reading = parse_line(&record.to_string()).unwrap();
+        assert!(reading.five_hour.is_none());
+        assert!((reading.seven_day.unwrap().used_percent - 100.0).abs() < f32::EPSILON);
+        assert_eq!(reading.reached, None);
+
+        let limits = &mut record["payload"]["rate_limits"];
+        limits["credits"]["has_credits"] = false.into();
+        assert_eq!(parse_line(&record.to_string()).unwrap().reached, None);
+        record["payload"]["rate_limits"]["credits"]["unlimited"] = true.into();
+        assert_eq!(parse_line(&record.to_string()).unwrap().reached, None);
+        record["payload"]["rate_limits"]["rate_limit_reached_type"] = "primary".into();
+        assert_eq!(
+            parse_line(&record.to_string()).unwrap().reached,
+            Some(RateLimitScope::SevenDay),
+            "only explicit blocks change lifecycle state"
+        );
+    }
+
+    #[test]
+    fn window_duration_overrides_position_without_guessing_unknown_scopes() {
+        for (minutes, expected) in [
+            (300, RateLimitScope::FiveHour),
+            (10080, RateLimitScope::SevenDay),
+            (60, RateLimitScope::Unknown),
+        ] {
+            let record = serde_json::json!({"payload":{"rate_limits":{
+                "primary":null,
+                "secondary":{"used_percent":100.0,"window_minutes":minutes},
+                "rate_limit_reached_type":"secondary"
+            }}});
+            assert_eq!(
+                parse_line(&record.to_string()).unwrap().reached,
+                Some(expected)
+            );
+        }
+        let legacy =
+            parse_line(r#"{"payload":{"rate_limits":{"primary":{"used_percent":100.0}}}}"#)
+                .unwrap();
+        assert!((legacy.five_hour.unwrap().used_percent - 100.0).abs() < f32::EPSILON);
+        assert_eq!(legacy.reached, None);
+    }
+
+    /// Credit telemetry is independent of the active plan/model quota.
     fn credit_line(has_credits: bool, unlimited: bool) -> String {
         format!(
             r#"{{"timestamp":"2026-06-12T06:26:08.491Z","type":"event_msg","payload":{{"type":"token_count","info":{{}},"rate_limits":{{"limit_id":"premium","limit_name":null,"primary":null,"secondary":null,"credits":{{"has_credits":{has_credits},"unlimited":{unlimited},"balance":"0"}},"individual_limit":null,"plan_type":"pro","rate_limit_reached_type":null}}}}}}"#
@@ -445,10 +729,10 @@ mod tests {
     }
 
     #[test]
-    fn credit_exhaustion_marks_reached() {
+    fn credit_exhaustion_does_not_infer_a_blocked_turn() {
         let exhausted = parse_line(&credit_line(false, false)).unwrap();
         assert!(exhausted.five_hour.is_none() && exhausted.seven_day.is_none());
-        assert_eq!(exhausted.reached, Some(RateLimitScope::Unknown));
+        assert_eq!(exhausted.reached, None);
 
         // Has credits, or unlimited → not capped.
         assert!(parse_line(&credit_line(true, false))
@@ -463,9 +747,7 @@ mod tests {
 
     #[test]
     fn has_credits_false_with_live_window_is_not_capped() {
-        // The window-plan account can carry credits.has_credits:false while a
-        // window still has quota (real: ~849 such records on disk). The
-        // "both windows null" guard must keep this from reading as a cap.
+        // Credit availability cannot establish whether plan quota is blocked.
         let line = r#"{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":40.0,"window_minutes":300,"resets_at":1781262859},"secondary":{"used_percent":50.0,"window_minutes":10080,"resets_at":1781745469},"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"rate_limit_reached_type":null}}}"#;
         let rl = parse_line(line).unwrap();
         assert!(rl.reached.is_none());

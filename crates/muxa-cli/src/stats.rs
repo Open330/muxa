@@ -19,14 +19,124 @@ use crate::theme::{self, CliTheme, TableTone, ThemeArg};
 use crate::time_range::TimeRange;
 use crate::{terminal_width, truncate_cell, use_colors};
 
+mod timeline;
+
+/// Options every `muxa stats` view shares. They are global, so they read the
+/// same before or after a subcommand: `stats --since week report` is
+/// `stats report --since week`.
+#[derive(Debug, clap::Args)]
+pub struct Window {
+    /// Time window to include: today, yesterday, week, month, last-week, last-month, 24h, 7d, RFC3339 timestamp, or all.
+    #[arg(long, default_value = "7d", global = true)]
+    pub since: String,
+
+    /// One-shot visual theme override for table output.
+    #[arg(long, value_enum, global = true)]
+    pub theme: Option<ThemeArg>,
+}
+
+/// `muxa stats`: the summary by default, or one of the other views of the
+/// same retained history.
+#[derive(Debug, clap::Args)]
+pub struct StatsCommand {
+    #[command(subcommand)]
+    action: Option<StatsCmd>,
+
+    #[command(flatten)]
+    window: Window,
+
+    #[command(flatten)]
+    summary: Args,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum StatsCmd {
+    /// Every breakdown (day, project, agent, session) as ACT/WACT tables,
+    /// or as JSON/Markdown for export.
+    Report(ReportArgs),
+    /// Query raw activity ledger intervals.
+    Activity(crate::activity_query::Args),
+}
+
+impl StatsCommand {
+    #[cfg(test)]
+    pub(crate) fn theme(&self) -> Option<ThemeArg> {
+        self.window.theme
+    }
+
+    #[cfg(test)]
+    pub(crate) fn action(&self) -> Option<&StatsCmd> {
+        self.action.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn since(&self) -> &str {
+        &self.window.since
+    }
+}
+
+/// `muxa report`, the former name of `muxa stats report`.
+#[derive(Debug, clap::Args)]
+pub struct ReportInvocation {
+    #[command(flatten)]
+    pub window: Window,
+
+    #[command(flatten)]
+    pub args: ReportArgs,
+}
+
+/// clap silently drops summary-only flags given before a subcommand
+/// (`stats --graph report`), so refuse them instead of ignoring them.
+pub(crate) fn check_flag_placement(
+    command: &mut clap::Command,
+    matches: &clap::ArgMatches,
+) -> Result<(), clap::Error> {
+    let Some(("stats", stats_matches)) = matches.subcommand() else {
+        return Ok(());
+    };
+    let Some((view, _)) = stats_matches.subcommand() else {
+        return Ok(());
+    };
+    let stats = command
+        .find_subcommand("stats")
+        .expect("`stats` is a subcommand");
+    let misplaced: Vec<String> = stats
+        .get_arguments()
+        .filter(|arg| !arg.is_global_set())
+        .filter(|arg| {
+            stats_matches.value_source(arg.get_id().as_str())
+                == Some(clap::parser::ValueSource::CommandLine)
+        })
+        .map(|arg| format!("--{}", arg.get_long().unwrap_or(arg.get_id().as_str())))
+        .collect();
+    if misplaced.is_empty() {
+        return Ok(());
+    }
+    Err(command.error(
+        clap::error::ErrorKind::ArgumentConflict,
+        format!(
+            "{} belongs to the `muxa stats` summary, not `muxa stats {view}`; \
+             put `{view}` options after `{view}`",
+            misplaced.join(", ")
+        ),
+    ))
+}
+
+/// Dispatch `muxa stats` to the summary or the chosen view.
+pub async fn run_command(client: &Client, cfg: &Config, command: StatsCommand) -> Result<()> {
+    match command.action {
+        None => run(client, cfg, &command.window, command.summary).await,
+        Some(StatsCmd::Report(args)) => run_report(client, cfg, &command.window, args).await,
+        Some(StatsCmd::Activity(args)) => {
+            crate::activity_query::run(cfg, &command.window, args).await
+        }
+    }
+}
+
 #[derive(Debug, clap::Args)]
 // CLI flags are independent toggles, not a state machine to fold into an enum.
 #[allow(clippy::struct_excessive_bools)]
 pub struct Args {
-    /// Time window to include: today, yesterday, week, month, last-week, last-month, 24h, 7d, RFC3339 timestamp, or all.
-    #[arg(long, default_value = "7d")]
-    since: String,
-
     /// Dimension used for the row breakdown.
     #[arg(long, value_enum, default_value_t = GroupBy::Day)]
     group_by: GroupBy,
@@ -38,6 +148,31 @@ pub struct Args {
     /// Render only the WACT time graph. Buckets adapt to the selected range.
     #[arg(long, default_value_t = false)]
     graph: bool,
+
+    /// Render a Gantt timeline of agent WORK per project (or `--group-by`
+    /// session/agent) on a real clock axis. `--limit` caps rows per day.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = ["graph", "json", "markdown", "format", "sort", "reverse"]
+    )]
+    timeline: bool,
+
+    /// Timeline layout: `day` stacks one block per day on an hour axis;
+    /// `range` gives each project one row across the whole range, so many
+    /// projects fit on one screen.
+    #[arg(long, value_enum, default_value = "day", requires = "timeline")]
+    layout: timeline::TimelineLayout,
+
+    /// Local hour window for the day layout, e.g. `9-18` or `9-24`.
+    /// Defaults to the span of recorded work.
+    #[arg(long, value_name = "START-END", value_parser = timeline::parse_hours, requires = "timeline")]
+    hours: Option<(u8, u8)>,
+
+    /// Timeline cell width in minutes; must divide a day (5, 10, 15, 30, 60,
+    /// 120, …). Defaults to the finest that fits the terminal.
+    #[arg(long, value_name = "MINUTES", value_parser = timeline::parse_cell, requires = "timeline")]
+    cell: Option<i64>,
 
     /// Shortcut for `--format json`. Overrides `--format`.
     #[arg(long, conflicts_with = "markdown")]
@@ -52,9 +187,10 @@ pub struct Args {
     limit: usize,
 
     /// Column to sort rows by: prompts, work, wait, err, tmux, human, think,
-    /// active, block, tok, words, sess, agents, last, or name.
-    #[arg(long, value_enum, default_value_t = SortKey::Prompts)]
-    sort: SortKey,
+    /// active, block, tok, words, sess, agents, last, or name. Defaults to
+    /// newest day first when grouping by day, and to prompts otherwise.
+    #[arg(long, value_enum)]
+    sort: Option<SortKey>,
 
     /// Reverse the sort order (numeric columns default to descending, name to ascending).
     #[arg(long, default_value_t = false)]
@@ -68,10 +204,6 @@ pub struct Args {
     #[arg(long = "exclude-session", value_name = "GLOB", value_delimiter = ',')]
     exclude_session: Vec<String>,
 
-    /// One-shot visual theme override for table output.
-    #[arg(long, value_enum)]
-    theme: Option<ThemeArg>,
-
     /// Print diagnostic table columns plus the full explanatory notes
     /// (methodology for THINK/ACTIVE, the retained-history window, ledger
     /// fallbacks). Without this, the table focuses on ACT/WACT and only
@@ -80,19 +212,8 @@ pub struct Args {
     verbose: bool,
 }
 
-impl Args {
-    #[cfg(test)]
-    pub(crate) fn theme(&self) -> Option<ThemeArg> {
-        self.theme
-    }
-}
-
 #[derive(Debug, clap::Args)]
 pub struct ReportArgs {
-    /// Time window to include: today, yesterday, week, month, last-week, last-month, 24h, 7d, RFC3339 timestamp, or all.
-    #[arg(long, default_value = "7d")]
-    since: String,
-
     /// Maximum rows per report section. Set 0 for all rows.
     #[arg(long, default_value_t = 10)]
     limit: usize,
@@ -112,10 +233,6 @@ pub struct ReportArgs {
     /// Exclude tmux session names or ids matching a glob. Repeat or comma-separate values.
     #[arg(long = "exclude-session", value_name = "GLOB", value_delimiter = ',')]
     exclude_session: Vec<String>,
-
-    /// One-shot visual theme override for table output.
-    #[arg(long, value_enum)]
-    theme: Option<ThemeArg>,
 
     /// Print diagnostic table columns plus the full explanatory notes
     /// (methodology for THINK/ACTIVE, the retained-history window, ledger
@@ -199,22 +316,31 @@ impl GroupBy {
     }
 }
 
-pub async fn run(client: &Client, cfg: &Config, args: Args) -> Result<()> {
+async fn run(client: &Client, cfg: &Config, window: &Window, args: Args) -> Result<()> {
     let exclusions = ScopeExclusions::new(args.exclude_pane.clone(), args.exclude_session.clone());
-    let data = load_data(client, cfg, &args.since, &exclusions).await?;
-    let doc = build_document(
-        &data,
-        args.group_by,
-        args.limit,
-        args.sort,
-        args.reverse,
-        args.graph,
-    );
+    let data = load_data(client, cfg, &window.since, &exclusions).await?;
+    if args.timeline {
+        let options = timeline::TimelineOptions {
+            group_by: args.group_by,
+            layout: args.layout,
+            hours: args.hours,
+            cell_minutes: args.cell,
+            limit: args.limit,
+        };
+        let theme = theme::for_config(cfg, window.theme, use_colors());
+        print!(
+            "{}",
+            timeline::render(&data, options, terminal_width(), theme)
+        );
+        return Ok(());
+    }
+    let (sort, reverse) = effective_sort(args.group_by, args.sort, args.reverse);
+    let doc = build_document(&data, args.group_by, args.limit, sort, reverse, args.graph);
     let format = OutputFormat::resolve(args.format, args.json, args.markdown);
     match format {
         OutputFormat::Table => render_table(
             &doc,
-            theme::for_config(cfg, args.theme, use_colors()),
+            theme::for_config(cfg, window.theme, use_colors()),
             args.verbose,
         ),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&doc)?),
@@ -252,13 +378,18 @@ async fn maybe_hint_orphans(client: &Client) {
         })
         .count();
     if orphans > 0 {
-        println!("\n{orphans} stale orphan agent row(s) with no pane — run `muxa prune` to clear (tmux sessions unaffected).");
+        println!("\n{orphans} stale orphan agent row(s) with no pane — run `muxa registry prune` to clear (tmux sessions unaffected).");
     }
 }
 
-pub async fn run_report(client: &Client, cfg: &Config, args: ReportArgs) -> Result<()> {
+pub async fn run_report(
+    client: &Client,
+    cfg: &Config,
+    window: &Window,
+    args: ReportArgs,
+) -> Result<()> {
     let exclusions = ScopeExclusions::new(args.exclude_pane.clone(), args.exclude_session.clone());
-    let data = load_data(client, cfg, &args.since, &exclusions).await?;
+    let data = load_data(client, cfg, &window.since, &exclusions).await?;
     let docs = [
         // Days read chronologically (the day-key string sorts by date), so a
         // report shows the shape of the week in order rather than ranked by
@@ -294,7 +425,7 @@ pub async fn run_report(client: &Client, cfg: &Config, args: ReportArgs) -> Resu
     match OutputFormat::resolve(OutputFormat::Table, args.json, args.markdown) {
         OutputFormat::Table => render_report_tables(
             &docs,
-            theme::for_config(cfg, args.theme, use_colors()),
+            theme::for_config(cfg, window.theme, use_colors()),
             args.verbose,
         ),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&docs)?),
@@ -893,15 +1024,21 @@ fn build_rows(
         if secs == 0 {
             continue;
         }
-        let key = agent_group_key(data, agent, group_by);
-        let acc = rows.entry(key).or_default();
-        add_state_secs(
-            agent.state,
-            secs,
-            &mut acc.working_secs,
-            &mut acc.waiting_secs,
-            &mut acc.error_secs,
-        );
+        let slices = if group_by == GroupBy::Day {
+            day_overlap_slices(data, agent.state_entered_at, data.now)
+        } else {
+            vec![(agent_group_key(data, agent, group_by), secs)]
+        };
+        for (key, secs) in slices {
+            let acc = rows.entry(key).or_default();
+            add_state_secs(
+                agent.state,
+                secs,
+                &mut acc.working_secs,
+                &mut acc.waiting_secs,
+                &mut acc.error_secs,
+            );
+        }
     }
 
     for agent in &data.agents {
@@ -969,6 +1106,16 @@ fn build_rows(
         .collect()
 }
 
+/// Day rows read as a calendar: with no `--sort`, newest day first (so
+/// `--limit` keeps the most recent days). Other groupings rank by prompts.
+fn effective_sort(group_by: GroupBy, sort: Option<SortKey>, reverse: bool) -> (SortKey, bool) {
+    match (sort, group_by) {
+        (Some(sort), _) => (sort, reverse),
+        (None, GroupBy::Day) => (SortKey::Name, !reverse),
+        (None, _) => (SortKey::Prompts, reverse),
+    }
+}
+
 fn sort_group_rows(rows: &mut [(String, GroupAccumulator)], sort: SortKey, reverse: bool) {
     rows.sort_by(|(a_key, a), (b_key, b)| {
         // Numeric columns default to descending (largest first); `name` defaults
@@ -1018,6 +1165,11 @@ fn add_activity_rows(
                 entry,
                 state_transition_overlap_secs(data, entry),
             ),
+            ActivityEntry::SessionForeground(entry) if group_by == GroupBy::Day => {
+                for (day, secs) in day_overlap_slices(data, entry.started_at, entry.ended_at) {
+                    rows.entry(day).or_default().foreground_secs += secs;
+                }
+            }
             ActivityEntry::SessionForeground(entry) => {
                 let secs = session_foreground_overlap_secs(data, entry);
                 if secs == 0 {
@@ -1642,19 +1794,66 @@ fn add_state_transition_row(
     if secs == 0 && !data.range.includes(entry.at) {
         return;
     }
-    let acc = rows
-        .entry(state_transition_group_key(data, entry, group_by))
-        .or_default();
-    add_state_secs(
-        entry.from,
-        secs,
-        &mut acc.working_secs,
-        &mut acc.waiting_secs,
-        &mut acc.error_secs,
-    );
-    if data.range.includes(entry.at) && is_attention_state(entry.to) {
-        acc.attention_events += 1;
+    let key = state_transition_group_key(data, entry, group_by);
+    if group_by == GroupBy::Day {
+        // A state held across midnight belongs to each day it covered, not
+        // all to the day it ended (an overnight wait once put 15h on a
+        // morning that was 10h old).
+        for (day, secs) in day_overlap_slices(data, transition_started_at(entry), entry.at) {
+            let acc = rows.entry(day).or_default();
+            add_state_secs(
+                entry.from,
+                secs,
+                &mut acc.working_secs,
+                &mut acc.waiting_secs,
+                &mut acc.error_secs,
+            );
+        }
+    } else {
+        let acc = rows.entry(key.clone()).or_default();
+        add_state_secs(
+            entry.from,
+            secs,
+            &mut acc.working_secs,
+            &mut acc.waiting_secs,
+            &mut acc.error_secs,
+        );
     }
+    if data.range.includes(entry.at) && is_attention_state(entry.to) {
+        rows.entry(key).or_default().attention_events += 1;
+    }
+}
+
+/// `[started_at, ended_at)` clipped to the report range as [`overlap_secs`]
+/// clips it, then split at the viewer's local midnights: one `(day, secs)`
+/// per calendar day the interval covers.
+fn day_overlap_slices(
+    data: &StatsData,
+    started_at: OffsetDateTime,
+    ended_at: OffsetDateTime,
+) -> Vec<(String, u64)> {
+    let start = data
+        .range
+        .since_at
+        .map_or(started_at, |since| started_at.max(since));
+    let end = ended_at.min(data.range.effective_end(data.now));
+    let offset = local_offset();
+    let mut slices = Vec::new();
+    let mut cursor = start;
+    while cursor < end {
+        let next_midnight = cursor
+            .to_offset(offset)
+            .date()
+            .next_day()
+            .map_or(end, |day| local_day_start(day, offset));
+        let slice_end = next_midnight.min(end);
+        let secs = u64::try_from((slice_end - cursor).whole_seconds()).unwrap_or(0);
+        if secs > 0 {
+            slices.push((format_day(cursor), secs));
+        }
+        cursor = slice_end;
+    }
+    slices
 }
 
 /// Historical records outlive tmux's view sessions. Fold only generated
@@ -1777,6 +1976,12 @@ fn add_open_session_foreground_rows(
         let Some(since) = activity.attached_since else {
             continue;
         };
+        if group_by == GroupBy::Day {
+            for (day, secs) in day_overlap_slices(data, since, data.now) {
+                rows.entry(day).or_default().foreground_secs += secs;
+            }
+            continue;
+        }
         let secs = overlap_secs(data, since, data.now);
         if secs == 0 {
             continue;
@@ -1791,10 +1996,15 @@ fn add_open_session_foreground_rows(
 }
 
 fn state_transition_overlap_secs(data: &StatsData, entry: &StateTransitionEntry) -> u64 {
-    let started_at = entry.state_entered_at.unwrap_or_else(|| {
+    overlap_secs(data, transition_started_at(entry), entry.at)
+}
+
+/// When the state a transition left began: `state_entered_at`, or `at` minus
+/// the recorded duration for ledger rows written before that field existed.
+fn transition_started_at(entry: &StateTransitionEntry) -> OffsetDateTime {
+    entry.state_entered_at.unwrap_or_else(|| {
         entry.at - time::Duration::seconds(i64::try_from(entry.duration_secs).unwrap_or(i64::MAX))
-    });
-    overlap_secs(data, started_at, entry.at)
+    })
 }
 
 fn session_foreground_overlap_secs(data: &StatsData, entry: &SessionForegroundEntry) -> u64 {
@@ -1950,10 +2160,7 @@ fn attention_intervals(data: &StatsData, group_by: GroupBy) -> Vec<AttentionInte
         if !is_attention_state(entry.from) {
             continue;
         }
-        let started_at = entry.state_entered_at.unwrap_or_else(|| {
-            entry.at
-                - time::Duration::seconds(i64::try_from(entry.duration_secs).unwrap_or(i64::MAX))
-        });
+        let started_at = transition_started_at(entry);
         let session_name = entry.session_name.clone().or_else(|| {
             entry
                 .pane
@@ -2275,7 +2482,7 @@ fn render_table(doc: &StatsDocument, theme: CliTheme, verbose: bool) {
     print_notes(&doc.notes, verbose, "muxa stats --verbose");
 }
 
-/// Table output for `muxa report`: the same range header and per-section tables
+/// Table output for `muxa stats report`: the same range header and per-section tables
 /// as `stats`, one table per group-by dimension. Totals/notes are identical
 /// across the documents (they aggregate the same data), so the range header and
 /// notes are printed once, from the first document.
@@ -2283,7 +2490,7 @@ fn render_report_tables(docs: &[StatsDocument], theme: CliTheme, verbose: bool) 
     let Some(first) = docs.first() else {
         return;
     };
-    print_range_header("muxa report", first);
+    print_range_header("muxa stats report", first);
     println!();
 
     let terminal_width = terminal_width();
@@ -2305,7 +2512,7 @@ fn render_report_tables(docs: &[StatsDocument], theme: CliTheme, verbose: bool) 
         println!("{}", compaction_hint());
     }
 
-    print_notes(&first.notes, verbose, "muxa report --verbose");
+    print_notes(&first.notes, verbose, "muxa stats report --verbose");
 }
 
 fn print_range_header(title: &str, doc: &StatsDocument) {
@@ -2924,7 +3131,7 @@ fn render_markdown_report(docs: &[StatsDocument]) -> String {
     let Some(first) = docs.first() else {
         return out;
     };
-    push_markdown_overview(&mut out, "muxa report", first);
+    push_markdown_overview(&mut out, "muxa stats report", first);
     for doc in docs {
         push_markdown_rows(
             &mut out,
@@ -3158,13 +3365,33 @@ fn format_duration(total_secs: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use muxa::event::AgentKind;
     use muxa::{
         HumanInteractionEntry, HumanInteractionInput, HumanInteractionKind, StateTransitionInput,
     };
     use time::macros::datetime;
+
+    #[test]
+    fn day_rows_default_to_newest_first_and_explicit_sorts_win() {
+        assert_eq!(
+            effective_sort(GroupBy::Day, None, false),
+            (SortKey::Name, true)
+        );
+        assert_eq!(
+            effective_sort(GroupBy::Day, None, true),
+            (SortKey::Name, false)
+        );
+        assert_eq!(
+            effective_sort(GroupBy::Project, None, false),
+            (SortKey::Prompts, false)
+        );
+        assert_eq!(
+            effective_sort(GroupBy::Day, Some(SortKey::Prompts), false),
+            (SortKey::Prompts, false)
+        );
+    }
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -3233,7 +3460,11 @@ mod tests {
         )
     }
 
-    fn live_agent(state: AgentState, state_entered_at: OffsetDateTime, cwd: Option<&str>) -> Agent {
+    pub(super) fn live_agent(
+        state: AgentState,
+        state_entered_at: OffsetDateTime,
+        cwd: Option<&str>,
+    ) -> Agent {
         Agent {
             tmux_socket: None,
             tmux_session: None,
@@ -3268,7 +3499,7 @@ mod tests {
         }
     }
 
-    fn data(prompts: Vec<HistoryEntry>) -> StatsData {
+    pub(super) fn data(prompts: Vec<HistoryEntry>) -> StatsData {
         StatsData {
             now: datetime!(2026-05-30 12:00:00 UTC),
             range: TimeRange {
@@ -3495,6 +3726,45 @@ mod tests {
             })),
         ];
         d
+    }
+
+    /// An agent waiting from 22:00 to 03:00 local time waited two hours on
+    /// the first day and three on the second, not five on the second.
+    #[test]
+    fn a_state_held_across_midnight_is_split_between_its_days() {
+        let offset = local_offset();
+        let day_one = local_day_start(datetime!(2026-05-30 00:00:00 UTC).date(), offset);
+        let entered = day_one + time::Duration::hours(22);
+        let ended = day_one + time::Duration::hours(27);
+        let mut d = data(Vec::new());
+        d.now = day_one + time::Duration::days(3);
+        d.range = TimeRange {
+            label: "bounded".into(),
+            since_at: Some(day_one),
+            until_at: Some(day_one + time::Duration::days(2)),
+        };
+        d.activity_entries = vec![ActivityEntry::StateTransition(StateTransitionEntry::new(
+            StateTransitionInput {
+                at: ended,
+                kind: AgentKind::ClaudeCode,
+                session_id: "overnight".into(),
+                pane: Some("%1".into()),
+                session_name: Some("main".into()),
+                cwd: None,
+                from: AgentState::WaitingInput,
+                to: AgentState::Stopped,
+                state_entered_at: Some(entered),
+            },
+        ))];
+        let rows = build_rows(&d, GroupBy::Day, 0, SortKey::Name, false);
+        let waiting = |day: OffsetDateTime| {
+            rows.iter()
+                .find(|row| row.key == format_day(day))
+                .map_or(0, |row| row.waiting_secs)
+        };
+        assert_eq!(waiting(entered), 2 * 3600, "{rows:?}");
+        assert_eq!(waiting(ended), 3 * 3600, "{rows:?}");
+        assert_eq!(build_totals(&d).waiting_secs, 5 * 3600);
     }
 
     #[test]

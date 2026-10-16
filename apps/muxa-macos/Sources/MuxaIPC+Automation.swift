@@ -157,15 +157,17 @@ enum MuxaAutomationAction: Hashable, Sendable, Codable {
     case sendPrompt
     case notify
     case interrupt
+    case pressEnter
     case other(String)
 
-    static let pickable: [MuxaAutomationAction] = [.sendPrompt, .notify, .interrupt]
+    static let pickable: [MuxaAutomationAction] = [.sendPrompt, .notify, .interrupt, .pressEnter]
 
     init(rawValue: String) {
         switch rawValue {
         case "send_prompt": self = .sendPrompt
         case "notify": self = .notify
         case "interrupt": self = .interrupt
+        case "press_enter": self = .pressEnter
         default: self = .other(rawValue)
         }
     }
@@ -175,6 +177,7 @@ enum MuxaAutomationAction: Hashable, Sendable, Codable {
         case .sendPrompt: "send_prompt"
         case .notify: "notify"
         case .interrupt: "interrupt"
+        case .pressEnter: "press_enter"
         case .other(let raw): raw
         }
     }
@@ -265,6 +268,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
     var work: String?
     var pane: String?
     var host: String?
+    var notification: String?
     var scope: [String]
     /// `for` — how long the agent must have been idle (`idle_for` only).
     var idleFor: String?
@@ -311,6 +315,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         work: String? = nil,
         pane: String? = nil,
         host: String? = nil,
+        notification: String? = nil,
         scope: [String] = [],
         idleFor: String? = nil,
         wait: String? = nil,
@@ -334,6 +339,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         self.work = work
         self.pane = pane
         self.host = host
+        self.notification = notification
         self.scope = scope
         self.idleFor = idleFor
         self.text = text
@@ -353,7 +359,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case name, on, enabled, action
-        case agent, workspace, work, pane, host, scope
+        case agent, workspace, work, pane, host, notification, scope
         case text, message, submit
         case wait, fallback, jitter, cooldown, filters
         case idleFor = "for"
@@ -375,6 +381,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         work = try values.decodeIfPresent(String.self, forKey: .work)
         pane = try values.decodeIfPresent(String.self, forKey: .pane)
         host = try values.decodeIfPresent(String.self, forKey: .host)
+        notification = try values.decodeIfPresent(String.self, forKey: .notification)
         scope = try values.decodeIfPresent([String].self, forKey: .scope) ?? []
         idleFor = try values.decodeIfPresent(String.self, forKey: .idleFor)
         text = try values.decodeIfPresent(String.self, forKey: .text)
@@ -411,6 +418,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         Self.put(work, key: "work", in: &object)
         Self.put(pane, key: "pane", in: &object)
         Self.put(host, key: "host", in: &object)
+        if let notification { object["notification"] = notification }
         if on.requiresDuration { Self.put(idleFor, key: "for", in: &object) }
         Self.put(wait, key: "wait", in: &object)
         if on.supportsResetTiming { Self.put(fallback, key: "fallback", in: &object) }
@@ -444,6 +452,9 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         ] {
             guard let value = Self.trimmed(value) else { continue }
             lines.append("\(key) = \(Self.tomlString(value))")
+        }
+        if let notification {
+            lines.append("notification = \(Self.tomlString(notification))")
         }
         if on.requiresDuration, let value = Self.trimmed(idleFor) {
             lines.append("for = \(Self.tomlString(value))")

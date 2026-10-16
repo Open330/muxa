@@ -3,6 +3,25 @@ import Darwin
 import Testing
 @testable import Muxa
 
+@Test func automationEditingPreservesNotificationFilter() throws {
+    let pattern = #"(?i)^Selected model is at capacity\. "#
+    let source: [String: Any] = [
+        "name": "resume-codex-capacity", "on": "error", "action": "send_prompt",
+        "agent": ["codex"], "text": "continue", "notification": pattern,
+    ]
+    let data = try JSONSerialization.data(withJSONObject: source)
+    let rule = try JSONDecoder().decode(MuxaAutomationRule.self, from: data)
+    var draft = MuxaAutomationRuleDraft.draft(editing: rule)
+    draft.wait = "5m"
+    let wire = draft.rule.wireObject
+    #expect(wire["notification"] as? String == pattern)
+    #expect(wire["wait"] as? String == "5m")
+    #expect(draft.rule.tomlSnippet.contains("notification = \(MuxaAutomationRule.tomlString(pattern))\n"))
+    let saved = try JSONSerialization.data(withJSONObject: wire)
+    let reloaded = try JSONDecoder().decode(MuxaAutomationRule.self, from: saved)
+    #expect(reloaded.wireObject["notification"] as? String == pattern)
+}
+
 @Test func automationAskConditionDefaultsAndRoundTrips() throws {
     let data = Data(#"{"name":"judge","on":"error","action":"interrupt","ask_condition":{"prompt":"  Is the task done?\nQuote: \"yes\"  ","provider":"team-openai"}}"#.utf8)
     let rule = try JSONDecoder().decode(MuxaAutomationRule.self, from: data)
@@ -1649,7 +1668,7 @@ struct MuxaIPCTests {
     @Test @MainActor
     func activityBarSeparatesOutcomesTopologyInboxAndShells() {
         let model = AppModel()
-        #expect(MuxaSidebarMode.allCases == [.work, .watch, .inbox, .shells])
+        #expect(MuxaSidebarMode.allCases == [.work, .watch, .inbox, .ask, .shells, .files])
 
         model.select(.host("rtzr"))
 
@@ -1679,8 +1698,9 @@ struct MuxaIPCTests {
 
         model.select(.ask)
 
+        // Its own container: a question to a provider is not agent mail.
         #expect(model.sidebarSelection == .ask)
-        #expect(model.sidebarMode == .inbox)
+        #expect(model.sidebarMode == .ask)
     }
 
     @Test @MainActor
@@ -1766,14 +1786,16 @@ private final class InboxMailboxProbe: @unchecked Sendable {
     private let lock = NSLock()
     private let base = IPCProbe()
     private var sentByHost: [String: [[String: Any]]] = [:]
+    private var incomingByHost: [String: [[String: Any]]] = [:]
     private var failureByHost: [String: String] = [:]
     private var mailboxReads: [String] = []
     private var getReads: [String] = []
 
-    func setMailbox(host: String, sent: [[String: Any]]) {
+    func setMailbox(host: String, sent: [[String: Any]], incoming: [[String: Any]] = []) {
         lock.lock()
         defer { lock.unlock() }
         sentByHost[host] = sent
+        incomingByHost[host] = incoming
     }
 
     /// `nil` restores a healthy host.
@@ -1826,7 +1848,7 @@ private final class InboxMailboxProbe: @unchecked Sendable {
                 "ok": true,
                 "fleet_result": [
                     "accepted": true,
-                    "collaboration_incoming": [],
+                    "collaboration_incoming": incomingByHost[host] ?? [],
                     "collaboration_sent": sentByHost[host] ?? [],
                 ],
             ])
@@ -2161,7 +2183,7 @@ private func alpha(_ color: Color?) -> Double? {
     let runs = captureRuns(rendered)
     #expect(runs.map(\.text) == ["red", " plain", "bold", "cyan", "default"])
 
-    #expect(srgb(runs[0].foreground) == [0xAC, 0x41, 0x42])
+    #expect(srgb(runs[0].foreground) == [0xD9, 0x67, 0x5F])
     #expect(runs[0].background == nil)
     #expect(runs[0].intent == nil)
 
@@ -2169,18 +2191,19 @@ private func alpha(_ color: Color?) -> Double? {
     #expect(runs[1].background == nil)
 
     #expect(runs[2].intent?.contains(.stronglyEmphasized) == true)
-    #expect(srgb(runs[2].background) == [0x7E, 0x8E, 0x50])
-    #expect(runs[2].foreground == nil)
+    #expect(srgb(runs[2].background) == [0x98, 0xA9, 0x64])
+    // The default foreground is 1.7:1 on green, below the minimum contrast.
+    #expect(srgb(runs[2].foreground) == [0, 0, 0])
 
     #expect(runs[3].intent == nil)
-    #expect(srgb(runs[3].foreground) == [0x7D, 0xD5, 0xCF])
-    #expect(srgb(runs[3].background) == [0x7E, 0x8E, 0x50])
+    #expect(srgb(runs[3].foreground) == [0, 0, 0])
+    #expect(srgb(runs[3].background) == [0x98, 0xA9, 0x64])
 
     #expect(runs[4].foreground == nil)
     #expect(runs[4].background == nil)
 
     let light = captureRuns(TerminalCaptureFormatter(palette: .light).render(text: "\u{1B}[91mbright\u{1B}[m"))
-    #expect(srgb(light[0].foreground) == [0xF0, 0x3E, 0x31])
+    #expect(srgb(light[0].foreground) == [0xC4, 0x27, 0x1B])
 }
 
 @Test func terminalCaptureFormatterSupports256AndTruecolor() {
@@ -2195,11 +2218,13 @@ private func alpha(_ color: Color?) -> Double? {
 
     #expect(srgb(runs[0].foreground) == [255, 0, 0])
     #expect(runs[0].background == nil)
-    #expect(srgb(runs[1].foreground) == [255, 0, 0])
+    // Red on mid gray falls below the minimum contrast and takes black, as
+    // Ghostty draws it; the dark truecolors below still sit on that gray.
+    #expect(srgb(runs[1].foreground) == [0, 0, 0])
     #expect(srgb(runs[1].background) == [128, 128, 128])
     #expect(srgb(runs[2].foreground) == [10, 20, 30])
     #expect(srgb(runs[3].foreground) == [40, 50, 60])
-    #expect(srgb(runs[4].foreground) == [0x6C, 0x99, 0xBB])
+    #expect(srgb(runs[4].foreground) == [0x7E, 0xA6, 0xC8])
     // Malformed extended colors leave the style untouched.
     #expect(runs[5].foreground == nil)
     #expect(runs[5].background == nil)
@@ -2216,7 +2241,7 @@ private func alpha(_ color: Color?) -> Double? {
     #expect(runs.map(\.text) == ["abcdefg", "h"])
     #expect(runs[0].foreground == nil)
     // An ESC inside a CSI aborts it and starts the next sequence.
-    #expect(srgb(runs[1].foreground) == [0x7E, 0x8E, 0x50])
+    #expect(srgb(runs[1].foreground) == [0x98, 0xA9, 0x64])
 }
 
 @Test func terminalCaptureFormatterDropsOSCAndOtherStrings() {
@@ -2248,7 +2273,7 @@ private func alpha(_ color: Color?) -> Double? {
     #expect(srgb(runs[0].background) == [0xD0, 0xD0, 0xD0])
 
     #expect(srgb(runs[1].foreground) == [0xD0, 0xD0, 0xD0])
-    #expect(alpha(runs[1].foreground).map { abs($0 - 0.6) < 0.01 } == true)
+    #expect(alpha(runs[1].foreground).map { abs($0 - TerminalCapturePalette.faintOpacity) < 0.01 } == true)
     #expect(runs[1].background == nil)
 
     #expect(runs[2].underline == .single)
@@ -2265,7 +2290,7 @@ private func alpha(_ color: Color?) -> Double? {
     #expect(runs[6].foreground == nil)
 
     #expect(srgb(runs[7].foreground) == [0x21, 0x21, 0x21])
-    #expect(srgb(runs[7].background) == [0xAC, 0x41, 0x42])
+    #expect(srgb(runs[7].background) == [0xD9, 0x67, 0x5F])
 }
 
 @Test func terminalCaptureFormatterSkipsLeadingPartialCharacter() {
@@ -2304,6 +2329,69 @@ private func alpha(_ color: Color?) -> Double? {
     #expect(srgb(TerminalCapturePalette.dark.color(for: .indexed(255))) == [238, 238, 238])
     #expect(srgb(TerminalCapturePalette.dark.color(for: .indexed(21))) == [0, 0, 255])
     #expect(srgb(TerminalCapturePalette.light.color(for: .rgb(9, 8, 7))) == [9, 8, 7])
+}
+
+/// Agent CLIs draw secondary text in bright black and accents in the other
+/// ANSI colors; every one must stay readable on its own background.
+@Test func terminalCapturePaletteKeepsAnsiColorsReadable() {
+    for palette in [TerminalCapturePalette.dark, .light] {
+        for index in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14] {
+            #expect(palette.ansi[index].contrast(with: palette.background) >= 4.5, "ANSI \(index)")
+        }
+        #expect(palette.foreground.contrast(with: palette.background) >= 7)
+    }
+}
+
+@Test func terminalRGBEnsuresContrastLikeGhostty() {
+    let dark = TerminalRGB(hex: 0x212121)
+    let light = TerminalRGB(hex: 0xF7F7F7)
+    #expect(TerminalRGB(hex: 0x303030).ensuringContrast(3, against: dark) == .white)
+    #expect(TerminalRGB(hex: 0xEEEEEE).ensuringContrast(3, against: light) == .black)
+    #expect(TerminalRGB(hex: 0x8C8C8C).ensuringContrast(3, against: dark) == TerminalRGB(hex: 0x8C8C8C))
+    #expect(abs(TerminalRGB.black.contrast(with: .white) - 21) < 0.01)
+    #expect(TerminalRGB(hex: 0x0A0B0C).hexString == "0A0B0C")
+}
+
+@Test func terminalAppearanceThemeCarriesThePalette() {
+    let rendered = MuxaTerminalAppearance.themeConfiguration(.dark).rendered
+    #expect(rendered.contains("background = 212121"))
+    #expect(rendered.contains("palette = 8=#8C8C8C"))
+    #expect(rendered.contains("palette = 15=#F5F5F5"))
+    let configuration = MuxaTerminalAppearance.configuration.rendered
+    #expect(configuration.contains("minimum-contrast = 3"))
+    #expect(configuration.contains("font-size = 13"))
+}
+
+@Test @MainActor func terminalAppearanceLoadsCleanly() {
+    #expect(MuxaTerminalAppearance.loadIssue() == nil)
+}
+
+@Test func terminalCaptureTrimsTrailingBlankRows() {
+    let trim = { (text: String) in
+        String(TerminalCaptureFormatter.trimmingTrailingBlankLines(AttributedString(text)).characters)
+    }
+    #expect(trim("$ ls\nfile  \n\n   \n\n") == "$ ls\nfile  ")
+    #expect(trim("  indented\nlast") == "  indented\nlast")
+    #expect(trim("\n\n") == "\n\n")
+}
+
+@Test func terminalPreviewCountsCellsLikeATerminal() {
+    #expect(TerminalPreviewFont.columns(in: "") == 0)
+    #expect(TerminalPreviewFont.columns(in: "abc\nabcdef\n") == 6)
+    // Hangul and CJK take two cells; a tab advances to the next stop.
+    #expect(TerminalPreviewFont.columns(in: "한글 ok") == 7)
+    #expect(TerminalPreviewFont.columns(in: "ab\tc") == 9)
+    #expect(TerminalPreviewFont.columns(in: "e\u{301}") == 1)
+}
+
+@Test @MainActor func terminalPreviewFitsWidePanesDownToAFloor() {
+    let full = TerminalPreviewFont.fitted(columns: 10, width: 2000)
+    #expect(full.pointSize == TerminalPreviewFont.pointSize)
+    let narrow = TerminalPreviewFont.fitted(columns: 400, width: 300)
+    #expect(narrow.pointSize == TerminalPreviewFont.minimumFittedPointSize)
+    let between = TerminalPreviewFont.fitted(columns: 120, width: 120 * 11 * 0.6)
+    #expect(between.pointSize > TerminalPreviewFont.minimumFittedPointSize)
+    #expect(between.pointSize < TerminalPreviewFont.pointSize)
 }
 
 // MARK: - Explore tree highlight (workbench peer)
@@ -2402,21 +2490,50 @@ func workbenchLaunchReactivationKeepsRestoredPreview() throws {
 
 // MARK: - Onboarding (peer: onboarding)
 
-@Test func onboardingShowsForFirstLaunchAndOlderRecordedVersions() {
-    #expect(OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: nil))
-    #expect(OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: ""))
-    #expect(OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: "0.1.0"))
-    #expect(OnboardingPreferences.shouldPresent(currentVersion: "0.1.10", completedVersion: "0.1.9"))
-    #expect(OnboardingPreferences.shouldPresent(currentVersion: "1.0", completedVersion: "0.9.9"))
+/// One release with highlights, so the decision does not depend on the
+/// shipped list.
+private let onboardingTestReleases = [
+    MuxaWhatsNew.Release(version: "0.2.0", highlights: [
+        MuxaWhatsNew.Highlight(systemImage: "star", title: "New", detail: "Something new"),
+    ]),
+]
+
+@Test func onboardingShowsTheFullGuideOnlyOnFirstLaunch() {
+    #expect(OnboardingPreferences.launchPresentation(
+        currentVersion: "0.2.0", completedVersion: nil, releases: onboardingTestReleases
+    ) == .welcomeGuide)
+    #expect(OnboardingPreferences.launchPresentation(
+        currentVersion: "0.2.0", completedVersion: " ", releases: onboardingTestReleases
+    ) == .welcomeGuide)
+    // First run with no highlights at all is still the full guide.
+    #expect(OnboardingPreferences.launchPresentation(
+        currentVersion: "0.2.0", completedVersion: nil, releases: []
+    ) == .welcomeGuide)
+}
+
+@Test func onboardingShowsWhatsNewAfterAnUpgradeWithHighlights() {
+    #expect(OnboardingPreferences.launchPresentation(
+        currentVersion: "0.2.0", completedVersion: "0.1.0", releases: onboardingTestReleases
+    ) == .whatsNew(version: "0.2.0"))
+    // A patch release without its own entry still surfaces the one skipped.
+    #expect(OnboardingPreferences.launchPresentation(
+        currentVersion: "0.2.1", completedVersion: "0.1.9", releases: onboardingTestReleases
+    ) == .whatsNew(version: "0.2.1"))
+    // Upgrading past a release without highlights stays quiet.
+    #expect(OnboardingPreferences.launchPresentation(
+        currentVersion: "0.2.1", completedVersion: "0.2.0", releases: onboardingTestReleases
+    ) == nil)
 }
 
 @Test func onboardingStaysQuietForEqualOrNewerRecordedVersions() {
-    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: "0.2.0"))
-    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: "0.2"))
-    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.2", completedVersion: "0.2.0"))
-    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.1.9", completedVersion: "0.1.10"))
-    #expect(!OnboardingPreferences.shouldPresent(currentVersion: "0.2.0", completedVersion: "0.3.0-beta"))
+    let releases = onboardingTestReleases
+    #expect(OnboardingPreferences.launchPresentation(currentVersion: "0.2.0", completedVersion: "0.2.0", releases: releases) == nil)
+    #expect(OnboardingPreferences.launchPresentation(currentVersion: "0.2.0", completedVersion: "0.2", releases: releases) == nil)
+    #expect(OnboardingPreferences.launchPresentation(currentVersion: "0.2", completedVersion: "0.2.0", releases: releases) == nil)
+    #expect(OnboardingPreferences.launchPresentation(currentVersion: "0.1.9", completedVersion: "0.1.10", releases: releases) == nil)
+    #expect(OnboardingPreferences.launchPresentation(currentVersion: "0.2.0", completedVersion: "0.3.0-beta", releases: releases) == nil)
     #expect(OnboardingPreferences.compareVersions("0.1.0-beta", "0.1.0") == .orderedSame)
+    #expect(OnboardingPreferences.compareVersions("0.1.9", "0.1.10") == .orderedAscending)
 }
 
 @Test func onboardingNeverPresentsInsideTestHosts() {
@@ -2426,7 +2543,7 @@ func workbenchLaunchReactivationKeepsRestoredPreview() throws {
     #expect(OnboardingPreferences.isRunningTests(environment: ["SWIFT_TESTING_ENABLED": "1"]))
     #expect(!OnboardingPreferences.isRunningTests(environment: ["PATH": "/usr/bin"]))
     #expect(OnboardingPreferences.isRunningTests())
-    #expect(!OnboardingPreferences.shouldPresentOnLaunch(currentVersion: "9.9.9"))
+    #expect(OnboardingPreferences.launchPresentationOnLaunch(currentVersion: "9.9.9") == nil)
 }
 
 @Test func onboardingRecordsTheCompletedVersionInDefaults() throws {
@@ -2435,17 +2552,17 @@ func workbenchLaunchReactivationKeepsRestoredPreview() throws {
     defer { defaults.removePersistentDomain(forName: suite) }
     let environment = ["PATH": "/usr/bin"]
 
-    #expect(OnboardingPreferences.shouldPresentOnLaunch(
-        defaults: defaults, currentVersion: "0.2.0", environment: environment
-    ))
-    OnboardingPreferences.markCompleted(version: "0.2.0", defaults: defaults)
-    #expect(defaults.string(forKey: OnboardingPreferences.completedVersionKey) == "0.2.0")
-    #expect(!OnboardingPreferences.shouldPresentOnLaunch(
-        defaults: defaults, currentVersion: "0.2.0", environment: environment
-    ))
-    #expect(OnboardingPreferences.shouldPresentOnLaunch(
-        defaults: defaults, currentVersion: "0.3.0", environment: environment
-    ))
+    #expect(OnboardingPreferences.launchPresentationOnLaunch(
+        defaults: defaults, currentVersion: "0.1.0", environment: environment, releases: onboardingTestReleases
+    ) == .welcomeGuide)
+    OnboardingPreferences.markCompleted(version: "0.1.0", defaults: defaults)
+    #expect(defaults.string(forKey: OnboardingPreferences.completedVersionKey) == "0.1.0")
+    #expect(OnboardingPreferences.launchPresentationOnLaunch(
+        defaults: defaults, currentVersion: "0.1.0", environment: environment, releases: onboardingTestReleases
+    ) == nil)
+    #expect(OnboardingPreferences.launchPresentationOnLaunch(
+        defaults: defaults, currentVersion: "0.2.0", environment: environment, releases: onboardingTestReleases
+    ) == .whatsNew(version: "0.2.0"))
 }
 
 @Test func onboardingChecklistMapsDetectedTools() {
@@ -3789,6 +3906,124 @@ func askProviderExecutablePathDetectionSkipsThePathProbe() throws {
 }
 
 @Test
+func askAppleEngineIsAKeylessCLIShippedInTheBundle() throws {
+    let engine = AskProviderEngine.apple
+    #expect(engine.kind == .cli)
+    #expect(engine.title == "Apple Intelligence")
+    #expect(engine.defaultExecutable == "muxa-afm")
+    #expect(engine.defaultCredentialEnv.isEmpty)
+    #expect(engine.defaultModel == "on-device")
+    #expect(!engine.credentialRequired)
+    #expect(!engine.takesCredential)
+    #expect(engine.installCommand == nil)
+    #expect(AskProviderEngine.claude.takesCredential)
+
+    // muxad's row: an empty `credential_env` is how it says "no key".
+    let row = try JSONDecoder().decode(MuxaAskProvider.self, from: Data(#"""
+    {"id":"apple","title":"Apple Intelligence","engine":"apple","kind":"cli",
+     "executable":"muxa-afm","credential_env":"","credential_required":false,
+     "credential_present":false,"model":"on-device","selected":true,
+     "builtin":true,"configured":false}
+    """#.utf8))
+    #expect(row.isApple)
+    #expect(!row.takesCredential)
+    #expect(!row.isConfigured)
+    #expect(row.symbolName == "apple.logo")
+    #expect(MuxaAskProvider(rawValue: "apple")?.title == "Apple Intelligence")
+    // A keyless engine this build has never heard of is still keyless…
+    let unknown = MuxaAskProvider(id: "local", title: "Local", kind: .cli, credentialEnv: "", engine: "llama")
+    #expect(!unknown.takesCredential)
+    // …while every engine with a key variable keeps its key row.
+    #expect(MuxaAskProvider.claude.takesCredential)
+    #expect(MuxaAskProvider.openai.takesCredential)
+    // The pre-`ask_providers_v1` fallback never offers what an old muxad
+    // cannot run.
+    #expect(!MuxaAskProvider.builtIn.contains { $0.id == "apple" })
+
+    // No key row means no key is ever put in a sign-in shell's environment.
+    let environment = MuxaProviderCredentialStore.environment(["PATH": "/bin"], for: row)
+    #expect(environment[""] == nil)
+}
+
+@Test
+func askAppleHelperIsFoundInTheAppBundleBeforePath() throws {
+    let helpers = "/Applications/Muxa.app/Contents/Helpers"
+    let bundled = AskProviderStore.bundledHelperDetection(
+        for: "muxa-afm",
+        helpersDirectory: helpers
+    ) { $0 == "\(helpers)/muxa-afm" }
+    let tool = try #require(bundled?.tool)
+    #expect(tool.name == "muxa-afm")
+    #expect(tool.path == "\(helpers)/muxa-afm")
+    // A development build without the helper leaves the answer to PATH.
+    #expect(AskProviderStore.bundledHelperDetection(for: "muxa-afm", helpersDirectory: helpers) { _ in false } == nil)
+    // Only the engine's own default is looked up there.
+    #expect(AskProviderStore.bundledHelperDetection(for: "claude", helpersDirectory: helpers) { _ in true } == nil)
+}
+
+@Test
+func askAppleHelperIsTheCopyTheServingMuxadWillRun() {
+    let installed = "/Applications/Muxa.app/Contents/Helpers"
+    let perUser = "/Users/op/Applications/Muxa.app/Contents/Helpers"
+    let downloads = "/Users/op/Downloads/Muxa.app/Contents/Helpers"
+    let homebrew = "/opt/homebrew/bin"
+    func path(own: String, daemon: String?, present: Set<String>) -> String? {
+        AskProviderStore.bundledHelperDetection(
+            for: "muxa-afm",
+            helpersDirectory: own,
+            daemonDirectory: daemon,
+            homeDirectory: "/Users/op"
+        ) { present.contains($0) }?.tool?.path
+    }
+    // A Homebrew daemon finds an installed app's copy, for all users or one.
+    #expect(path(own: installed, daemon: homebrew, present: ["\(installed)/muxa-afm"]) == "\(installed)/muxa-afm")
+    #expect(path(own: perUser, daemon: homebrew, present: ["\(perUser)/muxa-afm"]) == "\(perUser)/muxa-afm")
+    // It never looks in Downloads, so the app must not claim it is there…
+    #expect(path(own: downloads, daemon: homebrew, present: ["\(downloads)/muxa-afm"]) == nil)
+    // …unless that app is running its own bundled daemon.
+    #expect(path(own: downloads, daemon: downloads, present: ["\(downloads)/muxa-afm"]) == "\(downloads)/muxa-afm")
+    // A daemon with its own sibling uses that one, before any installed app.
+    #expect(path(own: installed, daemon: "/dev/target", present: ["/dev/target/muxa-afm", "\(installed)/muxa-afm"])
+        == "/dev/target/muxa-afm")
+    // A daemon that could not be identified leaves the app's copy trusted.
+    #expect(path(own: downloads, daemon: nil, present: ["\(downloads)/muxa-afm"]) == "\(downloads)/muxa-afm")
+}
+
+@Test
+func askAppleUsabilityFollowsTheProbeForTheModelTheInstanceNames() throws {
+    let probe = try #require(AskAppleProbe.decode(#"""
+    {"models":[{"available":true,"context_size":8192,"id":"on-device"},
+               {"available":false,"id":"private-cloud","reason":"system_not_ready",
+                "message":"Private Cloud Compute is not ready"}],
+     "protocol_version":1}
+    """#))
+    #expect(probe.status(of: .onDevice)?.contextSize == 8192)
+    #expect(AskProviderStore.appleUsability(model: nil, probe: probe) == .usable)
+    #expect(AskProviderStore.appleUsability(model: "on-device", probe: probe) == .usable)
+    // The helper's aliases mean the same model here.
+    #expect(AskProviderStore.appleUsability(model: " PCC ", probe: probe)
+        == .unavailable("Private Cloud Compute is not ready"))
+    #expect(AskAppleModel(configured: "private-cloud-compute") == .privateCloud)
+    #expect(AskAppleModel(configured: "default") == .onDevice)
+    #expect(AskAppleModel(configured: "gpt-5") == nil)
+    // A name the helper would refuse is flagged before an Ask is spent on it.
+    #expect(!AskProviderStore.appleUsability(model: "gpt-5", probe: probe).isUsable)
+    #expect(AskProviderStore.appleUsability(model: "gpt-5", probe: probe).reason == "unavailable")
+
+    // macOS 26 reports only the on-device model.
+    let older = try #require(AskAppleProbe.decode(#"{"models":[{"available":true,"id":"on-device"}]}"#))
+    #expect(!AskProviderStore.appleUsability(model: "private-cloud", probe: older).isUsable)
+    // Apple Intelligence switched off: the helper's sentence is what shows.
+    let off = try #require(AskAppleProbe.decode(#"""
+    {"models":[{"available":false,"id":"on-device","message":"Apple Intelligence is turned off"}]}
+    """#))
+    #expect(AskProviderStore.appleUsability(model: nil, probe: off) == .unavailable("Apple Intelligence is turned off"))
+    // No probe yet, or one that could not be read: muxad reports the reason.
+    #expect(AskProviderStore.appleUsability(model: nil, probe: nil) == .usable)
+    #expect(AskAppleProbe.decode("not json") == nil)
+}
+
+@Test
 func askProviderDraftValidatesIdsTheWayTheDaemonDoes() {
     #expect(AskProviderDraft.isValidIdentifier("anthropic-work"))
     #expect(AskProviderDraft.isValidIdentifier("openai_2"))
@@ -3822,7 +4057,7 @@ func askProviderDraftValidatesIdsTheWayTheDaemonDoes() {
     #expect(draft.validationMessage(taken: none)?.isEmpty == false)
 
     // The engine supplies every default the sheet only hints at.
-    #expect(AskProviderEngine.allCases.map(\.rawValue) == ["claude", "codex", "gemini", "anthropic", "openai"])
+    #expect(AskProviderEngine.allCases.map(\.rawValue) == ["claude", "codex", "gemini", "anthropic", "openai", "apple"])
     #expect(AskProviderEngine.gemini.defaultExecutable == "gemini")
     #expect(AskProviderEngine.gemini.defaultCredentialEnv == "GEMINI_API_KEY")
     #expect(AskProviderEngine.anthropic.defaultExecutable == nil)
@@ -5642,4 +5877,116 @@ private func airPipelineFixture() -> MuxaPipelineDefinition {
     )
     #expect(url?.absoluteString == "http://127.0.0.1:60995/?token=abc&initial=explicit")
     #expect(AirWorkbenchProcess.loopbackURL(in: "no address here") == nil)
+}
+
+@Test func aStalledDaemonReadsAsARestartRatherThanAnErrno() {
+    // muxad closes its listener and then holds in-flight handlers for a
+    // bounded drain, so a request already on the socket gets no reply until
+    // the re-exec lands. The app's SO_RCVTIMEO fires first and `read()`
+    // reports EAGAIN, which used to reach the connection banner verbatim as
+    // "read failed: Resource temporarily unavailable" — an errno the reader
+    // cannot act on, for the one situation that resolves by itself.
+    let timedOut = MuxaIPCError.posix(operation: "read", code: EAGAIN)
+    #expect(timedOut.errorDescription?.contains("restarting") == true)
+    #expect(timedOut.errorDescription?.contains("Resource temporarily") == false)
+    // Shutdown now closes a read-only handler instead of stalling it, so the
+    // same event arrives as end-of-file and must read the same way.
+    #expect(MuxaIPCError.emptyResponse.errorDescription?.contains("restarting") == true)
+
+    // An errno that is not a daemon that went away still reports itself.
+    #expect(
+        MuxaIPCError.posix(operation: "write", code: EINVAL).errorDescription
+            == "write failed: Invalid argument"
+    )
+
+    // Classification is presentation only: a read is still never replayed,
+    // because muxad may already have applied the request.
+    #expect(!timedOut.isReconnectable)
+    #expect(MuxaIPCError.posix(operation: "connect", code: ECONNREFUSED).isReconnectable)
+}
+
+struct MuxaPeerRecoveryTests {
+    @Test func interruptionAndDecisionDecodeWithoutCompletingWork() throws {
+        var object = inboxSentRequest(id: "original", createdAt: "2026-09-12T12:00:00Z", status: "claimed")
+        object["interruption"] = [
+            "request_id": "original", "active": true, "reason": "rate_limited",
+            "observed_at": "2026-09-12T12:01:00Z", "action_request_id": "human-action",
+            "decision": ["status": "completed", "body": "Wait; do not reassign", "at": "2026-09-12T12:02:00Z"],
+        ] as [String: Any]
+        let request = try decodeInboxRequest(object)
+        #expect(request.interruption?.actionRequestID == "human-action")
+        #expect(request.interruption?.decision?.body == "Wait; do not reassign")
+        #expect(request.status == "claimed")
+        #expect(request.reply == nil)
+        #expect(request.interruption?.resetAt == nil)
+    }
+}
+
+private func humanInboxRequest(id: String = "decision", answered: Bool = false) -> [String: Any] {
+    var object = inboxSentRequest(id: id, createdAt: "2026-10-15T10:00:00Z")
+    let sender = object["to"]
+    object["to"] = object["from"]
+    object["from"] = sender
+    object["kind"] = "question"
+    object["human_action"] = "approval"
+    if answered {
+        object["status"] = "completed"
+        object["reply"] = ["status": "completed", "body": "Approved for staging only", "at": "2026-10-15T10:01:00Z"]
+    }
+    return object
+}
+
+struct MuxaHumanAttentionInboxTests {
+    @Test @MainActor
+    func humanInboxRemainsAvailableAfterTheLastTerminalCloses() async throws {
+        let probe = InboxMailboxProbe()
+        probe.setMailbox(host: "local", sent: [], incoming: [humanInboxRequest()])
+        let model = try await makeInboxModel(probe: probe)
+        let host = try JSONDecoder().decode(MuxaFleetHost.self, from: JSONSerialization.data(withJSONObject: [
+            "alias": "local", "local": true, "mode": "control", "state": "online"
+        ]))
+        model.ingestExecutionSnapshotForTesting(MuxaExecutionSnapshot(hosts: [host]))
+        await model.refreshOperatorInbox(force: true)
+        #expect(model.operatorMessages.count == 1)
+        #expect(model.operatorMessages.first?.routePane.paneID == "console")
+        #expect(model.attention.dockCount == 1)
+    }
+
+    @Test @MainActor
+    func fleetDecisionsAppearOnEveryClientAndResolveTogether() async throws {
+        let probe = InboxMailboxProbe()
+        probe.setMailbox(host: "local", sent: [], incoming: [humanInboxRequest()])
+        probe.setMailbox(host: "dev", sent: [], incoming: [humanInboxRequest()])
+        let laptop = try await makeInboxModel(probe: probe)
+        let desktop = try await makeInboxModel(probe: probe)
+        await laptop.refreshOperatorInbox(force: true)
+        await desktop.refreshOperatorInbox(force: true)
+        #expect(laptop.operatorMessages.map(\.id) == desktop.operatorMessages.map(\.id))
+        #expect(Set(laptop.operatorMessages.map(\.id)) == ["local:decision", "dev:decision"])
+        #expect(laptop.operatorMessages.allSatisfy { $0.needsHumanDecision && !$0.isAwaitingAgentReply && $0.counterpart.agentSessionID == "agent-17" })
+        #expect(laptop.attention.dockCount == 2)
+        probe.setFailure(host: "dev", message: "SSH disconnected")
+        await desktop.refreshOperatorInbox(force: true)
+        #expect(desktop.operatorMessages.count == 2)
+        probe.setFailure(host: "dev", message: nil)
+        probe.setMailbox(host: "dev", sent: [], incoming: [humanInboxRequest(answered: true)])
+        await laptop.refreshOperatorInbox(force: true)
+        await desktop.refreshOperatorInbox(force: true)
+        for client in [laptop, desktop] {
+            let resolved = try #require(client.operatorMessages.first { $0.host.alias == "dev" })
+            #expect(!resolved.needsHumanDecision && !resolved.needsReply && !resolved.hasUnreadReply)
+            #expect(resolved.request.reply?.body == "Approved for staging only")
+            #expect(client.attention.dockCount == 1)
+        }
+    }
+
+    @Test @MainActor
+    func unrelatedAgentIncomingMessagesDoNotLeakIntoOperatorInbox() async throws {
+        let probe = InboxMailboxProbe()
+        let peer = inboxSentRequest(id: "peer-only", createdAt: "2026-10-15T10:00:00Z")
+        probe.setMailbox(host: "local", sent: [], incoming: [peer])
+        let model = try await makeInboxModel(probe: probe)
+        await model.refreshOperatorInbox(force: true)
+        #expect(model.operatorMessages.isEmpty)
+    }
 }

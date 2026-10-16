@@ -21,6 +21,47 @@ host마다 독립적인 OpenSSH process 하나를 유지합니다. 원격에서�
 여기서 Fleet host는 물리 node입니다. 기존 문서에서 사용하던 tmux/cmux/rmux/herdr/
 zellij “pane host”는 각 node 내부의 backend kind로 그대로 유지됩니다.
 
+## 여러 기기에서 같은 사람 확인 요청 받기
+
+에이전트는 실행 중인 호스트에서 다음 명령이나 MCP 도구를 사용합니다.
+
+```sh
+muxa msg attention "staging 배포를 승인해 주세요. 테스트는 통과했고 production은 변경하지 않습니다." --action approval
+```
+
+MCP에서는 `muxa_request_attention`에 `body`와 `action`(`approval`, `choice`,
+`information`)을 전달합니다. `dispatch_id`에 같은 UUID를 재사용하면 전송 재시도로
+같은 질문이 중복 생성되지 않습니다. 반환된 요청 ID로 `muxa_wait_reply`를 기다립니다.
+완료 상태 자체가 승인을 의미하지 않으므로 실제 답장 본문을 확인해야 합니다.
+
+요청과 답장은 **에이전트가 있는 원본 호스트**의 durable mailbox에 저장됩니다.
+Muxa for Mac은 연결된 모든 Fleet 호스트의 사람용 수신함을 모아 Work의 Attention,
+Inbox의 Needs Action, Dock 배지와 macOS 알림에 표시합니다. 한 Mac에서 답하면
+같은 호스트를 읽는 다른 Mac에도 답장과 처리 상태가 반영됩니다. 알림 수신 여부는
+각 Mac의 알림 설정을 따르며, 같은 요청의 배너는 기기별로 한 번만 보냅니다.
+연결이 끊긴 호스트의 마지막 요청은 유지하고, 재연결하면 다시 동기화합니다.
+
+예를 들어 `june-mba`에서는 나머지 호스트를 등록합니다. SSH alias는 먼저
+`~/.ssh/config`에 준비합니다.
+
+```sh
+muxa fleet host add rtzr rtzr --mode control
+muxa fleet host add jiun-mbp jiun-mbp --mode control
+muxa fleet host add jiun-mini jiun-mini --mode control
+```
+
+`jiun-mbp`를 사용하는 경우에는 `june-mba`, `rtzr`, `jiun-mini`를 그 기기의
+Fleet에도 등록합니다. 현재 기기는 항상 `local`로 포함됩니다. Fleet 등록은
+기기별 설정이므로 자동으로 양방향 등록되지는 않습니다. 읽기 전용 호스트의
+요청은 볼 수 있지만 답하려면 `control` 연결이 필요합니다.
+
+모든 호스트의 CLI·데몬·relay와 Mac 앱을 이 기능이 포함된 같은 버전으로 맞추고,
+에이전트의 MCP 연결도 새 도구 목록으로 갱신해야 합니다. 기존
+`muxa msg send human --human-action approval "..."` 경로도 유지됩니다.
+`[collaboration] enabled = true`가 필요하며, 알림을 닫거나 요청을 읽는 동작은
+승인이나 답장이 아닙니다. 원본 호스트가 오프라인인 동안 다른 Mac은 마지막으로
+가져온 내용만 보여주며, 답장 전송에는 원본 호스트 연결이 필요합니다.
+
 ## 준비
 
 - controller와 모든 remote host에 같은 Muxa version을 설치합니다.
@@ -51,10 +92,10 @@ controller node는 별도 설정 없이 바로 사용할 수 있습니다.
 
 ```bash
 muxa fleet status
-muxa host show local
-muxa host doctor local
-muxa host label local environment=development
-muxa host annotate local muxa.dev/owner=platform
+muxa fleet host show local
+muxa fleet host doctor local
+muxa fleet host label local environment=development
+muxa fleet host annotate local muxa.dev/owner=platform
 ```
 
 `local`도 remote node와 같은 stable NodeId와 topology를 가지지만 SSH를 사용하지 않고
@@ -66,15 +107,15 @@ metadata는 `[fleet.local]`에 저장됩니다. `muxa.io/local`, `muxa.io/transp
 CLI를 사용하면 TOML을 검증하고 atomic하게 변경합니다.
 
 ```bash
-muxa host add dev muxa-devbox \
+muxa fleet host add dev muxa-devbox \
   --label environment=development \
   --label region=icn \
   --annotation muxa.dev/owner=platform \
   --mode observe
 
-muxa host doctor dev
-muxa host list
-muxa host show dev
+muxa fleet host doctor dev
+muxa fleet host list
+muxa fleet host show dev
 ```
 
 첫 remote host 명령은 outbound SSH Fleet 연결을 활성화합니다. `[fleet] enabled = false`여도
@@ -85,17 +126,17 @@ config 변경은 보존하고 수동 restart 안내를 출력합니다.
 label은 Kubernetes key/value 규칙을 따르는 selection metadata입니다.
 
 ```bash
-muxa host label dev tier=worker accelerator=gpu
-muxa host label dev tier=worker --overwrite
-muxa host label dev accelerator-              # 제거
-muxa host tag dev region=icn                   # label의 visible alias
+muxa fleet host label dev tier=worker accelerator=gpu
+muxa fleet host label dev tier=worker --overwrite
+muxa fleet host label dev accelerator-              # 제거
+muxa fleet host tag dev region=icn                   # label의 visible alias
 ```
 
 annotation key도 namespaced key 규칙을 따르지만 value에는 설명이나 URL을 넣을 수
 있습니다.
 
 ```bash
-muxa host annotate dev muxa.dev/runbook=https://example.invalid/dev
+muxa fleet host annotate dev muxa.dev/runbook=https://example.invalid/dev
 ```
 
 controller alias는 사람이 읽는 config identity입니다. relay는 별도로
@@ -123,7 +164,7 @@ local node는 항상 connected/control이며, 아래 설정은 remote inventory�
 - `connect = "auto"`: bounded exponential backoff로 persistent relay를 유지합니다.
 - `connect = "on_demand"`: `muxa fleet connect` 전까지 연결하지 않습니다.
 
-`muxa host disable`은 metadata를 남기고 연결만 막으며, `muxa host enable`로 다시
+`muxa fleet host disable`은 metadata를 남기고 연결만 막으며, `muxa fleet host enable`로 다시
 활성화합니다.
 
 ## 사용
@@ -246,6 +287,25 @@ mutation은 자동 retry하지 않습니다. 결과는 text delivery와 Enter su
 검사를 적용하고 `local`은 owner-only socket control입니다. 호출 대기 시간이 끝나면
 결과의 정확한 `pane_key`와 `request_id`를 wait 도구에 그대로 넘기면 됩니다. 요청과
 구조화된 reply는 선택한 physical node에 남으므로 terminal capture polling이 필요 없습니다.
+
+Fleet 응답 대기는 controller에서 `(host, pane_key, request_id)`별로 공유합니다.
+`mailbox_watch` 지원 호스트는 최초 조회 후 mailbox 변경·연결 복구 때만 다시 읽으며,
+상태 변화 없는 5분 대기는 조회 1회로 끝납니다. 같은 호스트의 다른 요청 변경은
+조회가 발생할 수 있지만, 다른 호스트 이벤트와 일반 topology refresh는 무시합니다.
+대기자별 timeout은 독립적이고 마지막 대기 연결이 종료되면 구독도 정리합니다.
+구형 호스트/controller에만 1→2→4→8→16→30초 간격의 backoff를 적용합니다.
+
+진행 중 보완 지시는 `muxa_fleet_update_request(host, pane_key, request_id, body)`,
+수임자의 진행보고는 `muxa_update_request(request_id, body)`로 기존 요청에 남깁니다.
+`muxa_fleet_wait_reply`에 `after_update: 0`을 주면 완료 전 새 update에도 반환하고,
+이후 `next_after_update`로 이어서 기다릴 수 있습니다. `initiator`는 원래 조율자의
+식별 정보이며 권한을 추가하지 않습니다. `console`을 수신 pane으로 사용하지 않습니다.
+
+update는 작업 완료·새 작업 생성·터미널 입력을 하지 않습니다. 에이전트는 합의한
+검토 시점에 `muxa_list_messages`로 변경사항을 읽고 마지막에 `muxa_reply`를 한 번
+제출합니다. 지시를 검증한 뒤 묶어서 전달하고, 큰 근거는 파일 경로로 연결합니다.
+update당 8 KiB, 요청당 최근 32개/본문 합계 32 KiB를 보관합니다. 원격 update는
+`collaboration_update` capability와 control mode가 필요합니다.
 
 web dashboard를 켜면 read API에 `GET /api/fleet?selector=...`가 추가됩니다.
 `POST /api/fleet/{host}/command`는 serialized `FleetOperation`을 받아 PAT를 요구합니다.

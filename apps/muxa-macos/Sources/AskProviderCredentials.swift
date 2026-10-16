@@ -11,12 +11,16 @@ enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
     case gemini
     case anthropic
     case openai
+    /// Apple's Foundation Models — the on-device model and Private Cloud
+    /// Compute — which muxad reaches through the bundled `muxa-afm` helper.
+    case apple
 
     var id: String { rawValue }
 
     var kind: MuxaAskProvider.Kind {
         switch self {
-        case .claude, .codex, .gemini: .cli
+        // `apple` is a CLI to muxad: a binary it spawns, and no key.
+        case .claude, .codex, .gemini, .apple: .cli
         case .anthropic, .openai: .api
         }
     }
@@ -29,13 +33,21 @@ enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
         case .gemini: "Gemini CLI"
         case .anthropic: "Anthropic API"
         case .openai: "OpenAI API"
+        case .apple: "Apple Intelligence"
         }
     }
 
     /// Executable an instance runs unless it overrides `executable`.
     var defaultExecutable: String? {
-        kind == .cli ? rawValue : nil
+        switch self {
+        case .claude, .codex, .gemini: rawValue
+        case .apple: Self.appleHelperName
+        case .anthropic, .openai: nil
+        }
     }
+
+    /// The bridge to Foundation Models, shipped in `Contents/Helpers`.
+    static let appleHelperName = "muxa-afm"
 
     /// Environment variable muxad reads the key from when the instance does
     /// not name its own `api_key_env`.
@@ -45,6 +57,8 @@ enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
         case .codex: "CODEX_API_KEY"
         case .gemini: "GEMINI_API_KEY"
         case .openai: "OPENAI_API_KEY"
+        // No key at all: the model belongs to the signed-in Mac.
+        case .apple: ""
         }
     }
 
@@ -52,11 +66,16 @@ enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .anthropic: "claude-sonnet-5"
         case .openai: "gpt-5"
+        case .apple: AskAppleModel.onDevice.rawValue
         case .claude, .codex, .gemini: nil
         }
     }
 
     var credentialRequired: Bool { kind == .api }
+
+    /// False for an engine that has no key to give, so the pane offers
+    /// neither a key field nor a sign-in.
+    var takesCredential: Bool { self != .apple }
 
     var symbolName: String {
         switch self {
@@ -65,6 +84,7 @@ enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
         case .gemini: "diamond"
         case .anthropic: "brain"
         case .openai: "cpu"
+        case .apple: "apple.logo"
         }
     }
 
@@ -74,8 +94,56 @@ enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
         case .claude: "npm install -g @anthropic-ai/claude-code"
         case .codex: "npm install -g @openai/codex"
         case .gemini: "npm install -g @google/gemini-cli"
-        case .anthropic, .openai: nil
+        // The helper ships inside Muxa.app; there is nothing to install.
+        case .anthropic, .openai, .apple: nil
         }
+    }
+}
+
+/// The two system models the `apple` engine can run on, named the way
+/// `muxa-afm` names them. An instance picks one with its `model` field.
+enum AskAppleModel: String, CaseIterable, Sendable {
+    case onDevice = "on-device"
+    case privateCloud = "private-cloud"
+
+    /// The model a configured name means — the same aliases `muxa-afm`
+    /// accepts, so the pane checks the model the turn will actually use.
+    /// Nil for a name the helper would refuse.
+    init?(configured: String?) {
+        switch configured?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case nil, "", "default", "on-device", "ondevice", "system":
+            self = .onDevice
+        case "private-cloud", "private-cloud-compute", "pcc":
+            self = .privateCloud
+        default:
+            return nil
+        }
+    }
+}
+
+/// What `muxa-afm --probe` reports: whether each system model can answer on
+/// this Mac right now, and in the helper's own words why not.
+struct AskAppleProbe: Decodable, Equatable, Sendable {
+    struct Model: Decodable, Equatable, Sendable {
+        let id: String
+        let available: Bool
+        let message: String?
+        let contextSize: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case id, available, message
+            case contextSize = "context_size"
+        }
+    }
+
+    let models: [Model]
+
+    static func decode(_ output: String) -> AskAppleProbe? {
+        try? JSONDecoder().decode(AskAppleProbe.self, from: Data(output.utf8))
+    }
+
+    func status(of model: AskAppleModel) -> Model? {
+        models.first { $0.id == model.rawValue }
     }
 }
 
@@ -257,6 +325,16 @@ struct MuxaAskProvider: Decodable, Identifiable, Sendable {
 
     var isCLI: Bool { kind == .cli }
 
+    /// False when there is no key to save or sign in with. muxad says so
+    /// with an empty `credential_env`, which also covers a keyless engine
+    /// this build has never heard of.
+    var takesCredential: Bool {
+        if let engineDescriptor, !engineDescriptor.takesCredential { return false }
+        return credentialEnv?.isEmpty != true
+    }
+
+    var isApple: Bool { engineDescriptor == .apple }
+
     /// The engine this instance runs on, when this build knows it.
     var engineDescriptor: AskProviderEngine? { AskProviderEngine(rawValue: engine) }
 
@@ -329,12 +407,21 @@ struct MuxaAskProvider: Decodable, Identifiable, Sendable {
         model: "gpt-5"
     )
 
+    static let apple = MuxaAskProvider(
+        id: "apple",
+        title: "Apple Intelligence",
+        kind: .cli,
+        cliExecutable: AskProviderEngine.appleHelperName,
+        credentialEnv: "",
+        model: AskAppleModel.onDevice.rawValue
+    )
+
     /// Providers every muxad has supported: the list shown when the daemon
     /// does not advertise `ask_providers_v1`.
     static let builtIn: [MuxaAskProvider] = [claude, codex]
 
     /// Providers this build knows how to describe without the daemon.
-    static let known: [MuxaAskProvider] = [claude, codex, anthropic, openai]
+    static let known: [MuxaAskProvider] = [claude, codex, anthropic, openai, apple]
 
     /// Display title for an id, from the known table or capitalized.
     static func fallbackTitle(for id: String) -> String {
@@ -434,6 +521,7 @@ enum MuxaProviderCredentialStore {
         for provider: MuxaAskProvider
     ) -> [String: String] {
         var environment = augmentPath(base)
+        guard provider.takesCredential else { return environment }
         if environment[provider.environmentKey]?.isEmpty != false,
            let key = key(for: provider) {
             environment[provider.environmentKey] = key

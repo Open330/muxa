@@ -1,0 +1,117 @@
+import socket,json,datetime,time,pathlib,sys,subprocess
+ROOT=pathlib.Path('/tmp/muxa-quiet-e2e')
+SOCKET='/tmp/muxa-1044.sock'
+ENDPOINT='/tmp/rmux-1044/default'
+ACTORS={name:'rmux:'+json.loads((ROOT/f'{name}-launch.json').read_text())['pane'] for name in ('sender','recipient')}
+def rpc(kind,**kwargs):
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(15);s.connect(SOCKET);f=s.makefile('rwb')
+        def exchange(d):
+            f.write((json.dumps({'protocol':6,**d})+'\n').encode());f.flush();r=json.loads(f.readline());
+            if not r.get('ok'):raise RuntimeError(r)
+            return r
+        hello=exchange({'kind':'hello','client':'cli'})
+        return hello if kind=='hello' else exchange({'kind':kind,**kwargs})
+def origin(name):return {'pane':ACTORS[name],'socket':ENDPOINT,'console':False}
+def event(name,kind,**extra):
+    return rpc('ingest',event={'type':kind,'id':{'kind':'codex','agent_session_id':f'quiet-runtime-e2e-{name}-20260926','pane':ACTORS[name],'tmux_socket':ENDPOINT,'cwd':str(ROOT)},'at':datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00','Z'),**extra})
+def capture(name):return rpc('capture',pane=ACTORS[name]).get('capture')
+def send(body,kind='notice',reply=False,notify=None):
+    request={'kind':kind,'body':body,'expects_reply':reply,'work_mode':'read_only','paths':[]}
+    if notify is not None:request['notify']=notify
+    return rpc('collaboration_send',origin=origin('sender'),target=ACTORS['recipient'],request=request)['collaboration_request']
+def get(r,name='sender'):return rpc('collaboration_get',origin=origin(name),request_id=r['id'])['collaboration_request']
+def inbox(name):return rpc('collaboration_inbox',origin=origin(name))['collaboration_requests']
+def wait_for(test,timeout=12):
+    deadline=time.monotonic()+timeout
+    while time.monotonic()<deadline:
+        result=test()
+        if result:return result
+        time.sleep(.15)
+    raise AssertionError('timed out waiting for expected runtime state')
+def setup():
+    work=json.loads(subprocess.run(['/home/june/.cargo/bin/muxa','work','show',
+        'QUIET-E2E-20260926','--workspace','quiet-validation-20260926','--json'],
+        text=True,capture_output=True,check=True,timeout=15).stdout)
+    assert work['cwd']==str(ROOT)
+    expected={pane.removeprefix('rmux:') for pane in ACTORS.values()}
+    assert {agent['pane'] for agent in work['agents']}==expected
+    assert {agent['alias'] for agent in work['agents']}=={'quiet-sender','quiet-recipient'}
+    for name in ACTORS:
+        event(name,'started')
+        event(name,'turn_stopped',response='Dedicated terminal transport fixture; no model turn requested.')
+    print(json.dumps({'actors':ACTORS,'daemon':rpc('hello')},indent=2))
+def baseline():
+    setup();before=capture('recipient');existing=rpc('collaboration_list',origin=origin('sender'),mailbox='sent').get('collaboration_requests',[])
+    r=next((r for r in existing if r['body'].startswith('QUIET-BASELINE:')),None) or send('QUIET-BASELINE: ordinary progress, no response requested')
+    wait_for(lambda:get(r).get('notified_at'))
+    wait_for(lambda:r['id'] in (capture('recipient') or ''))
+    screen=capture('recipient')
+    result={'version':'0.8.51','notices_sent':1,'notified':1,'request_id':r['id'],'actual_terminal_contains_request':r['id'] in screen,'before_terminal_contains_request':r['id'] in (before or ''),'reply_requested_by_prompt':'then respond with muxa_reply' in screen}
+    (ROOT/'baseline.json').write_text(json.dumps(result,indent=2));inbox('recipient');print(json.dumps(result,indent=2))
+def after():
+    hello=rpc('hello')
+    assert hello['version']=='0.8.51+quiet.1', hello
+    old=json.loads((ROOT/'before-hello.json').read_text())
+    assert set(old['capabilities']) <= set(hello['capabilities'])
+    setup()
+    before=capture('recipient')
+    assert before is not None, 'actual recipient terminal unavailable'
+    started=time.monotonic()
+    records=[send(f'QUIET-AFTER: checkpoint {i}, no response requested') for i in range(39)]
+    (ROOT/'after-requests.json').write_text(json.dumps(records,indent=2))
+    # Cover the actual daemon's 30-second safety scan, not just event delivery.
+    time.sleep(35)
+    stored=[get(r) for r in records]
+    quiet_screen=capture('recipient')
+    assert all(r.get('notified_at') is None and r['status']=='queued' for r in stored)
+    assert quiet_screen==before, 'quiet notices altered actual terminal output'
+    claimed=inbox('recipient')
+    ids={r['id'] for r in records}
+    assert len([r for r in claimed if r['id'] in ids and r['status']=='completed'])==39
+    result={'daemon':hello,'quiet_notices':39,'quiet_notified':0,'quiet_terminal_unchanged':True,
+            'quiet_records_read_at_checkpoint':39,'quiet_observation_seconds':round(time.monotonic()-started,2)}
+    urgent=send('QUIET-AFTER: device handoff; no acknowledgement requested',notify=True)
+    t=time.monotonic()
+    wait_for(lambda:get(urgent).get('notified_at'))
+    wait_for(lambda:urgent['id'] in (capture('recipient') or ''))
+    urgent_screen=capture('recipient')
+    assert ''.join(urgent_screen.split()).count('[muxa:'+urgent['id']+']')==1, 'handoff repeated in real terminal'
+    assert 'Noreplyisexpected' in ''.join(urgent_screen.split())
+    result.update(handoff_notified=True,handoff_terminal_occurrences=1,handoff_observed_seconds=round(time.monotonic()-t,2))
+    inbox('recipient')
+    # Explicit notification must continue respecting a working recipient.
+    event('recipient','prompt_submitted',prompt='Transport fixture busy interval; no model is running a turn.')
+    busy_before=capture('recipient')
+    busy=send('QUIET-AFTER: handoff deferred while busy',notify=True)
+    time.sleep(2)
+    assert get(busy).get('notified_at') is None
+    assert capture('recipient')==busy_before
+    event('recipient','turn_stopped',response='Transport fixture returned to idle.')
+    wait_for(lambda:get(busy).get('notified_at'))
+    wait_for(lambda:busy['id'] in (capture('recipient') or ''))
+    inbox('recipient')
+    result['busy_recipient_respected']=True
+    # A pull-only actionable request still owes its sender a completion wake.
+    task=send('QUIET-AFTER: pull-only fixture review',kind='question',reply=True,notify=False)
+    task_claimed=inbox('recipient')
+    assert any(r['id']==task['id'] and r['status']=='claimed' for r in task_claimed)
+    sender_before=capture('sender')
+    event('sender','turn_stopped',response='Transport fixture waiting for completion.')
+    rpc('collaboration_reply',origin=origin('recipient'),request_id=task['id'],status='completed',
+        body='QUIET-AFTER: transport fixture completed',artifacts=[],air_artifacts=[])
+    # Reading as recipient does not suppress the sender notification under test.
+    wait_for(lambda:get(task,'recipient').get('reply_notified_at'))
+    wait_for(lambda:task['id'] in (capture('sender') or ''))
+    sender_screen=capture('sender')
+    assert task['id'] not in (sender_before or '')
+    assert ''.join(sender_screen.split()).count('[muxa:'+task['id']+']')==1
+    assert 'transport fixture completed' not in sender_screen
+    get(task) # consume the reply through the durable mailbox
+    result['completion_reply_terminal_occurrences']=1
+    result['completion_body_not_injected']=True
+    result['test_request_ids']=[r['id'] for r in records]+[urgent['id'],busy['id'],task['id']]
+    (ROOT/'after.json').write_text(json.dumps(result,indent=2))
+    print(json.dumps({k:v for k,v in result.items() if k not in ['daemon','test_request_ids']},indent=2))
+if __name__=='__main__':
+    {'baseline':baseline,'setup':setup,'after':after}[sys.argv[1]]()

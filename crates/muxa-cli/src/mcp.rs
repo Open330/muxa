@@ -34,7 +34,6 @@ use muxa::ipc::{Client, SendPromptOutcome, TransitionStream};
 use muxa::state::{Agent, Transition};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -61,33 +60,16 @@ const DEFAULT_SPAWN_GRACE_SECS: u64 = 10;
 /// Hard ceiling on `muxa_wait_for_change` so a caller can't pin the stdio
 /// loop forever on a typo'd huge timeout.
 const MAX_WAIT_SECS: u64 = 600;
-/// Fleet commands have their own short IPC/relay deadlines, so remote reply
-/// waits poll exact durable request state instead of pinning one relay frame.
-const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Compatibility polling is used only with controllers lacking shared reply waits.
+const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
-const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team control plane. \
-    Use muxa_guide for the user's surface/agent launch preferences, muxa_room_context \
-    for identity/peers, and muxa_collaboration_guide only when detailed collaboration \
-    guidance is needed. Reserved @peer/@muxa-peer requests for new \
-    work use muxa_call_peer; requests for an existing report use muxa_peer_report. \
-    Never substitute a GitHub/PR workflow without an explicit PR number or URL. Peer \
-    calls default to review + read_only. Never set execute=true or \
-    spawn_if_missing=true without explicit user authorization. Prior authorization within \
-    scope counts; do not ask again. Keep primary ownership \
-    and verify replies. Use muxa_start_work for a configured Work pipeline, \
-    muxa_start_agent for one agent, and muxa_manage_tmux for lifecycle; never invent \
-    raw tmux commands. Prefer pane-scoped muxa_status; no-argument status is compact \
-    unless full=true. For pane work, use one muxa_wait_for_change with until=settled \
-    and include_capture instead of polling status/capture. On Codex, if a long call \
-    yields a background cell, resume that same cell with the host wait function using \
-    yield_time_ms=60000; never start a second Muxa wait. For durable peer work prefer \
-    muxa_call_peer with wait=false: muxa wakes the idle sender when the reply is ready, \
-    then read it with muxa_wait_reply. Incoming notifications require muxa_inbox and \
-    exactly one terminal muxa_reply. A /name selects a registered message skill. \
-    muxa_fleet_call_peer/muxa_fleet_wait_reply are a separate physical-host plane: \
-    name host/pane explicitly and respect observe mode.";
+const MCP_SERVER_INSTRUCTIONS: &str =
+    "Muxa routes durable agent messages. Read muxa_collaboration_guide \
+    once for identity and protocol. Discover tools by exact name/suffix, never shared descriptions. \
+    Read instructions before choosing discovery calls; retain resolved handles/schemas. Delivery and reply receipt do not prove work success; \
+    reported_status is the recipient's declaration. Use mailbox tools, not terminal scraping.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -297,7 +279,13 @@ async fn dispatch_object(
         "initialize" => success(&id, initialize_result(config)),
         "ping" => success(&id, json!({})),
         "tools/list" => success(&id, json!({ "tools": tool_definitions(config) })),
-        "tools/call" => match call_tool(client, req.get("params"), config).await {
+        "tools/call" => match CALLER_SESSION
+            .scope(
+                caller_session_hint(req.get("params")),
+                call_tool(client, req.get("params"), config),
+            )
+            .await
+        {
             Ok(result) => success(&id, result),
             // A malformed `tools/call` (missing name / bad args) is a
             // protocol error; a tool that *ran* but failed reports
@@ -309,40 +297,14 @@ async fn dispatch_object(
     Some(response)
 }
 
-fn initialize_result(config: &muxa::config::Config) -> Value {
-    let mut instructions = format!("{MCP_SERVER_INSTRUCTIONS} {}", launch_guide_summary(config));
-    if !config.message.skills.is_empty() {
-        let names = config
-            .message
-            .skills
-            .keys()
-            .map(|name| format!("/{name}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = write!(
-            instructions,
-            " Registered Muxa message skills available to muxa_call_peer: {names}."
-        );
-    }
-    if let Some(user_instructions) = config
-        .mcp
-        .guide
-        .instructions
-        .as_deref()
-        .map(str::trim)
-        .filter(|instructions| !instructions.is_empty())
-    {
-        let _ = write!(
-            instructions,
-            " User-defined Muxa guide: {user_instructions}"
-        );
-    }
+fn initialize_result(_config: &muxa::config::Config) -> Value {
+    let instructions = MCP_SERVER_INSTRUCTIONS;
     json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
         "capabilities": { "tools": {} },
         "serverInfo": {
             "name": "muxa",
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": crate::mcp_revision::server_version(),
         },
         "instructions": instructions,
     })
@@ -500,7 +462,8 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "pane": { "type": "string", "description": "Pane id to filter to (e.g. %12, rmux:%12, or herdr:p1). Omit for all panes." },
-                    "limit": { "type": "integer", "minimum": 0, "description": "Max entries. 0 or omitted = all retained." },
+                    "limit": { "type": "integer", "minimum": 0, "description": "Default 20; normal range 1..100. Larger limits or 0 require full=true." },
+                    "full": { "type": "boolean", "description": "Explicit full-history read; omitted limit or limit=0 returns all retained entries. Default false." },
                 },
                 "additionalProperties": false,
             },
@@ -519,7 +482,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "agent": { "type": "string", "enum": ["claude", "codex", "gemini", "agy", "opencode"], "description": "Agent provider. May be omitted when mcp.guide.agent is configured." },
                     "options": { "type": "array", "items": { "type": "string" }, "description": "Additional provider CLI arguments. Overrides mcp.guide.options when present; Muxa shell-quotes every argument." },
                     "placement": { "type": "string", "enum": ["pane", "window", "session"], "description": "Defaults to mcp.guide.placement (pane when unconfigured). Managed work always uses its workspace window." },
-                    "target": { "type": "string", "description": "tmux target for pane/window placement. Defaults to TMUX_PANE." },
+                    "target": { "type": "string", "description": "Target for pane/window placement. Use the exact room pane including rmux:; defaults to the identified caller pane." },
                     "cwd": { "type": "string", "description": "Existing working directory. Defaults to the MCP process cwd." },
                     "prompt": { "type": "string", "description": "Optional first task; omit for an empty interactive agent." },
                     "name": { "type": "string", "description": "Optional window/session name." },
@@ -578,7 +541,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                         "type": "string",
                         "enum": ["list_workspace", "show_workspace", "list_work", "show_work", "interrupt_agent", "terminate_agent", "close_work", "close_workspace"]
                     },
-                    "pane": { "type": "string", "description": "Exact pane id for agent actions, for example %42." },
+                    "pane": { "type": "string", "description": "Exact pane id from room context for agent actions, for example rmux:%42 or %42. The server must resolve uniquely." },
                     "workspace": { "type": "string", "description": "Workspace/project id for workspace actions or to disambiguate work." },
                     "work": { "type": "string", "description": "Muxa Work id for Work actions, for example TEST-0001." },
                     "confirm": { "type": "boolean", "description": "Must be true for terminate_agent, close_work, and close_workspace." }
@@ -619,11 +582,12 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_fleet_status",
-            "description": "Read the cached physical-host Fleet hierarchy and health, including the always-present local controller node. Optionally filter hosts with a Kubernetes-style label selector. This does not open a new SSH connection per call.",
+            "description": "Read compact cached physical-host Fleet health, including the local controller. Full topology requires full=true. Optionally filter hosts with a Kubernetes-style label selector. This does not open a new SSH connection per call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "selector": { "type": "string", "description": "Optional label selector, for example environment=production,region in (icn,nrt)." }
+                    "selector": { "type": "string", "description": "Optional label selector, for example environment=production,region in (icn,nrt)." },
+                    "full": { "type": "boolean", "description": "Return complete cached host snapshots and topology. Default false: host health/counts and at most 20 active agents per host, without prompts." }
                 },
                 "additionalProperties": false
             }
@@ -643,7 +607,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_fleet_send_prompt",
-            "description": "Send literal text to one exact pane on a named Fleet host. Local is always control-capable; remote hosts must use control mode. The daemon never retries this mutation.",
+            "description": "Send literal text to one exact pane on a named Fleet host. Local is always control-capable; remote hosts must use control mode. The daemon never retries this mutation. For ongoing agent work use muxa_fleet_update_request; this tool has no request lifecycle or completion acknowledgement.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -657,11 +621,24 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             }
         }),
         json!({
+            "name":"muxa_dispatch_work",
+            "description":"Delegate authorized Work through the shared Fleet coordinator. Resolves node selectors and personalized paths, prepares an isolated worktree at an exact commit, and launches the configured pipeline. Reuse dispatch_id on retries. plan=true is read-only; launched means started, not completed.",
+            "inputSchema":{"type":"object","required":["dispatch_id","workspace","work","commit","body"],"properties":{
+                "dispatch_id":{"type":"string"},"workspace":{"type":"string"},"work":{"type":"string"},"commit":{"type":"string"},"body":{"type":"string"},"selector":{"type":"string"},"host":{"type":"string"},"plan":{"type":"boolean","default":false}
+            }}
+        }),
+        json!({
+            "name":"muxa_dispatch_status","description":"Read the durable Fleet dispatch by UUID through the shared coordinator. Does not repeat execution.",
+            "inputSchema":{"type":"object","required":["dispatch_id"],"properties":{"dispatch_id":{"type":"string"}}}
+        }),
+        json!({
             "name": "muxa_fleet_call_peer",
             "description": "Send one durable structured collaboration request to one exact agent pane on a named Fleet host and optionally wait for its reply. The host and pane are always explicit; this tool never auto-selects or spawns a remote agent. Remote hosts must be configured mode='control' and advertise collaboration reply support. Defaults to review + read_only. Set execute=true only after explicit user authorization. If the bounded wait expires, continue with muxa_fleet_wait_reply and the returned pane_key.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "dispatch_id": {"type":"string", "description":"UUID for this dispatch. Reuse unchanged on any uncertain-delivery retry."},
+                    "delegation_parent": {"type":"object", "required":["node_id","request_id"], "properties":{"node_id":{"type":"string"},"request_id":{"type":"string"}}},
                     "host": { "type": "string", "description": "Exact Fleet host alias. The remote host must be explicitly configured mode='control'." },
                     "pane": { "type": "string", "description": "Exact or unambiguous live pane id/path, for example %12 or session/window/%12." },
                     "intent": { "type": "string", "enum": ["review", "question", "task"], "description": "Default review." },
@@ -691,8 +668,23 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "muxa_update_request",
+            "description": "Append verified guidance or a progress report to an existing nonterminal request without completing it. Use this instead of sending a new message to pane:console or injecting a prompt. Only existing participants may update; scope and execution authority stay unchanged. Read updates through muxa_list_messages and finish with one muxa_reply.",
+            "inputSchema": {"type":"object", "properties": {
+                "request_id":{"type":"string"}, "body":{"type":"string","description":"One consolidated update, at most 8192 UTF-8 bytes. Link larger artifacts."}
+            }, "required":["request_id","body"], "additionalProperties":false}
+        }),
+        json!({
+            "name": "muxa_fleet_update_request",
+            "description": "Append consolidated guidance to an existing Fleet request using its exact returned host/pane_key/request_id. Does not send another task or inject terminal text. Existing authorized scope is unchanged. The recipient reads updates on the same request; terminal completion still uses muxa_reply.",
+            "inputSchema": {"type":"object", "properties": {
+                "host":{"type":"string"}, "pane_key":{"type":"object"},
+                "request_id":{"type":"string"}, "body":{"type":"string","description":"Verified guidance within the original scope, at most 8192 UTF-8 bytes."}
+            }, "required":["host","pane_key","request_id","body"], "additionalProperties":false}
+        }),
+        json!({
             "name": "muxa_fleet_wait_reply",
-            "description": "Continue waiting for the structured reply to a prior muxa_fleet_call_peer request. Pass the exact host, pane_key, and request_id returned by that call. The durable remote request remains readable even if the target pane has since exited. Remote hosts must remain explicitly configured mode='control'.",
+            "description": "Continue waiting for the structured reply to a prior muxa_fleet_call_peer request. Pass the exact host, pane_key, and request_id returned by that call. The durable remote request remains readable even if the target pane has since exited. Remote hosts must remain explicitly configured mode='control'. Prefer completion wakes/checkpoints; use 30-60 seconds for a foreground wait, not repeated 1-second probes. Check fresh recipient/host health after timeout; follow peer_interruption in muxa_collaboration_guide.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -702,7 +694,8 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                         "description": "Exact collision-free PaneKey object returned by muxa_fleet_call_peer; do not reconstruct it from a pane id."
                     },
                     "request_id": { "type": "string", "description": "Exact collaboration request id returned by muxa_fleet_call_peer." },
-                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." }
+                    "after_update": {"type":"integer", "minimum":0, "description":"Optionally return when a progress/guidance sequence newer than this value is available, without waiting for terminal completion. Start at 0; resume with next_after_update."},
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": DEFAULT_WAIT_SECS, "description": "Reply wait timeout. Default 30 seconds." }
                 },
                 "required": ["host", "pane_key", "request_id"],
                 "additionalProperties": false
@@ -730,12 +723,12 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_collaboration_guide",
-            "description": "Discover same-window peer agents and get concrete reviewer/subagent workflows. Call near the start of substantial work and again before finalizing important changes when an independent review could improve the result.",
-            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "description": "Return room.self identity, peers, launch preferences and messaging guardrails. Call once; refresh peers with muxa_room_context. Set workflows=true only for detailed examples.",
+            "inputSchema": { "type": "object", "properties": {"workflows":{"type":"boolean", "description":"Include detailed workflow examples. Default false."}}, "additionalProperties": false },
         }),
         json!({
             "name": "muxa_room_context",
-            "description": "Identify this agent and list collaboration peers in the same tmux window, plus unread request and reply counts. Use the returned pane, alias, role, and state to choose an appropriate reviewer or delegated subagent.",
+            "description": "Identify this agent (self) and list collaboration peers in the same tmux window, plus unread request and reply counts. A lightweight refresh after muxa_collaboration_guide; use the returned pane, alias, role, and state to choose a reviewer or delegated subagent.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
         json!({
@@ -775,12 +768,13 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_peer_report",
-            "description": "Read the newest completed Muxa peer report/reply sent to this agent, or retrieve an exact request_id. Use this first for possessive requests such as '@peer's report', 'peer findings', 'the peer conversation', or 'resolve the peer feedback'. This is Muxa mailbox data, not a GitHub PR review; never infer a PR number or review thread from it.",
+            "description": "Read the newest received Muxa peer report/reply sent to this agent, or retrieve an exact request_id. Use this first for possessive requests such as '@peer's report', 'peer findings', 'the peer conversation', or 'resolve the peer feedback'. This is Muxa mailbox data, not a GitHub PR review; never infer a PR number or review thread from it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "target": { "type": "string", "description": "Optional report author filter: peer/auto/@muxa-peer, provider, pane id, @alias, or role:<name>. Default newest report from any peer." },
-                    "request_id": { "type": "string", "description": "Retrieve one exact prior Muxa request/reply instead of selecting the newest report." }
+                    "request_id": { "type": "string", "description": "Retrieve one exact prior Muxa request/reply instead of selecting the newest report." },
+                    "full": { "type": "boolean", "description": "Return the legacy full request record. Default false: only receipt and reply." }
                 },
                 "additionalProperties": false
             },
@@ -798,15 +792,36 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             },
         }),
         json!({
+            "name": "muxa_request_attention",
+            "description": "Request a required human approval, choice, or missing information. Creates one durable operator request on this host, visible in every connected Fleet client including the Muxa Mac app. Explain what decision is needed, why, options and recommendation. Reuse the returned request ID and wait via muxa_wait_reply; never treat timeout or delivery as approval. Use only when a person is required, not for routine progress or peer work.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "body": { "type": "string" },
+                    "action": { "type": "string", "enum": ["approval", "choice", "information"], "default": "information" },
+                    "dispatch_id": { "type": "string", "description": "A UUID. Reuse for retries of the same decision to avoid duplicate requests." },
+                    "parent_request_id": { "type": "string" },
+                    "thread_id": { "type": "string" },
+                    "workspace_id": { "type": "string" },
+                    "work_id": { "type": "string" },
+                    "run_id": { "type": "string" }
+                },
+                "required": ["body"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "muxa_send_message",
             "description": "Send a durable request to a same-window peer. Use review + read_only for an independent critique before finalizing important work; question + read_only for focused analysis; task + execute + narrow paths for bounded, non-overlapping delegated edits. Attach typed air_artifacts when a validated AIR workflow, plan, or trace is the shared review context. Continue useful work, wait for the structured reply, and verify the result yourself. Targets: peer (only one peer), pane:%N, @alias, or role:<name> (only one matching role).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "peer, pane:%N, %N, @alias, or role:<name>" },
+                    "target": { "type": "string", "description": "peer, pane:%N, %N, @alias, role:<name>, or human for an operator decision" },
                     "kind": { "type": "string", "enum": ["question", "review", "task", "notice"] },
                     "body": { "type": "string" },
-                    "expects_reply": { "type": "boolean", "description": "Default true except notice." },
+                    "expects_reply": { "type": "boolean", "description": "Default true except notice. Independent of notify." },
+                    "notify": { "type": "boolean", "description": "Override recipient wake: one-way notices are quiet by default; other requests wake idle recipients. Set true only for blockers, decisions, or handoffs; false records without waking. Does not interrupt busy agents or override global wake=never." },
+                    "human_action": { "type": "string", "enum": ["approval", "choice", "information"], "description": "Use target human only when an operator decision is required. Explain the question, choices and recommendation in body. Internal agent requests must omit this." },
                     "work_mode": { "type": "string", "enum": ["read_only", "execute"], "description": "Default read_only." },
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope for execute work." },
                     "thread_id": { "type": "string", "description": "Stable id shared by one causal conversation. Omit for a root request; muxa assigns its request id. When parent_request_id is set, this must match the parent's canonical thread." },
@@ -829,16 +844,22 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_inbox",
-            "description": "Claim and read pending collaboration requests addressed to this exact agent session. Call promptly when muxa notifies you, honor each request's kind/work_mode/paths contract, and finish it with muxa_reply.",
-            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "description": "Claim and read pending collaboration requests addressed to this exact agent session. Instructions are included by default; full=true is for diagnostics. Call promptly when muxa notifies you, honor each request's kind/work_mode/paths contract, and finish it with muxa_reply.",
+            "inputSchema": { "type": "object", "properties": {"full": {"type":"boolean", "description":"Return legacy full records. Default false."}}, "additionalProperties": false },
         }),
         json!({
             "name": "muxa_list_messages",
-            "description": "List incoming, sent, or all Muxa collaboration requests for this exact agent session without claiming them. Results are newest first. For the latest completed report addressed to this agent's request, prefer muxa_peer_report.",
+            "description": "List incoming, sent, or all Muxa collaboration requests for this exact agent session without claiming them. Default: newest 20 metadata-only records. Use request_id + include_body for instructions, after_update for progress, or muxa_peer_report for replies.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "mailbox": { "type": "string", "enum": ["incoming", "sent", "all"], "description": "Default all." }
+                    "mailbox": { "type": "string", "enum": ["incoming", "sent", "all"], "description": "Default all." },
+                    "request_id": {"type":"string", "description":"Read one exact request without claiming it."},
+                    "limit": {"type":"integer", "minimum":1, "maximum":100, "description":"Newest records to return. Default 20."},
+                    "offset": {"type":"integer", "minimum":0, "description":"Skip this many records. Default 0."},
+                    "include_body": {"type":"boolean", "description":"Include instructions and attachments for an exact request_id; bulk reads require full=true. Default false."},
+                    "after_update": {"type":"integer", "minimum":0, "description":"Include only progress after this sequence; use with request_id."},
+                    "full": {"type":"boolean", "description":"Return legacy full records. Default false."}
                 },
                 "additionalProperties": false
             },
@@ -866,7 +887,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_wait_reply",
-            "description": "Wait until a peer reviewer/subagent request reaches a terminal status and return its structured reply. Verify findings or edits before integrating them. Default 30 seconds, max 600.",
+            "description": "Wait for a final reply or explicit cancellation/expiry. final_reply_received records receipt; reported_status is declared by the recipient. Timeout leaves work unchanged. An explicit peer_interrupted result keeps the work open; consult the opt-in recovery workflow. Prefer completion wakes or checkpoints over repeated 1-second probes. Default 30 seconds, max 600.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -905,10 +926,28 @@ async fn call_tool(
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
-    let args = params
+    let mut args = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+
+    let name = if name == "muxa_request_attention" {
+        let Some(object) = args.as_object_mut() else {
+            return Ok(error_result("attention arguments must be an object"));
+        };
+        let action = object
+            .remove("action")
+            .unwrap_or_else(|| json!("information"));
+        object.insert("human_action".into(), action);
+        object.insert("target".into(), json!("human"));
+        object.insert("kind".into(), json!("question"));
+        object.insert("expects_reply".into(), json!(true));
+        object.insert("notify".into(), json!(true));
+        object.insert("work_mode".into(), json!("read_only"));
+        "muxa_send_message"
+    } else {
+        name
+    };
 
     match name {
         "muxa_status" => {
@@ -992,17 +1031,12 @@ async fn call_tool(
             }
             Ok(json_result(&payload))
         }
-        "muxa_recent_prompts" => {
-            let pane = args.get("pane").and_then(Value::as_str);
-            let limit = args
-                .get("limit")
-                .and_then(Value::as_u64)
-                .and_then(|n| usize::try_from(n).ok());
-            Ok(match client.recent_prompts(pane, limit).await {
-                Ok(prompts) => json_result(&json!({ "prompts": prompts })),
-                Err(e) => error_result(&format!("recent_prompts failed: {e}")),
-            })
-        }
+        "muxa_recent_prompts" => Ok(
+            match crate::mcp_output::recent_prompts(client, &args).await {
+                Ok(value) => json_result(&value),
+                Err(error) => error_result(&format!("recent_prompts failed: {error}")),
+            },
+        ),
         "muxa_guide" => Ok(json_result(&launch_guide_value(config))),
         "muxa_start_agent" => {
             let explicit_agent = args.get("agent").and_then(Value::as_str);
@@ -1044,15 +1078,21 @@ async fn call_tool(
                 "options": args.get("options").is_none() && !reported_options.is_empty(),
                 "direction": args.get("direction").is_none(),
             });
+            let (endpoint, target) =
+                match lifecycle_target(client, args.get("target").and_then(Value::as_str)).await {
+                    Ok(value) => value,
+                    Err(error) => return Ok(error_result(&format!("start_agent failed: {error}"))),
+                };
             let request = crate::agent_launch::StartRequest {
                 socket: client.socket().to_path_buf(),
                 agent,
                 options,
                 placement,
-                target: args
-                    .get("target")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                target: if args.get("work").is_some() && args.get("target").is_none() {
+                    None
+                } else {
+                    target
+                },
                 cwd: args
                     .get("cwd")
                     .and_then(Value::as_str)
@@ -1076,11 +1116,26 @@ async fn call_tool(
                 generation: None,
                 direction,
             };
+            let is_rmux = endpoint
+                .as_ref()
+                .is_some_and(|e| e.host == muxa::HostKind::Rmux);
             Ok(
-                match tokio::task::spawn_blocking(move || crate::agent_launch::start(request)).await
+                match tokio::task::spawn_blocking(move || {
+                    crate::mux_control::with_endpoint(endpoint, || {
+                        crate::agent_launch::start(request)
+                    })
+                })
+                .await
                 {
                     Ok(Ok(result)) => {
                         let mut result = json!(result);
+                        if is_rmux {
+                            result["host"] = json!("rmux");
+                            result["pane"] = json!(format!(
+                                "rmux:{}",
+                                result["pane"].as_str().unwrap_or_default()
+                            ));
+                        }
                         result["options"] = json!(reported_options);
                         result["defaults_applied"] = defaults_applied;
                         json_result(&result)
@@ -1091,6 +1146,7 @@ async fn call_tool(
             )
         }
         "muxa_manage_tmux" => {
+            use crate::tmux_work::ManageAction;
             let Some(action) = args.get("action").and_then(Value::as_str) else {
                 return Ok(error_result("manage_tmux requires an action argument"));
             };
@@ -1098,9 +1154,35 @@ async fn call_tool(
                 Ok(action) => action,
                 Err(error) => return Ok(error_result(&error)),
             };
+            if matches!(
+                action,
+                ManageAction::TerminateAgent
+                    | ManageAction::CloseWork
+                    | ManageAction::CloseWorkspace
+            ) && !args
+                .get("confirm")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Ok(error_result(
+                    "manage_tmux destructive action requires confirm=true",
+                ));
+            }
+            if matches!(
+                action,
+                ManageAction::TerminateAgent | ManageAction::InterruptAgent
+            ) && args.get("pane").and_then(Value::as_str).is_none()
+            {
+                return Ok(error_result("manage_tmux agent action requires pane"));
+            }
+            let (endpoint, pane) =
+                match lifecycle_target(client, args.get("pane").and_then(Value::as_str)).await {
+                    Ok(value) => value,
+                    Err(error) => return Ok(error_result(&format!("manage_tmux failed: {error}"))),
+                };
             let request = crate::tmux_work::ManageRequest {
                 action,
-                pane: args.get("pane").and_then(Value::as_str).map(str::to_string),
+                pane,
                 workspace: args
                     .get("workspace")
                     .and_then(Value::as_str)
@@ -1111,9 +1193,24 @@ async fn call_tool(
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
             };
+            let reported_pane = args.get("pane").cloned();
             Ok(
-                match tokio::task::spawn_blocking(move || crate::tmux_work::manage(request)).await {
-                    Ok(Ok(result)) => json_result(&json!(result)),
+                match tokio::task::spawn_blocking(move || {
+                    crate::mux_control::with_endpoint(endpoint, || {
+                        crate::tmux_work::manage(request)
+                    })
+                })
+                .await
+                {
+                    Ok(Ok(result)) => {
+                        let mut result = json!(result);
+                        if result.get("pane").is_some() {
+                            if let Some(pane) = reported_pane {
+                                result["pane"] = pane;
+                            }
+                        }
+                        json_result(&result)
+                    }
                     Ok(Err(error)) => error_result(&format!("manage_tmux failed: {error}")),
                     Err(error) => error_result(&format!("manage_tmux worker failed: {error}")),
                 },
@@ -1134,9 +1231,13 @@ async fn call_tool(
                     // "Enter delivered" (`submitted`); surface the latter so a
                     // caller whose submit was requested but not delivered learns
                     // the text already landed and must not blindly resend it.
-                    Ok(outcome) => {
-                        render_send_result(text.len(), pane, submit, Some(outcome.submitted))
-                    }
+                    Ok(outcome) => render_send_result(
+                        text.len(),
+                        pane,
+                        submit,
+                        Some(outcome.submitted),
+                        outcome.submission_confirmed,
+                    ),
                     Err(e) => error_result(&format!("send_prompt failed: {e}")),
                 },
             )
@@ -1156,7 +1257,10 @@ async fn call_tool(
         "muxa_fleet_status" => {
             let selector = args.get("selector").and_then(Value::as_str);
             Ok(match client.fleet_snapshot(selector).await {
-                Ok(snapshot) => json_result(&json!(snapshot)),
+                Ok(snapshot) => json_result(&crate::mcp_output::fleet_view(
+                    &snapshot,
+                    args.get("full").and_then(Value::as_bool).unwrap_or(false),
+                )),
                 Err(error) => error_result(&format!("fleet status failed: {error}")),
             })
         }
@@ -1222,21 +1326,75 @@ async fn call_tool(
                 },
             )
         }
+        "muxa_dispatch_work" => {
+            let mut command = vec!["work".to_string(), "dispatch".to_string()];
+            if args.get("plan").and_then(Value::as_bool).unwrap_or(false) {
+                command.push("--plan".into());
+            }
+            let mut request = args.clone();
+            if let Some(object) = request.as_object_mut() {
+                object.remove("plan");
+            }
+            match client
+                .work_command(None, &command, Some(&request.to_string()))
+                .await
+            {
+                Ok(output) if output.exit_code == 0 => {
+                    match serde_json::from_str::<Value>(&output.stdout) {
+                        Ok(value) => Ok(json_result(&value)),
+                        Err(e) => Ok(error_result(&e.to_string())),
+                    }
+                }
+                Ok(output) => Ok(error_result(&output.stderr)),
+                Err(e) => Ok(json_result(
+                    &json!({"state":"unknown","dispatch_id":args["dispatch_id"],"error":e.to_string(),"next_step":"read muxa_dispatch_status with this ID; do not create a replacement"}),
+                )),
+            }
+        }
+        "muxa_dispatch_status" => {
+            let Some(id) = args.get("dispatch_id").and_then(Value::as_str) else {
+                return Ok(error_result("dispatch_id required"));
+            };
+            match client
+                .work_command(
+                    None,
+                    &["work".into(), "dispatch-status".into(), id.into()],
+                    None,
+                )
+                .await
+            {
+                Ok(output) if output.exit_code == 0 => {
+                    match serde_json::from_str::<Value>(&output.stdout) {
+                        Ok(v) => Ok(json_result(&v)),
+                        Err(e) => Ok(error_result(&e.to_string())),
+                    }
+                }
+                Ok(output) => Ok(error_result(&output.stderr)),
+                Err(e) => Ok(error_result(&e.to_string())),
+            }
+        }
         "muxa_fleet_call_peer" => Ok(fleet_call_peer(client, &args, &config.message.skills).await),
         "muxa_fleet_wait_reply" => Ok(fleet_wait_reply(client, &args).await),
         "muxa_wait_for_change" => Ok(wait_for_change(client, &args).await),
         "muxa_collaboration_guide" => {
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
             Ok(match client.collaboration_context(&origin).await {
-                Ok(room) => json_result(&collaboration_guide(room, config)),
+                Ok(room) => json_result(&collaboration_guide(
+                    room,
+                    config,
+                    args.get("workflows")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    crate::mcp_output::human_actions_supported(client).await,
+                )),
                 Err(error) => error_result(&format!("collaboration guide failed: {error}")),
             })
         }
         "muxa_room_context" => {
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
@@ -1251,7 +1409,7 @@ async fn call_tool(
         "muxa_set_identity" => {
             let alias = args.get("alias").and_then(Value::as_str);
             let roles = string_array(&args, "roles");
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
@@ -1269,6 +1427,11 @@ async fn call_tool(
             let Some(target) = args.get("target").and_then(Value::as_str) else {
                 return Ok(error_result("send_message requires a `target` argument"));
             };
+            if target.eq_ignore_ascii_case("human") {
+                if let Err(error) = crate::mcp_output::require_human_actions(client).await {
+                    return Ok(error_result(&error));
+                }
+            }
             let Some(body) = args.get("body").and_then(Value::as_str) else {
                 return Ok(error_result("send_message requires a `body` argument"));
             };
@@ -1289,7 +1452,7 @@ async fn call_tool(
                 .get("expects_reply")
                 .and_then(Value::as_bool)
                 .unwrap_or(kind != RequestKind::Notice);
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
@@ -1313,28 +1476,95 @@ async fn call_tool(
             )
         }
         "muxa_inbox" => {
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
             Ok(match client.collaboration_inbox(&origin).await {
-                Ok(requests) => json_result(&json!({ "requests": requests })),
+                Ok(requests) => json_result(&json!({ "requests": requests.iter().map(|request| {
+                    if args.get("full").and_then(Value::as_bool).unwrap_or(false) { json!(request) }
+                    else { crate::collaboration_output::message(request, true) }
+                }).collect::<Vec<_>>() })),
                 Err(error) => error_result(&format!("inbox failed: {error}")),
             })
         }
         "muxa_list_messages" => {
+            if let Err(error) = crate::mcp_output::validate_message_read(&args) {
+                return Ok(error_result(error));
+            }
             let mailbox = match parse_mailbox(args.get("mailbox").and_then(Value::as_str)) {
                 Ok(mailbox) => mailbox,
                 Err(error) => return Ok(error_result(error)),
             };
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
+            if let Some(id) = args.get("request_id").and_then(Value::as_str) {
+                return Ok(match client.collaboration_get(&origin, id).await {
+                    Ok(request) => json_result(&message_view(&request, &args)),
+                    Err(error) => error_result(&format!("list_messages failed: {error}")),
+                });
+            }
             Ok(match client.collaboration_list(&origin, mailbox).await {
-                Ok(requests) => json_result(&json!({ "requests": requests })),
+                Ok(requests) => json_result(&message_page(requests, &args)),
                 Err(error) => error_result(&format!("list_messages failed: {error}")),
             })
+        }
+        "muxa_update_request" | "muxa_fleet_update_request" => {
+            let Some(request_id) = args.get("request_id").and_then(Value::as_str) else {
+                return Ok(error_result("request_id is required"));
+            };
+            let Some(body) = args.get("body").and_then(Value::as_str) else {
+                return Ok(error_result("body is required"));
+            };
+            if body.trim().is_empty() || body.len() > 8192 {
+                return Ok(error_result("body must contain 1..8192 UTF-8 bytes"));
+            }
+            if name == "muxa_fleet_update_request" {
+                let Some(host) = args.get("host").and_then(Value::as_str) else {
+                    return Ok(error_result("host is required"));
+                };
+                let pane = match serde_json::from_value::<muxa::PaneKey>(
+                    args.get("pane_key").cloned().unwrap_or(Value::Null),
+                ) {
+                    Ok(pane) => pane,
+                    Err(error) => return Ok(error_result(&format!("invalid pane_key: {error}"))),
+                };
+                return Ok(
+                    match client
+                        .fleet_execute(
+                            host,
+                            &muxa::FleetOperation::CollaborationUpdate {
+                                pane,
+                                request_id: request_id.into(),
+                                body: body.into(),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(result) => match result.collaboration_request {
+                            Some(request) => json_result(
+                                &crate::collaboration_output::mutation_receipt(&request),
+                            ),
+                            None => error_result("update returned no request"),
+                        },
+                        Err(error) => error_result(&error.to_string()),
+                    },
+                );
+            }
+            let origin = match resolve_collaboration_origin(client).await {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(
+                match client.collaboration_update(&origin, request_id, body).await {
+                    Ok(request) => {
+                        json_result(&crate::collaboration_output::mutation_receipt(&request))
+                    }
+                    Err(error) => error_result(&error.to_string()),
+                },
+            )
         }
         "muxa_reply" => {
             let Some(request_id) = args.get("request_id").and_then(Value::as_str) else {
@@ -1352,7 +1582,7 @@ async fn call_tool(
                 Ok(references) => references,
                 Err(error) => return Ok(error_result(&error)),
             };
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
@@ -1368,7 +1598,9 @@ async fn call_tool(
                     )
                     .await
                 {
-                    Ok(request) => json_result(&request_ack(&request)),
+                    Ok(request) => {
+                        json_result(&crate::collaboration_output::mutation_receipt(&request))
+                    }
                     Err(error) => error_result(&format!("reply failed: {error}")),
                 },
             )
@@ -1380,19 +1612,97 @@ async fn call_tool(
                     "cancel_message requires a `request_id` argument",
                 ));
             };
-            let origin = match current_collaboration_origin() {
+            let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
             Ok(
                 match client.collaboration_cancel(&origin, request_id).await {
-                    Ok(request) => json_result(&request_ack(&request)),
+                    Ok(request) => {
+                        json_result(&crate::collaboration_output::mutation_receipt(&request))
+                    }
                     Err(error) => error_result(&format!("cancel_message failed: {error}")),
                 },
             )
         }
         other => Ok(error_result(&format!("unknown tool: {other}"))),
     }
+}
+
+/// Resolve namespace and server together before entering synchronous lifecycle
+/// code. A namespaced pane must never fall back onto a different ambient host.
+async fn lifecycle_target(
+    client: &Client,
+    target: Option<&str>,
+) -> Result<(Option<muxa::BackendEndpoint>, Option<String>), String> {
+    let resolved_origin = resolve_collaboration_origin(client).await;
+    if target.is_none_or(|t| muxa::backend::pane_id_host_kind(t).is_none())
+        && pane_env_is_borrowed()
+    {
+        let origin = resolved_origin.as_ref().map_err(Clone::clone)?;
+        if origin.pane.is_empty() || origin.socket.is_none() {
+            return Err("lifecycle caller is not bound to a server yet; refresh room context before retrying".into());
+        }
+    }
+    let origin = resolved_origin.ok();
+    let target = target.map(str::to_string).or_else(|| {
+        origin
+            .as_ref()
+            .map(|o| o.pane.clone())
+            .filter(|p| !p.is_empty())
+    });
+    let Some(pane) = target.as_deref() else {
+        return Ok((None, None));
+    };
+    let Some(host) = muxa::backend::pane_id_host_kind(pane) else {
+        // Session names belong to the caller's server, not the app-server's.
+        let endpoint = origin.and_then(|o| {
+            let host = muxa::backend::pane_id_host_kind(&o.pane)?;
+            crate::mux_control::supported(host).then_some(())?;
+            Some(muxa::BackendEndpoint {
+                host,
+                socket: o.socket?,
+            })
+        });
+        return Ok((endpoint, target));
+    };
+    if !crate::mux_control::supported(host) {
+        return Err(format!("{host} does not support this lifecycle operation"));
+    }
+    let agents = client
+        .by_pane(pane)
+        .await
+        .map_err(|e| format!("resolve lifecycle endpoint: {e}"))?;
+    let mut endpoints: Vec<_> = agents
+        .iter()
+        .filter_map(|a| a.tmux_socket.clone())
+        .collect();
+    if let Some(origin) = origin.filter(|o| o.pane == pane) {
+        if let Some(socket) = origin.socket {
+            endpoints.push(socket);
+        }
+    }
+    let endpoint = select_lifecycle_endpoint(host, endpoints)?;
+    Ok((
+        Some(endpoint),
+        Some(pane.strip_prefix("rmux:").unwrap_or(pane).to_string()),
+    ))
+}
+
+fn select_lifecycle_endpoint(
+    host: muxa::HostKind,
+    mut sockets: Vec<String>,
+) -> Result<muxa::BackendEndpoint, String> {
+    sockets.retain(|s| !s.trim().is_empty());
+    sockets.sort();
+    sockets.dedup();
+    if sockets.len() != 1 {
+        return Err("cannot resolve a unique lifecycle server for this pane; refresh room context and use an exact tracked target".into());
+    }
+    Ok(muxa::BackendEndpoint {
+        host,
+        socket: sockets.remove(0),
+    })
 }
 
 /// Keep the default fleet view useful for routing without embedding every
@@ -1525,7 +1835,13 @@ fn agent_status_summary(
     value
 }
 
-fn collaboration_guide(room: RoomContext, config: &muxa::config::Config) -> Value {
+#[allow(clippy::too_many_lines)] // declarative guide keeps detailed recovery workflows opt-in
+fn collaboration_guide(
+    room: RoomContext,
+    config: &muxa::config::Config,
+    include_workflows: bool,
+    human_actions: bool,
+) -> Value {
     let next_step = match room.peers.len() {
         0 => "No peer is available. Continue locally or run another agent in this tmux window.",
         1 => "One peer is available; target `peer` or its explicit pane id.",
@@ -1533,14 +1849,52 @@ fn collaboration_guide(room: RoomContext, config: &muxa::config::Config) -> Valu
             "Multiple peers are available; choose an explicit pane, @alias, or unique role:<name>."
         }
     };
-    json!({
+    let mut guide = json!({
+        "capabilities": {"human_actions":human_actions},
         "purpose": "Use another live agent as an independent reviewer or a bounded delegated subagent to improve important work.",
         "room": room,
         "user_launch_preferences": launch_guide_value(config),
+        "message_skills": config.message.skills.keys().collect::<Vec<_>>(),
+        "transport_contract": {
+            "discovery": "Resolve exact tool names and retain their handles/schema for the session. Do not print ALL_TOOLS again for a known tool; refresh only after a version/capability change or unknown-tool/argument error.",
+            "bounded_reads": "Prompt history defaults to 20 entries. Fleet status is a summary; full=true explicitly requests large data. Inbox already includes task instructions. include_body requires an exact request_id unless full=true.",
+            "final_reply_received": "Only reports that a recipient submitted a final reply; never proves success.",
+            "reported_status": "Recipient-declared completed/blocked/declined/failed. Muxa does not judge the work.",
+            "timeout": "The wait ended; work is unchanged. Prefer completion wakes or substantive checkpoints. If waiting in the foreground, use 30-60 seconds; a 1-second probe is for an expected result, not a polling loop. Do not renew waits blindly.",
+            "progress": "Use update_request (CLI: msg update REQUEST BODY) for consolidated guidance/progress on the same request; reply once at the end. No receipt acknowledgements or unchanged status messages.",
+            "reads": "Reports omit original requests. Lists default to 20 metadata records; request_id + include_body reads instructions, full=true opts into legacy records.",
+            "cli": "muxa msg wait REQUEST --body [--output FILE] prints the reply directly. Keep exit status/stderr; do not hide errors with grep or retry sends after empty filtered output. --notify means true; --notify false is quiet. Never judge completion from body keywords.",
+            "authority": "execute=true and bypass-permission spawning require existing explicit authorization. Preserve request identity on retry; a timeout never authorizes duplicate work.",
+            "fleet": "Use exact returned host/pane_key/request_id. Observe hosts cannot execute. Resume yielded host tool cells instead of duplicating waits."
+        },
         "next_step": next_step,
         "workflows": {
+            "peer_interruption": {
+                "wait_slice_secs": 60,
+                "owner": "The coordinator owns recovery; a capped peer may never send a reply. Set an overall wait budget; never renew timed-out waits blindly.",
+                "health": "Read the durable reply first, then fresh muxa_status for the exact recipient agent/session/socket or muxa_fleet_status for the returned host/pane_key. Request to.state is stale. Missing/offline is unknown availability, not proof of a cap or process exit.",
+                "evidence": ["state", "rate_limit_scope", "rate_limit_source", "rate_limited_until", "last_notification"],
+                "trigger": "Known cap/error/stopped, repeated unavailability, or exhausted overall budget requires a recovery decision. Utilization alone is insufficient; reset time is only a recheck hint.",
+                "recovery": "Record one update with evidence/artifacts. Use authorized independent work, one bounded reset recheck, or a healthy peer. Verify current health and progress; do not repeatedly prompt the capped agent.",
+                "handoff": "Cancel queued local requests with muxa_cancel_message and verify success. Claimed requests need supported authorized stop/handoff or isolated replacement work; a cap/offline state does not prevent resumption. Preserve request/thread identities and never impersonate the peer.",
+                "human": "Only if a real choice/approval/information is needed, follow human_feedback with one linked request; reuse its ID and existing authorization. Preserve remote endpoint identity.",
+                "completion": "Do not fabricate the peer reply. If ending your own incoming attempt, reply blocked with dependency/handoff evidence; keep it open during an active human decision.",
+                "limitation": "Upgraded daemons return peer_interrupted without completing work. A running coordinator handles recovery first; if unavailable or unacknowledged for two minutes the daemon creates one durable human action. Reuse interruption.action_request_id; inspect interruption.decision without interpreting completion as consent. Older hosts still need bounded health checks."
+            },
+            "human_feedback": {
+                "when": "Only when an actual operator approval, choice, or missing information is required; never for routine peer traffic or already-authorized work.",
+                "tool": "muxa_send_message",
+                "request": { "target": "human", "kind": "question", "expects_reply": true, "human_action": "choice" },
+                "actions": ["approval", "choice", "information"],
+                "context": "Include the exact decision, why required, options and recommendation. Include parent_request_id only for an existing request you participate in; inherit its thread and preserve known work identity.",
+                "wait": "Retain the returned request_id and use muxa_wait_reply. Continue independent work; never treat a timeout as consent or create duplicate questions. Keep the original peer request open while waiting.",
+                "answer": "The human answers in Need you (watch: e). Read status and body; completed is not necessarily approval. Honor refusal/cancellation and complete the original peer request after authorized work.",
+                "identity": "Never use console=true or claim/answer the operator inbox as an agent.",
+                "fallback": "If the installed schema lacks human_action, ask in the existing user conversation. Do not silently drop the question or redirect it to a peer."
+            },
             "reviewer": {
                 "when": "After implementation, self-review, and relevant tests; before declaring important work complete.",
+                "provider": "For independent review, Codex chooses Claude and Claude chooses Codex unless the user explicitly selects another provider.",
                 "request": {
                     "kind": "review",
                     "work_mode": "read_only",
@@ -1580,20 +1934,46 @@ fn collaboration_guide(room: RoomContext, config: &muxa::config::Config) -> Valu
                     "Open the source-bearing artifact in AIR Workbench for graph inspection or editing; muxa transports references and does not validate or execute AIR."
                 ]
             },
+            "ongoing_fleet_work": {
+                "steps": [
+                    "Consolidate verified guidance with muxa_fleet_update_request on the returned host/pane_key/request_id; do not inject repeated task prompts.",
+                    "Report nonterminal progress with muxa_update_request on the same request, never by addressing pane:console.",
+                    "At agreed checkpoints read muxa_list_messages; updates do not interrupt terminal input or widen execution authority.",
+                    "Wait with after_update=0 for progress, then resume with next_after_update; finish with exactly one terminal reply."
+                ]
+            },
             "incoming_request": {
                 "steps": [
-                    "Call muxa_inbox promptly to claim and read it.",
+                    "Call muxa_inbox to claim/read unless the complete request is already claimed and delivered in the prompt.",
                     "Honor kind, work_mode, and paths; read_only never authorizes edits.",
-                    "Reply exactly once with completed, blocked, declined, or failed and include useful artifacts."
+                    "Only when expects_reply=true, reply exactly once with completed, blocked, declined, or failed and useful artifacts. Never acknowledge one-way notices."
                 ]
             }
         },
         "guardrails": [
+            "Use room.self for identity; never derive it from TMUX_PANE or raw tmux commands, which may belong to a shared app-server.",
+            "Use Muxa lifecycle tools instead of raw tmux; name Fleet host/pane explicitly and respect observe mode.",
+            "Never infer GitHub/PR work without an explicit PR number or URL.",
+            "One-way notices need no acknowledgement; notify=true is for blockers, decisions, conflicts or handoffs. Batch progress at checkpoints.",
+            "For review use the opposite provider: Codex to Claude, Claude to Codex; an explicit user selection takes precedence.",
+            "Claim requests with muxa_inbox unless already claimed and delivered in full. Honor kind/work_mode/paths; read_only never authorizes edits. Reply once only when expects_reply=true; progress uses update_request.",
             "Do not create overlapping concurrent edits unless separate worktrees isolate them.",
             "Do not treat a peer reply as proof; verify it against the repository and tests.",
             "Do not delegate merely for ceremony or recursively bounce work without a concrete benefit."
         ]
-    })
+    });
+    if !human_actions {
+        guide["workflows"]
+            .as_object_mut()
+            .unwrap()
+            .remove("human_feedback");
+        guide["workflows"]["peer_interruption"]["limitation"] = json!("The running daemon has not advertised human-action support. Use bounded health checks and the existing user conversation for required decisions.");
+        guide["workflows"]["peer_interruption"]["human"] = json!("Human-action support is unverified on the running daemon. Ask through the existing user conversation; do not retry peer aliases.");
+    }
+    if !include_workflows {
+        guide.as_object_mut().unwrap().remove("workflows");
+    }
+    guide
 }
 
 #[derive(Debug, Clone)]
@@ -1629,7 +2009,7 @@ impl PeerSelection {
 /// Listing is non-claiming; the final exact get records that the sender read
 /// the reply, matching `muxa_wait_reply` semantics.
 async fn peer_report(client: &Client, args: &Value) -> Value {
-    let origin = match current_collaboration_origin() {
+    let origin = match resolve_collaboration_origin(client).await {
         Ok(origin) => origin,
         Err(error) => return error_result(&error),
     };
@@ -1637,10 +2017,10 @@ async fn peer_report(client: &Client, args: &Value) -> Value {
         return match client.collaboration_get(&origin, request_id).await {
             Ok(request) if request.reply.is_some() => json_result(&json!({
                 "selection_reason": "explicit request_id",
-                "request": request,
+                if args.get("full").and_then(Value::as_bool).unwrap_or(false) { "request" } else { "result" }: report_view(&request, args),
             })),
             Ok(_) => error_result(&format!(
-                "Muxa request {request_id:?} does not have a completed peer report yet"
+                "Muxa request {request_id:?} has no final reply yet"
             )),
             Err(error) => error_result(&format!("peer_report failed: {error}")),
         };
@@ -1662,13 +2042,13 @@ async fn peer_report(client: &Client, args: &Value) -> Value {
         .max_by_key(|request| request.created_at);
     let Some(selected) = selected else {
         return error_result(&format!(
-            "no completed Muxa peer report matches {target:?}; use muxa_call_peer only if the user wants a new request"
+            "no received Muxa peer report matches {target:?}; use muxa_call_peer only if the user wants a new request"
         ));
     };
     match client.collaboration_get(&origin, &selected.id).await {
         Ok(request) => json_result(&json!({
-            "selection_reason": format!("newest completed report matching {target:?}"),
-            "request": request,
+            "selection_reason": format!("newest received report matching {target:?}"),
+            if args.get("full").and_then(Value::as_bool).unwrap_or(false) { "request" } else { "result" }: report_view(&request, args),
         })),
         Err(error) => error_result(&format!("peer_report failed: {error}")),
     }
@@ -1731,7 +2111,7 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
             Ok(request) => request,
             Err(error) => return error_result(&error),
         };
-    let origin = match current_collaboration_origin() {
+    let origin = match resolve_collaboration_origin(client).await {
         Ok(origin) => origin,
         Err(error) => return error_result(&error),
     };
@@ -1740,6 +2120,7 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
         Err(error) => return error_result(&format!("call_peer context failed: {error}")),
     };
     let target = args.get("target").and_then(Value::as_str).unwrap_or("auto");
+    let target = review_provider_target(target, kind, room.current.agent_kind);
     let mut selection = match select_peer(&room, target) {
         Ok(selection) => selection,
         Err(error) => return error_result(&error),
@@ -1788,7 +2169,7 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
         Ok(request) => request,
         Err(error) => return error_result(&format!("call_peer send failed: {error}")),
     };
-    let peer_pending = selection.peer.is_none();
+    let peer_pending = muxa::collaboration::is_pending_session(&sent.to.agent_session_id);
     let mut common = json!({
         "sent": true,
         "selected_peer": selection.peer.clone().unwrap_or_else(|| sent.to.clone()),
@@ -1816,7 +2197,7 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
     }
     if !args.get("wait").and_then(Value::as_bool).unwrap_or(true) {
         let mut payload = common;
-        payload["completed"] = json!(false);
+        payload["final_reply_received"] = json!(false);
         payload["reason"] = json!("sent_without_waiting");
         return json_result(&payload);
     }
@@ -1829,19 +2210,21 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
     match await_collaboration_reply(client, &origin, &sent.id, timeout_secs).await {
         Ok(Some(request)) => {
             let mut payload = common;
-            payload["completed"] = json!(true);
-            payload["status"] = json!(request.status);
-            payload["reply"] = json!(request.reply);
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(request_outcome(&request).as_object().unwrap().clone());
             json_result(&payload)
         }
         Ok(None) => {
             let mut payload = common;
-            payload["completed"] = json!(false);
+            payload["final_reply_received"] = json!(false);
             payload["reason"] = json!("timeout");
             payload["timeout_secs"] = json!(timeout_secs);
-            payload["status"] = json!(sent.status);
+            payload["delivery_state"] =
+                crate::collaboration_output::receipt(&sent)["delivery_state"].clone();
             payload["next_step"] = json!(format!(
-                "the request stays queued for {}; call muxa_wait_reply with request_id {} to keep \
+                "the request remains durable for {}; call muxa_wait_reply with request_id {} to keep \
                  waiting, or muxa_peer_report later. Do not poll the pane.",
                 selection.pane, sent.id
             ));
@@ -1849,6 +2232,51 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
         }
         Err(error) => error_result(&format!("call_peer wait failed: {error}")),
     }
+}
+
+/// Durable sender receipt written before any remote effect. A restarted caller
+/// can recover the deterministic request ID without inventing another task.
+fn persist_peer_dispatch(
+    id: &str,
+    host: &str,
+    node_id: &muxa::NodeId,
+    pane: &muxa::PaneKey,
+    request: &NewRequest,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let root =
+        muxa::paths::default_node_id_file().ok_or_else(|| anyhow::anyhow!("no data directory"))?;
+    let dir = root
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("no data parent"))?
+        .join("dispatches/peer-outbox");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{id}.json"));
+    let mut contract = serde_json::to_value(request)?;
+    // Agent state/cwd changes between retries are advisory, not a new task.
+    contract.as_object_mut().unwrap().remove("initiator");
+    let value = json!({"host":host,"node_id":node_id,"pane_key":pane,"request":contract,"request_id":format!("dispatch-{id}")});
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(&serde_json::to_vec(&value)?)?;
+            file.sync_all()?;
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+            if existing != value {
+                anyhow::bail!("dispatch_id already journals a different target or payload");
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
 }
 
 /// Durable colleague call across a named physical Fleet host.
@@ -1892,12 +2320,17 @@ async fn fleet_call_peer(
         Err(error) => return error_result(&error),
     };
     let paths = string_array(args, "paths");
-    let request =
+    let mut request =
         match new_request_from_args(args, kind, body, true, work_mode, paths, air_artifacts) {
             Ok(request) => request,
             Err(error) => return error_result(&error),
         };
 
+    if let Ok(origin) = resolve_collaboration_origin(client).await {
+        if let Ok(room) = client.collaboration_context(&origin).await {
+            request.initiator = Some(Box::new(room.current));
+        }
+    }
     if let Err(error) = ensure_fleet_collaboration_ready(client, host).await {
         return error_result(&format!("fleet_call_peer refused: {error}"));
     }
@@ -1905,27 +2338,74 @@ async fn fleet_call_peer(
         Ok(target) => target,
         Err(error) => return error_result(&format!("fleet_call_peer failed: {error}")),
     };
+    let dispatch_id = match request.dispatch_id.as_deref() {
+        Some(id) => match uuid::Uuid::parse_str(id) {
+            Ok(id) => id.to_string(),
+            Err(_) => return error_result("dispatch_id must be a UUID"),
+        },
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+    request.dispatch_id = Some(dispatch_id.clone());
+    let snapshot = match client.fleet_snapshot(None).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return error_result(&error.to_string()),
+    };
+    request.source_node_id = snapshot
+        .hosts
+        .iter()
+        .find(|h| h.local)
+        .and_then(|h| h.node_id.clone());
+    if !snapshot.hosts.iter().any(|h| {
+        h.alias == host
+            && h.capabilities
+                .iter()
+                .any(|c| c == "collaboration_dispatch_v1")
+    }) {
+        return error_result("target must advertise collaboration_dispatch_v1; upgrade its muxa and muxad before durable dispatch");
+    }
+    let Some(node_id) = snapshot
+        .hosts
+        .iter()
+        .find(|h| h.alias == host)
+        .and_then(|h| h.node_id.as_ref())
+    else {
+        return error_result("target NodeId unavailable; refusing an unpinned peer dispatch");
+    };
+    if let Err(error) = persist_peer_dispatch(&dispatch_id, host, node_id, &pane_key, &request) {
+        return error_result(&format!("cannot journal dispatch before sending: {error}"));
+    }
     let result = match client
         .fleet_execute(
             host,
             &muxa::FleetOperation::CollaborationSend {
                 pane: pane_key.clone(),
-                request,
+                request: Box::new(request),
             },
         )
         .await
     {
         Ok(result) => result,
-        Err(error) => return error_result(&format!("fleet_call_peer send failed: {error}")),
+        Err(error) => {
+            return json_result(&json!({
+                "sent": null, "final_reply_received": false, "reason": "delivery_unknown",
+                "dispatch_id": dispatch_id, "request_id": format!("dispatch-{dispatch_id}"),
+                "host": host, "pane_key": pane_key, "error": error.to_string(),
+                "next_step": "Look up this exact request first. Retry only with the same dispatch_id and unchanged payload; never create a replacement automatically."
+            }))
+        }
     };
     let Some(sent) = result.collaboration_request.map(|request| *request) else {
         return error_result("fleet_call_peer send returned no collaboration request");
     };
     let common = json!({
+        "dispatch_id": dispatch_id,
         "sent": true,
         "host": host,
         "pane_key": pane_key,
         "selected_peer": sent.to,
+        "initiator": sent.initiator,
+        "progress_route": {"tool":"muxa_update_request", "request_id":sent.id},
+        "guidance_route": {"tool":"muxa_fleet_update_request", "host":host, "pane_key":pane_key, "request_id":sent.id},
         "expanded_skill": expanded_skill,
         "request_id": sent.id,
         "thread_id": sent.thread_id,
@@ -1938,7 +2418,7 @@ async fn fleet_call_peer(
     });
     if !args.get("wait").and_then(Value::as_bool).unwrap_or(true) {
         let mut payload = common;
-        payload["completed"] = json!(false);
+        payload["final_reply_received"] = json!(false);
         payload["reason"] = json!("sent_without_waiting");
         return json_result(&payload);
     }
@@ -1948,20 +2428,32 @@ async fn fleet_call_peer(
         .and_then(Value::as_u64)
         .unwrap_or(300)
         .clamp(1, MAX_WAIT_SECS);
-    match await_fleet_collaboration_reply(client, host, &pane_key, &sent.id, timeout_secs).await {
+    match await_fleet_collaboration_reply(client, host, &pane_key, &sent.id, timeout_secs, None)
+        .await
+    {
+        Ok(Some(request)) if request.peer_interrupted() && !request.status.is_terminal() => {
+            let mut payload = request_outcome(&request);
+            payload["host"] = json!(host);
+            payload["pane_key"] = json!(pane_key);
+            json_result(&payload)
+        }
         Ok(Some(request)) if request.status.is_terminal() => {
             let mut payload = common;
-            payload["completed"] = json!(true);
-            payload["status"] = json!(request.status);
-            payload["reply"] = json!(request.reply);
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(request_outcome(&request).as_object().unwrap().clone());
             json_result(&payload)
         }
         Ok(current) => {
             let mut payload = common;
-            payload["completed"] = json!(false);
+            payload["final_reply_received"] = json!(false);
             payload["reason"] = json!("timeout");
             payload["timeout_secs"] = json!(timeout_secs);
-            payload["status"] = json!(current.as_ref().unwrap_or(&sent).status);
+            payload["delivery_state"] =
+                crate::collaboration_output::receipt(current.as_ref().unwrap_or(&sent))
+                    ["delivery_state"]
+                    .clone();
             payload["next_step"] = json!({
                 "tool": "muxa_fleet_wait_reply",
                 "arguments": {
@@ -1979,10 +2471,11 @@ async fn fleet_call_peer(
             // duplicate work. Preserve the durable request and exact pane so
             // a later wait can resume after a transient relay failure.
             let mut payload = common;
-            payload["completed"] = json!(false);
+            payload["final_reply_received"] = json!(false);
             payload["reason"] = json!("wait_failed");
             payload["error"] = json!(error);
-            payload["status"] = json!(sent.status);
+            payload["delivery_state"] =
+                crate::collaboration_output::receipt(&sent)["delivery_state"].clone();
             payload["next_step"] = json!({
                 "tool": "muxa_fleet_wait_reply",
                 "arguments": {
@@ -2033,25 +2526,58 @@ async fn fleet_wait_reply(client: &Client, args: &Value) -> Value {
     let timeout_secs = args
         .get("timeout_secs")
         .and_then(Value::as_u64)
-        .unwrap_or(300)
+        .unwrap_or(DEFAULT_WAIT_SECS)
         .clamp(1, MAX_WAIT_SECS);
-    match await_fleet_collaboration_reply(client, host, &pane_key, request_id, timeout_secs).await {
-        Ok(Some(request)) if request.status.is_terminal() => json_result(&json!({
-            "completed": true,
-            "host": host,
-            "pane_key": pane_key,
-            "request_id": request.id,
-            "status": request.status,
-            "reply": request.reply,
-        })),
+    match await_fleet_collaboration_reply(
+        client,
+        host,
+        &pane_key,
+        request_id,
+        timeout_secs,
+        args.get("after_update").and_then(Value::as_u64),
+    )
+    .await
+    {
+        Ok(Some(request)) if request.peer_interrupted() && !request.status.is_terminal() => {
+            let mut payload = request_outcome(&request);
+            payload["host"] = json!(host);
+            payload["pane_key"] = json!(pane_key);
+            json_result(&payload)
+        }
+        Ok(Some(request)) if request.status.is_terminal() => {
+            let mut result = request_outcome(&request);
+            result["host"] = json!(host);
+            result["pane_key"] = json!(pane_key);
+            result["updates"] = crate::collaboration_output::updates(
+                &request,
+                args.get("after_update")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
+            result["next_after_update"] = json!(request.updates.last().map(|u| u.sequence));
+            json_result(&result)
+        }
+        Ok(Some(request))
+            if args
+                .get("after_update")
+                .and_then(Value::as_u64)
+                .is_some_and(|seen| request.updates.last().is_some_and(|u| u.sequence > seen)) =>
+        {
+            json_result(&json!({
+                "final_reply_received":false, "reason":"updated", "host":host, "pane_key":pane_key,
+                "request_id":request.id, "delivery_state":crate::collaboration_output::receipt(&request)["delivery_state"], "updates":crate::collaboration_output::updates(&request, args.get("after_update").and_then(Value::as_u64).unwrap_or(0)),
+                "first_retained_sequence":request.updates.first().map(|u| u.sequence),
+                "next_after_update":request.updates.last().map(|u| u.sequence),
+            }))
+        }
         Ok(current) => json_result(&json!({
-            "completed": false,
+            "final_reply_received": false,
             "reason": "timeout",
             "timeout_secs": timeout_secs,
             "host": host,
             "pane_key": pane_key,
             "request_id": request_id,
-            "status": current.map(|request| request.status),
+            "delivery_state": current.as_ref().map(|request| crate::collaboration_output::receipt(request)["delivery_state"].clone()),
         })),
         Err(error) => error_result(&format!("fleet_wait_reply failed: {error}")),
     }
@@ -2100,7 +2626,19 @@ async fn await_fleet_collaboration_reply(
     pane: &muxa::PaneKey,
     request_id: &str,
     timeout_secs: u64,
+    after_update: Option<u64>,
 ) -> std::result::Result<Option<CollaborationRequest>, String> {
+    let hello = client
+        .hello(Duration::from_secs(3))
+        .await
+        .map_err(|e| e.to_string())?;
+    if hello.capabilities.iter().any(|c| c == "fleet_wait_reply") {
+        return client
+            .fleet_wait_reply(host, pane, request_id, timeout_secs, after_update)
+            .await
+            .map_err(|e| e.to_string());
+    }
+    let mut poll_interval = FLEET_REPLY_POLL_INTERVAL;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut current = None;
     loop {
@@ -2117,16 +2655,22 @@ async fn await_fleet_collaboration_reply(
         let request = *result
             .collaboration_request
             .ok_or_else(|| "Fleet collaboration get returned no request".to_string())?;
-        let terminal = request.status.is_terminal();
+        let terminal = request.status.is_terminal() || request.peer_interrupted();
         current = Some(request);
-        if terminal || tokio::time::Instant::now() >= deadline {
+        let updated = after_update.is_some_and(|seen| {
+            current
+                .as_ref()
+                .is_some_and(|r| r.updates.last().is_some_and(|u| u.sequence > seen))
+        });
+        if terminal || updated || tokio::time::Instant::now() >= deadline {
             return Ok(current);
         }
         tokio::time::sleep_until(std::cmp::min(
             deadline,
-            tokio::time::Instant::now() + FLEET_REPLY_POLL_INTERVAL,
+            tokio::time::Instant::now() + poll_interval,
         ))
         .await;
+        poll_interval = (poll_interval * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -2195,8 +2739,16 @@ async fn start_work(client: &Client, args: &Value, config: &muxa::config::Config
         Ok(resolved) => resolved,
         Err(error) => return error_result(&format!("{error:#}")),
     };
+    let (endpoint, _) = match lifecycle_target(client, None).await {
+        Ok(value) => value,
+        Err(error) => return error_result(&format!("muxa_start_work failed: {error}")),
+    };
     let result = if up.dry_run {
-        match tokio::task::spawn_blocking(move || crate::work_up::apply(resolved, true)).await {
+        match tokio::task::spawn_blocking(move || {
+            crate::mux_control::with_endpoint(endpoint, || crate::work_up::apply(resolved, true))
+        })
+        .await
+        {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => return error_result(&format!("{error:#}")),
             Err(error) => return error_result(&format!("muxa_start_work worker failed: {error}")),
@@ -2205,7 +2757,9 @@ async fn start_work(client: &Client, args: &Value, config: &muxa::config::Config
         let runtime = tokio::runtime::Handle::current();
         let client = client.clone();
         match tokio::task::spawn_blocking(move || {
-            runtime.block_on(crate::work_up::apply_durable(resolved, &client))
+            crate::mux_control::with_endpoint(endpoint, || {
+                runtime.block_on(crate::work_up::apply_durable(resolved, &client))
+            })
         })
         .await
         {
@@ -2267,19 +2821,24 @@ fn select_peer(
         }));
     }
     let pane_target = target.strip_prefix("pane:").unwrap_or(target);
+    let pane_target = if pane_target.starts_with('%') && room.current.pane.starts_with("rmux:") {
+        format!("rmux:{pane_target}")
+    } else {
+        pane_target.to_owned()
+    };
     if let Some(peer) = live.iter().copied().find(|peer| peer.pane == pane_target) {
         return Ok(Some(PeerSelection::registered(
             peer.clone(),
             format!("explicit pane {}", peer.pane),
         )));
     }
-    if is_pane_selector(pane_target) {
+    if is_pane_selector(&pane_target) {
         // An explicitly addressed pane that hosts no registered peer is not an
         // error here: muxad resolves a muxa-launched pane whose agent has not
         // registered yet, and refuses anything else. Deciding that locally
         // would duplicate — and could contradict — the authoritative guard.
         return Ok(Some(PeerSelection::pending(
-            pane_target.to_string(),
+            pane_target.clone(),
             format!("explicit pane {pane_target}, pending its agent's registration"),
         )));
     }
@@ -2412,6 +2971,23 @@ fn provider_kind(target: &str) -> Option<AgentKind> {
     }
 }
 
+/// Review routing defaults to the other provider; explicit routing remains authoritative.
+fn review_provider_target(target: &str, kind: RequestKind, caller: AgentKind) -> &str {
+    let automatic = matches!(
+        target.trim().to_ascii_lowercase().as_str(),
+        "" | "auto" | "peer" | "@peer" | "@muxa-peer"
+    );
+    if kind == RequestKind::Review && automatic {
+        match caller {
+            AgentKind::Codex => "claude",
+            AgentKind::ClaudeCode => "codex",
+            _ => target,
+        }
+    } else {
+        target
+    }
+}
+
 fn peer_spawn_program(
     args: &Value,
     current: &Participant,
@@ -2509,15 +3085,22 @@ async fn spawn_peer(
     program: crate::agent_launch::AgentProgram,
     config: &muxa::config::Config,
 ) -> std::result::Result<(PeerSelection, crate::agent_launch::StartResult), String> {
-    if room.current.room.host != "tmux" || !room.current.pane.starts_with('%') {
-        return Err("call_peer automatic spawn currently requires a native tmux agent pane".into());
-    }
+    let host = muxa::backend::pane_id_host_kind(&room.current.pane)
+        .filter(|host| crate::mux_control::supported(*host))
+        .ok_or("call_peer automatic spawn requires a tmux or rmux agent pane")?;
+    let endpoint =
+        select_lifecycle_endpoint(host, room.current.socket.clone().into_iter().collect())?;
+    let native_pane = room
+        .current
+        .pane
+        .strip_prefix("rmux:")
+        .unwrap_or(&room.current.pane);
     let request = crate::agent_launch::StartRequest {
         socket: client.socket().to_path_buf(),
         agent: program,
         options: config.launch_options(program.label(), None),
         placement: crate::agent_launch::Placement::Pane,
-        target: Some(room.current.pane.clone()),
+        target: Some(native_pane.to_string()),
         cwd: room.current.cwd.as_deref().map(std::path::PathBuf::from),
         prompt: None,
         name: None,
@@ -2543,10 +3126,15 @@ async fn spawn_peer(
         .subscribe()
         .await
         .map_err(|error| format!("call_peer could not watch peer registration: {error}"))?;
-    let started = tokio::task::spawn_blocking(move || crate::agent_launch::start(request))
-        .await
-        .map_err(|error| format!("call_peer spawn worker failed: {error}"))?
-        .map_err(|error| format!("call_peer spawn failed: {error}"))?;
+    let mut started = tokio::task::spawn_blocking(move || {
+        crate::mux_control::with_endpoint(Some(endpoint), || crate::agent_launch::start(request))
+    })
+    .await
+    .map_err(|error| format!("call_peer spawn worker failed: {error}"))?
+    .map_err(|error| format!("call_peer spawn failed: {error}"))?;
+    if host == muxa::HostKind::Rmux {
+        started.pane = format!("rmux:{}", started.pane);
+    }
     let timeout_secs = args
         .get("spawn_timeout_secs")
         .and_then(Value::as_u64)
@@ -2686,10 +3274,144 @@ async fn await_collaboration_reply(
         .collaboration_wait(origin, request_id, timeout_secs)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(request.status.is_terminal().then_some(request))
+    Ok((request.status.is_terminal() || request.peer_interrupted()).then_some(request))
 }
 
-fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
+tokio::task_local! {
+    /// Agent session id the MCP host stamped on the current `tools/call`.
+    static CALLER_SESSION: Option<String>;
+}
+
+/// The calling thread's session id from a `tools/call`'s `_meta`. Codex sends
+/// `threadId`/`sessionId` (and the same id inside `x-codex-turn-metadata`) on
+/// every call; other hosts send nothing and keep the pane-env identity.
+fn caller_session_hint(params: Option<&Value>) -> Option<String> {
+    let meta = params?.get("_meta")?;
+    [
+        meta.get("threadId"),
+        meta.get("sessionId"),
+        meta.pointer("/x-codex-turn-metadata/session_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_str)
+    .map(str::trim)
+    .filter(|id| !id.is_empty())
+    .map(str::to_owned)
+}
+
+/// Whether this process inherited its pane env from a shared Codex
+/// app-server. Ancestry is fixed for the life of the process, so walk once.
+fn pane_env_is_borrowed() -> bool {
+    static SHARED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SHARED.get_or_init(|| {
+        muxa::adapters::proc_ancestry::under_shared_codex_app_server(std::process::id())
+    })
+}
+
+/// How long a session-id resolution is reused. Short enough that a binding
+/// the reconciler repairs (a pane claimed before the fix, a late cwd match)
+/// takes effect promptly; long enough that a burst of calls costs one lookup.
+const SESSION_ORIGIN_TTL: Duration = Duration::from_secs(30);
+
+/// The origin this MCP call or CLI invocation speaks for.
+///
+/// Normally the pane env names the caller ([`current_collaboration_origin`]).
+/// Under a shared Codex app-server it names whichever pane started that
+/// server, so the caller is identified by its Codex session id instead — the
+/// MCP `_meta` thread id, or `$CODEX_THREAD_ID` for a shell command — and
+/// mapped to the pane the registry bound that session to. A wrong identity is
+/// worse than none: when the session is unknown or not yet bound to a pane,
+/// this fails rather than borrowing the server's pane.
+pub(crate) async fn resolve_collaboration_origin(
+    client: &Client,
+) -> std::result::Result<CollaborationOrigin, String> {
+    let session = CALLER_SESSION
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            std::env::var("CODEX_THREAD_ID")
+                .ok()
+                .filter(|id| !id.trim().is_empty())
+        });
+    if !pane_env_is_borrowed() {
+        // The pane env is trustworthy, but a pane can still carry more than
+        // one registry row; the session id lets the daemon pick the caller's.
+        let mut origin = current_collaboration_origin()?;
+        origin.agent_session_id = session;
+        return Ok(origin);
+    }
+    let session = session.ok_or_else(|| {
+        "collaboration cannot identify this Codex thread: it runs under the shared \
+             Codex app-server, whose pane variables belong to another pane, and the \
+             call carried no thread id. Upgrade Codex, or start it with `codex --no-daemon`"
+            .to_string()
+    })?;
+    session_origin(client, &session).await
+}
+
+async fn session_origin(
+    client: &Client,
+    session: &str,
+) -> std::result::Result<CollaborationOrigin, String> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, (std::time::Instant, CollaborationOrigin)>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((at, origin)) = cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(session).cloned())
+    {
+        if at.elapsed() < SESSION_ORIGIN_TTL {
+            return Ok(origin);
+        }
+    }
+    let agents = client
+        .snapshot()
+        .await
+        .map_err(|error| format!("collaboration origin lookup failed: {error}"))?;
+    let origin = origin_for_session(&agents, session)?;
+    // An unbound origin is resolved by the daemon, which binds the session on
+    // demand; ask it again next time instead of caching the empty pane.
+    if !origin.pane.is_empty() {
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(
+                session.to_owned(),
+                (std::time::Instant::now(), origin.clone()),
+            );
+        }
+    }
+    Ok(origin)
+}
+
+fn origin_for_session(
+    agents: &[Agent],
+    session: &str,
+) -> std::result::Result<CollaborationOrigin, String> {
+    let agent = agents
+        .iter()
+        .find(|agent| agent.session_id == session)
+        .ok_or_else(|| {
+            format!(
+                "collaboration origin: Codex thread {session} is not tracked yet; \
+                 submit a prompt so its hooks register it, then retry"
+            )
+        })?;
+    // Not bound yet: send the session alone. The daemon binds it from live
+    // process evidence before resolving; an empty pane can never fall back
+    // onto another agent's pane.
+    let pane = agent.pane.clone().unwrap_or_default();
+    Ok(CollaborationOrigin {
+        pane,
+        socket: agent.tmux_socket.clone(),
+        console: false,
+        agent_session_id: Some(session.to_owned()),
+    })
+}
+
+pub(crate) fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
     let pane = muxa::default_backend()
         .current_pane()
         .or_else(current_process_host_pane)
@@ -2716,6 +3438,7 @@ fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, St
         pane,
         socket,
         console: false,
+        agent_session_id: None,
     })
 }
 
@@ -2816,9 +3539,29 @@ fn new_request_from_args(
     air_artifacts: Vec<AirArtifactReference>,
 ) -> std::result::Result<NewRequest, String> {
     Ok(NewRequest {
+        dispatch_id: optional_string(args, "dispatch_id")?,
+        source_node_id: None,
+        delegation_parent: args
+            .get("delegation_parent")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .map_err(|e| format!("invalid delegation_parent: {e}"))?,
+        human_action: args
+            .get("human_action")
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid human_action: {error}"))
+            })
+            .transpose()?,
+        initiator: None,
         kind,
         body,
         expects_reply,
+        notify: match args.get("notify") {
+            None => None,
+            Some(Value::Bool(notify)) => Some(*notify),
+            Some(_) => return Err("notify must be a boolean".into()),
+        },
         work_mode,
         thread_id: optional_string(args, "thread_id")?,
         parent_request_id: optional_string(args, "parent_request_id")?,
@@ -2859,7 +3602,7 @@ async fn wait_for_reply(client: &Client, args: &Value) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_WAIT_SECS)
         .clamp(1, MAX_WAIT_SECS);
-    let origin = match current_collaboration_origin() {
+    let origin = match resolve_collaboration_origin(client).await {
         Ok(origin) => origin,
         Err(error) => return error_result(&error),
     };
@@ -2867,39 +3610,45 @@ async fn wait_for_reply(client: &Client, args: &Value) -> Value {
         .collaboration_wait(&origin, request_id, timeout_secs)
         .await
     {
-        Ok(request) if request.status.is_terminal() => json_result(&request_outcome(&request)),
-        Ok(_) => json_result(&json!({
-            "completed": false,
-            "reason": "timeout",
-            "request_id": request_id,
-        })),
+        Ok(request) if request.status.is_terminal() || request.peer_interrupted() => {
+            json_result(&request_outcome(&request))
+        }
+        Ok(request) => {
+            let mut value = request_outcome(&request);
+            value["reason"] = json!("timeout");
+            json_result(&value)
+        }
         Err(error) => error_result(&format!("wait_reply failed: {error}")),
     }
 }
 
-/// Render the `muxa_send_prompt` result, defensively tolerating both the
-/// legacy contract (success = text sent, and Enter pressed if requested) and
-/// the newer daemon shape that reports Enter delivery separately.
-///
-/// `submitted` is what the daemon actually reported about the Enter keystroke:
-/// - `None` — the daemon didn't say (older client method that returns `()`):
-///   fall back to the caller's `submit` intent.
-/// - `Some(true)` — Enter was delivered; the line is committed.
-/// - `Some(false)` — the text landed but Enter did **not**; surfaced plainly
-///   so the caller doesn't assume the line was committed.
-fn render_send_result(text_len: usize, pane: &str, submit: bool, submitted: Option<bool>) -> Value {
+/// Report Enter transport acceptance separately from application acknowledgement.
+/// Legacy daemons and missing hooks leave application submission unknown.
+fn render_send_result(
+    text_len: usize,
+    pane: &str,
+    submit: bool,
+    submitted: Option<bool>,
+    submission_confirmed: Option<bool>,
+) -> Value {
     match submitted {
         Some(false) if submit => text_result(&format!(
             "sent {text_len} chars to {pane}, but the line was NOT submitted \
              (Enter not delivered) — the text is typed but not yet committed",
         )),
         _ => {
-            // No daemon signal → trust the requested `submit`; an explicit
-            // `Some(true)` confirms it.
-            let committed = submitted.unwrap_or(submit);
+            let enter_sent = submitted.unwrap_or(false);
             text_result(&format!(
                 "sent {text_len} chars to {pane}{}",
-                if committed { " and submitted" } else { "" },
+                if submission_confirmed == Some(true) {
+                    " and submission confirmed"
+                } else if enter_sent {
+                    "; Enter sent, application submission unconfirmed (do not resend text)"
+                } else if submit {
+                    "; submission status unavailable (do not resend text)"
+                } else {
+                    ""
+                },
             ))
         }
     }
@@ -2943,7 +3692,8 @@ async fn send_prompt_with_local_cmux(
         let target_prompt = prompt.to_string();
         if let Ok(Some(outcome)) = tokio::task::spawn_blocking(move || {
             let backend = muxa::backend::cmux::CmuxBackend::with_endpoint(endpoint);
-            if !muxa::PaneBackend::send_text(&backend, &target_pane, &target_prompt) {
+            if !muxa::PaneBackend::send_prompt_text_on(&backend, None, &target_pane, &target_prompt)
+            {
                 return None;
             }
             let submitted = if submit {
@@ -2957,6 +3707,7 @@ async fn send_prompt_with_local_cmux(
             Some(SendPromptOutcome {
                 sent: true,
                 submitted,
+                submission_confirmed: None,
             })
         })
         .await
@@ -3369,28 +4120,66 @@ fn text_result(text: &str) -> Value {
     json!({ "content": [ { "type": "text", "text": text } ] })
 }
 
-/// A compact acknowledgement for mutations. The caller already supplied the
-/// request body and attachments, so echoing the full durable record only
-/// consumes context; retain the correlation and routing fields it needs next.
+/// Initial send receipts retain routing; subsequent mutations use `mutation_receipt`.
 fn request_ack(request: &CollaborationRequest) -> Value {
-    json!({
-        "request_id": request.id,
-        "thread_id": request.thread_id,
-        "parent_request_id": request.parent_request_id,
-        "workspace_id": request.workspace_id,
-        "work_id": request.work_id,
-        "run_id": request.run_id,
-        "status": request.status,
-        "to": request.to,
-    })
+    let mut value = crate::collaboration_output::receipt(request);
+    value["notify"] = json!(request.should_notify());
+    value
 }
 
-/// Terminal request result without re-embedding the original prompt, sender,
-/// provenance, and timestamps. The structured reply is the new information.
 fn request_outcome(request: &CollaborationRequest) -> Value {
-    let mut value = request_ack(request);
-    value["completed"] = json!(true);
-    value["reply"] = json!(request.reply);
+    crate::collaboration_output::outcome(request)
+}
+
+fn report_view(request: &CollaborationRequest, args: &Value) -> Value {
+    if args.get("full").and_then(Value::as_bool).unwrap_or(false) {
+        json!(request)
+    } else {
+        request_outcome(request)
+    }
+}
+
+fn message_page(mut requests: Vec<CollaborationRequest>, args: &Value) -> Value {
+    requests.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let offset = usize::try_from(args.get("offset").and_then(Value::as_u64).unwrap_or(0))
+        .unwrap_or(usize::MAX);
+    let limit = usize::try_from(
+        args.get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 100),
+    )
+    .unwrap_or(100);
+    let has_more = requests.len().saturating_sub(offset) > limit;
+    json!({"requests":requests.iter().skip(offset).take(limit)
+        .map(|request| message_view(request, args)).collect::<Vec<_>>(),
+        "has_more":has_more, "next_offset":has_more.then(|| offset.saturating_add(limit))})
+}
+
+fn message_view(request: &CollaborationRequest, args: &Value) -> Value {
+    if args.get("full").and_then(Value::as_bool).unwrap_or(false) {
+        return json!(request);
+    }
+    let mut value = crate::collaboration_output::message(
+        request,
+        args.get("include_body")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    if args.get("request_id").is_some() {
+        if let Some(reply) = &request.reply {
+            value["reply"] = json!(reply);
+        }
+    }
+    if let Some(after) = args.get("after_update").and_then(Value::as_u64) {
+        value["updates"] = crate::collaboration_output::updates(request, after);
+        value["first_retained_sequence"] = json!(request.updates.first().map(|u| u.sequence));
+    }
     value
 }
 
@@ -3414,6 +4203,164 @@ fn error_result(message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn lifecycle_target_keeps_rmux_namespace_bound_to_registered_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("routing.sock");
+        let store = Store::shared();
+        let register = |session: &str, endpoint: &str| AgentEvent::Started {
+            id: muxa::event::AgentId {
+                kind: AgentKind::Codex,
+                session_id: session.into(),
+                surface: None,
+                pane: Some("rmux:%42".into()),
+                tmux_socket: Some(endpoint.into()),
+                cwd: None,
+            },
+            at: time::OffsetDateTime::now_utc(),
+        };
+        store
+            .apply(&register("routing-a", "/tmp/routing-a.sock"))
+            .await;
+        let server = Server::new(socket.clone(), store.clone()).with_backends(vec![]);
+        let (shutdown, rx) = broadcast::channel(1);
+        let daemon = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let (endpoint, target) = lifecycle_target(&client, Some("rmux:%42")).await.unwrap();
+        assert_eq!(
+            endpoint.unwrap(),
+            muxa::BackendEndpoint {
+                host: HostKind::Rmux,
+                socket: "/tmp/routing-a.sock".into()
+            }
+        );
+        assert_eq!(target.as_deref(), Some("%42"));
+        assert!(lifecycle_target(&client, Some("rmux:%999")).await.is_err());
+        store
+            .apply(&register("routing-b", "/tmp/routing-b.sock"))
+            .await;
+        assert!(lifecycle_target(&client, Some("rmux:%42")).await.is_err());
+        let _ = shutdown.send(());
+        daemon.await.unwrap();
+    }
+
+    #[test]
+    fn lifecycle_resolution_rejects_unknown_or_ambiguous_servers() {
+        use muxa::HostKind;
+        assert!(select_lifecycle_endpoint(HostKind::Rmux, vec![]).is_err());
+        assert!(select_lifecycle_endpoint(HostKind::Rmux, vec!["/a".into(), "/b".into()]).is_err());
+        let endpoint =
+            select_lifecycle_endpoint(HostKind::Rmux, vec!["/a".into(), "/a".into()]).unwrap();
+        assert_eq!(endpoint.host, HostKind::Rmux);
+        assert_eq!(endpoint.socket, "/a");
+    }
+
+    #[test]
+    fn message_pages_are_bounded_ordered_and_do_not_repeat_bodies() {
+        let requests: Vec<_> = (0..105)
+            .map(|index| {
+                let mut request = crate::collaboration_output::fixture();
+                request.id = format!("req-{index:03}");
+                request
+            })
+            .collect();
+        let page = message_page(requests.clone(), &json!({}));
+        assert_eq!(page["requests"].as_array().unwrap().len(), 20);
+        assert_eq!(page["requests"][0]["request_id"], "req-104");
+        assert!(page["requests"][0].get("body").is_none());
+        assert_eq!(page["next_offset"], 20);
+        let next = message_page(requests.clone(), &json!({"offset":20}));
+        assert_eq!(next["requests"][0]["request_id"], "req-084");
+        let capped = message_page(requests.clone(), &json!({"limit":1000}));
+        assert_eq!(capped["requests"].as_array().unwrap().len(), 100);
+        let tail = message_page(requests, &json!({"offset":100,"include_body":true}));
+        assert_eq!(tail["requests"].as_array().unwrap().len(), 5);
+        assert_eq!(tail["has_more"], false);
+        assert!(tail["next_offset"].is_null());
+        assert_eq!(tail["requests"][0]["body"], "original instructions");
+    }
+
+    #[test]
+    fn report_and_message_views_are_bounded_and_full_is_explicit() {
+        let request = crate::collaboration_output::fixture();
+        let compact = report_view(&request, &json!({}));
+        assert!(compact.get("body").is_none());
+        assert_eq!(report_view(&request, &json!({"full":true})), json!(request));
+        assert!(message_view(&request, &json!({})).get("body").is_none());
+        assert_eq!(
+            message_view(&request, &json!({"include_body":true}))["body"],
+            request.body
+        );
+        assert_eq!(
+            message_view(&request, &json!({"full":true})),
+            json!(request)
+        );
+    }
+
+    #[test]
+    fn caller_session_hint_reads_codex_meta() {
+        let params = json!({
+            "name": "muxa_room_context",
+            "_meta": {
+                "x-codex-turn-metadata": { "session_id": "turn-meta-id" },
+                "threadId": "01a0fa66-913b-7242-bf6a-5b1165479643",
+                "sessionId": "01a0fa66-913b-7242-bf6a-5b1165479643"
+            }
+        });
+        assert_eq!(
+            caller_session_hint(Some(&params)).as_deref(),
+            Some("01a0fa66-913b-7242-bf6a-5b1165479643")
+        );
+        let nested_only = json!({ "_meta": { "x-codex-turn-metadata": { "session_id": "s1" } } });
+        assert_eq!(
+            caller_session_hint(Some(&nested_only)).as_deref(),
+            Some("s1")
+        );
+        assert_eq!(
+            caller_session_hint(Some(&json!({ "_meta": { "threadId": " " } }))),
+            None
+        );
+        assert_eq!(caller_session_hint(Some(&json!({ "name": "x" }))), None);
+        assert_eq!(caller_session_hint(None), None);
+    }
+
+    fn tracked(session: &str, pane: Option<&str>) -> Agent {
+        let mut agent: Agent = serde_json::from_value(json!({
+            "kind": "codex",
+            "session_id": session,
+            "state": "idle",
+            "started_at": "2026-10-02T00:00:00Z",
+            "last_activity_at": "2026-10-02T00:00:00Z",
+            "state_entered_at": "2026-10-02T00:00:00Z"
+        }))
+        .expect("minimal agent");
+        agent.pane = pane.map(str::to_owned);
+        agent.tmux_socket = pane.map(|_| "default".to_owned());
+        agent
+    }
+
+    /// Three Codex threads share one app-server whose env says `%9`; each
+    /// must resolve to the pane the registry bound *its* session to.
+    #[test]
+    fn session_origin_uses_the_threads_own_binding() {
+        let agents = [
+            tracked("thread-junia", Some("rmux:%9")),
+            tracked("thread-a", Some("rmux:%137")),
+            tracked("thread-b", None),
+        ];
+        let origin = origin_for_session(&agents, "thread-a").unwrap();
+        assert_eq!(origin.pane, "rmux:%137");
+        assert_eq!(origin.socket.as_deref(), Some("default"));
+        assert!(!origin.console);
+        assert_eq!(origin.agent_session_id.as_deref(), Some("thread-a"));
+        let unbound = origin_for_session(&agents, "thread-b").unwrap();
+        assert_eq!(unbound.pane, "", "an unbound session never borrows a pane");
+        assert_eq!(unbound.agent_session_id.as_deref(), Some("thread-b"));
+        let unknown = origin_for_session(&agents, "thread-c").unwrap_err();
+        assert!(unknown.contains("not tracked"), "{unknown}");
+    }
     use muxa::backend::{BackendCaps, HostKind, PaneBackend, SharedBackend};
     use muxa::event::AgentEvent;
     use muxa::ipc::Server;
@@ -3501,6 +4448,7 @@ mod tests {
     fn registration_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -3552,6 +4500,459 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one isolated transport lifecycle, including origin env
+    async fn compact_collaboration_dispatch_round_trip() {
+        const PROBE: &str = "MUXA_COMPACT_DISPATCH_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mcp::tests::compact_collaboration_dispatch_round_trip",
+                    "--nocapture",
+                ])
+                .env(PROBE, "1")
+                .env_remove("MUXA_HOST")
+                .env_remove("MUXA_HOSTS")
+                .env_remove("RMUX")
+                .env_remove("RMUX_PANE")
+                .env_remove("CMUX_SOCKET_PATH")
+                .env_remove("HERDR_PANE")
+                .env("TMUX", "/tmp/muxa-compact-test/default,0,0")
+                .env("TMUX_PANE", "%1")
+                .env("CODEX_THREAD_ID", "compact-recipient")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("compact.sock");
+        let origin = current_collaboration_origin().unwrap();
+        let store = Store::shared();
+        for (pane, session, kind) in [
+            ("%1", "compact-recipient", AgentKind::Codex),
+            ("%2", "compact-sender", AgentKind::ClaudeCode),
+        ] {
+            store
+                .apply(&AgentEvent::Started {
+                    id: muxa::event::AgentId {
+                        kind,
+                        session_id: session.into(),
+                        surface: None,
+                        pane: Some(pane.into()),
+                        tmux_socket: origin.socket.clone(),
+                        cwd: Some("/repo".into()),
+                    },
+                    at: time::OffsetDateTime::now_utc(),
+                })
+                .await;
+        }
+        let panes = [("%1", "0"), ("%2", "1")]
+            .into_iter()
+            .map(|(pane, index)| {
+                let mut pane = registration_pane(pane, index);
+                pane.socket.clone_from(&origin.socket);
+                pane
+            })
+            .collect();
+        let backend: SharedBackend = Arc::new(RegistrationBackend { panes });
+        let mailbox = muxa::collaboration::CollaborationStore::in_memory(
+            muxa::collaboration::CollaborationOptions::default(),
+        );
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox.clone());
+        let (shutdown, rx) = broadcast::channel(1);
+        let daemon = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let room = client.collaboration_context(&origin).await.unwrap();
+        let request = mailbox
+            .create(
+                room.peers[0].clone(),
+                room.current.clone(),
+                new_request_from_args(
+                    &json!({"artifacts":["commit:abc"]}),
+                    RequestKind::Task,
+                    "instructions with pending and newline\nsecond line".into(),
+                    true,
+                    WorkMode::Execute,
+                    vec!["src/allowed.rs".into()],
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        mailbox
+            .update_request(&room.peers[0], &request.id, "guidance 1".into())
+            .await
+            .unwrap();
+        let tool = |name: &str, args: Value| {
+            json!({"jsonrpc":"2.0", "id":1,"method":"tools/call",
+            "params":{"name":name,"arguments":args,"_meta":{"threadId":"compact-recipient"}}})
+        };
+        let decode = |response: Value| {
+            assert!(response["result"].get("isError").is_none(), "{response}");
+            serde_json::from_str::<Value>(
+                response["result"]["content"][0]["text"].as_str().unwrap(),
+            )
+            .unwrap()
+        };
+        let inbox = decode(
+            dispatch(&client, &tool("muxa_inbox", json!({})))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(inbox["requests"][0]["body"], request.body);
+        assert_eq!(inbox["requests"][0]["paths"], json!(["src/allowed.rs"]));
+        assert_eq!(inbox["requests"][0]["updates"][0]["body"], "guidance 1");
+        assert!(inbox["requests"][0].get("created_at").is_none());
+        let listing = decode(
+            dispatch(&client, &tool("muxa_list_messages", json!({})))
+                .await
+                .unwrap(),
+        );
+        assert!(listing["requests"][0].get("body").is_none());
+        let bulk = dispatch(
+            &client,
+            &tool("muxa_list_messages", json!({"include_body":true})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bulk["result"]["isError"], true);
+        let body = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "muxa_list_messages",
+                    json!({
+                        "request_id":request.id,"include_body":true
+                    }),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(body["body"], request.body);
+
+        let exact = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "muxa_list_messages",
+                    json!({
+            "request_id":request.id,"after_update":0}),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(exact["updates"][0]["body"], "guidance 1");
+        let unchanged = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "muxa_list_messages",
+                    json!({
+            "request_id":request.id,"after_update":1}),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(unchanged["updates"], json!([]));
+        for _ in 0..2 {
+            crate::cmd_msg(
+                &client,
+                crate::MsgCmd::Update {
+                    request_id: request.id.clone(),
+                    body: "guidance 2".into(),
+                    json: true,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let updated = client
+            .collaboration_get(&origin, &request.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.updates.len(),
+            2,
+            "retry must not duplicate an update"
+        );
+        assert_eq!(updated.updates[1].sequence, 2);
+        assert_eq!(updated.updates[1].body, "guidance 2");
+        assert_eq!(updated.paths, request.paths);
+        assert_eq!(updated.work_mode, request.work_mode);
+        assert_eq!(updated.body, request.body);
+        let ack = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "muxa_update_request",
+                    json!({
+                        "request_id":request.id,"body":"guidance 3"
+                    }),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(ack["request_id"], request.id);
+        assert_eq!(ack["next_after_update"], 3);
+        eprintln!(
+            "mutation_receipt_bytes: initial={}, follow_up={}",
+            serde_json::to_vec(&request_ack(&updated)).unwrap().len(),
+            serde_json::to_vec(&ack).unwrap().len()
+        );
+
+        for field in ["from", "to", "initiator", "body", "notify"] {
+            assert!(ack.get(field).is_none(), "unexpected {field}");
+        }
+        let progress = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "muxa_list_messages",
+                    json!({
+                        "request_id":request.id,"after_update":2
+                    }),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(progress["updates"].as_array().unwrap().len(), 1);
+        assert_eq!(progress["updates"][0]["body"], "guidance 3");
+        let parsed = <crate::Args as clap::Parser>::try_parse_from([
+            "muxa",
+            "msg",
+            "list",
+            "--request-id",
+            request.id.as_str(),
+            "--after-update",
+            "2",
+            "--json",
+            "--scope",
+            "caller",
+        ])
+        .unwrap();
+        let Some(crate::Cmd::Msg { action }) = parsed.cmd else {
+            panic!("expected msg list")
+        };
+        crate::cmd_msg(&client, action).await.unwrap();
+
+        assert_eq!(
+            client
+                .collaboration_list(&origin, RequestMailbox::All)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let invalid = dispatch(
+            &client,
+            &tool("muxa_list_messages", json!({"after_update":0})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid["result"]["isError"], true);
+        let timeout = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "muxa_wait_reply",
+                    json!({
+            "request_id":request.id,"timeout_secs":1}),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(timeout["reason"], "timeout");
+        assert_eq!(timeout["final_reply_received"], false);
+        assert!(timeout.get("reported_status").is_none());
+        let reply = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "muxa_reply",
+                    json!({"request_id":request.id,
+            "status":"failed","body":"pending text in a final failure reply"}),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(reply["final_reply_received"], true);
+        assert_eq!(reply["reported_status"], "failed");
+        assert!(reply.get("from").is_none());
+        assert!(reply.get("to").is_none());
+        assert!(reply.get("initiator").is_none());
+        let late = crate::cmd_msg(
+            &client,
+            crate::MsgCmd::Update {
+                request_id: request.id.clone(),
+                body: "too late".into(),
+                json: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(late.to_string().contains("terminal"), "{late}");
+
+        let report = decode(
+            dispatch(
+                &client,
+                &tool("muxa_peer_report", json!({"request_id":request.id})),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(report["result"].get("body").is_none());
+        assert_eq!(
+            report["result"]["reply"]["body"],
+            "pending text in a final failure reply"
+        );
+        let legacy = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "muxa_peer_report",
+                    json!({"request_id":request.id,"full":true}),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(legacy["request"]["body"], request.body);
+        let queued = mailbox
+            .create(
+                room.current.clone(),
+                room.peers[0].clone(),
+                new_request_from_args(
+                    &json!({}),
+                    RequestKind::Question,
+                    "private cancellation instructions".into(),
+                    true,
+                    WorkMode::ReadOnly,
+                    vec![],
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cancelled = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "muxa_cancel_message",
+                    json!({
+                        "request_id":queued.id
+                    }),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(cancelled["request_id"], queued.id);
+        assert_eq!(cancelled["delivery_state"], "cancelled");
+        assert_eq!(cancelled["final_reply_received"], false);
+        for field in [
+            "from",
+            "to",
+            "initiator",
+            "body",
+            "notify",
+            "reported_status",
+        ] {
+            assert!(cancelled.get(field).is_none(), "unexpected {field}");
+        }
+        let stored = client.collaboration_get(&origin, &queued.id).await.unwrap();
+        assert_eq!(stored.body, queued.body);
+        assert_eq!(stored.status, RequestStatus::Cancelled);
+        eprintln!(
+            "cancel_receipt_bytes: initial={}, follow_up={}",
+            serde_json::to_vec(&request_ack(&queued)).unwrap().len(),
+            serde_json::to_vec(&cancelled).unwrap().len()
+        );
+
+        let attention_args = json!({"body":"Approve staging deployment?", "action":"approval", "dispatch_id":"a20fa7e0-5f79-4f9b-b172-049154f305cf"});
+        let first = decode(
+            dispatch(
+                &client,
+                &tool("muxa_request_attention", attention_args.clone()),
+            )
+            .await
+            .unwrap(),
+        );
+        let retry = decode(
+            dispatch(&client, &tool("muxa_request_attention", attention_args))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(first["request_id"], retry["request_id"]);
+        let id = first["request_id"].as_str().unwrap();
+        let human_request = client.collaboration_get(&origin, id).await.unwrap();
+        assert!(human_request.needs_human_response());
+        assert_eq!(
+            human_request.human_action,
+            Some(muxa::collaboration::HumanAction::Approval)
+        );
+        assert_eq!(human_request.notify, Some(true));
+        let mut other_room = room.current.room.clone();
+        other_room.window_id = "@999".into();
+        let operator = muxa::collaboration::Participant::console(other_room);
+        assert!(mailbox
+            .list_for(
+                &operator,
+                RequestMailbox::Incoming,
+                muxa::collaboration::MailboxScope::Caller
+            )
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.id == id));
+        mailbox
+            .reply(
+                &operator,
+                id,
+                RequestStatus::Completed,
+                "Approved for staging only".into(),
+                vec![],
+                vec![],
+            )
+            .await
+            .unwrap();
+        let resolved = client.collaboration_get(&origin, id).await.unwrap();
+        assert!(!resolved.needs_human_response());
+        assert_eq!(resolved.reply.unwrap().body, "Approved for staging only");
+        let invalid = dispatch(
+            &client,
+            &tool(
+                "muxa_request_attention",
+                json!({"body":"Test", "action":"notice"}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid["result"]["isError"], true);
+
+        shutdown.send(()).unwrap();
+        daemon.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn spawned_peer_registration_resumes_from_transition_stream() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("peer-registration.sock");
@@ -3583,6 +4984,7 @@ mod tests {
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
+            agent_session_id: None,
         };
         let waiting_client = client.clone();
         let waiter = tokio::spawn(async move {
@@ -3651,20 +5053,9 @@ mod tests {
         assert_eq!(init["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert!(init["result"]["capabilities"]["tools"].is_object());
         let instructions = init["result"]["instructions"].as_str().unwrap();
-        assert!(instructions.len() < 2_048, "instructions: {instructions}");
-        assert!(instructions.contains("muxa_manage_tmux"));
-        assert!(instructions.contains("raw tmux commands"));
-        assert!(instructions.contains("review + read_only"));
-        assert!(instructions.contains("@peer"));
-        assert!(instructions.contains("@muxa-peer"));
-        assert!(instructions.contains("muxa_call_peer"));
-        assert!(instructions.contains("muxa_peer_report"));
-        assert!(instructions.contains("explicit PR number or URL"));
-        assert!(instructions.contains("execute=true"));
-        assert!(instructions.contains("spawn_if_missing=true"));
-        assert!(instructions.contains("yield_time_ms=60000"));
-        assert!(instructions.contains("wait=false"));
-        assert!(instructions.contains("respect observe mode"));
+        assert!(instructions.len() < 400, "instructions: {instructions}");
+        assert!(instructions.contains("muxa_collaboration_guide"));
+        assert!(instructions.contains("reported_status"));
 
         let list = dispatch(
             &client,
@@ -3688,7 +5079,11 @@ mod tests {
                 "muxa_fleet_status",
                 "muxa_fleet_capture",
                 "muxa_fleet_send_prompt",
+                "muxa_dispatch_work",
+                "muxa_dispatch_status",
                 "muxa_fleet_call_peer",
+                "muxa_update_request",
+                "muxa_fleet_update_request",
                 "muxa_fleet_wait_reply",
                 "muxa_wait_for_change",
                 "muxa_collaboration_guide",
@@ -3696,6 +5091,7 @@ mod tests {
                 "muxa_call_peer",
                 "muxa_peer_report",
                 "muxa_set_identity",
+                "muxa_request_attention",
                 "muxa_send_message",
                 "muxa_inbox",
                 "muxa_list_messages",
@@ -3728,7 +5124,7 @@ mod tests {
         assert!(guide["description"]
             .as_str()
             .unwrap()
-            .contains("reviewer/subagent workflows"));
+            .contains("workflows=true"));
         assert_peer_tool_definitions(tools);
         assert_fleet_tool_definitions(tools, instructions);
 
@@ -3754,9 +5150,7 @@ mod tests {
         );
     }
 
-    fn assert_fleet_tool_definitions(tools: &[Value], instructions: &str) {
-        assert!(instructions.contains("muxa_fleet_call_peer"));
-        assert!(instructions.contains("muxa_fleet_wait_reply"));
+    fn assert_fleet_tool_definitions(tools: &[Value], _instructions: &str) {
         let fleet_call = tools
             .iter()
             .find(|tool| tool["name"] == "muxa_fleet_call_peer")
@@ -3859,8 +5253,57 @@ mod tests {
         }))
         .unwrap();
 
-        let guide = collaboration_guide(room, &muxa::config::Config::default());
+        let legacy =
+            collaboration_guide(room.clone(), &muxa::config::Config::default(), true, false);
+        assert_eq!(legacy["capabilities"]["human_actions"], false);
+        assert!(legacy["workflows"].get("human_feedback").is_none());
+        let guide = collaboration_guide(room, &muxa::config::Config::default(), true, true);
+        let recovery = &guide["workflows"]["peer_interruption"];
+        assert_eq!(recovery["wait_slice_secs"], 60);
+        assert!(recovery["health"]
+            .as_str()
+            .unwrap()
+            .contains("to.state is stale"));
+        assert!(recovery["handoff"]
+            .as_str()
+            .unwrap()
+            .contains("Claimed requests"));
+        assert!(recovery["human"].as_str().unwrap().contains("reuse its ID"));
+        assert!(recovery["limitation"]
+            .as_str()
+            .unwrap()
+            .contains("running coordinator"));
+        let human = &guide["workflows"]["human_feedback"];
+        assert_eq!(human["tool"], "muxa_send_message");
+        assert_eq!(human["request"]["target"], "human");
+        assert_eq!(human["request"]["expects_reply"], true);
+        let input = new_request_from_args(
+            &human["request"],
+            RequestKind::Question,
+            "Choose A or B".into(),
+            true,
+            WorkMode::ReadOnly,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            input.human_action,
+            Some(muxa::collaboration::HumanAction::Choice)
+        );
+        assert!(human["wait"].as_str().unwrap().contains("muxa_wait_reply"));
         assert_eq!(guide["room"]["peers"][0]["pane"], "%2");
+        let guardrails = guide["guardrails"].to_string();
+        for rule in [
+            "TMUX_PANE",
+            "raw tmux",
+            "GitHub/PR",
+            "notify=true",
+            "Codex to Claude",
+        ] {
+            assert!(guardrails.contains(rule), "missing {rule}");
+        }
+
         assert_eq!(guide["workflows"]["reviewer"]["request"]["kind"], "review");
         assert_eq!(
             guide["workflows"]["reviewer"]["request"]["work_mode"],
@@ -3878,7 +5321,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_surfaces_registered_peer_call_skills() {
+    fn initialize_keeps_registered_skills_out_of_repeated_instructions() {
         let mut config = muxa::config::Config::default();
         config.message.skills = BTreeMap::from([
             ("review-plan-feedback".into(), "review it".into()),
@@ -3886,12 +5329,34 @@ mod tests {
         ]);
         let result = initialize_result(&config);
         let instructions = result["instructions"].as_str().unwrap();
-        assert!(instructions.contains("/review-plan-feedback"));
-        assert!(instructions.contains("/summarize"));
+        assert!(!instructions.contains("/review-plan-feedback"));
+        assert!(!instructions.contains("/summarize"));
+        let request = crate::collaboration_output::fixture();
+        let room: RoomContext = serde_json::from_value(json!({
+            "self":request.from, "peers":[request.to], "unread":0, "unread_replies":0
+        }))
+        .unwrap();
+        let guide = collaboration_guide(room, &config, false, true);
+        assert!(guide.get("workflows").is_none());
+        for rule in [
+            "TMUX_PANE",
+            "raw tmux",
+            "GitHub/PR",
+            "notify=true",
+            "read_only",
+            "expects_reply=true",
+            "muxa_inbox",
+        ] {
+            assert!(guide["guardrails"].to_string().contains(rule));
+        }
+        assert_eq!(
+            guide["message_skills"],
+            json!(["review-plan-feedback", "summarize"])
+        );
     }
 
     #[test]
-    fn configured_launch_guide_changes_instructions_schema_and_options() {
+    fn configured_launch_guide_changes_schema_and_options_without_inflating_instructions() {
         let mut config = muxa::config::Config::default();
         config.mcp.guide.placement = muxa::config::McpPlacement::Window;
         config.mcp.guide.agent = Some("codex".into());
@@ -3901,11 +5366,18 @@ mod tests {
 
         let result = initialize_result(&config);
         let instructions = result["instructions"].as_str().unwrap();
-        assert!(instructions.contains("placement=window"));
-        assert!(instructions.contains("agent=codex"));
-        assert!(instructions.contains("gpt-5.3-codex"));
-        assert!(instructions.contains("pane direction=down"));
-        assert!(instructions.contains("Keep one task per window."));
+        assert!(!instructions.contains("placement=window"));
+        assert!(!instructions.contains("agent=codex"));
+        assert!(!instructions.contains("gpt-5.3-codex"));
+        assert!(!instructions.contains("pane direction=down"));
+        assert!(!instructions.contains("Keep one task per window."));
+        let preferences = launch_guide_value(&config);
+        assert_eq!(preferences["instructions"], "Keep one task per window.");
+        assert_eq!(preferences["launch_defaults"]["placement"], "window");
+        assert_eq!(
+            preferences["launch_defaults"]["options"],
+            json!(["--model", "gpt-5.3-codex"])
+        );
 
         let tools = tool_definitions(&config);
         let start_agent = tools
@@ -4083,6 +5555,41 @@ mod tests {
     }
 
     #[test]
+    fn notification_override_is_typed_and_independent_of_reply_contract() {
+        for notify in [None, Some(true), Some(false)] {
+            let mut args = json!({});
+            if let Some(value) = notify {
+                args["notify"] = json!(value);
+            }
+            let request = new_request_from_args(
+                &args,
+                RequestKind::Notice,
+                "checkpoint".into(),
+                false,
+                WorkMode::ReadOnly,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(request.notify, notify);
+            assert!(!request.expects_reply);
+        }
+        for value in [json!("true"), json!(1), Value::Null] {
+            let error = new_request_from_args(
+                &json!({"notify": value}),
+                RequestKind::Notice,
+                "checkpoint".into(),
+                false,
+                WorkMode::ReadOnly,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap_err();
+            assert_eq!(error, "notify must be a boolean");
+        }
+    }
+
+    #[test]
     fn request_metadata_is_optional_and_rejects_non_string_ids() {
         let request = new_request_from_args(
             &json!({}),
@@ -4116,6 +5623,19 @@ mod tests {
     }
 
     #[test]
+    fn bare_pane_selectors_use_the_callers_rmux_namespace() {
+        let current = peer_participant(AgentKind::Codex, "rmux:%1", AgentState::Idle);
+        let peer = peer_participant(AgentKind::ClaudeCode, "rmux:%143", AgentState::Idle);
+        let room = peer_room(current, vec![peer]);
+        for target in ["%143", "pane:%143", "rmux:%143", "pane:rmux:%143"] {
+            let selected = select_peer(&room, target).unwrap().unwrap();
+            assert_eq!(selected.pane, "rmux:%143");
+        }
+        let pending = select_peer(&room, "%999").unwrap().unwrap();
+        assert_eq!(pending.pane, "rmux:%999");
+    }
+
+    #[test]
     fn auto_peer_prefers_a_different_provider_then_numeric_pane_order() {
         let current = peer_participant(AgentKind::ClaudeCode, "%1", AgentState::Idle);
         let room = peer_room(
@@ -4134,6 +5654,23 @@ mod tests {
             select_peer(&room, "@muxa-peer").unwrap().unwrap().pane,
             "%3"
         );
+    }
+
+    #[test]
+    fn a_launched_peer_without_a_first_prompt_is_selectable_by_every_target() {
+        let current = peer_participant(AgentKind::ClaudeCode, "%1", AgentState::Idle);
+        let mut pending = peer_participant(AgentKind::Codex, "%2", AgentState::Starting);
+        pending.agent_session_id = "pending-pane:default:%2".into();
+        pending.alias = Some("review".into());
+        pending.roles = vec!["reviewer".into()];
+        let room = peer_room(current, vec![pending]);
+        for target in ["auto", "codex", "@review", "role:reviewer", "pane:%2"] {
+            let selected = select_peer(&room, target).unwrap().unwrap();
+            assert_eq!(selected.pane, "%2");
+            assert!(muxa::collaboration::is_pending_session(
+                &selected.peer.unwrap().agent_session_id
+            ));
+        }
     }
 
     /// An explicitly addressed pane with no registered peer is handed to muxad
@@ -4200,6 +5737,32 @@ mod tests {
         assert!(select_peer(&room, "role:rust")
             .unwrap_err()
             .contains("multiple peers"));
+    }
+
+    #[test]
+    fn review_auto_routing_uses_opposite_provider_without_overriding_explicit_targets() {
+        for target in ["auto", "peer", "@peer", "@muxa-peer"] {
+            assert_eq!(
+                review_provider_target(target, RequestKind::Review, AgentKind::Codex),
+                "claude"
+            );
+            assert_eq!(
+                review_provider_target(target, RequestKind::Review, AgentKind::ClaudeCode),
+                "codex"
+            );
+        }
+        assert_eq!(
+            review_provider_target("codex", RequestKind::Review, AgentKind::Codex),
+            "codex"
+        );
+        assert_eq!(
+            review_provider_target("pane:%2", RequestKind::Review, AgentKind::Codex),
+            "pane:%2"
+        );
+        assert_eq!(
+            review_provider_target("auto", RequestKind::Task, AgentKind::Codex),
+            "auto"
+        );
     }
 
     #[test]
@@ -4594,13 +6157,19 @@ mod tests {
     fn render_send_result_covers_all_submit_shapes() {
         let text = |v: &Value| v["content"][0]["text"].as_str().unwrap().to_string();
 
-        // Unknown submit status (client returns `()` today) → trust intent.
-        assert!(text(&render_send_result(5, "%1", true, None)).contains("and submitted"));
-        assert!(!text(&render_send_result(5, "%1", false, None)).contains("submitted"));
-        // Daemon confirms Enter landed.
-        assert!(text(&render_send_result(5, "%1", true, Some(true))).contains("and submitted"));
+        // Older daemon: requested intent does not prove application submission.
+        assert!(text(&render_send_result(5, "%1", true, None, None)).contains("status unavailable"));
+        assert!(!text(&render_send_result(5, "%1", false, None, None)).contains("submitted"));
+        // PromptSubmitted evidence confirms application submission.
+        assert!(
+            text(&render_send_result(5, "%1", true, Some(true), Some(true)))
+                .contains("submission confirmed")
+        );
+        let unconfirmed = text(&render_send_result(5, "%1", true, Some(true), None));
+        assert!(unconfirmed.contains("application submission unconfirmed"));
+        assert!(!unconfirmed.contains("submission confirmed"));
         // Daemon says text landed but Enter did NOT — surfaced to the caller.
-        let not_submitted = text(&render_send_result(5, "%1", true, Some(false)));
+        let not_submitted = text(&render_send_result(5, "%1", true, Some(false), None));
         assert!(not_submitted.contains("NOT submitted"), "{not_submitted}");
     }
 

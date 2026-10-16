@@ -89,6 +89,19 @@ pub(crate) async fn run(client: Client) -> Result<()> {
                 muxa_version: env!("CARGO_PKG_VERSION").into(),
                 capabilities: FLEET_CAPABILITIES
                     .iter()
+                    .filter(|capability| {
+                        (**capability != muxa::fleet::FLEET_MAILBOX_WATCH_CAPABILITY
+                            || mailbox_updates.is_some())
+                            && (**capability != "collaboration_update"
+                                || daemon
+                                    .capabilities
+                                    .iter()
+                                    .any(|c| c == "collaboration_update"))
+                    })
+                    .filter(|c| {
+                        !matches!(**c, "collaboration_dispatch_v1" | "orchestration_v1")
+                            || daemon.capabilities.iter().any(|d| d == *c)
+                    })
                     .map(|capability| (*capability).to_string())
                     .collect(),
                 daemon_generation: daemon.generation,
@@ -141,8 +154,25 @@ pub(crate) async fn run(client: Client) -> Result<()> {
     let mailbox_task = mailbox_updates.take().map(|mut mailbox_updates| {
         let mailbox_tx = output_tx.clone();
         let mailbox_topology_revision = Arc::clone(&revision);
+        let mailbox_client = client.clone();
         tokio::spawn(async move {
-            while let Ok(Some(mailbox_revision)) = mailbox_updates.recv().await {
+            loop {
+                let mailbox_revision = if let Ok(Some(revision)) = mailbox_updates.recv().await {
+                    revision
+                } else {
+                    loop {
+                        tokio::select! {
+                            () = mailbox_tx.closed() => return,
+                            () = tokio::time::sleep(Duration::from_secs(2)) => {},
+                        }
+                        if let Ok(stream) = mailbox_client.collaboration_subscribe().await {
+                            mailbox_updates = stream;
+                            break;
+                        }
+                    }
+                    // A fresh subscription alone cannot replay changes lost during disconnection.
+                    0
+                };
                 if mailbox_tx
                     .send(RelayFrame::Keepalive {
                         revision: mailbox_topology_revision.load(Ordering::SeqCst),
@@ -356,11 +386,11 @@ async fn handle_request(
             let socket = pane.window.session.endpoint.socket.clone();
             let pane_id = pane.pane_id.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                if !backend.send_text_on(Some(&socket), &pane_id, &text) {
+                if !backend.send_prompt_text_on(Some(&socket), &pane_id, &text) {
                     return None;
                 }
                 let submitted = if submit {
-                    std::thread::sleep(muxa::backend::PROMPT_SUBMIT_GRACE);
+                    std::thread::sleep(muxa::backend::prompt_submit_grace(&pane_id));
                     backend.send_text_on(Some(&socket), &pane_id, "\r")
                 } else {
                     false
@@ -368,6 +398,7 @@ async fn handle_request(
                 Some(muxa::ipc::SendPromptOutcome {
                     sent: true,
                     submitted,
+                    submission_confirmed: None,
                 })
             })
             .await
@@ -422,15 +453,31 @@ async fn handle_request(
                 result: FleetCommandResult::collaboration_request(request),
             })
         }
-        RelayRequest::CollaborationMailbox { request_id, pane } => {
-            exact_backend(&backends, &pane).await?;
+        RelayRequest::CollaborationMailbox {
+            request_id,
+            pane,
+            operator_only,
+        } => {
+            if !operator_only {
+                exact_backend(&backends, &pane).await?;
+            }
             let agent = collaboration_origin(&pane, false);
             let console = collaboration_origin(&pane, true);
-            let (incoming, sent) = tokio::try_join!(
-                client.collaboration_list(&agent, RequestMailbox::Incoming),
+            let (mut incoming, sent, human) = tokio::try_join!(
+                async {
+                    if operator_only {
+                        Ok(Vec::new())
+                    } else {
+                        client
+                            .collaboration_list(&agent, RequestMailbox::Incoming)
+                            .await
+                    }
+                },
                 client.collaboration_list(&console, RequestMailbox::Sent),
+                client.collaboration_list(&console, RequestMailbox::Incoming),
             )
             .context("reading collaboration mailbox")?;
+            incoming.extend(human);
             Ok(RelayFrame::Result {
                 request_id,
                 result: FleetCommandResult::collaboration_mailbox(incoming, sent),
@@ -463,6 +510,24 @@ async fn handle_request(
                 result: FleetCommandResult::collaboration_mailbox(incoming, Vec::new()),
             })
         }
+        RelayRequest::CollaborationUpdate {
+            request_id,
+            pane,
+            collaboration_request_id,
+            body,
+        } => {
+            let request = client
+                .collaboration_update(
+                    &collaboration_origin(&pane, true),
+                    &collaboration_request_id,
+                    &body,
+                )
+                .await?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: FleetCommandResult::collaboration_request(request),
+            })
+        }
         RelayRequest::CollaborationReply {
             request_id,
             pane,
@@ -470,8 +535,21 @@ async fn handle_request(
             status,
             body,
         } => {
-            exact_backend(&backends, &pane).await?;
             let agent = collaboration_origin(&pane, false);
+            let stored = client
+                .collaboration_get(
+                    &collaboration_origin(&pane, true),
+                    &collaboration_request_id,
+                )
+                .await?;
+            if !stored.to.console {
+                exact_backend(&backends, &pane).await?;
+            }
+            let agent = if stored.to.console {
+                collaboration_origin(&pane, true)
+            } else {
+                agent
+            };
             let request = client
                 .collaboration_reply(&agent, &collaboration_request_id, status, &body, &[], &[])
                 .await
@@ -491,6 +569,7 @@ fn collaboration_origin(pane: &PaneKey, console: bool) -> CollaborationOrigin {
         socket: matches!(endpoint.host, HostKind::Tmux | HostKind::Rmux)
             .then(|| endpoint.socket.clone()),
         console,
+        agent_session_id: None,
     }
 }
 
@@ -825,6 +904,135 @@ pub(crate) fn remote_attach(token: &str, fit: bool) -> Result<()> {
 mod tests {
     use super::*;
     use muxa::{BackendEndpoint, SessionKey, WindowKey};
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one isolated relay lifecycle: read, reply, reread, and peer denial
+    async fn operator_mailbox_and_reply_survive_without_any_terminal_backend() {
+        use muxa::collaboration::{
+            CollaborationOptions, CollaborationStore, HumanAction, Participant, RequestStatus,
+            RoomId,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("human-relay.sock");
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let room = RoomId {
+            host: "tmux".into(),
+            socket: Some("default".into()),
+            window_id: "@old".into(),
+        };
+        let mut sender = Participant::console(room.clone());
+        sender.console = false;
+        sender.agent_kind = muxa::AgentKind::Codex;
+        sender.agent_session_id = "ended-agent".into();
+        sender.pane = "%1".into();
+        let request = mailbox
+            .create(
+                sender,
+                Participant::console(room),
+                muxa::collaboration::NewRequest {
+                    body: "Which deployment target?".into(),
+                    human_action: Some(HumanAction::Choice),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let server = muxa::ipc::Server::new(socket.clone(), muxa::Store::shared())
+            .with_collaboration(mailbox);
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let client = Client::new(socket);
+        let pane = PaneKey {
+            window: WindowKey {
+                session: SessionKey {
+                    endpoint: BackendEndpoint {
+                        host: HostKind::Tmux,
+                        socket: "default".into(),
+                    },
+                    session_id: "console".into(),
+                },
+                window_id: "console".into(),
+            },
+            pane_id: "console".into(),
+        };
+        let revision = Arc::new(AtomicU64::new(0));
+        let read = handle_request(
+            RelayRequest::CollaborationMailbox {
+                request_id: "read".into(),
+                pane: pane.clone(),
+                operator_only: true,
+            },
+            client.clone(),
+            vec![],
+            revision.clone(),
+        )
+        .await
+        .unwrap();
+        let RelayFrame::Result { result, .. } = read else {
+            panic!("expected mailbox")
+        };
+        assert_eq!(result.collaboration_incoming[0].id, request.id);
+        assert!(result.collaboration_incoming[0].needs_human_response());
+        // Closing all terminals must not prevent the human from answering.
+        handle_request(
+            RelayRequest::CollaborationReply {
+                request_id: "reply".into(),
+                pane: pane.clone(),
+                collaboration_request_id: request.id.clone(),
+                status: RequestStatus::Completed,
+                body: "Use staging only".into(),
+            },
+            client.clone(),
+            vec![],
+            revision.clone(),
+        )
+        .await
+        .unwrap();
+        let read = handle_request(
+            RelayRequest::CollaborationMailbox {
+                request_id: "other-client".into(),
+                pane: pane.clone(),
+                operator_only: true,
+            },
+            client.clone(),
+            vec![],
+            revision.clone(),
+        )
+        .await
+        .unwrap();
+        let RelayFrame::Result { result, .. } = read else {
+            panic!("expected mailbox")
+        };
+        assert!(!result.collaboration_incoming[0].needs_human_response());
+        assert_eq!(
+            result.collaboration_incoming[0]
+                .reply
+                .as_ref()
+                .unwrap()
+                .body,
+            "Use staging only"
+        );
+        assert!(handle_request(
+            RelayRequest::CollaborationMailbox {
+                request_id: "agent-mailbox".into(),
+                pane,
+                operator_only: false
+            },
+            client,
+            vec![],
+            revision
+        )
+        .await
+        .is_err());
+        shutdown.send(()).unwrap();
+        handle.await.unwrap();
+    }
 
     #[test]
     fn attach_token_is_shell_safe_and_round_trips() {

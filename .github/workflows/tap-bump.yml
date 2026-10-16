@@ -16,11 +16,17 @@ name: tap-bump
 #     the web UI or their own credentials — the recovery path when the
 #     automated publish did not run.
 #
-# Requires the `TAP_GITHUB_TOKEN` repo secret: a fine-grained PAT with
-# Contents read/write on Open330/homebrew-tap (the default
-# GITHUB_TOKEN cannot push to a sibling repo). When the secret is
-# absent the job exits early with a notice instead of failing, so
-# releases stay green while the tap is bumped by hand.
+# Pushing to Open330/homebrew-tap needs a credential of its own (the default
+# GITHUB_TOKEN cannot push to a sibling repo). Preferred: the
+# `HOMEBREW_TAP_DEPLOY_KEY` **organization** secret, the private half of an SSH
+# deploy key with write access on homebrew-tap. The tap serves several Open330
+# projects (aas, agt, barshelf, amux, muxa), so one org-wide key serves every
+# release workflow that publishes there. A deploy key is scoped to that one
+# repo and never expires.
+# Fallback: `TAP_GITHUB_TOKEN`, a fine-grained PAT with Contents read/write.
+# PATs expire (30 days by default), which silently broke the tap twice.
+# With neither secret the job exits early with a notice instead of failing,
+# so releases stay green while the tap is bumped by hand.
 
 on:
   release:
@@ -95,6 +101,7 @@ jobs:
 
       - name: Render and push formula
         env:
+          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
           VERSION: ${{ steps.ref.outputs.version }}
           MAC_ARM: ${{ steps.sums.outputs.mac_arm }}
@@ -104,12 +111,21 @@ jobs:
           DMG_SHA: ${{ steps.sums.outputs.dmg }}
         run: |
           set -euo pipefail
-          if [ -z "${TAP_GITHUB_TOKEN}" ]; then
-            echo "::notice::TAP_GITHUB_TOKEN is not configured — skipping the tap bump. Update Open330/homebrew-tap manually or add the secret."
+          if [ -n "${TAP_DEPLOY_KEY}" ]; then
+            key="${RUNNER_TEMP}/tap_deploy_key"
+            ( umask 077; printf '%s\n' "${TAP_DEPLOY_KEY}" > "${key}" )
+            # Pin github.com's published host key rather than trusting a scan.
+            printf '%s\n' "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" \
+              > "${RUNNER_TEMP}/known_hosts"
+            export GIT_SSH_COMMAND="ssh -i ${key} -o IdentitiesOnly=yes -o UserKnownHostsFile=${RUNNER_TEMP}/known_hosts -o StrictHostKeyChecking=yes"
+            git clone --depth 1 git@github.com:Open330/homebrew-tap.git tap
+          elif [ -n "${TAP_GITHUB_TOKEN}" ]; then
+            git clone --depth 1 \
+              "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/Open330/homebrew-tap.git" tap
+          else
+            echo "::notice::Neither HOMEBREW_TAP_DEPLOY_KEY nor TAP_GITHUB_TOKEN is configured — skipping the tap bump. Update Open330/homebrew-tap manually or add a deploy key."
             exit 0
           fi
-          git clone --depth 1 \
-            "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/Open330/homebrew-tap.git" tap
           cat > tap/Formula/muxa.rb <<EOF
           class Muxa < Formula
             desc "Agent CLI observability and orchestration layer for terminal multiplexers"

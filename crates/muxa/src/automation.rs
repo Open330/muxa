@@ -352,6 +352,13 @@ pub enum AutomationAction {
     Notify,
     /// Send the pane's interrupt key. Types no prompt.
     Interrupt,
+    /// Press Enter only on a visibly selected Yes/Proceed confirmation.
+    PressEnter,
+    /// Move the agent onto another `aas` account (`account`, default the
+    /// best-ranked one with quota left) and resume its conversation; then
+    /// type `text`, or the `[swap]` follow-up, so the cut-off turn carries
+    /// on. See [`crate::account_swap`].
+    SwapAccount,
 }
 
 /// The live-state predicate re-checked at fire time.
@@ -425,9 +432,8 @@ pub fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
 
 /// `[automation]` — the master switch, the pause, and the rules.
 ///
-/// Defaults to enabled **with no rules**: a fresh install runs the engine's
-/// bookkeeping and does nothing, until the operator (or Muxa.app) writes a
-/// rule.
+/// An empty config enables the engine with no rules. Init and daemon startup
+/// install disabled starter rules; only operator-enabled rules can act.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutomationConfig {
@@ -523,6 +529,10 @@ pub struct AutomationRule {
     /// or a pane-host namespace: `tmux`, `cmux`, `rmux`, `zellij`, `herdr`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Regex matched against the latest notification. Missing notifications do
+    /// not match. Rechecked at firing time so a changed error cancels the action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<String>,
     /// Which rate-limit windows count. Only valid with `on = "rate_limited"`;
     /// empty means any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -558,6 +568,10 @@ pub struct AutomationRule {
     /// Whether `send_prompt` commits the line with Enter. Default `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submit: Option<bool>,
+    /// `swap_account` target: an `aas` account name, or `auto` (the
+    /// default) for the best-ranked account with quota left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 
     // --- guards: a rule cannot opt out of these, only tune them ---
     /// Firings allowed per hour, per pane. Default 3, capped at 60, and
@@ -592,6 +606,7 @@ impl AutomationRule {
             work: None,
             pane: None,
             host: None,
+            notification: None,
             scope: Vec::new(),
             for_: None,
             wait: None,
@@ -601,6 +616,7 @@ impl AutomationRule {
             text: None,
             message: None,
             submit: None,
+            account: None,
             max_per_hour: None,
             cooldown: None,
             only_if_still: None,
@@ -610,6 +626,11 @@ impl AutomationRule {
     #[must_use]
     pub fn wait(&self) -> WaitSpec {
         self.wait.unwrap_or(match self.on {
+            // Another account is the way around the cap, not a reason to
+            // wait it out.
+            _ if self.action == AutomationAction::SwapAccount => {
+                WaitSpec::after_event(time::Duration::ZERO)
+            }
             // A cap that names its reset time is the whole point of the
             // anchor, so that is the default for `rate_limited`.
             AutomationEvent::RateLimited => WaitSpec::after_reset(time::Duration::ZERO),
@@ -680,7 +701,7 @@ impl AutomationRule {
     pub fn validate(&self) -> Result<(), String> {
         let named = |message: String| format!("automation.rule {:?}: {message}", self.name);
         if let Some(condition) = &self.ask_condition {
-            condition.validate().map_err(&named)?;
+            condition.validate().map_err(named)?;
         }
 
         if self.name.trim().is_empty() {
@@ -705,6 +726,13 @@ impl AutomationRule {
                     "work {work:?} is not a valid regex: {error}"
                 )));
             }
+        }
+        if let Some(pattern) = &self.notification {
+            regex::Regex::new(pattern).map_err(|error| {
+                named(format!(
+                    "notification {pattern:?} is not a valid regex: {error}"
+                ))
+            })?;
         }
         if let Some(host) = &self.host {
             if parse_host_filter(host).is_none() {
@@ -735,7 +763,7 @@ impl AutomationRule {
                 return Err(named("`on = \"idle_for\"` requires `for`".into()))
             }
             (AutomationEvent::IdleFor, Some(value)) => {
-                value.validate("for").map_err(&named)?;
+                value.validate("for").map_err(named)?;
                 if value.duration().is_zero() {
                     return Err(named("`for` must be greater than zero".into()));
                 }
@@ -745,7 +773,7 @@ impl AutomationRule {
         }
 
         let wait = self.wait();
-        wait.validate("wait").map_err(&named)?;
+        wait.validate("wait").map_err(named)?;
         if wait.anchor == WaitAnchor::Reset && self.on != AutomationEvent::RateLimited {
             return Err(named(
                 "a `reset` wait only applies to `on = \"rate_limited\"`; \
@@ -754,13 +782,13 @@ impl AutomationRule {
             ));
         }
         if let Some(fallback) = self.fallback {
-            fallback.validate("fallback").map_err(&named)?;
+            fallback.validate("fallback").map_err(named)?;
         }
         if let Some(jitter) = self.jitter {
-            jitter.validate("jitter").map_err(&named)?;
+            jitter.validate("jitter").map_err(named)?;
         }
         if let Some(cooldown) = self.cooldown {
-            cooldown.validate("cooldown").map_err(&named)?;
+            cooldown.validate("cooldown").map_err(named)?;
         }
         if let Some(max) = self.max_per_hour {
             if max == 0 {
@@ -773,6 +801,11 @@ impl AutomationRule {
             }
         }
 
+        if self.account.is_some() && self.action != AutomationAction::SwapAccount {
+            return Err(named(
+                "`account` belongs to `action = \"swap_account\"`".into(),
+            ));
+        }
         match self.action {
             AutomationAction::SendPrompt => {
                 let text = self
@@ -813,11 +846,55 @@ impl AutomationRule {
                     ));
                 }
             }
+            AutomationAction::PressEnter => {
+                if self.on != AutomationEvent::WaitingInput
+                    || self.only_if_still() != AutomationCondition::WaitingInput
+                {
+                    return Err(named(
+                        "press_enter requires waiting_input and a waiting_input recheck".into(),
+                    ));
+                }
+                if self.text.is_some() || self.message.is_some() || self.submit.is_some() {
+                    return Err(named(
+                        "press_enter takes no text, message, or submit".into(),
+                    ));
+                }
+            }
             AutomationAction::Interrupt => {
                 if self.text.is_some() || self.message.is_some() || self.submit.is_some() {
                     return Err(named(
                         "`action = \"interrupt\"` takes no `text`, `message`, or `submit`".into(),
                     ));
+                }
+            }
+            AutomationAction::SwapAccount => {
+                if self.message.is_some() || self.submit.is_some() {
+                    return Err(named(
+                        "`action = \"swap_account\"` takes `account` and `text`, \
+                         not `message` or `submit`"
+                            .into(),
+                    ));
+                }
+                if let Some(account) = &self.account {
+                    if account.trim().is_empty() || account.contains(char::is_whitespace) {
+                        return Err(named(format!(
+                            "account {account:?} is not an aas account name"
+                        )));
+                    }
+                }
+                if let Some(text) = &self.text {
+                    if text.len() > MAX_ACTION_TEXT_BYTES {
+                        return Err(named(format!(
+                            "text cannot exceed {MAX_ACTION_TEXT_BYTES} bytes"
+                        )));
+                    }
+                    if !text_is_terminal_safe(text) {
+                        return Err(named(
+                            "text contains terminal control characters; only printable \
+                             text, tabs, and newlines are accepted"
+                                .into(),
+                        ));
+                    }
                 }
             }
         }
@@ -844,6 +921,9 @@ impl AutomationRule {
         }
         if let Some(host) = &self.host {
             parts.push(format!("host={host}"));
+        }
+        if let Some(notification) = &self.notification {
+            parts.push(format!("notification={notification}"));
         }
         if !self.scope.is_empty() {
             let scopes: Vec<String> = self
@@ -920,6 +1000,7 @@ pub struct AutomationSubject {
     pub workspace: Option<String>,
     pub work: Option<String>,
     pub state: AgentState,
+    pub last_notification: Option<String>,
     pub rate_limit_scope: Option<RateLimitScope>,
     pub rate_limit_source: Option<RateLimitSource>,
     pub rate_limited_until: Option<OffsetDateTime>,
@@ -942,6 +1023,7 @@ impl AutomationSubject {
             workspace: None,
             work: None,
             state: agent.state,
+            last_notification: agent.last_notification.clone(),
             rate_limit_scope: agent.rate_limit_scope,
             rate_limit_source: agent.rate_limit_source,
             rate_limited_until: agent.rate_limited_until,
@@ -1041,6 +1123,15 @@ impl AutomationSubject {
                 _ => return false,
             }
         }
+        if let Some(pattern) = &rule.notification {
+            match (
+                regex::Regex::new(pattern),
+                self.last_notification.as_deref(),
+            ) {
+                (Ok(regex), Some(message)) if regex.is_match(message) => {}
+                _ => return false,
+            }
+        }
         if !rule.scope.is_empty() {
             match self.rate_limit_scope {
                 Some(scope) if rule.scope.contains(&scope) => {}
@@ -1058,6 +1149,9 @@ impl AutomationSubject {
 /// `automation_test`, and any future caller evaluate identical inputs.
 #[must_use]
 pub fn subjects_from(agents: &[Agent], panes: &[crate::tmux::PaneInfo]) -> Vec<AutomationSubject> {
+    // A `~view~` listing of a grouped pane can lack the workspace stamp and
+    // would fail workspace filters; match against one listing per pane.
+    let panes = crate::tmux::canonical_panes(panes);
     agents
         .iter()
         .map(|agent| {
@@ -1156,6 +1250,9 @@ pub struct PlannedFiring {
     pub text: Option<String>,
     pub submit: bool,
     pub only_if_still: AutomationCondition,
+    /// `swap_account`'s target account; `None` means `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 /// Ordered by fire time so a `BinaryHeap<Reverse<_>>` pops the next one
@@ -1257,12 +1354,13 @@ impl Scheduler {
             fire_at,
             action: rule.action,
             text: match rule.action {
-                AutomationAction::SendPrompt => rule.text.clone(),
+                AutomationAction::SendPrompt | AutomationAction::SwapAccount => rule.text.clone(),
                 AutomationAction::Notify => rule.message.clone(),
-                AutomationAction::Interrupt => None,
+                AutomationAction::Interrupt | AutomationAction::PressEnter => None,
             },
             submit: rule.submit(),
             only_if_still: rule.only_if_still(),
+            account: rule.account.clone(),
         }))
     }
 
@@ -1298,6 +1396,12 @@ impl Scheduler {
             return Decision::Skip(SkipReason::ConditionCleared);
         }
         if !subject.satisfies(firing.only_if_still) {
+            return Decision::Skip(SkipReason::ConditionCleared);
+        }
+        if !subject.matches_filters(rule) {
+            return Decision::Skip(SkipReason::FilterMismatch);
+        }
+        if subject.agent_session_id != firing.agent_session_id || subject.socket != firing.socket {
             return Decision::Skip(SkipReason::ConditionCleared);
         }
         if guards.episode_handled {
@@ -1722,6 +1826,8 @@ pub struct AutomationRuleView {
     pub pane: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope: Vec<RateLimitScope>,
     #[serde(default, rename = "for", skip_serializing_if = "Option::is_none")]
@@ -1733,6 +1839,8 @@ pub struct AutomationRuleView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub submit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 
     // --- effective timing and guards, defaults already resolved ---
     /// `reset+2m` / `5m`.
@@ -1921,11 +2029,13 @@ impl AutomationStore {
                     work: rule.work.clone(),
                     pane: rule.pane.clone(),
                     host: rule.host.clone(),
+                    notification: rule.notification.clone(),
                     scope: rule.scope.clone(),
                     for_: rule.for_,
                     text: rule.text.clone(),
                     message: rule.message.clone(),
                     submit: rule.submit(),
+                    account: rule.account.clone(),
                     wait: rule.wait().to_string(),
                     fallback: render_duration(rule.fallback()),
                     jitter: render_duration(rule.jitter()),
@@ -2206,7 +2316,7 @@ fn table_name(table: &toml_edit::Table) -> Option<String> {
 
 /// The `automation.rule` array of tables, created (with an implicit
 /// `[automation]` parent) when absent.
-fn automation_rules_mut(
+pub(crate) fn automation_rules_mut(
     document: &mut toml_edit::DocumentMut,
 ) -> Result<&mut toml_edit::ArrayOfTables, String> {
     let automation = implicit_table(document.as_table_mut(), "automation")?;
@@ -2225,7 +2335,7 @@ fn automation_rules_mut(
 /// Render a rule as the `[[automation.rule]]` table the loader reads back,
 /// key for key. Built by serializing the rule itself, so a new field cannot
 /// be silently dropped on write-back.
-fn rule_table(rule: &AutomationRule) -> Result<toml_edit::Table, String> {
+pub(crate) fn rule_table(rule: &AutomationRule) -> Result<toml_edit::Table, String> {
     let text = toml::to_string(rule).map_err(|error| format!("rendering rule: {error}"))?;
     let document: toml_edit::DocumentMut = text
         .parse()
@@ -2265,7 +2375,7 @@ fn load_document(path: &Path) -> Result<toml_edit::DocumentMut, String> {
 
 /// Write-then-rename in the target's directory, keeping the mode of the
 /// file being replaced (a fresh file is owner-only).
-fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
     use std::io::Write as _;
     if let Some(parent) = path
         .parent()
@@ -2333,12 +2443,65 @@ mod tests {
             workspace: Some("callabo".into()),
             work: Some("CAL-1234".into()),
             state: AgentState::Error,
+            last_notification: None,
             rate_limit_scope: Some(RateLimitScope::FiveHour),
             rate_limit_source: Some(RateLimitSource::Statusline),
             rate_limited_until: Some(NOW + time::Duration::hours(1)),
             state_entered_at: NOW,
             last_activity_at: NOW,
         }
+    }
+
+    // --- swap_account ------------------------------------------------------
+
+    #[test]
+    fn swap_account_fires_on_the_cap_not_its_reset_and_carries_the_account() {
+        let toml = r#"
+            [[rule]]
+            name = "swap-on-limit"
+            on = "rate_limited"
+            action = "swap_account"
+            account = "jelly@claude"
+            text = "pick up where you left off"
+        "#;
+        let config: AutomationConfig = toml::from_str(toml).unwrap();
+        config.validate().unwrap();
+        let rule = &config.rule[0];
+        assert_eq!(rule.wait(), WaitSpec::after_event(time::Duration::ZERO));
+        let mut rule = rule.clone();
+        rule.jitter = Some(DurationSpec::seconds(0));
+        let decision = Scheduler::arm(
+            &config,
+            &rule,
+            &capped_subject(),
+            GuardState::default(),
+            NOW,
+            0.0,
+        );
+        let firing = decision.firing().expect("fires");
+        assert_eq!(firing.fire_at, NOW, "no waiting out the cap");
+        assert_eq!(firing.account.as_deref(), Some("jelly@claude"));
+        assert_eq!(firing.text.as_deref(), Some("pick up where you left off"));
+    }
+
+    #[test]
+    fn swap_account_rejects_foreign_payloads_and_account_elsewhere() {
+        let mut rule = AutomationRule::new(
+            "swap",
+            AutomationEvent::RateLimited,
+            AutomationAction::SwapAccount,
+        );
+        rule.validate().expect("account and text are optional");
+        rule.submit = Some(false);
+        assert!(rule.validate().is_err());
+        rule.submit = None;
+        rule.account = Some("two words".into());
+        assert!(rule.validate().is_err());
+
+        let mut prompt = resume_rule();
+        prompt.account = Some("jelly@claude".into());
+        let error = prompt.validate().unwrap_err();
+        assert!(error.contains("swap_account"), "{error}");
     }
 
     // --- duration / wait parsing ------------------------------------------
@@ -2675,6 +2838,85 @@ waaait = "5m"
             capped_subject().current_event(),
             Some(AutomationEvent::RateLimited),
         );
+    }
+
+    #[test]
+    fn capacity_notification_filters_and_rechecks_the_live_error() {
+        let config = AutomationConfig::default();
+        let mut rule = AutomationRule::new(
+            "resume-codex-capacity",
+            AutomationEvent::Error,
+            AutomationAction::SendPrompt,
+        );
+        rule.agent = vec![AgentKindSpec(AgentKind::Codex)];
+        rule.notification = Some("(?i)^Selected model is at capacity\\.".into());
+        rule.text = Some("continue".into());
+        rule.wait = Some(WaitSpec::after_event(time::Duration::minutes(2)));
+        rule.jitter = Some(DurationSpec::seconds(0));
+        rule.validate().unwrap();
+        let mut subject = capped_subject();
+        subject.kind = AgentKind::Codex;
+        subject.rate_limit_scope = None;
+        subject.last_notification =
+            Some("Selected model is at capacity. Please try a different model.".into());
+        let decision = Scheduler::arm(&config, &rule, &subject, GuardState::default(), NOW, 0.0);
+        let firing = decision.firing().unwrap();
+        assert_eq!(firing.fire_at, NOW + time::Duration::minutes(2));
+        let confirm = |subject: &AutomationSubject| {
+            Scheduler::confirm(
+                &config,
+                &rule,
+                firing,
+                Some(subject),
+                GuardState::default(),
+                firing.fire_at,
+            )
+        };
+        assert!(confirm(&subject).firing().is_some());
+        for notification in [None, Some("Network connection failed".into())] {
+            subject.last_notification = notification;
+            assert_eq!(
+                Scheduler::arm(&config, &rule, &subject, GuardState::default(), NOW, 0.0)
+                    .skip_reason(),
+                Some(SkipReason::FilterMismatch)
+            );
+            assert_eq!(
+                confirm(&subject).skip_reason(),
+                Some(SkipReason::FilterMismatch)
+            );
+        }
+        subject.last_notification = Some("Selected model is at capacity.".into());
+        subject.state = AgentState::Working;
+        assert_eq!(
+            confirm(&subject).skip_reason(),
+            Some(SkipReason::ConditionCleared)
+        );
+        subject.state = AgentState::Error;
+        subject.agent_session_id = "replacement-session".into();
+        assert_eq!(
+            confirm(&subject).skip_reason(),
+            Some(SkipReason::ConditionCleared)
+        );
+        subject
+            .agent_session_id
+            .clone_from(&firing.agent_session_id);
+        assert_eq!(
+            Scheduler::arm(
+                &config,
+                &rule,
+                &subject,
+                GuardState {
+                    episode_handled: true,
+                    ..GuardState::default()
+                },
+                NOW,
+                0.0
+            )
+            .skip_reason(),
+            Some(SkipReason::EpisodeAlreadyHandled)
+        );
+        rule.notification = Some("[".into());
+        assert!(rule.validate().unwrap_err().contains("notification"));
     }
 
     // --- scheduler: filters ------------------------------------------------
@@ -3556,11 +3798,13 @@ waaait = "5m"
             work: Some("^CAL-".into()),
             pane: None,
             host: None,
+            notification: None,
             scope: vec![RateLimitScope::FiveHour],
             for_: None,
             text: Some("continue".into()),
             message: None,
             submit: true,
+            account: None,
             wait: "reset+2m".into(),
             fallback: "20m".into(),
             jitter: "30s".into(),

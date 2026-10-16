@@ -9,6 +9,811 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Agents can explicitly request required human attention with `muxa msg attention`
+  or `muxa_request_attention`. Muxa for Mac aggregates these durable operator
+  requests across Fleet hosts, displays pending decisions in Attention/Inbox and
+  the Dock badge, and posts per-device deduplicated notifications that open the
+  exact request. Replies resolve on every connected client, including after the
+  originating terminal closes; disconnected hosts retain their last messages.
+
+### Fixed
+
+- Muxa.app builds with Xcode 27: the embedded `muxad`/`muxa` build no longer
+  hands Xcode's `MACOSX_DEPLOYMENT_TARGET` to the host proc-macros, which then
+  failed to load (`can't find crate for tokio_macros`). The deployment target
+  still applies to the shipped binaries.
+- `muxa reload` resumes the right conversation on macOS. It reads each pane's
+  argv with its argument boundaries instead of the joined `ps` line, so an
+  initial prompt is no longer replayed word by word (a Codex argument error)
+  and a quoted `--append-system-prompt` value survives. The agent and its id
+  now come from the pane's own command line: a stale registry row no longer
+  puts a Claude id on a Codex pane, a screen-detected row takes the id its
+  command names, and a Codex pane with no id is matched to the one thread
+  begun in its directory after it started. An agent started with an
+  instruction whose conversation is still unknown is left for a person
+  instead of being relaunched as the same task again, and `continue` goes
+  only to agents whose conversation actually came back.
+
+## [0.9.0] - 2026-10-15
+
+### Added
+
+- `muxa reload` tells agents it cut off mid-turn to carry on: once each
+  resumed agent's screen settles, it types `continue` (change it with
+  `--continue TEXT`, skip it with `--no-continue`). Only agents that were
+  working when the snapshot was taken get it. `muxa restore` does the same only
+  with `--continue`, since an old snapshot's turn may no longer be wanted.
+- `muxa swap` moves agents onto another `aas` account and resumes each
+  conversation in its own pane: every rate-limited agent by default, named
+  panes, or `--all` (`--force` for mid-turn agents). The account is the next
+  eligible one from `aas candidates`, a named one (`--to`), or round-robin
+  (`--spread`); a follow-up prompt carries the cut-off turn on. Defaults live
+  in `[swap]`. See docs/ACCOUNT_SWAP.md.
+- Automation action `swap_account`: on a usage cap, switch accounts right away
+  instead of waiting for the reset.
+- Human decision requests and interrupted-peer recovery preserve the original
+  request and its authority. Agents discover optional human-action support
+  before using it; an interruption or timeout does not close the work.
+- `muxa msg update REQUEST BODY` sends quiet guidance or progress on an existing
+  request. `muxa msg list --request-id REQUEST --after-update SEQUENCE --json`
+  reads only newer updates without repeating the task or final reply.
+- Browser onboarding provides a continuous interactive terminal walkthrough,
+  with keyboard navigation and a unified landing-page design.
+
+### Changed
+
+- MCP prompt history defaults to 20 entries, with a normal maximum of 100;
+  `full=true` explicitly requests larger or complete history. Fleet status
+  defaults to compact health, counts and at most 20 active agents per host.
+- MCP request-body reads require an exact request ID unless `full=true` is
+  explicit. Follow-up MCP mutation receipts for replies, progress and
+  cancellations omit repeated task and routing data; delivery and reply receipt
+  remain distinct from a recipient's declared work result.
+- Collaboration guidance favors completion notifications and checkpoints over
+  repeated short polls. Fleet reply waits default to 30 seconds, and MCP
+  initialization explains exact tool discovery and schema reuse.
+- CLI inbox text includes the reply obligation, permitted paths, attachments and
+  progress updates. `muxa msg wait --timeout` aliases `--timeout-secs`, and a
+  bare `muxa msg send --notify` enables notifications.
+
+### Fixed
+
+- MCP agent creation, Work startup, peer spawning and pane control resolve the
+  target's tmux or rmux server before running lifecycle commands. rmux pane IDs
+  retain their namespace in agent-facing responses; ambiguous servers are
+  rejected instead of falling back to another host. Confirmation and managed
+  ownership checks remain required for destructive actions.
+- `muxa daemon start` uses the installed service manager when appropriate,
+  avoiding a second manually launched daemon alongside the managed service.
+- Screen detection reapplies unchanged terminal evidence when an agent's
+  recorded state has drifted, allowing restored sessions to recover correctly.
+- The website avoids an initial fallback flash and supports keyboard
+  continuation through browser onboarding.
+
+## [0.8.58] - 2026-10-15
+
+### Added
+
+- Run `muxa` with no subcommand to open tracked agents or choose an installed
+  agent to start in the current folder. First-agent setup previews the required
+  hook and tmux changes; cancelling also cancels the launch. MCP is optional.
+- `muxa onboard --quick` prepares practice agents for a three-step watch and
+  attend demo without agent API calls. The empty watch screen offers agent
+  creation and, outside tmux, the short demo.
+- `muxa msg expire --older-than <age> [--dry-run]` expires requests nobody
+  claimed, whoever sent them, including senders that no longer exist.
+- `muxa reload mcp [--codex-home DIR | --all]` refreshes a shared Codex
+  app-server's Muxa MCP connections without restarting it or starting a turn:
+  it writes a binary revision into the owned MCP entry, reloads, and verifies
+  each loaded connection (exit 2 while a refresh is still pending).
+- `muxa ask --new` starts a fresh provider conversation, and
+  `muxa ask provider use <id>` makes a provider the default (`[ask] agent`).
+- `muxa agent move` / `muxa window move` relocate live agents and whole windows
+  without restarting them.
+- Automation starter rules (disabled by default) installed by `muxa init`.
+- The dashboard collaboration reader is resizable, keeps its reading position,
+  and navigates retained history.
+
+### Changed
+
+- Status rows show what an injected prompt is instead of its markup:
+  `⟳ <task summary>` for a finished Claude background task, and
+  `↳ <Kind> request from <sender>` for a muxa peer request.
+- `muxa status` shows agents as a session / window / pane tree, like
+  `muxa watch`, with each session's state counts. Grouped `~view~` sessions
+  fold onto their base, and paneless agents are listed last. `--flat` keeps
+  the previous one-row-per-agent table; `--json` is unchanged.
+- `muxa --help` groups commands by purpose. Several commands moved under a
+  parent; the old names still work as hidden aliases:
+  `logs` → `daemon logs`, `sync`/`prune`/`panes` → `registry …`,
+  `run`/`attach`/`detach`/`register` → `proc …`,
+  `report`/`activity` → `stats report`/`stats activity` (`--since`/`--theme`
+  work on either side of the view), `host` → `fleet host`.
+- Agent-facing collaboration output is compact. `muxa msg wait` and the MCP
+  wait/report tools report `delivery_state`, `final_reply_received` and
+  `reported_status`, a wait timeout exits 2, and `--body [--output FILE]`
+  prints only the reply. `muxa msg list` shows 20 metadata rows by default
+  (`--limit 0` for all, `--full` for bodies, `--request-id` for one request).
+  `--full` / `full=true` return the previous complete records.
+- `muxa doctor` groups checks into a tree (muxad, Hooks, Agent integration,
+  tmux, Config). Passing sections fold to one line; `-v` lists every check.
+  It also warns about requests left unclaimed for over a day.
+- A wake that goes out anyway names the recipient's unread one-way notices.
+
+### Fixed
+
+- Onboarding sandboxes pin discovery to their own tmux server and disable
+  importing the caller's Codex sessions. Explicit XDG directory overrides now
+  apply on macOS too, keeping sandbox state and history out of user data.
+
+- `muxa stats` splits an interval that crosses midnight between its days.
+  Before, a state held overnight (an agent left waiting on a question) was
+  credited whole to the day it ended, putting 15h of WAIT on a morning that
+  was 10h old. Totals are unchanged.
+- `muxa stats` / `report` recorded no attached or hands-on time (WACT/ACT
+  `-`) for workspaces on rmux: session activity sampled only tmux and herdr.
+  rmux is sampled now. Its session ids are kept apart from tmux's
+  (`rmux:$N`), and a client is identified by its pid, so a reattach is not
+  counted as input.
+- `muxa stats` lists day rows newest first when no `--sort` is given.
+  Previously they were ranked by prompt count, which shuffled the dates.
+- `muxa panes` lists a grouped pane once, with `+N views`.
+- `muxa restore` / `muxa reload` relaunch agents correctly:
+  - **Wrapped agents.** A pane started with its command (as `muxa agent start`
+    does) is recorded as that command, wrapper included. Before, the snapshot
+    took its child: `node …/codex` without the `aas` wrapper, so the
+    account-specific resume failed.
+  - **Instruction-launched agents.** Resuming an agent that was launched with
+    its first instruction no longer sends that instruction again; flags and
+    their values are kept.
+  - **Parenthesised instructions.** An agent whose command contained
+    parentheses, such as an instruction mentioning "(commit, push)", was taken
+    for a process title and left out of the restore. When the argv was
+    captured, only the program argument is judged now; older snapshots are
+    re-judged when they are read.
+- Run from a plain terminal or a tmux shell, `muxa status` listed agents
+  living in rmux as raw `rmux:%N` ids. `status`, `dashboard` and `attend` now
+  name panes from every active host, matched to the agent's server. When no
+  live listing exists they fall back to the session muxad recorded. `muxa
+  sync` discovers agents on every active host.
+- After a multiplexer restart (`muxa reload`, an rmux upgrade), agents keep
+  their identity. A resumed session moves to the pane its hook reports. An
+  idle resumed agent is rebound, or registered if its row was reaped, from its
+  `--resume` / `codex resume` id. A dead session left on a reused pane id is
+  stopped once its pane has run no agent for an hour. Before, collaboration
+  could address another agent's pane, or a service pane, under a stale id.
+- The workload scan dropped panes whose agent had no child processes, losing
+  most idle agents' workload.
+- Screen detection no longer flips a restored Codex pane between idle and
+  stopped every few seconds until its first hook.
+- A pending request is offered only to a recipient delivery accepts. A reused
+  pane id in another window made muxad retry a refused wake on every tick and
+  flood the log.
+- muxad and headless `muxa ask` turns no longer inherit the session env
+  (`CLAUDE_CONFIG_DIR`, messaging socket) of the agent that started muxad, so
+  asks run as the configured account. Headless turns set `MUXA_ASK=1` for
+  user hooks, and a failed turn shows the reason the CLI printed on stdout.
+- `muxa doctor` no longer starts a stray rmux server on the default tmux
+  socket when scoped by `MUXA_TMUX_SOCKET`. It also no longer warns about a
+  missing `MUXA_SOCKET` pin on the default socket, or about systemd when a
+  shell rc starts muxad.
+- `muxa daemon logs | head` exits quietly instead of panicking on a closed
+  pipe.
+- Security: rustls 0.23.46 (RUSTSEC-2026-0346 and three related advisories:
+  TLS secrets in `Debug` output, data sent after ECH rejection, unbounded
+  brotli certificate decompression, ServerHello key-exchange downgrade).
+- Prompts sent to agents use explicit bracketed-paste boundaries before
+  submitting, and multiline text survives.
+
+## [0.8.57] - 2026-10-11
+
+### Added
+
+- `muxa stats --timeline` shows when each project had an agent working, on a
+  real clock axis: one block per day by default, or `--layout range` for one
+  row per project across the whole range so many projects fit on one screen.
+  `--hours 9-24` and `--cell 15` fix the window and the cell width, and
+  `--group-by session|agent` swaps projects for sessions or agent kinds.
+
+### Changed
+
+- Muxa for Mac is easier to read. Content text no longer drops below 11pt:
+  body text is 13pt, supporting text 12pt, badges and timestamps 11pt.
+  Terminal text in the Live Pane preview and in attached panes uses one
+  high-contrast palette (bright black, red and the bright yellows were
+  1.5–3:1). Ghostty now runs with `minimum-contrast = 3` and a readable dim
+  opacity, at the same 13pt size as the preview.
+- The Live Pane preview follows the newest output unless you scroll away,
+  trims trailing blank rows, and shrinks wide panes (down to 10pt) to fit the
+  panel before it scrolls sideways.
+- An agent's status reads the same everywhere. A rate-limited agent (muxad
+  reports its stopped turn as `error`) shows **Limited** with its reset time
+  instead of **Error**, and is no longer counted, notified or badged as
+  needing attention.
+- Explore shows a status once per row and pins agents that need attention
+  above the host tree. The Work Command Center opens with a one-line summary
+  and a "Look at now" list covering every host. The agent inspector shows its
+  status once and previews long responses with Show more.
+- Editor tabs drag like VS Code's. An insertion bar marks the drop point, a
+  tab can move to the other group's strip or editor, the outer edge of an
+  editor opens a new group, and Option copies instead of moving.
+
+### Fixed
+
+- Grouped sessions (two terminals on one workspace: `name` plus `name~view~N`)
+  list every pane once per member, and Muxa treated those listings as
+  separate panes. Codex threads in a grouped session failed to bind ("not
+  bound to a pane") although their prompt was on screen. Dashboard work
+  control typed a prompt or Ctrl-C into a grouped pane once per view. Share
+  pins on grouped panes always failed, work snapshots doubled runs, and fleet
+  doubled pane counts. View names were also persisted into the activity log
+  and history, where session exclusions missed them. Every place that counts,
+  matches, persists or scans panes now sees each physical pane once, named by
+  its base session.
+- Opening an empty remote or local file showed a blank page that looked like
+  a failed load; it now says the file is empty.
+
+## [0.8.56] - 2026-10-02
+
+### Added
+
+- `muxa upgrade` snapshots the workspace before swapping binaries. Afterwards
+  it lists the agent tool servers (`muxa mcp`) still running the old build,
+  grouped by owner. For each owner it gives the command to run:
+  `codex app-server daemon restart` (with its `CODEX_HOME`) for Codex's shared
+  server, or an agent restart / `muxa reload` for pane agents. It also prints
+  the `muxa restore <snapshot>` commands that rebuild the pre-upgrade
+  workspace. `muxa doctor` runs the same check. Killing a `muxa mcp` is no
+  refresh: agents do not respawn it.
+
+### Fixed
+
+- Codex 0.160+ runs every TUI's hooks, MCP servers and shell commands from
+  one shared `codex app-server`. Those processes inherit the pane variables of
+  whichever pane started the server, so every Codex reported that pane's
+  session/window/pane in collaboration, and replies went to the wrong agent.
+  Muxa now detects the shared server from process ancestry and identifies a
+  thread by its exact Codex thread id (`_meta.threadId` on MCP calls,
+  `$CODEX_THREAD_ID` for `muxa msg`/`muxa peers`). Collaboration origins carry
+  that id, and muxad matches it before the pane.
+- Codex threads under the shared server are bound to their real pane:
+  - **Exact resume:** from an exact `codex resume <id>` process.
+  - **Unique cwd:** from the one free pane running Codex at the thread's cwd.
+  - **Screen prompt:** when several Codex panes share that cwd, from the pane
+    whose screen shows the thread's latest prompt.
+
+  Binding happens when the thread's first prompt hook arrives, and again on its
+  first collaboration call. `/new` inside a bound TUI hands the pane to the new
+  thread. Ambiguous evidence, such as an identical prompt in one cwd, leaves
+  the thread unbound with a clear error rather than borrowing another pane's
+  identity.
+- Daemon startup no longer re-seeds a closed Codex thread onto the pane its
+  prompt history recorded. Behind the shared server that pane belonged to a
+  different agent.
+- Agent guidance (MCP instructions, skill, bootstrap) asks for one
+  `muxa_collaboration_guide` call for identity, peers and launch preferences,
+  and says to report location from `self` rather than `$TMUX_PANE`.
+- Rust 1.99 clippy lints pass.
+
+- Local Mac app builds derive their marketing version from the workspace,
+  matching the bundled CLI and daemon. Refresh Welcome, release highlights,
+  Korean install instructions, and dashboard landing screenshots; document
+  Codex rollout polling, quota evidence, and activity sorting.
+
+## [0.8.55] - 2026-10-01
+
+### Added
+
+- Dashboard **Workspaces** rail lists every tmux session, since muxa's layout
+  makes a session a workspace. It used to list only workspaces started with
+  `muxa work up`, so a fleet of unmanaged sessions read "0/0 · 0 works". Each
+  entry shows windows, agents, a rolled-up state and its Work count; managed
+  workspaces merge with the session of the same name, and names repeated
+  across tmux servers read `name · socket`. Selecting one scopes the Work
+  board, unlinked executions, the Sessions navigator, the Agents/Panes tables
+  and the Timeline, kept in the URL fragment. Presentation only: no Work is
+  created and no window is tagged. With no managed Work at all, the summary
+  cards and empty board collapse into one line pointing at `muxa work up`,
+  and the Sessions navigator comes first.
+- Dashboard pane output is live. The drawer and window tiles subscribe to the
+  new operator-only SSE route `GET /api/panes/{pane}/output/stream` instead of
+  polling `/output` every 1.5 s / 3 s. The daemon runs one capture loop per
+  pane only while someone watches, captures every 300 ms and sends the text
+  only when it changed; `gone` reports a closed pane. Streams are bounded (32
+  panes, 8 viewers per pane, 429 beyond; 30-minute lifetime) and a window
+  streams at most six tiles, polling the rest. The client reconnects with
+  backoff, pauses while the tab is hidden, and falls back to polling against
+  a daemon without the route.
+- Dashboard pane output renders Nerd Font icons (powerlevel10k/starship
+  prompts, Claude Code and Codex status lines) instead of empty boxes. The
+  daemon embeds a Private-Use-Area subset of Symbols Nerd Font Mono v3.5.1
+  (MIT; see `crates/muxa/src/dashboard/web/fonts/`), loaded through a
+  `unicode-range` fallback so normal text is unchanged. The shared-pane page's
+  CSP now names `font-src 'self'`.
+- Dashboard **Sessions** navigator organized the way muxa tracks agents:
+  session → window → pane. A keyboard-navigable, filterable tree with
+  rolled-up state (error > waiting > working > idle) and counts; a session
+  view listing windows; and a window view that draws panes with tmux's own
+  geometry (new read route `GET /api/windows/{window}/layout`), with live
+  output tails for operators and a window-scope share button. The Agents
+  table shows `session › window › pane` breadcrumbs, and `#session=`,
+  `#window=` and `#pane=` restore the selection.
+- Dashboard pane drawer for talking to an agent. Clicking an agent or pane
+  row opens a drawer with the pane's live output, a composer (Enter sends,
+  Shift+Enter adds a line, IME-safe), abort and share; `#pane=<id>` links to
+  it, and a header **agents** chip jumps to the Agents table. It replaces the
+  per-row prompt/abort/share buttons and the `window.prompt()` box. Backed by
+  the new operator-only `GET /api/panes/{pane}/output` (plain text, escapes
+  stripped, newest lines with tmux scrollback, bounded); viewers and anonymous
+  `public_read` visitors cannot read it.
+
+- Dashboard operator sign-in through any OpenID Connect provider
+  (`[dashboard.login]`). Access requires membership in `required_group` from
+  the ID token's group claim; the bearer token keeps working for API clients
+  and as the fallback. Cookie-authorized writes require the public `Origin`
+  and `X-Muxa-Operator: 1`.
+- Operator enrollment for dashboard sign-in. A holder of the dashboard token
+  can register a signed-in account outside `required_group` as an operator on
+  `/auth/enroll`; later sign-ins go straight in. `required_group` is now
+  optional, and `[dashboard.login] enrollment = false` restores group-only
+  sign-in. Enrolled accounts are stored by issuer and subject in a private
+  SQLite file, listed and removed from the dashboard's **access** dialog
+  (`GET /api/operators`, `POST /api/operators/{id}/remove`), and removal ends
+  their sessions immediately. Wrong tokens are limited per pending enrollment
+  and globally backed off.
+- Read-only viewers for dashboard sign-in. An account matching
+  `[dashboard.login] viewer_group` or a viewer rule (`email:<address>`,
+  `email:*@<domain>` or `sub:<subject>`; email rules need `email_verified`)
+  can read the dashboard like a `public_read` visitor, and every write returns
+  403. Operators manage rules in the dashboard's new **access** dialog
+  (`GET/POST /api/viewers`, `POST /api/viewers/{id}/remove`), which also shows
+  the current account and how it is authorized; `viewer_rules` in the
+  configuration are shown read-only. Removing a rule ends its sessions. A
+  viewer can become an operator with **upgrade with token**. Accounts matching
+  nothing still get no access. `/api/access` and `/auth/session` report `role`.
+
+### Changed
+
+- Dashboard: the rail's scope and the Sessions navigator's selection are now
+  separate. The rail writes `#workspace=<name>` (plus `&wsocket=` only when the
+  session name exists on several tmux servers) and scopes the page; the
+  navigator's `#session=`/`#window=`/`#pane=` only choose what its detail side
+  and the pane drawer show, so clicking a window no longer rescopes the page
+  or the Timeline filter. Old `#session=` links are migrated to the same scope
+  once on load.
+- Dashboard: while the rail is scoped to a session, the Sessions tree shows
+  only that session, expanded, with a **show all sessions** switch; the filter
+  box works inside the scope.
+- Dashboard: the Collaboration panel follows the rail scope — only messages
+  whose sender or recipient pane is in the scoped session, with pane-less
+  participants (the console, agents outside tmux) kept only when they talked
+  to an in-scope one — and its header reads **scoped to <name> · clear**.
+- Dashboard: the Workspaces header is a count badge with the wording in its
+  tooltip, instead of text that truncated to `18 sess…` in the narrow rail.
+- CI runs the dashboard's JavaScript tests
+  (`node --test crates/muxa/tests-js/*.test.mjs`) on Node 22.
+- A 401/403 from a dashboard control request now re-reads `/api/access`
+  instead of assuming the credential is gone, so a refused request no longer
+  hides an operator's controls until the page is reloaded.
+
+- Local Fleet mailbox notifications use in-process revisions instead of a
+  subscription to the daemon's own IPC socket. Host refreshes read only the
+  selected host, and pipeline readiness checks no longer clone every Run.
+- A saturated Fleet host command queue returns an explicit retry error without
+  blocking command routing to other hosts.
+
+### Fixed
+
+- Codex lifecycle status refreshes from timestamped rollout events every two
+  seconds when hooks miss updates, including resumed sessions created on older
+  dates. Recover active or completed turns from stale errors without inventing
+  recent activity; historical quota records cannot overwrite newer work.
+- `muxa watch` corrects stale Codex pane bindings using explicit resume session
+  IDs and live process ancestry, so activity updates and latest sorting apply to
+  the actual tmux session. Discover agents launched through `aas`, recognize
+  current Codex working/composer footers, and retain deliberate quota clearing
+  in UI snapshots.
+- Codex quota windows follow their reported duration, including weekly-only
+  primary windows. Saturated utilization and credit balances no longer imply
+  a blocked turn; only explicit blocking evidence changes lifecycle state.
+- Dashboard: with no managed Work, the unlinked tmux windows were hidden with
+  the empty board. They are now a compact, collapsible **Windows not tracked
+  as Work (N)** section (collapsed by default then, remembered per browser),
+  scoped by the rail, whose rows open the window in the navigator.
+- IPC observation subscriptions now stop on daemon shutdown, including blocked
+  stream writes, without consuming the five-second request drain deadline.
+  In-flight mutation handlers retain their existing drain guarantee.
+- Pipeline reconciliation workers now have a 60-second deadline and bounded
+  output capture, stop when the daemon shuts down, and back off after failures.
+  Already-launched tmux agents remain available for the next reconciliation.
+- `muxa work reconcile` now returns a failure after trying the remaining Runs
+  when a claim or launch fails, so the daemon can apply its retry delay.
+
+## [0.8.54] - 2026-09-25
+
+### Added
+
+- **Answer agents from their notifications.** Muxa for Mac's agent
+  notifications have Open and Mark as Read buttons, and one waiting for
+  input has Reply…: the text goes to the agent's pane through muxad's
+  `send_prompt`, and a reply that cannot be sent comes back as a
+  notification carrying the text.
+- **Side-by-side diffs and Viewed marks in Changes.** A Unified / Split
+  switch, a Viewed box per file with "N of M viewed" (a mark clears when the
+  file's diff changes), and `j` / `k` / `v` in the file list.
+- **Every host in one place.** ⌘J badges each agent with its host and ranks
+  agents across hosts (⇧⌘J follows the same order), and the usage popover
+  shows a provider account shared by several hosts once, with live-session
+  cost per host.
+- **Onboarding that ends with a running agent.** The Welcome Guide starts
+  your first agent, fixes a missing tmux or agent CLI with Copy and Run in
+  Shell, asks for notification permission with the reason, and tours the
+  workbench and its shortcuts. After an upgrade a short What's New window
+  opens instead of the whole guide, and empty Explore and Inbox views say
+  what to do next.
+- **Compare a snapshot with what runs now before restoring it.** Muxa for
+  Mac's Restore Snapshot sheet marks every session, window and pane as
+  missing now or running, lists what is new since the snapshot (a restore
+  never closes it), and sums it up — "2 sessions to recreate, 5 already
+  running, 1 new since snapshot". The Restore button says what it will do,
+  and with muxad's `mux_snapshot_plan_v1` an "Only missing sessions" switch
+  can be turned off to also fill in the windows and panes running sessions
+  lack. `muxa restore --json` adds `state`, `new_windows` and
+  `new_sessions`, and the dry-run text lists what is new since the snapshot.
+
+## [0.8.53] - 2026-09-25
+
+### Fixed
+
+- **Muxa for Mac builds with Xcode 16 again.** v0.8.52's app build failed on
+  the release runner, so v0.8.52 was never published; this release carries
+  everything listed under 0.8.52. The app now posts notifications through
+  `UNUserNotificationCenter`'s callback APIs, which are safe to call from the
+  main actor with the macOS 15 SDK, and the DMG packaging prints the compiler
+  errors when the build fails instead of only `BUILD FAILED`.
+
+## [0.8.52] - 2026-09-25
+
+### Added
+
+- **Muxa for Mac works like an editor.** The side bar's title row and the
+  editor tab strip double as the title bar, so the window chrome is one
+  compact row instead of a toolbar over a tab bar. The activity bar, side bar,
+  tabs and status bar follow VS Code's Modern themes, and a flat design system
+  replaces stock bezeled buttons, segmented controls and fields across the
+  workbench. The embedded terminal no longer claims ⌘W, ⌃Tab, ⌘1–9 or ⌘, —
+  only its own copy, paste, scroll and line-editing keys — and ⌘W closes the
+  focused editor before it closes the window. New: ⌘J jumps to an agent (the
+  ones needing you first, ⌘1–9 opens a result), ⇧⌘J goes to the next agent
+  needing attention, ⌘B toggles the side bar, ⇧⌘T reopens a closed editor, and
+  ⌘/ lists every shortcut.
+- **Muxa for Mac tells you when an agent needs you.** A macOS notification
+  when an agent starts waiting for input or a choice, errors, or finishes a
+  turn; clicking it opens that pane. An agent that finished or started waiting
+  since you last looked keeps a dot on its tab and Explore row, the Explore
+  icon counts them, and the Dock badge counts them with the agents needing
+  attention. The pane you are looking at never notifies, and permission is
+  asked the first time there is something to say. Settings › Behaviour turns
+  each kind, the sound and the Dock badge off.
+- **Start an agent from Muxa for Mac.** ⌥⌘T starts the default agent in the
+  focused pane's folder; ⌥⇧⌘T opens a sheet for the agent, folder, host
+  (control-mode fleet hosts included) and placement — split, window, session
+  or a Muxa terminal. muxad runs `muxa agent start --json` for it
+  (`agent_start_v1`). `muxa agent start` outside tmux no longer fails its own
+  `--direction` check.
+- **Usage and rate limits in Muxa for Mac.** The status bar shows the 5-hour
+  and 7-day usage of each provider that reports it (Claude, Codex), orange
+  from 80% and red from 95% or when capped, with reset times, live-session
+  cost and the capped agents one click away. Each agent shows a context-window
+  meter and, when capped, when it can continue.
+- **Review an agent's changes in Muxa for Mac.** A Changes module on panes
+  and Work (⌃⇧G) lists the repository's staged, unstaged and untracked files —
+  or everything since the branch base — with a unified diff. Comments on lines
+  or ranges collect into a review that goes back to the agent as one prompt,
+  previewed first.
+
+- **Snapshots are taken for you, and restoring one is safe to press.**
+  muxad takes an automatic workspace snapshot every 15 minutes when the
+  workspace changed, keeping the newest 10 (`[snapshot]
+  auto_interval_minutes`, `keep_auto`; `0` turns it off); snapshots taken by
+  hand or by `muxa reload` are never pruned. `muxa restore --only-missing`
+  recreates only the sessions the server lacks and never adds panes to one it
+  already has, and the dry run now says per session "will create", "exists —
+  skipped" or "exists — only missing windows and panes will be added".
+  `muxa snapshot --list`,
+  `muxa snapshot --delete <id>`, and `--json` on `snapshot` and `restore`
+  make all of it scriptable.
+- **Save and restore snapshots from Muxa for Mac.** Explore "…" → Save
+  Snapshot / Restore Snapshot…, also in the command palette. The restore
+  sheet lists snapshots (automatic ones badged), previews each as session ›
+  window › pane with what every pane will run, dry-runs the restore, and
+  shows per-pane results. It always restores only the missing sessions.
+  Needs muxad with the `mux_snapshot_v1` capability.
+
+- **`muxa reload` restarts the multiplexer and puts the workspace back.**
+  Picking up a new tmux/rmux server build means restarting it, and a restart
+  discards every pane process and every agent conversation; rebuilding thirty
+  panes by hand is not realistic. `muxa snapshot` captures the shape —
+  sessions, windows, panes, geometry, working directories — plus each pane's
+  own command line, which has to be read before the restart because it lives
+  in the process table. `muxa restore` rebuilds from a snapshot and prints the
+  plan unless `--run`. `muxa reload` does all three, refusing to run inside
+  the server it is about to kill, and `--snapshot DIR` reuses an existing
+  capture so an interrupted restore can be retried.
+
+  A pane muxa tracked comes back on its own conversation: the provider's
+  session id is spliced in as `--resume` when the captured command line does
+  not already carry one. Four things the obvious implementation gets wrong are
+  handled: a session *group* lists each window once per member (what
+  `muxa workspace view` builds for a second terminal), so a 32-pane workspace
+  would otherwise restore as 380 panes; `select-layout` renumbers panes by
+  geometry, so directories are set per final index rather than inherited from
+  `split-window -c`; keys sent to a shell that has not reached a prompt are
+  swallowed, so the restore polls for the shell instead of sleeping a guessed
+  interval; and servers that rewrite their own argv into a status line (puma)
+  are reported for a human rather than replayed as a command.
+
+  Agents are matched under their host namespace: the registry names a pane
+  `rmux:%12` while the host's own control commands report the bare `%12`, so
+  without it no pane would ever be recognised as an agent's and no
+  conversation would resume.
+
+### Fixed
+
+- **A restore types into a pane only once its shell is listening, and says
+  "relaunched" only when the program is running.** A shell still working
+  through its startup files has no line editor yet; a startup that prints
+  first looked ready, and the `cd` and relaunch typed then could be swallowed
+  by anything in that startup reading the terminal — while the restore
+  reported the pane relaunched. muxa now waits for the pane's terminal to
+  leave canonical mode (the line editor reading keys), and afterwards counts a
+  pane as relaunched only once its program is seen holding it; otherwise it
+  is reported as not confirmed, with the reason.
+
+- **`muxa reload` can bring the server back it just killed, and no longer
+  doubles a workspace.** A snapshot recorded the server by the short socket
+  name muxad keeps on a pane, which resolves only against a live server —
+  so after `kill-server` every command went to `/dev/null` and the restore
+  failed on its first `new-session`. Snapshots now record the socket's
+  absolute path, and an absolute path is used as given. On macOS no pane's
+  command line was captured at all (`ps --ppid` is a GNU flag), so nothing
+  was relaunched; the BSD form is used. A restore into a server that already
+  has the sessions — a retry, or tmux-continuum rebuilding its own save on
+  server start — added every pane a second time; it now creates only what a
+  window lacks, types into idle shells only, and `reload` waits for
+  continuum to finish before filling in the rest. An agent pane whose
+  command line is unknown is reported with the `--resume` it would need
+  instead of being skipped silently, and the error for an unknown target
+  server names the actual flag, `--mux-socket`. Agents are matched to panes
+  on the snapshot's own server: every tmux server numbers panes from `%0`,
+  so a snapshot of a second server used to pick up the default server's
+  agent for the same pane number and splice its `--resume` onto whatever
+  that pane was running.
+
+- **`muxa peers`, `muxa msg` and `muxa identity` speak for the right pane on
+  every host.** The CLI built its collaboration origin by reading `$TMUX_PANE`
+  and shortening `$TMUX` to a socket name, which is only correct on tmux. Hook
+  stamping and the pane scan namespace a pane by its host — `rmux:%102` — and
+  keep rmux and cmux endpoints as full paths, so on those hosts the origin
+  matched no tracked agent and every one of those commands refused with
+  "collaboration origin is not a hook-correlated tracked pane agent", naming a
+  pane whose agent was running perfectly well. The CLI now shares the MCP
+  server's origin, so the two cannot disagree again.
+
+### Changed
+
+- **New Shell is ⌘T in Muxa for Mac** (was ⇧⌘N), as in every terminal.
+
+## [0.8.51] - 2026-09-23
+
+### Fixed
+
+- **Detaching a pane ends its parked read at once again.** 0.8.49 made a
+  session wait look again after any wake without new output, which also
+  swallowed the wake an attach or detach sends — so a detaching client's read
+  held its connection for the full 15-second deadline. An attachment change
+  now ends the wait, as it did before.
+- **Apple Intelligence leaves out answers it gave without its tools by
+  what it was given, not by what it said.** The on-device model keeps no
+  session, so muxad replays the conversation on every turn — and a small
+  model replayed its own earlier "I cannot access other applications",
+  true before 0.8.48 gave it the workspace tools, sooner than call them.
+  0.8.50 recognised that answer by its English wording, which missed other
+  phrasings and other languages. muxad now records on each Ask entry
+  whether the turn had the workspace tools (`workspace_tools`), and a turn
+  that has them replays only turns that had them too; the helper's wording
+  filter is gone. Entries written before this version carry no such
+  record, so an Apple Intelligence conversation from 0.8.48–0.8.50 starts
+  its replay afresh once.
+- **The Apple Intelligence helper is found in `~/Applications` too, and the
+  app no longer promises a helper muxad cannot find.** A Homebrew muxad now
+  looks in `~/Applications/Muxa.app` after `/Applications/Muxa.app`, and
+  skips a copy it cannot execute. Settings › Providers now finds the helper
+  the way the running muxad does — beside the daemon, then in an installed
+  app — and probes that copy, so an app opened from Downloads beside a
+  Homebrew muxad no longer reads "Runs on this Mac" while every turn fails. `muxa work init` now offers the `apple` engine
+  when the helper is inside an installed app rather than only on `PATH`.
+- **Global Ask exports keep their shape.** An answer's own headings move
+  under the export's `##` sections, a code fence left open by a cut-off
+  answer is closed — in Markdown and in *Copy as Prompt*, where the
+  wrapper's tags would otherwise read as code — and *Copy as Prompt*
+  escapes a closing `</assistant>`, `</user>` or `</conversation>` inside a
+  message and quotes in the provider name. Saving to a file whose title starts with a dot no
+  longer makes a hidden file, and a failed save shows as a warning instead
+  of beside a checkmark.
+- **The Ask sidebar's status filter filters.** Active lists conversations
+  still being answered and Attention those whose last turn failed; before,
+  both showed every conversation.
+- Settings › Providers says that `private-cloud` does not work yet, as the
+  configuration guide does, and `docs/MACOS.md` describes the Ask container
+  instead of Ask inside the Inbox.
+
+## [0.8.50] - 2026-09-20
+
+### Fixed
+
+- **A conversation in which Apple Intelligence once said it could not see
+  your agents now recovers on its own.** 0.8.49 told the model that such an
+  earlier answer was out of date; with three of them in a row in the replay,
+  the on-device model still repeated itself on one run in three, and putting
+  the live session list into the instructions made it worse, not better — a
+  small model keeps the story it told three turns ago. So when the workspace
+  tools are available the helper drops those turns from the replay: a short
+  answer that is nothing but the model's "I cannot access external
+  applications" boilerplate is left out, and a long answer that merely
+  mentions the phrase stays. Against the real conversation that showed the
+  problem: ten runs, no refusals, seven of them reading the sessions.
+
+## [0.8.49] - 2026-09-20
+
+### Changed
+
+- **Global Ask has its own place in the sidebar.** It used to be a row inside
+  the Inbox container, next to the Operator Inbox, with its history as an
+  "Ask" scope of the Inbox view — but a question to a provider is not a
+  request from an agent. The activity bar now reads Work · Explore · Inbox ·
+  Ask · Shells. The Ask container lists the selected provider's
+  conversations, newest activity first, with a filter and a New Conversation
+  button; picking one opens it in the editor. The Inbox keeps to agent mail
+  and loses its Ask scope, and its badge no longer counts a question still
+  being answered — the Ask container's does.
+
+### Fixed
+
+- **The Apple Intelligence provider reads your agent sessions even in a
+  conversation where it once said it could not.** The workspace tools arrived
+  after 0.8.47, so a conversation started before them holds an earlier turn
+  in which the model said, truthfully then, that it cannot access other
+  applications — and the on-device model repeated that answer rather than
+  reach for the tools it now has. The helper's instructions now say outright
+  that such an earlier answer is out of date and that a question about the
+  user's agents means calling `list_agent_sessions`, not answering from
+  memory. Checked against the real conversation that showed the problem:
+  the model called the tool on every run instead of never.
+- **A session's exit is no longer reported before its last output can be
+  read.** The PTY reader and the process watcher are separate threads, so a
+  child that printed and exited could be reaped, and `exited` published,
+  before its final bytes had been read off the PTY. A client that stops
+  reading at `exited` then missed them — the same race made the
+  `session_wait_wakes_for_output_instead_of_polling` test fail on most CI
+  runs. The exit now waits for the reader to reach end-of-file, up to half a
+  second so a grandchild holding the PTY open cannot hold the exit back, and
+  a session wait re-checks for output after every wake instead of returning
+  whatever a wake for a resize, an end-of-file, or nothing at all happened
+  to find.
+
+## [0.8.48] - 2026-09-20
+
+### Added
+
+- **Apple Intelligence is a Global Ask provider.** A new `apple` engine runs
+  the Mac's own Foundation Models — no API key, no vendor account, nothing
+  to install. It is a built-in provider on macOS 26 and later, listed beside
+  `claude`, `codex`, `gemini`, `anthropic` and `openai`, and `model` chooses
+  between the two system models: `on-device` (the default; 8,192-token
+  context, never leaves the Mac) and `private-cloud` (Apple's Private Cloud
+  Compute; macOS 27, 32,768 tokens). `muxa ask --agent apple`, `muxa ask
+  provider add … --engine apple` and Settings › Providers all speak it.
+
+  Foundation Models is a Swift-only, in-process framework with no CLI, so
+  muxad cannot call it and there is nothing to drive in print mode. The
+  engine therefore spawns `muxa-afm`, a small helper that now ships in
+  `Muxa.app/Contents/Helpers` beside muxad: one JSON request on stdin, one
+  JSON answer on stdout, the reason for a failure as the last line of
+  stderr. muxad finds it beside its own executable, then in
+  `/Applications/Muxa.app` (a Homebrew muxad serving an installed app), then
+  on `PATH`; `[ask.providers.<id>] executable` names another copy. The
+  helper keeps the app's macOS 13 floor — the framework is weak-linked and
+  every use sits behind `#available` — so on an older Mac it runs and says
+  what is missing rather than failing to launch. The helper also compiles
+  without the macOS 26 SDK, which is a trap for whoever builds the app: it
+  would ship a provider that can never answer. So its build step looks for
+  an installed Xcode whose SDK has Foundation Models and compiles the helper
+  with that one, whichever Xcode builds the app, and a Release build that
+  finds none fails instead of shipping it. Private Cloud Compute and
+  `LanguageModelError` exist only in the macOS 27 SDK, so those uses are
+  compiled in by FoundationModels module version, not just guarded by
+  `#available`: built with an Xcode 26 SDK — what a macos-15 release runner
+  has — the helper answers on-device and reports that this build has no
+  private-cloud model.
+
+  Like the API engines it has no session to resume, so the store is its
+  thread: muxad replays the conversation on every turn, cut to 6,000
+  characters for the on-device window. Characters only estimate tokens, so
+  when the model still reports an overflow the helper drops the older half
+  of the replay and tries again, down to the bare prompt, before giving up.
+
+  The agent CLIs can look at the workspace because they have a shell; a bare
+  model cannot, and asked "can you read my muxa agent sessions?" it answered,
+  truthfully, that it has no access to other applications. So on a Global Ask
+  turn muxad hands the helper its own socket, and the helper gives the model
+  two read-only tools backed by `muxa status --json` and `muxa recap`:
+  `list_agent_sessions` and `read_agent_session`. The model decides when to
+  call them, the lists are cut to fit the on-device window, and it can only
+  read — never send input to an agent. `on-device` keeps what it reads on the
+  Mac; `private-cloud` sends it to Apple's Private Cloud Compute with the
+  question. One-shot turns (`muxa work init`) get no tools.
+
+  Being installed is never the interesting question for this provider, so
+  Settings › Providers asks the helper (`muxa-afm --probe`) instead and shows
+  the system's own answer — Apple Intelligence turned off, the model still
+  downloading, a Mac that is not eligible — and offers neither an API key
+  field nor a sign-in, because there is no key. The built-in row is listed
+  on every host, so one `config.toml` can serve a Mac and a Linux box; a
+  turn on a host that cannot run it fails with a plain "runs only on macOS".
+- **Global Ask answers can leave the app.** Until now the only way to take an
+  answer anywhere was to select text by hand (or the Copy button on a code
+  block). Every exchange — in the Ask tab and in the Inbox's Ask scope — now
+  has a share menu, also on right-click: **Copy Answer**, **Copy Question**,
+  **Copy as Markdown**, and **Copy as Prompt**. The conversation header gains
+  **Export**: copy the whole conversation as Markdown or as a prompt, or
+  **Save as Markdown…** to a file named after the conversation.
+
+  *Copy as Prompt* is for handing a thread to another agent: the exchange
+  wrapped in `<conversation>` / `<user>` / `<assistant name="…">` tags under a
+  line saying where it came from, ending on a blank line for the instruction
+  that is yours to type. Markdown export leads a conversation with its title
+  and a `Global Ask · provider · date` line, and a single turn is just the two
+  messages. A turn with no answer says why — failed, with the error, or not
+  answered yet — instead of exporting an empty section.
+
+### Fixed
+
+- **"Reload muxad" no longer fails with "the existing muxad did not stop within
+  five seconds" when the daemon is a Homebrew binary that was started by
+  hand.** The app stopped a `/opt/homebrew` muxad only through
+  `brew services stop`, which exits 0 with a "not started" warning when the
+  process was launched from a shell rather than as the service — so nothing
+  ever signalled it and the wait always timed out. The app now sends SIGTERM
+  to the socket owner after the service stop as well.
+- **The Welcome guide's "Open Settings…" buttons open the tab that fixes the
+  row.** The Global Ask row lands on Providers, the muxad connection row on
+  Runtime and the work folder row on General, instead of whichever tab
+  Settings showed last.
+- **Muxa.app builds on a Mac that has only Xcode 26.4-or-later SDKs.**
+  `Scripts/build-app.sh` failed in the libghostty step with every libc symbol
+  undefined: those SDKs' `libSystem.tbd` offers arm64e but no longer plain
+  arm64, which is what Zig 0.15.2 links its build runner as. The script's
+  compatibility check searched the whole file for `arm64-macos`, and the
+  macOS 27 SDK names it in a few re-exported sub-libraries while libSystem
+  itself does not — so the SDK read as compatible and then failed to link.
+  The check now reads libSystem's own target list. The SDKs this build has
+  always preferred are still tried first, so a release runner gets the one it
+  always got; then any other installed SDK Zig can link against; and when
+  none qualifies, the newest SDK Zig's libc++ still compiles against (it does
+  not against the macOS 27 headers) is wrapped in a generated
+  `.build/zig-macos-sdk`: symlinks into the real SDK, plus a copy of
+  `libSystem.tbd` with arm64 listed beside arm64e. Only Zig's host link reads
+  it; Xcode still links the app against the real SDK. A macos-15 release
+  runner has an SDK that qualifies as it is, so nothing changes there.
+- **`Scripts/build-app.sh` no longer needs `xcode-select` repointed.** When the
+  active developer directory is the Command Line Tools — changing it takes
+  sudo — the script uses the installed Xcode for that build.
+
+## [0.8.47] - 2026-09-13
+
+### Added
+
 - **The workbench is fully drivable from the keyboard, with `⌘P` and `⌘⇧P` in
   front.** `⌘P` opens Quick Open over sessions, windows, panes, native shells,
   work and agents; `⌘⇧P` opens the command palette for navigating, creating
@@ -99,6 +904,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [Advanced launch options form](docs/CONFIGURATION.md#advanced-launch-options-form).
 
 ### Fixed
+
+- **A muxad restart no longer reports itself to the macOS app as a failure.**
+  Every restart burned the full five-second handler drain before re-exec, and
+  the app gave up on its own three-second socket timeout first — so adding a
+  Fleet host, which asks muxad to reload, disconnected the app with the errno
+  text `read failed: Resource temporarily unavailable` instead of registering
+  the host.
+
+  The drain never ended early because `read_session_wait` — the event-driven
+  terminal read the app holds open per live pane — parks a `spawn_blocking`
+  thread for as long as the client asked for, up to 30 seconds. Blocking tasks
+  cannot be cancelled and `JoinSet::abort_all` only drops the join handle, so
+  the handler sat in the drain until that wait expired on its own, while every
+  other streaming handler had already returned. The wait is read-only and
+  performs no mutation, so shutdown now abandons it the way it already
+  abandoned subscriptions, and the daemon re-execs immediately.
+
+  The app reads the situation correctly on both sides of that: a read that
+  hits its receive timeout, and a connection muxad closed before answering,
+  now say muxad may be restarting rather than handing over an errno. Neither
+  is retried automatically — a read failure cannot prove muxad did not already
+  apply the request, and replaying a mutation would double-apply it — so
+  recovery stays with the reconciliation poll, which now backs off from 750ms
+  instead of waiting out its fifteen-second period.
 
 - **The macOS app no longer stops muxad from starting at login.** Replacing a
   running daemon ran `launchctl disable` on the legacy `dev.open330.muxad`
@@ -3495,7 +4324,21 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.8.45...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/Open330/muxa/compare/v0.8.58...v0.9.0
+[0.8.58]: https://github.com/Open330/muxa/compare/v0.8.57...v0.8.58
+[0.8.57]: https://github.com/Open330/muxa/compare/v0.8.56...v0.8.57
+[0.8.56]: https://github.com/Open330/muxa/compare/v0.8.55...v0.8.56
+[0.8.55]: https://github.com/Open330/muxa/compare/v0.8.54...v0.8.55
+[0.8.54]: https://github.com/Open330/muxa/compare/v0.8.53...v0.8.54
+[0.8.53]: https://github.com/Open330/muxa/compare/v0.8.52...v0.8.53
+[0.8.52]: https://github.com/Open330/muxa/compare/v0.8.51...v0.8.52
+[0.8.51]: https://github.com/Open330/muxa/compare/v0.8.50...v0.8.51
+[0.8.50]: https://github.com/Open330/muxa/compare/v0.8.49...v0.8.50
+[0.8.49]: https://github.com/Open330/muxa/compare/v0.8.48...v0.8.49
+[0.8.48]: https://github.com/Open330/muxa/compare/v0.8.47...v0.8.48
+[0.8.47]: https://github.com/Open330/muxa/compare/v0.8.46...v0.8.47
+[0.8.46]: https://github.com/Open330/muxa/compare/v0.8.45...v0.8.46
 [0.8.45]: https://github.com/Open330/muxa/compare/v0.8.44...v0.8.45
 [0.8.44]: https://github.com/Open330/muxa/compare/v0.8.43...v0.8.44
 [0.8.43]: https://github.com/Open330/muxa/compare/v0.8.42...v0.8.43

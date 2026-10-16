@@ -12,9 +12,64 @@ The cap is only the first rule anyone wants, so the mechanism is general —
 an **event**, some **filters**, a **delay**, and an **action** — and the
 first rule is just one instance of it.
 
-**Automation ships enabled with no rules.** A fresh install runs the
-engine and does nothing. Nothing is typed into any pane until you write a
-rule, or Muxa.app writes one for you.
+**Automation ships with five disabled rules.** `muxa init` installs them;
+`muxad` also adds missing rules on startup for binary-only upgrades. Existing
+rules with the same names keep every setting, including their enabled state.
+The engine is enabled by default, but new rules do nothing until you enable them.
+
+| Rule | Action | Timing |
+| ---- | ------ | ------ |
+| `resume-codex-capacity` | Send `continue` for the specific Codex capacity error | 2m + up to 15s jitter; at most 6/hour/pane |
+| `resume-after-limit` | Send `continue` after a usage cap resets | Reset + 2m; 20m fallback without a reset time |
+| `notify-waiting-input` | Record an input-wait notice | 5m + jitter |
+| `notify-persistent-error` | Record a non-quota error notice | 5m + jitter |
+| `confirm-selected-yes` | Press Enter on the selected Yes/Proceed option | 5s; at most 10/hour/pane |
+
+`notify` records a daemon log notice and automation ledger entry; it does not
+send an OS notification. The existing cooldown, hourly ceilings, live condition
+check and one-firing-per-episode guards apply to every rule.
+
+```console
+muxa automation list
+muxa automation enable resume-codex-capacity
+muxa automation test resume-codex-capacity
+muxa automation disable resume-codex-capacity
+```
+
+New installs and upgrades add only missing names. Your custom rules, comments,
+engine enable/pause settings, and changes to existing starter rules survive.
+Removing a starter rule removes it until the next init or daemon startup; leave
+it disabled to keep it inactive. Uninstalling init wiring retains these editable
+rules as operator configuration.
+
+To add the rules to an existing installation explicitly:
+
+```console
+muxa init --component automation --yes
+```
+
+When the daemon is already running, restart it after init to load file edits.
+CLI `automation enable/disable/add` changes the live engine immediately.
+
+## Confirm selected Yes / Proceed
+
+`confirm-selected-yes` is installed disabled. It watches Claude/Codex input
+waits and uses `action = "press_enter"`. Before Enter, muxad captures the
+current pane and requires exactly one highlighted `Yes` or `Proceed` row and
+an Enter/confirmation footer. A selected `No`, plain text input, an ambiguous
+screen or a failed capture receives no key. The live waiting state and episode
+are checked again after capture. The rule does not move the selection.
+
+```console
+muxa automation enable confirm-selected-yes
+muxa automation disable confirm-selected-yes
+```
+
+Enabling this rule authorizes confirmation of the selected affirmative option,
+including permission prompts. `automation test` evaluates the deterministic
+state checks without sending keys; the screen check runs immediately before
+an actual Enter action. `press_enter` requires `on = "waiting_input"`, its
+waiting-input recheck, and no `text`, `message` or `submit` payload.
 
 ## Quick start
 
@@ -48,6 +103,45 @@ $ echo '{"name":"resume-after-limit","on":"rate_limited","action":"send_prompt",
     muxa automation add --from-json -
 wrote resume-after-limit
 ```
+
+## Retry Codex model capacity errors
+
+Capacity failures are ordinary `error` events, not usage caps. Match the latest
+notification to avoid resuming unrelated errors:
+
+```toml
+[[automation.rule]]
+name = "resume-codex-capacity"
+on = "error"
+agent = ["codex"]
+notification = '(?i)^Selected model is at capacity\.'
+action = "send_prompt"
+text = "continue"
+wait = "2m"
+jitter = "15s"
+cooldown = "2m"
+max_per_hour = 6
+```
+
+The notification filter is checked both when scheduling and before sending.
+If the error changes or the agent resumes, nothing is sent. Each error episode
+gets one attempt; another attempt requires a new episode. The existing hourly
+limits and cooldown still apply.
+
+## Switch accounts instead of waiting
+
+With several `aas` (Agent Account Switcher) accounts, a capped agent
+does not have to wait for its reset: `swap_account` moves it onto the next
+account with quota left and resumes the same conversation.
+
+```toml
+[[automation.rule]]
+name = "swap-on-limit"
+on = "rate_limited"
+action = "swap_account"
+```
+
+`muxa swap` does the same by hand. See [ACCOUNT_SWAP.md](ACCOUNT_SWAP.md).
 
 ## Commands
 
@@ -86,6 +180,7 @@ workspace = "callabo"            # exact workspace id stamped on the pane
 work = "^CAL-"                   # regex on the Work id
 pane = "%42"                     # exact pane id
 host = "local"                   # `local`, or tmux / cmux / rmux / zellij / herdr
+notification = "(?i)capacity"     # regex on the latest notification
 scope = ["five_hour"]            # rate-limit window (rate_limited only)
 
 # --- when to act ---
@@ -128,6 +223,8 @@ Closed set.
 | `send_prompt` | `text` (required), `submit` (default `true`) | Types `text` into the pane, waits the same submit grace the collaboration waker uses, then sends Enter. |
 | `notify` | `message` (required) | Emits a daemon-side notice and a ledger entry. Types nothing. |
 | `interrupt` | — | Sends the pane's interrupt (`Ctrl-C`). Types no prompt. |
+| `press_enter` | — | Checks the selected affirmative confirmation and live waiting state, then sends Enter. |
+| `swap_account` | `account` (default `auto`), `text` (default `[swap]`) | Moves the agent onto another `aas` account and resumes its conversation, then types the follow-up. Fires immediately by default. See [ACCOUNT_SWAP.md](ACCOUNT_SWAP.md). |
 
 `text` is refused at load time if it contains terminal control sequences.
 An automation types into a live TUI; escape sequences reaching one are how

@@ -40,6 +40,15 @@ use tokio::sync::{broadcast, watch, Notify, RwLock};
 pub const SYNTHETIC_SESSION_PREFIX: &str = "synthetic-";
 const CLAUDE_IDLE_PROMPT_NOTIFICATION: &str = "Claude is waiting for your input";
 
+/// The listing that names a pane: a grouped session reports one per `~view~`
+/// member; the base session represents it whatever the scan order.
+fn best_listing<'p>(listings: impl Iterator<Item = &'p PaneInfo>) -> Option<&'p PaneInfo> {
+    listings.fold(None, |kept, pane| match kept {
+        Some(kept) if !crate::tmux::prefer_listing(pane, kept) => Some(kept),
+        _ => Some(pane),
+    })
+}
+
 fn is_synthetic(session_id: &str) -> bool {
     session_id.starts_with(SYNTHETIC_SESSION_PREFIX)
 }
@@ -310,8 +319,7 @@ fn pid_alive(pid: u32) -> bool {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
     }
 }
 
@@ -678,11 +686,13 @@ fn heartbeat_changes_metrics(agent: &Agent, ev: &AgentEvent) -> bool {
     (model.is_some() && model != &agent.model)
         || (context_used_pct.is_some() && context_used_pct != &agent.context_used_pct)
         || (cost_usd.is_some() && cost_usd != &agent.cost_usd)
-        || (rate_limit_5h_pct.is_some() && rate_limit_5h_pct != &agent.rate_limit_5h_pct)
-        || (rate_limit_5h_resets_at.is_some()
+        || ((agent.kind == AgentKind::Codex || rate_limit_5h_pct.is_some())
+            && rate_limit_5h_pct != &agent.rate_limit_5h_pct)
+        || ((agent.kind == AgentKind::Codex || rate_limit_5h_resets_at.is_some())
             && rate_limit_5h_resets_at != &agent.rate_limit_5h_resets_at)
-        || (rate_limit_7d_pct.is_some() && rate_limit_7d_pct != &agent.rate_limit_7d_pct)
-        || (rate_limit_7d_resets_at.is_some()
+        || ((agent.kind == AgentKind::Codex || rate_limit_7d_pct.is_some())
+            && rate_limit_7d_pct != &agent.rate_limit_7d_pct)
+        || ((agent.kind == AgentKind::Codex || rate_limit_7d_resets_at.is_some())
             && rate_limit_7d_resets_at != &agent.rate_limit_7d_resets_at)
 }
 
@@ -722,6 +732,41 @@ fn mutate_for_event(
     let mut prompt_record: Option<PromptRecord> = None;
     let mut history_entry: Option<HistoryEntry> = None;
     let prev_state = agent.state;
+    // A new Codex prompt or tool execution supersedes a prior quota error.
+    // Older muxa versions inferred that error from utilization alone and then
+    // ignored real work indefinitely. Preserve unrelated errors and agents.
+    if agent.kind == AgentKind::Codex
+        && matches!(
+            agent.rate_limit_source,
+            Some(RateLimitSource::CodexRollout | RateLimitSource::Statusline)
+        )
+        && matches!(
+            ev,
+            AgentEvent::PromptSubmitted { .. }
+                | AgentEvent::ToolStarted { .. }
+                | AgentEvent::ToolCompleted { success: true, .. }
+        )
+    {
+        agent.rate_limit_source = None;
+        agent.rate_limit_scope = None;
+        agent.rate_limited_until = None;
+        if agent.state == AgentState::Error {
+            agent.state = AgentState::Working;
+        }
+    }
+    // A newer rollout record proves Codex resumed despite a missed prompt
+    // hook. Ordinary tool hooks still preserve unrelated errors.
+    if agent.kind == AgentKind::Codex
+        && agent.state == AgentState::Error
+        && at > agent.last_activity_at
+        && matches!(ev, AgentEvent::ToolStarted { tool, .. } if tool == "codex rollout activity")
+    {
+        agent.state = AgentState::Working;
+        agent.last_notification = None;
+        agent.rate_limit_source = None;
+        agent.rate_limit_scope = None;
+        agent.rate_limited_until = None;
+    }
     let touches_activity = event_touches_activity(agent, ev);
 
     match ev {
@@ -845,7 +890,10 @@ fn mutate_for_event(
             // produce. `response.is_none()` doesn't qualify: the
             // adapter may simply have failed to read the transcript,
             // including the case where the turn itself was rate-limited.
-            if response.is_some() {
+            if response.is_some() || (agent.kind == AgentKind::Codex && *idle_confirmed) {
+                if agent.kind == AgentKind::Codex {
+                    agent.last_notification = None;
+                }
                 agent.rate_limit_scope = None;
                 agent.rate_limited_until = None;
                 agent.rate_limit_source = None;
@@ -962,6 +1010,18 @@ fn apply_heartbeat(agent: &mut Agent, ev: &AgentEvent) {
         agent.rate_limit_7d_resets_at = Some(*t);
     }
 
+    // Codex rollout heartbeats contain complete quota snapshots. Clear
+    // missing windows too, including a formerly misclassified weekly primary
+    // that older muxa stored in the five-hour fields.
+    // Only an explicit RateLimited event can mark Codex as blocked.
+    if agent.kind == AgentKind::Codex {
+        agent.rate_limit_5h_pct = *rate_limit_5h_pct;
+        agent.rate_limit_5h_resets_at = *rate_limit_5h_resets_at;
+        agent.rate_limit_7d_pct = *rate_limit_7d_pct;
+        agent.rate_limit_7d_resets_at = *rate_limit_7d_resets_at;
+        return;
+    }
+
     let five_hour_saturated = rate_limit_5h_pct.is_some_and(|p| p >= 100.0);
     let seven_day_saturated = rate_limit_7d_pct.is_some_and(|p| p >= 100.0);
     if five_hour_saturated || seven_day_saturated {
@@ -1065,6 +1125,34 @@ fn apply_rate_limited(agent: &mut Agent, ev: &AgentEvent) {
         "rate_limited event applied",
     );
     agent.state = AgentState::Error;
+}
+
+/// Adopt the hook's pane when the row has none, or when the session has moved
+/// (see [`hook_moved_session`]): a multiplexer restart renumbers panes and the
+/// agent resumes in a new one, while the old id may already belong to another
+/// agent. Keeping it would route this session's identity, wakes and replies
+/// there. A moved row drops its endpoint so `refresh_endpoint` re-adopts the
+/// hook's.
+fn refresh_pane(agent: &mut Agent, id: &AgentId, new_agent: bool) {
+    if agent.pane.is_none() {
+        agent.pane.clone_from(&id.pane);
+    } else if !new_agent && hook_moved_session(agent, id) {
+        agent.pane.clone_from(&id.pane);
+        agent.tmux_socket = None;
+    }
+}
+
+/// Whether a hook for a known session reports it in a different pane, from a
+/// source trustworthy enough to move it. The hook reads `$TMUX_PANE` inside the
+/// agent's own process, except for Codex: its TUIs share one app-server whose
+/// hooks inherit the *first* pane's `$TMUX_PANE`, so Codex pane bindings come
+/// from `codex_binding` (resume argv, cwd, visible prompt) instead.
+fn hook_moved_session(agent: &Agent, id: &AgentId) -> bool {
+    id.pane.is_some()
+        && agent.pane != id.pane
+        && !is_synthetic(&id.session_id)
+        && id.kind != AgentKind::Codex
+        && agent.kind != AgentKind::Codex
 }
 
 /// Reconcile pane occupants for an incoming `Started` event.
@@ -1287,9 +1375,7 @@ impl Store {
         });
 
         // Keep identity fields fresh — adapters may re-send with more info.
-        if agent.pane.is_none() {
-            agent.pane.clone_from(&id.pane);
-        }
+        refresh_pane(agent, id, new_agent);
         refresh_endpoint(agent, id);
         if agent.surface.is_none() {
             agent.surface.clone_from(&id.surface);
@@ -1452,6 +1538,74 @@ impl Store {
         removed
     }
 
+    /// Reconcile native PTY ownership with an authoritative session lookup.
+    /// `None` means the surface no longer exists; `Some(false)` means its
+    /// process exited but output is still available. A failed lookup is a no-op.
+    /// Lookups run under the registry lock, so a new hook cannot race cleanup.
+    pub async fn reconcile_native_surfaces<F>(&self, lookup: F) -> usize
+    where
+        F: Fn(&str) -> Result<Option<bool>, crate::session::SessionError> + Send,
+    {
+        let mut agents = self.agents.write().await;
+        let mut changed = 0;
+        for agent in agents.values_mut() {
+            let Some(surface) = agent.surface.as_ref() else {
+                continue;
+            };
+            if surface.kind != crate::event::SurfaceKind::Pty || agent.pane.is_some() {
+                continue;
+            }
+            let running = match lookup(&surface.id) {
+                Ok(Some(true)) | Err(_) => continue,
+                Ok(other) => other,
+            };
+            let missing = running.is_none();
+            if missing {
+                agent.surface = None;
+            }
+            // A surviving pid after daemon restart still owns its task row.
+            // Detach the stale surface, but leave pid liveness to its own sweep.
+            if missing && agent.pid.is_some_and(pid_alive) {
+                changed += 1;
+                continue;
+            }
+            let previous = agent.state;
+            if previous != AgentState::Stopped {
+                agent.state = AgentState::Stopped;
+                agent.state_entered_at = OffsetDateTime::now_utc();
+                agent.subagents.clear();
+                let _ = self.transitions.send(Transition {
+                    from: previous,
+                    to: agent.state,
+                    agent: Arc::new(agent.clone()),
+                });
+            }
+            if missing || previous != AgentState::Stopped {
+                // Reconciliation is not new agent activity: retain its age so
+                // an old ghost is immediately eligible for prune and GC.
+                changed += 1;
+            }
+        }
+        drop(agents);
+        if changed > 0 {
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
+        changed
+    }
+
+    /// Forget one exact agent session, including rows on partially observed
+    /// hosts. This only changes the registry: no process or pane is stopped.
+    /// A later hook or inventory scan can register the agent again.
+    pub async fn forget_agent(&self, session_id: &str) -> bool {
+        let removed = self.agents.write().await.remove(session_id).is_some();
+        if removed {
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
+        removed
+    }
+
     /// Immediately delete fully orphaned rows (no pane, surface, or pid)
     /// whose last activity predates `cutoff`. The on-demand analogue of the
     /// reconciler's `mark_stale_paneless_stopped` age-out — backs `muxa
@@ -1548,6 +1702,71 @@ impl Store {
             self.changes.send_replace(());
         }
         flipped
+    }
+
+    /// Flip agent rows to `Stopped` whose pane has run no agent process for
+    /// `min_idle`. Pane ids are only unique per server lifetime: after a
+    /// multiplexer restart a dead session's old id can name an unrelated pane
+    /// (a shell, a test service), where the row looked alive forever and
+    /// collaboration could type into it. The idle floor keeps a launching or
+    /// briefly-hidden agent safe; a live agent's next hook revives its row.
+    /// Only panes this tick actually scanned count, only on complete hosts,
+    /// and only for kinds whose process the scan recognizes.
+    pub async fn stop_rows_without_agent_process(
+        &self,
+        by_pane: &HashMap<String, WorkloadSummary>,
+        complete_kinds: &[HostKind],
+        min_idle: Duration,
+    ) -> usize {
+        let now = OffsetDateTime::now_utc();
+        let mut agents = self.agents.write().await;
+        let mut stopped = 0_usize;
+        for agent in agents.values_mut() {
+            if agent.state == AgentState::Stopped
+                || is_synthetic(&agent.session_id)
+                || agent.pid.is_some()
+                || agent.surface.is_some()
+                || !matches!(
+                    agent.kind,
+                    AgentKind::ClaudeCode
+                        | AgentKind::Codex
+                        | AgentKind::GeminiCli
+                        | AgentKind::Antigravity
+                )
+                || now - agent.last_activity_at < min_idle
+            {
+                continue;
+            }
+            let Some(pane_id) = agent.pane.as_deref() else {
+                continue;
+            };
+            if crate::backend::pane_id_host_kind(pane_id)
+                .is_some_and(|host| !complete_kinds.contains(&host))
+            {
+                continue;
+            }
+            let Some(workload) = by_pane.get(pane_id) else {
+                continue;
+            };
+            if workload.primary_pid.is_some() {
+                continue;
+            }
+            let prev = agent.state;
+            agent.state = AgentState::Stopped;
+            agent.state_entered_at = now;
+            stopped += 1;
+            let _ = self.transitions.send(Transition {
+                from: prev,
+                to: agent.state,
+                agent: Arc::new(agent.clone()),
+            });
+        }
+        if stopped > 0 {
+            drop(agents);
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
+        stopped
     }
 
     /// Flip pid-tracked rows (`AgentKind::Task`) whose process has exited to
@@ -1831,14 +2050,24 @@ impl Store {
             let Some(cands) = panes_by_id.get(pane_id) else {
                 continue;
             };
+            // Among a grouped session's `~view~` listings of the pane, name
+            // it by the base session, whatever order the scan listed them in.
             let chosen = match a.tmux_socket.as_deref() {
-                Some(sock) => cands.iter().find(|p| p.socket.as_deref() == Some(sock)),
-                None => match cands.len() {
-                    1 => cands.first(),
-                    _ => cands
+                Some(sock) => best_listing(
+                    cands
                         .iter()
-                        .find(|p| p.socket.as_deref() == Some("default"))
-                        .or(cands.first()),
+                        .copied()
+                        .filter(|p| p.socket.as_deref() == Some(sock)),
+                ),
+                None => match cands.len() {
+                    1 => cands.first().copied(),
+                    _ => best_listing(
+                        cands
+                            .iter()
+                            .copied()
+                            .filter(|p| p.socket.as_deref() == Some("default")),
+                    )
+                    .or_else(|| best_listing(cands.iter().copied())),
                 },
             };
             if let Some(p) = chosen {
@@ -1871,6 +2100,7 @@ impl Store {
     fn correlate_paneless_codex(
         agents: &mut HashMap<String, Agent>,
         panes_by_id: &HashMap<&str, Vec<&PaneInfo>>,
+        codex_hosts: &[PaneInfo],
     ) -> usize {
         // A pane's cwd, resolved the same way `backfill_tmux_names` picks the
         // right candidate when a pane id repeats across tmux servers.
@@ -1914,6 +2144,23 @@ impl Store {
                     .entry(path)
                     .or_default()
                     .push((pane_id, a.tmux_socket.clone()));
+            }
+        }
+
+        // Panes whose live process tree runs an interactive Codex count too:
+        // the screen detector may own the pane's placeholder as `Unknown`.
+        for host in codex_hosts {
+            let key = (host.pane_id.clone(), host.socket.clone());
+            if real_codex_panes.contains(&key) {
+                continue;
+            }
+            let path = host.current_path.trim();
+            if path.is_empty() {
+                continue;
+            }
+            let candidates = panes_by_cwd.entry(path.to_string()).or_default();
+            if !candidates.contains(&key) {
+                candidates.push(key);
             }
         }
 
@@ -2011,10 +2258,115 @@ impl Store {
     /// test) sees the exact same adopt-then-demote-in-one-pass behavior as
     /// before the correlation was lifted out of [`Self::reconcile_hosted`].
     pub async fn reconcile(&self, live_panes: &[PaneInfo]) -> ReconcileReport {
-        let paneless_correlated = self.correlate_paneless_codex_union(live_panes).await;
+        let paneless_correlated = self.correlate_paneless_codex_union(live_panes, &[]).await;
         let mut report = self.reconcile_hosted(live_panes, HostKind::Tmux).await;
         report.paneless_correlated = paneless_correlated;
         report
+    }
+
+    /// Refresh physical session names after a live pane move. A partial scan
+    /// can update names, but must never reap agents or manufacture activity.
+    pub async fn refresh_pane_locations(&self, live_panes: &[PaneInfo]) {
+        let mut agents = self.agents.write().await;
+        let before: HashMap<_, _> = agents
+            .iter()
+            .map(|(id, a)| (id.clone(), (a.tmux_session.clone(), a.tmux_socket.clone())))
+            .collect();
+        let mut by_id: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
+        for pane in live_panes {
+            by_id.entry(&pane.pane_id).or_default().push(pane);
+        }
+        Self::backfill_tmux_names(&mut agents, &by_id);
+        let changed = agents.iter().any(|(id, a)| {
+            before.get(id) != Some(&(a.tmux_session.clone(), a.tmux_socket.clone()))
+        });
+        drop(agents);
+        if changed {
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
+    }
+
+    /// Repair a binding using an explicit running resume (`codex resume
+    /// <session>`, `claude --resume <session>`) beneath a known pane. This does
+    /// not manufacture user activity.
+    pub(crate) async fn rebind_resumes(
+        &self,
+        bindings: &[crate::process_tree::ResumeBinding],
+    ) -> usize {
+        let mut agents = self.agents.write().await;
+        let mut changed = 0;
+        for binding in bindings {
+            let pane = &binding.pane;
+            let Some(agent) = agents.get_mut(&binding.session_id) else {
+                continue;
+            };
+            if !matches!(agent.kind, AgentKind::Codex | AgentKind::ClaudeCode)
+                || agent.surface.is_some()
+            {
+                continue;
+            }
+            if agent.pane.as_deref() == Some(&pane.pane_id) && agent.tmux_socket == pane.socket {
+                continue;
+            }
+            agent.pane = Some(pane.pane_id.clone());
+            agent.tmux_socket.clone_from(&pane.socket);
+            agent.tmux_session = Some(pane.session.clone());
+            changed += 1;
+        }
+        if changed > 0 {
+            drop(agents);
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
+        changed
+    }
+
+    /// Register a running resumed agent that has no row at all. A multiplexer
+    /// restart reaps the rows of panes that disappeared, and the agents that
+    /// `muxa reload` relaunched by resume id then have nothing for
+    /// [`Self::rebind_resumes`] to move: until their next hook they show only
+    /// as uncorrelated placeholders, and collaboration cannot identify them.
+    /// The explicit resume id is the session's own id, so the row is minted
+    /// under it (a real `Started`, which also retires the pane's placeholder).
+    /// A pane that a live real session already holds is left alone.
+    pub(crate) async fn adopt_unrowed_resumes(
+        &self,
+        bindings: &[crate::process_tree::ResumeBinding],
+    ) -> usize {
+        let adoptable: Vec<&crate::process_tree::ResumeBinding> = {
+            let agents = self.agents.read().await;
+            bindings
+                .iter()
+                .filter(|b| matches!(b.kind, AgentKind::Codex | AgentKind::ClaudeCode))
+                .filter(|b| !agents.contains_key(&b.session_id))
+                .filter(|b| {
+                    !agents.values().any(|a| {
+                        a.state != AgentState::Stopped
+                            && !is_synthetic(&a.session_id)
+                            && same_pane_identity(a, &b.pane.pane_id, b.pane.socket.as_deref())
+                    })
+                })
+                .collect()
+        };
+        let at = OffsetDateTime::now_utc();
+        for binding in &adoptable {
+            let cwd =
+                (!binding.pane.current_path.is_empty()).then(|| binding.pane.current_path.clone());
+            self.apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: binding.kind,
+                    session_id: binding.session_id.clone(),
+                    surface: None,
+                    pane: Some(binding.pane.pane_id.clone()),
+                    tmux_socket: binding.pane.socket.clone(),
+                    cwd,
+                },
+                at,
+            })
+            .await;
+        }
+        adoptable.len()
     }
 
     /// Adopt paneless codex hook rows onto the tmux/herdr pane they actually
@@ -2031,19 +2383,120 @@ impl Store {
     /// cwd with a tmux pane. The reconciler calls this before its per-host
     /// reap/dedup passes so those passes still demote the redundant synthetic
     /// in the same tick.
-    pub async fn correlate_paneless_codex_union(&self, live_panes: &[PaneInfo]) -> usize {
+    pub async fn correlate_paneless_codex_union(
+        &self,
+        live_panes: &[PaneInfo],
+        codex_hosts: &[PaneInfo],
+    ) -> usize {
         let mut agents = self.agents.write().await;
         let mut panes_by_id: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
         for p in live_panes {
             panes_by_id.entry(p.pane_id.as_str()).or_default().push(p);
         }
-        let adopted = Self::correlate_paneless_codex(&mut agents, &panes_by_id);
+        let adopted = Self::correlate_paneless_codex(&mut agents, &panes_by_id, codex_hosts);
         if adopted > 0 {
             drop(agents);
             self.dirty.notify_one();
             self.changes.send_replace(());
         }
         adopted
+    }
+
+    /// Whether `session_id` is a real Codex thread still waiting for a pane.
+    pub(crate) async fn is_unplaced_codex(&self, session_id: &str) -> bool {
+        self.agents
+            .read()
+            .await
+            .get(session_id)
+            .is_some_and(crate::codex_binding::is_unplaced_codex)
+    }
+
+    /// Live Codex hosts at the cwd of a still-unbound Codex thread that no
+    /// other thread owns — the panes whose screens can settle an ambiguous
+    /// cwd. Empty when nothing is contested, so callers capture nothing.
+    pub(crate) async fn contested_codex_hosts(&self, codex_hosts: &[PaneInfo]) -> Vec<PaneInfo> {
+        let agents = self.agents.read().await;
+        let unbound_cwds: HashSet<&str> = agents
+            .values()
+            .filter(|agent| crate::codex_binding::is_unplaced_codex(agent))
+            .filter_map(|agent| agent.cwd.as_deref().map(str::trim))
+            .filter(|cwd| !cwd.is_empty())
+            .collect();
+        if unbound_cwds.is_empty() {
+            return Vec::new();
+        }
+        // Owned panes stay in: after `/new` the unbound thread runs in a pane
+        // its predecessor still owns.
+        codex_hosts
+            .iter()
+            .filter(|host| unbound_cwds.contains(host.current_path.trim()))
+            .cloned()
+            .collect()
+    }
+
+    /// Bind unbound Codex threads to the one contested pane whose `screens`
+    /// text shows the thread's latest prompt (see
+    /// [`crate::codex_binding::prompt_pairs`]). Returns the number bound.
+    pub(crate) async fn correlate_paneless_codex_by_prompt(
+        &self,
+        screens: &[(PaneInfo, String)],
+    ) -> usize {
+        if screens.is_empty() {
+            return 0;
+        }
+        let mut agents = self.agents.write().await;
+        let rows: Vec<(String, String, String)> = agents
+            .values()
+            .filter(|agent| crate::codex_binding::is_unplaced_codex(agent))
+            .filter_map(|agent| {
+                let cwd = agent.cwd.as_deref()?.trim();
+                let needle = crate::codex_binding::prompt_needle(agent.last_prompt.as_deref()?)?;
+                (!cwd.is_empty()).then(|| (agent.session_id.clone(), cwd.to_owned(), needle))
+            })
+            .collect();
+        let pairs = crate::codex_binding::prompt_pairs(&rows, screens);
+        let mut bound = 0;
+        for (session, pane) in pairs {
+            let Some(prompted_at) = agents.get(&session).and_then(|a| a.last_prompt_at) else {
+                continue;
+            };
+            // A pane owned by an older thread changed threads (`/new`); one
+            // owned by a thread prompted since then is not this thread's.
+            let owners: Vec<String> = agents
+                .values()
+                .filter(|agent| {
+                    agent.kind == AgentKind::Codex
+                        && !is_synthetic(&agent.session_id)
+                        && agent.pane.as_deref() == Some(pane.pane_id.as_str())
+                        && agent.tmux_socket == pane.socket
+                })
+                .map(|agent| agent.session_id.clone())
+                .collect();
+            if owners.iter().any(|owner| {
+                agents[owner]
+                    .last_prompt_at
+                    .is_some_and(|owner_at| owner_at >= prompted_at)
+            }) {
+                continue;
+            }
+            for owner in owners {
+                if let Some(previous) = agents.get_mut(&owner) {
+                    previous.pane = None;
+                    previous.state = AgentState::Stopped;
+                }
+            }
+            if let Some(agent) = agents.get_mut(&session) {
+                agent.pane = Some(pane.pane_id.clone());
+                agent.tmux_socket.clone_from(&pane.socket);
+                bound += 1;
+            }
+        }
+        if bound > 0 {
+            drop(agents);
+            self.dirty.notify_one();
+            self.changes.send_replace(());
+        }
+        bound
     }
 
     /// Converge against a complete pane set observed by `observing_kind`.
@@ -2663,6 +3116,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_surface_reconciliation_distinguishes_missing_exited_and_failed_lookups() {
+        let store = Store::shared();
+        let old = OffsetDateTime::now_utc() - time::Duration::days(2);
+        let mut rows = Vec::new();
+        for sid in ["missing", "exited", "running", "failed", "foreign", "paned"] {
+            let mut row = stored_agent(sid, AgentKind::Codex, AgentState::Idle, None);
+            row.last_activity_at = old;
+            row.pane = (sid == "paned").then(|| "%123".into());
+            row.surface = Some(SurfaceRef {
+                kind: if sid == "foreign" {
+                    crate::event::SurfaceKind::Tmux
+                } else {
+                    crate::event::SurfaceKind::Pty
+                },
+                id: sid.into(),
+                workspace: None,
+            });
+            rows.push(row);
+        }
+        store.hydrate(rows).await;
+        let lookup = |id: &str| match id {
+            "missing" => Ok(None),
+            "exited" => Ok(Some(false)),
+            "running" => Ok(Some(true)),
+            "failed" => Err(crate::session::SessionError::Pty("unavailable".into())),
+            other => panic!("must not observe another owner's surface: {other}"),
+        };
+        assert_eq!(store.reconcile_native_surfaces(lookup).await, 2);
+        let missing = store.by_session("missing").await.unwrap();
+        assert_eq!(missing.state, AgentState::Stopped);
+        assert!(missing.surface.is_none());
+        assert_eq!(missing.last_activity_at, old);
+        let exited = store.by_session("exited").await.unwrap();
+        assert_eq!(exited.state, AgentState::Stopped);
+        assert!(
+            exited.surface.is_some(),
+            "retained output remains accessible"
+        );
+        for sid in ["running", "failed", "foreign", "paned"] {
+            let row = store.by_session(sid).await.unwrap();
+            assert_eq!(row.state, AgentState::Idle);
+            assert!(row.surface.is_some());
+        }
+        assert_eq!(store.reconcile_native_surfaces(lookup).await, 0);
+        assert_eq!(store.prune_orphans(OffsetDateTime::now_utc()).await, 1);
+        assert!(store.by_session("missing").await.is_none());
+        assert!(store.by_session("failed").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn missing_native_surface_keeps_a_surviving_pid_task_alive() {
+        let store = Store::shared();
+        let mut row = stored_agent("survivor", AgentKind::Task, AgentState::Idle, None);
+        row.pane = None;
+        row.pid = Some(std::process::id());
+        row.surface = Some(SurfaceRef {
+            kind: crate::event::SurfaceKind::Pty,
+            id: "pty:old-daemon".into(),
+            workspace: None,
+        });
+        store.hydrate(vec![row]).await;
+        assert_eq!(store.reconcile_native_surfaces(|_| Ok(None)).await, 1);
+        let row = store.by_session("survivor").await.unwrap();
+        assert_eq!(row.state, AgentState::Idle);
+        assert!(row.surface.is_none());
+        assert_eq!(store.prune_orphans(OffsetDateTime::now_utc()).await, 0);
+    }
+
+    #[tokio::test]
     async fn prune_orphans_deletes_only_stale_ownerless_rows() {
         let store = Store::shared();
         let old = datetime!(2026-04-24 12:00:00 UTC);
@@ -2710,6 +3232,75 @@ mod tests {
         let report = store.reconcile(&[]).await;
         assert_eq!(report.stale_panes_reaped, 0);
         assert!(store.by_session("task").await.is_some());
+    }
+
+    /// After a multiplexer restart a dead session's old pane id can name an
+    /// unrelated pane. A row whose scanned pane has run no agent process for
+    /// the idle floor is stopped; everything short of that evidence is kept.
+    #[tokio::test]
+    async fn rows_on_panes_without_an_agent_process_are_stopped_after_the_idle_floor() {
+        let store = Store::shared();
+        let long_ago = OffsetDateTime::now_utc() - time::Duration::hours(3);
+        let recent = OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        let started = |sid: &str, pane: &str, at| AgentEvent::Started {
+            id: AgentId {
+                tmux_socket: None,
+                kind: AgentKind::ClaudeCode,
+                session_id: sid.into(),
+                surface: None,
+                pane: Some(pane.into()),
+                cwd: None,
+            },
+            at,
+        };
+        store.apply(&started("dead", "rmux:%67", long_ago)).await;
+        store.apply(&started("alive", "rmux:%68", long_ago)).await;
+        store.apply(&started("fresh", "rmux:%69", recent)).await;
+        store
+            .apply(&started("unscanned", "rmux:%70", long_ago))
+            .await;
+        let shell_only = WorkloadSummary {
+            shell_count: 1,
+            ..WorkloadSummary::default()
+        };
+        let with_agent = WorkloadSummary {
+            primary_pid: Some(42),
+            ..WorkloadSummary::default()
+        };
+        let by_pane = HashMap::from([
+            ("rmux:%67".to_string(), shell_only.clone()),
+            ("rmux:%68".to_string(), with_agent),
+            ("rmux:%69".to_string(), shell_only),
+        ]);
+        let floor = Duration::from_secs(60 * 60);
+        let complete = [HostKind::Rmux];
+        assert_eq!(
+            store
+                .stop_rows_without_agent_process(&by_pane, &complete, floor)
+                .await,
+            1
+        );
+        let snap = store.snapshot().await;
+        let of = |sid: &str| snap.iter().find(|a| a.session_id == sid).unwrap().state;
+        assert_eq!(of("dead"), AgentState::Stopped);
+        assert_ne!(
+            of("alive"),
+            AgentState::Stopped,
+            "an agent process runs there"
+        );
+        assert_ne!(of("fresh"), AgentState::Stopped, "inside the idle floor");
+        assert_ne!(
+            of("unscanned"),
+            AgentState::Stopped,
+            "no evidence this tick"
+        );
+        // Not repeated once stopped, and an incomplete host is left alone.
+        assert_eq!(
+            store
+                .stop_rows_without_agent_process(&by_pane, &[HostKind::Tmux], floor)
+                .await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -2849,6 +3440,7 @@ mod tests {
             .unwrap();
         let pane = PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -3196,6 +3788,112 @@ mod tests {
             AgentState::Error,
             "ToolStarted must not clobber Error"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_real_work_recovers_persisted_quota_error_and_activity() {
+        let t0 = datetime!(2026-05-05 12:00:00 UTC);
+        let t1 = t0 + time::Duration::seconds(10);
+        for source in [RateLimitSource::CodexRollout, RateLimitSource::Statusline] {
+            for event_kind in ["prompt", "tool_started", "tool_completed"] {
+                let store = Store::shared();
+                let mut codex = id("codex-recovery");
+                codex.kind = AgentKind::Codex;
+                store
+                    .apply(&AgentEvent::RateLimited {
+                        id: codex.clone(),
+                        scope: RateLimitScope::FiveHour,
+                        source,
+                        resets_at: Some(t0 + time::Duration::days(7)),
+                        message: None,
+                        at: t0,
+                    })
+                    .await;
+                let event = match event_kind {
+                    "prompt" => AgentEvent::PromptSubmitted {
+                        id: codex,
+                        prompt: "continue".into(),
+                        at: t1,
+                    },
+                    "tool_started" => AgentEvent::ToolStarted {
+                        id: codex,
+                        tool: "exec_command".into(),
+                        subagent: None,
+                        at: t1,
+                    },
+                    _ => AgentEvent::ToolCompleted {
+                        id: codex,
+                        tool: "exec_command".into(),
+                        success: true,
+                        at: t1,
+                    },
+                };
+                store.apply(&event).await;
+                let agent = store.by_session("codex-recovery").await.unwrap();
+                assert_eq!(agent.state, AgentState::Working, "{event_kind}");
+                assert_eq!(agent.last_activity_at, t1, "{event_kind}");
+                assert_eq!(agent.state_entered_at, t1);
+                assert_eq!(agent.rate_limit_source, None);
+                assert_eq!(agent.rate_limit_scope, None);
+                assert_eq!(agent.rate_limited_until, None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_tool_does_not_clear_unrelated_error() {
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        let mut codex = id("codex-error");
+        codex.kind = AgentKind::Codex;
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: codex.clone(),
+                level: NotificationLevel::Error,
+                message: "failure".into(),
+                at: now,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::ToolStarted {
+                id: codex,
+                tool: "exec_command".into(),
+                subagent: None,
+                at: now,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("codex-error").await.unwrap().state,
+            AgentState::Error
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_weekly_snapshot_clears_old_five_hour_metrics() {
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        let mut codex = id("codex-quota");
+        codex.kind = AgentKind::Codex;
+        for (five, seven) in [(Some(100.0), None), (None, Some(100.0))] {
+            store
+                .apply(&AgentEvent::Heartbeat {
+                    id: codex.clone(),
+                    model: None,
+                    context_used_pct: None,
+                    cost_usd: None,
+                    rate_limit_5h_pct: five,
+                    rate_limit_5h_resets_at: five.map(|_| now),
+                    rate_limit_7d_pct: seven,
+                    rate_limit_7d_resets_at: seven.map(|_| now),
+                    at: now,
+                })
+                .await;
+        }
+        let agent = store.by_session("codex-quota").await.unwrap();
+        assert_eq!(agent.rate_limit_5h_pct, None);
+        assert_eq!(agent.rate_limit_5h_resets_at, None);
+        assert_eq!(agent.rate_limit_7d_pct, Some(100.0));
+        assert_eq!(agent.rate_limit_scope, None);
     }
 
     #[tokio::test]
@@ -4471,6 +5169,54 @@ mod tests {
         );
     }
 
+    /// A multiplexer restart renumbers panes and the agent resumes in a new
+    /// one. Its hooks must move the session there, or its identity stays on
+    /// an id that now belongs to another agent. Codex is the exception: its
+    /// shared app-server's hooks carry another pane's `$TMUX_PANE`.
+    #[tokio::test]
+    async fn a_resumed_session_follows_its_hook_into_a_new_pane() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-10-14 08:00:00 UTC);
+        let id = |kind, session: &str, pane: &str| AgentId {
+            tmux_socket: Some("/tmp/rmux-1/default".into()),
+            kind,
+            session_id: session.into(),
+            surface: None,
+            pane: Some(pane.into()),
+            cwd: None,
+        };
+        for (kind, session) in [
+            (AgentKind::ClaudeCode, "claude-s"),
+            (AgentKind::Codex, "codex-t"),
+        ] {
+            store
+                .apply(&AgentEvent::Started {
+                    id: id(kind, session, "rmux:%13"),
+                    at: t0,
+                })
+                .await;
+            store
+                .apply(&AgentEvent::PromptSubmitted {
+                    id: id(kind, session, "rmux:%20"),
+                    prompt: "after the restart".into(),
+                    at: t0 + time::Duration::minutes(1),
+                })
+                .await;
+        }
+        let snap = store.snapshot().await;
+        let pane = |session: &str| {
+            snap.iter()
+                .find(|a| a.session_id == session)
+                .and_then(|a| a.pane.clone())
+        };
+        assert_eq!(pane("claude-s").as_deref(), Some("rmux:%20"));
+        assert_eq!(
+            pane("codex-t").as_deref(),
+            Some("rmux:%13"),
+            "a Codex hook's pane is borrowed from the shared app-server"
+        );
+    }
+
     #[tokio::test]
     async fn real_started_replaces_synthetic_on_same_pane() {
         let store = Store::shared();
@@ -4656,6 +5402,212 @@ mod tests {
         assert!(res.is_err(), "expected no transition, got {res:?}");
     }
 
+    /// A fresh thread behind Codex's shared app-server reports no pane, and
+    /// the screen detector may own the pane's placeholder as `Unknown`. The
+    /// live process scan's Codex host is then the only pane evidence: a
+    /// unique cwd adopts it, two Codex panes at that cwd adopt neither.
+    #[tokio::test]
+    async fn paneless_codex_adopts_a_live_codex_host_without_a_codex_placeholder() {
+        let t0 = datetime!(2026-10-02 04:00:00 UTC);
+        let started =
+            |kind, sid: &str, pane: Option<&str>, cwd: Option<&str>| AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind,
+                    session_id: sid.into(),
+                    surface: None,
+                    pane: pane.map(str::to_owned),
+                    cwd: cwd.map(str::to_owned),
+                },
+                at: t0,
+            };
+        let host = |id: &str, cwd: &str| {
+            let mut p = pane(id);
+            p.current_path = cwd.into();
+            p
+        };
+
+        let store = Store::shared();
+        store
+            .apply(&started(
+                AgentKind::Unknown,
+                "synthetic-%204",
+                Some("%204"),
+                None,
+            ))
+            .await;
+        store
+            .apply(&started(
+                AgentKind::Codex,
+                "01a0fad4",
+                None,
+                Some("/scratch/e2e"),
+            ))
+            .await;
+        let live = [host("%204", "/scratch/e2e")];
+        assert_eq!(store.correlate_paneless_codex_union(&live, &[]).await, 0);
+        assert_eq!(store.correlate_paneless_codex_union(&live, &live).await, 1);
+        let snap = store.snapshot().await;
+        let real = snap.iter().find(|a| a.session_id == "01a0fad4").unwrap();
+        assert_eq!(real.pane.as_deref(), Some("%204"));
+
+        let store = Store::shared();
+        store
+            .apply(&started(AgentKind::Codex, "fresh", None, Some("/repo")))
+            .await;
+        let live = [host("%5", "/repo"), host("%6", "/repo")];
+        assert_eq!(store.correlate_paneless_codex_union(&live, &live).await, 0);
+    }
+
+    /// Two fresh threads prompted in one cwd before either bound: the live
+    /// hosts are contested, and each pane's screen shows one thread's prompt.
+    #[tokio::test]
+    async fn contested_codex_cwd_binds_by_the_prompt_on_screen() {
+        let t0 = datetime!(2026-10-02 05:00:00 UTC);
+        let store = Store::shared();
+        for (sid, prompt) in [
+            ("thread-a", "Review the auth middleware for token leaks"),
+            ("thread-b", "Write migration tests for the billing schema"),
+        ] {
+            let id = AgentId {
+                tmux_socket: None,
+                kind: AgentKind::Codex,
+                session_id: sid.into(),
+                surface: None,
+                pane: None,
+                cwd: Some("/repo".into()),
+            };
+            store
+                .apply(&AgentEvent::Started {
+                    id: id.clone(),
+                    at: t0,
+                })
+                .await;
+            store
+                .apply(&AgentEvent::PromptSubmitted {
+                    id,
+                    prompt: prompt.into(),
+                    at: t0,
+                })
+                .await;
+            assert!(store.is_unplaced_codex(sid).await);
+        }
+        let host = |id: &str| {
+            let mut p = pane(id);
+            p.current_path = "/repo".into();
+            p
+        };
+        let hosts = [host("%1"), host("%2")];
+        assert_eq!(
+            store.correlate_paneless_codex_union(&hosts, &hosts).await,
+            0
+        );
+        let contested = store.contested_codex_hosts(&hosts).await;
+        assert_eq!(contested.len(), 2);
+
+        let screens = vec![
+            (
+                hosts[0].clone(),
+                "› Write migration tests for the\n  billing schema\n".to_string(),
+            ),
+            (
+                hosts[1].clone(),
+                "› Review the auth middleware for token leaks\n".to_string(),
+            ),
+        ];
+        assert_eq!(store.correlate_paneless_codex_by_prompt(&screens).await, 2);
+        let snap = store.snapshot().await;
+        let pane_of = |sid: &str| {
+            snap.iter()
+                .find(|a| a.session_id == sid)
+                .and_then(|a| a.pane.clone())
+        };
+        assert_eq!(pane_of("thread-a").as_deref(), Some("%2"));
+        assert_eq!(pane_of("thread-b").as_deref(), Some("%1"));
+        assert!(store.contested_codex_hosts(&hosts).await.is_empty());
+        assert!(!store.is_unplaced_codex("thread-a").await);
+    }
+
+    /// `/new` inside a bound TUI: the newer thread whose prompt is on that
+    /// pane takes it over and its predecessor stops; an older unbound thread
+    /// can never take a pane from a thread prompted after it.
+    #[tokio::test]
+    async fn newer_thread_on_screen_takes_over_its_predecessors_pane() {
+        let t0 = datetime!(2026-10-02 06:00:00 UTC);
+        let store = Store::shared();
+        let prompt = |sid: &str, pane: Option<&str>, text: &str, at| {
+            let id = AgentId {
+                tmux_socket: pane.map(|_| "default".to_owned()),
+                kind: AgentKind::Codex,
+                session_id: sid.into(),
+                surface: None,
+                pane: pane.map(str::to_owned),
+                cwd: Some("/repo".into()),
+            };
+            AgentEvent::PromptSubmitted {
+                id,
+                prompt: text.into(),
+                at,
+            }
+        };
+        let first = "First thread: reply with exactly the word ready";
+        let second = "Second thread after slash new: reply ready";
+        store.apply(&prompt("old", Some("%1"), first, t0)).await;
+        store
+            .apply(&prompt(
+                "new",
+                None,
+                second,
+                t0 + time::Duration::seconds(30),
+            ))
+            .await;
+        let mut host = pane("%1");
+        host.current_path = "/repo".into();
+        host.socket = Some("default".into());
+        let hosts = [host.clone()];
+        assert_eq!(
+            store.correlate_paneless_codex_union(&hosts, &hosts).await,
+            0
+        );
+        assert_eq!(store.contested_codex_hosts(&hosts).await.len(), 1);
+
+        let screen = format!("› {second}\n• ready\n");
+        assert_eq!(
+            store
+                .correlate_paneless_codex_by_prompt(&[(host.clone(), screen)])
+                .await,
+            1
+        );
+        let snap = store.snapshot().await;
+        let row = |sid: &str| snap.iter().find(|a| a.session_id == sid).unwrap().clone();
+        assert_eq!(row("new").pane.as_deref(), Some("%1"));
+        assert_eq!(row("old").pane, None);
+        assert_eq!(row("old").state, AgentState::Stopped);
+        assert!(
+            !store.is_unplaced_codex("old").await,
+            "a stopped thread is not rebound"
+        );
+
+        // The reverse: an unbound thread older than the owner never steals.
+        let store = Store::shared();
+        store.apply(&prompt("stale", None, first, t0)).await;
+        store
+            .apply(&prompt(
+                "owner",
+                Some("%1"),
+                second,
+                t0 + time::Duration::seconds(30),
+            ))
+            .await;
+        let screen = format!("› {first}\n› {second}\n");
+        assert_eq!(
+            store
+                .correlate_paneless_codex_by_prompt(&[(host, screen)])
+                .await,
+            0
+        );
+    }
+
     /// A `code_mode_host` codex splits into a synthetic pane placeholder
     /// (discovery) plus a paneless real hook row (the app-server fires hooks
     /// with no `TMUX_PANE`). Reconcile must rejoin them by cwd: the real row
@@ -4752,9 +5704,157 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn resume_binding_repairs_wrong_pane_without_inventing_activity() {
+        let store = Store::shared();
+        let at = datetime!(2026-10-01 06:00:00 UTC);
+        let sid = "01a0f231-262f-77a3-9d42-b36d645fefcd";
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: sid.into(),
+                    surface: None,
+                    pane: Some("%183".into()),
+                    tmux_socket: None,
+                    cwd: Some("/work/muxa".into()),
+                },
+                at,
+            })
+            .await;
+        let mut changes = store.subscribe_changes();
+        let mut actual = pane("%181");
+        actual.session = "muxa".into();
+        actual.socket = Some("default".into());
+        let bindings = vec![crate::process_tree::ResumeBinding {
+            session_id: sid.to_owned(),
+            kind: AgentKind::Codex,
+            pane: actual,
+        }];
+        assert_eq!(store.rebind_resumes(&bindings).await, 1);
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        let agent = store
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|a| a.session_id == sid)
+            .unwrap();
+        assert_eq!(agent.pane.as_deref(), Some("%181"));
+        assert_eq!(agent.tmux_session.as_deref(), Some("muxa"));
+        assert_eq!(agent.last_activity_at, at);
+        assert_eq!(store.rebind_resumes(&bindings).await, 0);
+        assert!(!changes.has_changed().unwrap());
+    }
+
+    /// `muxa reload` relaunches Claude as `claude --resume <id>` in a pane whose
+    /// id the restart renumbered. The process tree is the evidence, so an idle
+    /// resumed Claude is moved before it fires any hook. Other kinds have no
+    /// resume evidence and are left to their hooks.
+    #[tokio::test]
+    async fn a_claude_resume_moves_its_row_without_waiting_for_a_hook() {
+        let store = Store::shared();
+        let at = datetime!(2026-10-14 08:42:00 UTC);
+        let started = |kind, sid: &str| AgentEvent::Started {
+            id: AgentId {
+                kind,
+                session_id: sid.into(),
+                surface: None,
+                pane: Some("rmux:%66".into()),
+                tmux_socket: None,
+                cwd: None,
+            },
+            at,
+        };
+        let claude = "9e48c8ff-1b70-4a3e-9f32-1581a05f0f75";
+        let gemini = "5b1c2d3e-0000-4000-8000-000000000001";
+        store.apply(&started(AgentKind::ClaudeCode, claude)).await;
+        store.apply(&started(AgentKind::GeminiCli, gemini)).await;
+        let bindings = vec![
+            crate::process_tree::ResumeBinding {
+                session_id: claude.to_owned(),
+                kind: AgentKind::ClaudeCode,
+                pane: pane("rmux:%8"),
+            },
+            crate::process_tree::ResumeBinding {
+                session_id: gemini.to_owned(),
+                kind: AgentKind::GeminiCli,
+                pane: pane("rmux:%9"),
+            },
+        ];
+        assert_eq!(store.rebind_resumes(&bindings).await, 1);
+        let snap = store.snapshot().await;
+        let pane_of = |sid: &str| {
+            snap.iter()
+                .find(|a| a.session_id == sid)
+                .and_then(|a| a.pane.clone())
+        };
+        assert_eq!(pane_of(claude).as_deref(), Some("rmux:%8"));
+        assert_eq!(pane_of(gemini).as_deref(), Some("rmux:%66"));
+    }
+
+    /// After a multiplexer restart reaped its row, a resumed agent that has
+    /// fired no hook yet is registered under its own resume id, replacing the
+    /// pane's placeholder. A pane held by another live session is left alone.
+    #[tokio::test]
+    async fn a_running_resume_with_no_row_is_registered_under_its_own_id() {
+        let store = Store::shared();
+        let at = OffsetDateTime::now_utc();
+        let started = |kind, sid: &str, pane: &str| AgentEvent::Started {
+            id: AgentId {
+                kind,
+                session_id: sid.into(),
+                surface: None,
+                pane: Some(pane.into()),
+                tmux_socket: None,
+                cwd: None,
+            },
+            at,
+        };
+        // Discovery's placeholder for the resumed pane, and a live session
+        // that owns another pane.
+        store
+            .apply(&started(AgentKind::Codex, "synthetic-%30", "rmux:%30"))
+            .await;
+        store
+            .apply(&started(AgentKind::ClaudeCode, "owner", "rmux:%31"))
+            .await;
+        let binding = |sid: &str, kind, pane_id: &str| crate::process_tree::ResumeBinding {
+            session_id: sid.into(),
+            kind,
+            pane: pane(pane_id),
+        };
+        let thread = "01a12f38-89b3-7370-b0e3-39875fb23fc2";
+        let bindings = vec![
+            binding(thread, AgentKind::Codex, "rmux:%30"),
+            binding(
+                "01a12f38-0000-7000-8000-000000000001",
+                AgentKind::Codex,
+                "rmux:%31",
+            ),
+        ];
+        assert_eq!(store.adopt_unrowed_resumes(&bindings).await, 1);
+        let snap = store.snapshot().await;
+        let on = |pane: &str| {
+            snap.iter()
+                .filter(|a| a.pane.as_deref() == Some(pane))
+                .map(|a| a.session_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(on("rmux:%30"), [thread], "the placeholder is replaced");
+        assert_eq!(
+            on("rmux:%31"),
+            ["owner"],
+            "a live session's pane is not taken"
+        );
+        // Once registered there is nothing left to adopt.
+        assert_eq!(store.adopt_unrowed_resumes(&bindings).await, 0);
+    }
+
     fn pane(id: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -4980,6 +6080,31 @@ mod tests {
         let untagged = store.by_session("untagged").await.expect("agent kept");
         assert_eq!(untagged.tmux_session.as_deref(), Some("main"));
         assert_eq!(untagged.tmux_socket.as_deref(), Some("default"));
+
+        let before = store.by_session("on-amux").await.unwrap();
+        let mut moved = pane("%1");
+        moved.socket = Some("amux".into());
+        moved.session = "moved-session".into();
+        // A partial observation cannot age out the unobserved default row.
+        store.refresh_pane_locations(&[moved]).await;
+        let after = store.by_session("on-amux").await.unwrap();
+        let mut expected = before;
+        expected.tmux_session = Some("moved-session".into());
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            store
+                .by_session("untagged")
+                .await
+                .unwrap()
+                .tmux_session
+                .as_deref(),
+            Some("main")
+        );
+        store.refresh_pane_locations(&[]).await;
+        assert_eq!(store.snapshot().await.len(), 2);
     }
 
     /// A socket-tagged agent whose server no longer has its pane is reaped

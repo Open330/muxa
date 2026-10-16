@@ -51,6 +51,8 @@ pub enum Component {
     AgentMcp,
     /// Headless questions from watch: enable `[ask]` in config
     Ask,
+    /// Disabled starter automation rules; existing operator rules are preserved.
+    Automation,
 }
 
 impl Component {
@@ -74,6 +76,7 @@ impl Component {
         Component::AgentSkills,
         Component::AgentMcp,
         Component::Ask,
+        Component::Automation,
     ];
 
     /// Stable kebab-case id used in CLI flags and marker blocks.
@@ -98,6 +101,7 @@ impl Component {
             Component::AgentSkills => "agent-skills",
             Component::AgentMcp => "agent-mcp",
             Component::Ask => "ask",
+            Component::Automation => "automation",
         }
     }
 
@@ -108,7 +112,9 @@ impl Component {
     /// One-line label shown in the multi-select.
     pub fn label(self) -> &'static str {
         match self {
-            Component::TmuxPopup => "tmux: prefix+s watch + prefix+S Fleet + prefix+D dashboard",
+            Component::TmuxPopup => {
+                "tmux: prefix+s watch + prefix+S Fleet + prefix+M move + prefix+D dashboard"
+            }
             Component::TmuxStatusLine => "tmux: per-pane agent glyphs in status-right",
             Component::TmuxPeek => "tmux: prefix+Q overlays each pane with its agent",
             Component::TmuxWindowNames => "tmux: muxa owns window names (prefix+, renames)",
@@ -127,6 +133,7 @@ impl Component {
             Component::AgentSkills => "Agents: shared collaboration skill with symlinks",
             Component::AgentMcp => "Agents: register Muxa MCP for Codex and Claude Code",
             Component::Ask => "Ask: headless questions to an agent from watch",
+            Component::Automation => "Automation: install five disabled starter rules",
         }
     }
 
@@ -156,6 +163,9 @@ impl Component {
             }
             Component::AgentMcp => "merges only the muxa server; forwards Codex pane environment",
             Component::Ask => "a/A in watch; muxad spawns an agent CLI that bills your account",
+            Component::Automation => {
+                "capacity retry, limit recovery, input/error notices; enable individually"
+            }
         }
     }
 
@@ -189,6 +199,7 @@ impl Component {
         let dm = Component::recommended_daemon_manager();
         match p {
             Preset::Minimal => vec![
+                Component::Automation,
                 Component::TmuxPopup,
                 Component::TmuxStatusLine,
                 Component::TmuxPeek,
@@ -196,6 +207,7 @@ impl Component {
                 Component::TmuxAutoView,
             ],
             Preset::Standard => vec![
+                Component::Automation,
                 Component::TmuxPopup,
                 Component::TmuxStatusLine,
                 Component::TmuxPeek,

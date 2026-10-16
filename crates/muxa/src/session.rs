@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,6 +26,13 @@ const DEFAULT_ROWS: u16 = 40;
 const MAX_BUFFER_BYTES: usize = 512 * 1024;
 const READ_CHUNK_BYTES: usize = 8192;
 const EXITED_SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+/// How long an exit waits for the PTY reader to reach end-of-file before
+/// being reported anyway. The child's last bytes are in the kernel's PTY
+/// buffer when `wait()` returns, and the reader needs a moment to move them
+/// into ours; without this a client sees `exited` and stops reading before
+/// the final output arrives. Bounded because a grandchild that keeps the
+/// PTY open would otherwise hold the exit back forever.
+const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, strum::Display)]
@@ -211,6 +218,43 @@ impl PtySessionBackend {
         Arc::new(Self::default())
     }
 
+    /// Authoritative lookup of an exact native surface: missing, running, or
+    /// exited but retained for output capture. Errors are not evidence of death.
+    pub fn session_liveness(&self, id: &str) -> Result<Option<bool>, SessionError> {
+        self.prune_exited();
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| SessionError::Pty("session registry lock poisoned".into()))?;
+        let Some(session) = sessions.get(id) else {
+            return Ok(None);
+        };
+        let meta = session
+            .meta
+            .lock()
+            .map_err(|_| SessionError::Pty("session meta lock poisoned".into()))?;
+        Ok(Some(!meta.exited))
+    }
+
+    /// Unlike the compatibility list API, never turn a failed observation into
+    /// an empty inventory. Cleanup clients must be able to distinguish them.
+    pub fn list_sessions_checked(&self) -> Result<Vec<SessionRef>, SessionError> {
+        self.prune_exited();
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| SessionError::Pty("session registry lock poisoned".into()))?;
+        let mut refs = Vec::with_capacity(sessions.len());
+        for session in sessions.values() {
+            let meta = session
+                .meta
+                .lock()
+                .map_err(|_| SessionError::Pty("session meta lock poisoned".into()))?;
+            refs.push(meta.reference());
+        }
+        Ok(refs)
+    }
+
     pub fn spawn_session(&self, input: SpawnSession) -> Result<SessionRef, SessionError> {
         if input.command.trim().is_empty() {
             return Err(SessionError::Pty("command is empty".into()));
@@ -279,6 +323,8 @@ impl PtySessionBackend {
             buffer: Mutex::new(OutputBuffer::new(MAX_BUFFER_BYTES)),
             activity: Mutex::new(0),
             activity_changed: Condvar::new(),
+            reader_done: AtomicBool::new(false),
+            attachments: AtomicU64::new(0),
         });
 
         let session_for_reader = session.clone();
@@ -294,6 +340,10 @@ impl PtySessionBackend {
                     i32::try_from(s.exit_code()).unwrap_or(1)
                 }
             });
+            // The reader and this thread race: the child can be reaped before
+            // its last write has been read off the PTY. Let the reader finish
+            // first, so `exited` never arrives ahead of the output.
+            session_for_wait.wait_for_reader(EXIT_DRAIN_GRACE);
             if let Ok(mut meta) = session_for_wait.meta.lock() {
                 meta.exited = true;
                 meta.exit_status = exit_status;
@@ -316,7 +366,7 @@ impl PtySessionBackend {
         };
         sessions.retain(|_, session| {
             let Ok(meta) = session.meta.lock() else {
-                return false;
+                return true;
             };
             if !meta.exited {
                 return true;
@@ -463,7 +513,7 @@ impl SessionBackend for PtySessionBackend {
         // Attachment changes are also cancellation signals for a client that
         // has a read_output_wait parked on this session. In particular, a
         // detach should not have to wait for the 15-second output deadline.
-        session.publish_activity();
+        session.publish_attachment_change();
         Ok(())
     }
 
@@ -491,22 +541,19 @@ struct PtySession {
     /// `Condvar::wait_timeout` hand-off.
     activity: Mutex<u64>,
     activity_changed: Condvar,
+    /// Set by the reader thread once the PTY has no more to give, which is
+    /// what makes an `exited` report mean "and you have seen everything".
+    reader_done: AtomicBool,
+    /// Bumped, under `activity`, whenever a client attaches or detaches. A
+    /// parked `read_output_wait` returns when it moves; every other wake
+    /// without new output is a reason to look again, not to return.
+    attachments: AtomicU64,
 }
 
 impl PtySession {
     fn reference(&self) -> SessionRef {
         let meta = self.meta.lock().expect("session meta lock poisoned");
-        SessionRef {
-            id: meta.id.clone(),
-            backend: SessionBackendKind::Pty,
-            display_name: meta.display_name.clone(),
-            cwd: meta.cwd.clone(),
-            attached_clients: meta.total_attached_clients(),
-            has_been_attached: meta.has_been_attached,
-            exited: meta.exited,
-            exit_status: meta.exit_status,
-            pid: meta.pid,
-        }
+        meta.reference()
     }
 
     fn snapshot_text(&self) -> Result<(u16, u16, String, bool), SessionError> {
@@ -551,19 +598,64 @@ impl PtySession {
         offset: u64,
         timeout: Duration,
     ) -> Result<SessionOutput, SessionError> {
-        let activity = self
+        let deadline = std::time::Instant::now() + timeout;
+        let mut activity = self
             .activity
             .lock()
             .map_err(|_| SessionError::Pty("session activity lock poisoned".into()))?;
-        let output = self.read_output(offset)?;
-        if output.next_offset != offset || output.truncated || output.exited || timeout.is_zero() {
-            return Ok(output);
+        let attachments = self.attachments.load(Ordering::Acquire);
+        loop {
+            let output = self.read_output(offset)?;
+            if output.next_offset != offset || output.truncated || output.exited {
+                return Ok(output);
+            }
+            // An attach or detach cancels the wait, so a detaching client's
+            // parked read does not hold its connection for the full timeout.
+            if self.attachments.load(Ordering::Acquire) != attachments {
+                return Ok(output);
+            }
+            // Activity is published for more than new output — a resize, a
+            // reader reaching end-of-file — and a condvar may wake for no
+            // reason at all, so a wake is a reason to look again, not an
+            // answer. Otherwise the deadline is the only way out.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(output);
+            }
+            let (guard, _) = self
+                .activity_changed
+                .wait_timeout(activity, remaining)
+                .map_err(|_| SessionError::Pty("session activity lock poisoned".into()))?;
+            activity = guard;
         }
-        let (_activity, _wait) = self
-            .activity_changed
-            .wait_timeout(activity, timeout)
-            .map_err(|_| SessionError::Pty("session activity lock poisoned".into()))?;
-        self.read_output(offset)
+    }
+
+    /// Blocks until the reader thread has hit end-of-file, or `grace` has
+    /// passed. The reader publishes activity when it finishes, so this waits
+    /// on the same condvar rather than polling.
+    fn wait_for_reader(&self, grace: Duration) {
+        let deadline = std::time::Instant::now() + grace;
+        let Ok(mut activity) = self.activity.lock() else {
+            return;
+        };
+        while !self.reader_done.load(Ordering::Acquire) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match self.activity_changed.wait_timeout(activity, remaining) {
+                Ok((guard, _)) => activity = guard,
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn publish_attachment_change(&self) {
+        if let Ok(mut activity) = self.activity.lock() {
+            self.attachments.fetch_add(1, Ordering::AcqRel);
+            *activity = activity.wrapping_add(1);
+            self.activity_changed.notify_all();
+        }
     }
 
     fn publish_activity(&self) {
@@ -594,6 +686,20 @@ struct SessionMeta {
 }
 
 impl SessionMeta {
+    fn reference(&self) -> SessionRef {
+        SessionRef {
+            id: self.id.clone(),
+            backend: SessionBackendKind::Pty,
+            display_name: self.display_name.clone(),
+            cwd: self.cwd.clone(),
+            attached_clients: self.total_attached_clients(),
+            has_been_attached: self.has_been_attached,
+            exited: self.exited,
+            exit_status: self.exit_status,
+            pid: self.pid,
+        }
+    }
+
     fn total_attached_clients(&self) -> usize {
         self.attached_clients
             .saturating_add(self.attached_client_ids.len())
@@ -659,6 +765,11 @@ fn read_pty_loop(mut reader: Box<dyn Read + Send>, session: Arc<PtySession>) {
             Err(_) => break,
         }
     }
+    // End-of-file (or the EIO macOS and Linux raise once the slave side is
+    // gone): everything the child wrote is in the buffer. Say so, and wake
+    // the exit watcher that may be holding the exit back for exactly this.
+    session.reader_done.store(true, Ordering::Release);
+    session.publish_activity();
 }
 
 fn next_session_id() -> String {
@@ -686,6 +797,57 @@ fn validate_env_pair(key: &str, value: &str) -> Result<(), SessionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_session_observation_failure_is_not_an_empty_inventory() {
+        let backend = PtySessionBackend::shared();
+        let poisoned = backend.clone();
+        let _ = thread::spawn(move || {
+            let _guard = poisoned.sessions.lock().unwrap();
+            panic!("simulate a failed session registry");
+        })
+        .join();
+        assert!(backend.list_sessions_checked().is_err());
+        assert!(backend.session_liveness("pty:unknown").is_err());
+        assert_eq!(
+            PtySessionBackend::default()
+                .session_liveness("pty:unknown")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn native_session_liveness_keeps_exited_output_until_retention_ends() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let backend = PtySessionBackend::default();
+        let session = backend
+            .spawn_session(SpawnSession {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "read line".into()],
+                env: Vec::new(),
+                cwd: None,
+                name: None,
+                cols: None,
+                rows: None,
+            })
+            .unwrap();
+        assert_eq!(backend.session_liveness(&session.id).unwrap(), Some(true));
+        let native = backend.get(&session.id).unwrap();
+        {
+            let mut meta = native.meta.lock().unwrap();
+            meta.exited = true;
+            meta.exited_at = Some(SystemTime::now());
+        }
+        assert_eq!(backend.session_liveness(&session.id).unwrap(), Some(false));
+        assert!(backend.capture(&session.id).is_ok());
+        native.meta.lock().unwrap().exited_at =
+            Some(SystemTime::now() - EXITED_SESSION_TTL - Duration::from_secs(1));
+        assert_eq!(backend.session_liveness(&session.id).unwrap(), None);
+        native.killer.lock().unwrap().kill().unwrap();
+    }
 
     #[test]
     fn generated_session_ids_do_not_collide_in_same_process() {
@@ -745,6 +907,92 @@ mod tests {
             .unwrap();
         assert!(output.data.contains("ready"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A detach is a cancellation signal: the parked read must return
+    /// promptly instead of holding its connection until the deadline.
+    #[test]
+    fn session_wait_returns_when_a_client_detaches() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let backend = Arc::new(PtySessionBackend::default());
+        let session = backend
+            .spawn_session(SpawnSession {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                env: Vec::new(),
+                cwd: None,
+                name: None,
+                cols: Some(80),
+                rows: Some(24),
+            })
+            .unwrap();
+        backend
+            .set_attached(&session.id, Some("client"), true)
+            .unwrap();
+        let offset = backend.read_output(&session.id, 0).unwrap().next_offset;
+
+        let detacher = {
+            let backend = backend.clone();
+            let id = session.id.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                backend.set_attached(&id, Some("client"), false).unwrap();
+            })
+        };
+        let started = std::time::Instant::now();
+        let output = backend
+            .read_output_wait(&session.id, offset, Duration::from_secs(10))
+            .unwrap();
+        detacher.join().unwrap();
+        assert!(!output.exited);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        backend.terminate(&session.id).unwrap();
+    }
+
+    /// The child's last bytes and its exit race through two threads. A
+    /// client that stops reading at `exited` must still have seen them.
+    #[test]
+    fn session_exit_is_reported_only_after_the_last_output_is_readable() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let backend = PtySessionBackend::default();
+        for round in 0..20 {
+            let session = backend
+                .spawn_session(SpawnSession {
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), format!("printf 'last words {round}'")],
+                    env: Vec::new(),
+                    cwd: None,
+                    name: None,
+                    cols: Some(80),
+                    rows: Some(24),
+                })
+                .unwrap();
+            let mut seen = String::new();
+            let mut offset = 0;
+            let started = std::time::Instant::now();
+            loop {
+                let output = backend
+                    .read_output_wait(&session.id, offset, Duration::from_secs(2))
+                    .unwrap();
+                seen.push_str(&output.data);
+                offset = output.next_offset;
+                if output.exited {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "round {round}: the exit was never reported"
+                );
+            }
+            assert!(
+                seen.contains(&format!("last words {round}")),
+                "round {round}: exited before the output could be read: {seen:?}"
+            );
+        }
     }
 
     #[test]

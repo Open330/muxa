@@ -22,6 +22,28 @@ This is distinct from Muxa's historical “pane host” terminology. A Fleet hos
 is a physical node. tmux, cmux, rmux, herdr, and zellij remain backend kinds inside
 that node.
 
+## Human attention across clients
+
+An agent can explicitly request a required decision with
+`muxa msg attention "Approve staging deployment?" --action approval`, or call
+`muxa_request_attention` with `body` and `action` (`approval`, `choice`, or
+`information`). Retain the request ID and wait with `muxa_wait_reply`; reuse a
+UUID `dispatch_id` for retries. Read the response body: completion is not consent.
+
+The source host stores the durable request and response. Each connected Mac
+aggregates operator requests from all its Fleet hosts into Attention and Inbox,
+posts a local macOS notification, and keeps a Dock badge until answered. Another
+Mac reading that source sees the same resolution. Notification deduplication is
+per device; dismissing or reading a notification never answers a request.
+
+Register the other machines in Fleet on **each** Mac you use; `local` is included
+automatically. Registration is not bidirectional or an automatic mesh. Read-only
+hosts can be viewed; replying needs a control connection. Keep the app, CLI,
+daemon and relay on the same version with this feature, enable collaboration,
+and refresh agents' MCP connections. Existing `msg send human --human-action`
+requests work too. A disconnected host retains its last known messages; initial
+reads and replies require that source to be reachable.
+
 ## Prerequisites
 
 - Install the same Muxa version on the controller and every remote host.
@@ -54,10 +76,10 @@ No setup is required for the controller node:
 
 ```bash
 muxa fleet status
-muxa host show local
-muxa host doctor local
-muxa host label local environment=development
-muxa host annotate local muxa.dev/owner=platform
+muxa fleet host show local
+muxa fleet host doctor local
+muxa fleet host label local environment=development
+muxa fleet host annotate local muxa.dev/owner=platform
 ```
 
 `local` has the same stable NodeId and topology shape as a remote node, but it
@@ -71,15 +93,15 @@ Register hosts through the CLI so Muxa validates and atomically updates the
 TOML inventory:
 
 ```bash
-muxa host add dev muxa-devbox \
+muxa fleet host add dev muxa-devbox \
   --label environment=development \
   --label region=icn \
   --annotation muxa.dev/owner=platform \
   --mode observe
 
-muxa host doctor dev
-muxa host list
-muxa host show dev
+muxa fleet host doctor dev
+muxa fleet host list
+muxa fleet host show dev
 ```
 
 The first remote-host command enables outbound SSH Fleet connections. The
@@ -91,17 +113,17 @@ prints a reminder to restart it manually.
 Labels follow Kubernetes key/value rules and are meant for selection:
 
 ```bash
-muxa host label dev tier=worker accelerator=gpu
-muxa host label dev tier=worker --overwrite
-muxa host label dev accelerator-              # remove
-muxa host tag dev region=icn                   # visible alias of label
+muxa fleet host label dev tier=worker accelerator=gpu
+muxa fleet host label dev tier=worker --overwrite
+muxa fleet host label dev accelerator-              # remove
+muxa fleet host tag dev region=icn                   # visible alias of label
 ```
 
 Annotation keys use the same namespaced key rules but their values may hold
 descriptive text or URLs:
 
 ```bash
-muxa host annotate dev muxa.dev/runbook=https://example.invalid/dev
+muxa fleet host annotate dev muxa.dev/runbook=https://example.invalid/dev
 ```
 
 The controller alias is human-friendly configuration identity. The relay also
@@ -132,8 +154,8 @@ apply to remote inventory entries:
   reconnect backoff.
 - `connect = "on_demand"` remains disconnected until `muxa fleet connect`.
 
-Use `muxa host disable` to keep metadata but suppress all connections, and
-`muxa host enable` to restore it.
+Use `muxa fleet host disable` to keep metadata but suppress all connections, and
+`muxa fleet host enable` to restore it.
 
 ## Operating the fleet
 
@@ -303,7 +325,7 @@ into keystrokes.
   `BatchMode=yes` and never disables host-key checking.
 - Fleet forces `ClearAllForwardings=yes` and does not request agent forwarding.
 - Start new hosts in observe mode, then promote only the hosts that need
-  control with `muxa host add ... --mode control --overwrite`.
+  control with `muxa fleet host add ... --mode control --overwrite`.
 - Treat access to the controller's muxad socket, config file, and SSH keys as
   shell-equivalent authority.
 - Use labels for selection, not secrets. Annotations are displayed in the
@@ -311,3 +333,19 @@ into keystrokes.
 
 See [CONFIGURATION.md](CONFIGURATION.md) for every setting and
 [MULTI_HOST.md](MULTI_HOST.md) for local multi-backend observation.
+
+### Event-driven replies and progress
+
+Fleet reply waits share a controller-side subscription per exact host/pane/request.
+`mailbox_watch` hosts reconcile on mailbox changes and reconnection rather than
+polling every 500 ms; older hosts use capped exponential backoff. Independent
+waiters retain their deadlines and release the worker when none remain.
+Use `muxa_fleet_update_request` for consolidated guidance and `muxa_update_request`
+for progress on that same durable request. `muxa_fleet_wait_reply(after_update=0)`
+can return progress before terminal completion. See [MCP.md](MCP.md) for sequence,
+retention, authority and compatibility contracts.
+
+## Work placement and personalized execution paths
+
+See [Fleet Work dispatch](FLEET_ORCHESTRATION.md) for coordinator routing,
+selector-based placement, configurable workspace paths, and durable dispatch.

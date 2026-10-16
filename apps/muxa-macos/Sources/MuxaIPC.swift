@@ -16,6 +16,12 @@ enum MuxaIPCError: LocalizedError {
 
     /// True while the request provably never reached muxad: the connect or
     /// the write failed on a socket muxad had already dropped.
+    ///
+    /// Deliberately excludes read failures — a timeout (EAGAIN) or a reset
+    /// partway through a reply proves nothing about whether muxad applied the
+    /// request, and replaying a mutation would double-apply it. Those are
+    /// reported, not retried; `AppModel` re-polls instead, which is safe
+    /// because a snapshot refresh mutates nothing.
     var isReconnectable: Bool {
         switch self {
         case .posix(let operation, let code):
@@ -40,9 +46,13 @@ enum MuxaIPCError: LocalizedError {
         case .posix(let operation, let code):
             // A dropped connection almost always means muxad restarted (its
             // own binary watch re-execs it, and an app update replaces it),
-            // so say that rather than handing over an errno.
+            // so say that rather than handing over an errno. A read that hits
+            // SO_RCVTIMEO reports EAGAIN, which is that same restart seen from
+            // a connection muxad accepted and then stopped answering on as it
+            // shut down; left unclassified it reached the connection banner as
+            // "read failed: Resource temporarily unavailable".
             switch code {
-            case EPIPE, ECONNRESET, ECONNREFUSED, ENOENT:
+            case EPIPE, ECONNRESET, ECONNREFUSED, ENOENT, EAGAIN, ETIMEDOUT:
                 "muxad is not answering — it may be restarting. Try again in a moment."
             default:
                 "\(operation) failed: \(String(cString: strerror(code)))"
@@ -50,7 +60,10 @@ enum MuxaIPCError: LocalizedError {
         case .responseTooLarge:
             "muxad returned an oversized IPC response"
         case .emptyResponse:
-            "muxad closed the IPC connection without a response"
+            // End of file before a response: muxad closed the connection,
+            // which is what its shutdown now does to an idle or read-only
+            // handler instead of holding the client for the drain timeout.
+            "muxad closed the connection without responding — it may be restarting. Try again in a moment."
         case .server(let message):
             message
         case .incompatibleProtocol(let minimum, let maximum):
@@ -304,6 +317,17 @@ struct MuxaAgent: Decodable, Hashable, Identifiable, Sendable {
     let model: String?
     let contextUsedPercent: Double?
     let costUSD: Double?
+    // WS-C usage: rate-limit fields from Claude's statusline heartbeat and
+    // Codex's rollout. Timestamps and enums stay strings, like `startedAt`;
+    // `MuxaUsage` parses them. All optional so older daemons still decode.
+    let rateLimit5hPercent: Double?
+    let rateLimit5hResetsAt: String?
+    let rateLimit7dPercent: Double?
+    let rateLimit7dResetsAt: String?
+    let rateLimitedUntil: String?
+    let rateLimitScope: String?
+    let rateLimitSource: String?
+    // WS-C usage end
     let startedAt: String?
     let lastActivityAt: String?
     let stateEnteredAt: String?
@@ -324,6 +348,15 @@ struct MuxaAgent: Decodable, Hashable, Identifiable, Sendable {
         case lastNotification = "last_notification"
         case contextUsedPercent = "context_used_pct"
         case costUSD = "cost_usd"
+        // WS-C usage
+        case rateLimit5hPercent = "rate_limit_5h_pct"
+        case rateLimit5hResetsAt = "rate_limit_5h_resets_at"
+        case rateLimit7dPercent = "rate_limit_7d_pct"
+        case rateLimit7dResetsAt = "rate_limit_7d_resets_at"
+        case rateLimitedUntil = "rate_limited_until"
+        case rateLimitScope = "rate_limit_scope"
+        case rateLimitSource = "rate_limit_source"
+        // WS-C usage end
         case startedAt = "started_at"
         case lastActivityAt = "last_activity_at"
         case stateEnteredAt = "state_entered_at"
@@ -385,6 +418,15 @@ struct MuxaAgentSubagent: Decodable, Hashable, Identifiable, Sendable {
 }
 
 struct MuxaPaneInfo: Decodable, Hashable, Sendable {
+    /// A console routing envelope, never a terminal target. Operator-only
+    /// mailbox reads/replies work even after a host's last pane has closed.
+    static let operatorRoute = MuxaPaneInfo(
+        paneID: "console", sessionID: "console", session: "", windowID: "console",
+        windowName: "", windowIndex: "0", paneIndex: "0", currentCommand: "",
+        title: "", currentPath: "", socket: "default", workspaceID: nil,
+        workID: nil, agentRole: nil, agentAlias: nil
+    )
+
     let paneID: String
     let sessionID: String
     let session: String
@@ -662,6 +704,8 @@ struct MuxaFleetHost: Decodable, Hashable, Identifiable, Sendable {
     let annotations: [String: String]?
     let remote: MuxaRemoteSnapshot?
 
+    var nodeID: String? = nil
+
     var id: String { alias }
     var identity: MuxaFleetHostIdentity {
         MuxaFleetHostIdentity(alias: alias, local: local, state: state, mode: mode)
@@ -669,6 +713,7 @@ struct MuxaFleetHost: Decodable, Hashable, Identifiable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case alias, local, mode, state, error, labels, annotations, remote
+        case nodeID = "node_id"
         case sshTarget = "ssh_target"
         case latencyMS = "latency_ms"
         case muxaVersion = "muxa_version"
@@ -803,7 +848,32 @@ struct MuxaCollaborationReply: Decodable, Hashable, Sendable {
     let at: String
 }
 
+struct MuxaPeerInterruption: Decodable, Hashable, Sendable {
+    let requestID: String
+    let reason: String
+    let active: Bool
+    let observedAt: String
+    let resetAt: String?
+    let actionRequestID: String?
+    let decision: MuxaCollaborationReply?
+    enum CodingKeys: String, CodingKey {
+        case reason, active, decision
+        case requestID = "request_id"
+        case observedAt = "observed_at"
+        case resetAt = "reset_at"
+        case actionRequestID = "action_request_id"
+    }
+}
+
 struct MuxaCollaborationRequest: Decodable, Identifiable, Hashable, Sendable {
+    var interruption: MuxaPeerInterruption? = nil
+    var peerInterrupted: Bool {
+        interruption?.active == true && interruption?.requestID == id && ["queued", "claimed"].contains(status)
+    }
+    var humanAction: String? = nil
+    var needsHumanResponse: Bool {
+        to.console == true && expectsReply && kind != "notice" && ["queued", "claimed"].contains(status)
+    }
     let id: String
     let from: MuxaCollaborationParticipant
     let to: MuxaCollaborationParticipant
@@ -824,6 +894,8 @@ struct MuxaCollaborationRequest: Decodable, Identifiable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, from, to, kind, body, status, reply
+        case interruption
+        case humanAction = "human_action"
         case expectsReply = "expects_reply"
         case workMode = "work_mode"
         case createdAt = "created_at"
@@ -907,7 +979,7 @@ private struct MuxaRevisionUpdate: Decodable, Sendable {
 }
 
 typealias MuxaIPCRequestHandler = @Sendable (String, Data) throws -> Data
-fileprivate typealias MuxaIPCTimedRequestHandler = @Sendable (
+typealias MuxaIPCTimedRequestHandler = @Sendable (
     String,
     Data,
     TimeInterval
@@ -932,7 +1004,7 @@ final class SerializedIPCTransport: @unchecked Sendable {
         self.handler = { path, payload, _ in try handler(path, payload) }
     }
 
-    fileprivate init(label: String, timedHandler: @escaping MuxaIPCTimedRequestHandler) {
+    init(label: String, timedHandler: @escaping MuxaIPCTimedRequestHandler) {
         queue = DispatchQueue(label: label, qos: .userInitiated)
         handler = timedHandler
     }
@@ -1468,12 +1540,14 @@ actor MuxaIPCClient {
 
     func collaborationMailbox(
         host: MuxaFleetHostIdentity,
-        pane: MuxaPaneInfo
+        pane: MuxaPaneInfo,
+        operatorOnly: Bool = false
     ) async throws -> MuxaCollaborationMailbox {
         let result = try await fleetCommand(
             host: host,
             operation: [
                 "kind": "collaboration_mailbox",
+                "operator_only": operatorOnly,
                 "pane": Self.paneKey(pane),
             ],
             requestTransport: fleetReadTransport(for: host.alias)

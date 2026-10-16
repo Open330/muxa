@@ -33,12 +33,18 @@
 //! an **unstable wire format** — the values may bump on any minor release
 //! when the underlying schema changes.
 
+pub mod account_swap;
 pub mod activity;
 pub mod adapters;
+pub mod agent_control;
 pub mod ask;
 pub mod automation;
+pub mod automation_choice;
+pub mod automation_defaults;
 pub mod automation_judge;
 pub mod backend;
+pub mod child_env;
+mod codex_binding;
 pub mod collaboration;
 pub mod collaboration_audit;
 pub mod config;
@@ -48,15 +54,22 @@ pub mod discovery;
 pub mod error;
 pub mod event;
 pub mod fleet;
+mod fleet_wait;
 pub mod history;
 pub mod ipc;
 pub mod metrics;
 pub mod notify;
+pub mod orchestration;
 pub mod paths;
 pub mod pipeline;
 pub mod pipeline_run;
 mod process_snapshot;
 pub mod process_tree;
+mod prompt_headline;
+#[doc(hidden)]
+pub mod test_support;
+pub use prompt_headline::prompt_headline;
+pub mod prompt_delivery;
 pub mod reconcile;
 pub mod request;
 pub mod scope_filter;
@@ -74,6 +87,8 @@ pub mod work;
 pub mod work_compose;
 #[doc(hidden)]
 pub mod work_control;
+// WS-F: snapshot
+pub mod mux_snapshot_control;
 pub mod work_pipeline_spec;
 pub mod work_presets;
 

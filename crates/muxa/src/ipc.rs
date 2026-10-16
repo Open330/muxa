@@ -101,6 +101,12 @@ const fn default_session_wait_ms() -> u64 {
     15_000
 }
 
+/// A snapshot plan or restore leaves existing sessions alone unless the
+/// client says otherwise (`mux_snapshot_plan_v1`).
+const fn mux_snapshot_only_missing() -> bool {
+    true
+}
+
 /// Overall deadline for a client request/response round trip (connect +
 /// hello + write + read). No caller should ever block forever against a
 /// wedged or half-dead daemon.
@@ -198,6 +204,47 @@ enum RequestBody {
         #[serde(default)]
         stdin: Option<String>,
     },
+    // WS-B: new agent
+    /// Start one allowlisted agent through `muxa agent start --json`, on
+    /// this host or a control-mode Fleet host. Synchronous, bounded to 30 s.
+    AgentStart {
+        request: crate::agent_control::AgentStartRequest,
+    },
+    // WS-F: snapshot
+    /// Workspace snapshots, run through `muxa snapshot` / `muxa restore
+    /// --json` (`mux_snapshot_v1`). Local host only. Newest first.
+    MuxSnapshotList,
+    /// Take a manual snapshot of the server muxa's agents are on.
+    MuxSnapshotSave,
+    /// Dry-run a restore of one snapshot: per session "create" or "skip",
+    /// and (`mux_snapshot_plan_v1`) what is missing, present or new since
+    /// the snapshot on the server now.
+    MuxSnapshotPlan {
+        id: String,
+        /// `mux_snapshot_plan_v1`: false plans existing sessions to get
+        /// the windows and panes they lack. Absent means true, which is
+        /// all a `mux_snapshot_v1` daemon does.
+        #[serde(default = "mux_snapshot_only_missing")]
+        only_missing: bool,
+    },
+    /// Start restoring the sessions of one snapshot that the server does
+    /// not have; unless `only_missing` is false (`mux_snapshot_plan_v1`),
+    /// existing sessions are never touched. Poll with
+    /// `mux_snapshot_restore_status`.
+    MuxSnapshotRestore {
+        id: String,
+        #[serde(default)]
+        layout_only: bool,
+        #[serde(default = "mux_snapshot_only_missing")]
+        only_missing: bool,
+    },
+    MuxSnapshotRestoreStatus {
+        operation_id: String,
+    },
+    MuxSnapshotDelete {
+        id: String,
+    },
+    // END WS-F: snapshot
     /// Draft one pipeline from a description with a read-only headless
     /// turn, validated with the `pipeline set` rules and retried once on a
     /// draft that would not launch. Writes nothing.
@@ -265,6 +312,14 @@ enum RequestBody {
     FleetCommand {
         host: String,
         operation: FleetOperation,
+    },
+    FleetWaitReply {
+        #[serde(default)]
+        after_update: Option<u64>,
+        host: String,
+        pane: crate::topology::PaneKey,
+        request_id: String,
+        timeout_secs: u64,
     },
     ByPane {
         pane: String,
@@ -415,6 +470,11 @@ enum RequestBody {
     /// Hand out the daemon's `config.toml` as text, so a client can edit
     /// the sections that have no typed request of their own.
     ConfigRead {},
+    ConfigOrchestrationRead {},
+    ConfigOrchestrationWrite {
+        expected_text: String,
+        settings: crate::orchestration::OrchestrationConfig,
+    },
     ConfigLaunchRead {},
     ConfigLaunchWrite {
         expected_text: String,
@@ -472,6 +532,11 @@ enum RequestBody {
     /// row and only loses its overrides. Answers with the updated list.
     AskProviderRemove {
         id: String,
+    },
+    /// Select `provider` and write it to `[ask] agent`, so the choice
+    /// survives a restart. Answers with the updated list.
+    AskProviderDefault {
+        provider: String,
     },
     // --- automation_v1 ---------------------------------------------------
     /// Every `[[automation.rule]]` with its effective timing, its guards,
@@ -553,6 +618,11 @@ enum RequestBody {
         origin: CollaborationOrigin,
         request_id: String,
     },
+    CollaborationUpdate {
+        origin: CollaborationOrigin,
+        request_id: String,
+        body: String,
+    },
     /// Block on the mailbox's durable revision signal until this exact
     /// participant-visible request becomes terminal, or return its latest
     /// state at the bounded deadline. Unlike `collaboration_get` loops, one
@@ -566,6 +636,13 @@ enum RequestBody {
         origin: CollaborationOrigin,
         request_id: String,
     },
+    /// Operator housekeeping: expire never-claimed requests older than
+    /// `older_than_secs`. Answers with the affected requests.
+    CollaborationExpire {
+        older_than_secs: u64,
+        #[serde(default)]
+        dry_run: bool,
+    },
 
     /// Wholesale pane-metadata snapshot pushed by an out-of-process
     /// backend source — today the zellij WASM plugin forwarding
@@ -575,6 +652,10 @@ enum RequestBody {
     /// no-op on tmux (that backend enumerates panes itself).
     BackendPaneSnapshot {
         panes: Vec<PaneInfo>,
+    },
+    /// Observe locations after a move, without changing agent activity/state.
+    RefreshPaneLocations {
+        pane: String,
     },
     SpawnSession {
         command: String,
@@ -645,6 +726,10 @@ enum RequestBody {
         #[serde(default)]
         command: Option<String>,
     },
+    /// Explicitly forget one exact agent session without terminating its host.
+    ForgetAgent {
+        session_id: String,
+    },
     /// Delete fully orphaned rows (no pane, surface, or pid) idle longer than
     /// `max_age_secs`. Backs `muxa prune` — the on-demand cleanup of
     /// remote/detached ghost rows the reconciler would otherwise only age out
@@ -690,19 +775,29 @@ const CAPABILITIES: &[&str] = &[
     "needs_choice",
     "rate_limited",
     "collaboration_mailbox",
+    "collaboration_expire_v1",
     "collaboration_lifecycle",
     "collaboration_wait",
     "collaboration_subscribe",
+    "collaboration_dispatch_v1",
+    "orchestration_v1",
     "collaboration_identity",
     "collaboration_provenance",
     "collaboration_scope",
     "fleet_v1",
     "fleet_raw_capture_v1",
     "fleet_subscribe",
+    "fleet_wait_reply",
+    "collaboration_update",
+    "collaboration_peer_recovery",
+    collaboration::HUMAN_ACTIONS_CAPABILITY,
     "pipeline_runs_v1",
     "pipeline_subscribe",
     "work_control_v1",
     "work_command_v1",
+    "agent_start_v1",  // WS-B: new agent
+    "mux_snapshot_v1", // WS-F: snapshot
+    "mux_snapshot_plan_v1",
     "handle_namespace_v1",
     "session_bytes_v1",
     "session_attachment_identity_v1",
@@ -713,10 +808,12 @@ const CAPABILITIES: &[&str] = &[
     "ask_send_new_v1",
     "ask_subscribe",
     "ask_providers_v1",
+    "ask_provider_default_v1",
     "work_compose_v1",
     "automation_v1",
     "automation_ask_v1",
     "config_launch_v1",
+    "config_orchestration_v1",
     "config_edit_v1",
 ];
 
@@ -791,11 +888,17 @@ pub struct Response {
     /// Whether a `send_prompt`'s submit CR landed. Present only on a
     /// `send_prompt` response. `false` with `sent:true` and a requested
     /// `submit:true` is a PARTIAL success: the text is in the pane but the
-    /// Enter didn't commit — retry the submit alone (e.g. `send_prompt` with
-    /// empty text + submit), never the whole prompt. `false` is also the
+    /// host rejected Enter. Inspect the current input before an Enter-only
+    /// retry; never resend the whole prompt. `true` is transport acceptance,
+    /// not an application acknowledgement (see `submission_confirmed`). `false` is also the
     /// normal value when `submit:false` was requested (nothing to submit).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submitted: Option<bool>,
+    /// Application-level `PromptSubmitted` evidence, separate from transport
+    /// acceptance. None means unobserved (including hosts without hooks),
+    /// never a reason to resend the body or blindly retry Enter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submission_confirmed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room: Option<RoomContext>,
     /// Handle issued by the room's namespace arbiter. Absent when the room
@@ -836,6 +939,17 @@ pub struct Response {
     pub work_operation: Option<WorkUpOperation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_command: Option<WorkCommandOutput>,
+    /// `agent_start_v1`: the started agent's surface. WS-B: new agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_start: Option<crate::agent_control::AgentStartResult>,
+    // WS-F: snapshot
+    /// `mux_snapshot_v1`: the CLI's own JSON — the listing, a saved
+    /// snapshot, or a restore plan — passed through untouched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mux_snapshot: Option<serde_json::Value>,
+    /// `mux_snapshot_v1`: a restore operation and, once done, its report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mux_snapshot_operation: Option<crate::mux_snapshot_control::MuxSnapshotOperation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_compose: Option<WorkComposeOutput>,
     /// `automation_v1`: the rule list plus the engine's switch/pause.
@@ -851,6 +965,8 @@ pub struct Response {
     pub automation_judgment: Option<crate::automation_judge::AutomationJudgment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch: Option<crate::config_file::LaunchSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<crate::orchestration::OrchestrationConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -882,6 +998,7 @@ impl Response {
             capture: None,
             sent: None,
             submitted: None,
+            submission_confirmed: None,
             room: None,
             handle: None,
             collaboration_requests: None,
@@ -901,12 +1018,16 @@ impl Response {
             pipeline_claims: None,
             work_operation: None,
             work_command: None,
+            agent_start: None,
+            mux_snapshot: None,
+            mux_snapshot_operation: None,
             work_compose: None,
             automation_rules: None,
             automation_log: None,
             automation_test: None,
             automation_judgment: None,
             launch: None,
+            orchestration: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -953,6 +1074,24 @@ impl Response {
     fn with_work_command(output: WorkCommandOutput) -> Self {
         let mut response = Self::ok();
         response.work_command = Some(output);
+        response
+    }
+    fn with_agent_start(result: crate::agent_control::AgentStartResult) -> Self {
+        let mut response = Self::ok();
+        response.agent_start = Some(result);
+        response
+    }
+    // WS-F: snapshot
+    fn with_mux_snapshot(value: serde_json::Value) -> Self {
+        let mut response = Self::ok();
+        response.mux_snapshot = Some(value);
+        response
+    }
+    fn with_mux_snapshot_operation(
+        operation: crate::mux_snapshot_control::MuxSnapshotOperation,
+    ) -> Self {
+        let mut response = Self::ok();
+        response.mux_snapshot_operation = Some(operation);
         response
     }
     fn with_work_compose(output: WorkComposeOutput) -> Self {
@@ -1231,6 +1370,7 @@ struct WorkUpOperations {
 
 struct WorkUpManager {
     socket_path: PathBuf,
+    config_path: Option<PathBuf>,
     /// Runs `work` argv on remote Fleet hosts. `None` while Fleet is not
     /// installed, in which case every non-local `host` is refused.
     remote: Option<Arc<dyn RemoteWorkRunner>>,
@@ -1307,6 +1447,7 @@ impl WorkUpManager {
     fn with_remote(socket_path: PathBuf, remote: Option<Arc<dyn RemoteWorkRunner>>) -> Arc<Self> {
         Arc::new(Self {
             socket_path,
+            config_path: None,
             remote,
             next_id: AtomicU64::new(1),
             operations: tokio::sync::Mutex::new(WorkUpOperations::default()),
@@ -1355,17 +1496,54 @@ impl WorkUpManager {
         let _permit = self.commands.try_acquire().map_err(|_| {
             format!("at most {MAX_CONCURRENT_WORK_COMMANDS} work commands may run at once")
         })?;
+        let limits = WorkCommandLimits::for_args(&args);
+        let mut local_args = args.clone();
+        if let Some(path) = &self.config_path {
+            local_args.splice(0..0, ["--config".into(), path.display().to_string()]);
+        }
         match remote {
             Some((host, runner)) => runner
-                .run(&host, args, stdin, WorkCommandLimits::COMMAND)
+                .run(&host, args, stdin, limits)
                 .await
                 .map_err(|error| error.to_string()),
             None => work_control::execute_work_command(
                 &work_control::resolve_muxa_binary(),
-                &args,
+                &local_args,
                 stdin.as_deref(),
                 Some(&self.socket_path),
-                WorkCommandLimits::COMMAND,
+                limits,
+            )
+            .await
+            .map_err(|error| error.to_string()),
+        }
+    }
+
+    // WS-B: new agent
+    /// Start one agent with the canonical `muxa agent start`, here or on a
+    /// control-mode Fleet host, sharing the `work_command` concurrency cap.
+    async fn agent_start(
+        &self,
+        request: crate::agent_control::AgentStartRequest,
+    ) -> Result<crate::agent_control::AgentStartResult, String> {
+        request.validate().map_err(|error| error.to_string())?;
+        let args = request.arguments();
+        let remote = self.remote_for(request.host.as_deref(), &args).await?;
+        let _permit = self.commands.try_acquire().map_err(|_| {
+            format!("at most {MAX_CONCURRENT_WORK_COMMANDS} work commands may run at once")
+        })?;
+        match remote {
+            Some((host, runner)) => {
+                let output = runner
+                    .run(&host, args, None, WorkCommandLimits::COMMAND)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                crate::agent_control::parse_output(&output, Some(&host))
+                    .map_err(|error| error.to_string())
+            }
+            None => crate::agent_control::execute_local(
+                &work_control::resolve_muxa_binary(),
+                &request,
+                Some(&self.socket_path),
             )
             .await
             .map_err(|error| error.to_string()),
@@ -1498,6 +1676,7 @@ pub struct Server {
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
     work_up: Arc<WorkUpManager>,
+    mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>, // WS-F: snapshot
     /// The daemon's `config.toml`, for the requests that read and replace it
     /// whole. `None` when muxad was started without one.
     config_path: Option<PathBuf>,
@@ -1508,6 +1687,8 @@ impl Server {
     pub fn new(socket_path: PathBuf, store: SharedStore) -> Self {
         let backend = default_backend();
         let work_up = WorkUpManager::new(socket_path.clone());
+        let mux_snapshots =
+            crate::mux_snapshot_control::MuxSnapshotControl::new(socket_path.clone());
         Self {
             socket_path,
             store,
@@ -1522,6 +1703,7 @@ impl Server {
             fleet: None,
             pipeline_runs: PipelineRunStore::in_memory(),
             work_up,
+            mux_snapshots,
             config_path: None,
             handler_limit: MAX_INFLIGHT_HANDLERS,
         }
@@ -1557,6 +1739,9 @@ impl Server {
     /// `config_write` can serve it. Without one, both refuse.
     #[must_use]
     pub fn with_config_path(mut self, path: Option<PathBuf>) -> Self {
+        if let Some(manager) = Arc::get_mut(&mut self.work_up) {
+            manager.config_path.clone_from(&path);
+        }
         self.config_path = path;
         self
     }
@@ -1612,7 +1797,22 @@ impl Server {
                 fleet: fleet.clone(),
             })),
         );
+        if let Some(manager) = Arc::get_mut(&mut self.work_up) {
+            manager.config_path.clone_from(&self.config_path);
+        }
         self.fleet = Some(fleet);
+        self
+    }
+
+    // WS-F: snapshot
+    /// Share muxad's snapshot control with its automatic-snapshot task, so a
+    /// restore started from the app holds that task off.
+    #[must_use]
+    pub fn with_mux_snapshots(
+        mut self,
+        mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>,
+    ) -> Self {
+        self.mux_snapshots = mux_snapshots;
         self
     }
 
@@ -1644,6 +1844,9 @@ impl Server {
         tracing::info!(socket = %self.socket_path.display(), "listening");
 
         let mut handlers: JoinSet<()> = JoinSet::new();
+        // Sticky signal: a handler entering push mode after shutdown still
+        // observes it. Request mutations themselves are never cancelled by it.
+        let (stopping_tx, stopping_rx) = watch::channel(false);
         // Fixed budget of concurrent handlers. A permit is held for the
         // lifetime of each handler and released when it ends, so live fds
         // from handlers can never exceed `MAX_INFLIGHT_HANDLERS` — keeping
@@ -1718,7 +1921,9 @@ impl Server {
                     let fleet = self.fleet.clone();
                     let pipeline_runs = self.pipeline_runs.clone();
                     let work_up = self.work_up.clone();
+                    let mux_snapshots = self.mux_snapshots.clone();
                     let config_path = self.config_path.clone();
+                    let stopping = stopping_rx.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
@@ -1737,7 +1942,9 @@ impl Server {
                                 fleet,
                                 pipeline_runs,
                                 work_up,
+                                mux_snapshots,
                                 config_path,
+                                stopping,
                             ))
                             .await
                         {
@@ -1754,6 +1961,9 @@ impl Server {
                 }
             }
         }
+
+        stopping_tx.send_replace(true);
+        let drain_started = Instant::now();
 
         // Drain in-flight handlers with a bounded timeout. Closes the
         // lost-update window where a handler could call `Store::apply`
@@ -1772,7 +1982,10 @@ impl Server {
             // Best-effort: let the abort propagate.
             while handlers.join_next().await.is_some() {}
         } else {
-            tracing::debug!("ipc handlers drained cleanly");
+            tracing::debug!(
+                elapsed_ms = u64::try_from(drain_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "ipc handlers drained cleanly"
+            );
         }
 
         // Remove our own socket file so next startup is clean.
@@ -1904,6 +2117,31 @@ where
     *line = String::from_utf8(bytes)
         .map_err(|e| RuntimeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
     Ok(line.len())
+}
+
+/// Only use at cancellation-safe boundaries: waiting for a new request or
+/// streaming read-only updates. In-flight mutations retain the bounded drain.
+async fn until_server_shutdown<T>(
+    stopping: &mut watch::Receiver<bool>,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = stopping.wait_for(|value| *value) => None,
+        result = future => Some(result),
+    }
+}
+
+/// The stream takeover acknowledgement is read-only too. A peer may stop
+/// reading before it arrives, so cancellation must cover this first write.
+async fn write_subscription_ack(
+    writer: &mut WriteHalf,
+    bytes: &[u8],
+    stopping: &mut watch::Receiver<bool>,
+) -> Result<bool, RuntimeError> {
+    until_server_shutdown(stopping, write_line_or_closed(writer, bytes))
+        .await
+        .unwrap_or(Ok(false))
 }
 
 /// Encode the `{"event":"lagged","dropped":N}` overflow control frame — but
@@ -2398,22 +2636,57 @@ async fn automation_subjects(
     crate::automation::subjects_from(&agents, &panes)
 }
 
+/// A fresh Codex thread behind the shared app-server reports no pane, and the
+/// reconciler binds it only every `reconciler.interval_secs`. Its first
+/// collaboration call usually comes sooner, so bind now — only for a caller
+/// that names an unbound Codex session, so ordinary requests never scan.
+async fn bind_unplaced_codex_origin(
+    store: &SharedStore,
+    backends: &[SharedBackend],
+    agents: &[Agent],
+    panes: &[PaneInfo],
+    origin_session: Option<&str>,
+) -> bool {
+    let Some(session) = origin_session else {
+        return false;
+    };
+    let unplaced = agents
+        .iter()
+        .any(|agent| agent.session_id == session && crate::codex_binding::is_unplaced_codex(agent));
+    unplaced
+        && crate::codex_binding::bind_paneless_codex(store, backends, Some(panes.to_vec())).await
+            > 0
+}
+
 async fn collaboration_participants(
     store: &SharedStore,
     backends: &[SharedBackend],
     collaboration: &CollaborationStore,
+    origin_session: Option<&str>,
 ) -> CollaborationTopology {
-    let agents = store.snapshot().await;
-    let backends = backends.to_vec();
-    let panes = tokio::task::spawn_blocking(move || {
-        backends
+    let mut agents = store.snapshot().await;
+    let listed = backends.to_vec();
+    let discovery_agents = agents.clone();
+    let (panes, mut participants) = tokio::task::spawn_blocking(move || {
+        let panes = listed
             .iter()
             .flat_map(|backend| backend.list_panes())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let participants = collaboration::participants_from(&discovery_agents, &panes);
+        (panes, participants)
     })
     .await
     .unwrap_or_default();
-    let mut participants = collaboration::participants_from(&agents, &panes);
+    if bind_unplaced_codex_origin(store, backends, &agents, &panes, origin_session).await {
+        agents = store.snapshot().await;
+        let refreshed = agents.clone();
+        let observed = panes.clone();
+        participants = tokio::task::spawn_blocking(move || {
+            collaboration::participants_from(&refreshed, &observed)
+        })
+        .await
+        .unwrap_or_default();
+    }
     collaboration.enrich_participants(&mut participants).await;
     CollaborationTopology {
         participants,
@@ -2616,6 +2889,16 @@ fn represented_participant(
             .find(|participant| participant.console)
             .cloned();
     }
+    let requests: Vec<_> = requests.collect();
+    if let Some(session) = origin.agent_session_id.as_deref() {
+        if let Some(participant) = requests
+            .iter()
+            .flat_map(|request| [&request.from, &request.to])
+            .find(|participant| participant.agent_session_id == session)
+        {
+            return Some(participant.clone());
+        }
+    }
     for request in requests {
         for participant in [&request.from, &request.to] {
             if participant.pane == origin.pane
@@ -2629,6 +2912,18 @@ fn represented_participant(
         }
     }
     None
+}
+
+// WS-F: snapshot
+/// A finished snapshot request as a response: the CLI's document, or its
+/// error line.
+fn mux_snapshot_response(
+    outcome: Result<serde_json::Value, crate::mux_snapshot_control::MuxSnapshotError>,
+) -> Response {
+    match outcome {
+        Ok(value) => Response::with_mux_snapshot(value),
+        Err(error) => Response::err(error.to_string()),
+    }
 }
 
 async fn record_collaboration_audit(
@@ -2658,6 +2953,42 @@ async fn record_collaboration_audit(
     audit.append(entry).await;
 }
 
+fn orchestration_config_response(
+    path: Option<&Path>,
+    update: Option<(&str, &crate::orchestration::OrchestrationConfig)>,
+) -> Response {
+    let Some(path) = path else {
+        return Response::err(NO_CONFIG_PATH);
+    };
+    let result = match update {
+        Some((expected, settings)) => {
+            crate::config_file::write_orchestration(path, expected, settings)
+        }
+        None => crate::config_file::read(path),
+    };
+    match result {
+        Ok(document) => match toml::from_str::<crate::Config>(&document.text) {
+            Ok(config) => {
+                let mut response = Response::with_config(document);
+                response.orchestration = Some(config.orchestration);
+                response
+            }
+            Err(e) => Response::err(e.to_string()),
+        },
+        Err(crate::config_file::ConfigFileError::Conflict { current }) => {
+            let mut response =
+                Response::err("config.toml changed; reload before saving Fleet policy");
+            response.config = Some(crate::config_file::ConfigDocument {
+                path: path.into(),
+                exists: true,
+                text: current,
+            });
+            response
+        }
+        Err(e) => Response::err(e.to_string()),
+    }
+}
+
 #[tracing::instrument(
     level = "debug",
     skip(
@@ -2673,7 +3004,8 @@ async fn record_collaboration_audit(
         restart,
         fleet,
         pipeline_runs,
-        work_up
+        work_up,
+        mux_snapshots
     )
 )]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // IPC dispatch table and its shared daemon state
@@ -2691,7 +3023,9 @@ async fn handle(
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
     work_up: Arc<WorkUpManager>,
+    mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>,
     config_path: Option<PathBuf>,
+    mut stopping: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError> {
     let mut collaboration_actor = observe_collaboration_actor(&stream);
     let (reader, mut writer) = stream.into_split();
@@ -2713,9 +3047,27 @@ async fn handle(
         // persistent client simply reconnects; a half-open one can't leak.
         // (A `Subscribe` connection never reaches a second iteration: it hands
         // off to `stream_transitions` and returns, so streams are unaffected.)
+        let deadline = tokio::time::Instant::now() + IDLE_CONN_TIMEOUT;
+        // fill_buf is cancellation-safe. Once any bytes of a request arrive,
+        // finish reading/processing it under the normal drain budget instead
+        // of dropping a partially received ingest on shutdown.
+        let Some(ready) = until_server_shutdown(
+            &mut stopping,
+            tokio::time::timeout_at(deadline, async {
+                reader.fill_buf().await.map(|bytes| !bytes.is_empty())
+            }),
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        match ready {
+            Ok(Ok(true)) => {}
+            Ok(Err(error)) if !is_client_disconnect(&error) => return Err(error.into()),
+            _ => return Ok(()),
+        }
         let Ok(read_result) =
-            tokio::time::timeout(IDLE_CONN_TIMEOUT, read_limited_line(&mut reader, &mut line))
-                .await
+            tokio::time::timeout_at(deadline, read_limited_line(&mut reader, &mut line)).await
         else {
             tracing::debug!("idle connection timed out; closing");
             return Ok(());
@@ -2746,6 +3098,64 @@ async fn handle(
         // logs rather than mis-attributing the timing.
         #[allow(unused_assignments)]
         let mut kind: &'static str = "dispatch_unknown";
+        // Global Ask has one owner. Entry hosts forward without replaying local history.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed).and_then(|value| {
+            let request: Request = serde_json::from_value(value.clone())?;
+            if negotiated.is_none() && request.protocol != 0 && request.protocol != PROTOCOL_VERSION
+            {
+                return Err(serde::de::Error::custom("protocol mismatch"));
+            }
+            Ok(value)
+        }) {
+            let ask_kind = value["kind"].as_str().unwrap_or("");
+            if crate::orchestration::shared_ask_kind(ask_kind) || ask_kind == "ask_subscribe" {
+                let policy = if let Ok(config) = config_path
+                    .as_deref()
+                    .map(|p| crate::Config::load_or_default(Some(p)))
+                    .transpose()
+                {
+                    config.map(|c| c.orchestration)
+                } else {
+                    let response = Response::err("cannot load coordinator routing configuration; refusing to fall back to a local Ask conversation");
+                    let bytes = encode_line(&response, negotiated.unwrap_or(PROTOCOL_VERSION))?;
+                    if !write_line_or_closed(&mut writer, &bytes).await? {
+                        return Ok(());
+                    }
+                    continue;
+                };
+                if let Some(host) = policy
+                    .filter(|p| p.enabled)
+                    .and_then(|p| p.coordinator)
+                    .filter(|h| h != "local")
+                {
+                    let result = if ask_kind == "ask_subscribe" {
+                        Err("shared Ask streaming requires a direct coordinator connection; use ask_list for snapshots".to_string())
+                    } else {
+                        work_up
+                            .command(
+                                Some(host),
+                                vec!["work".into(), "fleet-ask".into()],
+                                Some(trimmed.into()),
+                            )
+                            .await
+                            .and_then(|o| {
+                                if o.exit_code == 0 {
+                                    serde_json::from_str::<serde_json::Value>(&o.stdout)
+                                        .map_err(|e| e.to_string())
+                                } else {
+                                    Err(o.stderr)
+                                }
+                            })
+                    };
+                    let response = result.unwrap_or_else(|error| serde_json::json!({"ok":false,"protocol":PROTOCOL_VERSION,"error":error}));
+                    let bytes = encode_line(&response, negotiated.unwrap_or(PROTOCOL_VERSION))?;
+                    if !write_line_or_closed(&mut writer, &bytes).await? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
+        }
         let resp = match serde_json::from_str::<Request>(trimmed) {
             // Strict-match only applies in the legacy regime, and only
             // for non-`hello` kinds. Once the client has sent `hello`,
@@ -2815,6 +3225,25 @@ async fn handle(
                     if in_scope {
                         tracing::debug!(?event, "ingest");
                         store.apply(&event).await;
+                        // A Codex thread behind the shared app-server arrives
+                        // paneless; bind it now, before a sibling started in
+                        // the same cwd makes the evidence ambiguous.
+                        // Only a session start or prompt can introduce or
+                        // re-evidence a thread; tool hooks would rescan per call.
+                        let id = event.id();
+                        if id.kind == crate::AgentKind::Codex
+                            && id.pane.is_none()
+                            && matches!(
+                                event,
+                                AgentEvent::Started { .. } | AgentEvent::PromptSubmitted { .. }
+                            )
+                            && store.is_unplaced_codex(&id.session_id).await
+                        {
+                            crate::codex_binding::schedule_bind_paneless_codex(
+                                store.clone(),
+                                backends.clone(),
+                            );
+                        }
                     } else {
                         tracing::debug!(
                             socket = event.id().tmux_socket.as_deref(),
@@ -2839,8 +3268,15 @@ async fn handle(
                         Err(e) => Response::err(e),
                     }
                 }
+                RequestBody::ForgetAgent { session_id } => {
+                    kind = "forget_agent";
+                    Response::with_pruned(usize::from(store.forget_agent(&session_id).await))
+                }
                 RequestBody::Prune { max_age_secs } => {
                     kind = "prune";
+                    store
+                        .reconcile_native_surfaces(|id| sessions.session_liveness(id))
+                        .await;
                     let cutoff = time::OffsetDateTime::now_utc()
                         - std::time::Duration::from_secs(max_age_secs);
                     let pruned = store.prune_orphans(cutoff).await;
@@ -2859,10 +3295,15 @@ async fn handle(
                     let changes = pipeline_runs.subscribe();
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
                     let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
-                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                    if !write_subscription_ack(&mut writer, &ack_bytes, &mut stopping).await? {
                         return Ok(());
                     }
-                    return stream_revision_updates(writer, changes, stream_proto).await;
+                    return until_server_shutdown(
+                        &mut stopping,
+                        stream_revision_updates(writer, changes, stream_proto),
+                    )
+                    .await
+                    .unwrap_or(Ok(()));
                 }
                 RequestBody::WorkUp { request } => {
                     kind = "work_up";
@@ -2887,6 +3328,52 @@ async fn handle(
                         Err(error) => Response::err(error),
                     }
                 }
+                // WS-B: new agent
+                RequestBody::AgentStart { request } => {
+                    kind = "agent_start";
+                    match work_up.agent_start(request).await {
+                        Ok(result) => Response::with_agent_start(result),
+                        Err(error) => Response::err(error),
+                    }
+                }
+                // WS-F: snapshot
+                RequestBody::MuxSnapshotList => {
+                    kind = "mux_snapshot_list";
+                    mux_snapshot_response(mux_snapshots.list().await)
+                }
+                RequestBody::MuxSnapshotSave => {
+                    kind = "mux_snapshot_save";
+                    mux_snapshot_response(mux_snapshots.save().await)
+                }
+                RequestBody::MuxSnapshotPlan { id, only_missing } => {
+                    kind = "mux_snapshot_plan";
+                    mux_snapshot_response(mux_snapshots.plan(&id, only_missing).await)
+                }
+                RequestBody::MuxSnapshotDelete { id } => {
+                    kind = "mux_snapshot_delete";
+                    mux_snapshot_response(mux_snapshots.delete(&id).await)
+                }
+                RequestBody::MuxSnapshotRestore {
+                    id,
+                    layout_only,
+                    only_missing,
+                } => {
+                    kind = "mux_snapshot_restore";
+                    match mux_snapshots.restore(&id, layout_only, only_missing).await {
+                        Ok(operation) => Response::with_mux_snapshot_operation(operation),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::MuxSnapshotRestoreStatus { operation_id } => {
+                    kind = "mux_snapshot_restore_status";
+                    match mux_snapshots.status(&operation_id).await {
+                        Some(operation) => Response::with_mux_snapshot_operation(operation),
+                        None => Response::err(format!(
+                            "snapshot restore {operation_id:?} was not found"
+                        )),
+                    }
+                }
+                // END WS-F: snapshot
                 RequestBody::WorkCompose {
                     description,
                     agent,
@@ -3042,7 +3529,7 @@ async fn handle(
                         .collect::<HashSet<_>>();
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
                     let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
-                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                    if !write_subscription_ack(&mut writer, &ack_bytes, &mut stopping).await? {
                         return Ok(());
                     }
                     tracing::debug!(
@@ -3051,15 +3538,19 @@ async fn handle(
                         kind,
                         "ipc.handle (fleet stream takeover)",
                     );
-                    return stream_fleet_updates(
-                        writer,
-                        fleet.store.clone(),
-                        updates,
-                        stream_proto,
-                        selector,
-                        visible_hosts,
+                    return until_server_shutdown(
+                        &mut stopping,
+                        stream_fleet_updates(
+                            writer,
+                            fleet.store.clone(),
+                            updates,
+                            stream_proto,
+                            selector,
+                            visible_hosts,
+                        ),
                     )
-                    .await;
+                    .await
+                    .unwrap_or(Ok(()));
                 }
                 RequestBody::FleetCommand { host, operation } => {
                     kind = "fleet_command";
@@ -3072,6 +3563,42 @@ async fn handle(
                             Err(error) => Response::err(error),
                         },
                         None => Response::err("fleet is not enabled in muxad"),
+                    }
+                }
+                RequestBody::FleetWaitReply {
+                    host,
+                    pane,
+                    request_id,
+                    timeout_secs,
+                    after_update,
+                } => {
+                    kind = "fleet_wait_reply";
+                    let response = async {
+                        match &fleet {
+                            Some(fleet) => match fleet
+                                .wait_for_reply(
+                                    host,
+                                    pane,
+                                    request_id,
+                                    Duration::from_secs(
+                                        timeout_secs.clamp(1, MAX_COLLABORATION_WAIT_SECS),
+                                    ),
+                                    after_update,
+                                )
+                                .await
+                            {
+                                Ok(Some(request)) => Response::with_collaboration_request(request),
+                                Ok(None) => Response::ok(),
+                                Err(error) => Response::err(error),
+                            },
+                            None => Response::err("fleet is not enabled in muxad"),
+                        }
+                    };
+                    // A disconnected waiter must release its shared subscription promptly.
+                    tokio::select! {
+                        response = response => response,
+                        _ = reader.fill_buf() => return Ok(()),
+                        _ = stopping.wait_for(|value| *value) => return Ok(()),
                     }
                 }
                 RequestBody::ByPane { pane } => {
@@ -3140,6 +3667,23 @@ async fn handle(
                     tracing::debug!(panes = count, "backend_pane_snapshot");
                     Response::ok()
                 }
+                RequestBody::RefreshPaneLocations { pane } => {
+                    kind = "refresh_pane_locations";
+                    match resolve_backend(&backends, &pane) {
+                        Err(error) => Response::err(format!("no active {error} backend")),
+                        Ok(target) => {
+                            let target = target.clone();
+                            match tokio::task::spawn_blocking(move || target.observe_panes()).await
+                            {
+                                Ok(observation) => {
+                                    store.refresh_pane_locations(&observation.panes).await;
+                                    Response::ok()
+                                }
+                                Err(error) => Response::err(error.to_string()),
+                            }
+                        }
+                    }
+                }
                 RequestBody::SendPrompt { pane, text, submit } => {
                     kind = "send_prompt";
                     match resolve_backend(&backends, &pane) {
@@ -3173,14 +3717,20 @@ async fn handle(
                                     // socket call, so run it off the async worker.
                                     // Text and submit CR are TWO non-atomic
                                     // injections; report the outcomes separately.
+                                    let observer = crate::prompt_delivery::SubmissionObserver::new(
+                                        &store,
+                                        &agents,
+                                        socket.as_deref(),
+                                        &text,
+                                    );
                                     let (sent, submitted) =
                                         tokio::task::spawn_blocking(move || {
                                             let s = socket.as_deref();
-                                            let sent = target.send_text_on(s, &pane, &text);
+                                            let sent = target.send_prompt_text_on(s, &pane, &text);
                                             let submitted = if sent && submit {
                                                 if !text.is_empty() {
                                                     std::thread::sleep(
-                                                        crate::backend::PROMPT_SUBMIT_GRACE,
+                                                        crate::backend::prompt_submit_grace(&pane),
                                                     );
                                                 }
                                                 target.send_text_on(s, &pane, "\r")
@@ -3193,7 +3743,13 @@ async fn handle(
                                         .unwrap_or((false, false));
                                     if sent {
                                         tracing::debug!(submit, submitted, "send_prompt");
-                                        Response::with_send_result(sent, submitted)
+                                        let mut response =
+                                            Response::with_send_result(sent, submitted);
+                                        if submitted {
+                                            response.submission_confirmed =
+                                                observer.confirm().await;
+                                        }
+                                        response
                                     } else {
                                         // Nothing landed — safe for the caller to
                                         // retry the whole send.
@@ -3241,8 +3797,13 @@ async fn handle(
                         origin.clone(),
                     );
                     let response = if collaboration.enabled() {
-                        let topology =
-                            collaboration_participants(&store, &backends, &collaboration).await;
+                        let topology = collaboration_participants(
+                            &store,
+                            &backends,
+                            &collaboration,
+                            origin.agent_session_id.as_deref(),
+                        )
+                        .await;
                         match topology.resolve_origin(&origin) {
                             Ok(current) => Response::with_room(
                                 collaboration::room_context(
@@ -3275,7 +3836,7 @@ async fn handle(
                 } => {
                     kind = "collaboration_issue_handle";
                     let topology =
-                        collaboration_participants(&store, &backends, &collaboration).await;
+                        collaboration_participants(&store, &backends, &collaboration, None).await;
                     match topology.room_of(&pane, socket.as_deref()) {
                         Some(room) => match collaboration
                             .issue_handle(&room, &pane, &topology.participants, request)
@@ -3301,8 +3862,13 @@ async fn handle(
                         CollaborationAuditOperation::SetIdentity,
                         origin.clone(),
                     );
-                    let topology =
-                        collaboration_participants(&store, &backends, &collaboration).await;
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
                     let response = match topology.resolve_origin(&origin) {
                         Ok(current) => match collaboration
                             .set_identity(&current, &topology.participants, alias, roles)
@@ -3350,10 +3916,15 @@ async fn handle(
                     let changes = ask.subscribe();
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
                     let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
-                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                    if !write_subscription_ack(&mut writer, &ack_bytes, &mut stopping).await? {
                         return Ok(());
                     }
-                    return stream_revision_updates(writer, changes, stream_proto).await;
+                    return until_server_shutdown(
+                        &mut stopping,
+                        stream_revision_updates(writer, changes, stream_proto),
+                    )
+                    .await
+                    .unwrap_or(Ok(()));
                 }
                 RequestBody::AskStatus {} => {
                     kind = "ask_status";
@@ -3408,6 +3979,20 @@ async fn handle(
                         },
                         None => Response::err(NO_CONFIG_PATH.to_string()),
                     }
+                }
+                RequestBody::ConfigOrchestrationRead {} => {
+                    kind = "config_orchestration_read";
+                    orchestration_config_response(config_path.as_deref(), None)
+                }
+                RequestBody::ConfigOrchestrationWrite {
+                    expected_text,
+                    settings,
+                } => {
+                    kind = "config_orchestration_write";
+                    orchestration_config_response(
+                        config_path.as_deref(),
+                        Some((&expected_text, &settings)),
+                    )
                 }
                 RequestBody::ConfigLaunchRead {} => {
                     kind = "config_launch_read";
@@ -3530,6 +4115,13 @@ async fn handle(
                         Err(error) => Response::err(error.to_string()),
                     }
                 }
+                RequestBody::AskProviderDefault { provider } => {
+                    kind = "ask_provider_default";
+                    match ask.set_default_agent(&provider).await {
+                        Ok(providers) => Response::with_ask_providers(providers),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
                 RequestBody::AskProviderRemove { id } => {
                     kind = "ask_provider_remove";
                     match ask.remove_provider(&id).await {
@@ -3631,8 +4223,13 @@ async fn handle(
                     );
                     audit_context.target = Some(target.clone());
                     audit_context.message_bytes = Some(request.body.len());
-                    let topology =
-                        collaboration_participants(&store, &backends, &collaboration).await;
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
                     let result = topology.resolve_origin(&origin).and_then(|sender| {
                         topology
                             .resolve_target(&sender, &target, collaboration.scope())
@@ -3677,8 +4274,13 @@ async fn handle(
                         CollaborationAuditOperation::Inbox,
                         origin.clone(),
                     );
-                    let topology =
-                        collaboration_participants(&store, &backends, &collaboration).await;
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
                     let response = match topology.resolve_origin(&origin) {
                         Ok(current) => match collaboration.claim_for(&current).await {
                             Ok(requests) => Response::with_collaboration_requests(requests),
@@ -3700,7 +4302,7 @@ async fn handle(
                     let changes = collaboration.subscribe();
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
                     let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
-                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                    if !write_subscription_ack(&mut writer, &ack_bytes, &mut stopping).await? {
                         return Ok(());
                     }
                     tracing::debug!(
@@ -3709,7 +4311,12 @@ async fn handle(
                         kind,
                         "ipc.handle (collaboration stream takeover)",
                     );
-                    return stream_revision_updates(writer, changes, stream_proto).await;
+                    return until_server_shutdown(
+                        &mut stopping,
+                        stream_revision_updates(writer, changes, stream_proto),
+                    )
+                    .await
+                    .unwrap_or(Ok(()));
                 }
                 RequestBody::CollaborationList {
                     origin,
@@ -3727,14 +4334,58 @@ async fn handle(
                     // their own — a caller-scoped list is the norm and says
                     // nothing about reach.
                     audit_context.scope = (!matches!(scope, MailboxScope::Caller)).then_some(scope);
-                    let topology =
-                        collaboration_participants(&store, &backends, &collaboration).await;
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
                     let response = match topology.resolve_origin(&origin) {
                         Ok(current) => match collaboration.list_for(&current, mailbox, scope).await
                         {
                             Ok(requests) => {
                                 Response::with_scoped_collaboration_requests(requests, scope)
                             }
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
+                }
+                RequestBody::CollaborationUpdate {
+                    origin,
+                    request_id,
+                    body,
+                } => {
+                    kind = "collaboration_update";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::Update,
+                        origin.clone(),
+                    );
+                    audit_context.request_id = Some(request_id.clone());
+                    audit_context.message_bytes = Some(body.len());
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
+                    let response = match topology.resolve_origin(&origin) {
+                        Ok(current) => match collaboration
+                            .update_request(&current, &request_id, body)
+                            .await
+                        {
+                            Ok(request) => Response::with_collaboration_request(request),
                             Err(error) => Response::err(error.to_string()),
                         },
                         Err(error) => Response::err(error.to_string()),
@@ -3765,8 +4416,13 @@ async fn handle(
                     audit_context.request_id = Some(request_id.clone());
                     audit_context.status = Some(status);
                     audit_context.message_bytes = Some(body.len());
-                    let topology =
-                        collaboration_participants(&store, &backends, &collaboration).await;
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
                     let response = match topology.resolve_origin(&origin) {
                         Ok(current) => match collaboration
                             .reply(
@@ -3801,8 +4457,13 @@ async fn handle(
                         origin.clone(),
                     );
                     audit_context.request_id = Some(request_id.clone());
-                    let topology =
-                        collaboration_participants(&store, &backends, &collaboration).await;
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
                     let response = match topology.resolve_origin(&origin) {
                         Ok(current) => match collaboration.get_for(&current, &request_id).await {
                             Ok(request) => Response::with_collaboration_request(request),
@@ -3831,8 +4492,13 @@ async fn handle(
                         origin.clone(),
                     );
                     audit_context.request_id = Some(request_id.clone());
-                    let topology =
-                        collaboration_participants(&store, &backends, &collaboration).await;
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
                     let response = match topology.resolve_origin(&origin) {
                         Ok(current) => match collaboration
                             .wait_for_terminal(
@@ -3858,6 +4524,21 @@ async fn handle(
                     .await;
                     response
                 }
+                RequestBody::CollaborationExpire {
+                    older_than_secs,
+                    dry_run,
+                } => {
+                    kind = "collaboration_expire";
+                    let age =
+                        time::Duration::seconds(i64::try_from(older_than_secs).unwrap_or(i64::MAX));
+                    let cutoff = time::OffsetDateTime::now_utc()
+                        .checked_sub(age)
+                        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+                    match collaboration.expire_queued_before(cutoff, dry_run).await {
+                        Ok(requests) => Response::with_collaboration_requests(requests),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
                 RequestBody::CollaborationCancel { origin, request_id } => {
                     kind = "collaboration_cancel";
                     collaboration_actor.observe_pane(&backends).await;
@@ -3866,8 +4547,13 @@ async fn handle(
                         origin.clone(),
                     );
                     audit_context.request_id = Some(request_id.clone());
-                    let topology =
-                        collaboration_participants(&store, &backends, &collaboration).await;
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
                     let response = match topology.resolve_origin(&origin) {
                         Ok(current) => {
                             match collaboration.cancel_for(&current, &request_id).await {
@@ -3929,7 +4615,10 @@ async fn handle(
                 }
                 RequestBody::ListSessions => {
                     kind = "list_sessions";
-                    Response::with_sessions(sessions.list_sessions())
+                    match sessions.list_sessions_checked() {
+                        Ok(list) => Response::with_sessions(list),
+                        Err(error) => Response::err(error.to_string()),
+                    }
                 }
                 RequestBody::CaptureSession { session_id } => {
                     kind = "capture_session";
@@ -3953,11 +4642,23 @@ async fn handle(
                     kind = "read_session_wait";
                     let sessions = Arc::clone(&sessions);
                     let timeout = Duration::from_millis(timeout_ms.clamp(1, 30_000));
-                    match tokio::task::spawn_blocking(move || {
+                    let wait = tokio::task::spawn_blocking(move || {
                         sessions.read_output_wait(&session_id, offset, timeout)
-                    })
-                    .await
-                    {
+                    });
+                    // A read-only long poll, so shutdown may abandon it. It
+                    // has to be abandoned explicitly: `spawn_blocking` cannot
+                    // be cancelled, and `JoinSet::abort_all` only drops the
+                    // join handle, so a handler that kept awaiting this would
+                    // sit in the drain until the client's own timeout expired
+                    // — up to 30s, which made every restart burn the whole
+                    // `HANDLER_DRAIN_TIMEOUT` before re-exec. Stop awaiting
+                    // instead: the blocking thread expires on its own (and is
+                    // replaced outright by the re-exec), and no mutation is
+                    // lost because this request performs none.
+                    let Some(joined) = until_server_shutdown(&mut stopping, wait).await else {
+                        return Ok(());
+                    };
+                    match joined {
                         Ok(Ok(output)) => Response::with_output(output),
                         Ok(Err(e)) => Response::err(e.to_string()),
                         Err(e) => Response::err(format!("session wait task failed: {e}")),
@@ -4016,10 +4717,15 @@ async fn handle(
                     let protocol = negotiated.unwrap_or(PROTOCOL_VERSION);
                     let changes = store.subscribe_changes();
                     let ack = encode_line(&Response::ok(), protocol)?;
-                    if !write_line_or_closed(&mut writer, &ack).await? {
+                    if !write_subscription_ack(&mut writer, &ack, &mut stopping).await? {
                         return Ok(());
                     }
-                    return stream_agent_changes(writer, changes, protocol).await;
+                    return until_server_shutdown(
+                        &mut stopping,
+                        stream_agent_changes(writer, changes, protocol),
+                    )
+                    .await
+                    .unwrap_or(Ok(()));
                 }
                 RequestBody::Subscribe { lagged_markers } => {
                     kind = "subscribe";
@@ -4034,7 +4740,7 @@ async fn handle(
                     // — this connection is now owned by the streaming
                     // pump.
                     let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
-                    if !write_line_or_closed(&mut writer, &ack_bytes).await? {
+                    if !write_subscription_ack(&mut writer, &ack_bytes, &mut stopping).await? {
                         return Ok(());
                     }
                     tracing::debug!(
@@ -4043,8 +4749,12 @@ async fn handle(
                         kind,
                         "ipc.handle (stream takeover)",
                     );
-                    return stream_transitions(writer, transitions, stream_proto, lagged_markers)
-                        .await;
+                    return until_server_shutdown(
+                        &mut stopping,
+                        stream_transitions(writer, transitions, stream_proto, lagged_markers),
+                    )
+                    .await
+                    .unwrap_or(Ok(()));
                 }
             },
             Err(e) => {
@@ -4240,8 +4950,10 @@ pub struct SendPromptOutcome {
     /// The text injection landed. Always `true` here (a failed text send is an
     /// `Err`); carried explicitly for symmetry and forward-compatibility.
     pub sent: bool,
-    /// The submit carriage return landed and committed the line.
+    /// The host accepted the submit carriage return. This alone does not
+    /// establish that the application committed the prompt.
     pub submitted: bool,
+    pub submission_confirmed: Option<bool>,
 }
 
 /// Long-lived handle returned by [`Client::subscribe`]. Calls to
@@ -4538,6 +5250,12 @@ impl Client {
         decode_agents(&resp)
     }
 
+    pub async fn refresh_pane_locations(&self, pane: &str) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "refresh_pane_locations", "pane": pane });
+        self.call_checked(&req).await?;
+        Ok(())
+    }
+
     /// Read the central physical-host cache. This is a local Unix-socket
     /// operation; SSH collection runs continuously in muxad's `FleetManager`.
     pub async fn fleet_snapshot(
@@ -4684,6 +5402,22 @@ impl Client {
 
     /// Execute an exact operation on one configured host. Mutations are
     /// authorized again by the manager's per-host access mode.
+    pub async fn collaboration_update(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+        body: &str,
+    ) -> Result<CollaborationRequest, RuntimeError> {
+        let response = self
+            .call_checked(&serde_json::json!({
+                "protocol": PROTOCOL_VERSION, "kind": "collaboration_update",
+                "origin": origin, "request_id": request_id, "body": body,
+            }))
+            .await?;
+        serde_json::from_value(response["collaboration_request"].clone())
+            .map_err(RuntimeError::Json)
+    }
+
     pub async fn fleet_execute(
         &self,
         host: &str,
@@ -4709,6 +5443,38 @@ impl Client {
         serde_json::from_value(response["fleet_result"].clone()).map_err(RuntimeError::Json)
     }
 
+    /// Wait through the controller's shared event subscription, without pinning a relay command.
+    pub async fn fleet_wait_reply(
+        &self,
+        host: &str,
+        pane: &crate::topology::PaneKey,
+        request_id: &str,
+        timeout_secs: u64,
+        after_update: Option<u64>,
+    ) -> Result<Option<CollaborationRequest>, RuntimeError> {
+        let timeout_secs = timeout_secs.clamp(1, MAX_COLLABORATION_WAIT_SECS);
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION, "kind": "fleet_wait_reply",
+            "host": host, "pane": pane, "request_id": request_id, "timeout_secs": timeout_secs, "after_update":after_update,
+        });
+        let response = self
+            .call_with_timeout(
+                &req,
+                Duration::from_secs(timeout_secs).saturating_add(CLIENT_CALL_TIMEOUT),
+            )
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("fleet reply wait failed")
+                    .to_string(),
+            )));
+        }
+        serde_json::from_value(response["collaboration_request"].clone())
+            .map_err(RuntimeError::Json)
+    }
+
     /// Run one allowlisted `muxa work …` argv through the daemon, on its own
     /// host or on the Fleet host `host`, and return the child's exit code and
     /// streams. Requires the `work_command_v1` capability.
@@ -4726,7 +5492,10 @@ impl Client {
             "stdin": stdin,
         });
         let response = self
-            .call_with_timeout(&req, WORK_COMMAND_CLIENT_TIMEOUT)
+            .call_with_timeout(
+                &req,
+                WorkCommandLimits::for_args(args).timeout + WORK_COMMAND_CLIENT_TIMEOUT,
+            )
             .await?;
         if !response["ok"].as_bool().unwrap_or(false) {
             return Err(RuntimeError::Json(serde::de::Error::custom(
@@ -4737,6 +5506,49 @@ impl Client {
             )));
         }
         serde_json::from_value(response["work_command"].clone()).map_err(RuntimeError::Json)
+    }
+
+    // WS-B: new agent
+    /// Start one allowlisted agent through the daemon, on its own host or a
+    /// control-mode Fleet host. Requires the `agent_start_v1` capability.
+    pub async fn agent_start(
+        &self,
+        request: &crate::agent_control::AgentStartRequest,
+    ) -> Result<crate::agent_control::AgentStartResult, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "agent_start",
+            "request": request,
+        });
+        let response = self
+            .call_with_timeout(&req, WORK_COMMAND_CLIENT_TIMEOUT)
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("agent start failed")
+                    .to_string(),
+            )));
+        }
+        serde_json::from_value(response["agent_start"].clone()).map_err(RuntimeError::Json)
+    }
+
+    // WS-F: snapshot
+    /// The workspace snapshots, newest first, as `muxa snapshot --list
+    /// --json` prints them. Requires `mux_snapshot_v1`.
+    pub async fn mux_snapshot_list(&self) -> Result<serde_json::Value, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "mux_snapshot_list",
+        });
+        let response = self
+            .call_with_timeout(&req, WORK_COMMAND_CLIENT_TIMEOUT)
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        Ok(response["mux_snapshot"].clone())
     }
 
     /// Ask the daemon which additive features it supports and, when it can
@@ -4832,6 +5644,19 @@ impl Client {
         Ok(())
     }
 
+    /// Forget one exact agent session. Returns false when it is already absent.
+    /// Does not terminate the agent or its pane; later activity may recreate it.
+    pub async fn forget_agent(&self, session_id: &str) -> Result<bool, RuntimeError> {
+        let resp = self
+            .call_checked(&serde_json::json!({
+                "protocol": PROTOCOL_VERSION,
+                "kind": "forget_agent",
+                "session_id": session_id,
+            }))
+            .await?;
+        Ok(resp["pruned"].as_u64() == Some(1))
+    }
+
     /// Ask the daemon to delete fully orphaned rows (no pane, surface, or
     /// pid) idle longer than `max_age`. `max_age = Duration::ZERO` removes
     /// every orphan regardless of age. Returns the number removed. Backs
@@ -4877,6 +5702,7 @@ impl Client {
             sent: resp["sent"].as_bool().unwrap_or(true),
             // Absent field (older daemon) → fall back to the requested intent.
             submitted: resp["submitted"].as_bool().unwrap_or(submit),
+            submission_confirmed: resp["submission_confirmed"].as_bool(),
         })
     }
 
@@ -5166,6 +5992,21 @@ impl Client {
 
     /// Remove an `[ask.providers.<id>]` instance and read back the updated
     /// list. Requires the `ask_providers_v1` capability.
+    /// Select `provider` and persist it as `[ask] agent`. Requires the
+    /// `ask_provider_default_v1` capability.
+    pub async fn ask_provider_default(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<AskProviderInfo>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "ask_provider_default",
+            "provider": provider,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["ask_providers"].clone()).map_err(RuntimeError::Json)
+    }
+
     pub async fn ask_provider_remove(
         &self,
         id: &str,
@@ -5485,6 +6326,23 @@ impl Client {
             )
             .await;
         }
+    }
+
+    /// Expire never-claimed requests older than `older_than_secs`, or list
+    /// them with `dry_run`. Requires the `collaboration_expire_v1` capability.
+    pub async fn collaboration_expire(
+        &self,
+        older_than_secs: u64,
+        dry_run: bool,
+    ) -> Result<Vec<CollaborationRequest>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_expire",
+            "older_than_secs": older_than_secs,
+            "dry_run": dry_run,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
     }
 
     pub async fn collaboration_cancel(
@@ -6218,6 +7076,7 @@ mod tests {
     fn collaboration_test_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: Some("callabo".into()),
@@ -6331,6 +7190,7 @@ mod tests {
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
+            agent_session_id: None,
         };
         let request = client
             .collaboration_wait(&origin, "legacy-request", 2)
@@ -6367,6 +7227,7 @@ mod tests {
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
+            agent_session_id: None,
         });
         assert_eq!(
             provenance.origin_match,
@@ -6394,6 +7255,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_updates_round_trip_between_fleet_console_and_recipient() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("request-updates.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "recipient", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "unrelated", AgentKind::ClaudeCode).await;
+        let backend: SharedBackend = Arc::new(CollaborationTestBackend {
+            panes: vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+            ],
+        });
+        let audit = CollaborationAuditLog::in_memory();
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(CollaborationStore::in_memory(
+                CollaborationOptions::default(),
+            ))
+            .with_collaboration_audit(audit.clone());
+        let (shutdown, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let origin = |pane: &str, console| CollaborationOrigin {
+            pane: pane.into(),
+            socket: Some("default".into()),
+            console,
+            agent_session_id: None,
+        };
+        let request = client
+            .collaboration_send(
+                &origin("%1", true),
+                "pane:%1",
+                &NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(request.from.console);
+        client
+            .collaboration_inbox(&origin("%1", false))
+            .await
+            .unwrap();
+        let progress = client
+            .collaboration_update(&origin("%1", false), &request.id, "Tests running")
+            .await
+            .unwrap();
+        assert_eq!(progress.status, RequestStatus::Claimed);
+        assert!(progress.reply.is_none());
+        let guidance = client
+            .collaboration_update(&origin("%1", true), &request.id, "Include the retry path")
+            .await
+            .unwrap();
+        assert_eq!(guidance.updates.len(), 2);
+        assert!(client
+            .collaboration_update(&origin("%2", false), &request.id, "unrelated")
+            .await
+            .is_err());
+        let completed = client
+            .collaboration_reply(
+                &origin("%1", false),
+                &request.id,
+                RequestStatus::Completed,
+                "verified",
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.updates[0].body, "Tests running");
+        assert_eq!(completed.updates[1].author.pane, "console");
+        assert!(client
+            .collaboration_update(&origin("%1", true), &request.id, "late")
+            .await
+            .is_err());
+        let entries = audit.entries().await;
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.operation == CollaborationAuditOperation::Update && e.ok)
+                .count(),
+            2
+        );
+        shutdown.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // explicit wire-compatibility request fixtures
     async fn widening_a_listing_over_ipc_is_console_only() {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("muxa-collaboration-scope.sock");
@@ -6431,6 +7383,7 @@ mod tests {
             pane: pane.into(),
             socket: Some("default".into()),
             console,
+            agent_session_id: None,
         };
         let ask = |from: CollaborationOrigin, to: &'static str, body: &'static str| {
             let client = client.clone();
@@ -6440,9 +7393,15 @@ mod tests {
                         &from,
                         to,
                         &NewRequest {
+                            dispatch_id: None,
+                            source_node_id: None,
+                            delegation_parent: None,
+                            human_action: None,
+                            initiator: None,
                             kind: collaboration::RequestKind::Question,
                             body: body.into(),
                             expects_reply: true,
+                            notify: None,
                             work_mode: collaboration::WorkMode::ReadOnly,
                             thread_id: None,
                             parent_request_id: None,
@@ -6536,16 +7495,19 @@ mod tests {
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
+            agent_session_id: None,
         };
         let recipient = CollaborationOrigin {
             pane: "%2".into(),
             socket: Some("default".into()),
             console: false,
+            agent_session_id: None,
         };
         let verifier = CollaborationOrigin {
             pane: "%3".into(),
             socket: Some("default".into()),
             console: false,
+            agent_session_id: None,
         };
         client
             .collaboration_set_identity(
@@ -6579,9 +7541,15 @@ mod tests {
                 &sender,
                 "role:review",
                 &NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
+                    human_action: None,
+                    initiator: None,
                     kind: collaboration::RequestKind::Question,
                     body: "ambiguous".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: collaboration::WorkMode::ReadOnly,
                     thread_id: None,
                     parent_request_id: None,
@@ -6602,9 +7570,15 @@ mod tests {
                 &sender,
                 "@reviewer",
                 &NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
+                    human_action: None,
+                    initiator: None,
                     kind: collaboration::RequestKind::Review,
                     body: "review this".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: collaboration::WorkMode::ReadOnly,
                     thread_id: None,
                     parent_request_id: None,
@@ -6695,9 +7669,15 @@ mod tests {
                 &sender,
                 "role:rust",
                 &NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
+                    human_action: None,
+                    initiator: None,
                     kind: collaboration::RequestKind::Question,
                     body: "obsolete question".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: collaboration::WorkMode::ReadOnly,
                     thread_id: None,
                     parent_request_id: None,
@@ -6738,12 +7718,19 @@ mod tests {
                     pane: "%1".into(),
                     socket: Some("default".into()),
                     console: true,
+                    agent_session_id: None,
                 },
                 "pane:%1",
                 &NewRequest {
+                    dispatch_id: None,
+                    source_node_id: None,
+                    delegation_parent: None,
+                    human_action: None,
+                    initiator: None,
                     kind: collaboration::RequestKind::Task,
                     body: "dispatch to launch pane".into(),
                     expects_reply: true,
+                    notify: None,
                     work_mode: collaboration::WorkMode::ReadOnly,
                     thread_id: None,
                     parent_request_id: None,
@@ -6783,6 +7770,139 @@ mod tests {
                     == Some(collaboration::CONSOLE_SESSION_ID)
         }));
 
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forget_agent_removes_exact_cmux_record_and_notifies_watch() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("forget.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let client = Client::new(sock);
+        let target = AgentId {
+            kind: AgentKind::Codex,
+            session_id: "old-cmux".into(),
+            pane: Some("cmux:surface-1".into()),
+            tmux_socket: Some("/tmp/cmux.sock".into()),
+            surface: Some(crate::event::SurfaceRef {
+                kind: crate::event::SurfaceKind::Cmux,
+                id: "surface-1".into(),
+                workspace: Some("workspace-1".into()),
+            }),
+            cwd: None,
+        };
+        for id in [
+            target.clone(),
+            AgentId {
+                session_id: "old-cmux-other".into(),
+                pane: Some("cmux:surface-2".into()),
+                surface: None,
+                ..target.clone()
+            },
+        ] {
+            client
+                .ingest(&AgentEvent::Started {
+                    id,
+                    at: OffsetDateTime::now_utc() - time::Duration::days(10),
+                })
+                .await
+                .unwrap();
+        }
+        // Ordinary orphan pruning cannot remove either pane-bound record.
+        assert_eq!(client.prune(std::time::Duration::ZERO).await.unwrap(), 0);
+        let mut changes = store.subscribe_changes();
+        let dirty = store.dirty();
+        // Consume notifications from fixture setup before checking deletion.
+        dirty.notified().await;
+        assert!(!client.forget_agent("old").await.unwrap());
+        assert!(!changes.has_changed().unwrap());
+        assert!(client.forget_agent("old-cmux").await.unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(1), changes.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), dirty.notified())
+            .await
+            .unwrap();
+        assert!(store.by_session("old-cmux").await.is_none());
+        assert!(store.by_session("old-cmux-other").await.is_some());
+        assert!(!client.forget_agent("old-cmux").await.unwrap());
+        // Forget is cleanup, not a persistent block against a live agent.
+        client
+            .ingest(&AgentEvent::Started {
+                id: target,
+                at: OffsetDateTime::now_utc(),
+            })
+            .await
+            .unwrap();
+        assert!(store.by_session("old-cmux").await.is_some());
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_clears_missing_native_surface_without_reconciler() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-prune-native.sock");
+        let store = Store::shared();
+        let server = Server::new(sock.clone(), store.clone());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let client = Client::new(sock);
+        for (sid, at) in [
+            (
+                "old-native",
+                OffsetDateTime::now_utc() - time::Duration::days(2),
+            ),
+            ("fresh-native", OffsetDateTime::now_utc()),
+        ] {
+            client
+                .ingest(&AgentEvent::Started {
+                    id: AgentId {
+                        kind: AgentKind::Codex,
+                        session_id: sid.into(),
+                        surface: Some(crate::event::SurfaceRef {
+                            kind: crate::event::SurfaceKind::Pty,
+                            id: format!("pty:{sid}"),
+                            workspace: None,
+                        }),
+                        pane: None,
+                        tmux_socket: None,
+                        cwd: None,
+                    },
+                    at,
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            client
+                .prune(std::time::Duration::from_secs(3600))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(store.by_session("old-native").await.is_none());
+        let fresh = store.by_session("fresh-native").await.unwrap();
+        assert!(fresh.surface.is_none());
+        assert_eq!(fresh.state, AgentState::Stopped);
+        assert_eq!(client.prune(std::time::Duration::ZERO).await.unwrap(), 1);
         tx.send(()).unwrap();
         handle.await.unwrap();
     }
@@ -7017,6 +8137,135 @@ mod tests {
         assert!(res.is_err());
     }
 
+    #[tokio::test]
+    async fn shutdown_cancels_all_subscription_kinds_without_drain_timeout() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("subscriptions.sock");
+        let (fleet, _commands) = FleetRuntime::new(Arc::new(crate::fleet::FleetStore::new()));
+        let server = Server::new(sock.clone(), Store::shared()).with_fleet(fleet);
+        let (shutdown, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(server.run(receiver));
+        wait_for_socket(&sock).await;
+
+        // Keep each client alive through shutdown. No state changes or
+        // keepalive writes should be necessary to release these handlers.
+        let mut clients = Vec::new();
+        for kind in [
+            "subscribe",
+            "subscribe_agent_changes",
+            "fleet_subscribe",
+            "collaboration_subscribe",
+            "ask_subscribe",
+            "pipeline_subscribe",
+        ] {
+            let mut stream = Stream::connect(&sock).await.unwrap();
+            let request = serde_json::json!({"protocol": PROTOCOL_VERSION, "kind": kind});
+            stream
+                .write_all(&encode_line(&request, PROTOCOL_VERSION).unwrap())
+                .await
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut ack = String::new();
+            tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut ack))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&ack).unwrap()["ok"],
+                true,
+                "{kind}: {ack}"
+            );
+            clients.push(reader);
+        }
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("subscriptions must not consume the five-second drain deadline")
+            .unwrap()
+            .unwrap();
+        for mut client in clients {
+            let mut line = String::new();
+            assert_eq!(client.read_line(&mut line).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_takeover_after_shutdown_does_not_poll_the_pump() {
+        let (shutdown, mut receiver) = watch::channel(false);
+        shutdown.send_replace(true);
+        let result = until_server_shutdown(&mut receiver, async {
+            panic!("a stream admitted after shutdown must not start");
+        })
+        .await;
+        assert!(result.is_none());
+    }
+
+    // Fills a socket send buffer through `OwnedWriteHalf::try_write`; a named
+    // pipe has no non-blocking write to fill it with.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_cancels_a_backpressured_subscription_ack() {
+        let (server, _client) = Stream::pair().await.unwrap();
+        let (_reader, mut writer) = server.into_split();
+        writer.writable().await.unwrap();
+        let bytes = vec![0_u8; 65536];
+        let mut written = 0;
+        loop {
+            match writer.try_write(&bytes) {
+                Ok(n) => written += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill socket: {error}"),
+            }
+        }
+        assert!(written > 0);
+        let (stop, mut stopping) = watch::channel(false);
+        let mut ack = Box::pin(write_subscription_ack(&mut writer, b"{}\n", &mut stopping));
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut ack)
+            .await
+            .is_err());
+        stop.send_replace(true);
+        assert!(!tokio::time::timeout(Duration::from_secs(1), ack)
+            .await
+            .unwrap()
+            .unwrap());
+    }
+
+    // Fills a socket send buffer through `OwnedWriteHalf::try_write`; a named
+    // pipe has no non-blocking write to fill it with.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_cancels_a_backpressured_subscription_write() {
+        let (server, _client) = Stream::pair().await.unwrap();
+        let (_reader, writer) = server.into_split();
+        // Fill the send buffer while the peer deliberately reads nothing.
+        let bytes = vec![0_u8; 65536];
+        writer.writable().await.unwrap();
+        let mut written = 0;
+        loop {
+            match writer.try_write(&bytes) {
+                Ok(n) => written += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill socket: {error}"),
+            }
+        }
+        assert!(written > 0, "the test must fill the actual socket buffer");
+        let (changes, receiver) = watch::channel(0_u64);
+        let (shutdown, mut shutdown_rx) = watch::channel(false);
+        changes.send_replace(1);
+        let mut pump = Box::pin(until_server_shutdown(
+            &mut shutdown_rx,
+            stream_revision_updates(writer, receiver, PROTOCOL_VERSION),
+        ));
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut pump)
+            .await
+            .is_err());
+        shutdown.send_replace(true);
+        assert!(tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("blocked stream write must be cancellable")
+            .is_none());
+    }
+
     /// `Server::run` must wait for in-flight handlers to finish before
     /// returning. Otherwise, an ingest landing during shutdown could
     /// call `Store::apply` *after* the snapshotter's final flush, losing
@@ -7074,10 +8323,9 @@ mod tests {
         // still blocked on its read.
         tx.send(()).unwrap();
 
-        // Now finish the request (newline) so the handler can complete,
-        // then close the stream so the handler's read loop sees EOF and
-        // returns. Without the close, `handle()` would happily wait for
-        // a follow-up request and the drain timeout would fire.
+        // Finish the admitted request after shutdown. The handler must apply
+        // it and close the connection itself rather than waiting for a new
+        // request; the client deliberately remains open while reading EOF.
         stream.write_all(b"\n").await.unwrap();
         stream.flush().await.unwrap();
         // Read the single response so we know the apply landed before
@@ -7113,6 +8361,7 @@ mod tests {
     async fn client_disconnect_before_response_is_clean_handler_exit() {
         let (server_stream, mut client_stream) = Stream::pair().await.unwrap();
         let store = Store::shared();
+        let (_stopping_tx, stopping_rx) = watch::channel(false);
         let handle = tokio::spawn(handle(
             server_stream,
             store,
@@ -7127,7 +8376,11 @@ mod tests {
             None,
             PipelineRunStore::in_memory(),
             WorkUpManager::new(PathBuf::from("/tmp/muxa-disconnect-test.sock")),
+            crate::mux_snapshot_control::MuxSnapshotControl::new(PathBuf::from(
+                "/tmp/muxa-disconnect-test.sock",
+            )),
             None,
+            stopping_rx,
         ));
 
         let req = serde_json::json!({
@@ -7145,6 +8398,124 @@ mod tests {
             .expect("handler should exit promptly")
             .expect("handler task panicked");
         outcome.expect("client disconnect should not be treated as a handler failure");
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_idle_connections_and_all_local_subscriptions_promptly() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("shutdown-streams.sock");
+        let server = Server::new(socket.clone(), Store::shared());
+        let (stop, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(server.run(receiver));
+        wait_for_socket(&socket).await;
+        let mut connections = Vec::new();
+        for kind in [
+            "subscribe",
+            "subscribe_agent_changes",
+            "pipeline_subscribe",
+            "ask_subscribe",
+            "collaboration_subscribe",
+        ] {
+            let stream = Stream::connect(&socket).await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut bytes = serde_json::to_vec(
+                &serde_json::json!({"protocol": PROTOCOL_VERSION, "kind": kind}),
+            )
+            .unwrap();
+            bytes.push(b'\n');
+            reader.get_mut().write_all(&bytes).await.unwrap();
+            let mut ack = String::new();
+            reader.read_line(&mut ack).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&ack).unwrap()["ok"],
+                true,
+                "{kind}"
+            );
+            connections.push(reader);
+        }
+        // A persistent client has completed its request and is now idle.
+        let mut idle = BufReader::new(Stream::connect(&socket).await.unwrap());
+        idle.get_mut()
+            .write_all(
+                format!("{{\"protocol\":{PROTOCOL_VERSION},\"kind\":\"snapshot\"}}\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut ack = String::new();
+        idle.read_line(&mut ack).await.unwrap();
+        connections.push(idle);
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("subscriptions must close without waiting for the five-second drain timeout")
+            .unwrap()
+            .unwrap();
+        for mut reader in connections {
+            let mut line = String::new();
+            assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_abandons_an_in_flight_session_wait() {
+        // `read_session_wait` parks a `spawn_blocking` thread for as long as
+        // the client asked for — up to 30s. `spawn_blocking` cannot be
+        // cancelled and `JoinSet::abort_all` only drops the join handle, so a
+        // handler that kept awaiting it held the drain for the full
+        // `HANDLER_DRAIN_TIMEOUT` on the way out. The macOS app keeps one of
+        // these open per live terminal, which turned every muxad restart into
+        // a five-second blackout: long enough that the app's own three-second
+        // socket timeout fired first and reported the restart as a failure.
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("shutdown-session-wait.sock");
+        let sessions = PtySessionBackend::shared();
+        // Silent and long-lived, so the wait can only end by being abandoned.
+        let session = sessions
+            .spawn_session(SpawnSession {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                env: Vec::new(),
+                cwd: None,
+                name: None,
+                cols: Some(80),
+                rows: Some(24),
+            })
+            .unwrap();
+        let server = Server::new(socket.clone(), Store::shared()).with_sessions(sessions.clone());
+        let (stop, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(server.run(receiver));
+        wait_for_socket(&socket).await;
+
+        let mut waiting = BufReader::new(Stream::connect(&socket).await.unwrap());
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "read_session_wait",
+            "session_id": session.id,
+            "offset": 0,
+            "timeout_ms": 20_000,
+        }))
+        .unwrap();
+        bytes.push(b'\n');
+        waiting.get_mut().write_all(&bytes).await.unwrap();
+        // Let the handler reach the blocking wait before the signal lands.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("a session wait must not hold the drain for its client's timeout")
+            .unwrap()
+            .unwrap();
+        let mut line = String::new();
+        assert_eq!(
+            waiting.read_line(&mut line).await.unwrap(),
+            0,
+            "the abandoned wait must close the connection, not answer it"
+        );
+        let _ = sessions.terminate(&session.id);
     }
 
     #[tokio::test]
@@ -7305,6 +8676,7 @@ mod tests {
         assert!(caps.contains(&"ask_conversations_v1"));
         assert!(caps.contains(&"ask_send_new_v1"));
         assert!(caps.contains(&"ask_providers_v1"));
+        assert!(caps.contains(&"ask_provider_default_v1"));
         assert!(caps.contains(&"work_compose_v1"));
         assert!(!caps.contains(&RESTART_CAPABILITY));
         assert!(!caps.contains(&STOP_CAPABILITY));
@@ -7695,6 +9067,16 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
 
+        let default: RequestBody = serde_json::from_value(serde_json::json!({
+            "kind": "ask_provider_default",
+            "provider": "codex",
+        }))
+        .unwrap();
+        match default {
+            RequestBody::AskProviderDefault { provider } => assert_eq!(provider, "codex"),
+            other => panic!("unexpected {other:?}"),
+        }
+
         let compose: RequestBody = serde_json::from_value(serde_json::json!({
             "kind": "work_compose",
             "description": "implementer in claude, reviewer in codex after it",
@@ -7873,6 +9255,39 @@ mod tests {
         assert!(ask.list().await.is_empty());
         assert_eq!(client.call(&request).await.unwrap()["ok"], false);
         assert_eq!(automation.ledger().all().await.len(), 2);
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn orchestration_settings_ipc_roundtrips_and_rejects_stale_writes() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("orchestration.sock");
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "# existing\n").unwrap();
+        let server = Server::new(socket.clone(), Store::shared()).with_config_path(Some(path));
+        let (shutdown, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(async move { server.run(receiver).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let read = client
+            .call(&serde_json::json!({"kind":"config_orchestration_read"}))
+            .await
+            .unwrap();
+        assert_eq!(read["orchestration"]["enabled"], false);
+        let mut settings = read["orchestration"].clone();
+        settings["enabled"] = serde_json::json!(true);
+        let request = serde_json::json!({"kind":"config_orchestration_write", "expected_text":"# existing\n", "settings":settings});
+        let saved = client.call(&request).await.unwrap();
+        assert_eq!(saved["orchestration"]["enabled"], true);
+        assert!(saved["config"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("# existing\n"));
+        let stale = client.call(&request).await.unwrap();
+        assert_eq!(stale["ok"], false);
+        assert_eq!(stale["config"], saved["config"]);
+        assert!(CAPABILITIES.contains(&"config_orchestration_v1"));
         shutdown.send(()).unwrap();
         task.await.unwrap();
     }
@@ -8177,17 +9592,18 @@ mod tests {
         }
         let providers = client.ask_providers().await.unwrap();
         let ids: Vec<&str> = providers.iter().map(|info| info.id.as_str()).collect();
+        let mut expected = vec![
+            "anthropic-personal",
+            "anthropic-work",
+            "claude",
+            "codex",
+            "gemini",
+            "anthropic",
+            "openai",
+        ];
+        expected.push("apple");
         assert_eq!(
-            ids,
-            [
-                "anthropic-personal",
-                "anthropic-work",
-                "claude",
-                "codex",
-                "gemini",
-                "anthropic",
-                "openai",
-            ],
+            ids, expected,
             "composed instances lead, then the built-ins they do not cover"
         );
         // And they are selectable by their own ids.
@@ -8722,6 +10138,7 @@ mod tests {
 
         let pane = PaneInfo {
             session_group: None,
+            agent_program: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -8901,6 +10318,67 @@ mod tests {
             ],
         );
 
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_prompt_confirms_hook_without_repeating_body_or_enter() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-send-confirm.sock");
+        let store = Store::shared();
+        let id = AgentId {
+            kind: AgentKind::Codex,
+            session_id: "original".into(),
+            surface: None,
+            pane: Some("%1".into()),
+            tmux_socket: None,
+            cwd: None,
+        };
+        store
+            .apply(&AgentEvent::Started {
+                id: id.clone(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let (backend, sends) = RecordingBackend::new(HostKind::Tmux, true);
+        let (tx, handle) = serve(&sock, store.clone(), vec![backend]).await;
+        let observed = sends.clone();
+        let hook = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if observed
+                        .lock()
+                        .unwrap()
+                        .last()
+                        .is_some_and(|(_, t)| t == "\r")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            store
+                .apply(&AgentEvent::PromptSubmitted {
+                    id,
+                    prompt: "continue".into(),
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+        });
+        let outcome = Client::new(sock)
+            .send_prompt("%1", "continue", true)
+            .await
+            .unwrap();
+        assert!(outcome.sent && outcome.submitted);
+        assert_eq!(outcome.submission_confirmed, Some(true));
+        hook.await.unwrap();
+        assert_eq!(
+            *sends.lock().unwrap(),
+            vec![("%1".into(), "continue".into()), ("%1".into(), "\r".into()),]
+        );
         tx.send(()).unwrap();
         handle.await.unwrap();
     }
@@ -9650,6 +11128,49 @@ mod work_command_tests {
         }
     }
 
+    #[tokio::test]
+    async fn global_ask_uses_coordinator_response_without_touching_local_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("entry.sock");
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[orchestration]\nenabled = true\ncoordinator = \"dev\"\n",
+        )
+        .unwrap();
+        let runner = FakeRunner::new(
+            HostAccessMode::Control,
+            r#"{"ok":true,"protocol":1,"ask_entries":[]}"#,
+        );
+        let mut server =
+            Server::new(socket.clone(), crate::Store::shared()).with_config_path(Some(config));
+        server.work_up = WorkUpManager::with_remote(socket.clone(), Some(runner.clone()));
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let handle = tokio::spawn(server.run(rx));
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let response = Client::new(socket)
+            .call(&serde_json::json!({"kind":"ask_list"}))
+            .await
+            .unwrap();
+        assert_eq!(response["ask_entries"], serde_json::json!([]));
+        let sent = runner.runs();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].host, "dev");
+        assert_eq!(sent[0].args, vec!["work", "fleet-ask"]);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(sent[0].stdin.as_deref().unwrap()).unwrap()
+                ["kind"],
+            "ask_list"
+        );
+        shutdown.send(()).unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
     }
@@ -9818,6 +11339,143 @@ mod work_command_tests {
             .await
             .unwrap_err();
         assert!(error.contains("fleet is not enabled"), "{error}");
+    }
+
+    // WS-B: new agent
+    fn agent_request(host: Option<&str>) -> crate::agent_control::AgentStartRequest {
+        serde_json::from_value(serde_json::json!({
+            "agent": "codex",
+            "host": host,
+            "placement": "window",
+            "target": "$3",
+            "cwd": "/srv/remote/checkout",
+            "prompt": "fix the flaky test",
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn agent_start_on_a_control_host_runs_the_cli_argv_on_the_runner() {
+        let runner = FakeRunner::new(
+            HostAccessMode::Control,
+            r#"{"schema_version":1,"host":"tmux","agent":"codex","placement":"window","pane":"%42","cwd":"/srv/remote/checkout","prompt_supplied":true}"#,
+        );
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        let result = manager
+            .agent_start(agent_request(Some("dev")))
+            .await
+            .unwrap();
+        assert_eq!(result.pane.as_deref(), Some("%42"));
+        assert_eq!(result.fleet_host.as_deref(), Some("dev"));
+        let runs = runner.runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].args, agent_request(Some("dev")).arguments());
+        assert_eq!(runs[0].limits, WorkCommandLimits::COMMAND);
+        // What the runner is asked to carry is what the relay will accept.
+        work_control::validate_work_command(&runs[0].args, None, WorkCommandSurface::Relay)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_start_is_refused_on_observe_hosts_and_bad_requests() {
+        let runner = FakeRunner::new(HostAccessMode::Observe, "{}");
+        let manager = WorkUpManager::with_remote(
+            PathBuf::from("/tmp/muxa-work-remote-test.sock"),
+            Some(runner.clone()),
+        );
+        let error = manager
+            .agent_start(agent_request(Some("dev")))
+            .await
+            .unwrap_err();
+        assert!(error.contains("observe-only"), "{error}");
+        let mut native = agent_request(Some("dev"));
+        native.placement = crate::agent_control::AgentPlacement::Native;
+        native.target = None;
+        let error = manager.agent_start(native).await.unwrap_err();
+        assert!(error.contains("this Mac"), "{error}");
+        assert!(runner.runs().is_empty());
+    }
+
+    #[test]
+    fn agent_start_request_decodes_and_response_encodes() {
+        let request: Request = serde_json::from_str(
+            r#"{"protocol":6,"kind":"agent_start","request":{"agent":"claude","placement":"session","cwd":"/srv/app"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(request.body, RequestBody::AgentStart { .. }));
+        assert!(CAPABILITIES.contains(&"agent_start_v1"));
+        let plain = serde_json::to_value(Response::ok()).unwrap();
+        assert!(plain.get("agent_start").is_none());
+    }
+
+    // WS-F: snapshot
+    #[test]
+    fn mux_snapshot_requests_decode_the_documented_shapes() {
+        let decode = |json: &str| serde_json::from_str::<Request>(json).unwrap().body;
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_list"}"#),
+            RequestBody::MuxSnapshotList
+        ));
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_save"}"#),
+            RequestBody::MuxSnapshotSave
+        ));
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_plan","id":"1790000000"}"#),
+            RequestBody::MuxSnapshotPlan { id, only_missing: true } if id == "1790000000"
+        ));
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_plan","id":"1","only_missing":false}"#),
+            RequestBody::MuxSnapshotPlan {
+                only_missing: false,
+                ..
+            }
+        ));
+        match decode(r#"{"protocol":6,"kind":"mux_snapshot_restore","id":"1790000000"}"#) {
+            RequestBody::MuxSnapshotRestore {
+                id,
+                layout_only,
+                only_missing,
+            } => {
+                assert_eq!(id, "1790000000");
+                assert!(!layout_only, "restores the commands unless asked not to");
+                assert!(
+                    only_missing,
+                    "a mux_snapshot_v1 client never fills live sessions"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_restore","id":"1","only_missing":false}"#),
+            RequestBody::MuxSnapshotRestore {
+                only_missing: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode(
+                r#"{"protocol":6,"kind":"mux_snapshot_restore_status","operation_id":"snapshot-restore-1"}"#
+            ),
+            RequestBody::MuxSnapshotRestoreStatus { .. }
+        ));
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_delete","id":"1790000000"}"#),
+            RequestBody::MuxSnapshotDelete { .. }
+        ));
+        assert!(CAPABILITIES.contains(&"mux_snapshot_v1"));
+        assert!(CAPABILITIES.contains(&"mux_snapshot_plan_v1"));
+        let plain = serde_json::to_value(Response::ok()).unwrap();
+        assert!(plain.get("mux_snapshot").is_none());
+        assert!(plain.get("mux_snapshot_operation").is_none());
+        let listed = serde_json::to_value(Response::with_mux_snapshot(
+            serde_json::json!({"snapshots": []}),
+        ))
+        .unwrap();
+        assert_eq!(listed["mux_snapshot"]["snapshots"], serde_json::json!([]));
     }
 
     #[tokio::test]

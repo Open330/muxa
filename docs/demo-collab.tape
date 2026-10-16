@@ -54,7 +54,7 @@ Enter
 Sleep 12s
 Type "clear"
 Enter
-Type "$MUXA_DEMO_TMUX -u -L muxa-demo attach -t ctl:0"
+Type "$MUXA_DEMO_TMUX -u -f /dev/null -S /tmp/muxa-demo-sandbox/tmux.sock attach -t ctl:0"
 Enter
 Sleep 2s
 Type "muxa watch"

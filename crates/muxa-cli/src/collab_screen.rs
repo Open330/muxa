@@ -587,6 +587,13 @@ mod tests {
 
     fn request(id: &str, from: Participant, to: Participant, body: &str) -> CollaborationRequest {
         CollaborationRequest {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
+            interruption: None,
+            human_action: None,
+            initiator: None,
+            updates: Vec::new(),
             id: id.into(),
             from,
             to,
@@ -594,6 +601,7 @@ mod tests {
             kind: RequestKind::Question,
             body: body.into(),
             expects_reply: true,
+            notify: None,
             work_mode: WorkMode::ReadOnly,
             thread_id: None,
             parent_request_id: None,

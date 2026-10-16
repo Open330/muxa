@@ -159,9 +159,16 @@ pub struct Config {
     /// one is written.
     #[serde(default)]
     pub automation: crate::automation::AutomationConfig,
+    /// Defaults for moving agents onto another `aas` account: `muxa swap`
+    /// and the `swap_account` automation action.
+    pub swap: crate::account_swap::SwapConfig,
+    pub orchestration: crate::orchestration::OrchestrationConfig,
     pub history: HistoryConfig,
     pub activity: ActivityConfig,
     pub state: StateConfig,
+    // WS-F: snapshot
+    /// Workspace snapshots: how often muxad takes an automatic one.
+    pub snapshot: SnapshotConfig,
     pub session_activity: SessionActivityConfig,
     pub sinks: SinksConfig,
     pub stats: StatsConfig,
@@ -435,8 +442,9 @@ pub const DEFAULT_ASK_TIMEOUT_SECS: u64 = 30 * 60;
 pub struct AskConfig {
     pub enabled: bool,
     /// Provider instance the next question goes to. Either one of the
-    /// built-in ids — `claude`, `codex`, `gemini` (agent CLIs), or
-    /// `anthropic`, `openai` (HTTPS APIs) — or the id of an
+    /// built-in ids — `claude`, `codex`, `gemini` (agent CLIs),
+    /// `anthropic`, `openai` (HTTPS APIs), or `apple` (the Mac's own
+    /// Foundation Models) — or the id of an
     /// `[ask.providers.<id>]` instance the operator added. See
     /// [`crate::ask::supported_agents`] for the built-ins.
     pub agent: String,
@@ -486,7 +494,8 @@ impl Default for AskConfig {
 ///
 /// The table id is the instance's name on the wire, in `[ask] agent`, and
 /// in `muxa ask --agent`. `engine` names the closed set of code that
-/// drives it (`claude`, `codex`, `gemini`, `anthropic`, `openai`), so the
+/// drives it (`claude`, `codex`, `gemini`, `anthropic`, `openai`,
+/// `apple`), so the
 /// operator can keep several instances of one engine side by side — a
 /// work and a personal `OpenAI` account, two Anthropic keys, a second
 /// `claude` binary — each with its own key.
@@ -496,8 +505,9 @@ impl Default for AskConfig {
 /// `[ask.providers.anthropic] model = "…"` keep meaning "the built-in
 /// anthropic provider, with this model". `title` is what clients show and
 /// defaults to a humanized id. `model` overrides the engine's default
-/// (`claude-sonnet-5` for `anthropic`, `gpt-5` for `openai`; the agent
-/// CLIs use their own unless one is named here). `api_key_env` names an
+/// (`claude-sonnet-5` for `anthropic`, `gpt-5` for `openai`, `on-device`
+/// for `apple`, whose other model is `private-cloud`; the agent CLIs use
+/// their own unless one is named here). `api_key_env` names an
 /// environment variable the daemon reads the key from — a pointer, so a
 /// raw secret is never written into this file. `executable` overrides the
 /// binary a CLI engine spawns and is ignored by the API engines.
@@ -807,7 +817,7 @@ fn default_collaboration_max_message_bytes() -> usize {
 }
 
 /// `[stats]` config — tuning for the engaged ("active") time estimate in
-/// `muxa stats` / `muxa report`. ACTIVE pads each human action (a prompt or a
+/// `muxa stats` / `muxa stats report`. ACTIVE pads each human action (a prompt or a
 /// tmux input tick) into a window; these control its size.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -974,6 +984,11 @@ pub struct WebhookToml {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DashboardTomlConfig {
+    /// Optional authenticated, pane-scoped browser sharing.
+    pub sharing: Option<Box<crate::dashboard::sharing::SharingConfig>>,
+    /// Optional operator sign-in through an `OpenID` Connect provider. The
+    /// bearer token stays required and keeps working alongside it.
+    pub login: Option<Box<crate::dashboard::operator::LoginConfig>>,
     pub enabled: Option<bool>,
     /// Socket address as `ip:port`. Default `127.0.0.1:7878`.
     pub bind: Option<String>,
@@ -1109,12 +1124,10 @@ pub struct ReconcilerConfig {
     /// keyboard, so the cutoff should be generous.
     #[serde(default = "default_zero")]
     pub stuck_waiting_timeout_secs: u64,
-    /// Poll codex session-rollout files (`~/.codex/sessions`) each tick for
-    /// rate-limit state. Codex exposes no error/rate-limit hook, so this is
-    /// the only way muxa learns a codex usage cap — including a cap that
-    /// blocks a turn before any hook fires. Reads the tail of each live
-    /// codex session's JSONL; cost scales with the number of live codex
-    /// sessions, not history size.
+    /// Poll Codex session-rollout tails (`~/.codex/sessions`) every two
+    /// seconds for lifecycle and quota evidence when hooks miss updates.
+    /// This does not increase the full pane reconciliation cadence. Cost
+    /// scales with the number of live Codex sessions, not history size.
     ///
     /// Default `true`. Set `false` to disable (e.g. non-codex deployments
     /// that want to skip the per-tick directory scan entirely).
@@ -1365,6 +1378,34 @@ impl Default for StateConfig {
             enabled: true,
             path: None,
             debounce_ms: default_state_debounce_ms(),
+        }
+    }
+}
+
+// WS-F: snapshot
+/// `[snapshot]` — muxad's automatic workspace snapshots.
+///
+/// A reboot or a crashed multiplexer takes every session with it, and a
+/// snapshot only helps if somebody remembered to take one. muxad takes one
+/// every `auto_interval_minutes` through `muxa snapshot --auto`, which writes
+/// nothing when the workspace has not changed since the newest snapshot of
+/// its server and keeps only the newest `keep_auto` automatic snapshots.
+/// Snapshots taken by hand, or by `muxa reload`, are never pruned. Set
+/// `auto_interval_minutes = 0` to turn the automatic ones off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SnapshotConfig {
+    /// Minutes between automatic snapshots; `0` disables them.
+    pub auto_interval_minutes: u64,
+    /// How many automatic snapshots to keep.
+    pub keep_auto: usize,
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self {
+            auto_interval_minutes: 15,
+            keep_auto: 10,
         }
     }
 }
@@ -2395,6 +2436,19 @@ fn parse_width_string(raw: &str) -> WidthSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // WS-F: snapshot
+    #[test]
+    fn automatic_snapshots_are_on_by_default_and_zero_turns_them_off() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.snapshot, SnapshotConfig::default());
+        assert_eq!(config.snapshot.auto_interval_minutes, 15);
+        assert_eq!(config.snapshot.keep_auto, 10);
+        let off: Config = toml::from_str("[snapshot]\nauto_interval_minutes = 0\n").unwrap();
+        assert_eq!(off.snapshot.auto_interval_minutes, 0);
+        assert_eq!(off.snapshot.keep_auto, 10);
+        assert!(toml::from_str::<Config>("[snapshot]\nkeep = 3\n").is_err());
+    }
 
     #[test]
     fn provider_options_are_keyed_so_a_flag_cannot_reach_the_wrong_cli() {

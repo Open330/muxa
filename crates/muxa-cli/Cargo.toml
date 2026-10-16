@@ -13,6 +13,7 @@ name = "muxa"
 path = "src/main.rs"
 
 [dependencies]
+uuid.workspace = true
 muxa = { workspace = true }
 
 anyhow = { workspace = true }
@@ -29,6 +30,9 @@ time = { workspace = true }
 # `io-std` (on top of the workspace feature set) gives `muxa mcp` async
 # stdin/stdout for its JSON-RPC stdio loop.
 tokio = { workspace = true, features = ["io-std"] }
+sha2 = "0.10"
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -65,6 +69,12 @@ toml = { workspace = true }
 unicode-width = "0.2"
 # Cryptographically-strong dashboard tokens via the OS RNG.
 rand = "0.8"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+# `muxa reload` reads each pane's argv with its argument boundaries (macOS
+# `ps` only reports them joined) and when the agent in it started. Linux
+# reads both from `/proc`.
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tempfile = "3"

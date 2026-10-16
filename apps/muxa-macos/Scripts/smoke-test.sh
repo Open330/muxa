@@ -116,11 +116,31 @@ required = {
     "ask_conversations_v1",
     "automation_ask_v1",
     "config_launch_v1",
+    "config_orchestration_v1",
 }
 missing = required.difference(response.get("capabilities", []))
 if missing:
     raise SystemExit(f"muxad did not advertise required capabilities: {sorted(missing)}")
 PY
+
+# Exercise the app's typed policy endpoint and bundled CLI without launching work.
+policy=$(ipc '{"protocol":6,"kind":"config_orchestration_read"}')
+update=$(python3 - "$policy" <<'PYTHON'
+import json, sys
+value = json.loads(sys.argv[1])
+value["orchestration"]["enabled"] = True
+print(json.dumps({"protocol":6,"kind":"config_orchestration_write",
+    "expected_text":value["config"]["text"],"settings":value["orchestration"]}))
+PYTHON
+)
+ipc "$update" >/dev/null
+options=$(ipc '{"protocol":6,"kind":"work_command","args":["work","dispatch-options"]}')
+python3 - "$options" <<'PYTHON'
+import json, sys
+result = json.loads(sys.argv[1])["work_command"]
+assert result["exit_code"] == 0, result["stderr"]
+assert json.loads(result["stdout"])["enabled"] is True
+PYTHON
 
 spawned=$(ipc '{"protocol":6,"kind":"spawn_session","command":"/bin/sh","args":["-c","/usr/bin/yes muxa-macos-smoke | /usr/bin/head -c 524288; sleep 5"],"env":[],"cwd":"/tmp","name":"macOS smoke","cols":80,"rows":24}')
 session_id=$(python3 - "$spawned" <<'PY'

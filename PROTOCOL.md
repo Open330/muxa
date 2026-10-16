@@ -112,6 +112,21 @@ Response:
 { "ok": true, "protocol": 1, "agents": [ <Agent>, ... ] }
 ```
 
+#### `forget_agent`
+
+Explicitly remove one registry row by its exact agent session id. Unlike orphan
+pruning, this also supports rows that retain a pane or surface, including stale
+cmux records. It never terminates a process, pane, or native PTY session, and it
+retains prompt history. Subsequent hooks or scans can register the agent again.
+
+```json
+{ "protocol": 6, "kind": "forget_agent", "session_id": "agent-session-id" }
+```
+
+Response: `{ "ok": true, "protocol": 6, "pruned": 1 }`, or `pruned: 0` if
+already absent. Deletion signals snapshot persistence and live registry subscribers.
+Older daemons reject this additive method as an unknown request.
+
 #### Durable pipeline Runs (v5)
 
 The `pipeline_runs_v1` capability covers the daemon-owned Work pipeline

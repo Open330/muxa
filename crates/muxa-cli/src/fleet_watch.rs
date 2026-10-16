@@ -144,12 +144,14 @@ enum InputMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum MailboxTab {
     #[default]
+    Human,
     Incoming,
     Sent,
 }
 
 #[derive(Debug, Clone, Default)]
 struct MailboxState {
+    human: Vec<CollaborationRequest>,
     open: bool,
     loading: bool,
     host: Option<String>,
@@ -872,6 +874,7 @@ impl App {
 
     fn mailbox_requests(&self) -> &[CollaborationRequest] {
         match self.mailbox.tab {
+            MailboxTab::Human => &self.mailbox.human,
             MailboxTab::Incoming => &self.mailbox.incoming,
             MailboxTab::Sent => &self.mailbox.sent,
         }
@@ -1172,6 +1175,12 @@ pub(crate) async fn run(
                     app.mailbox.loading = false;
                     match result {
                         Ok(result) => {
+                            app.mailbox.human = result
+                                .collaboration_incoming
+                                .iter()
+                                .filter(|request| request.needs_human_response())
+                                .cloned()
+                                .collect();
                             app.mailbox.incoming = result.collaboration_incoming;
                             app.mailbox.sent = result.collaboration_sent;
                             app.clamp_mailbox();
@@ -1365,9 +1374,15 @@ fn handle_key(
                             )
                         };
                         let request = NewRequest {
+                            dispatch_id: None,
+                            source_node_id: None,
+                            delegation_parent: None,
+                            human_action: None,
+                            initiator: None,
                             kind: app.message_kind,
                             body: text,
                             expects_reply: app.message_kind != RequestKind::Notice,
+                            notify: None,
                             work_mode: match mode {
                                 WatchCollaborationMode::Execute => WorkMode::Execute,
                                 WatchCollaborationMode::ReadOnly
@@ -1582,8 +1597,9 @@ fn handle_key(
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 app.mailbox.tab = match app.mailbox.tab {
+                    MailboxTab::Human => MailboxTab::Incoming,
                     MailboxTab::Incoming => MailboxTab::Sent,
-                    MailboxTab::Sent => MailboxTab::Incoming,
+                    MailboxTab::Sent => MailboxTab::Human,
                 };
                 app.mailbox.selected = 0;
             }
@@ -2107,6 +2123,7 @@ fn fleet_watch_console_origin(pane: &PaneKey) -> CollaborationOrigin {
         socket: matches!(endpoint.host, HostKind::Tmux | HostKind::Rmux)
             .then(|| endpoint.socket.clone()),
         console: true,
+        agent_session_id: None,
     }
 }
 
@@ -2144,7 +2161,7 @@ fn spawn_collaboration_broadcast(
                             &target.recipient.host_alias,
                             &FleetOperation::CollaborationSend {
                                 pane: target.recipient.pane,
-                                request,
+                                request: Box::new(request),
                             },
                         )
                         .await
@@ -2179,7 +2196,13 @@ fn spawn_collaboration_send(
     let sender = background.clone();
     tokio::spawn(async move {
         let result = client
-            .fleet_execute(&host, &FleetOperation::CollaborationSend { pane, request })
+            .fleet_execute(
+                &host,
+                &FleetOperation::CollaborationSend {
+                    pane,
+                    request: Box::new(request),
+                },
+            )
             .await
             .map_err(|error| error.to_string());
         let _ = sender.send(BackgroundResult::CollaborationSent(result));
@@ -2221,7 +2244,13 @@ fn refresh_mailbox(
     app.mailbox.loading = true;
     tokio::spawn(async move {
         let result = client
-            .fleet_execute(&host, &FleetOperation::CollaborationMailbox { pane })
+            .fleet_execute(
+                &host,
+                &FleetOperation::CollaborationMailbox {
+                    pane,
+                    operator_only: false,
+                },
+            )
             .await
             .map_err(|error| error.to_string());
         let _ = background.send(BackgroundResult::Mailbox(result));
@@ -2254,7 +2283,7 @@ fn claim_mailbox(
 }
 
 fn open_reply_composer(app: &mut App) {
-    if app.mailbox.tab != MailboxTab::Incoming {
+    if app.mailbox.tab == MailboxTab::Sent {
         app.status("switch to incoming requests to reply");
         return;
     }
@@ -2262,7 +2291,7 @@ fn open_reply_composer(app: &mut App) {
         app.status("no incoming request selected");
         return;
     };
-    if request.status == RequestStatus::Queued {
+    if request.status == RequestStatus::Queued && !request.needs_human_response() {
         app.status("press i to claim the request before replying");
         return;
     }
@@ -4020,6 +4049,14 @@ fn render_mailbox(frame: &mut Frame, area: Rect, app: &App) {
         .title(Line::from(vec![
             Span::styled(" mailbox ", theme.accent_badge()),
             Span::styled(
+                format!(" need you {} ", app.mailbox.human.len()),
+                if app.mailbox.tab == MailboxTab::Human {
+                    theme.action_badge()
+                } else {
+                    theme.dim_style()
+                },
+            ),
+            Span::styled(
                 format!(" incoming {} ", app.mailbox.incoming.len()),
                 if app.mailbox.tab == MailboxTab::Incoming {
                     theme.action_badge()
@@ -4038,7 +4075,9 @@ fn render_mailbox(frame: &mut Frame, area: Rect, app: &App) {
             ),
             Span::styled(format!(" · {target} "), theme.table_header_style()),
         ]))
-        .title_bottom(" Tab inbox/sent · j/k move · i claim · e reply · r refresh · M/Esc close ")
+        .title_bottom(
+            " Tab need you/agent inbox/sent · j/k move · e reply · r refresh · M/Esc close ",
+        )
         .borders(Borders::ALL)
         .border_type(theme.border_type)
         .border_style(theme.border_style());
@@ -4074,7 +4113,7 @@ fn render_mailbox(frame: &mut Frame, area: Rect, app: &App) {
                 "  "
             };
             let peer = match app.mailbox.tab {
-                MailboxTab::Incoming => request.from.label(),
+                MailboxTab::Human | MailboxTab::Incoming => request.from.label(),
                 MailboxTab::Sent => request.to.label(),
             };
             Row::new(vec![
@@ -4727,6 +4766,7 @@ mod tests {
                 agents: Vec::new(),
                 panes: vec![PaneInfo {
                     session_group: None,
+                    agent_program: None,
                     agent_role: None,
                     agent_alias: None,
                     workspace_id: None,
@@ -4821,9 +4861,15 @@ mod tests {
 
     fn broadcast_request() -> NewRequest {
         NewRequest {
+            dispatch_id: None,
+            source_node_id: None,
+            delegation_parent: None,
+            human_action: None,
+            initiator: None,
             kind: RequestKind::Question,
             body: "coordinate this change".into(),
             expects_reply: true,
+            notify: None,
             work_mode: WorkMode::ReadOnly,
             thread_id: None,
             parent_request_id: None,
