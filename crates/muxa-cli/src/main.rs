@@ -3876,7 +3876,7 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
                 // Best-effort Heartbeat: parse errors on stdin must never
                 // cause the status line to fail, so log and move on.
                 if let Ok(input) = serde_json::from_slice::<claude::StatusLineInput>(&buf) {
-                    let pane = std::env::var("TMUX_PANE").ok();
+                    let pane = muxa::adapters::hook::host_pane_env();
                     let ev = claude::statusline_heartbeat(input, pane);
                     best_effort_ingest(client, &ev).await;
                 } else {
@@ -3906,7 +3906,9 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
                 .map(|u| format!(" · ${u:.2}"))
                 .unwrap_or_default();
             println!("{label}{ctx}{cost}");
-            let pane = std::env::var("TMUX_PANE").ok();
+            // Same resolution as the event hooks, so an rmux pane is stamped
+            // `rmux:%N` rather than read back as a bare tmux `%N`.
+            let pane = muxa::adapters::hook::host_pane_env();
             let ev = claude::statusline_heartbeat(input, pane);
             best_effort_ingest(client, &ev).await;
         }

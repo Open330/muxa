@@ -217,7 +217,7 @@ fn cmux_surface_env_from(read: impl Fn(&str) -> Option<String>) -> Option<Surfac
 /// pane on tmux while `detect_from` chose cmux for the endpoint, producing a
 /// `%N` row with a cmux socket that no pane scan can match. `MUXA_HOST=cmux`
 /// forces the surface id when an operator really wants it.
-fn host_pane_env() -> Option<String> {
+pub fn host_pane_env() -> Option<String> {
     host_pane_env_from(|name| std::env::var(name).ok())
 }
 
