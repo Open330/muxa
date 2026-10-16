@@ -307,7 +307,7 @@ pub(crate) fn start_detached(
 ///
 /// `CreateProcess` from here would hand the daemon every inheritable handle
 /// this process holds — including the pipe a caller reads `muxa`'s output
-/// from, so `muxa daemon start *> $null` in a PowerShell profile would wait
+/// from, so `muxa daemon start *> $null` in a `PowerShell` profile would wait
 /// for the daemon to exit before the shell could start. It would also leave
 /// the daemon in the launching shell's job object, which rmux closes along
 /// with its server, taking the daemon with it. Neither is reachable without

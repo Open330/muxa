@@ -229,20 +229,20 @@ fn read_processes() -> Vec<Proc> {
         .processes()
         .values()
         .filter_map(|process| {
-            let mut argv = process
+            let mut words = process
                 .cmd()
                 .iter()
                 .map(|argument| argument.to_string_lossy().into_owned());
-            let program = argv.next()?;
-            let args = std::iter::once(muxa::shell::program_name(&program).to_owned())
-                .chain(argv)
+            let program = words.next()?;
+            let line = std::iter::once(muxa::shell::program_name(&program).to_owned())
+                .chain(words)
                 .collect::<Vec<_>>()
                 .join(" ");
             Some(Proc {
                 pid: process.pid().as_u32(),
                 parent_pid: process.parent().map_or(0, sysinfo::Pid::as_u32),
                 age: Duration::from_secs(process.run_time()),
-                args,
+                args: line,
             })
         })
         .collect()

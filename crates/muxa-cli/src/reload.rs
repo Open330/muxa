@@ -1573,10 +1573,11 @@ fn foreground(endpoint: &BackendEndpoint, target: &str) -> Option<String> {
     )
     .ok()?;
     let reply = reply.trim_end_matches(['\r', '\n']);
-    let (command, _pane_pid) = reply.split_once('\t').unwrap_or((reply, ""));
+    let (command, pane_pid) = reply.split_once('\t').unwrap_or((reply, ""));
+    #[cfg(not(windows))]
+    let _ = pane_pid;
     #[cfg(windows)]
     if is_shell(command.trim()) {
-        let pane_pid = _pane_pid;
         if let Ok(pane_pid) = pane_pid.trim().parse::<u32>() {
             if let Some(child) = process::ProcessTable::read().child_command(pane_pid) {
                 let program = child

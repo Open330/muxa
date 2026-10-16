@@ -1053,6 +1053,7 @@ fn secure_database_files(path: &Path) -> Result<(), CollaborationError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // same signature as the Unix arm
 fn secure_database_files(_path: &Path) -> Result<(), CollaborationError> {
     Ok(())
 }
@@ -1078,6 +1079,7 @@ fn prepare_database_file(path: &Path) -> Result<(), CollaborationError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // same signature as the Unix arm
 fn prepare_database_file(_path: &Path) -> Result<(), CollaborationError> {
     Ok(())
 }

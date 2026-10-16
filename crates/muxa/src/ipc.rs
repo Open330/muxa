@@ -4716,8 +4716,8 @@ async fn handle(
                 RequestBody::SubscribeAgentChanges => {
                     let protocol = negotiated.unwrap_or(PROTOCOL_VERSION);
                     let changes = store.subscribe_changes();
-                    let ack = encode_line(&Response::ok(), protocol)?;
-                    if !write_subscription_ack(&mut writer, &ack, &mut stopping).await? {
+                    let ack_line = encode_line(&Response::ok(), protocol)?;
+                    if !write_subscription_ack(&mut writer, &ack_line, &mut stopping).await? {
                         return Ok(());
                     }
                     return until_server_shutdown(

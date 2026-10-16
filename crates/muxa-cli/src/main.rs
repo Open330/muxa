@@ -3630,14 +3630,14 @@ fn rmux_client_from_context(listing: &str, context: &str) -> Option<String> {
         .filter_map(|line| line.split_once('\t'))
         .collect();
     if clients.len() == 1 {
-        return Some(clients[0].0.to_string());
+        return Some((*clients[0].0).to_string());
     }
     let session = context.split(',').nth(2)?.trim_start_matches('$');
     let mut matches = clients
         .iter()
         .filter(|(_, id)| id.trim_start_matches('$') == session);
     let (client, _) = matches.next()?;
-    matches.next().is_none().then(|| client.to_string())
+    matches.next().is_none().then(|| (*client).to_string())
 }
 
 fn jump_to_pane_rmux_target(socket: &str, session: &str, window: &str, pane: &str) {
@@ -3844,17 +3844,15 @@ fn run_forward(cmd: &str, stdin_bytes: &[u8]) -> Result<i32> {
     let status = child
         .wait()
         .with_context(|| "failed to wait on forward command")?;
-    Ok(status.code().unwrap_or_else(|| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            status.signal().map_or(1, |s| 128 + s)
-        }
-        #[cfg(not(unix))]
-        {
-            1
-        }
-    }))
+    #[cfg(unix)]
+    let code = status.code().unwrap_or_else(|| {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map_or(1, |s| 128 + s)
+    });
+    // No signals on Windows: an exit code is always there.
+    #[cfg(not(unix))]
+    let code = status.code().unwrap_or(1);
+    Ok(code)
 }
 
 async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {

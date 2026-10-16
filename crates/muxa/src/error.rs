@@ -14,8 +14,10 @@ pub enum CoreError {
     #[error("config parse error ({path}): {source}")]
     ConfigParse {
         path: PathBuf,
+        /// Boxed: the parse error is large, and with Windows' wider `PathBuf`
+        /// it pushed every `Result<_, CoreError>` past clippy's size limit.
         #[source]
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
 
     #[error("config validation error ({path}): {source}")]

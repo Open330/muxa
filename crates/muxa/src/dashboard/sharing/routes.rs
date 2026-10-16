@@ -712,6 +712,8 @@ fn perform(
     }
 }
 
+// Only the Windows arm reads synchronously; the others await.
+#[cfg_attr(windows, allow(clippy::unused_async))]
 pub(super) async fn process_stamp(pid: u32) -> Result<String, ()> {
     if pid == 0 {
         return Err(());

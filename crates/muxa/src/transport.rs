@@ -421,6 +421,7 @@ mod imp {
     }
 
     /// Protection is set at creation; there is nothing to re-apply after.
+    #[allow(clippy::unnecessary_wraps)] // same signature as the Unix arm
     pub(super) fn harden(_endpoint: &Path) -> io::Result<()> {
         Ok(())
     }
@@ -436,6 +437,7 @@ mod imp {
     }
 
     /// Nothing to clear: the pipe is gone once the daemon drops its handles.
+    #[allow(clippy::unnecessary_wraps)] // same signature as the Unix arm
     pub(super) fn clear(_endpoint: &Path) -> io::Result<()> {
         Ok(())
     }

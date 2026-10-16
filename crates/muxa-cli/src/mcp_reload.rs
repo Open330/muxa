@@ -8,10 +8,9 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::{
-    tungstenite::{protocol::WebSocketConfig, Message},
-    WebSocketStream,
-};
+#[cfg(unix)]
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
 #[derive(Debug, Args)]
 pub struct McpReloadArgs {
@@ -314,8 +313,11 @@ async fn reload_host(
             )
             .await
         }
+        // Codex exposes its control socket on Unix only; nothing on this
+        // platform could have been submitted or written.
         #[cfg(not(unix))]
         {
+            let _ = (&mut submitted, &mut revision_written, revision, backup);
             bail!("local Codex control socket reload is unsupported on this platform")
         }
     })
@@ -351,6 +353,8 @@ fn failure_state(error: &anyhow::Error, submitted: bool) -> &'static str {
     }
 }
 
+// The WebSocket exchange runs over Codex's Unix control socket only.
+#[cfg_attr(not(unix), allow(dead_code))]
 async fn send<S: AsyncRead + AsyncWrite + Unpin>(
     connection: &mut WebSocketStream<S>,
     value: Value,
@@ -361,6 +365,7 @@ async fn send<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 async fn response<S: AsyncRead + AsyncWrite + Unpin>(
     connection: &mut WebSocketStream<S>,
     id: u64,
@@ -387,6 +392,7 @@ async fn response<S: AsyncRead + AsyncWrite + Unpin>(
     bail!("Codex control connection closed before acknowledging the request")
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     connection: &mut WebSocketStream<S>,
     submitted: &mut bool,
@@ -494,6 +500,7 @@ async fn verify_host(
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unused_async)] // same signature as the Unix arm
 async fn verify_host(
     _socket: &std::path::Path,
     _revision: &str,

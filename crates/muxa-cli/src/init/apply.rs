@@ -193,11 +193,38 @@ fn apply_symlink(
         ensure_parent(path)?;
         #[cfg(unix)]
         std::os::unix::fs::symlink(target, path)?;
-        #[cfg(not(unix))]
-        anyhow::bail!("agent skill symlinks require a Unix host");
+        #[cfg(windows)]
+        link_directory(target, path)?;
+        #[cfg(not(any(unix, windows)))]
+        anyhow::bail!("agent skill symlinks require a Unix or Windows host");
         report.edited.push(path.to_path_buf());
         Ok(())
     }
+}
+
+/// A Windows directory symlink needs Developer Mode or an elevated token; a
+/// junction does not, and agents follow either the same way. Try the
+/// symlink first so a capable host gets the same link Unix gets.
+#[cfg(windows)]
+fn link_directory(target: &Path, path: &Path) -> Result<()> {
+    if std::os::windows::fs::symlink_dir(target, path).is_ok() {
+        return Ok(());
+    }
+    let status = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(path)
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .context("running mklink /J")?;
+    if !status.success() {
+        anyhow::bail!(
+            "could not link {} to {} (mklink /J exited with {status})",
+            path.display(),
+            target.display()
+        );
+    }
+    Ok(())
 }
 
 fn apply_edit(
@@ -432,6 +459,7 @@ fn sync_parent(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // same signature as the Unix arm
 fn sync_parent(_path: &Path) -> Result<()> {
     Ok(())
 }

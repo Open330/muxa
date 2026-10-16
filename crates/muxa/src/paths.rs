@@ -55,12 +55,13 @@ pub fn default_socket() -> PathBuf {
     // per-user local data directory. On Windows the path is not bound to a
     // filesystem object anyway — the transport derives a pipe name from it —
     // but it is still what `create_dir_all` runs against, and creating a
-    // `	mp` at the drive root would be a surprising thing for a daemon to do.
+    // `\tmp` at the drive root would be a surprising thing for a daemon to do.
     #[cfg(not(unix))]
     {
-        dirs::data_local_dir()
-            .map(|d| d.join(CONFIG_DIRNAME).join(SOCKET_FILENAME))
-            .unwrap_or_else(|| PathBuf::from(SOCKET_FILENAME))
+        dirs::data_local_dir().map_or_else(
+            || PathBuf::from(SOCKET_FILENAME),
+            |d| d.join(CONFIG_DIRNAME).join(SOCKET_FILENAME),
+        )
     }
 }
 
