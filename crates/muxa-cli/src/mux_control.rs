@@ -125,16 +125,39 @@ pub fn watch_popup(client: Option<&str>) -> anyhow::Result<()> {
 }
 
 fn popup_shell_command(words: &[std::ffi::OsString]) -> anyhow::Result<String> {
-    words
+    let words = words
         .iter()
         .map(|word| {
-            let word = word
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("popup argument is not UTF-8"))?;
-            Ok(format!("'{}'", word.replace('\'', "'\"'\"'")))
+            word.to_str()
+                .ok_or_else(|| anyhow::anyhow!("popup argument is not UTF-8"))
         })
-        .collect::<anyhow::Result<Vec<_>>>()
-        .map(|words| words.join(" "))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(if cfg!(windows) {
+        powershell_command(&words)
+    } else {
+        posix_command(&words)
+    })
+}
+
+fn posix_command(words: &[&str]) -> String {
+    words
+        .iter()
+        .map(|word| format!("'{}'", word.replace('\'', "'\"'\"'")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// rmux on Windows runs popup commands through its `default-shell`, `pwsh`
+/// by default. A line of quoted words is a parse error there — a leading
+/// string is an expression, not a command — so the program needs the call
+/// operator, and a single quote escapes by doubling.
+fn powershell_command(words: &[&str]) -> String {
+    let quoted = words
+        .iter()
+        .map(|word| format!("'{}'", word.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("& {quoted}")
 }
 
 /// Capture the source pane in the binding, before the popup has a pane of its own.
@@ -321,17 +344,21 @@ esac
 
     #[test]
     fn popup_arguments_survive_shell_metacharacters() {
-        let words: Vec<std::ffi::OsString> = ["a path/muxa", "it's $HOME; $(false)", ""]
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        let quoted = popup_shell_command(&words).unwrap();
+        let quoted = posix_command(&["a path/muxa", "it's $HOME; $(false)", ""]);
         let output = Command::new("/bin/sh")
             .args(["-c", &format!("printf '%s\\0' {quoted}")])
             .output()
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"a path/muxa\0it's $HOME; $(false)\0\0");
+    }
+
+    #[test]
+    fn powershell_popups_call_the_program_and_double_single_quotes() {
+        assert_eq!(
+            powershell_command(&[r"C:\Program Files\muxa.exe", "watch", "it's $HOME", "%4"]),
+            r"& 'C:\Program Files\muxa.exe' 'watch' 'it''s $HOME' '%4'"
+        );
     }
 
     #[test]
