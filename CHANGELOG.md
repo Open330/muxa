@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Collaboration host scope accepts namespaced pane IDs such as `rmux:%N`
+  across windows and sessions. Room-local aliases and role selectors retain
+  their scope, and duplicate pane IDs across servers remain ambiguous.
 - Muxa.app builds with Xcode 27: the embedded `muxad`/`muxa` build no longer
   hands Xcode's `MACOSX_DEPLOYMENT_TARGET` to the host proc-macros, which then
   failed to load (`can't find crate for tokio_macros`). The deployment target

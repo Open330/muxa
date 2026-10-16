@@ -122,7 +122,9 @@ argument로 발신 pane을 임의 지정하지 않습니다.
 - 셋 이상이면 `@claude`처럼 handle로, 없으면 `%12` / `pane:%12`로 지정합니다.
 - identity를 등록한 agent는 `@reviewer` 또는 `role:rust`처럼 지정할 수 있습니다.
 - `scope = "window"`에서는 다른 window의 pane을 거부합니다. `scope = "host"`는
-  명시적 `pane:%12` 대상을 다른 window/session까지 넓힙니다.
+  명시적 pane 대상(`pane:rmux:%12`, `pane:%12` 등)을 다른 window/session까지 넓힙니다.
+  Muxa가 반환한 backend 접두사를 유지해야 합니다. `peer`, `@alias`, `role:`은
+  같은 room 안에서만 찾으며, 다른 서버에 같은 pane ID가 있으면 모호한 대상으로 거부합니다.
 - 요청은 pane뿐 아니라 현재 agent session에도 고정됩니다. pane을 새 agent가
   재사용해도 이전 요청을 받지 않습니다.
 

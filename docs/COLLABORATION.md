@@ -198,9 +198,12 @@ ends up answering to `@claude` twice. Explicit aliases register with it too,
 before they are stamped. With no daemon reachable a pane simply stays unnamed
 and keeps `%1242`.
 `scope = "window"` refuses cross-window targets; `scope = "host"` widens an
-explicit `pane:%N` target to other windows and sessions. Requests are also
-pinned to the target's current agent session, so a new process reusing that
-pane cannot inherit old work.
+explicit pane target (for example `pane:rmux:%12` or `pane:%12`) to other
+windows and sessions. `peer`, `@alias` and `role:` stay within the sender's
+room, and pane IDs repeated on different servers are rejected as ambiguous.
+Keep the backend prefix returned by Muxa. Requests are also pinned to the
+target's current agent session, so a new process reusing that pane cannot
+inherit old work.
 
 An exact agent session can also register its own room-local alias and
 advisory roles, which override the minted one for routing:
