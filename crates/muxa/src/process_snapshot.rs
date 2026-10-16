@@ -4,10 +4,8 @@
 //! single `ps` pass over the whole process table. Callers then walk this in
 //! memory instead of spawning `ps`/`pgrep` once per pane.
 //!
-//! Windows has neither `/proc` nor `ps`. Rather than let it fall into the
-//! `ps` arm and fail at runtime with an empty table, the non-Unix arm is
-//! spelled out below and returns empty *deliberately*. See
-//! `docs/WINDOWS.md` for what wiring a real Windows process source needs.
+//! Windows has neither `/proc` nor `ps`; its arm reads the same table through
+//! `sysinfo`, which wraps the Win32 process APIs without unsafe code here.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -30,7 +28,7 @@ pub(crate) struct ProcessTable {
     children_by_parent: HashMap<u32, Vec<u32>>,
 }
 
-#[cfg_attr(any(target_os = "linux", not(unix)), allow(dead_code))]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 impl ProcessTable {
     pub(crate) fn from_processes(processes: impl IntoIterator<Item = ProcessInfo>) -> Self {
         let mut table = Self::default();
@@ -166,25 +164,125 @@ fn parse_ps_table(stdout: &str) -> ProcessTable {
     ProcessTable::from_processes(processes)
 }
 
-// --- Non-Unix (Windows) -----------------------------------------------------
+// --- Windows ------------------------------------------------------------------
 //
-// Windows exposes neither `/proc` nor `ps`. These arms exist so that the
-// absence of a process source is one visible place in the tree, rather than an
-// accident of `not(target_os = "linux")` quietly selecting the `ps` code path
-// and failing at runtime with an empty table and a debug line nobody reads.
-//
-// Returning empty is honest rather than lossy: without a Windows `PaneBackend`
-// there are no panes whose descendants could be attributed anyway. Wiring a
-// real source (Toolhelp32 / WTS) is only worth doing once such a backend
-// exists to give the PIDs meaning. See `docs/WINDOWS.md`.
+// rmux reports each pane's shell pid (`#{pane_pid}`) but only ever the shell as
+// `#{pane_current_command}`: a console has no foreground process group to ask.
+// The agent running in that shell is found here instead, as its child.
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn system_processes(with_cmd: bool) -> sysinfo::System {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut system = System::new();
+    let kind = if with_cmd {
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always)
+    } else {
+        ProcessRefreshKind::nothing()
+    };
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+    system
+}
+
+#[cfg(windows)]
+pub(crate) fn read_parent_pid_map() -> HashMap<u32, u32> {
+    system_processes(false)
+        .processes()
+        .values()
+        .filter_map(|process| Some((process.pid().as_u32(), process.parent()?.as_u32())))
+        .collect()
+}
+
+#[cfg(windows)]
+pub(crate) fn read_current_process_table() -> ProcessTable {
+    let system = system_processes(true);
+    let processes = system.processes().values().map(|process| {
+        let argv: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        // `comm` mirrors `ps`'s argv[0]; a process whose command line could
+        // not be read (another user's, a protected one) still has a name.
+        let comm = argv
+            .first()
+            .cloned()
+            .unwrap_or_else(|| process.name().to_string_lossy().into_owned());
+        let cmdline = if argv.is_empty() {
+            comm.clone()
+        } else {
+            argv.join(" ")
+        };
+        ProcessInfo {
+            pid: process.pid().as_u32(),
+            parent_pid: process.parent().map_or(0, sysinfo::Pid::as_u32),
+            depth: 0,
+            comm,
+            cmdline,
+        }
+    });
+    ProcessTable::from_processes(processes)
+}
+
+/// One process's argv (its image name when the command line is unreadable),
+/// or `None` once it has exited.
+#[cfg(windows)]
+pub(crate) fn process_argv(pid: u32) -> Option<Vec<String>> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let process = system.process(pid)?;
+    let argv: Vec<String> = process
+        .cmd()
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    Some(if argv.is_empty() {
+        vec![process.name().to_string_lossy().into_owned()]
+    } else {
+        argv
+    })
+}
+
+/// When `pid` started, in Unix seconds, or `None` once it has exited.
+#[cfg(windows)]
+pub(crate) fn start_time(pid: u32) -> Option<u64> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    system.process(pid).map(sysinfo::Process::start_time)
+}
+
+/// Whether `pid` names a live process.
+#[cfg(windows)]
+pub(crate) fn pid_exists(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    system.process(pid).is_some()
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn read_parent_pid_map() -> HashMap<u32, u32> {
     tracing::debug!("parent-pid snapshot unavailable: no process source on this platform");
     HashMap::new()
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn read_current_process_table() -> ProcessTable {
     tracing::debug!("process-table snapshot unavailable: no process source on this platform");
     ProcessTable::default()

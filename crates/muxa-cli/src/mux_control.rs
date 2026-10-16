@@ -40,12 +40,23 @@ pub fn supported(host: HostKind) -> bool {
     matches!(host, HostKind::Tmux | HostKind::Rmux)
 }
 
+/// The rmux server ambient commands go to: the one this shell's `$RMUX` (or
+/// the selected endpoint) names, else — on Windows, where rmux is the only
+/// tmux-compatible host — rmux's default server, as tmux's default server is
+/// everywhere else.
+pub fn ambient_rmux() -> Option<muxa::RmuxBackend> {
+    match rmux_endpoint() {
+        Some(socket) => Some(muxa::RmuxBackend::with_endpoint(socket)),
+        None => (cfg!(windows) && selected_endpoint().is_none()).then(muxa::RmuxBackend::new),
+    }
+}
+
 pub fn ambient_command() -> Command {
     if let Some(endpoint) = selected_endpoint() {
         return command(&endpoint).expect("lifecycle endpoint must support mux control");
     }
-    if let Some(socket) = rmux_endpoint() {
-        muxa::RmuxBackend::with_endpoint(socket).command(None)
+    if let Some(rmux) = ambient_rmux() {
+        rmux.command(None)
     } else {
         muxa::tmux::tmux_command_scoped()
     }
@@ -53,10 +64,8 @@ pub fn ambient_command() -> Command {
 
 pub fn ambient_command_with_args<S: AsRef<str>>(args: &[S]) -> anyhow::Result<Command> {
     let args: Vec<_> = args.iter().map(AsRef::as_ref).collect();
-    if let Some(socket) = rmux_endpoint() {
-        return muxa::RmuxBackend::with_endpoint(socket)
-            .control_command(&args)
-            .map_err(anyhow::Error::msg);
+    if let Some(rmux) = ambient_rmux() {
+        return rmux.control_command(&args).map_err(anyhow::Error::msg);
     }
     let mut command = ambient_command();
     command.args(args);
@@ -198,7 +207,7 @@ pub enum Control {
 impl Control {
     pub fn is_rmux(&self) -> bool {
         match self {
-            Self::Ambient => rmux_endpoint().is_some(),
+            Self::Ambient => ambient_rmux().is_some(),
             Self::Endpoint(endpoint) => endpoint.host == HostKind::Rmux,
         }
     }
@@ -210,10 +219,8 @@ impl Control {
                 if let Some(endpoint) = selected_endpoint() {
                     return capture(&endpoint, args).map_err(anyhow::Error::msg);
                 }
-                if let Some(socket) = rmux_endpoint() {
-                    return muxa::RmuxBackend::with_endpoint(socket)
-                        .capture_control(args)
-                        .map_err(anyhow::Error::msg);
+                if let Some(rmux) = ambient_rmux() {
+                    return rmux.capture_control(args).map_err(anyhow::Error::msg);
                 }
                 let output = ambient_command().args(args).output()?;
                 anyhow::ensure!(

@@ -4804,6 +4804,45 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
 /// Every failure is `None`: the caller's job is to name a pane, and losing
 /// the daemon means it names it without the arbiter's blessing rather than
 /// not at all.
+#[cfg(not(unix))]
+pub fn blocking_call(
+    socket_path: &Path,
+    req: &serde_json::Value,
+    deadline: Duration,
+) -> Option<serde_json::Value> {
+    // A named pipe opened as a file cannot bound a read, so the call runs on
+    // the async transport instead, on a thread of its own: the caller may
+    // itself be inside a runtime, which cannot be blocked on from within.
+    let socket_path = socket_path.to_path_buf();
+    let mut bytes = serde_json::to_vec(req).ok()?;
+    bytes.push(b'\n');
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        runtime.block_on(async move {
+            tokio::time::timeout(deadline, async {
+                let (read, mut write) = Stream::connect(&socket_path).await.ok()?.into_split();
+                write.write_all(&bytes).await.ok()?;
+                write.flush().await.ok()?;
+                let mut line = String::new();
+                let read = BufReader::new(read).read_line(&mut line).await.ok()?;
+                (read != 0)
+                    .then(|| serde_json::from_str(&line).ok())
+                    .flatten()
+            })
+            .await
+            .ok()
+            .flatten()
+        })
+    })
+    .join()
+    .ok()
+    .flatten()
+}
+
+#[cfg(unix)]
 pub fn blocking_call(
     socket_path: &Path,
     req: &serde_json::Value,
@@ -5047,7 +5086,7 @@ fn response_error(resp: &serde_json::Value) -> RuntimeError {
 /// keeps Linuxbrew and relocated installs working.
 fn installed_by_homebrew() -> bool {
     std::env::current_exe()
-        .and_then(std::fs::canonicalize)
+        .and_then(crate::paths::canonicalize)
         .is_ok_and(|exe| {
             exe.components()
                 .any(|component| component.as_os_str() == "Cellar")

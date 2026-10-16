@@ -51,13 +51,17 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
     String::from_utf8(output.stdout).ok()?.trim().parse().ok()
 }
 
-/// No ancestry source on non-Unix hosts.
-///
-/// Spelled out rather than left to `not(target_os = "linux")`, which would
-/// otherwise select the `ps` arm above and fail at runtime. Returning `None`
-/// degrades exactly like an unavailable `ps`: the caller falls back to the
-/// pane env var and gives up quietly. See `docs/WINDOWS.md`.
-#[cfg(not(unix))]
+/// Windows: one parent lookup through the shared process table. Hooks walk a
+/// whole snapshot instead (see `hook.rs`); this per-pid form serves the MCP
+/// ancestry recovery, which asks only a handful of times.
+#[cfg(windows)]
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    crate::process_snapshot::read_parent_pid_map()
+        .get(&pid)
+        .copied()
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn parent_pid(_pid: u32) -> Option<u32> {
     None
 }

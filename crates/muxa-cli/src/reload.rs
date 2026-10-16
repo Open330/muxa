@@ -1123,7 +1123,7 @@ fn rebuild_shape(
                 "send-keys",
                 "-t",
                 &target,
-                &format!("cd {}", shell_quote(&pane.path)),
+                &muxa::shell::Dialect::native().cd(&pane.path),
                 "Enter",
             ],
         ) {
@@ -1370,10 +1370,7 @@ fn relaunch_command(pane: &PaneShape) -> Option<String> {
                 Some(kind) => without_initial_prompt(argv, kind),
                 None => argv.to_vec(),
             };
-            argv.iter()
-                .map(|argument| shell_word(argument))
-                .collect::<Vec<_>>()
-                .join(" ")
+            muxa::shell::Dialect::native().command_line(&argv)
         }
         _ => pane.command.clone()?,
     };
@@ -1461,13 +1458,15 @@ fn without_initial_prompt(argv: &[String], kind: &str) -> Vec<String> {
         _ => return argv.to_vec(),
     };
     let program = |argument: &str| {
-        let name = argument.rsplit('/').next().unwrap_or(argument);
+        let name = muxa::shell::program_name(argument);
         matches!(name, "claude" | "codex") || name.ends_with("@claude") || name.ends_with("@codex")
     };
     let start = argv
         .iter()
         .rposition(|argument| argument == "--" || program(argument))
-        .map_or(0, |at| at + 1);
+        // Unrecognised, argv[0] is still the program — never a prompt, even
+        // when its path has a space in it (`C:\Program Files\…`).
+        .map_or(usize::from(!argv.is_empty()), |at| at + 1);
     let mut kept = argv[..start].to_vec();
     let mut takes_value = false;
     for argument in &argv[start..] {
@@ -1557,18 +1556,39 @@ fn wait_for_shell(endpoint: &BackendEndpoint, target: &str) -> bool {
 }
 
 /// `#{pane_current_command}`, or `None` when the server did not answer.
+///
+/// A Windows console has no foreground process group, so rmux there reports
+/// the pane's shell for as long as it lives, whatever runs inside it. A
+/// program the shell started is read from the process table instead.
 fn foreground(endpoint: &BackendEndpoint, target: &str) -> Option<String> {
-    mux_control::capture(
+    let reply = mux_control::capture(
         endpoint,
         &[
             "display-message",
             "-p",
             "-t",
             target,
-            "#{pane_current_command}",
+            "#{pane_current_command}\t#{pane_pid}",
         ],
     )
-    .ok()
+    .ok()?;
+    let reply = reply.trim_end_matches(['\r', '\n']);
+    let (command, _pane_pid) = reply.split_once('\t').unwrap_or((reply, ""));
+    #[cfg(windows)]
+    if is_shell(command.trim()) {
+        let pane_pid = _pane_pid;
+        if let Ok(pane_pid) = pane_pid.trim().parse::<u32>() {
+            if let Some(child) = process::ProcessTable::read().child_command(pane_pid) {
+                let program = child
+                    .argv
+                    .as_ref()
+                    .and_then(|argv| argv.first())
+                    .map_or(child.command.as_str(), String::as_str);
+                return Some(muxa::shell::program_name(program).to_owned());
+            }
+        }
+    }
+    Some(command.to_owned())
 }
 
 /// The pane's terminal device, for reading its mode.
@@ -1665,24 +1685,6 @@ fn wait_for_sessions_to_settle(endpoint: &BackendEndpoint) {
         } else if quiet_since.elapsed() >= QUIET && started.elapsed() >= HEAD_START {
             return;
         }
-    }
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
-}
-
-/// One argument as a shell reads it back: bare when it is plainly a word,
-/// quoted otherwise, so the relaunch hands the program the same argv.
-fn shell_word(value: &str) -> String {
-    let plain = !value.is_empty()
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_-./:=@%+,".contains(c));
-    if plain {
-        value.to_owned()
-    } else {
-        shell_quote(value)
     }
 }
 
@@ -1799,7 +1801,7 @@ fn endpoint_for(host: &str, socket: String) -> Result<BackendEndpoint> {
 /// rmux and cmux keep their sockets in their own directories, which is the
 /// only hint left once the shell is outside every multiplexer.
 fn host_from_socket_path(socket: &str) -> Option<HostKind> {
-    if socket.contains("/rmux-") {
+    if muxa::backend::rmux::is_endpoint(socket) {
         Some(HostKind::Rmux)
     } else if socket.contains("/cmux-") {
         Some(HostKind::Cmux)
@@ -1960,10 +1962,7 @@ fn split_cmdline(raw: &[u8]) -> Vec<String> {
 }
 
 fn is_shell(command: &str) -> bool {
-    matches!(
-        command.trim_start_matches('-'),
-        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh"
-    )
+    muxa::shell::is_shell_program(command)
 }
 
 #[cfg(test)]
@@ -2449,10 +2448,5 @@ mod tests {
         );
         assert_eq!(split_cmdline(b"sleep\x00777\x00"), vec!["sleep", "777"]);
         assert!(split_cmdline(b"").is_empty());
-    }
-
-    #[test]
-    fn shell_quoting_survives_an_apostrophe() {
-        assert_eq!(shell_quote("/tmp/june's dir"), r"'/tmp/june'\''s dir'");
     }
 }

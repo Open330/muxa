@@ -39,6 +39,11 @@ base64 = { workspace = true }
 sha2 = "0.10"
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
 
+[target.'cfg(windows)'.dependencies]
+# Windows has neither `/proc` nor `ps`; sysinfo reads the process table
+# (pid, parent, argv) through safe bindings, so `unsafe_code` stays forbidden.
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 tempfile = "3"

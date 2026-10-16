@@ -355,7 +355,7 @@ fn needs_socket_pin(socket: &Path, default_socket: &Path) -> bool {
 /// backup `apply` takes is the file as it stood a moment earlier, and the
 /// dry-run diff for each component shows only that component's change.
 pub(super) fn file_base(actions: &[Action], path: &Path) -> Result<(Option<String>, String)> {
-    let resolved = std::fs::canonicalize(path).ok();
+    let resolved = muxa::paths::canonicalize(path).ok();
     let pending = actions.iter().rev().find_map(|action| match action {
         Action::EditFile {
             path: planned,
@@ -363,7 +363,7 @@ pub(super) fn file_base(actions: &[Action], path: &Path) -> Result<(Option<Strin
             ..
         } if planned == path
             || resolved.as_ref().is_some_and(|target| {
-                std::fs::canonicalize(planned).ok().as_ref() == Some(target)
+                muxa::paths::canonicalize(planned).ok().as_ref() == Some(target)
             }) =>
         {
             Some(after.clone())

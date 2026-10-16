@@ -66,12 +66,13 @@ pub fn classify_command(cmd: &str) -> Option<AgentKind> {
 }
 
 /// The bare command basename: `/usr/local/bin/Cursor-Agent` → `Cursor-Agent`
-/// (case preserved). The single source of the basename rule — `classify_command`
-/// lowercases the result, and `screen`'s manifest matcher reuses this so the two
-/// agree on what "the command" is by construction.
+/// (case preserved), and `C:\…\claude.exe` → `claude`. The single source of
+/// the basename rule — `classify_command` lowercases the result, and
+/// `screen`'s manifest matcher reuses this so the two agree on what "the
+/// command" is by construction.
 #[must_use]
 pub fn command_name(cmd: &str) -> &str {
-    cmd.trim().rsplit('/').next().unwrap_or(cmd).trim()
+    crate::shell::program_name(cmd.trim()).trim()
 }
 
 /// Foreground commands that commonly host an agent CLI as a child process

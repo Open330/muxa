@@ -169,7 +169,7 @@ fn is_interactive_codex(process: &ProcessInfo) -> bool {
         return false;
     }
     let mut args = process.cmdline.split_whitespace();
-    if !args.any(|arg| arg.rsplit('/').next() == Some("codex")) {
+    if !args.any(|arg| crate::shell::program_name(arg) == "codex") {
         return false;
     }
     !matches!(
@@ -403,7 +403,7 @@ fn display_command(proc: &ProcessInfo, kind: WorkloadProcessKind) -> String {
 }
 
 fn command_name(s: &str) -> &str {
-    s.rsplit('/').next().unwrap_or(s).trim()
+    crate::shell::program_name(s.trim()).trim()
 }
 
 #[cfg(target_os = "linux")]

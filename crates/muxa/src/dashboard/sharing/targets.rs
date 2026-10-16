@@ -46,8 +46,8 @@ pub(super) async fn pin(
     };
     if requested_socket.is_some_and(|requested| {
         requested.contains('/')
-            && std::fs::canonicalize(requested).unwrap_or_else(|_| requested.into())
-                != std::fs::canonicalize(&socket).unwrap_or_else(|_| (&socket).into())
+            && crate::paths::canonicalize(requested).unwrap_or_else(|_| requested.into())
+                != crate::paths::canonicalize(&socket).unwrap_or_else(|_| (&socket).into())
     }) {
         return Err((
             StatusCode::CONFLICT,

@@ -219,9 +219,10 @@ fn apply_edit(
     // Keep dotfile symlinks intact: replace their resolved target atomically.
     // This also makes hook and integration edits sharing a config compose.
     let resolved = match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            Some(fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?)
-        }
+        Ok(meta) if meta.file_type().is_symlink() => Some(
+            muxa::paths::canonicalize(path)
+                .with_context(|| format!("resolving {}", path.display()))?,
+        ),
         _ => None,
     };
     let path = resolved.as_deref().unwrap_or(path);

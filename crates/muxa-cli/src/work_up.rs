@@ -778,7 +778,7 @@ fn resolve_cwd(
         }
         let plan = pipeline::worktree_plan(config, vars, &|value| expand_tilde(value));
         let created = ensure_worktree(&plan)?;
-        let cwd = std::fs::canonicalize(&plan.path)
+        let cwd = muxa::paths::canonicalize(&plan.path)
             .with_context(|| format!("resolve worktree {}", plan.path.display()))?;
         return Ok((cwd, Some(plan), created));
     }
@@ -792,7 +792,7 @@ fn resolve_cwd(
             None => std::env::current_dir().context("resolve current directory")?,
         },
     };
-    let cwd = std::fs::canonicalize(&source)
+    let cwd = muxa::paths::canonicalize(&source)
         .with_context(|| format!("resolve cwd {}", source.display()))?;
     if !cwd.is_dir() {
         bail!("cwd is not a directory: {}", cwd.display());
@@ -835,7 +835,7 @@ fn prepared_cwd(
         println!("preparing: {command}");
         run_prepare(&command)?;
     }
-    let cwd = std::fs::canonicalize(&target).with_context(|| {
+    let cwd = muxa::paths::canonicalize(&target).with_context(|| {
         format!(
             "prepare ran but {} does not exist; check the route's cwd",
             target.display()
@@ -845,9 +845,9 @@ fn prepared_cwd(
 }
 
 fn run_prepare(command: &str) -> Result<()> {
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
+    // `sh -c` on Unix, PowerShell on Windows: a route's `prepare` is written
+    // for the shell of the host it runs on.
+    let status = muxa::shell::script_command(command)
         .status()
         .with_context(|| format!("running prepare: {command}"))?;
     if !status.success() {
@@ -860,9 +860,10 @@ pub(crate) fn expand_tilde(value: &str) -> String {
     let Some(rest) = value.strip_prefix('~') else {
         return value.to_string();
     };
-    // Only a bare `~` or `~/` — `~user` is a shell feature muxa has no
-    // business guessing at.
-    if !rest.is_empty() && !rest.starts_with('/') {
+    // Only a bare `~` or `~/` (`~\` on Windows) — `~user` is a shell feature
+    // muxa has no business guessing at.
+    let separator = rest.starts_with('/') || (cfg!(windows) && rest.starts_with('\\'));
+    if !rest.is_empty() && !separator {
         return value.to_string();
     }
     dirs::home_dir().map_or_else(
@@ -1587,8 +1588,8 @@ fn state_label(state: AgentState) -> &'static str {
 }
 
 fn send_prompt(pane: &str, text: &str) -> Result<()> {
-    let sent = if muxa::backend::rmux::endpoint_from_env().is_some() {
-        muxa::PaneBackend::send_prompt_text_on(&muxa::RmuxBackend::new(), None, pane, text)
+    let sent = if let Some(rmux) = crate::mux_control::ambient_rmux() {
+        muxa::PaneBackend::send_prompt_text_on(&rmux, None, pane, text)
     } else {
         muxa::PaneBackend::send_prompt_text_on(&muxa::TmuxBackend::new(), None, pane, text)
     };

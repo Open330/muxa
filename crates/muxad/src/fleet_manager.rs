@@ -838,20 +838,11 @@ async fn local_send_prompt(
 }
 
 fn local_hostname() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "unknown".into())
+    muxa::fleet::local_hostname().unwrap_or_else(|| "unknown".into())
 }
 
 fn local_boot_id() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| format!("process-{}", std::process::id()))
+    muxa::fleet::local_boot_id().unwrap_or_else(|| format!("process-{}", std::process::id()))
 }
 
 struct HostCommand {

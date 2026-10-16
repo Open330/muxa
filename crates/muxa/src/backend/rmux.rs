@@ -368,6 +368,14 @@ pub fn endpoint_from_env() -> Option<String> {
     endpoint_from_value(&std::env::var("RMUX").ok()?)
 }
 
+/// Whether `socket` is an rmux server's control endpoint: a socket under an
+/// `rmux-<uid>` directory on Unix, or a `\\.\pipe\rmux-…` named pipe on
+/// Windows.
+#[must_use]
+pub fn is_endpoint(socket: &str) -> bool {
+    socket.contains("/rmux-") || socket.contains("\\rmux-")
+}
+
 fn namespace_pane_id(pane_id: &str) -> String {
     if pane_id.starts_with(PANE_ID_PREFIX) {
         pane_id.to_string()
@@ -469,12 +477,13 @@ fn rmux_binary() -> &'static Path {
 
 fn rmux_fallback_candidates(home: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::with_capacity(4);
+    let program = if cfg!(windows) { "rmux.exe" } else { "rmux" };
     if let Some(home) = home {
         // rmux's official installer defaults to ~/.local/bin. Cargo installs
         // into ~/.cargo/bin. Neither is guaranteed to be in systemd/launchd's
         // PATH, so both must be resolved explicitly for muxad.
-        candidates.push(home.join(".local/bin/rmux"));
-        candidates.push(home.join(".cargo/bin/rmux"));
+        candidates.push(home.join(".local").join("bin").join(program));
+        candidates.push(home.join(".cargo").join("bin").join(program));
     }
     candidates.push(PathBuf::from("/opt/homebrew/bin/rmux"));
     candidates.push(PathBuf::from("/usr/local/bin/rmux"));

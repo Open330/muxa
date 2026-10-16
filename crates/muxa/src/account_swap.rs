@@ -530,24 +530,8 @@ pub fn relaunch_line(
         words.extend(resume_free_args(line.tokens.get(1..).unwrap_or(&[]), kind));
     }
     words.extend(resume_suffix(kind, session_id));
-    Ok(words
-        .iter()
-        .map(|word| shell_word(word))
-        .collect::<Vec<_>>()
-        .join(" "))
-}
-
-/// One argument as a shell reads it back.
-fn shell_word(value: &str) -> String {
-    let plain = !value.is_empty()
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_-./:=@%+,".contains(c));
-    if plain {
-        value.to_owned()
-    } else {
-        format!("'{}'", value.replace('\'', r"'\''"))
-    }
+    // Typed into the pane's own shell: PowerShell under rmux on Windows.
+    Ok(crate::shell::Dialect::native().command_line(&words))
 }
 
 /// Whether `process` is the interactive `kind` agent (not Codex's
@@ -660,8 +644,13 @@ pub fn query_candidates(aas: &str, provider: &str) -> Result<Vec<Candidate>, Str
 /// A bare program name, looked up on `PATH` and then where `aas` is
 /// usually installed — a launchd-started daemon has a minimal `PATH`.
 fn resolve_aas(configured: &str) -> String {
-    if configured.contains('/') {
+    if configured.contains(['/', '\\']) {
         return configured.to_owned();
+    }
+    if cfg!(windows) {
+        // `aas.exe` / `aas.cmd`: PATH lookup has to try the extensions.
+        return crate::shell::find_program(configured)
+            .map_or_else(|| configured.to_owned(), |path| path.display().to_string());
     }
     let on_path = std::env::var_os("PATH")
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(configured).is_file()));
@@ -994,9 +983,26 @@ fn stop(launch: &PaneLaunch) -> Result<(), String> {
 }
 
 fn signal_pids(signal: &str, pids: &[u32]) {
-    let mut command = std::process::Command::new("kill");
-    command.arg(format!("-{signal}"));
-    command.args(pids.iter().map(u32::to_string));
+    // Windows has no signals: `taskkill` asks a process to close, and `/F`
+    // is the `KILL` that cannot be refused.
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = std::process::Command::new("taskkill");
+        if signal == "KILL" {
+            command.arg("/F");
+        }
+        for pid in pids {
+            command.args(["/PID", &pid.to_string()]);
+        }
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = std::process::Command::new("kill");
+        command.arg(format!("-{signal}"));
+        command.args(pids.iter().map(u32::to_string));
+        command
+    };
     let _ = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1009,6 +1015,13 @@ fn is_alive(pid: u32) -> bool {
 }
 
 /// The command line of `pid`, or `None` once it has exited.
+#[cfg(windows)]
+fn process_command(pid: u32) -> Option<String> {
+    crate::process_snapshot::process_argv(pid).map(|argv| argv.join(" "))
+}
+
+/// The command line of `pid`, or `None` once it has exited.
+#[cfg(not(windows))]
 fn process_command(pid: u32) -> Option<String> {
     let output = std::process::Command::new("ps")
         .args(["-o", "args=", "-p", &pid.to_string()])
@@ -1020,11 +1033,14 @@ fn process_command(pid: u32) -> Option<String> {
 }
 
 fn is_shell(command: &str) -> bool {
-    let program = command.split_whitespace().next().unwrap_or_default();
-    matches!(
-        crate::discovery::command_name(program).trim_start_matches('-'),
-        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh"
-    )
+    // A whole command line may lead with a Windows path that has spaces in
+    // it (`C:\Program Files\PowerShell\7\pwsh.exe -NoLogo`), so the full
+    // line is tried before its first word.
+    crate::shell::is_shell_program(command)
+        || crate::shell::is_shell_program(command.split_whitespace().next().unwrap_or_default())
+        || command
+            .split_once(".exe")
+            .is_some_and(|(program, _)| crate::shell::is_shell_program(program))
 }
 
 /// Wait for the resumed TUI to stop redrawing, so the follow-up lands in

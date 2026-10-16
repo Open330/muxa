@@ -469,17 +469,20 @@ pub async fn execute_work_command(
 
 /// Fleet-managed Work always has an attachable tmux surface, independent of
 /// the coordinator's terminal backend. Detaching does not stop the agents.
+/// On Windows that surface is rmux's default server, the only tmux-compatible
+/// host there.
 pub async fn execute_tmux_work(
     binary: &Path,
     args: &[String],
     socket: &Path,
 ) -> Result<WorkCommandOutput, WorkCommandError> {
+    let host = if cfg!(windows) { "rmux" } else { "tmux" };
     let mut command = tokio::process::Command::new(binary);
     command
         .args(args)
         .env("MUXA_SOCKET", socket)
-        .env("MUXA_HOST", "tmux")
-        .env("MUXA_HOSTS", "tmux")
+        .env("MUXA_HOST", host)
+        .env("MUXA_HOSTS", host)
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .env_remove("RMUX")

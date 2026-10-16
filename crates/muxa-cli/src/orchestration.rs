@@ -300,7 +300,7 @@ async fn refresh_worker(id: &str, client: &Client) -> Result<Record> {
             .resolve_paths(&dirs::home_dir().context("home missing")?)
             .map_err(anyhow::Error::msg)?;
         // work up records a canonical cwd (notably /private/tmp on macOS).
-        let run_path = std::fs::canonicalize(&paths.run).unwrap_or_else(|_| paths.run.clone());
+        let run_path = muxa::paths::canonicalize(&paths.run).unwrap_or_else(|_| paths.run.clone());
         let runs = client.pipeline_runs().await?;
         if let Some(run) = runs.iter().find(|r| {
             r.identity
@@ -357,8 +357,8 @@ async fn prepare_checkout(
     std::fs::create_dir_all(paths.repo.parent().context("repository parent missing")?)?;
     // Multiple Works can prepare the same registered clone concurrently. Lock
     // only Git preparation, not the agent lifetime; the OS releases it on crash.
-    let repo = std::fs::canonicalize(&paths.repo).unwrap_or_else(|_| paths.repo.clone());
-    let parent = std::fs::canonicalize(repo.parent().context("repository parent missing")?)?;
+    let repo = muxa::paths::canonicalize(&paths.repo).unwrap_or_else(|_| paths.repo.clone());
+    let parent = muxa::paths::canonicalize(repo.parent().context("repository parent missing")?)?;
     let lock_path = parent.join(format!(
         ".{}.muxa-prepare.lock",
         repo.file_name()

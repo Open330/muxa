@@ -77,6 +77,7 @@ pub mod scope_filter;
 pub mod screen;
 pub mod session;
 pub mod session_activity;
+pub mod shell;
 pub mod sinks;
 pub mod snapshot;
 pub mod state;

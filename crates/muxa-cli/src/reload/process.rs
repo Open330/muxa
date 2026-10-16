@@ -37,7 +37,10 @@ impl ProcessTable {
     fn command(process: &Process) -> Option<ChildCommand> {
         let argv = Self::argv(process);
         let command = argv.join(" ").trim().to_owned();
-        (!command.is_empty() && !is_shell(&command)).then_some(ChildCommand {
+        // The program alone decides: a Windows shell's argv0 is a full path
+        // with flags after it (`C:\…\pwsh.exe -NoLogo -NoExit`).
+        let shell = argv.first().is_some_and(|program| is_shell(program)) || is_shell(&command);
+        (!command.is_empty() && !shell).then_some(ChildCommand {
             command,
             argv: Some(argv),
         })
@@ -62,7 +65,26 @@ impl ProcessTable {
         if let Some(command) = self.system.process(pane).and_then(Self::command) {
             return Some(command);
         }
-        self.children(pane).into_iter().find_map(Self::command)
+        // A shell can have more than one child: a Windows shell keeps helpers
+        // such as `WindowsPackageManagerServer.exe` beside the agent. The
+        // agent is what a restore must bring back, so it wins over whichever
+        // child happens to have the lower pid.
+        let commands: Vec<ChildCommand> = self
+            .children(pane)
+            .into_iter()
+            .filter_map(Self::command)
+            .collect();
+        let agent = commands.iter().position(|command| {
+            command
+                .argv
+                .as_deref()
+                .is_some_and(|argv| super::agent::launched(argv).is_some())
+        });
+        let mut commands = commands.into_iter();
+        match agent {
+            Some(index) => commands.nth(index),
+            None => commands.next(),
+        }
     }
 
     /// When the `kind` agent under `pane_pid` started, in Unix seconds. The
@@ -80,7 +102,7 @@ impl ProcessTable {
                 Self::argv(process)
                     .iter()
                     .take(2)
-                    .any(|argument| argument.rsplit('/').next() == Some(program))
+                    .any(|argument| muxa::shell::program_name(argument) == program)
             }) {
                 return Some(agent.start_time());
             }

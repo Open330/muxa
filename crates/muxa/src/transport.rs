@@ -87,9 +87,9 @@ pub fn remove_endpoint(endpoint: &Path) {
 /// For callers with no runtime to await on. Returns
 /// [`io::ErrorKind::Unsupported`] on Windows: a named pipe opened as a file has
 /// no way to bound a read without an unsafe `SetCommTimeouts`, and a transport
-/// that can hang the caller forever is worse than one that declines. The single
-/// caller ([`crate::ipc::blocking_call`]) already degrades every failure to
-/// `None`.
+/// that can hang the caller forever is worse than one that declines. On
+/// Windows [`crate::ipc::blocking_call`] therefore runs the async transport
+/// under a timeout on a thread of its own instead of calling this.
 pub fn blocking_connect(endpoint: &Path, deadline: Duration) -> io::Result<BlockingStream> {
     imp::blocking_connect(endpoint, deadline)
 }

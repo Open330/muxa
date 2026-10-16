@@ -1788,7 +1788,7 @@ fn resolve_window_identity(target: Option<&str>) -> Result<WindowIdentity> {
         .ok_or_else(|| {
             anyhow::anyhow!("window target is required outside tmux; pass --window @N")
         })?;
-    if crate::mux_control::rmux_endpoint().is_some() {
+    if crate::mux_control::ambient_rmux().is_some() {
         // A grouped @window may be linked into a different session from the
         // caller. rmux 0.10's display-message can then report empty identity
         // fields; enumeration gives each link its explicit session context.
@@ -2042,7 +2042,7 @@ pub fn mark_agent(
         // and took the launch down with it.
         muxa::ipc::blocking_reserve_handle(
             socket,
-            &if crate::mux_control::rmux_endpoint().is_some() {
+            &if crate::mux_control::ambient_rmux().is_some() {
                 format!("rmux:{pane}")
             } else {
                 pane.to_string()

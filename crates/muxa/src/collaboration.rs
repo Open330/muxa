@@ -3322,6 +3322,7 @@ pub fn resolve_target(
     if scope == crate::config::CollaborationScope::Host {
         let pane = selector.strip_prefix("pane:").unwrap_or(selector);
         if pane.starts_with('%') {
+            let pane = in_sender_namespace(pane, sender);
             let matches: Vec<_> = participants
                 .iter()
                 .filter(|candidate| candidate.pane == pane && !candidate.same_endpoint(sender))
@@ -3371,7 +3372,7 @@ pub fn resolve_target(
             .collect();
         return select_target(matches, selector);
     }
-    let pane = selector.strip_prefix("pane:").unwrap_or(selector);
+    let pane = in_sender_namespace(selector.strip_prefix("pane:").unwrap_or(selector), sender);
     let matches: Vec<_> = peers
         .into_iter()
         .filter(|candidate| {
@@ -3381,6 +3382,18 @@ pub fn resolve_target(
         })
         .collect();
     select_target(matches, selector)
+}
+
+/// A bare `%N` read in the sender's pane namespace. rmux shows and exports
+/// `%N` while muxa stores its panes as `rmux:%N`, so a target typed the way
+/// rmux displays it would otherwise never match a peer on the same server.
+fn in_sender_namespace<'a>(pane: &'a str, sender: &Participant) -> std::borrow::Cow<'a, str> {
+    match sender.pane.find('%') {
+        Some(at) if at > 0 && pane.starts_with('%') => {
+            std::borrow::Cow::Owned(format!("{}{pane}", &sender.pane[..at]))
+        }
+        _ => std::borrow::Cow::Borrowed(pane),
+    }
 }
 
 fn select_target(
@@ -3419,6 +3432,8 @@ pub fn resolve_pending_pane_target(
     if !pane_id.starts_with('%') && crate::backend::pane_id_host_kind(pane_id).is_none() {
         return Err(CollaborationError::UnknownTarget(selector.to_string()));
     }
+    let pane_id = in_sender_namespace(pane_id, sender);
+    let pane_id = pane_id.as_ref();
     if pane_id == sender.pane {
         return Err(CollaborationError::UnknownTarget(selector.to_string()));
     }
@@ -6093,6 +6108,25 @@ mod tests {
                 .pane,
             "%2"
         );
+    }
+
+    /// rmux displays `%N` but muxa stores `rmux:%N`; the id as displayed must
+    /// still name the peer on the sender's own server.
+    #[test]
+    fn a_bare_pane_id_resolves_in_the_rmux_senders_namespace() {
+        let sender = participant("rmux:%1", "sender");
+        let peers = vec![sender.clone(), participant("rmux:%2", "two")];
+        for selector in ["%2", "pane:%2", "rmux:%2"] {
+            for scope in [CollaborationScope::Window, CollaborationScope::Host] {
+                assert_eq!(
+                    resolve_target(&sender, selector, &peers, scope)
+                        .unwrap()
+                        .pane,
+                    "rmux:%2",
+                    "{selector} under {scope:?}"
+                );
+            }
+        }
     }
 
     #[test]

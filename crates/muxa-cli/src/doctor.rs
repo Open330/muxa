@@ -41,11 +41,6 @@ const LAUNCHD_LABEL: &str = "dev.open330.muxad";
 /// systemd unit name installed by the `MuxadSystemd` component.
 const SYSTEMD_UNIT: &str = "muxad";
 
-/// Path to muxad's stderr log on macOS+Linux (the launchd plist and the
-/// systemd unit both redirect there). Reading is best-effort — a
-/// missing file just means the daemon hasn't logged anything to disk.
-const MUXAD_ERR_LOG: &str = "/tmp/muxad.err";
-
 /// Run the diagnostic and print results to stdout. Returns `Ok(())`
 /// regardless of how many checks fail — `muxa doctor` is informational,
 /// not a gate. The exit code stays 0 so users can run it from scripts
@@ -77,7 +72,10 @@ pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Resul
     add(&mut report, "muxad", None, check_unit_file());
     // Recent muxad errors. These are warnings, not failures: a stale ERROR
     // line from yesterday shouldn't make the whole run look red.
-    let warnings = recent_muxad_errors(MUXAD_ERR_LOG, 20, 3);
+    // muxad's stderr log: where the launchd plist and the systemd unit
+    // redirect it, or the combined log a Windows start writes. Reading is
+    // best-effort — a missing file just means nothing was logged to disk.
+    let warnings = recent_muxad_errors(&crate::logs::default_err(), 20, 3);
     if warnings.is_empty() {
         add(
             &mut report,
@@ -921,9 +919,17 @@ fn check_tmux_watch_binding(env: &TmuxEnvironment) -> CheckResult {
     // Scoped like the other tmux checks. Unscoped, it asked the default
     // socket, and rmux, unlike tmux, starts a server to answer: every
     // isolated doctor run (the test suite included) left one behind.
-    let out = muxa::tmux::tmux_command_scoped()
-        .args(["list-keys", "-T", "prefix"])
-        .output();
+    // On Windows the host is rmux, asked only through the server this shell
+    // is in for the same reason.
+    let mut command = if cfg!(windows) {
+        if muxa::backend::rmux::endpoint_from_env().is_none() {
+            return CheckResult::Ok("rmux: run from an rmux pane to check its bindings".into());
+        }
+        muxa::RmuxBackend::new().command(None)
+    } else {
+        muxa::tmux::tmux_command_scoped()
+    };
+    let out = command.args(["list-keys", "-T", "prefix"]).output();
     let text = match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
         // No server running yet is not a misconfiguration — there is
@@ -1161,7 +1167,7 @@ fn line_anchored_find(haystack: &str, needle: &str) -> Option<usize> {
 /// lines that mention "ERROR" or "panic". Best-effort: a missing file
 /// or read error returns an empty vec, which the caller renders as
 /// "log clean".
-fn recent_muxad_errors(path: &str, tail_lines: usize, max_warnings: usize) -> Vec<String> {
+fn recent_muxad_errors(path: &Path, tail_lines: usize, max_warnings: usize) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };

@@ -68,7 +68,7 @@ use muxa::{
 use owo_colors::Style;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 use theme::{CliTheme, TableTone, ThemeArg};
 use time::OffsetDateTime;
@@ -3815,12 +3815,11 @@ fn alias_target(ev: &muxa::event::AgentEvent) -> Option<(String, &'static str)> 
     Some((pane, watch::agent_kind_short(id.kind)))
 }
 
-/// Spawn `cmd` via `/bin/sh -c`, feed it `stdin_bytes`, stream its stdout to
-/// our stdout, and return its exit code (128 + signal if killed by signal).
+/// Spawn `cmd` through the local shell (`/bin/sh -c`, `PowerShell` on
+/// Windows), feed it `stdin_bytes`, stream its stdout to our stdout, and
+/// return its exit code (128 + signal if killed by signal).
 fn run_forward(cmd: &str, stdin_bytes: &[u8]) -> Result<i32> {
-    let mut child = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(cmd)
+    let mut child = muxa::shell::script_command(cmd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // stderr is inherited so the forwarded tool can report errors.

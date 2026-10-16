@@ -53,13 +53,14 @@ impl AgentProgram {
         }
     }
 
-    fn launch_command(self, options: &[String], prompt: Option<&str>) -> String {
+    fn launch_argv(self, options: &[String], prompt: Option<&str>) -> Vec<String> {
         let launch = self.native_launch(options, prompt);
-        std::iter::once(launch.command)
-            .chain(launch.args)
-            .map(|argument| shell_quote_argument(&argument))
-            .collect::<Vec<_>>()
-            .join(" ")
+        std::iter::once(launch.command).chain(launch.args).collect()
+    }
+
+    #[cfg(test)]
+    fn launch_command(self, options: &[String], prompt: Option<&str>) -> String {
+        muxa::shell::Dialect::Posix.command_line(&self.launch_argv(options, prompt))
     }
 
     fn native_launch(self, options: &[String], prompt: Option<&str>) -> NativeLaunch {
@@ -110,7 +111,8 @@ struct NativeLaunch {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchHost {
-    /// Use tmux when this shell is in a real tmux pane; otherwise use muxa's PTY.
+    /// Use the multiplexer when this shell is in a real tmux or rmux pane;
+    /// otherwise use muxa's PTY.
     #[default]
     Auto,
     /// Spawn a muxa-owned PTY session through muxad.
@@ -122,7 +124,9 @@ pub enum LaunchHost {
 impl LaunchHost {
     fn resolve(self, detected: Option<HostKind>) -> Self {
         match self {
-            Self::Auto if detected == Some(HostKind::Tmux) => Self::Tmux,
+            // rmux speaks tmux's commands, so the same launcher places the
+            // agent in an rmux pane — the only multiplexer rmux on Windows has.
+            Self::Auto if matches!(detected, Some(HostKind::Tmux | HostKind::Rmux)) => Self::Tmux,
             Self::Auto => Self::Native,
             explicit => explicit,
         }
@@ -198,16 +202,16 @@ impl SplitDirection {
 /// `#{pane_width}x#{pane_height}` for a target pane, or `None` when tmux
 /// cannot answer (no server, unknown target).
 fn pane_shape(target: &str) -> Option<(u32, u32)> {
-    let output = std::process::Command::new("tmux")
-        .args([
-            "display",
-            "-p",
-            "-t",
-            target,
-            "#{pane_width}x#{pane_height}",
-        ])
-        .output()
-        .ok()?;
+    let output = crate::mux_control::ambient_command_with_args(&[
+        "display",
+        "-p",
+        "-t",
+        target,
+        "#{pane_width}x#{pane_height}",
+    ])
+    .ok()?
+    .output()
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -221,7 +225,8 @@ pub struct StartArgs {
     /// Known agent CLI to launch. codex expands the local cx profile (codex --yolo).
     #[arg(long, value_enum)]
     pub agent: AgentProgram,
-    /// Execution host. Auto uses tmux inside tmux and a muxa-owned PTY elsewhere.
+    /// Execution host. Auto uses the multiplexer inside tmux or rmux and a
+    /// muxa-owned PTY elsewhere.
     #[arg(long, value_enum, default_value = "auto")]
     pub host: LaunchHost,
     /// Create a split pane (default), window, or independent session.
@@ -500,7 +505,7 @@ async fn run_native(
     }
 
     let cwd_source = args.cwd.unwrap_or(std::env::current_dir()?);
-    let cwd = std::fs::canonicalize(&cwd_source)
+    let cwd = muxa::paths::canonicalize(&cwd_source)
         .with_context(|| format!("resolve cwd {}", cwd_source.display()))?;
     if !cwd.is_dir() {
         bail!("cwd is not a directory: {}", cwd.display());
@@ -657,11 +662,10 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         .as_deref()
         .filter(|prompt| !prompt.trim().is_empty());
     // Replace tmux's command shell, so the pane's foreground command and PID
-    // describe the CLI even before it emits a hook.
-    let command = format!(
-        "exec {}",
-        request.agent.launch_command(&request.options, prompt)
-    );
+    // describe the CLI even before it emits a hook. rmux on Windows hands the
+    // line to PowerShell, which has no `exec`; there the program just runs.
+    let command = muxa::shell::Dialect::native()
+        .exec_line(&request.agent.launch_argv(&request.options, prompt));
     let args = tmux_args(&request, &cwd, &command)?;
     let output = crate::mux_control::ambient_command_with_args(&args)?
         .output()
@@ -784,8 +788,8 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
 
 fn register_launched_agent(request: &StartRequest, pane: &str) {
     use muxa::backend::PaneBackend;
-    let observed = if let Some(endpoint) = crate::mux_control::rmux_endpoint() {
-        muxa::RmuxBackend::with_endpoint(endpoint).resolve_pane(&format!("rmux:{pane}"))
+    let observed = if let Some(rmux) = crate::mux_control::ambient_rmux() {
+        rmux.resolve_pane(&format!("rmux:{pane}"))
     } else {
         muxa::TmuxBackend::new().resolve_pane(pane)
     };
@@ -845,7 +849,7 @@ fn prepare_launch(request: &mut StartRequest) -> Result<PreparedLaunch> {
         .clone()
         .map_or_else(std::env::current_dir, Ok)
         .context("resolve current directory")?;
-    let initial_cwd = std::fs::canonicalize(&initial_cwd_source)
+    let initial_cwd = muxa::paths::canonicalize(&initial_cwd_source)
         .with_context(|| format!("resolve cwd {}", initial_cwd_source.display()))?;
     if !initial_cwd.is_dir() {
         bail!("cwd is not a directory: {}", initial_cwd.display());
@@ -871,10 +875,10 @@ fn prepare_launch(request: &mut StartRequest) -> Result<PreparedLaunch> {
     let cwd_source = existing_work
         .as_ref()
         .map_or(initial_cwd.as_path(), |existing| existing.cwd.as_path());
-    let cwd = std::fs::canonicalize(cwd_source)
+    let cwd = muxa::paths::canonicalize(cwd_source)
         .with_context(|| format!("resolve cwd {}", cwd_source.display()))?;
     if let (Some(existing), Some(requested)) = (&existing_work, requested_cwd) {
-        let requested = std::fs::canonicalize(&requested)
+        let requested = muxa::paths::canonicalize(&requested)
             .with_context(|| format!("resolve cwd {}", requested.display()))?;
         if requested != cwd {
             bail!(
@@ -1123,18 +1127,6 @@ fn tmux_args(request: &StartRequest, cwd: &Path, command: &str) -> Result<Vec<St
     Ok(args)
 }
 
-fn shell_quote_argument(text: &str) -> String {
-    if !text.is_empty()
-        && text
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || "_-+./:=,@%".contains(ch))
-    {
-        text.to_string()
-    } else {
-        format!("'{}'", text.replace('\'', "'\\''"))
-    }
-}
-
 fn session_base_name(cwd: &str) -> String {
     Path::new(cwd)
         .file_name()
@@ -1367,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_launch_uses_tmux_only_for_a_tmux_shell() {
+    fn auto_launch_uses_the_multiplexer_only_for_a_tmux_or_rmux_shell() {
         assert_eq!(
             LaunchHost::Auto.resolve(Some(HostKind::Tmux)),
             LaunchHost::Tmux
@@ -1375,6 +1367,10 @@ mod tests {
         assert_eq!(LaunchHost::Auto.resolve(None), LaunchHost::Native);
         assert_eq!(
             LaunchHost::Auto.resolve(Some(HostKind::Rmux)),
+            LaunchHost::Tmux
+        );
+        assert_eq!(
+            LaunchHost::Auto.resolve(Some(HostKind::Cmux)),
             LaunchHost::Native
         );
         assert_eq!(

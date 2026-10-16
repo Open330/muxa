@@ -154,7 +154,9 @@ impl Component {
             Component::OpencodeHooks => "installs ~/.config/opencode/plugins/muxa.ts",
             Component::MuxadSystemd => "Linux only; skipped on macOS / launchd hosts",
             Component::MuxadLaunchd => "macOS only; skipped on Linux / systemd hosts",
-            Component::MuxadShellrc => "appends to ~/.zshrc or ~/.bashrc; cross-platform",
+            Component::MuxadShellrc => {
+                "appends to ~/.zshrc, ~/.bashrc, or the PowerShell profile; cross-platform"
+            }
             Component::Dashboard => "loopback :7878 by default; token in config",
             Component::Collaboration => "lets a peer's request type a wake prompt into your pane",
             Component::AgentInstructions => "adds a managed block to active AGENTS.md / CLAUDE.md",
