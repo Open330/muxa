@@ -1730,15 +1730,36 @@ async fn resolve_endpoint(client: &Client, socket: Option<&str>) -> Result<Backe
             let (socket, host) = sockets.into_iter().next().expect("one entry");
             endpoint_for(&host, socket)
         }
-        0 => bail!(
-            "muxad tracks no tmux/rmux agents, so there is nothing to work out the \
-             target server from; pass --mux-socket"
-        ),
+        // No tracked agents — common before any agent hook is installed —
+        // leaves the server this shell runs in as the only honest guess.
+        0 => match shell_server(|name| std::env::var(name).ok()) {
+            Some((socket, host)) => endpoint_for(&host.to_string(), socket),
+            None => bail!(
+                "muxad tracks no tmux/rmux agents and this shell is not inside one, \
+                 so there is nothing to work out the target server from; pass --mux-socket"
+            ),
+        },
         _ => bail!(
             "agents span several servers ({}); pass --mux-socket to name one",
             sockets.keys().cloned().collect::<Vec<_>>().join(", ")
         ),
     }
+}
+
+/// The server the calling shell is inside, read from the variable its host
+/// exports (`$RMUX` for rmux, `$TMUX` for tmux): `<socket>,<pid>,<session>`.
+/// `read` stands in for `std::env::var` so tests need not mutate the
+/// process environment.
+fn shell_server(read: impl Fn(&str) -> Option<String>) -> Option<(String, HostKind)> {
+    let host = muxa::backend::detect_host_env_with(&read)?;
+    let var = match host {
+        HostKind::Rmux => "RMUX",
+        HostKind::Tmux => "TMUX",
+        _ => return None,
+    };
+    let raw = read(var)?;
+    let socket = raw.split(',').next().filter(|path| !path.is_empty())?;
+    Some((socket.to_owned(), host))
 }
 
 /// The control sockets muxa's tracked agents live on, each with its host.
@@ -1960,6 +1981,32 @@ mod tests {
             argv: None,
             agent: None,
         }
+    }
+
+    #[test]
+    fn the_shells_own_server_is_the_fallback_target() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        // rmux exports both variables; its own wins.
+        assert_eq!(
+            shell_server(env(&[
+                ("RMUX", r"\\.\pipe\rmux-a,23380,3"),
+                ("TMUX", r"\\.\pipe\rmux-a,23380,3"),
+            ])),
+            Some((r"\\.\pipe\rmux-a".to_owned(), HostKind::Rmux))
+        );
+        assert_eq!(
+            shell_server(env(&[("TMUX", "/tmp/tmux-1000/default,42,0")])),
+            Some(("/tmp/tmux-1000/default".to_owned(), HostKind::Tmux))
+        );
+        assert_eq!(shell_server(env(&[])), None);
+        assert_eq!(shell_server(env(&[("ZELLIJ", "0")])), None);
     }
 
     #[test]

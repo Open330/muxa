@@ -26,6 +26,7 @@ mod message_skill;
 mod mux_control;
 mod onboarding;
 mod orchestration;
+mod owner_only;
 mod peek;
 mod relay;
 mod reload;
@@ -2667,6 +2668,27 @@ async fn cmd_detach(client: &Client, session: &str) -> Result<()> {
     Ok(())
 }
 
+// `Option` because the Windows arm can fail to find its own process.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn parent_pid() -> Option<u32> {
+    Some(std::os::unix::process::parent_id())
+}
+
+/// Windows has no `getppid`; the process table records the parent instead.
+#[cfg(not(unix))]
+fn parent_pid() -> Option<u32> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let own = Pid::from_u32(std::process::id());
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[own]),
+        false,
+        ProcessRefreshKind::nothing(),
+    );
+    system.process(own)?.parent().map(Pid::as_u32)
+}
+
 async fn cmd_register(
     client: &Client,
     name: String,
@@ -2676,7 +2698,7 @@ async fn cmd_register(
 ) -> Result<()> {
     // Default to the calling shell so `muxa proc register --name X` from a pane
     // tracks that shell without the user hunting for a pid.
-    let pid = pid.or_else(|| Some(std::os::unix::process::parent_id()));
+    let pid = pid.or_else(parent_pid);
     client
         .register(&name, pid, cwd.as_deref(), pane.as_deref(), None)
         .await?;

@@ -1003,7 +1003,7 @@ fn popup_binding_is_full_client(binding: &str) -> bool {
 /// `~/.tmux.conf`. We bundle the result so the user sees one tmux
 /// line in the doctor output rather than two redundant ones.
 fn check_tmux_blocks() -> CheckResult {
-    let Some(path) = dirs::home_dir().map(|h| h.join(".tmux.conf")) else {
+    let Some(path) = crate::init::files::tmux::default_path() else {
         return CheckResult::Warn("tmux: could not resolve $HOME".into());
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -1124,7 +1124,7 @@ fn parse_muxa_socket_env(stdout: &str) -> Option<String> {
 /// stale. Mirrors the connect probe in `muxa::ipc` — a local unix connect
 /// resolves immediately, so no timeout is needed.
 fn socket_is_reachable(path: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(path).is_ok()
+    muxa::transport::endpoint_is_live(path)
 }
 
 /// Pure detector for a `# >>> muxa managed (<id>) >>>` ... `# <<< muxa

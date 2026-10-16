@@ -39,6 +39,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 
@@ -537,7 +538,12 @@ fn restart_generation() -> u64 {
 /// Replace this process with the binary now resolved by its original argv[0].
 /// `exec` preserves pid, argv, environment, working directory and the service
 /// manager's ownership while loading the newly installed inode.
+///
+/// Windows has no `exec`: the replacement is spawned as a new process and this
+/// one exits once the spawn succeeds. The IPC endpoint was already released by
+/// the drain above, so the successor can bind it; the pid changes.
 fn reexec_self() -> std::io::Error {
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
 
     let mut argv = std::env::args_os();
@@ -546,10 +552,21 @@ fn reexec_self() -> std::io::Error {
     };
     let next = restart_generation().saturating_add(1);
     tracing::info!(?program, generation = next, "restarting: re-executing self");
-    std::process::Command::new(&program)
+    let mut command = std::process::Command::new(&program);
+    command
         .args(argv)
-        .env(RESTART_GENERATION_ENV, next.to_string())
-        .exec()
+        .env(RESTART_GENERATION_ENV, next.to_string());
+    #[cfg(unix)]
+    {
+        command.exec()
+    }
+    #[cfg(not(unix))]
+    {
+        match command.spawn() {
+            Ok(_) => std::process::exit(0),
+            Err(error) => error,
+        }
+    }
 }
 
 async fn await_shutdown_task(name: &'static str, handle: Option<tokio::task::JoinHandle<()>>) {
@@ -2244,11 +2261,29 @@ fn spawn_gc_task(
 
 fn install_shutdown_signal_handler(restart: Arc<RestartController>) {
     tokio::spawn(async move {
-        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-        tokio::select! {
-            _ = term.recv() => tracing::info!("SIGTERM received"),
-            _ = int.recv()  => tracing::info!("SIGINT received"),
+        #[cfg(unix)]
+        {
+            let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+            tokio::select! {
+                _ = term.recv() => tracing::info!("SIGTERM received"),
+                _ = int.recv()  => tracing::info!("SIGINT received"),
+            }
+        }
+        // Windows has no SIGTERM. Ctrl+C, closing the console, and the
+        // shutdown a service stop or logoff sends all arrive as console
+        // control events.
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows;
+            let mut ctrl_c = windows::ctrl_c().expect("install Ctrl+C handler");
+            let mut close = windows::ctrl_close().expect("install console-close handler");
+            let mut shutdown = windows::ctrl_shutdown().expect("install shutdown handler");
+            tokio::select! {
+                _ = ctrl_c.recv() => tracing::info!("Ctrl+C received"),
+                _ = close.recv() => tracing::info!("console close received"),
+                _ = shutdown.recv() => tracing::info!("system shutdown received"),
+            }
         }
         // Monotonic stop state: once a signal wins, an already-open IPC
         // handler cannot re-arm a restart during the drain.

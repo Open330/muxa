@@ -593,6 +593,7 @@ mod tests {
 
     /// The local path runs the given binary with the argv, the daemon socket,
     /// and only the allowlisted environment.
+    #[cfg(unix)] // Runs a `#!/bin/sh` fixture.
     #[tokio::test]
     async fn local_execution_runs_the_binary_with_pinned_socket_and_env() {
         let dir = tempfile::tempdir().unwrap();

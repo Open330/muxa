@@ -1483,6 +1483,7 @@ async fn enrolled_operators_are_bounded() {
         .contains("Max-Age=0"));
 }
 
+#[cfg(unix)] // Asserts 0600/0700 modes.
 #[tokio::test]
 async fn enrollments_are_durable_private_and_exclusive() {
     use std::os::unix::fs::PermissionsExt;

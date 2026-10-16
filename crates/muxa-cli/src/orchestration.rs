@@ -1,6 +1,6 @@
 //! CLI adapter for durable, single-coordinator Fleet dispatch.
+use crate::owner_only::OwnerOnly;
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -85,7 +85,7 @@ fn save(path: &Path, record: &Record) -> Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .owner_only(0o600)
         .open(&temp)?;
     f.write_all(&serde_json::to_vec(record)?)?;
     f.sync_all()?;
@@ -98,7 +98,7 @@ fn reserve(path: &Path, record: &Record) -> Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .owner_only(0o600)
         .open(path)
         .context("dispatch already reserved; read dispatch-status instead of launching again")?;
     f.write_all(&serde_json::to_vec(record)?)?;
@@ -369,7 +369,7 @@ async fn prepare_checkout(
         .create(true)
         .truncate(false)
         .write(true)
-        .mode(0o600)
+        .owner_only(0o600)
         .open(lock_path)?;
     let _lock = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
         lock.lock()?;
@@ -437,7 +437,7 @@ async fn prepare_checkout(
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .owner_only(0o600)
         .open(paths.artifacts.join("dispatch.json"))?;
     file.write_all(&serde_json::to_vec_pretty(
         &json!({"plan":plan,"paths":paths}),
@@ -552,6 +552,7 @@ pub async fn options(cfg: &Config, client: &Client, at_coordinator: bool) -> Res
 mod tests {
     use super::*;
     use muxa::orchestration::ExecutionPaths;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     fn record() -> Record {
         Record {

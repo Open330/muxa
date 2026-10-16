@@ -1,0 +1,6 @@
+# Windows gives the main thread a 1 MiB stack; Linux and macOS give 8 MiB.
+# muxa's clap tree and async entry points fit in 8 MiB with room to spare, but
+# an unoptimized build overflows 1 MiB before `muxa init --help` prints. Match
+# the Unix default rather than chase individual frames.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/STACK:8388608"]

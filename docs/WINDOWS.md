@@ -1,13 +1,55 @@
 # Windows
 
-Status: **not a supported host. Use WSL2.** muxa observes and drives agents
-running in multiplexer panes, and no Windows-native multiplexer exposes the
-control surface [`PaneBackend`] requires. Under WSL2 muxa is the complete
-product, unchanged.
+Status: **native, through [rmux](https://rmux.io).** rmux runs natively on
+Windows and speaks tmux's command surface over a named pipe, so it is the
+pane host muxa observes and drives there. `muxa` and `muxad` build for
+`x86_64-pc-windows-msvc` and install with `cargo install` like anywhere else.
+WSL2 remains the complete, tested product if you would rather run tmux.
 
 This document records what is true today, why, and what the platform gates in
-the tree are protecting — so that a future port starts from measurements
-rather than from a fresh survey.
+the tree are protecting.
+
+## Native install (rmux)
+
+```powershell
+winget install Helvesec.RMUX          # or any rmux >= 0.10 on PATH
+cargo install --path crates/muxad --locked
+cargo install --path crates/muxa-cli --locked
+muxa init --component tmux-popup,tmux-peek
+```
+
+`muxa init` writes its bindings to `~/.rmux.conf` on Windows — rmux reads that
+file (then `%APPDATA%\rmux\rmux.conf`) and never `~/.tmux.conf` — and accepts
+rmux in place of tmux in its pre-flight. Run it from inside an rmux pane so the
+live reload reaches the right server.
+
+There is no service manager integration yet, so start the daemon yourself
+(`Start-Process muxad -WindowStyle Hidden`, or a Task Scheduler logon task).
+
+Verified on Windows 11 with rmux 0.10.0: `muxad` serves the named pipe,
+`muxa doctor` reaches it and resolves the rmux server, and `muxa watch` renders
+every rmux session, window, and pane.
+
+### Known gaps
+
+- **No daemon autostart.** `muxa doctor` reports the service checks as
+  unsupported on Windows rather than failing them.
+- **Agent skill install** (`muxa init --component agent-skills`) needs a
+  symlink and bails on Windows.
+- **Codex MCP live reload** needs Codex's Unix control socket and reports
+  itself unavailable.
+- **No process source** (reason 3 below): hook ancestry recovery and
+  process-based agent attribution return empty, so agents are found through
+  their hooks and screen detection only.
+- **Dashboard pane sharing** pins a share to a tmux socket path and has not
+  been mapped onto rmux's named pipe; its tests are Unix-only.
+- **`muxa onboard`'s live tour** builds a POSIX-shell sandbox and is not
+  expected to work.
+- Re-exec on upgrade spawns a successor and exits instead of `exec`ing in
+  place, so the daemon's pid changes.
+- **Upgrading needs the daemon stopped.** Windows locks a running
+  executable, so `cargo install` cannot replace `muxad.exe` while it runs
+  (`Access is denied`). Stop it, install, start it again.
 
 ## Use WSL2
 
@@ -23,13 +65,17 @@ Windows Terminal attaches to the WSL distribution like any other shell, so
 Clone into the WSL filesystem (`~/`) rather than building from `/mnt/<drive>`.
 The 9p mount that backs `/mnt` makes cargo builds several times slower.
 
-## Why not native
+## What stood in the way
 
-Four independent reasons, in increasing order of how hard they are to remove.
-The second has since been removed — it is kept here, marked, because what it
+Four independent reasons. The first two are resolved and the fourth is
+resolved as far as compiling goes; each is kept here, marked, because what it
 cost and what it could not recover are the useful part of the record.
 
-### 1. No host to observe
+### 1. No host to observe — resolved by rmux
+
+*Historical.* Native rmux implements the tmux command surface on Windows, and
+muxa's rmux backend drives it through that CLI, so the requirements below are
+met. The reasoning is kept because it is still true of Windows Terminal.
 
 [`PaneBackend`] requires `list_panes`, `resolve_pane`, `capture_pane`,
 `pane_pid_map`, `current_pane`, `focus_pane`, and `send_text`. Windows Terminal
@@ -105,54 +151,43 @@ source (Toolhelp32, WTS) is only worth doing once those PIDs mean something.
 Note that `unsafe_code = "forbid"` is set workspace-wide, so a future process
 source cannot call the Win32 APIs directly — it needs a safe wrapper crate.
 
-### 4. Unix assumptions throughout the CLI
+### 4. Unix assumptions throughout the CLI — compiles, partly gated
 
-`muxa-cli` depends on `nix` and `signal-hook`, neither of which builds for a
-Windows target, so the CLI fails at dependency resolution rather than at
-compile time. Service installation shells out to `launchctl` and `systemctl`,
-and roughly twenty other call sites invoke `sh`, `bash`, `id`, `kill`, `ps`,
-or `nohup`.
+`muxa-cli` keeps `nix` and `signal-hook` for Unix; on Windows the interactive
+attach wait is a plain `Child::wait` (a console close reaches the child
+directly), owner-only creation modes go through `owner_only::OwnerOnly` (a
+no-op under the per-user profile ACL), and daemon liveness probes use
+`muxa::transport::endpoint_is_live` so they understand named pipes. `muxad`
+installs Ctrl+C / console-close / shutdown handlers in place of SIGTERM and
+SIGINT, and re-exec spawns a successor rather than calling `exec`.
+
+Service installation still shells out to `launchctl` and `systemctl` only, and
+the call sites that invoke `sh`, `bash`, `id`, `kill`, `ps`, or `nohup` are
+reached only from features listed under *Known gaps*.
+
+Windows also gives the main thread a 1 MiB stack. An unoptimized build of the
+CLI overflows it before `muxa init --help` prints, so `.cargo/config.toml`
+links MSVC targets with the 8 MiB stack Unix hosts default to.
 
 ## What builds and runs today
 
-The `muxa` library crate compiles clean for `x86_64-pc-windows-msvc`, warnings
-included, and its test suite runs:
+`muxa`, `muxad`, and `muxa-cli` build for `x86_64-pc-windows-msvc`. Tests that
+exercise Unix-only behaviour — `#!/bin/sh` fixtures through
+`test_support::write_executable`, `0600`/`0700` mode assertions, and socket
+send-buffer backpressure — are gated `#[cfg(unix)]`.
 
-```
-cargo check -p muxa --all-targets     # clean
-cargo test  -p muxa --lib             # 995 passed, 8 failed
-```
+The remaining Windows test failures are pre-existing Unix assumptions in
+fixtures — 20 of 1,217 in `cargo test -p muxa --lib` (paths like `/tmp/...` that
+are not absolute without a drive prefix,
+Unix process liveness), left alone because teaching fixtures a second path
+grammar is separate work. CI runs on Linux and macOS only.
 
-The whole dependency tree builds, including `rusqlite` (bundled SQLite, so a C
-toolchain is exercised), `portable-pty` (ConPTY), `axum`, `reqwest`, `tokio`,
-and `notify-rust` (which pulls `tauri-winrt-notification` for toasts). The
-dependencies were never the obstacle.
+## What is left
 
-The eight failures are all pre-existing Unix assumptions in test fixtures, none
-in transport or IPC:
-
-| Test | Assumption |
-| --- | --- |
-| `ipc::work_command_tests` (4) | fixture cwd `/tmp/...`, which `Path::is_absolute` rejects without a drive prefix |
-| `work_control::tests::native_work_request_...` | same |
-| `adapters::antigravity::tests` (2) | transcript path shape |
-| `state::tests::reap_dead_pids_...` | Unix process liveness |
-
-They are left alone deliberately. Making them pass means teaching fixtures a
-second path grammar, which is only worth doing for a host muxa intends to
-support.
-
-`muxa-cli` still does not build — `nix` fails at dependency resolution. `muxad`
-has no such dependency and is the natural next crate, if anyone wants one.
-
-## If the blocker ever lifts
-
-Sequence the remaining work as 1 → 3 → 4, and settle 1 first. Reasons 3 and 4
-are tractable and individually reviewable, but they buy nothing on their own: a
-daemon that starts on Windows and observes no panes is not a product. Reason 2
-was worth doing early only because it was the load-bearing one for *compiling*
-at all, and because writing the transport down forced the security differences
-above into one reviewable place.
+With rmux as the host, the order is: a process source (reason 3, through a
+safe wrapper crate since `unsafe_code` is forbidden) so agents are attributed
+to panes without hooks; a Task Scheduler daemon component for `muxa init`;
+then the gaps listed above.
 
 [`PaneBackend`]: ../crates/muxa/src/backend/mod.rs
 [`BackendCaps`]: ../crates/muxa/src/backend/mod.rs

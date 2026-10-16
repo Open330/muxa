@@ -25,7 +25,6 @@
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,19 +110,34 @@ fn trap_signals() {
             return;
         };
         runtime.block_on(async {
-            use tokio::signal::unix::{signal, SignalKind};
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
 
-            let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
-                signal(SignalKind::interrupt()),
-                signal(SignalKind::terminate()),
-                signal(SignalKind::hangup()),
-            ) else {
-                return;
-            };
-            tokio::select! {
-                _ = interrupt.recv() => {}
-                _ = terminate.recv() => {}
-                _ = hangup.recv() => {}
+                let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
+                    signal(SignalKind::interrupt()),
+                    signal(SignalKind::terminate()),
+                    signal(SignalKind::hangup()),
+                ) else {
+                    return;
+                };
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = terminate.recv() => {}
+                    _ = hangup.recv() => {}
+                }
+            }
+            #[cfg(windows)]
+            {
+                use tokio::signal::windows::{ctrl_c, ctrl_close};
+
+                let (Ok(mut interrupt), Ok(mut close)) = (ctrl_c(), ctrl_close()) else {
+                    return;
+                };
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = close.recv() => {}
+                }
             }
             INTERRUPTED.store(true, Ordering::SeqCst);
         });
@@ -506,7 +520,7 @@ fn allocate_tour_dir() -> Result<(String, PathBuf)> {
         };
         let dir = temp.join(&name);
         let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700);
+        crate::owner_only::OwnerOnly::owner_only(&mut builder, 0o700);
         match builder.create(&dir) {
             Ok(()) => return Ok((name, dir)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}

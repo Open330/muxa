@@ -774,6 +774,7 @@ async fn submit(
     .await
 }
 
+#[cfg(unix)] // Asserts 0600/0700 modes.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One lifecycle across two daemon restarts.
 async fn restart_keeps_identity_receipts_and_revocations_but_requires_login() {

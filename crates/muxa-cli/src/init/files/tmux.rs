@@ -201,8 +201,16 @@ pub fn remove_env(original: &str) -> (String, Outcome) {
 /// Default path for `~/.tmux.conf`. Returns `None` only if `$HOME` is
 /// unset, which is exotic enough that we let the caller decide how to
 /// surface the error.
+///
+/// On Windows the only multiplexer is native rmux, which reads
+/// `~/.rmux.conf` (then `%APPDATA%\rmux\rmux.conf`) and never `~/.tmux.conf`,
+/// so the bindings go where they will actually be sourced.
 pub fn default_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".tmux.conf"))
+    #[cfg(windows)]
+    let name = ".rmux.conf";
+    #[cfg(not(windows))]
+    let name = ".tmux.conf";
+    dirs::home_dir().map(|h| h.join(name))
 }
 
 #[cfg(test)]

@@ -11,16 +11,33 @@
 //! signal, handing it to the child, and returning normally lets every guard
 //! restore its state before the process ends.
 
+//!
+//! Windows has no hang-up signal to forward: a console closing delivers its
+//! close event to every attached process, the child included, so the wait
+//! there is a plain `Child::wait`.
+
 use std::process::{Child, Command, ExitStatus};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(unix)]
 use std::sync::{Arc, OnceLock};
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use nix::sys::signal::{kill, Signal};
+#[cfg(unix)]
 use nix::unistd::Pid;
+#[cfg(unix)]
 use signal_hook::consts::{SIGHUP, SIGTERM};
 
+/// No signal is ever forwarded off Unix, so its type has no values.
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Signal {}
+
 /// Zero while no signal is pending; otherwise the signal number.
+#[cfg(unix)]
 fn pending_signal() -> &'static Arc<AtomicUsize> {
     static PENDING: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
     PENDING.get_or_init(|| {
@@ -37,6 +54,7 @@ fn pending_signal() -> &'static Arc<AtomicUsize> {
 
 /// `Child::wait` would block straight through the signal, so the wait polls
 /// `try_wait` at this interval and checks for a recorded signal in between.
+#[cfg(unix)]
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Outcome of an interactive child.
@@ -63,6 +81,15 @@ pub(crate) fn run_interactive(command: &mut Command) -> std::io::Result<Interact
     wait_forwarding_hangup(child)
 }
 
+#[cfg(not(unix))]
+pub(crate) fn wait_forwarding_hangup(mut child: Child) -> std::io::Result<InteractiveExit> {
+    Ok(InteractiveExit {
+        status: child.wait()?,
+        forwarded_signal: None,
+    })
+}
+
+#[cfg(unix)]
 pub(crate) fn wait_forwarding_hangup(mut child: Child) -> std::io::Result<InteractiveExit> {
     let pending = pending_signal();
     pending.store(0, Ordering::SeqCst);
@@ -92,7 +119,7 @@ pub(crate) fn wait_forwarding_hangup(mut child: Child) -> std::io::Result<Intera
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;

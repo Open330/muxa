@@ -375,7 +375,7 @@ fn systemd_unit_enabled() -> bool {
 }
 
 pub(crate) fn socket_responding(socket: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(socket).is_ok()
+    muxa::transport::endpoint_is_live(socket)
 }
 
 async fn wait_for_serving(client: &Client, timeout: Duration) -> Option<Hello> {
