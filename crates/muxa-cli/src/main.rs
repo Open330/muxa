@@ -3874,7 +3874,8 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
                 // cause the status line to fail, so log and move on.
                 if let Ok(input) = serde_json::from_slice::<claude::StatusLineInput>(&buf) {
                     let pane = muxa::adapters::hook::host_pane_env();
-                    let ev = claude::statusline_heartbeat(input, pane);
+                    let mut ev = claude::statusline_heartbeat(input, pane);
+                    muxa::adapters::hook::stamp_pane_endpoint(&mut ev);
                     best_effort_ingest(client, &ev).await;
                 } else {
                     tracing::debug!("claude-statusline: stdin was not valid statusline JSON");
@@ -3906,7 +3907,8 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
             // Same resolution as the event hooks, so an rmux pane is stamped
             // `rmux:%N` rather than read back as a bare tmux `%N`.
             let pane = muxa::adapters::hook::host_pane_env();
-            let ev = claude::statusline_heartbeat(input, pane);
+            let mut ev = claude::statusline_heartbeat(input, pane);
+            muxa::adapters::hook::stamp_pane_endpoint(&mut ev);
             best_effort_ingest(client, &ev).await;
         }
         HookCmd::Codex { event } => {
