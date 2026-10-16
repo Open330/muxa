@@ -4,7 +4,7 @@ Status: **native, through [rmux](https://rmux.io).** rmux runs natively on
 Windows and speaks tmux's command surface over a named pipe, so it is the
 pane host muxa observes and drives there. `muxa` and `muxad` build for
 `x86_64-pc-windows-msvc` and install with `cargo install` like anywhere else.
-WSL2 remains the complete, tested product if you would rather run tmux.
+WSL2 remains an option if you would rather run tmux.
 
 This document records what is true today, why, and what the platform gates in
 the tree are protecting.
@@ -15,7 +15,7 @@ the tree are protecting.
 winget install Helvesec.RMUX          # or any rmux >= 0.10 on PATH
 cargo install --path crates/muxad --locked
 cargo install --path crates/muxa-cli --locked
-muxa init --component tmux-popup,tmux-peek
+muxa init --component tmux-popup,tmux-peek,claude-hooks,codex-hooks,muxad-shellrc
 ```
 
 `muxa init` writes its bindings to `~/.rmux.conf` on Windows — rmux reads that
@@ -23,33 +23,40 @@ file (then `%APPDATA%\rmux\rmux.conf`) and never `~/.tmux.conf` — and accepts
 rmux in place of tmux in its pre-flight. Run it from inside an rmux pane so the
 live reload reaches the right server.
 
-There is no service manager integration yet, so start the daemon yourself
-(`Start-Process muxad -WindowStyle Hidden`, or a Task Scheduler logon task).
+`muxad-shellrc` is the autostart: on Windows it adds a block to the PowerShell
+profile (`$PROFILE.CurrentUserCurrentHost`), so the first pane rmux opens
+starts the daemon. `muxa daemon start` creates the daemon through
+`Win32_Process.Create` (see *Detaching the daemon* below), so it survives the
+shell — and the rmux server — that started it.
 
-Verified on Windows 11 with rmux 0.10.0: `muxad` serves the named pipe,
-`muxa doctor` reaches it and resolves the rmux server, and `muxa watch` renders
-every rmux session, window, and pane.
+Verified on Windows 11 with rmux 0.10.0 by driving a real client:
+
+- prefix `s`/`S`/`D`/`q`/`M` open watch, Fleet watch, the dashboard, peek and
+  agent move in popups; Enter in watch jumps the client across sessions;
+  agent move relocates a pane.
+- hooks and the Claude status line attach agents to their rmux panes;
+  `muxa status`, `recap`, `msg` (peer delivery and inbox) and `snapshot` work.
+- `muxa restore` rebuilds sessions, windows, panes and directories, relaunches
+  their commands, and resumes Claude with `--resume <id>`.
+- `muxa agent start` places an agent in an rmux pane or window.
+- `muxa daemon start/stop/restart/logs` and the PowerShell profile autostart.
 
 ### Known gaps
 
-- **No daemon autostart.** `muxa doctor` reports the service checks as
-  unsupported on Windows rather than failing them.
-- **Agent skill install** (`muxa init --component agent-skills`) needs a
-  symlink and bails on Windows.
-- **Codex MCP live reload** needs Codex's Unix control socket and reports
-  itself unavailable.
-- **No process source** (reason 3 below): hook ancestry recovery and
-  process-based agent attribution return empty, so agents are found through
-  their hooks and screen detection only.
-- **Dashboard pane sharing** pins a share to a tmux socket path and has not
-  been mapped onto rmux's named pipe; its tests are Unix-only.
-- **`muxa onboard`'s live tour** builds a POSIX-shell sandbox and is not
-  expected to work.
+- **Codex MCP live reload** needs Codex's Unix control socket, which Codex
+  does not create on Windows; `muxa mcp reload` reports it unavailable.
+- **Collaboration provenance** records no caller pid: a named pipe has no
+  safe peer-credential call, so requests read "origin unverified".
+- **`muxa onboard`'s live tour** builds a POSIX-shell sandbox on a private
+  tmux server and is not expected to work.
+- **Dashboard pane sharing** now verifies pane identity on Windows, but the
+  complete share flow (OIDC sign-in) has not been exercised there.
+- **`muxa upgrade`** needs a source checkout on Windows (no prebuilt release
+  is published for it). It moves the running `muxa.exe`/`muxad.exe` aside
+  before `cargo install`, since Windows refuses to overwrite a running
+  executable but allows renaming one.
 - Re-exec on upgrade spawns a successor and exits instead of `exec`ing in
   place, so the daemon's pid changes.
-- **Upgrading needs the daemon stopped.** Windows locks a running
-  executable, so `cargo install` cannot replace `muxad.exe` while it runs
-  (`Access is denied`). Stop it, install, start it again.
 
 ## Use WSL2
 
@@ -67,15 +74,14 @@ The 9p mount that backs `/mnt` makes cargo builds several times slower.
 
 ## What stood in the way
 
-Four independent reasons. The first two are resolved and the fourth is
-resolved as far as compiling goes; each is kept here, marked, because what it
+Five independent reasons. Each is resolved; each is kept here because what it
 cost and what it could not recover are the useful part of the record.
 
 ### 1. No host to observe — resolved by rmux
 
-*Historical.* Native rmux implements the tmux command surface on Windows, and
-muxa's rmux backend drives it through that CLI, so the requirements below are
-met. The reasoning is kept because it is still true of Windows Terminal.
+Native rmux implements the tmux command surface on Windows, and muxa's rmux
+backend drives it through that CLI. The reasoning below is still true of
+Windows Terminal.
 
 [`PaneBackend`] requires `list_panes`, `resolve_pane`, `capture_pane`,
 `pane_pid_map`, `current_pane`, `focus_pane`, and `send_text`. Windows Terminal
@@ -84,14 +90,6 @@ returns, with no pane enumeration, no stable pane ids, no screen capture, and
 no way to send input to a pane it is not focused on. ConPTY is a pseudoconsole
 API, not a multiplexer.
 
-[`BackendCaps`] can already describe a host with gaps — that is how the zellij
-CLI baseline is modelled — but `list_panes` has no capability flag because
-every host must answer it. A Windows backend could not.
-
-This is the blocker. The three below are ordinary work; this one has no known
-solution, so the other three should not be started on its account — and
-finishing one of them, as the next section did, changes nothing here.
-
 ### 2. IPC was a Unix-domain socket — resolved
 
 `ipc.rs` used to bind a `UnixListener` and thread
@@ -99,14 +97,7 @@ finishing one of them, as the next section did, changes nothing here.
 through `crates/muxa/src/transport.rs`, which resolves to a Unix socket or a
 Windows named pipe. See [PROTOCOL.md](../PROTOCOL.md#transport).
 
-The encoding was never the coupled part — line-delimited JSON, which Fleet
-already carries over an SSH stdio byte stream (`crates/muxa-cli/src/relay.rs`).
-The types were. Rather than make the dispatch table generic, the module exposes
-one `Stream`/`ReadHalf`/`WriteHalf` family whose definition is platform-chosen,
-so `ipc.rs` gained no type parameters.
-
-What did **not** port cleanly, and is why this is a compile story rather than a
-support story:
+What did not port cleanly:
 
 - **Protection is weaker.** `0600` on a socket file has no named-pipe
   equivalent. A pipe's DACL is fixed at creation and setting a custom one needs
@@ -116,54 +107,72 @@ support story:
   SMB reachability, which are the other two exposures.
 - **No peer credentials.** `SO_PEERCRED` has no safe counterpart, so
   collaboration provenance records `None` for pid/uid/gid on Windows.
-- **No synchronous client.** `blocking_call` needs a bounded read, and a pipe
-  opened as a file cannot set one without `SetCommTimeouts`. It returns
-  `Unsupported` rather than risk hanging the caller — which lands on the
-  "daemon unavailable" path the function already documents.
+- **The synchronous client** (`ipc::blocking_call`, used to register a
+  launched agent and reserve its alias) cannot bound a read on a pipe opened
+  as a file. On Windows it runs the async transport under a timeout on a
+  thread of its own instead.
 - **Accept has a gap a socket does not have.** One pipe instance serves one
   client, and the successor is created only once the pending instance is
   claimed. A client connecting in that window gets `ERROR_PIPE_BUSY`, so
   clients retry it briefly; a socket's backlog hides the same burst.
 
-### 3. No process source
+### 3. No process source — resolved through sysinfo
 
-Linux reads `/proc`. Every other platform took one `ps` snapshot. Windows has
-neither.
+Linux reads `/proc`; other Unix hosts take one `ps` snapshot. Windows has
+neither, and `unsafe_code = "forbid"` rules out calling Toolhelp32 directly.
+The Windows arms read the same table through `sysinfo`, which wraps those APIs
+safely:
 
-Until recently the second arm was spelled `#[cfg(not(target_os = "linux"))]`,
-which meant Windows *silently* selected the `ps` implementation and got an
-empty table with one `tracing::debug!` line. Those arms are now
-`#[cfg(all(unix, not(target_os = "linux")))]` with explicit `#[cfg(not(unix))]`
-counterparts, so the absence is visible in the tree instead of being an
-accident of cfg arithmetic:
+| File | Windows arm |
+| --- | --- |
+| `process_snapshot.rs` | whole table (pid, parent, argv), one process's argv, start time, liveness |
+| `adapters/proc_ancestry.rs` | parent lookup for hook ancestry |
+| `state.rs` | pid liveness for `muxa proc`/`muxa run` rows |
+| `account_swap.rs` | the agent's command line; `taskkill` in place of signals |
+| `muxa-cli` `stale_agents.rs`, `reload/process.rs` | stale `muxa mcp` scan; each pane's command for snapshots |
 
-| File | Unix arm | Non-Unix arm |
-| --- | --- | --- |
-| `process_snapshot.rs` | `/proc` or `ps` | empty table |
-| `adapters/proc_ancestry.rs` | `/proc` or `ps` | `None` |
-| `tmux/scanner.rs` | walk `$TMUX_TMPDIR`, probe sockets | no sockets |
-| `backend/unix_socket.rs` | `std::os::unix::net::UnixStream` | uninhabited stand-in whose `connect` always fails |
+rmux reports `#{pane_pid}` (the pane's shell) but, a console having no
+foreground process group, always the shell as `#{pane_current_command}`. The
+program running in a pane is therefore read from the shell's children:
+snapshot records it (an agent child wins over a helper such as
+`WindowsPackageManagerServer.exe`), and restore confirms a relaunch from it.
 
-Returning empty is the honest answer while reason 1 stands: with no Windows
-backend there are no panes whose descendants could be attributed. Wiring a real
-source (Toolhelp32, WTS) is only worth doing once those PIDs mean something.
+### 4. Commands are read by PowerShell, not `/bin/sh` — resolved
 
-Note that `unsafe_code = "forbid"` is set workspace-wide, so a future process
-source cannot call the Win32 APIs directly — it needs a safe wrapper crate.
+tmux runs `new-window`, `split-window`, `display-popup` and `run-shell`
+commands through `/bin/sh`. rmux on Windows runs them through its
+`default-shell`, PowerShell by default, where POSIX quoting (`'\''`), `exec`,
+`2>/dev/null`, `|| true`, `printf`/`read`, and a leading quoted program are
+all errors. A popup whose command fails closes at once under `-E`, which is
+why prefix `s` appeared to do nothing.
 
-### 4. Unix assumptions throughout the CLI — compiles, partly gated
+`muxa::shell::Dialect` is the single place a command line is built:
+PowerShell quoting doubles `'`, a program that needs quoting goes through the
+call operator `&`, `exec` is dropped, and `cd` is `Set-Location -LiteralPath`.
+Popups, agent launch, restore, account swap, watch's work-up window and spawn
+form all go through it. `muxa::shell` also names programs without their path
+or `.exe`/`.cmd`, recognises `pwsh`/`powershell`/`cmd` as shells, runs scripts
+(`work up`'s `prepare`, the status-line `--forward`) through PowerShell, and
+finds npm's `.cmd` shims, which `Command::new` alone does not.
 
-`muxa-cli` keeps `nix` and `signal-hook` for Unix; on Windows the interactive
-attach wait is a plain `Child::wait` (a console close reaches the child
-directly), owner-only creation modes go through `owner_only::OwnerOnly` (a
-no-op under the per-user profile ACL), and daemon liveness probes use
-`muxa::transport::endpoint_is_live` so they understand named pipes. `muxad`
-installs Ctrl+C / console-close / shutdown handlers in place of SIGTERM and
-SIGINT, and re-exec spawns a successor rather than calling `exec`.
+### 5. Unix process management — resolved
 
-Service installation still shells out to `launchctl` and `systemctl` only, and
-the call sites that invoke `sh`, `bash`, `id`, `kill`, `ps`, or `nohup` are
-reached only from features listed under *Known gaps*.
+- **Detaching the daemon.** `nohup` does not exist, and a process created
+  with `CreateProcess` inherits every inheritable handle of its creator — so a
+  daemon started by `muxa daemon start *> $null` held the pipe PowerShell
+  reads from, and the profile hook would have waited for the daemon to exit.
+  It also stayed in the launching pane's job object, which rmux closes with
+  its server. `muxa daemon start` therefore creates muxad through
+  `Win32_Process.Create`: the WMI service inherits nothing to it and puts it
+  in no job.
+- **Signals.** `muxad` installs Ctrl+C / console-close / shutdown handlers in
+  place of SIGTERM and SIGINT, and re-exec spawns a successor rather than
+  calling `exec`.
+- **The ambient multiplexer** is rmux's default server on Windows when the
+  shell is in no pane, as tmux's is elsewhere; Fleet Work runs there.
+- **Paths.** `std::fs::canonicalize` returns verbatim paths (`\\?\F:\…`) that
+  no hook reports; `muxa::paths::canonicalize` drops the prefix so cwd
+  comparisons hold.
 
 Windows also gives the main thread a 1 MiB stack. An unoptimized build of the
 CLI overflows it before `muxa init --help` prints, so `.cargo/config.toml`
@@ -171,23 +180,19 @@ links MSVC targets with the 8 MiB stack Unix hosts default to.
 
 ## What builds and runs today
 
-`muxa`, `muxad`, and `muxa-cli` build for `x86_64-pc-windows-msvc`. Tests that
-exercise Unix-only behaviour — `#!/bin/sh` fixtures through
-`test_support::write_executable`, `0600`/`0700` mode assertions, and socket
-send-buffer backpressure — are gated `#[cfg(unix)]`.
+`muxa`, `muxad`, and `muxa-cli` build for `x86_64-pc-windows-msvc` with no
+clippy warnings. Tests that exercise Unix-only behaviour — `#!/bin/sh`
+fixtures through `test_support::write_executable`, `0600`/`0700` mode
+assertions, and socket send-buffer backpressure — are gated `#[cfg(unix)]`.
 
-The remaining Windows test failures are pre-existing Unix assumptions in
-fixtures — 20 of 1,217 in `cargo test -p muxa --lib` (paths like `/tmp/...` that
-are not absolute without a drive prefix,
-Unix process liveness), left alone because teaching fixtures a second path
-grammar is separate work. CI runs on Linux and macOS only.
+The remaining Windows test failures are Unix assumptions in fixtures — 20 of
+1,225 in `cargo test -p muxa --lib` (paths like `/tmp/...` that are not
+absolute without a drive prefix), and `muxa-cli`'s unit tests import Unix-only
+APIs. CI runs on Linux and macOS only.
 
 ## What is left
 
-With rmux as the host, the order is: a process source (reason 3, through a
-safe wrapper crate since `unsafe_code` is forbidden) so agents are attributed
-to panes without hooks; a Task Scheduler daemon component for `muxa init`;
-then the gaps listed above.
+Teaching the test fixtures a second path grammar so Windows can join CI; the
+gaps listed above.
 
 [`PaneBackend`]: ../crates/muxa/src/backend/mod.rs
-[`BackendCaps`]: ../crates/muxa/src/backend/mod.rs
