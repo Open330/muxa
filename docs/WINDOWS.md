@@ -12,7 +12,7 @@ the tree are protecting.
 ## Native install (rmux)
 
 ```powershell
-winget install Helvesec.RMUX          # or any rmux >= 0.10 on PATH
+winget install Helvesec.RMUX          # or any rmux >= 0.10 on PATH (see below)
 cargo install --path crates/muxad --locked
 cargo install --path crates/muxa-cli --locked
 muxa init --component tmux-popup,tmux-peek,claude-hooks,codex-hooks,muxad-shellrc
@@ -27,9 +27,30 @@ live reload reaches the right server.
 profile (`$PROFILE.CurrentUserCurrentHost`), so the first pane rmux opens
 starts the daemon. `muxa daemon start` creates the daemon through
 `Win32_Process.Create` (see *Detaching the daemon* below), so it survives the
-shell — and the rmux server — that started it.
+shell — and the rmux server — that started it. It writes its log itself
+(`muxad --log-file`) to `%TEMP%\muxad.log`, which `muxa daemon logs` reads.
 
-Verified on Windows 11 with rmux 0.10.0 by driving a real client:
+rmux 0.10.0 redraws a whole popup every frame, so the watch popup flickers.
+[Open330/rmux](https://github.com/Open330/rmux)'s `main` carries the renderer
+fix ([RMUX.md](RMUX.md#popup-rendering-on-rmux-0100)); until a release does,
+`cargo install --git https://github.com/Open330/rmux --locked rmux` builds it.
+
+### After a reboot
+
+muxad snapshots the workspace on an interval, and follows the server across
+restarts even though its pipe name changes. With the rmux server back up,
+
+```powershell
+muxa restore --run
+```
+
+rebuilds the sessions, windows and panes of the newest snapshot and resumes
+their agents; `muxa restore` alone prints the plan. A server started from Task
+Scheduler at boot can run the same command right after it creates its first
+session.
+
+Verified on Windows 11 with rmux 0.10.0 and Open330/rmux `main` by driving a
+real client:
 
 - prefix `s`/`S`/`D`/`q`/`M` open watch, Fleet watch, the dashboard, peek and
   agent move in popups; Enter in watch jumps the client across sessions;
@@ -185,9 +206,10 @@ clippy warnings. Tests that exercise Unix-only behaviour — `#!/bin/sh`
 fixtures through `test_support::write_executable`, `0600`/`0700` mode
 assertions, and socket send-buffer backpressure — are gated `#[cfg(unix)]`.
 
-The remaining Windows test failures are Unix assumptions in fixtures — 20 of
-1,225 in `cargo test -p muxa --lib` (paths like `/tmp/...` that are not
-absolute without a drive prefix), and `muxa-cli`'s unit tests import Unix-only
+The remaining Windows test failures are Unix assumptions in fixtures — 23 of
+1,229 in `cargo test -p muxa --lib`: paths like `/tmp/...` that are not
+absolute without a drive prefix, so request validation rejects them, and
+bounded-command tests that run `sh`. `muxa-cli`'s unit tests import Unix-only
 APIs. CI runs on Linux and macOS only.
 
 ## What is left

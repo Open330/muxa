@@ -4,9 +4,6 @@
 # Defaults to $XDG_RUNTIME_DIR/muxa.sock (or /tmp/muxa-$UID.sock as fallback).
 # socket = "/run/user/1000/muxa.sock"
 
-# tmux socket to attach to for control mode. Default: auto-detect from $TMUX.
-# tmux_socket = "default"
-
 # Env-only: MUXA_TMUX_SOCKET scopes muxa to a single tmux socket path instead
 # of enumerating every server under /tmp/tmux-$UID. It scopes BOTH the
 # multi-server pane scan AND hook ingest: events whose captured $TMUX socket
@@ -223,7 +220,7 @@
 
 # tmux session foreground-time tracker. A session counts as active while an
 # interactive tmux client has that session foregrounded. `muxa watch`
-# (work view — the default) shows the workspace cumulative total in its DUR column.
+# shows the workspace cumulative total in its DUR column.
 [session_activity]
 # enabled       = true
 # path          = "/home/$USER/.local/share/muxa/session-activity.json"
@@ -253,7 +250,7 @@
 # to opt back into model / ctx / cost, always-visible workload, or to reorder.
 #
 # Valid column keys: pane, kind, state, state_age, model, ctx, cost, limits, workload,
-# prompt, activity, workspace_time.
+# prompt, activity, duration.
 # Omit a key to hide the column. Unknown keys log a warning and are skipped.
 [watch]
 # theme = "classic"   # optional watch-only override for [ui].theme
@@ -318,22 +315,22 @@
 # `pane_id` as a final stable tiebreaker. Stale agents (pane closed)
 # always sink to the bottom regardless of what's listed here.
 #
-# Default: ["state", "workspace", "latest"] — floats attention states first,
-# then groups by workspace and recency.
+# Default: ["state", "name", "latest"] — floats attention states first,
+# then groups by session name and recency.
 #
 # Available keys:
-#   workspace — tmux workspace/session name asc
-#   workspace_time — workspace foreground duration desc
+#   state     — attention states first
+#   name      — session/agent name asc
+#   duration  — foreground duration desc (alias: dur)
 #   latest    — last_activity_at desc (most recently updated first)
-#   activity  — alias for latest
+#   activity  — alias for latest (also: act)
 #   pane      — window then pane index, parsed numerically
 #   pane_id   — raw pane id lex asc (predictable; useful for screenshots)
 #
 # Examples:
 #   sort = ["latest"]                # global newest-first, no grouping
-#   sort = ["workspace", "pane"]       # tmux-native order within workspace
-#   sort = ["workspace", "latest"]     # workspace grouping + recency
-# sort = ["workspace", "latest"]
+#   sort = ["name", "pane"]          # tmux-native order within a session
+#   sort = ["name", "latest"]        # session grouping + recency
 
 # Per-column widths. Three accepted forms:
 #   integer  -> fixed length      (Constraint::Length)
@@ -346,13 +343,13 @@
 # workload = 8
 # prompt   = "min:20"
 # activity = 6
-# workspace_time = 6
+# duration = 6
 
 # Selected-row detail: a dim "↳ <text>" line rendered under the highlighted
 # row. Visible child shell/subagent work is shown as `tree ◇1 ▸1 +2` in the
 # session/name column; otherwise this falls back to the template below.
 #
-# Default `template = "{last_response|last_prompt}"` — pipe-separated
+# Default `template = "{last_notification|last_response|last_prompt}"` — pipe-separated
 # alternatives resolve left-to-right and pick the first non-dash value.
 # When the agent has captured a response that wins; otherwise the user's
 # last prompt is shown so the detail row stays useful for older agents,
@@ -365,7 +362,7 @@
 # placeholders are preserved verbatim so typos surface visually.
 # [watch.detail]
 # enabled  = true
-# template = "{last_response|last_prompt}"
+# template = "{last_notification|last_response|last_prompt}"
 # # Combined view (heavily truncated since each side gets half the room):
 # # template = "{last_prompt} → {last_response}"
 # # Just the user's prompt:

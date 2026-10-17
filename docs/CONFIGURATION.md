@@ -89,7 +89,7 @@ points beside this config. Keep user preferences here; see
 placement = "window" # pane (default) | window | session
 agent = "codex"      # claude | codex | gemini | agy | opencode
 options = ["--model", "preferred-model"]
-direction = "auto"   # auto (default) | right | down
+direction = "right"  # right (default) | down
 instructions = "Keep one task per window; use a new session for unrelated projects."
 ```
 
@@ -454,9 +454,9 @@ therefore cannot broaden either contract.
 
 ```toml
 [watch]
-view = "work"
+view = "window"
 columns = ["pane", "state_age", "model", "ctx", "cost", "prompt", "activity"]
-sort = ["state", "workspace", "latest"]
+sort = ["state", "name", "latest"]
 hide_paneless = true
 collaboration_kind = "question"   # question | review | task | notice
 collaboration_mode = "read_only"  # read_only | execute | just_send

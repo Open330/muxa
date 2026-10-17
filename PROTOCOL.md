@@ -40,9 +40,8 @@ On Unix, the supported host:
 - Peer credentials via `SO_PEERCRED`; collaboration provenance records them
   as `caller_pid` / `caller_uid` / `caller_gid`.
 
-On Windows — **not** a supported host (see `docs/WINDOWS.md`), but no longer
-blocked by the transport — the same protocol runs over a named pipe. The
-differences are not cosmetic:
+On Windows (a native host through rmux — see `docs/WINDOWS.md`) the same
+protocol runs over a named pipe. The differences are not cosmetic:
 
 - Address: `\\.\pipe\muxa-<stem>-<digest>`, derived from the same path.
   `$XDG_RUNTIME_DIR` being unset, that path defaults under `%LOCALAPPDATA%`.
@@ -67,7 +66,7 @@ resync markers. Collaboration operations are advertised by the optional
 unsupported frame. Running `muxa work …` on the remote node is advertised by
 the relay capability `work_command`; a controller talking to an older relay
 runs the same argv over a one-shot OpenSSH command instead (see
-[`work_command`](#work_command)). See
+[`work_command`](#work-control-work_up-work_up_status-work_command)). See
 [`docs/FLEET.md`](docs/FLEET.md); `FLEET_PROTOCOL_VERSION` is negotiated
 separately from this local IPC protocol.
 
@@ -204,7 +203,7 @@ The `work_command` operation (`{ "kind": "work_command", "args": [...],
 and answers through three additive `FleetCommandResult` fields:
 `command_exit_code`, `command_stdout`, `command_stderr`. They are absent on
 every other operation and in replies from a relay that predates the
-operation. Clients normally reach it through [`work_command`](#work_command)
+operation. Clients normally reach it through [`work_command`](#work-control-work_up-work_up_status-work_command)
 and `work_up` with a `host` rather than dispatching it themselves.
 
 #### Work control: `work_up`, `work_up_status`, `work_command`

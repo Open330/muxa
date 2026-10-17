@@ -71,6 +71,11 @@ events and fewer process launches without changing callers.
   servers is rejected with an explicit message.
 - The implementation follows the public CLI/format contract verified against
   rmux 0.10.x.
+- On Windows the endpoint is a named pipe whose name ends in a nonce drawn
+  each time the server starts. An endpoint recorded before a restart (in a
+  snapshot, an agent row, or across `muxa reload`) is followed to the one
+  live pipe that differs only in that nonce. See
+  [WINDOWS.md](WINDOWS.md) for the rest of the Windows specifics.
 
 ## Popup rendering on rmux 0.10.0
 
@@ -81,13 +86,18 @@ popup and its footer otherwise share the same terminal row. Existing users
 can re-run the popup component of `muxa init`, or change only the watch
 bindings from `-h 100%` to `-h 99%` while keeping `-x 0 -y 0`.
 
-This mitigates the bottom-row collision, **not all popup flicker**. In an
-isolated 120x30 client, six idle seconds of watch produced about 58 KB and
-180 full-width blank rows both with the status bar enabled and disabled.
-A static `sleep` popup produced status updates with the bar enabled and no
-output with it disabled. The rmux popup renderer fills the entire popup
-before drawing its contents; running `muxa watch` directly in a pane avoids
-that popup redraw path. Fixing that renderer requires a change in rmux.
+This mitigates the bottom-row collision, **not all popup flicker**. rmux
+0.10.0's popup renderer fills the entire popup before drawing its contents on
+every frame: in an isolated 120x30 client, six idle seconds of watch produced
+about 58 KB and 180 full-width blank rows, with the status bar enabled or not.
+
+The renderer fix is in [Open330/rmux](https://github.com/Open330/rmux)'s
+`main` after v0.10.0 (`dbbbbcc4` coalesces popup output and sends only
+changed rows; `aa777483` diffs bordered popups cell by cell; `58a679bd`
+defers status ticks a popup covers). Until a release carries it, build rmux
+from that branch. Measured through a real client on Windows, an idle watch
+popup went from 2–4 KB/s on 0.10.0 to 25–40 B/s. Running `muxa watch`
+directly in a pane avoids the popup redraw path on any version.
 
 ## Validation
 

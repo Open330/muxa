@@ -5,8 +5,9 @@ This page keeps the detailed install and wiring notes out of the README.
 ## Requirements
 
 - Rust 1.89+ (source builds only)
-- tmux 3.x
-- Unix-like OS
+- tmux 3.x, or [rmux](https://rmux.io) 0.10+
+- Linux or macOS; Windows natively through rmux (see [WINDOWS.md](WINDOWS.md))
+  or inside WSL2
 - One supported agent CLI: Claude Code, OpenAI Codex, Google Gemini CLI, or the
   Google Antigravity CLI (`agy`)
 

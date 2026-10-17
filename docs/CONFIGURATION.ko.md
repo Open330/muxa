@@ -345,9 +345,9 @@ timeout, permission scope를 포함하지 않습니다. `m`에서는 현재 선�
 
 ```toml
 [watch]
-view = "work"
+view = "window"
 columns = ["pane", "state_age", "model", "ctx", "cost", "prompt", "activity"]
-sort = ["state", "workspace", "latest"]
+sort = ["state", "name", "latest"]
 hide_paneless = true
 collaboration_kind = "question"   # question | review | task | notice
 collaboration_mode = "read_only"  # read_only | execute | just_send
