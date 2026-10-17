@@ -12,12 +12,12 @@ workspace-card console이 필요하면 [`muxa dashboard`](DASHBOARD_CLI.ko.md)�
 
 ```bash
 muxa watch
-muxa watch --view work
+muxa watch --layout work
 muxa watch --view pane
 muxa watch --include-paneless
 ```
 
-`view = "work"`는 tmux window 기준으로 묶고 parent를 `workspace › work`로
+기본값 `view = "window"`는 tmux window 기준으로 묶고 parent를 `workspace › work`로
 표시하는 실행 topology view입니다. session은 Workspace를, window는 현재 Run을,
 child pane은 agent session을 바인딩합니다. `view = "pane"`은 pane별로 한 줄씩
 보여줍니다. 지속되는 Work와 외부 이슈 상태는 이 tree가 아니라 `muxa dashboard`가
@@ -477,7 +477,7 @@ muxa status --json
 
 ```toml
 [watch]
-view = "work"
+view = "window"
 columns = ["pane", "state_age", "model", "ctx", "cost", "prompt", "activity"]
 
 [watch.widths]
@@ -487,7 +487,7 @@ activity = 6
 ```
 
 사용 가능한 column key: `pane`, `state`, `state_age`, `kind`, `model`, `ctx`, `cost`,
-`limits`, `workload`, `prompt`, `activity`, `workspace_time`.
+`limits`, `workload`, `prompt`, `activity`, `duration`.
 기본 `state_age` column은 `▶ WAIT 3m`, `● WORK 42s`처럼 현재 상태와 해당 상태에
 머문 시간을 함께 보여줍니다. compact glyph만 필요하면 `state`를 사용하세요.
 기본값에서는 child shell/subagent 작업이 선택된 row의 detail line에만
@@ -499,17 +499,17 @@ process를 의미합니다.
 
 ```toml
 [watch]
-sort = ["state", "workspace", "latest"]
+sort = ["state", "name", "latest"]
 # sort = ["latest"]
-# sort = ["workspace_time"]
+# sort = ["duration"]
 # sort = ["state", "latest"]
-# sort = ["workspace", "pane"]
+# sort = ["name", "pane"]
 # sort = ["pane_id"]
 ```
 
 런타임 정렬 키는 위 preset과 대응하며, 선택한 preset을 `[watch].sort`에 다시
 저장합니다. `--sort` flag는 런타임 정렬 키를 누르기 전까지 현재 실행에만 적용되는
-override입니다. 기본값은 attention state를 먼저 띄운 뒤 workspace로 묶고,
+override입니다. 기본값은 attention state를 먼저 띄운 뒤 session 이름으로 묶고,
 각 group 안에서 가장 최근 activity가 있는 work를 위로 올립니다. `activity`와
 `act`는 `latest` alias로 계속 동작합니다.
 

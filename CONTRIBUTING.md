@@ -84,17 +84,17 @@ pushing. New lints otherwise appear in CI on code you did not touch.
 
 ## Adding a new agent adapter
 
-The three stdin-JSON adapters (`claude`, `codex`, `gemini`) all implement
-the `HookAdapter` trait defined in `crates/muxa-adapters/src/hook.rs`.
-To add a new agent:
+The stdin-JSON adapters (`claude`, `codex`, `gemini`, `antigravity`,
+`opencode`) all implement the `HookAdapter` trait defined in
+`crates/muxa/src/adapters/hook.rs`. To add a new agent:
 
-1. Create `crates/muxa-adapters/src/<agent>.rs`.
+1. Create `crates/muxa/src/adapters/<agent>.rs`.
 2. Define `Input` (serde-deserializable payload shape) and `Event` (hook
    event enum).
 3. `impl HookAdapter for <Agent>Adapter` with the three required items:
    `KIND`, `parse_event`, `normalize`.
-4. Register the module in `crates/muxa-adapters/src/lib.rs`.
-5. Add a `HookCmd::<Agent>` variant in `crates/muxa/src/main.rs` and wire
+4. Register the module in `crates/muxa/src/adapters/mod.rs`.
+5. Add a `HookCmd::<Agent>` variant in `crates/muxa-cli/src/main.rs` and wire
    it through `handle_hook`.
 6. Add a hook-config snippet under `examples/`.
 

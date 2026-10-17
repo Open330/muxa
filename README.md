@@ -498,7 +498,7 @@ several at once (e.g. during a tmux→herdr migration):
 | Host | Status | Notes |
 | --- | --- | --- |
 | tmux | Full | The default backend. |
-| [rmux](https://rmux.io) | Initial CLI backend | Pane discovery, capture, focus, and targeted input; see [docs/RMUX.md](docs/RMUX.md). |
+| [rmux](https://rmux.io) | Initial CLI backend | Pane discovery, capture, focus, and targeted input; see [docs/RMUX.md](docs/RMUX.md). The host on native Windows — see [docs/WINDOWS.md](docs/WINDOWS.md). |
 | [herdr](https://herdr.dev) | Full | Via herdr's socket API; see [docs/HERDR.md](docs/HERDR.md). |
 | zellij | CLI baseline | Richer plugin path planned; see [docs/ZELLIJ.md](docs/ZELLIJ.md). |
 
@@ -515,6 +515,7 @@ simultaneously.
 | MCP control plane (`muxa mcp`) | [docs/MCP.md](docs/MCP.md) |
 | herdr host support | [docs/HERDR.md](docs/HERDR.md) |
 | rmux host support | [docs/RMUX.md](docs/RMUX.md) |
+| Native Windows (PowerShell + rmux) | [docs/WINDOWS.md](docs/WINDOWS.md) |
 | Multi-host observation | [docs/MULTI_HOST.md](docs/MULTI_HOST.md) |
 | Physical SSH fleet | [docs/FLEET.md](docs/FLEET.md) |
 | Antigravity CLI (`agy`) support | [docs/ANTIGRAVITY.md](docs/ANTIGRAVITY.md) |

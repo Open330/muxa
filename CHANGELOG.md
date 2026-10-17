@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- muxa runs natively on Windows (PowerShell) with rmux as the pane host — no
+  WSL needed. IPC moves to a named pipe and commands are written for
+  PowerShell. The process table comes from `sysinfo`. `muxa daemon start`
+  detaches muxad through WMI, and `muxad --log-file` writes its own log. rmux
+  endpoints follow a server across restarts, though its pipe name changes.
+  Watch popups, hooks, status, messaging, snapshot/restore, `reload mux` and
+  the PowerShell profile autostart are verified; the gaps are listed in
+  `docs/WINDOWS.md`.
 - Agents can explicitly request required human attention with `muxa msg attention`
   or `muxa_request_attention`. Muxa for Mac aggregates these durable operator
   requests across Fleet hosts, displays pending decisions in Attention/Inbox and

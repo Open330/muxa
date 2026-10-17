@@ -12,13 +12,13 @@ prompts, aborting turns, and inspecting live captures, use
 
 ```bash
 muxa watch
-muxa watch --view work
+muxa watch --layout work
 muxa watch --view pane
 muxa watch --include-paneless
 ```
 
-`view = "work"` groups tmux panes by window and labels each parent as
-`workspace › work`. This is an execution topology view: a session binds a
+The default `view = "window"` groups tmux panes by window and labels each
+parent as `workspace › work`. This is an execution topology view: a session binds a
 Workspace, a window binds the current Run, and each child pane binds an agent
 session. `view = "pane"` shows one row per pane. Durable Work and external issue
 state belong to `muxa dashboard`, not this topology tree.
@@ -548,7 +548,7 @@ Columns are configured under `[watch]`:
 
 ```toml
 [watch]
-view = "work"
+view = "window"
 columns = ["pane", "state_age", "model", "ctx", "cost", "prompt", "activity"]
 
 [watch.widths]
@@ -558,7 +558,7 @@ activity = 6
 ```
 
 Available column keys include `pane`, `state`, `state_age`, `kind`, `model`, `ctx`,
-`cost`, `limits`, `workload`, `prompt`, `activity`, and `workspace_time`.
+`cost`, `limits`, `workload`, `prompt`, `activity`, and `duration`.
 The default `state_age` column renders values such as `▶ WAIT 3m` and
 `● WORK 42s`; use `state` when only the compact glyph is wanted.
 By default, child shell/subagent work is shown only on the selected row's
@@ -570,19 +570,19 @@ means other visible process.
 
 ```toml
 [watch]
-sort = ["state", "workspace", "latest"]
+sort = ["state", "name", "latest"]
 # sort = ["latest"]
-# sort = ["workspace_time"]
+# sort = ["duration"]
 # sort = ["state", "latest"]
-# sort = ["workspace", "pane"]
+# sort = ["name", "pane"]
 # sort = ["pane_id"]
 ```
 
 Runtime sort keys mirror these presets and save the selected preset back to
 `[watch].sort`. The `--sort` flag remains a one-shot launch override until
 you press a runtime sort key. The default floats attention states first,
-then groups by workspace and floats the most recently active work in each
-group. `activity` and `act` remain accepted aliases for `latest`.
+then groups by session name and floats the most recently active work in
+each group. `activity` and `act` remain accepted aliases for `latest`.
 
 `latest` follows agent activity, not the order in which you visit windows.
 State transitions and same-state activity trigger daemon invalidations,
