@@ -43,11 +43,7 @@ impl Storage {
     /// racing this one's view of who is enrolled.
     pub(super) fn open(path: &Path) -> io::Result<(Self, Vec<Enrolled>, Vec<StoredRule>)> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
+            crate::dashboard::sharing::private_dir(parent)?;
         }
         let private_file = crate::dashboard::sharing::private_file;
         let lock = private_file(&path.with_extension("lock"))?;

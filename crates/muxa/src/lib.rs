@@ -66,6 +66,7 @@ pub mod pipeline_run;
 mod process_snapshot;
 pub mod process_tree;
 mod prompt_headline;
+#[cfg(unix)]
 #[doc(hidden)]
 pub mod test_support;
 pub use prompt_headline::prompt_headline;
@@ -76,12 +77,14 @@ pub mod scope_filter;
 pub mod screen;
 pub mod session;
 pub mod session_activity;
+pub mod shell;
 pub mod sinks;
 pub mod snapshot;
 pub mod state;
 pub mod timeline;
 pub mod tmux;
 pub mod topology;
+pub mod transport;
 pub mod work;
 pub mod work_compose;
 #[doc(hidden)]

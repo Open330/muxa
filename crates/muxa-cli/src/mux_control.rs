@@ -40,12 +40,23 @@ pub fn supported(host: HostKind) -> bool {
     matches!(host, HostKind::Tmux | HostKind::Rmux)
 }
 
+/// The rmux server ambient commands go to: the one this shell's `$RMUX` (or
+/// the selected endpoint) names, else — on Windows, where rmux is the only
+/// tmux-compatible host — rmux's default server, as tmux's default server is
+/// everywhere else.
+pub fn ambient_rmux() -> Option<muxa::RmuxBackend> {
+    match rmux_endpoint() {
+        Some(socket) => Some(muxa::RmuxBackend::with_endpoint(socket)),
+        None => (cfg!(windows) && selected_endpoint().is_none()).then(muxa::RmuxBackend::new),
+    }
+}
+
 pub fn ambient_command() -> Command {
     if let Some(endpoint) = selected_endpoint() {
         return command(&endpoint).expect("lifecycle endpoint must support mux control");
     }
-    if let Some(socket) = rmux_endpoint() {
-        muxa::RmuxBackend::with_endpoint(socket).command(None)
+    if let Some(rmux) = ambient_rmux() {
+        rmux.command(None)
     } else {
         muxa::tmux::tmux_command_scoped()
     }
@@ -53,10 +64,8 @@ pub fn ambient_command() -> Command {
 
 pub fn ambient_command_with_args<S: AsRef<str>>(args: &[S]) -> anyhow::Result<Command> {
     let args: Vec<_> = args.iter().map(AsRef::as_ref).collect();
-    if let Some(socket) = rmux_endpoint() {
-        return muxa::RmuxBackend::with_endpoint(socket)
-            .control_command(&args)
-            .map_err(anyhow::Error::msg);
+    if let Some(rmux) = ambient_rmux() {
+        return rmux.control_command(&args).map_err(anyhow::Error::msg);
     }
     let mut command = ambient_command();
     command.args(args);
@@ -125,16 +134,39 @@ pub fn watch_popup(client: Option<&str>) -> anyhow::Result<()> {
 }
 
 fn popup_shell_command(words: &[std::ffi::OsString]) -> anyhow::Result<String> {
-    words
+    let words = words
         .iter()
         .map(|word| {
-            let word = word
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("popup argument is not UTF-8"))?;
-            Ok(format!("'{}'", word.replace('\'', "'\"'\"'")))
+            word.to_str()
+                .ok_or_else(|| anyhow::anyhow!("popup argument is not UTF-8"))
         })
-        .collect::<anyhow::Result<Vec<_>>>()
-        .map(|words| words.join(" "))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(if cfg!(windows) {
+        powershell_command(&words)
+    } else {
+        posix_command(&words)
+    })
+}
+
+fn posix_command(words: &[&str]) -> String {
+    words
+        .iter()
+        .map(|word| format!("'{}'", word.replace('\'', "'\"'\"'")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// rmux on Windows runs popup commands through its `default-shell`, `pwsh`
+/// by default. A line of quoted words is a parse error there — a leading
+/// string is an expression, not a command — so the program needs the call
+/// operator, and a single quote escapes by doubling.
+fn powershell_command(words: &[&str]) -> String {
+    let quoted = words
+        .iter()
+        .map(|word| format!("'{}'", word.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("& {quoted}")
 }
 
 /// Capture the source pane in the binding, before the popup has a pane of its own.
@@ -175,7 +207,7 @@ pub enum Control {
 impl Control {
     pub fn is_rmux(&self) -> bool {
         match self {
-            Self::Ambient => rmux_endpoint().is_some(),
+            Self::Ambient => ambient_rmux().is_some(),
             Self::Endpoint(endpoint) => endpoint.host == HostKind::Rmux,
         }
     }
@@ -187,10 +219,8 @@ impl Control {
                 if let Some(endpoint) = selected_endpoint() {
                     return capture(&endpoint, args).map_err(anyhow::Error::msg);
                 }
-                if let Some(socket) = rmux_endpoint() {
-                    return muxa::RmuxBackend::with_endpoint(socket)
-                        .capture_control(args)
-                        .map_err(anyhow::Error::msg);
+                if let Some(rmux) = ambient_rmux() {
+                    return rmux.capture_control(args).map_err(anyhow::Error::msg);
                 }
                 let output = ambient_command().args(args).output()?;
                 anyhow::ensure!(
@@ -321,17 +351,21 @@ esac
 
     #[test]
     fn popup_arguments_survive_shell_metacharacters() {
-        let words: Vec<std::ffi::OsString> = ["a path/muxa", "it's $HOME; $(false)", ""]
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        let quoted = popup_shell_command(&words).unwrap();
+        let quoted = posix_command(&["a path/muxa", "it's $HOME; $(false)", ""]);
         let output = Command::new("/bin/sh")
             .args(["-c", &format!("printf '%s\\0' {quoted}")])
             .output()
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"a path/muxa\0it's $HOME; $(false)\0\0");
+    }
+
+    #[test]
+    fn powershell_popups_call_the_program_and_double_single_quotes() {
+        assert_eq!(
+            powershell_command(&[r"C:\Program Files\muxa.exe", "watch", "it's $HOME", "%4"]),
+            r"& 'C:\Program Files\muxa.exe' 'watch' 'it''s $HOME' '%4'"
+        );
     }
 
     #[test]

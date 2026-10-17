@@ -542,6 +542,14 @@ fn is_muxa_workspace_manifest(manifest: &Path) -> bool {
 /// banner — we just exec.
 fn cargo_install(repo: &Path, rel_path: &str) -> Result<()> {
     let abs = repo.join(rel_path);
+    if cfg!(windows) {
+        let program = if rel_path.ends_with("muxad") {
+            "muxad"
+        } else {
+            "muxa"
+        };
+        park_running_binary(program);
+    }
     run_streaming(
         Command::new("cargo")
             .arg("install")
@@ -550,6 +558,31 @@ fn cargo_install(repo: &Path, rel_path: &str) -> Result<()> {
             .arg("--locked")
             .arg("--force"),
     )
+}
+
+/// Windows refuses to overwrite an executable while it runs — this very
+/// `muxa`, or the daemon — but lets it be renamed. Move the installed copy
+/// aside so `cargo install` can write a fresh one in its place; the running
+/// process keeps its image, and a restart launches the new file from the
+/// original path. Copies parked by an earlier upgrade go once nothing runs
+/// them. Best-effort: when this fails, cargo reports the real error.
+fn park_running_binary(program: &str) {
+    let Ok(installed) = which::which(program) else {
+        return;
+    };
+    let Some(dir) = installed.parent() else {
+        return;
+    };
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let prefix = format!("{program}.parked-");
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let parked = dir.join(format!("{program}.parked-{}.exe", std::process::id()));
+    let _ = std::fs::rename(&installed, parked);
 }
 
 /// Spawn `cmd` and wait for it. stdout/stderr stay attached to the

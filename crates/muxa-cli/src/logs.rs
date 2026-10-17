@@ -20,8 +20,25 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 
-const DEFAULT_LOG: &str = "/tmp/muxad.log";
-const DEFAULT_ERR: &str = "/tmp/muxad.err";
+/// Where the daemon's stdout lands: `/tmp`, where the launchd plist and a
+/// detached start put it. On Windows `muxa daemon start` writes one combined
+/// log to the temp directory, and there is no separate stderr file.
+pub(crate) fn default_log() -> PathBuf {
+    if cfg!(windows) {
+        std::env::temp_dir().join("muxad.log")
+    } else {
+        PathBuf::from("/tmp/muxad.log")
+    }
+}
+
+/// Where the daemon's stderr lands; the combined log on Windows.
+pub(crate) fn default_err() -> PathBuf {
+    if cfg!(windows) {
+        default_log()
+    } else {
+        PathBuf::from("/tmp/muxad.err")
+    }
+}
 
 /// How often the follow loop wakes to check for newly-appended bytes. 100ms
 /// is responsive enough to feel live without burning CPU on idle daemons.
@@ -96,15 +113,16 @@ pub async fn run(args: Args) -> Result<()> {
 }
 
 fn resolve_source(err_only: bool, no_follow: bool, lines: usize) -> Result<Source> {
-    let log = PathBuf::from(DEFAULT_LOG);
-    let err = PathBuf::from(DEFAULT_ERR);
+    let log = default_log();
+    let err = default_err();
 
     let mut files: Vec<PathBuf> = Vec::new();
     if !err_only && log.exists() {
         files.push(log.clone());
     }
-    if err.exists() {
-        files.push(err);
+    // One combined file on Windows: listed once.
+    if err.exists() && (err_only || err != log) {
+        files.push(err.clone());
     }
 
     if !files.is_empty() {
@@ -132,8 +150,10 @@ fn resolve_source(err_only: bool, no_follow: bool, lines: usize) -> Result<Sourc
     }
 
     anyhow::bail!(
-        "no muxad logs found: neither {DEFAULT_LOG} nor {DEFAULT_ERR} exist, \
-         and `journalctl` is not on PATH. Is muxad running?"
+        "no muxad logs found: neither {} nor {} exist, \
+         and `journalctl` is not on PATH. Is muxad running?",
+        log.display(),
+        err.display()
     )
 }
 

@@ -1485,7 +1485,7 @@ impl Config {
         let text = std::fs::read_to_string(path)?;
         let cfg: Self = toml::from_str(&text).map_err(|e| CoreError::ConfigParse {
             path: path.to_path_buf(),
-            source: e,
+            source: Box::new(e),
         })?;
         cfg.validate().map_err(|source| CoreError::ConfigValidate {
             path: path.to_path_buf(),

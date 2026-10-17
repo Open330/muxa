@@ -1229,7 +1229,7 @@ fn plan_spawn_work(
     if let Some(existing) =
         crate::tmux_work::find_work_in(work, Some(workspace)).map_err(|error| error.to_string())?
     {
-        let existing_cwd = std::fs::canonicalize(&existing.cwd)
+        let existing_cwd = muxa::paths::canonicalize(&existing.cwd)
             .map_err(|error| format!("resolve {}: {error}", existing.cwd.display()))?;
         if existing_cwd != cwd {
             return Err(format!(
@@ -1401,7 +1401,8 @@ impl Effects for RealEffects {
         if !crate::mux_control::supported(endpoint.host) {
             return Err(format!("{} topology spawn is not supported", endpoint.host));
         }
-        let cwd = std::fs::canonicalize(dir).map_err(|error| format!("resolve {dir}: {error}"))?;
+        let cwd =
+            muxa::paths::canonicalize(dir).map_err(|error| format!("resolve {dir}: {error}"))?;
         let cwd = cwd.display().to_string();
         let args = match target {
             TopologyNodeKey::Session(session) => {
@@ -1539,7 +1540,10 @@ impl Effects for RealEffects {
     }
 
     fn send_prompt(&mut self, pane_id: &str, text: &str) -> std::result::Result<(), String> {
-        send_prompt_to_backend(&muxa::TmuxBackend::new(), None, pane_id, text)
+        match crate::mux_control::ambient_rmux() {
+            Some(rmux) => send_prompt_to_backend(&rmux, None, pane_id, text),
+            None => send_prompt_to_backend(&muxa::TmuxBackend::new(), None, pane_id, text),
+        }
     }
 
     fn send_prompt_to(&mut self, pane: &PaneKey, text: &str) -> std::result::Result<(), String> {
@@ -1564,7 +1568,8 @@ impl Effects for RealEffects {
     ) -> std::result::Result<String, String> {
         let base = explicit_work.map_or_else(|| session_base_name(dir), str::to_string);
         let work = crate::tmux_work::normalize_work_id(&base).map_err(|error| error.to_string())?;
-        let cwd = std::fs::canonicalize(dir).map_err(|error| format!("resolve {dir}: {error}"))?;
+        let cwd =
+            muxa::paths::canonicalize(dir).map_err(|error| format!("resolve {dir}: {error}"))?;
         let workspace =
             crate::tmux_work::workspace_id_for_cwd(&cwd).map_err(|error| error.to_string())?;
         let plan = plan_spawn_work(&cwd, &workspace, &work, launch)?;
@@ -1644,10 +1649,27 @@ impl Effects for RealEffects {
             applicable: bool,
         }
 
-        let in_tmux = std::env::var_os("TMUX").is_some();
+        // rmux exports `$TMUX` too, and on Windows there is no tmux to take it.
+        let inside_rmux = std::env::var_os("RMUX").is_some();
+        let in_tmux = std::env::var_os("TMUX").is_some() && !inside_rmux;
         let in_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
         let in_x11 = std::env::var_os("DISPLAY").is_some();
+        let powershell = muxa::shell::powershell().to_string_lossy().into_owned();
         let candidates: &[Cand] = &[
+            // The Windows clipboard first there: it is what a desktop user
+            // pastes from, while an rmux buffer only answers `prefix ]`.
+            Cand {
+                label: "clipboard",
+                bin: &powershell,
+                args: &["-NoLogo", "-NoProfile", "-Command", WINDOWS_SET_CLIPBOARD],
+                applicable: cfg!(windows),
+            },
+            Cand {
+                label: "rmux",
+                bin: "rmux",
+                args: &["load-buffer", "-"],
+                applicable: inside_rmux,
+            },
             Cand {
                 label: "tmux",
                 bin: "tmux",
@@ -1691,15 +1713,23 @@ impl Effects for RealEffects {
                 return Ok(c.label.to_string());
             }
         }
-        // Last-resort fallback: dump to /tmp so the user can `cat` it.
-        let path = format!(
-            "/tmp/muxa-clip-{}.txt",
+        // Last-resort fallback: dump to the temp dir so the user can `cat` it.
+        let path = std::env::temp_dir().join(format!(
+            "muxa-clip-{}.txt",
             OffsetDateTime::now_utc().unix_timestamp()
-        );
+        ));
+        let path = path.display().to_string();
         std::fs::write(&path, text).map_err(|e| format!("write {path}: {e}"))?;
         Ok(format!("tmpfile:{path}"))
     }
 }
+
+/// `PowerShell` reads its standard input in the console code page unless told
+/// otherwise, which mangles anything outside ASCII — Korean included.
+const WINDOWS_SET_CLIPBOARD: &str = "[Console]::InputEncoding = [Text.Encoding]::UTF8; \
+     Set-Clipboard -Value ([Console]::In.ReadToEnd())";
+const WINDOWS_GET_CLIPBOARD: &str = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+     $text = Get-Clipboard -Raw; if ($text) { [Console]::Out.Write($text) }";
 
 fn send_prompt_to_backend(
     backend: &dyn muxa::PaneBackend,
@@ -2186,7 +2216,7 @@ impl SpawnAgent {
     /// an agent parked on its first permission prompt in a window nobody
     /// is watching never runs the command it was created for.
     fn launch_command(self, prompt: &str) -> String {
-        let quoted = shell_single_quote(prompt);
+        let quoted = muxa::shell::Dialect::native().quote(prompt);
         match self {
             Self::Claude => format!("claude --dangerously-skip-permissions {quoted}"),
             Self::Codex => {
@@ -2211,10 +2241,18 @@ fn insert_str_at(text: &mut String, cursor: &mut usize, pasted: &str) {
 /// `copy_to_clipboard`'s backend cascade in reverse; first non-empty
 /// answer wins.
 fn system_clipboard_text() -> Option<String> {
-    let in_tmux = std::env::var_os("TMUX").is_some();
+    let inside_rmux = std::env::var_os("RMUX").is_some();
+    let in_tmux = std::env::var_os("TMUX").is_some() && !inside_rmux;
     let in_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     let in_x11 = std::env::var_os("DISPLAY").is_some();
-    let candidates: [(&str, &[&str], bool); 5] = [
+    let powershell = muxa::shell::powershell().to_string_lossy().into_owned();
+    let candidates: [(&str, &[&str], bool); 7] = [
+        (
+            &powershell,
+            &["-NoLogo", "-NoProfile", "-Command", WINDOWS_GET_CLIPBOARD],
+            cfg!(windows),
+        ),
+        ("rmux", &["save-buffer", "-"], inside_rmux),
         ("tmux", &["save-buffer", "-"], in_tmux),
         ("pbpaste", &[], cfg!(target_os = "macos")),
         ("wl-paste", &["--no-newline"], in_wayland),
@@ -2265,8 +2303,9 @@ fn wrap_input_rows(text: &str, avail: usize) -> Vec<(String, usize)> {
 }
 
 /// POSIX-safe single quoting: close, escape the quote, reopen.
+#[cfg(test)]
 fn shell_single_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
+    muxa::shell::Dialect::Posix.quote(text)
 }
 
 /// tmux session names cannot contain `.` or `:`; everything else from a
@@ -10630,18 +10669,32 @@ fn open_work_up_window(raw: &str, in_tmux: bool) -> std::result::Result<String, 
 /// over-long input, so a work id can still carry a quote or a semicolon and
 /// this string is handed to a shell.
 fn work_up_window_args(exe: &str, work: &str) -> Vec<String> {
-    let command = format!(
-        "{} work up {}; printf '\\n-- enter to close --'; read _",
-        shell_quote(exe),
-        shell_quote(work),
-    );
+    work_up_window_args_in(muxa::shell::Dialect::native(), exe, work)
+}
+
+/// [`work_up_window_args`] for one shell dialect: rmux on Windows runs the
+/// window's command through `PowerShell`, which has neither `printf` nor
+/// `read`, and reads a leading quoted program as a string.
+fn work_up_window_args_in(dialect: muxa::shell::Dialect, exe: &str, work: &str) -> Vec<String> {
+    use muxa::shell::Dialect;
+    let (exe, work) = (dialect.quote(exe), dialect.quote(work));
+    let command = match dialect {
+        Dialect::Posix => {
+            format!("{exe} work up {work}; printf '\\n-- enter to close --'; read _")
+        }
+        Dialect::PowerShell => format!(
+            "& {exe} work up {work}; Write-Host \"`n-- enter to close --\" -NoNewline; \
+             $null = Read-Host"
+        ),
+    };
     vec!["new-window".into(), "-n".into(), "work-up".into(), command]
 }
 
 /// POSIX single-quote quoting: wrap in `'`, and close/escape/reopen around any
 /// embedded `'`.
+#[cfg(test)]
 fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    muxa::shell::Dialect::Posix.quote(value)
 }
 
 /// Whether `list-windows` output already gives `name` to a *different* window.

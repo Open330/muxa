@@ -33,10 +33,24 @@ pub struct Detection {
     pub launchctl_available: bool,
 }
 
+/// The tmux-compatible host `muxa init` writes bindings for. Windows has no
+/// tmux; native rmux speaks the same command surface and is what the bindings
+/// target there (see `files::tmux::default_path`).
+fn tmux_compatible_version() -> Option<String> {
+    #[cfg(windows)]
+    {
+        tool_version("tmux", &["-V"]).or_else(|| tool_version("rmux", &["-V"]))
+    }
+    #[cfg(not(windows))]
+    {
+        tool_version("tmux", &["-V"])
+    }
+}
+
 impl Detection {
     pub fn run() -> Detection {
         Detection {
-            tmux: tool_version("tmux", &["-V"]),
+            tmux: tmux_compatible_version(),
             zellij: tool_version("zellij", &["--version"]),
             cargo: tool_version("cargo", &["--version"]),
             claude_settings: agent_config(super::files::claude::default_path(), "claude"),

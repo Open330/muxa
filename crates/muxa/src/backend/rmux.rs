@@ -368,6 +368,14 @@ pub fn endpoint_from_env() -> Option<String> {
     endpoint_from_value(&std::env::var("RMUX").ok()?)
 }
 
+/// Whether `socket` is an rmux server's control endpoint: a socket under an
+/// `rmux-<uid>` directory on Unix, or a `\\.\pipe\rmux-…` named pipe on
+/// Windows.
+#[must_use]
+pub fn is_endpoint(socket: &str) -> bool {
+    socket.contains("/rmux-") || socket.contains("\\rmux-")
+}
+
 fn namespace_pane_id(pane_id: &str) -> String {
     if pane_id.starts_with(PANE_ID_PREFIX) {
         pane_id.to_string()
@@ -415,9 +423,56 @@ fn rmux_command(endpoint: Option<&str>) -> Command {
         // Commands on a recorded endpoint use their own targets; retain RMUX
         // for session context, but never borrow the calling pane's identity.
         command.env_remove("RMUX_PANE").env_remove("TMUX_PANE");
-        command.arg("-S").arg(endpoint);
+        command.arg("-S").arg(live_endpoint(endpoint));
     }
     command
+}
+
+/// The pipe the server behind `endpoint` listens on now.
+///
+/// On Windows rmux names its pipe `\\.\pipe\rmux-<user>-…-<label hash>-<nonce>`
+/// and draws a fresh nonce every time the server starts, so an endpoint
+/// recorded before a restart — in a snapshot, or by `muxa reload` across its
+/// own `kill-server` — names a pipe that no longer exists. The rest of the
+/// name is the same user and socket label, which is the server meant. The
+/// pipe directory is only listed, never opened, so no server sees a client.
+#[must_use]
+pub fn live_endpoint(endpoint: &str) -> String {
+    if !cfg!(windows) {
+        return endpoint.to_owned();
+    }
+    let Some(name) = endpoint.strip_prefix(r"\\.\pipe\") else {
+        return endpoint.to_owned();
+    };
+    let Ok(entries) = std::fs::read_dir(r"\\.\pipe\") else {
+        return endpoint.to_owned();
+    };
+    let names: Vec<String> = entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    restarted_pipe(name, &names)
+        .map_or_else(|| endpoint.to_owned(), |live| format!(r"\\.\pipe\{live}"))
+}
+
+/// Pure half of [`live_endpoint`]: `None` while `name` itself is listed (or
+/// it has no nonce to replace), else the one listed pipe that differs from it
+/// only in its final `-<nonce>`.
+fn restarted_pipe<'a>(name: &str, listed: &'a [String]) -> Option<&'a str> {
+    if listed.iter().any(|pipe| pipe == name) {
+        return None;
+    }
+    let (stem, nonce) = name.rsplit_once('-')?;
+    if nonce.is_empty() || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut candidates = listed.iter().filter(|pipe| {
+        pipe.strip_prefix(stem)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit()))
+    });
+    let live = candidates.next()?;
+    candidates.next().is_none().then_some(live.as_str())
 }
 
 /// `list-sessions` and `list-clients` stdout from the default rmux server, for
@@ -469,12 +524,13 @@ fn rmux_binary() -> &'static Path {
 
 fn rmux_fallback_candidates(home: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::with_capacity(4);
+    let program = if cfg!(windows) { "rmux.exe" } else { "rmux" };
     if let Some(home) = home {
         // rmux's official installer defaults to ~/.local/bin. Cargo installs
         // into ~/.cargo/bin. Neither is guaranteed to be in systemd/launchd's
         // PATH, so both must be resolved explicitly for muxad.
-        candidates.push(home.join(".local/bin/rmux"));
-        candidates.push(home.join(".cargo/bin/rmux"));
+        candidates.push(home.join(".local").join("bin").join(program));
+        candidates.push(home.join(".cargo").join("bin").join(program));
     }
     candidates.push(PathBuf::from("/opt/homebrew/bin/rmux"));
     candidates.push(PathBuf::from("/usr/local/bin/rmux"));
@@ -641,9 +697,38 @@ mod tests {
 
     #[test]
     fn daemon_fallbacks_cover_official_and_cargo_user_installs() {
-        let candidates = rmux_fallback_candidates(Some(Path::new("/home/tester")));
-        assert_eq!(candidates[0], PathBuf::from("/home/tester/.local/bin/rmux"));
-        assert_eq!(candidates[1], PathBuf::from("/home/tester/.cargo/bin/rmux"));
+        let home = Path::new("/home/tester");
+        let program = if cfg!(windows) { "rmux.exe" } else { "rmux" };
+        let candidates = rmux_fallback_candidates(Some(home));
+        assert_eq!(candidates[0], home.join(".local").join("bin").join(program));
+        assert_eq!(candidates[1], home.join(".cargo").join("bin").join(program));
+    }
+
+    #[test]
+    fn a_restarted_windows_server_is_found_by_its_label() {
+        let old = "rmux-S-1-5-21-1001-il-high-g-a2e5d6-e896b048";
+        let listed = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        // The recorded pipe is still there: nothing to re-resolve.
+        assert_eq!(restarted_pipe(old, &listed(&[old, "other"])), None);
+        // Restarted: same user and label, new nonce.
+        let pipes = listed(&[
+            "rmux-S-1-5-21-1001-il-high-g-a2e5d6-ad57aac8",
+            "rmux-S-1-5-21-1001-il-high-g-ffff00-0001",
+        ]);
+        assert_eq!(
+            restarted_pipe(old, &pipes),
+            Some("rmux-S-1-5-21-1001-il-high-g-a2e5d6-ad57aac8")
+        );
+        // Another label, or two candidates, is not a guess worth making.
+        assert_eq!(
+            restarted_pipe(old, &listed(&["rmux-S-1-5-21-1001-il-high-g-ffff00-0001"])),
+            None
+        );
+        let twins = listed(&[
+            "rmux-S-1-5-21-1001-il-high-g-a2e5d6-01",
+            "rmux-S-1-5-21-1001-il-high-g-a2e5d6-02",
+        ]);
+        assert_eq!(restarted_pipe(old, &twins), None);
     }
 
     /// Exercise the public CLI transport against an explicitly isolated rmux

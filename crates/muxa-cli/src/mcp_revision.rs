@@ -50,12 +50,16 @@ pub(crate) fn server_version() -> String {
         .clone()
 }
 
+// Applied through Codex's Unix control socket; on other platforms a plan is
+// prepared and reported but never written.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct RevisionPlan {
     pub path: PathBuf,
     pub revision: String,
     before: String,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 impl RevisionPlan {
     pub fn prepare(home: &Path, binary: &Path, revision: &str) -> Result<Option<Self>> {
         let path = home.join("config.toml");

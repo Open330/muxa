@@ -26,6 +26,7 @@ mod message_skill;
 mod mux_control;
 mod onboarding;
 mod orchestration;
+mod owner_only;
 mod peek;
 mod relay;
 mod reload;
@@ -67,7 +68,7 @@ use muxa::{
 use owo_colors::Style;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 use theme::{CliTheme, TableTone, ThemeArg};
 use time::OffsetDateTime;
@@ -2667,6 +2668,27 @@ async fn cmd_detach(client: &Client, session: &str) -> Result<()> {
     Ok(())
 }
 
+// `Option` because the Windows arm can fail to find its own process.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn parent_pid() -> Option<u32> {
+    Some(std::os::unix::process::parent_id())
+}
+
+/// Windows has no `getppid`; the process table records the parent instead.
+#[cfg(not(unix))]
+fn parent_pid() -> Option<u32> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let own = Pid::from_u32(std::process::id());
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[own]),
+        false,
+        ProcessRefreshKind::nothing(),
+    );
+    system.process(own)?.parent().map(Pid::as_u32)
+}
+
 async fn cmd_register(
     client: &Client,
     name: String,
@@ -2676,7 +2698,7 @@ async fn cmd_register(
 ) -> Result<()> {
     // Default to the calling shell so `muxa proc register --name X` from a pane
     // tracks that shell without the user hunting for a pid.
-    let pid = pid.or_else(|| Some(std::os::unix::process::parent_id()));
+    let pid = pid.or_else(parent_pid);
     client
         .register(&name, pid, cwd.as_deref(), pane.as_deref(), None)
         .await?;
@@ -3608,14 +3630,14 @@ fn rmux_client_from_context(listing: &str, context: &str) -> Option<String> {
         .filter_map(|line| line.split_once('\t'))
         .collect();
     if clients.len() == 1 {
-        return Some(clients[0].0.to_string());
+        return Some((*clients[0].0).to_string());
     }
     let session = context.split(',').nth(2)?.trim_start_matches('$');
     let mut matches = clients
         .iter()
         .filter(|(_, id)| id.trim_start_matches('$') == session);
     let (client, _) = matches.next()?;
-    matches.next().is_none().then(|| client.to_string())
+    matches.next().is_none().then(|| (*client).to_string())
 }
 
 fn jump_to_pane_rmux_target(socket: &str, session: &str, window: &str, pane: &str) {
@@ -3793,12 +3815,11 @@ fn alias_target(ev: &muxa::event::AgentEvent) -> Option<(String, &'static str)> 
     Some((pane, watch::agent_kind_short(id.kind)))
 }
 
-/// Spawn `cmd` via `/bin/sh -c`, feed it `stdin_bytes`, stream its stdout to
-/// our stdout, and return its exit code (128 + signal if killed by signal).
+/// Spawn `cmd` through the local shell (`/bin/sh -c`, `PowerShell` on
+/// Windows), feed it `stdin_bytes`, stream its stdout to our stdout, and
+/// return its exit code (128 + signal if killed by signal).
 fn run_forward(cmd: &str, stdin_bytes: &[u8]) -> Result<i32> {
-    let mut child = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(cmd)
+    let mut child = muxa::shell::script_command(cmd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // stderr is inherited so the forwarded tool can report errors.
@@ -3823,17 +3844,15 @@ fn run_forward(cmd: &str, stdin_bytes: &[u8]) -> Result<i32> {
     let status = child
         .wait()
         .with_context(|| "failed to wait on forward command")?;
-    Ok(status.code().unwrap_or_else(|| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            status.signal().map_or(1, |s| 128 + s)
-        }
-        #[cfg(not(unix))]
-        {
-            1
-        }
-    }))
+    #[cfg(unix)]
+    let code = status.code().unwrap_or_else(|| {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map_or(1, |s| 128 + s)
+    });
+    // No signals on Windows: an exit code is always there.
+    #[cfg(not(unix))]
+    let code = status.code().unwrap_or(1);
+    Ok(code)
 }
 
 async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
@@ -3854,8 +3873,9 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
                 // Best-effort Heartbeat: parse errors on stdin must never
                 // cause the status line to fail, so log and move on.
                 if let Ok(input) = serde_json::from_slice::<claude::StatusLineInput>(&buf) {
-                    let pane = std::env::var("TMUX_PANE").ok();
-                    let ev = claude::statusline_heartbeat(input, pane);
+                    let pane = muxa::adapters::hook::host_pane_env();
+                    let mut ev = claude::statusline_heartbeat(input, pane);
+                    muxa::adapters::hook::stamp_pane_endpoint(&mut ev);
                     best_effort_ingest(client, &ev).await;
                 } else {
                     tracing::debug!("claude-statusline: stdin was not valid statusline JSON");
@@ -3884,8 +3904,11 @@ async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
                 .map(|u| format!(" · ${u:.2}"))
                 .unwrap_or_default();
             println!("{label}{ctx}{cost}");
-            let pane = std::env::var("TMUX_PANE").ok();
-            let ev = claude::statusline_heartbeat(input, pane);
+            // Same resolution as the event hooks, so an rmux pane is stamped
+            // `rmux:%N` rather than read back as a bare tmux `%N`.
+            let pane = muxa::adapters::hook::host_pane_env();
+            let mut ev = claude::statusline_heartbeat(input, pane);
+            muxa::adapters::hook::stamp_pane_endpoint(&mut ev);
             best_effort_ingest(client, &ev).await;
         }
         HookCmd::Codex { event } => {

@@ -1123,7 +1123,7 @@ fn rebuild_shape(
                 "send-keys",
                 "-t",
                 &target,
-                &format!("cd {}", shell_quote(&pane.path)),
+                &muxa::shell::Dialect::native().cd(&pane.path),
                 "Enter",
             ],
         ) {
@@ -1370,10 +1370,7 @@ fn relaunch_command(pane: &PaneShape) -> Option<String> {
                 Some(kind) => without_initial_prompt(argv, kind),
                 None => argv.to_vec(),
             };
-            argv.iter()
-                .map(|argument| shell_word(argument))
-                .collect::<Vec<_>>()
-                .join(" ")
+            muxa::shell::Dialect::native().command_line(&argv)
         }
         _ => pane.command.clone()?,
     };
@@ -1461,13 +1458,15 @@ fn without_initial_prompt(argv: &[String], kind: &str) -> Vec<String> {
         _ => return argv.to_vec(),
     };
     let program = |argument: &str| {
-        let name = argument.rsplit('/').next().unwrap_or(argument);
+        let name = muxa::shell::program_name(argument);
         matches!(name, "claude" | "codex") || name.ends_with("@claude") || name.ends_with("@codex")
     };
     let start = argv
         .iter()
         .rposition(|argument| argument == "--" || program(argument))
-        .map_or(0, |at| at + 1);
+        // Unrecognised, argv[0] is still the program — never a prompt, even
+        // when its path has a space in it (`C:\Program Files\…`).
+        .map_or(usize::from(!argv.is_empty()), |at| at + 1);
     let mut kept = argv[..start].to_vec();
     let mut takes_value = false;
     for argument in &argv[start..] {
@@ -1557,18 +1556,40 @@ fn wait_for_shell(endpoint: &BackendEndpoint, target: &str) -> bool {
 }
 
 /// `#{pane_current_command}`, or `None` when the server did not answer.
+///
+/// A Windows console has no foreground process group, so rmux there reports
+/// the pane's shell for as long as it lives, whatever runs inside it. A
+/// program the shell started is read from the process table instead.
 fn foreground(endpoint: &BackendEndpoint, target: &str) -> Option<String> {
-    mux_control::capture(
+    let reply = mux_control::capture(
         endpoint,
         &[
             "display-message",
             "-p",
             "-t",
             target,
-            "#{pane_current_command}",
+            "#{pane_current_command}\t#{pane_pid}",
         ],
     )
-    .ok()
+    .ok()?;
+    let reply = reply.trim_end_matches(['\r', '\n']);
+    let (command, pane_pid) = reply.split_once('\t').unwrap_or((reply, ""));
+    #[cfg(not(windows))]
+    let _ = pane_pid;
+    #[cfg(windows)]
+    if is_shell(command.trim()) {
+        if let Ok(pane_pid) = pane_pid.trim().parse::<u32>() {
+            if let Some(child) = process::ProcessTable::read().child_command(pane_pid) {
+                let program = child
+                    .argv
+                    .as_ref()
+                    .and_then(|argv| argv.first())
+                    .map_or(child.command.as_str(), String::as_str);
+                return Some(muxa::shell::program_name(program).to_owned());
+            }
+        }
+    }
+    Some(command.to_owned())
 }
 
 /// The pane's terminal device, for reading its mode.
@@ -1668,24 +1689,6 @@ fn wait_for_sessions_to_settle(endpoint: &BackendEndpoint) {
     }
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
-}
-
-/// One argument as a shell reads it back: bare when it is plainly a word,
-/// quoted otherwise, so the relaunch hands the program the same argv.
-fn shell_word(value: &str) -> String {
-    let plain = !value.is_empty()
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_-./:=@%+,".contains(c));
-    if plain {
-        value.to_owned()
-    } else {
-        shell_quote(value)
-    }
-}
-
 fn summary(snapshot: &Snapshot) -> String {
     let sessions: std::collections::BTreeSet<_> = snapshot
         .windows
@@ -1730,15 +1733,36 @@ async fn resolve_endpoint(client: &Client, socket: Option<&str>) -> Result<Backe
             let (socket, host) = sockets.into_iter().next().expect("one entry");
             endpoint_for(&host, socket)
         }
-        0 => bail!(
-            "muxad tracks no tmux/rmux agents, so there is nothing to work out the \
-             target server from; pass --mux-socket"
-        ),
+        // No tracked agents — common before any agent hook is installed —
+        // leaves the server this shell runs in as the only honest guess.
+        0 => match shell_server(|name| std::env::var(name).ok()) {
+            Some((socket, host)) => endpoint_for(&host.to_string(), socket),
+            None => bail!(
+                "muxad tracks no tmux/rmux agents and this shell is not inside one, \
+                 so there is nothing to work out the target server from; pass --mux-socket"
+            ),
+        },
         _ => bail!(
             "agents span several servers ({}); pass --mux-socket to name one",
             sockets.keys().cloned().collect::<Vec<_>>().join(", ")
         ),
     }
+}
+
+/// The server the calling shell is inside, read from the variable its host
+/// exports (`$RMUX` for rmux, `$TMUX` for tmux): `<socket>,<pid>,<session>`.
+/// `read` stands in for `std::env::var` so tests need not mutate the
+/// process environment.
+fn shell_server(read: impl Fn(&str) -> Option<String>) -> Option<(String, HostKind)> {
+    let host = muxa::backend::detect_host_env_with(&read)?;
+    let var = match host {
+        HostKind::Rmux => "RMUX",
+        HostKind::Tmux => "TMUX",
+        _ => return None,
+    };
+    let raw = read(var)?;
+    let socket = raw.split(',').next().filter(|path| !path.is_empty())?;
+    Some((socket.to_owned(), host))
 }
 
 /// The control sockets muxa's tracked agents live on, each with its host.
@@ -1756,7 +1780,14 @@ async fn tracked_servers(client: &Client) -> Result<BTreeMap<String, String>> {
             continue;
         };
         if mux_control::supported(host) {
-            sockets.insert(socket.clone(), host.to_string());
+            // An agent last heard from before an rmux restart still names
+            // the old Windows pipe; it is the same server as the live one.
+            let socket = if host == HostKind::Rmux {
+                muxa::backend::rmux::live_endpoint(socket)
+            } else {
+                socket.clone()
+            };
+            sockets.insert(socket, host.to_string());
         }
     }
     Ok(sockets)
@@ -1778,7 +1809,7 @@ fn endpoint_for(host: &str, socket: String) -> Result<BackendEndpoint> {
 /// rmux and cmux keep their sockets in their own directories, which is the
 /// only hint left once the shell is outside every multiplexer.
 fn host_from_socket_path(socket: &str) -> Option<HostKind> {
-    if socket.contains("/rmux-") {
+    if muxa::backend::rmux::is_endpoint(socket) {
         Some(HostKind::Rmux)
     } else if socket.contains("/cmux-") {
         Some(HostKind::Cmux)
@@ -1939,10 +1970,7 @@ fn split_cmdline(raw: &[u8]) -> Vec<String> {
 }
 
 fn is_shell(command: &str) -> bool {
-    matches!(
-        command.trim_start_matches('-'),
-        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh"
-    )
+    muxa::shell::is_shell_program(command)
 }
 
 #[cfg(test)]
@@ -1960,6 +1988,32 @@ mod tests {
             argv: None,
             agent: None,
         }
+    }
+
+    #[test]
+    fn the_shells_own_server_is_the_fallback_target() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        // rmux exports both variables; its own wins.
+        assert_eq!(
+            shell_server(env(&[
+                ("RMUX", r"\\.\pipe\rmux-a,23380,3"),
+                ("TMUX", r"\\.\pipe\rmux-a,23380,3"),
+            ])),
+            Some((r"\\.\pipe\rmux-a".to_owned(), HostKind::Rmux))
+        );
+        assert_eq!(
+            shell_server(env(&[("TMUX", "/tmp/tmux-1000/default,42,0")])),
+            Some(("/tmp/tmux-1000/default".to_owned(), HostKind::Tmux))
+        );
+        assert_eq!(shell_server(env(&[])), None);
+        assert_eq!(shell_server(env(&[("ZELLIJ", "0")])), None);
     }
 
     #[test]
@@ -2402,10 +2456,5 @@ mod tests {
         );
         assert_eq!(split_cmdline(b"sleep\x00777\x00"), vec!["sleep", "777"]);
         assert!(split_cmdline(b"").is_empty());
-    }
-
-    #[test]
-    fn shell_quoting_survives_an_apostrophe() {
-        assert_eq!(shell_quote("/tmp/june's dir"), r"'/tmp/june'\''s dir'");
     }
 }

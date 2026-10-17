@@ -432,6 +432,10 @@ pub fn installed_programs() -> Vec<String> {
 /// Whether `program` resolves to an executable on `PATH`.
 #[must_use]
 pub fn is_installed(program: &str) -> bool {
+    if cfg!(windows) {
+        // `claude.exe`, `codex.cmd`: the bare name is never the file there.
+        return crate::shell::find_program(program).is_some();
+    }
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };

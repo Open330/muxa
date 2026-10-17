@@ -1053,6 +1053,7 @@ fn secure_database_files(path: &Path) -> Result<(), CollaborationError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // same signature as the Unix arm
 fn secure_database_files(_path: &Path) -> Result<(), CollaborationError> {
     Ok(())
 }
@@ -1078,6 +1079,7 @@ fn prepare_database_file(path: &Path) -> Result<(), CollaborationError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // same signature as the Unix arm
 fn prepare_database_file(_path: &Path) -> Result<(), CollaborationError> {
     Ok(())
 }
@@ -3320,10 +3322,12 @@ pub fn resolve_target(
     if scope == crate::config::CollaborationScope::Host {
         let pane = selector.strip_prefix("pane:").unwrap_or(selector);
         if crate::backend::pane_id_host_kind(pane).is_some() {
-            let matches: Vec<_> = participants
-                .iter()
-                .filter(|candidate| candidate.pane == pane && !candidate.same_endpoint(sender))
-                .collect();
+            let matches = in_sender_namespace_first(pane, sender, |pane| {
+                participants
+                    .iter()
+                    .filter(|candidate| candidate.pane == pane && !candidate.same_endpoint(sender))
+                    .collect()
+            });
             return match matches.as_slice() {
                 [participant] => Ok((*participant).clone()),
                 [] => Err(CollaborationError::UnknownTarget(selector.to_string())),
@@ -3370,15 +3374,47 @@ pub fn resolve_target(
         return select_target(matches, selector);
     }
     let pane = selector.strip_prefix("pane:").unwrap_or(selector);
-    let matches: Vec<_> = peers
-        .into_iter()
-        .filter(|candidate| {
-            candidate.pane == pane
-                || candidate.label() == selector
-                || format!("{}@{}", candidate.agent_kind, candidate.pane) == selector
-        })
-        .collect();
+    let matches = in_sender_namespace_first(pane, sender, |pane| {
+        peers
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                candidate.pane == pane
+                    || candidate.label() == selector
+                    || format!("{}@{}", candidate.agent_kind, candidate.pane) == selector
+            })
+            .collect()
+    });
     select_target(matches, selector)
+}
+
+/// Match `pane` read in the sender's namespace first, then as typed: a bare
+/// `%N` from an rmux pane usually means a peer on that same server, but a
+/// tmux pane has no prefix to name it by, so it must stay reachable.
+fn in_sender_namespace_first<'p>(
+    pane: &str,
+    sender: &Participant,
+    find: impl Fn(&str) -> Vec<&'p Participant>,
+) -> Vec<&'p Participant> {
+    let namespaced = in_sender_namespace(pane, sender);
+    let matches = find(&namespaced);
+    if matches.is_empty() && namespaced != pane {
+        find(pane)
+    } else {
+        matches
+    }
+}
+
+/// A bare `%N` read in the sender's pane namespace. rmux shows and exports
+/// `%N` while muxa stores its panes as `rmux:%N`, so a target typed the way
+/// rmux displays it would otherwise never match a peer on the same server.
+fn in_sender_namespace<'a>(pane: &'a str, sender: &Participant) -> std::borrow::Cow<'a, str> {
+    match sender.pane.find('%') {
+        Some(at) if at > 0 && pane.starts_with('%') => {
+            std::borrow::Cow::Owned(format!("{}{pane}", &sender.pane[..at]))
+        }
+        _ => std::borrow::Cow::Borrowed(pane),
+    }
 }
 
 fn select_target(
@@ -3417,6 +3453,8 @@ pub fn resolve_pending_pane_target(
     if !pane_id.starts_with('%') && crate::backend::pane_id_host_kind(pane_id).is_none() {
         return Err(CollaborationError::UnknownTarget(selector.to_string()));
     }
+    let pane_id = in_sender_namespace(pane_id, sender);
+    let pane_id = pane_id.as_ref();
     if pane_id == sender.pane {
         return Err(CollaborationError::UnknownTarget(selector.to_string()));
     }
@@ -6091,6 +6129,39 @@ mod tests {
                 .pane,
             "%2"
         );
+    }
+
+    /// rmux displays `%N` but muxa stores `rmux:%N`; the id as displayed must
+    /// still name the peer on the sender's own server.
+    #[test]
+    fn a_bare_pane_id_resolves_in_the_rmux_senders_namespace() {
+        let sender = participant("rmux:%1", "sender");
+        let peers = vec![sender.clone(), participant("rmux:%2", "two")];
+        for selector in ["%2", "pane:%2", "rmux:%2"] {
+            for scope in [CollaborationScope::Window, CollaborationScope::Host] {
+                assert_eq!(
+                    resolve_target(&sender, selector, &peers, scope)
+                        .unwrap()
+                        .pane,
+                    "rmux:%2",
+                    "{selector} under {scope:?}"
+                );
+            }
+        }
+    }
+
+    /// A tmux pane has no prefix, so an rmux sender can only name it bare.
+    #[test]
+    fn a_bare_pane_id_still_reaches_a_tmux_peer_from_an_rmux_sender() {
+        let sender = participant("rmux:%1", "sender");
+        let peers = vec![sender.clone(), participant("%2", "tmux")];
+        for scope in [CollaborationScope::Window, CollaborationScope::Host] {
+            assert_eq!(
+                resolve_target(&sender, "%2", &peers, scope).unwrap().pane,
+                "%2",
+                "{scope:?}"
+            );
+        }
     }
 
     #[test]

@@ -17,13 +17,52 @@ pub const DASHBOARD_WORK_FILENAME: &str = "dashboard-work.json";
 pub const SNAPSHOT_DIRNAME: &str = "snapshots";
 pub const PIPELINE_RUN_FILENAME: &str = "pipeline-runs.json";
 
+/// [`std::fs::canonicalize`] in the form the rest of the system writes paths.
+///
+/// Windows canonicalizes to a verbatim path (`\\?\F:\work`), which no shell,
+/// hook payload or multiplexer reports. Paths are compared as strings — an
+/// agent's cwd against a pane's — so the prefix is dropped where the plain
+/// form means the same thing.
+pub fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<PathBuf> {
+    let resolved = std::fs::canonicalize(path)?;
+    Ok(without_verbatim_prefix(resolved))
+}
+
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
 /// Default daemon socket path. Prefers `$XDG_RUNTIME_DIR/muxa.sock`; falls
 /// back to `/tmp/muxa-<uid>.sock` when the runtime dir is unset.
 pub fn default_socket() -> PathBuf {
     if let Some(dir) = xdg_dir("XDG_RUNTIME_DIR", dirs::runtime_dir) {
         return dir.join(SOCKET_FILENAME);
     }
-    PathBuf::from(format!("/tmp/muxa-{}.sock", posix_uid()))
+    #[cfg(unix)]
+    {
+        PathBuf::from(format!("/tmp/muxa-{}.sock", posix_uid()))
+    }
+    // No `$XDG_RUNTIME_DIR` and no `/tmp` worth writing to: fall back to the
+    // per-user local data directory. On Windows the path is not bound to a
+    // filesystem object anyway — the transport derives a pipe name from it —
+    // but it is still what `create_dir_all` runs against, and creating a
+    // `\tmp` at the drive root would be a surprising thing for a daemon to do.
+    #[cfg(not(unix))]
+    {
+        dirs::data_local_dir().map_or_else(
+            || PathBuf::from(SOCKET_FILENAME),
+            |d| d.join(CONFIG_DIRNAME).join(SOCKET_FILENAME),
+        )
+    }
 }
 
 /// Default config file path: `$XDG_CONFIG_HOME/muxa/config.toml`, falling
@@ -110,6 +149,7 @@ pub fn default_pipeline_run_file() -> Option<PathBuf> {
         .map(|d| d.join(CONFIG_DIRNAME).join(PIPELINE_RUN_FILENAME))
 }
 
+#[cfg(unix)]
 fn posix_uid() -> u32 {
     std::process::Command::new("id")
         .arg("-u")
@@ -134,6 +174,26 @@ fn absolute_override(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbatim_windows_paths_come_back_plain() {
+        let plain = |raw: &str| without_verbatim_prefix(PathBuf::from(raw));
+        assert_eq!(
+            plain(r"\\?\F:\workspace\muxa"),
+            PathBuf::from(r"F:\workspace\muxa")
+        );
+        assert_eq!(
+            plain(r"\\?\UNC\server\share\x"),
+            PathBuf::from(r"\\server\share\x")
+        );
+        // A verbatim path with no plain spelling is left alone, as is any
+        // path that never had the prefix.
+        assert_eq!(
+            plain(r"\\?\Volume{abc}\x"),
+            PathBuf::from(r"\\?\Volume{abc}\x")
+        );
+        assert_eq!(plain("/home/june/work"), PathBuf::from("/home/june/work"));
+    }
 
     #[test]
     fn explicit_xdg_paths_support_sandbox_isolation_on_every_platform() {

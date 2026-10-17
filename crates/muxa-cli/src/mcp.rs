@@ -2243,8 +2243,8 @@ fn persist_peer_dispatch(
     pane: &muxa::PaneKey,
     request: &NewRequest,
 ) -> anyhow::Result<()> {
+    use crate::owner_only::OwnerOnly;
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let root =
         muxa::paths::default_node_id_file().ok_or_else(|| anyhow::anyhow!("no data directory"))?;
     let dir = root
@@ -2260,7 +2260,7 @@ fn persist_peer_dispatch(
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .owner_only(0o600)
         .open(&path)
     {
         Ok(mut file) => {

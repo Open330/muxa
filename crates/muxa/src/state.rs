@@ -312,7 +312,11 @@ fn pid_alive(pid: u32) -> bool {
     {
         std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        crate::process_snapshot::pid_exists(pid)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])

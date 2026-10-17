@@ -128,6 +128,24 @@ set-window-option -g automatic-rename off
 # prefix + , renames through muxa: whitespace to `-`, duplicates refused.
 bind-key , command-prompt -F -I "#W" "set-buffer -b 'muxa-window-name-#{client_pid}' -- \"%%%\" ; run-shell \"muxa window rename --window '#{window_id}' --buffer 'muxa-window-name-#{client_pid}'; tmux delete-buffer -b 'muxa-window-name-#{client_pid}' 2>/dev/null || true\"""##;
 
+/// [`WINDOW_NAMES_BODY`] for rmux on Windows, whose `run-shell` hands the
+/// command to `PowerShell`: no `/dev/null`, no `true`, and no `tmux` binary.
+/// `$null` is out too — tmux's config parser expands `$…` inside double
+/// quotes — so the cleanup's output is discarded through a pipe instead.
+pub const WINDOWS_WINDOW_NAMES_BODY: &str = r##"# muxa owns window names: a window is a Work Run, not the process in it.
+# `muxa window rename --auto` opts one window back into tmux's dynamic name.
+set-window-option -g automatic-rename off
+# prefix + , renames through muxa: whitespace to `-`, duplicates refused.
+bind-key , command-prompt -F -I "#W" "set-buffer -b 'muxa-window-name-#{client_pid}' -- \"%%%\" ; run-shell \"muxa window rename --window '#{window_id}' --buffer 'muxa-window-name-#{client_pid}'; rmux delete-buffer -b 'muxa-window-name-#{client_pid}' 2>&1 | Out-Null\"""##;
+
+fn window_names_body() -> &'static str {
+    if cfg!(windows) {
+        WINDOWS_WINDOW_NAMES_BODY
+    } else {
+        WINDOW_NAMES_BODY
+    }
+}
+
 /// The body that goes inside the `tmux-statusline` marker block.
 ///
 /// Two segments: a GLOBAL attention summary (`⚠ N need you`, red, empty
@@ -151,8 +169,14 @@ set -g status-right "#(muxa status-line --needs-attention) #(muxa status-line --
 pub fn env_body(socket: &std::path::Path) -> String {
     // Quote the path so a shell-special character in $XDG_RUNTIME_DIR
     // (rare but possible) doesn't break tmux's parser. Embedded `"` in
-    // a path is exotic enough that we just escape it conservatively.
-    let escaped = socket.display().to_string().replace('"', r#"\""#);
+    // a path is exotic enough that we just escape it conservatively. A
+    // backslash — every Windows path separator — starts an escape inside
+    // double quotes (`\U…` is a code point), so it is doubled first.
+    let escaped = socket
+        .display()
+        .to_string()
+        .replace('\\', r"\\")
+        .replace('"', r#"\""#);
     format!(
         "# Pin the muxad IPC socket path so panes started in any tmux\n\
          # session can reach the daemon regardless of when their parent\n\
@@ -170,7 +194,7 @@ pub fn upsert(original: &str, component: Component) -> (String, Outcome) {
         Component::TmuxPopup => marker::upsert(original, component.id(), POPUP_BODY),
         Component::TmuxStatusLine => marker::upsert(original, component.id(), STATUSLINE_BODY),
         Component::TmuxPeek => marker::upsert(original, component.id(), PEEK_BODY),
-        Component::TmuxWindowNames => marker::upsert(original, component.id(), WINDOW_NAMES_BODY),
+        Component::TmuxWindowNames => marker::upsert(original, component.id(), window_names_body()),
         Component::TmuxAutoView => marker::upsert(original, component.id(), AUTO_VIEW_BODY),
         _ => (original.to_string(), Outcome::Unchanged),
     }
@@ -201,8 +225,16 @@ pub fn remove_env(original: &str) -> (String, Outcome) {
 /// Default path for `~/.tmux.conf`. Returns `None` only if `$HOME` is
 /// unset, which is exotic enough that we let the caller decide how to
 /// surface the error.
+///
+/// On Windows the only multiplexer is native rmux, which reads
+/// `~/.rmux.conf` (then `%APPDATA%\rmux\rmux.conf`) and never `~/.tmux.conf`,
+/// so the bindings go where they will actually be sourced.
 pub fn default_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".tmux.conf"))
+    #[cfg(windows)]
+    let name = ".rmux.conf";
+    #[cfg(not(windows))]
+    let name = ".tmux.conf";
+    dirs::home_dir().map(|h| h.join(name))
 }
 
 #[cfg(test)]

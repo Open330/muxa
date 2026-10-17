@@ -39,6 +39,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 
@@ -112,6 +113,13 @@ struct Args {
     /// `::1`.
     #[arg(long)]
     allow_public: bool,
+
+    /// Append logs to this file instead of writing them to stderr. The file
+    /// is opened shared, so a successor can append while its predecessor
+    /// still holds it — what `muxa daemon start` relies on on Windows, where
+    /// the daemon has no stderr worth keeping.
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -126,21 +134,48 @@ async fn main() -> Result<()> {
     // and those warnings were silently swallowed on the daemon path. The
     // log filter comes from `RUST_LOG` (env), not config, so there's no
     // chicken-and-egg.
+    let log_file = args
+        .log_file
+        .as_deref()
+        .map(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("opening log file {}", path.display()))
+        })
+        .transpose()?;
+    let to_file = log_file.is_some();
+    let writer = match log_file {
+        Some(file) => {
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::sync::Mutex::new(file))
+        }
+        // Daemon logs go to stderr — stdout is reserved for any future
+        // tool-friendly output, and external tooling (systemd, e2e
+        // tests) expects logs on stderr.
+        None => tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr),
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "muxa=info".into()),
         )
-        // Daemon logs go to stderr — stdout is reserved for any future
-        // tool-friendly output, and external tooling (systemd, e2e
-        // tests) expects logs on stderr.
-        .with_writer(std::io::stderr)
+        .with_writer(writer)
         // Disable ANSI escapes when stderr isn't a TTY. systemd-journald
         // captures the bytes verbatim; without this, `journalctl -u muxad`
         // is full of literal `\e[1m` debris. Same logic helps anything
         // grep-ing piped logs (the e2e tests included).
-        .with_ansi(std::io::stderr().is_terminal())
+        .with_ansi(!to_file && std::io::stderr().is_terminal())
         .init();
+    if to_file {
+        // A panic message goes to stderr, which a file-logging daemon does
+        // not keep; record it where the rest of the log is.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!(%info, "muxad panicked");
+            previous(info);
+        }));
+    }
 
     let config_path = args.config.clone().or_else(paths::default_config_file);
     let mut cfg = Config::load_or_default(config_path.as_deref()).context("loading config")?;
@@ -537,7 +572,12 @@ fn restart_generation() -> u64 {
 /// Replace this process with the binary now resolved by its original argv[0].
 /// `exec` preserves pid, argv, environment, working directory and the service
 /// manager's ownership while loading the newly installed inode.
+///
+/// Windows has no `exec`: the replacement is spawned as a new process and this
+/// one exits once the spawn succeeds. The IPC endpoint was already released by
+/// the drain above, so the successor can bind it; the pid changes.
 fn reexec_self() -> std::io::Error {
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
 
     let mut argv = std::env::args_os();
@@ -546,10 +586,21 @@ fn reexec_self() -> std::io::Error {
     };
     let next = restart_generation().saturating_add(1);
     tracing::info!(?program, generation = next, "restarting: re-executing self");
-    std::process::Command::new(&program)
+    let mut command = std::process::Command::new(&program);
+    command
         .args(argv)
-        .env(RESTART_GENERATION_ENV, next.to_string())
-        .exec()
+        .env(RESTART_GENERATION_ENV, next.to_string());
+    #[cfg(unix)]
+    {
+        command.exec()
+    }
+    #[cfg(not(unix))]
+    {
+        match command.spawn() {
+            Ok(_) => std::process::exit(0),
+            Err(error) => error,
+        }
+    }
 }
 
 async fn await_shutdown_task(name: &'static str, handle: Option<tokio::task::JoinHandle<()>>) {
@@ -2244,11 +2295,29 @@ fn spawn_gc_task(
 
 fn install_shutdown_signal_handler(restart: Arc<RestartController>) {
     tokio::spawn(async move {
-        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-        tokio::select! {
-            _ = term.recv() => tracing::info!("SIGTERM received"),
-            _ = int.recv()  => tracing::info!("SIGINT received"),
+        #[cfg(unix)]
+        {
+            let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+            tokio::select! {
+                _ = term.recv() => tracing::info!("SIGTERM received"),
+                _ = int.recv()  => tracing::info!("SIGINT received"),
+            }
+        }
+        // Windows has no SIGTERM. Ctrl+C, closing the console, and the
+        // shutdown a service stop or logoff sends all arrive as console
+        // control events.
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows;
+            let mut ctrl_c = windows::ctrl_c().expect("install Ctrl+C handler");
+            let mut close = windows::ctrl_close().expect("install console-close handler");
+            let mut shutdown = windows::ctrl_shutdown().expect("install shutdown handler");
+            tokio::select! {
+                _ = ctrl_c.recv() => tracing::info!("Ctrl+C received"),
+                _ = close.recv() => tracing::info!("console close received"),
+                _ = shutdown.recv() => tracing::info!("system shutdown received"),
+            }
         }
         // Monotonic stop state: once a signal wins, an already-open IPC
         // handler cannot re-arm a restart during the drain.

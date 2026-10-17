@@ -712,6 +712,8 @@ fn perform(
     }
 }
 
+// Only the Windows arm reads synchronously; the others await.
+#[cfg_attr(windows, allow(clippy::unused_async))]
 pub(super) async fn process_stamp(pid: u32) -> Result<String, ()> {
     if pid == 0 {
         return Err(());
@@ -741,7 +743,16 @@ pub(super) async fn process_stamp(pid: u32) -> Result<String, ()> {
             .map(|start| format!("{boot}:{start}"))
             .ok_or(())
     }
-    #[cfg(not(target_os = "linux"))]
+    // Windows: the process start time, through the same safe process table
+    // as the rest of the crate. A reused pid starts later, so the stamp
+    // still tells two processes apart.
+    #[cfg(windows)]
+    {
+        crate::process_snapshot::start_time(pid)
+            .map(|started| started.to_string())
+            .ok_or(())
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let output = crate::work_control::execute_work_command(
             std::path::Path::new("/usr/bin/env"),

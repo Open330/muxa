@@ -79,20 +79,40 @@ impl Record {
 
 /// Create or open an owner-only (0600) file, refusing symlinks. Shared with
 /// the enrolled-operator store.
+///
+/// Off Unix there is no mode to set: the file inherits the ACL of the
+/// per-user data directory it lives in.
 pub(in crate::dashboard) fn private_file(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(io::Error::other("dashboard storage must not be a symlink"));
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(file)
+}
+
+/// Create an owner-only (0700) directory tree. Shared with the
+/// enrolled-operator store; off Unix the directory inherits its parent's ACL.
+pub(in crate::dashboard) fn private_dir(path: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 fn validate_database(connection: &Connection) -> io::Result<()> {
@@ -120,11 +140,7 @@ fn validate_database(connection: &Connection) -> io::Result<()> {
 impl Storage {
     fn open(path: &Path, config: &SharingConfig) -> io::Result<(Arc<Self>, Registry)> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
+            private_dir(parent)?;
         }
         let lock = private_file(&path.with_extension("lock"))?;
         lock.try_lock()

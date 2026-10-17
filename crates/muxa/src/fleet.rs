@@ -29,6 +29,32 @@ use crate::tmux::{PaneInfo, SessionInfo};
 use crate::topology::{PaneKey, WindowKey};
 use crate::work_control::WorkCommandOutput;
 
+/// This machine's name: `/etc/hostname`, then `$HOSTNAME`, then Windows'
+/// `%COMPUTERNAME%`.
+#[must_use]
+pub fn local_hostname() -> Option<String> {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// An id that is stable for one boot of this machine: the kernel's boot id
+/// on Linux, the boot time on Windows. `None` where neither is readable.
+#[must_use]
+pub fn local_boot_id() -> Option<String> {
+    let linux = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    #[cfg(windows)]
+    let linux = linux.or_else(|| Some(format!("boot-{}", sysinfo::System::boot_time())));
+    linux
+}
+
 pub const FLEET_PROTOCOL_VERSION: u32 = 1;
 pub const FLEET_MIN_PROTOCOL_VERSION: u32 = 1;
 /// Reserved inventory alias for the daemon's own physical node.

@@ -4,7 +4,10 @@ mod login;
 mod routes;
 mod storage;
 mod targets;
-#[cfg(test)]
+// Share targets are pinned by tmux socket path, which the fixtures resolve as
+// Unix socket names; on Windows every creation conflicts and one test blocks
+// on a write barrier that is never reached.
+#[cfg(all(test, unix))]
 mod tests;
 
 use super::oidc::{self, random_secret};
@@ -16,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 
 pub(super) use routes::{admin_routes, recipient_routes};
-pub(super) use storage::private_file;
+pub(super) use storage::{private_dir, private_file};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 /// write-in-place install would otherwise make look identical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BinaryIdentity {
+    #[cfg(unix)]
     device: u64,
+    #[cfg(unix)]
     inode: u64,
     size: u64,
     modified_nanos: u128,
@@ -37,6 +39,7 @@ impl BinaryIdentity {
     /// is the `bin/` link and the upgrade happens at its target, so watching
     /// the link itself would see nothing change.
     pub(crate) fn read(path: &Path) -> Option<Self> {
+        #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
 
         let metadata = std::fs::metadata(path).ok()?;
@@ -47,8 +50,12 @@ impl BinaryIdentity {
             // to re-exec onto.
             return None;
         }
+        // Windows has no stable inode through std; size plus mtime is what
+        // an install there changes.
         Some(Self {
+            #[cfg(unix)]
             device: metadata.dev(),
+            #[cfg(unix)]
             inode: metadata.ino(),
             size: metadata.len(),
             modified_nanos: metadata

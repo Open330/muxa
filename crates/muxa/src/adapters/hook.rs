@@ -100,12 +100,24 @@ where
     // inside a cmux tab inherits `CMUX_*` variables, and an independent
     // detection used to stamp `%N` rows with the cmux socket — a pairing no
     // pane scan can match, which made the agent invisible to collaboration.
+    stamp_pane_endpoint(&mut ev);
+    Ok(ev)
+}
+
+/// Record the control endpoint of the server that owns `ev`'s pane, read from
+/// this process's environment, unless the event already names one.
+///
+/// Every event that carries a pane needs it — the Claude status line
+/// included. A pane id alone is only unique on one server: after an rmux
+/// restart (whose Windows pipe name changes) a row keeping the previous
+/// endpoint pairs `rmux:%N` with a server that no longer exists, and the
+/// agent stops matching its pane.
+pub fn stamp_pane_endpoint(ev: &mut AgentEvent) {
     if ev.id().tmux_socket.is_none() {
         if let Some(pane) = ev.id().pane.clone() {
             ev.id_mut().tmux_socket = pane_endpoint_env(&pane);
         }
     }
-    Ok(ev)
 }
 
 /// The tmux server socket path from `$TMUX` (`"<socket>,<pid>,<session>"`),
@@ -217,7 +229,7 @@ fn cmux_surface_env_from(read: impl Fn(&str) -> Option<String>) -> Option<Surfac
 /// pane on tmux while `detect_from` chose cmux for the endpoint, producing a
 /// `%N` row with a cmux socket that no pane scan can match. `MUXA_HOST=cmux`
 /// forces the surface id when an operator really wants it.
-fn host_pane_env() -> Option<String> {
+pub fn host_pane_env() -> Option<String> {
     host_pane_env_from(|name| std::env::var(name).ok())
 }
 

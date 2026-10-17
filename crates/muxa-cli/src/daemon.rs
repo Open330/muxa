@@ -8,6 +8,7 @@ use crate::init::files::{launchd, systemd};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
 use muxa::ipc::{Client, Hello, RuntimeError};
+#[cfg(not(windows))]
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -75,8 +76,9 @@ async fn start(
         .await
         .ok_or_else(|| {
             anyhow!(
-                "muxad did not become responsive at {}; check /tmp/muxad.log",
-                socket.display()
+                "muxad did not become responsive at {}; check {}",
+                socket.display(),
+                crate::logs::default_log().display()
             )
         })?;
     if !quiet {
@@ -121,8 +123,9 @@ async fn restart(client: &Client, socket: &Path, config_path: Option<&Path>) -> 
                 .await
                 .ok_or_else(|| {
                     anyhow!(
-                        "muxad did not become responsive at {}; check /tmp/muxad.log",
-                        socket.display()
+                        "muxad did not become responsive at {}; check {}",
+                        socket.display(),
+                        crate::logs::default_log().display()
                     )
                 })?;
             println!("muxad started ({})", describe(socket, &hello));
@@ -178,9 +181,16 @@ fn describe(socket: &Path, hello: &Hello) -> String {
 
 /// The detached `muxad` invocation, minus its stdio.
 fn muxad_command(muxad: &Path, socket: &Path, config_path: Option<&Path>) -> Command {
-    let mut command = Command::new("nohup");
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new("nohup");
+        command.arg(muxad);
+        command
+    };
+    // Windows has no `nohup`; `windows_detach` detaches the process.
+    #[cfg(not(unix))]
+    let mut command = Command::new(muxad);
     command
-        .arg(muxad)
         .arg("--socket")
         .arg(socket)
         .env_remove("MUXA_RESTART_GENERATION");
@@ -231,42 +241,164 @@ pub(crate) fn start_detached(
     }
 
     let muxad = which::which("muxad").context("finding muxad on PATH")?;
-    let log_path = std::env::temp_dir().join("muxad.log");
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("opening {}", log_path.display()))?;
-    let stderr = log.try_clone().context("cloning muxad log handle")?;
+    // The file `muxa daemon logs` reads back.
+    let log_path = crate::logs::default_log();
 
-    let mut command = muxad_command(&muxad, socket, config_path);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(stderr));
-    let mut child = command.spawn().context("spawning detached muxad")?;
-
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        if socket_responding(socket) {
-            drop(child);
-            return Ok(true);
+    #[cfg(windows)]
+    {
+        windows_detach::spawn(&muxad_command(&muxad, socket, config_path), &log_path)
+            .context("spawning detached muxad")?;
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if socket_responding(socket) {
+                return Ok(true);
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
-        if let Some(status) = child.try_wait().context("polling detached muxad")? {
+        bail!(
+            "muxad did not bind {} within {}s; check {}",
+            socket.display(),
+            timeout.as_secs(),
+            log_path.display()
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("opening {}", log_path.display()))?;
+        let stderr = log.try_clone().context("cloning muxad log handle")?;
+
+        let mut command = muxad_command(&muxad, socket, config_path);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(stderr));
+        let mut child = command.spawn().context("spawning detached muxad")?;
+
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if socket_responding(socket) {
+                drop(child);
+                return Ok(true);
+            }
+            if let Some(status) = child.try_wait().context("polling detached muxad")? {
+                bail!(
+                    "muxad exited with {status} before binding {}; check {}",
+                    socket.display(),
+                    log_path.display()
+                );
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        bail!(
+            "muxad started but did not bind {} within {}s; check {}",
+            socket.display(),
+            timeout.as_secs(),
+            log_path.display()
+        )
+    }
+}
+
+/// Starting a daemon on Windows so that it is truly on its own.
+///
+/// `CreateProcess` from here would hand the daemon every inheritable handle
+/// this process holds — including the pipe a caller reads `muxa`'s output
+/// from, so `muxa daemon start *> $null` in a `PowerShell` profile would wait
+/// for the daemon to exit before the shell could start. It would also leave
+/// the daemon in the launching shell's job object, which rmux closes along
+/// with its server, taking the daemon with it. Neither is reachable without
+/// unsafe Win32 calls, so the process is created by the WMI service instead
+/// (`Win32_Process.Create`): it inherits no handle and belongs to no job.
+#[cfg(windows)]
+mod windows_detach {
+    use anyhow::{bail, Context, Result};
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    /// Create the process described by `command` (program, arguments, and
+    /// environment changes) with its output appended to `log`.
+    pub(super) fn spawn(command: &Command, log: &Path) -> Result<()> {
+        let mut words = vec![quote(&command.get_program().to_string_lossy())];
+        words.extend(command.get_args().map(|arg| quote(&arg.to_string_lossy())));
+        // The daemon writes its own log, opened shared. A `cmd /c … >> log`
+        // redirection opens it exclusively, and the next daemon to start —
+        // a restart overlapping its predecessor — then could not start.
+        words.extend(["--log-file".to_owned(), quote(&log.to_string_lossy())]);
+        let command_line = words.join(" ");
+        let mut environment: std::collections::BTreeMap<String, String> =
+            std::env::vars().collect();
+        for (name, value) in command.get_envs() {
+            let name = name.to_string_lossy().into_owned();
+            match value {
+                Some(value) => {
+                    environment.insert(name, value.to_string_lossy().into_owned());
+                }
+                None => {
+                    environment.remove(&name);
+                }
+            }
+        }
+        let environment: Vec<String> = environment
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+
+        let mut powershell = Command::new(muxa::shell::powershell());
+        powershell
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                SCRIPT,
+            ])
+            .env("MUXA_DETACH_COMMAND_LINE", &command_line)
+            .env("MUXA_DETACH_CWD", &cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = powershell.spawn().context("starting PowerShell")?;
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().context("PowerShell stdin")?;
+            stdin.write_all(serde_json::to_string(&environment)?.as_bytes())?;
+        }
+        let output = child.wait_with_output().context("waiting for PowerShell")?;
+        if !output.status.success() {
             bail!(
-                "muxad exited with {status} before binding {}; check {}",
-                socket.display(),
-                log_path.display()
+                "Win32_Process.Create failed: {}{}",
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        std::thread::sleep(POLL_INTERVAL);
+        Ok(())
     }
-    bail!(
-        "muxad started but did not bind {} within {}s; check {}",
-        socket.display(),
-        timeout.as_secs(),
-        log_path.display()
-    )
+
+    /// The environment arrives as JSON on stdin — it can exceed what a
+    /// command line holds — and replaces WMI's default block entirely.
+    const SCRIPT: &str = r"
+$ErrorActionPreference = 'Stop'
+$environment = [string[]]([Console]::In.ReadToEnd() | ConvertFrom-Json)
+$startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{
+    ShowWindow = [uint16]0
+    EnvironmentVariables = $environment
+}
+$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+    CommandLine = $env:MUXA_DETACH_COMMAND_LINE
+    CurrentDirectory = $env:MUXA_DETACH_CWD
+    ProcessStartupInformation = $startup
+}
+if ($created.ReturnValue -ne 0) { Write-Output ('error ' + $created.ReturnValue); exit 1 }
+";
+
+    fn quote(word: &str) -> String {
+        format!("\"{word}\"")
+    }
 }
 
 /// The per-user service `muxa init` installs, when it is the one that would
@@ -375,7 +507,7 @@ fn systemd_unit_enabled() -> bool {
 }
 
 pub(crate) fn socket_responding(socket: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(socket).is_ok()
+    muxa::transport::endpoint_is_live(socket)
 }
 
 async fn wait_for_serving(client: &Client, timeout: Duration) -> Option<Hello> {

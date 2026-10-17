@@ -1940,7 +1940,9 @@ impl AskEngine {
         // `claude` under a different login, say. Only the program changes;
         // the argv and the parser stay the engine's.
         let bin = turn.executable.unwrap_or(default_bin);
-        let mut cmd = tokio::process::Command::new(bin);
+        // Through the PATHEXT-aware lookup: an npm-installed CLI on Windows
+        // is a `.cmd` shim that `Command::new("codex")` alone cannot find.
+        let mut cmd = tokio::process::Command::from(crate::shell::program_command(bin));
         cmd.args(&args)
             .current_dir(turn.cwd)
             .stdin(std::process::Stdio::null())

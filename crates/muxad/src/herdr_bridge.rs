@@ -49,9 +49,12 @@ use muxa::state::{Agent, SYNTHETIC_SESSION_PREFIX};
 use muxa::{AgentState, HostKind, SharedBackend, SharedStore};
 
 use crate::synthetic::{self, SyntheticState};
+#[cfg(not(unix))]
+use no_unix_socket::UnixStream;
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
 
@@ -930,6 +933,33 @@ pub fn spawn_herdr_report_task(
         "herdr report path enabled (pushing hook-derived state via pane.report_agent)",
     );
     Some(tokio::spawn(run_report(store, socket_path, shutdown_tx)))
+}
+
+/// herdr ships for Unix only. Off Unix the bridge keeps its body unchanged and
+/// connects through an uninhabited stand-in whose `connect` always fails,
+/// landing on the bridge's existing "not connected" paths — the same shape as
+/// `muxa::backend::unix_socket` for the synchronous clients.
+#[cfg(not(unix))]
+mod no_unix_socket {
+    use std::convert::Infallible;
+    use std::io;
+    use std::path::Path;
+
+    pub(super) struct UnixStream(Infallible);
+
+    impl UnixStream {
+        #[allow(clippy::unused_async)]
+        pub(super) async fn connect<P: AsRef<Path>>(_path: P) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "herdr is not available on this platform",
+            ))
+        }
+
+        pub(super) fn into_split(self) -> (tokio::io::Empty, tokio::io::Sink) {
+            match self.0 {}
+        }
+    }
 }
 
 #[cfg(test)]

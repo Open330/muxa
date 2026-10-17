@@ -39,7 +39,7 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
 /// for the MCP ancestry recovery; hook reconciliation already takes a shared
 /// one-shot process snapshot on macOS/BSD. A failed or unavailable `ps`
 /// degrades cleanly to no ancestry match.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn parent_pid(pid: u32) -> Option<u32> {
     let output = std::process::Command::new("ps")
         .args(["-o", "ppid=", "-p", &pid.to_string()])
@@ -49,6 +49,21 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
         return None;
     }
     String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
+/// Windows: one parent lookup through the shared process table. Hooks walk a
+/// whole snapshot instead (see `hook.rs`); this per-pid form serves the MCP
+/// ancestry recovery, which asks only a handful of times.
+#[cfg(windows)]
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    crate::process_snapshot::read_parent_pid_map()
+        .get(&pid)
+        .copied()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn parent_pid(_pid: u32) -> Option<u32> {
+    None
 }
 
 /// Parse the `PPid:` field out of `/proc/<pid>/status` content.

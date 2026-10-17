@@ -355,7 +355,8 @@ fn failure_detail(output: &WorkCommandOutput) -> String {
         .unwrap_or_else(|| format!("muxa exited with status {}", output.exit_code))
 }
 
-#[cfg(test)]
+// Every test drives a `#!/bin/sh` fake CLI.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

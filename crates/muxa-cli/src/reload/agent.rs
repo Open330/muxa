@@ -26,7 +26,7 @@ fn is_uuid(value: &str) -> bool {
 /// `aas` account it runs under (`june@claude`, `e-ed@codex`).
 pub(super) fn launched(argv: &[String]) -> Option<Launched> {
     let kind = argv.iter().find_map(|argument| {
-        let name = argument.rsplit('/').next().unwrap_or(argument);
+        let name = muxa::shell::program_name(argument);
         if name == "claude" || name.ends_with("@claude") {
             Some("claude_code")
         } else if name == "codex" || name.ends_with("@codex") {

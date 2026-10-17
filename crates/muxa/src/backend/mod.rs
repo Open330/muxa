@@ -56,6 +56,7 @@ pub mod cmux;
 pub mod herdr;
 pub mod rmux;
 pub mod tmux;
+pub(crate) mod unix_socket;
 pub mod zellij;
 
 use std::collections::HashMap;
@@ -676,6 +677,12 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
 /// backend in that case.
 pub fn detect_host_env() -> Option<HostKind> {
     detect_from(|name| std::env::var(name).ok())
+}
+
+/// [`detect_host_env`] over a caller-supplied environment, for callers that
+/// read the same variables afterwards and test without mutating `std::env`.
+pub fn detect_host_env_with(read: impl Fn(&str) -> Option<String>) -> Option<HostKind> {
+    detect_from(read)
 }
 
 /// Decoupled-from-process-env variant of [`detect_host_env`] for tests.

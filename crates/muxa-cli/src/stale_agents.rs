@@ -202,16 +202,54 @@ fn classify(
 
 fn is_muxa_mcp(args: &str) -> bool {
     let mut words = args.split_whitespace();
-    words.next().and_then(|p| p.rsplit('/').next()) == Some("muxa") && words.next() == Some("mcp")
+    words.next().map(muxa::shell::program_name) == Some("muxa") && words.next() == Some("mcp")
 }
 
 fn codex_subcommand(args: &str) -> Option<&str> {
     let mut words = args.split_whitespace();
     let program = words.next()?;
-    (program.rsplit('/').next() == Some("codex")).then(|| words.next().unwrap_or(""))
+    (muxa::shell::program_name(program) == "codex").then(|| words.next().unwrap_or(""))
+}
+
+/// One pass over the process table: pid, parent pid, age, command line.
+///
+/// Windows has no `ps`; its table comes from `sysinfo`. The program is
+/// reduced to its name there, because a path such as `C:\Program Files\…`
+/// would otherwise split into several words.
+#[cfg(windows)]
+fn read_processes() -> Vec<Proc> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    system
+        .processes()
+        .values()
+        .filter_map(|process| {
+            let mut words = process
+                .cmd()
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned());
+            let program = words.next()?;
+            let line = std::iter::once(muxa::shell::program_name(&program).to_owned())
+                .chain(words)
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(Proc {
+                pid: process.pid().as_u32(),
+                parent_pid: process.parent().map_or(0, sysinfo::Pid::as_u32),
+                age: Duration::from_secs(process.run_time()),
+                args: line,
+            })
+        })
+        .collect()
 }
 
 /// One `ps` pass: pid, parent pid, elapsed time, command line.
+#[cfg(not(windows))]
 fn read_processes() -> Vec<Proc> {
     let Ok(output) = std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid=,etime=,args="])
@@ -238,6 +276,7 @@ fn read_processes() -> Vec<Proc> {
 }
 
 /// `ps` elapsed time: `[[dd-]hh:]mm:ss`.
+#[cfg_attr(windows, allow(dead_code))] // Windows reads ages from sysinfo
 fn parse_etime(value: &str) -> Option<Duration> {
     let (days, clock) = match value.split_once('-') {
         Some((days, clock)) => (days.parse::<u64>().ok()?, clock),

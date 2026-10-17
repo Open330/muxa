@@ -1,6 +1,6 @@
 //! CLI adapter for durable, single-coordinator Fleet dispatch.
+use crate::owner_only::OwnerOnly;
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -85,7 +85,7 @@ fn save(path: &Path, record: &Record) -> Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .owner_only(0o600)
         .open(&temp)?;
     f.write_all(&serde_json::to_vec(record)?)?;
     f.sync_all()?;
@@ -98,7 +98,7 @@ fn reserve(path: &Path, record: &Record) -> Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .owner_only(0o600)
         .open(path)
         .context("dispatch already reserved; read dispatch-status instead of launching again")?;
     f.write_all(&serde_json::to_vec(record)?)?;
@@ -300,7 +300,7 @@ async fn refresh_worker(id: &str, client: &Client) -> Result<Record> {
             .resolve_paths(&dirs::home_dir().context("home missing")?)
             .map_err(anyhow::Error::msg)?;
         // work up records a canonical cwd (notably /private/tmp on macOS).
-        let run_path = std::fs::canonicalize(&paths.run).unwrap_or_else(|_| paths.run.clone());
+        let run_path = muxa::paths::canonicalize(&paths.run).unwrap_or_else(|_| paths.run.clone());
         let runs = client.pipeline_runs().await?;
         if let Some(run) = runs.iter().find(|r| {
             r.identity
@@ -357,8 +357,8 @@ async fn prepare_checkout(
     std::fs::create_dir_all(paths.repo.parent().context("repository parent missing")?)?;
     // Multiple Works can prepare the same registered clone concurrently. Lock
     // only Git preparation, not the agent lifetime; the OS releases it on crash.
-    let repo = std::fs::canonicalize(&paths.repo).unwrap_or_else(|_| paths.repo.clone());
-    let parent = std::fs::canonicalize(repo.parent().context("repository parent missing")?)?;
+    let repo = muxa::paths::canonicalize(&paths.repo).unwrap_or_else(|_| paths.repo.clone());
+    let parent = muxa::paths::canonicalize(repo.parent().context("repository parent missing")?)?;
     let lock_path = parent.join(format!(
         ".{}.muxa-prepare.lock",
         repo.file_name()
@@ -369,7 +369,7 @@ async fn prepare_checkout(
         .create(true)
         .truncate(false)
         .write(true)
-        .mode(0o600)
+        .owner_only(0o600)
         .open(lock_path)?;
     let _lock = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
         lock.lock()?;
@@ -437,7 +437,7 @@ async fn prepare_checkout(
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .owner_only(0o600)
         .open(paths.artifacts.join("dispatch.json"))?;
     file.write_all(&serde_json::to_vec_pretty(
         &json!({"plan":plan,"paths":paths}),
@@ -552,6 +552,7 @@ pub async fn options(cfg: &Config, client: &Client, at_coordinator: bool) -> Res
 mod tests {
     use super::*;
     use muxa::orchestration::ExecutionPaths;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     fn record() -> Record {
         Record {

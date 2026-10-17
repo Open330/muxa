@@ -669,20 +669,11 @@ fn backend_info(backends: &[SharedBackend]) -> Vec<FleetBackendInfo> {
 }
 
 fn hostname() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "unknown".into())
+    muxa::fleet::local_hostname().unwrap_or_else(|| "unknown".into())
 }
 
 fn boot_id() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| format!("relay-{}", muxa::NodeId::generate()))
+    muxa::fleet::local_boot_id().unwrap_or_else(|| format!("relay-{}", muxa::NodeId::generate()))
 }
 
 /// Encode an exact target into a shell-token-safe hexadecimal argument for a
