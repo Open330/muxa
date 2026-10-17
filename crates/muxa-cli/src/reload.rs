@@ -1780,7 +1780,14 @@ async fn tracked_servers(client: &Client) -> Result<BTreeMap<String, String>> {
             continue;
         };
         if mux_control::supported(host) {
-            sockets.insert(socket.clone(), host.to_string());
+            // An agent last heard from before an rmux restart still names
+            // the old Windows pipe; it is the same server as the live one.
+            let socket = if host == HostKind::Rmux {
+                muxa::backend::rmux::live_endpoint(socket)
+            } else {
+                socket.clone()
+            };
+            sockets.insert(socket, host.to_string());
         }
     }
     Ok(sockets)

@@ -436,7 +436,8 @@ fn rmux_command(endpoint: Option<&str>) -> Command {
 /// own `kill-server` — names a pipe that no longer exists. The rest of the
 /// name is the same user and socket label, which is the server meant. The
 /// pipe directory is only listed, never opened, so no server sees a client.
-fn live_endpoint(endpoint: &str) -> String {
+#[must_use]
+pub fn live_endpoint(endpoint: &str) -> String {
     if !cfg!(windows) {
         return endpoint.to_owned();
     }
