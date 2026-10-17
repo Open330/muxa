@@ -38,16 +38,21 @@ fix ([RMUX.md](RMUX.md#popup-rendering-on-rmux-0100)); until a release does,
 ### After a reboot
 
 muxad snapshots the workspace on an interval, and follows the server across
-restarts even though its pipe name changes. With the rmux server back up,
+restarts even though its pipe name changes.
 
 ```powershell
-muxa restore --run
+muxa init --component restore-at-login
 ```
 
-rebuilds the sessions, windows and panes of the newest snapshot and resumes
-their agents; `muxa restore` alone prints the plan. A server started from Task
-Scheduler at boot can run the same command right after it creates its first
-session.
+registers a Task Scheduler task, `muxa-restore`, that runs `muxa restore
+--boot` at logon: when the rmux server has no sessions it starts it and
+rebuilds the newest snapshot, resuming the agents, and otherwise it changes
+nothing. Output goes to `%TEMP%\muxa-restore.log`. The task runs at the
+level of the terminal that installed it — an elevated terminal's rmux server
+is a different server from a limited one's — and starts rmux through
+`Win32_Process.Create`, since a task's job object forbids the breakaway rmux
+needs for its daemon. By hand, `muxa restore --run` does the same into a
+running server.
 
 Verified on Windows 11 with rmux 0.10.0 and Open330/rmux `main` by driving a
 real client:
@@ -61,6 +66,18 @@ real client:
   their commands, and resumes Claude with `--resume <id>`.
 - `muxa agent start` places an agent in an rmux pane or window.
 - `muxa daemon start/stop/restart/logs` and the PowerShell profile autostart.
+- `muxa agent start --agent codex` launches Codex (an npm `.cmd` shim) in a
+  window, and its hooks track it. Codex asks once to trust the hooks
+  `muxa init` added.
+- `muxa upgrade` end to end: build, swap the running binaries, re-exec muxad.
+- SSH Fleet with Windows as the controller (Windows OpenSSH): `fleet host
+  doctor`, `status`, `panes`, `capture`, `send`, `attach` and `fleet watch`
+  against a Linux host. A WSL host on `localhost` needs `HostName 127.0.0.1`:
+  WSL forwards localhost over IPv4 only.
+- Dashboard pane sharing's whole flow — OIDC sign-in, share link, guest
+  prompt, reconnect, daemon restart, revocation — through
+  `scripts/dashboard-sharing-smoke.py` on a private rmux label.
+- `muxa restore --boot` from a logon task, into a stopped server.
 
 ### Known gaps
 
@@ -70,8 +87,8 @@ real client:
   safe peer-credential call, so requests read "origin unverified".
 - **`muxa onboard`'s live tour** builds a POSIX-shell sandbox on a private
   tmux server and is not expected to work.
-- **Dashboard pane sharing** now verifies pane identity on Windows, but the
-  complete share flow (OIDC sign-in) has not been exercised there.
+- **`muxa fleet attach`** through Windows OpenSSH can let a remote tmux's
+  terminal-query reply (`…;42c`) reach the remote shell as typed text.
 - **`muxa upgrade`** needs a source checkout on Windows (no prebuilt release
   is published for it). It moves the running `muxa.exe`/`muxad.exe` aside
   before `cargo install`, since Windows refuses to overwrite a running

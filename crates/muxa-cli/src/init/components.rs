@@ -53,6 +53,9 @@ pub enum Component {
     Ask,
     /// Disabled starter automation rules; existing operator rules are preserved.
     Automation,
+    /// `muxa restore --boot` at login: systemd user unit, `LaunchAgent`, or
+    /// Task Scheduler task
+    RestoreAtLogin,
 }
 
 impl Component {
@@ -77,6 +80,7 @@ impl Component {
         Component::AgentMcp,
         Component::Ask,
         Component::Automation,
+        Component::RestoreAtLogin,
     ];
 
     /// Stable kebab-case id used in CLI flags and marker blocks.
@@ -102,6 +106,7 @@ impl Component {
             Component::AgentMcp => "agent-mcp",
             Component::Ask => "ask",
             Component::Automation => "automation",
+            Component::RestoreAtLogin => "restore-at-login",
         }
     }
 
@@ -134,6 +139,7 @@ impl Component {
             Component::AgentMcp => "Agents: register Muxa MCP for Codex and Claude Code",
             Component::Ask => "Ask: headless questions to an agent from watch",
             Component::Automation => "Automation: install five disabled starter rules",
+            Component::RestoreAtLogin => "Workspace: restore the last snapshot at login",
         }
     }
 
@@ -168,6 +174,9 @@ impl Component {
             Component::Automation => {
                 "capacity retry, limit recovery, input/error notices; enable individually"
             }
+            Component::RestoreAtLogin => {
+                "`muxa restore --boot`; only when the multiplexer has no sessions yet"
+            }
         }
     }
 
@@ -191,6 +200,9 @@ impl Component {
         match self {
             Component::MuxadSystemd => std::env::consts::OS == "linux",
             Component::MuxadLaunchd => std::env::consts::OS == "macos",
+            Component::RestoreAtLogin => {
+                matches!(std::env::consts::OS, "linux" | "macos" | "windows")
+            }
             // shellrc + everything else is OS-agnostic.
             _ => true,
         }

@@ -271,6 +271,34 @@ release binary) and re-execs muxad. Around the swap it also:
    Existing sessions, windows and panes are kept. Only missing ones are
    created, so it is safe to rerun.
 
+## Restore After Reboot
+
+muxad snapshots the workspace on an interval. To have the newest snapshot
+rebuilt when you log in after a reboot:
+
+```bash
+muxa init --component restore-at-login
+```
+
+It registers `muxa restore --boot` with this host's per-user scheduler:
+
+| Host | Registration | Output |
+| --- | --- | --- |
+| Linux | systemd user unit `muxa-restore.service` (`default.target`) | `journalctl --user -u muxa-restore` |
+| macOS | `LaunchAgent` `dev.open330.muxa-restore`, loaded at the next login | `/tmp/muxa-restore.log` |
+| Windows | Task Scheduler task `muxa-restore`, at logon | `%TEMP%\muxa-restore.log` |
+
+`restore --boot` rebuilds only into a server that has no sessions — starting
+it if it is down — and does nothing when the server already has sessions, so
+a login that kept its server is untouched. Agents come back on their own
+conversations, as with `muxa restore --run`. The hook records the `muxa`
+binary and `PATH` of the shell that installed it; rerun the component after
+moving either. On Linux, a user manager runs only while you are logged in
+unless lingering is enabled (`loginctl enable-linger`). On Windows the task
+runs at the installing terminal's level, so install it from the kind of
+terminal (elevated or not) you attach from. `muxa init --uninstall
+--component restore-at-login` removes it.
+
 ## Rollback
 
 ```bash

@@ -13,6 +13,7 @@ pub mod collaboration;
 pub mod dashboard;
 pub mod gemini;
 pub mod launchd;
+pub mod login_restore;
 pub mod opencode;
 pub mod shellrc;
 pub mod systemd;

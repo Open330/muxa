@@ -139,6 +139,10 @@ fn apply_one(action: &Action, dry_run: bool, stamp: i64, report: &mut ApplyRepor
             }
             Ok(())
         }
+        Action::ManageLoginRestore { enable } => {
+            apply_login_restore(*enable, dry_run, report);
+            Ok(())
+        }
         Action::StartDaemonIfNeeded {
             socket,
             config_path,
@@ -464,6 +468,21 @@ fn sync_parent(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn apply_login_restore(enable: bool, dry_run: bool, report: &mut ApplyReport) {
+    if dry_run {
+        return;
+    }
+    if enable {
+        if let Err(e) = files::login_restore::enable() {
+            report
+                .warnings
+                .push(format!("registering the login restore failed: {e}"));
+        }
+    } else {
+        files::login_restore::disable();
+    }
+}
+
 fn describe(a: &Action) -> String {
     match a {
         Action::EditFile { path, .. } => format!("editing {}", path.display()),
@@ -474,6 +493,8 @@ fn describe(a: &Action) -> String {
         Action::DisableSystemdUnit => "disabling muxad.service".into(),
         Action::EnableLaunchdUnit { .. } => "loading launchd LaunchAgent".into(),
         Action::DisableLaunchdUnit => "unloading launchd LaunchAgent".into(),
+        Action::ManageLoginRestore { enable: true } => "registering the login restore".into(),
+        Action::ManageLoginRestore { enable: false } => "unregistering the login restore".into(),
         Action::StartDaemonIfNeeded { .. } => "starting muxad if needed".into(),
         Action::SourceTmuxConf { path } => format!("sourcing {}", path.display()),
         Action::PrintDashboard { .. } => "rendering dashboard info".into(),
@@ -539,6 +560,17 @@ pub fn render_dry_run(plan: &Plan) -> String {
             }
             Action::DisableLaunchdUnit => {
                 let _ = writeln!(s, "  ⚙ launchctl bootout gui/<uid>/dev.open330.muxad");
+            }
+            Action::ManageLoginRestore { enable } => {
+                let what = match (std::env::consts::OS, *enable) {
+                    ("linux", true) => "systemctl --user enable muxa-restore.service",
+                    ("linux", false) => "systemctl --user disable muxa-restore.service",
+                    ("macos", true) => "launchd loads dev.open330.muxa-restore at the next login",
+                    ("macos", false) => "launchctl bootout gui/<uid>/dev.open330.muxa-restore",
+                    (_, true) => "register Task Scheduler task muxa-restore (at logon)",
+                    (_, false) => "unregister Task Scheduler task muxa-restore",
+                };
+                let _ = writeln!(s, "  ⚙ {what}");
             }
             Action::StartDaemonIfNeeded { .. } => {
                 let _ = writeln!(s, "  ⚙ start muxad if not running");

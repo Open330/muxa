@@ -129,6 +129,13 @@ pub struct RestoreArgs {
     /// Print the plan — and with `--run` the per-pane results — as JSON.
     #[arg(long)]
     json: bool,
+
+    /// What a login hook runs (`muxa init --component restore-at-login`):
+    /// rebuild the snapshot only when its server has no sessions — as after a
+    /// reboot — starting the server if it is down, and change nothing when it
+    /// already has sessions. Implies `--run`; no snapshot is not an error.
+    #[arg(long, conflicts_with_all = ["only_missing", "json"])]
+    boot: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -474,6 +481,9 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 }
 
 pub fn restore(args: RestoreArgs) -> Result<()> {
+    if args.boot {
+        return restore_at_boot(args);
+    }
     let path = match args.snapshot {
         Some(path) => path,
         None => newest_snapshot()?,
@@ -575,6 +585,99 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
         print_json(&document(sessions, Some(totals)))?;
     }
     outcome
+}
+
+/// The session `restore --boot` holds a Windows rmux server open with until
+/// the snapshot's own sessions exist.
+const BOOT_PLACEHOLDER: &str = "__muxa_boot";
+
+/// `restore --boot`. A server that already has sessions — the hook firing a
+/// second time, or a user quicker than it — is left exactly as it is, and
+/// having no snapshot yet is a fresh install, not a failure.
+fn restore_at_boot(mut args: RestoreArgs) -> Result<()> {
+    let path = match args.snapshot.take() {
+        Some(path) => path,
+        None => match newest_snapshot() {
+            Ok(path) => path,
+            Err(error) => {
+                println!("nothing to restore: {error:#}");
+                return Ok(());
+            }
+        },
+    };
+    let snapshot = read_snapshot(&path)?;
+    let socket = args
+        .mux_socket
+        .clone()
+        .unwrap_or_else(|| snapshot.socket.clone());
+    let endpoint = control_endpoint(&endpoint_for(&snapshot.host, socket)?);
+    if live_sessions(&endpoint).is_some_and(|sessions| !sessions.is_empty()) {
+        println!("{} already has sessions; nothing restored", endpoint.socket);
+        return Ok(());
+    }
+    let placeholder = start_boot_server(&endpoint)?;
+    args.snapshot = Some(path);
+    args.run = true;
+    args.boot = false;
+    let restored = restore(args);
+    if placeholder {
+        // Its own `=name` target: an unanchored one could match a
+        // restored session whose name merely begins the same way.
+        let _ = muxa::RmuxBackend::new().capture_control(&[
+            "kill-session",
+            "-t",
+            &format!("={BOOT_PLACEHOLDER}"),
+        ]);
+    }
+    restored
+}
+
+/// Bring up the server a boot restore goes into, when naming it is not
+/// enough. A tmux or Unix rmux socket path starts its server on the
+/// restore's first `new-session`. A Windows rmux pipe ends in a nonce the
+/// server draws anew at every start, so the recorded pipe can no longer
+/// start anything: start the default server, held open by a placeholder
+/// session, and confirm it is the one the snapshot was taken on — the
+/// recorded pipe then resolves to it. `true` when a placeholder was made.
+///
+/// The server is started outside this process's job: a login task's job
+/// forbids the breakaway rmux needs, and rmux will not start a daemon
+/// that would die with the task.
+#[cfg(windows)]
+fn start_boot_server(endpoint: &BackendEndpoint) -> Result<bool> {
+    if endpoint.host != HostKind::Rmux {
+        return Ok(false);
+    }
+    let default = muxa::RmuxBackend::new();
+    let mut start = default.command(None);
+    start.args(["new-session", "-d", "-s", BOOT_PLACEHOLDER]);
+    crate::windows_detach::spawn(&start).context("starting the default rmux server")?;
+    let placeholder = format!("={BOOT_PLACEHOLDER}");
+    let started = Instant::now();
+    while default
+        .capture_control(&["has-session", "-t", &placeholder])
+        .is_err()
+    {
+        if started.elapsed() > Duration::from_secs(20) {
+            bail!("the default rmux server did not start within 20s");
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if live_sessions(endpoint).is_none() {
+        let _ = default.capture_control(&["kill-session", "-t", &placeholder]);
+        bail!(
+            "the snapshot was taken on an rmux server other than the default one ({}); \
+             start that server and run `muxa restore --run`",
+            endpoint.socket
+        );
+    }
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::unnecessary_wraps)] // same signature as the Windows arm
+fn start_boot_server(_endpoint: &BackendEndpoint) -> Result<bool> {
+    Ok(false)
 }
 
 /// The sessions the server has right now; `None` when it does not answer,
@@ -1969,13 +2072,46 @@ fn split_cmdline(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Whether `command` is not what a pane runs: the shell itself, or the
+/// shell-rc autostart's `muxa daemon start` caught while a new shell reads
+/// its profile. Replaying either would only type a stray command into the
+/// restored shell.
 fn is_shell(command: &str) -> bool {
-    muxa::shell::is_shell_program(command)
+    muxa::shell::is_shell_program(command) || is_daemon_autostart(command)
+}
+
+fn is_daemon_autostart(command: &str) -> bool {
+    let line = command.trim();
+    let program = muxa::shell::program_token(line);
+    if muxa::shell::program_name(program) != "muxa" {
+        return false;
+    }
+    let rest = line
+        .split_once(program)
+        .map_or("", |(_, rest)| rest.trim_start_matches('"'));
+    rest.split_whitespace().next() == Some("daemon")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profile's `muxa daemon start`, caught mid-flight, is no pane's
+    /// program; `muxa watch` in a pane is one, and restore brings it back.
+    #[test]
+    fn the_daemon_autostart_is_not_what_a_pane_runs() {
+        for line in [
+            "muxa daemon start --quiet",
+            "/home/u/.cargo/bin/muxa daemon start",
+            r"C:\Users\u\.cargo\bin\muxa.exe daemon start --quiet",
+            r#""C:\Program Files\muxa\muxa.exe" daemon start"#,
+        ] {
+            assert!(is_shell(line), "{line}");
+        }
+        for line in ["muxa watch", "muxad", "vim daemon", "claude --resume x"] {
+            assert!(!is_shell(line), "{line}");
+        }
+    }
 
     fn pane(session: &str, window: &str, index: &str, command: Option<&str>) -> PaneShape {
         PaneShape {
