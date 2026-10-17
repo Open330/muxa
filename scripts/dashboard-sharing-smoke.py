@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Isolated pane-sharing browser smoke test. Requires cryptography and Playwright."""
-import os, json, pathlib, tempfile, subprocess, shutil, time, socket, threading, base64, hashlib, signal, atexit
+import os, sys, json, pathlib, tempfile, subprocess, shutil, time, socket, threading, base64, hashlib, signal, atexit
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 REPO = pathlib.Path(__file__).resolve().parent.parent
 root = pathlib.Path(tempfile.mkdtemp(prefix='muxa-share-browser-'))
+# Windows has no tmux: a private rmux label stands in for the private tmux socket.
+WINDOWS = os.name == 'nt'
 
 def port():
     with socket.socket() as s:
@@ -52,7 +54,7 @@ class Provider(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == '/test/add-pane':
-            subprocess.run(['tmux', '-S', str(sock), 'split-window', '-d', '-t', 'share-test:0', 'cat'], env=env, check=True)
+            subprocess.run(mux + ['split-window', '-d', '-t', 'share-test:0', pane_cmd], env=env, check=True)
             self.reply({'ok': True})
             return
         if self.path == '/test/restart':
@@ -80,42 +82,67 @@ for k in ['XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME'
     d = root / k
     d.mkdir(mode=448)
     env[k] = str(d)
-env.update(MUXA_HOST='tmux', MUXA_HOSTS='tmux')
 sock = root / 'pane.sock'
-env['MUXA_TMUX_SOCKET'] = str(sock)
+if WINDOWS:
+    env.pop('SHELL', None)  # rmux would otherwise run pane commands through Git Bash
+    env.update(MUXA_HOST='rmux', MUXA_HOSTS='rmux')
+    mux = ['rmux', '-L', os.environ.get('MUXA_TEST_RMUX_LABEL', 'muxa-share-smoke')]
+    (root / 'echo.py').write_text('import sys\nfor line in sys.stdin:\n    print(line, end="", flush=True)\n')
+    pane_cmd = f"& '{sys.executable}' -u '{root / 'echo.py'}'"
+    shell = shutil.which('pwsh') or shutil.which('powershell')
+    (root / 'rmux.conf').write_text('set -g default-shell ' + json.dumps(shell) + '\n')
+    mux_start = mux + ['-f', str(root / 'rmux.conf')]
+else:
+    env.update(MUXA_HOST='tmux', MUXA_HOSTS='tmux')
+    env['MUXA_TMUX_SOCKET'] = str(sock)
+    mux = ['tmux', '-S', str(sock)]
+    pane_cmd = 'cat'
+    mux_start = ['tmux', '-f', '/dev/null', '-S', str(sock)]
+exe = '.exe' if WINDOWS else ''
 p = None
 node = None
 
+def stop_daemon():
+    if WINDOWS:
+        p.terminate()
+    else:
+        p.send_signal(signal.SIGTERM)
+
 def cleanup():
     if node is not None:
-        try:
-            os.killpg(node.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        if WINDOWS:
+            subprocess.run(['taskkill', '/T', '/F', '/PID', str(node.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            try:
+                os.killpg(node.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         node.wait()
     if p is not None and p.poll() is None:
-        p.send_signal(signal.SIGTERM)
+        stop_daemon()
         try:
             p.wait(timeout=15)
         except subprocess.TimeoutExpired:
             p.kill()
             p.wait()
     server.shutdown()
-    subprocess.run(['tmux', '-S', str(sock), 'kill-server'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(mux + ['kill-server'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 atexit.register(cleanup)
-subprocess.run(['tmux', '-f', '/dev/null', '-S', str(sock), 'new-session', '-d', '-s', 'share-test', 'cat'], env=env, check=True)
-subprocess.run(['tmux', '-S', str(sock), 'split-window', '-d', '-t', 'share-test:0', 'cat'], env=env, check=True)
+subprocess.run(mux_start + ['new-session', '-d', '-s', 'share-test', pane_cmd], env=env, check=True)
+subprocess.run(mux + ['split-window', '-d', '-t', 'share-test:0', pane_cmd], env=env, check=True)
+if WINDOWS:
+    env['RMUX'] = subprocess.run(mux + ['display-message', '-p', '-t', 'share-test', '#{socket_path},#{pid},#{session_id}'], env=env, check=True, capture_output=True, text=True).stdout.strip()
 config = root / 'config.toml'
 config.write_text(f'[discovery]\nenabled=false\n[reconciler]\nenabled=false\n[dashboard]\nenabled=true\nbind="127.0.0.1:{webport}"\nauth="token"\ntoken="operator"\n[dashboard.sharing]\npublic_url="{origin}"\nissuer_url="{issuer}"\nclient_id="muxa"\n')
-shutil.copy2(os.environ.get('MUXA_TEST_MUXAD', str(REPO / 'target/debug/muxad')), root / 'muxad')
+shutil.copy2(os.environ.get('MUXA_TEST_MUXAD', str(REPO / ('target/debug/muxad' + exe))), root / ('muxad' + exe))
 log = (root / 'daemon.log').open('w')
-p = subprocess.Popen([str(root / 'muxad'), '--config', str(config), '--socket', str(root / 'ipc.sock')], env=env, cwd=root, stdout=log, stderr=log)
+p = subprocess.Popen([str(root / ('muxad' + exe)), '--config', str(config), '--socket', str(root / 'ipc.sock')], env=env, cwd=root, stdout=log, stderr=log)
 
 def restart_daemon():
     global p
-    p.send_signal(signal.SIGTERM)
+    stop_daemon()
     p.wait(timeout=15)
-    p = subprocess.Popen([str(root / 'muxad'), '--config', str(config), '--socket', str(root / 'ipc.sock')], env=env, cwd=root, stdout=log, stderr=log)
+    p = subprocess.Popen([str(root / ('muxad' + exe)), '--config', str(config), '--socket', str(root / 'ipc.sock')], env=env, cwd=root, stdout=log, stderr=log)
     for _ in range(200):
         assert p.poll() is None, (root / 'daemon.log').read_text()
         try:
@@ -132,7 +159,9 @@ try:
                 break
         except OSError:
             time.sleep(0.05)
-    node = subprocess.Popen(['node', str(REPO / 'scripts/dashboard-sharing-smoke.cjs'), origin, str(root), issuer], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    env['MUXA_TEST_PANE_PREFIX'] = 'rmux:' if WINDOWS else ''
+    group = dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) if WINDOWS else dict(start_new_session=True)
+    node = subprocess.Popen(['node', str(pathlib.Path(__file__).resolve().parent / 'dashboard-sharing-smoke.cjs'), origin, str(root), issuer], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **group)
     stdout, stderr = node.communicate(timeout=120)
     print(stdout)
     print(stderr)

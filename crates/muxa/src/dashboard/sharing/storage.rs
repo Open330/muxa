@@ -249,7 +249,9 @@ impl Sharing {
         let path = config
             .storage_path
             .clone()
-            .or_else(|| dirs::data_dir().map(|d| d.join("muxa/dashboard-sharing/shares.sqlite3")))
+            .or_else(|| {
+                crate::paths::data_dir().map(|d| d.join("muxa/dashboard-sharing/shares.sqlite3"))
+            })
             .ok_or_else(|| {
                 io::Error::other("sharing storage_path is required without an XDG data directory")
             })?;

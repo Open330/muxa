@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Watch popups, hooks, status, messaging, snapshot/restore, `reload mux` and
   the PowerShell profile autostart are verified; the gaps are listed in
   `docs/WINDOWS.md`.
+- `muxa restore --boot` and the `restore-at-login` init component restore
+  the newest snapshot after a reboot. The hook rebuilds only into a
+  multiplexer server with no sessions, starting it if it is down, and
+  otherwise changes nothing. It is registered as a systemd user unit, a
+  `LaunchAgent`, or a Task Scheduler task.
+- The dashboard sharing browser smoke test also runs on Windows, against a
+  private rmux label.
 - Agents can explicitly request required human attention with `muxa msg attention`
   or `muxa_request_attention`. Muxa for Mac aggregates these durable operator
   requests across Fleet hosts, displays pending decisions in Attention/Inbox and
@@ -26,6 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On Windows and macOS, the dashboard sharing and operator databases and the
+  automation ledger honour `XDG_DATA_HOME` like every other muxa store.
+  Before, a sandboxed daemon shared the user's real ones.
+- A snapshot no longer records a shell profile's `muxa daemon start`, caught
+  mid-flight, as the pane's program, so a restore stops typing it into the
+  new shell.
+- The dashboard sharing smoke test opens shares through the pane drawer; its
+  old share button had been removed from the dashboard.
+- muxad on Windows also stops cleanly on Ctrl+Break, the console stop a
+  supervisor can send to its process group. Dashboard socket labels shorten
+  Windows pipe paths too.
 - Collaboration host scope accepts namespaced pane IDs such as `rmux:%N`
   across windows and sessions. Room-local aliases and role selectors retain
   their scope, and duplicate pane IDs across servers remain ambiguous.

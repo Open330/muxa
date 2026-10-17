@@ -40,6 +40,8 @@ mod timeline;
 mod tmux_work;
 mod upgrade;
 mod watch;
+#[cfg(windows)]
+mod windows_detach;
 mod work_compose;
 mod work_init;
 mod work_options;

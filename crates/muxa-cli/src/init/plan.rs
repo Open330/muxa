@@ -49,6 +49,9 @@ pub enum Action {
     EnableLaunchdUnit { plist_path: PathBuf },
     /// `launchctl bootout gui/<uid>/<label>`.
     DisableLaunchdUnit,
+    /// Register (`enable`) or unregister the login hook that runs
+    /// `muxa restore --boot` with this host's scheduler.
+    ManageLoginRestore { enable: bool },
     /// Start `muxad` in the background if it isn't already responding
     /// on the IPC socket. Cross-platform — works regardless of which
     /// (or no) daemon-manager component was selected. Honours
@@ -87,6 +90,7 @@ impl Plan {
             | Action::DisableSystemdUnit
             | Action::EnableLaunchdUnit { .. }
             | Action::DisableLaunchdUnit
+            | Action::ManageLoginRestore { .. }
             | Action::StartDaemonIfNeeded { .. } => true,
             Action::SourceTmuxConf { .. } | Action::PrintDashboard { .. } => false,
         })
@@ -129,6 +133,7 @@ pub fn build(
             Component::MuxadSystemd => plan_systemd(direction, *c, detect, &mut actions)?,
             Component::MuxadLaunchd => plan_launchd(direction, *c, detect, &mut actions)?,
             Component::MuxadShellrc => plan_shellrc(direction, *c, &mut actions)?,
+            Component::RestoreAtLogin => plan_login_restore(direction, *c, detect, &mut actions)?,
             Component::Dashboard => {
                 let Some(path) = files::dashboard::default_path() else {
                     continue;
@@ -553,6 +558,44 @@ fn plan_systemd(
         Direction::Uninstall => {
             actions.push(Action::DisableSystemdUnit);
             if path.is_file() {
+                actions.push(Action::DeleteFile { component: c, path });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The login hook is a unit file plus a registration on Linux and macOS,
+/// and a Task Scheduler task alone on Windows. Linux without a reachable
+/// user manager has nowhere to put it.
+fn plan_login_restore(
+    direction: Direction,
+    c: Component,
+    detect: &Detection,
+    actions: &mut Vec<Action>,
+) -> Result<()> {
+    let path = files::login_restore::unit_path();
+    match direction {
+        Direction::Install => {
+            if std::env::consts::OS == "linux" && !detect.systemd_user_available {
+                return Ok(());
+            }
+            if let (Some(path), Some(want)) = (path, files::login_restore::render()) {
+                let before = read_to_string_opt(&path)?;
+                let (after, outcome) = files::login_restore::upsert(before.as_deref(), &want);
+                actions.push(Action::EditFile {
+                    component: c,
+                    path,
+                    before,
+                    after,
+                    outcome,
+                });
+            }
+            actions.push(Action::ManageLoginRestore { enable: true });
+        }
+        Direction::Uninstall => {
+            actions.push(Action::ManageLoginRestore { enable: false });
+            if let Some(path) = path.filter(|path| path.is_file()) {
                 actions.push(Action::DeleteFile { component: c, path });
             }
         }

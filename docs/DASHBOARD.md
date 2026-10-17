@@ -987,6 +987,11 @@ export MUXA_TEST_CHROMIUM=/path/to/chromium
 python3 scripts/dashboard-sharing-smoke.py
 ```
 
+On Windows the harness runs the panes on a private rmux label instead
+(`MUXA_TEST_RMUX_LABEL`, default `muxa-share-smoke`) and needs PowerShell
+and Python on `PATH`; build with `cargo build -p muxad` and point
+`MUXA_TEST_CHROMIUM` at an installed Chrome.
+
 This harness creates only loopback listeners and fixture identities. Passing it
 does not replace the deployment's own HTTPS and real-provider login check.
 

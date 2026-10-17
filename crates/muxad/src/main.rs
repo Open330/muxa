@@ -2313,8 +2313,12 @@ fn install_shutdown_signal_handler(restart: Arc<RestartController>) {
             let mut ctrl_c = windows::ctrl_c().expect("install Ctrl+C handler");
             let mut close = windows::ctrl_close().expect("install console-close handler");
             let mut shutdown = windows::ctrl_shutdown().expect("install shutdown handler");
+            // A process group cannot be sent Ctrl+C, only Ctrl+Break — the
+            // one console stop a supervisor can aim at muxad alone.
+            let mut ctrl_break = windows::ctrl_break().expect("install Ctrl+Break handler");
             tokio::select! {
                 _ = ctrl_c.recv() => tracing::info!("Ctrl+C received"),
+                _ = ctrl_break.recv() => tracing::info!("Ctrl+Break received"),
                 _ = close.recv() => tracing::info!("console close received"),
                 _ = shutdown.recv() => tracing::info!("system shutdown received"),
             }
