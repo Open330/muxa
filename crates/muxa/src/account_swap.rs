@@ -1033,14 +1033,7 @@ fn process_command(pid: u32) -> Option<String> {
 }
 
 fn is_shell(command: &str) -> bool {
-    // A whole command line may lead with a Windows path that has spaces in
-    // it (`C:\Program Files\PowerShell\7\pwsh.exe -NoLogo`), so the full
-    // line is tried before its first word.
     crate::shell::is_shell_program(command)
-        || crate::shell::is_shell_program(command.split_whitespace().next().unwrap_or_default())
-        || command
-            .split_once(".exe")
-            .is_some_and(|(program, _)| crate::shell::is_shell_program(program))
 }
 
 /// Wait for the resumed TUI to stop redrawing, so the follow-up lands in

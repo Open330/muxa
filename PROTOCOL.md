@@ -452,7 +452,7 @@ control action, not a read. The IPC endpoint is already owner-only on Unix
 daemon's own user can invoke it; there is no network exposure and no
 additional authentication layer. Treat endpoint access as equivalent to shell
 access for that user. The Windows named pipe is additionally reachable by
-administrators, which is one of the reasons Windows is not a supported host.
+administrators (its default DACL), so on Windows they hold that access too.
 
 **Pre-1.0 evolution.** These methods are additive (they do not bump
 `PROTOCOL_VERSION`). Like the rest of the pre-1.0 surface they may change

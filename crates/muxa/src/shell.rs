@@ -156,11 +156,44 @@ pub fn program_name(argv0: &str) -> &str {
     base
 }
 
-/// Whether `argv0` names an interactive shell (login-shell `-` prefix and
-/// Windows extensions allowed).
+/// The program at the head of a command line: its first word, except that
+/// a quoted program, or an unquoted Windows path with spaces in it
+/// (`C:\Program Files\PowerShell\pwsh.exe -NoLogo`), runs to its closing
+/// quote or executable extension. Arguments never count, so `vim ~/fish`
+/// is `vim`.
 #[must_use]
-pub fn is_shell_program(argv0: &str) -> bool {
-    let name = program_name(argv0.trim()).trim_start_matches('-');
+pub fn program_token(line: &str) -> &str {
+    let line = line.trim();
+    if let Some(quoted) = line.strip_prefix('"') {
+        return quoted.split('"').next().unwrap_or(quoted);
+    }
+    let bytes = line.as_bytes();
+    let windows_path = line.starts_with(r"\\")
+        || (bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == br":\");
+    if windows_path {
+        let lower = line.to_ascii_lowercase();
+        let end = [".exe", ".cmd", ".bat", ".com", ".ps1"]
+            .iter()
+            .flat_map(|extension| {
+                lower
+                    .match_indices(extension)
+                    .map(|(at, _)| at + extension.len())
+            })
+            .filter(|&end| lower[end..].chars().next().is_none_or(char::is_whitespace))
+            .min();
+        if let Some(end) = end {
+            return &line[..end];
+        }
+    }
+    line.split_whitespace().next().unwrap_or_default()
+}
+
+/// Whether the program `command` runs is an interactive shell (login-shell
+/// `-` prefix and Windows extensions allowed). Only the program is looked
+/// at — see [`program_token`] — never its arguments.
+#[must_use]
+pub fn is_shell_program(command: &str) -> bool {
+    let name = program_name(program_token(command)).trim_start_matches('-');
     [
         "sh",
         "bash",
@@ -244,10 +277,20 @@ mod tests {
             r"C:\Program Files\PowerShell\7\pwsh.exe",
             "powershell.exe",
             "cmd.exe",
+            "zsh -l",
+            r"C:\Program Files\PowerShell\pwsh.exe -NoLogo -NoExit",
+            r#""C:\Program Files\PowerShell\pwsh.exe" -NoLogo"#,
         ] {
             assert!(is_shell_program(shell), "{shell}");
         }
-        for program in ["claude", "claude.exe", "codex.cmd", "node"] {
+        for program in [
+            "claude",
+            "claude.exe",
+            "codex.cmd",
+            "node",
+            "vim /home/u/.config/fish",
+            r"C:\tools\vim.exe C:\y\fish",
+        ] {
             assert!(!is_shell_program(program), "{program}");
         }
     }

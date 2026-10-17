@@ -42,15 +42,16 @@ need() {
 # Git Bash, MSYS2 and Cygwin all report a Windows-family `uname -s` while
 # providing a POSIX shell, so this script runs happily and then spends several
 # minutes compiling before dying inside `nix`, which has no Windows target.
-# Answer the question up front instead: muxa has no Windows host, and WSL is
-# not a workaround there but the actual supported environment.
+# Answer the question up front instead: a native Windows install goes
+# through PowerShell and rmux (docs/WINDOWS.md), or WSL runs this script as is.
 case "$(uname -s 2>/dev/null)" in
   MINGW* | MSYS* | CYGWIN* | Windows_NT)
     cat >&2 <<'WINDOWS_NOTICE'
-muxa-install: this is a Windows shell, and muxa has no Windows host.
+muxa-install: this is a Windows shell, which this script does not install into.
 
-muxa observes agents running in tmux panes, and tmux does not run natively on
-Windows. Install inside WSL2, where muxa is the complete product:
+For a native install, use PowerShell with rmux as the multiplexer — the steps
+are under "Native install (rmux)" in docs/WINDOWS.md. Or install inside WSL2,
+where tmux and this script work unchanged:
 
   wsl --install                 # once, if you have no distribution yet
   wsl                           # then, inside it:
@@ -62,7 +63,7 @@ Windows Terminal attaches to that distribution like any other shell, so
 Clone into the WSL filesystem (~/) rather than /mnt/c — the 9p mount makes
 cargo builds several times slower.
 
-See docs/WINDOWS.md for why native support is not planned.
+See docs/WINDOWS.md for what works natively and what is left.
 WINDOWS_NOTICE
     exit 1
     ;;

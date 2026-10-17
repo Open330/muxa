@@ -24,9 +24,8 @@
 //! | Teardown | unlink the socket file | the pipe dies with its last handle |
 //! | Blocking client | a second synchronous socket | unsupported |
 //!
-//! Windows is not a supported host (see `docs/WINDOWS.md`). This exists so the
-//! transport stops being the reason it cannot be, and so the differences above
-//! live in one place instead of being rediscovered later.
+//! Windows runs through rmux (see `docs/WINDOWS.md`). The differences above
+//! live here, in one place, instead of being rediscovered by each caller.
 
 use std::io;
 use std::path::Path;
@@ -43,7 +42,7 @@ pub use imp::{BlockingStream, Listener, ReadHalf, Stream, WriteHalf};
 /// `observe_collaboration_actor` maps `None` to
 /// `CollaborationClientKind::Unknown` — so this is the existing degradation
 /// rather than a new path. It does leave collaboration provenance weaker on
-/// Windows, which is one more reason it is not a supported host.
+/// Windows: a message's origin shows as unverified there.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PeerIdentity {
     pub pid: Option<u32>,
