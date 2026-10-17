@@ -1,4 +1,5 @@
 const { chromium } = require(process.env.MUXA_PLAYWRIGHT_PACKAGE || 'playwright');
+const pane=n=>(process.env.MUXA_TEST_PANE_PREFIX||'')+'%'+n;
 (async()=>{
  const browser=await chromium.launch({executablePath:process.env.MUXA_TEST_CHROMIUM,headless:true,args:['--no-sandbox']});
  try {
@@ -7,21 +8,21 @@ const { chromium } = require(process.env.MUXA_PLAYWRIGHT_PACKAGE || 'playwright'
   await page.goto(origin+'/#token=operator');
   await page.locator('[data-collapse-target="data-panel"]').click();
   await page.locator('[data-tab="panes"]').click();
-  await page.locator('#panes-tbody [data-pane-action="share"]').first().click();
+  await page.locator('#panes-tbody [data-open-pane]').first().click();await page.locator('#pane-drawer-share').click();
   await page.getByRole('button',{name:'Check login setup'}).click();
   await page.waitForFunction(()=>document.querySelector('.share-message').textContent.includes('reachable'));
   await page.locator('[name=email]').fill('guest@example.com');await page.locator('[name=permission]').selectOption('prompt');await page.locator('[name=scope]').selectOption('window');await page.getByRole('button',{name:'Create share',exact:true}).click();
   const link=page.getByLabel('Share link');await link.waitFor();const url=await link.inputValue();
   const guest=await browser.newContext();const shared=await guest.newPage();shared.on('pageerror',e=>console.error('GUESTERROR',e));
-  await shared.goto(url);await shared.locator('#login').click();await shared.waitForURL(url);await shared.locator('#prompt').waitFor();await shared.locator('#pane').selectOption('%1');await shared.waitForFunction(()=>document.querySelector('#identity').textContent.startsWith('%1'));
+  await shared.goto(url);await shared.locator('#login').click();await shared.waitForURL(url);await shared.locator('#prompt').waitFor();await shared.locator('#pane').selectOption(pane(1));await shared.waitForFunction(p=>document.querySelector('#identity').textContent.startsWith(p),pane(1));
   await fetch(process.argv[4]+'/test/add-pane',{method:'POST'});
-  const uninvitedPane=await shared.evaluate(async()=> (await fetch(location.pathname.replace('/share/','/share/api/')+'?pane=%252')).status);
+  const uninvitedPane=await shared.evaluate(async p=> (await fetch(location.pathname.replace('/share/','/share/api/')+'?pane='+encodeURIComponent(p))).status,pane(2));
   if(uninvitedPane!==403)throw Error('new pane inherited permission '+uninvitedPane);
   let firstPayload;shared.on('request',r=>{if(r.url().endsWith('/prompt')&&!firstPayload)firstPayload=r.postDataJSON()});
   await shared.locator('#prompt').fill('muxa-browser-marker');await shared.locator('#send').click();
   await shared.waitForFunction(()=>document.querySelector('#output').textContent.includes('muxa-browser-marker'));
   await fetch(process.argv[4]+'/test/restart',{method:'POST'});
-  await shared.reload();await shared.locator('#login').click();await shared.waitForURL(url);await shared.locator('#prompt').waitFor();await shared.locator('#pane').selectOption('%1');await shared.waitForFunction(()=>document.querySelector('#identity').textContent.startsWith('%1'));
+  await shared.reload();await shared.locator('#login').click();await shared.waitForURL(url);await shared.locator('#prompt').waitFor();await shared.locator('#pane').selectOption(pane(1));await shared.waitForFunction(p=>document.querySelector('#identity').textContent.startsWith(p),pane(1));
   const replay=await shared.evaluate(async payload=>(await fetch(location.pathname.replace('/share/','/share/api/')+'/prompt',{method:'POST',headers:{'Content-Type':'application/json','X-Muxa-Share':'1'},body:JSON.stringify(payload)})).status,firstPayload);
   if(replay!==200)throw Error('receipt replay failed '+replay);
   await guest.setOffline(true);await shared.waitForFunction(()=>document.querySelector('#send').disabled);

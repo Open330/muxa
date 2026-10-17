@@ -708,8 +708,10 @@ const store = {
 // back to the raw id when no scan match is available (e.g. before the
 // first /api/panes response, or when the pane lives on an unreadable
 // socket).
+// A Windows rmux endpoint is a pipe path (`\\.\pipe\rmux-...`), so both
+// separators end a component.
 function socketShortName(socket) {
-  return (socket || "default").split("/").pop() || "default";
+  return (socket || "default").split(/[\\/]/).pop() || "default";
 }
 
 function paneLookupKey(socket, paneId) {
@@ -2281,7 +2283,7 @@ function renderPanes() {
 
   const html = rows
     .map((p) => {
-      const sockShort = p.socket.split("/").pop() || p.socket;
+      const sockShort = socketShortName(p.socket);
       return `<tr${paneRowAttrs(p.pane_id, p.socket, `${p.session}:${p.window_index}.${p.pane_id}`)}>
         <td title="${esc(p.socket)}">${esc(sockShort)}</td>
         <td>${esc(p.session)}</td>
@@ -3191,7 +3193,7 @@ function shortPath(path) {
 function renderSocketChips(sockets) {
   const html = sockets
     .map((s) => {
-      const short = s.split("/").pop() || s;
+      const short = socketShortName(s);
       const active = store.filters.paneSockets.has(s);
       return `<button class="chip${active ? " active" : ""}" data-socket="${esc(s)}" title="${esc(s)}">${esc(short)}</button>`;
     })

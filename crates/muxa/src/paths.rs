@@ -163,6 +163,15 @@ fn posix_uid() -> u32 {
 // dirs follows macOS conventions and ignores XDG overrides there. Honor the
 // explicit overrides on every platform so isolated runtimes cannot accidentally
 // share the user's state, history, or configuration.
+/// The data directory: `$XDG_DATA_HOME` when it is set to an absolute path,
+/// else the platform's own. `dirs::data_dir` reads `XDG_DATA_HOME` only on
+/// Linux, so a sandboxed daemon on Windows or macOS would otherwise share
+/// the user's real stores.
+#[must_use]
+pub fn data_dir() -> Option<PathBuf> {
+    xdg_dir("XDG_DATA_HOME", dirs::data_dir)
+}
+
 fn xdg_dir(key: &str, fallback: fn() -> Option<PathBuf>) -> Option<PathBuf> {
     absolute_override(std::env::var_os(key)).or_else(fallback)
 }

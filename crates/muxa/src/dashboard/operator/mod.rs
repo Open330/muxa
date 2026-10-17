@@ -433,7 +433,7 @@ impl OperatorLogin {
             return Ok(login);
         }
         let path = path
-            .or_else(|| dirs::data_dir().map(|d| d.join(DEFAULT_STORAGE_PATH)))
+            .or_else(|| crate::paths::data_dir().map(|d| d.join(DEFAULT_STORAGE_PATH)))
             .ok_or_else(|| std::io::Error::other("operator sign-in needs an XDG data directory"))?;
         let (storage, enrolled, viewer_rules) =
             tokio::task::spawn_blocking(move || storage::Storage::open(&path))

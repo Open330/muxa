@@ -82,7 +82,7 @@ const DEFAULT_MAX_PER_HOUR: u32 = 3;
 /// ask history and collaboration mailbox it sits alongside.
 #[must_use]
 pub fn default_automation_file() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| {
+    crate::paths::data_dir().map(|dir| {
         dir.join(crate::paths::CONFIG_DIRNAME)
             .join(AUTOMATION_FILENAME)
     })
