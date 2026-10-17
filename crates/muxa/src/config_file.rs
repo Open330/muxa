@@ -371,22 +371,28 @@ fn write_unlocked(
         }
     }
 
-    let parsed: Config = toml::from_str(text).map_err(|error| {
-        ConfigFileError::Invalid(format!(
-            "the config would not parse, so it was not written: {error}"
-        ))
-    })?;
-    parsed.validate().map_err(|error| {
-        ConfigFileError::Invalid(format!(
-            "the config is invalid, so it was not written: {error}"
-        ))
-    })?;
+    loads(text, ", so it was not written")?;
 
     atomic_write(path, text).map_err(ConfigFileError::Io)?;
     Ok(ConfigDocument {
         path: path.to_path_buf(),
         text: text.to_string(),
         exists: true,
+    })
+}
+
+/// Whether `text` would load: it parses as a [`Config`] and passes
+/// [`Config::validate`]. [`write`] refuses anything this refuses.
+pub fn check(text: &str) -> Result<(), ConfigFileError> {
+    loads(text, "")
+}
+
+fn loads(text: &str, consequence: &str) -> Result<(), ConfigFileError> {
+    let parsed: Config = toml::from_str(text).map_err(|error| {
+        ConfigFileError::Invalid(format!("the config would not parse{consequence}: {error}"))
+    })?;
+    parsed.validate().map_err(|error| {
+        ConfigFileError::Invalid(format!("the config is invalid{consequence}: {error}"))
     })
 }
 
@@ -781,6 +787,20 @@ options = ["--model", "other"]
             "[ask]\nenabled = true\n"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `check` is the write's own gate, without a file to compare against.
+    #[test]
+    fn check_judges_a_document_the_way_a_write_would() {
+        check("[ask]\nenabled = true\n").expect("loads");
+        let error = check("[ask]\nnot_a_key = 1\n").expect_err("refused");
+        let ConfigFileError::Invalid(detail) = error else {
+            panic!("{error:?}");
+        };
+        assert!(
+            detail.starts_with("the config would not parse:"),
+            "{detail}"
+        );
     }
 
     #[test]

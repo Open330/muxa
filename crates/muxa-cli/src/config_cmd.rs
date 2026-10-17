@@ -46,8 +46,9 @@ enum ConfigCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Check a document without writing it: the daemon parses and validates
-    /// it exactly as `set` would.
+    /// Check a document without writing it: it is parsed and validated
+    /// exactly as `set` would. The daemon judges its own file; `--from` is
+    /// judged by this CLI.
     Check {
         /// File to check; `-` reads standard input. Defaults to the config
         /// the daemon currently has.
@@ -104,16 +105,23 @@ pub(crate) async fn run(args: Args, socket: PathBuf) -> Result<()> {
             }
         }
         ConfigCommand::Check { from, json } => {
-            let text = match from {
-                Some(path) => read_source(&path)?,
-                None => read(&client).await?.text,
+            let checked = if let Some(path) = from {
+                // Another document never touches the daemon's file: it is
+                // judged here, by the same parse and validation a write runs.
+                muxa::config_file::check(&read_source(&path)?).map_err(anyhow::Error::from)
+            } else {
+                // The daemon's own file is judged by the daemon, which will
+                // not write a document it refuses: a write of the text that is
+                // already there, pinned to itself, is a no-op on success.
+                let text = read(&client).await?.text;
+                client
+                    .config_write(&text, Some(&text))
+                    .await
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
             };
-            // The daemon is the only judge of what loads, and it will not
-            // write a document it refuses, so a check is a write of the text
-            // that is already there — pinned to itself, which makes it a
-            // no-op on success.
-            match client.config_write(&text, Some(&text)).await {
-                Ok(_) => {
+            match checked {
+                Ok(()) => {
                     if json {
                         println!("{}", serde_json::json!({ "ok": true }));
                     } else {
@@ -122,14 +130,6 @@ pub(crate) async fn run(args: Args, socket: PathBuf) -> Result<()> {
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    if message.contains("changed on disk") {
-                        // The text differs from the file, so it was never a
-                        // no-op check; ask for it explicitly instead.
-                        bail!(
-                            "check compares against the daemon's current file; \
-                             pass --from to check a different document"
-                        );
-                    }
                     if json {
                         println!("{}", serde_json::json!({ "ok": false, "error": message }));
                         std::process::exit(1);
