@@ -19,6 +19,16 @@ ignore = [
     # the OIDC dependency: https://rustsec.org/advisories/RUSTSEC-2023-0071.html
     "RUSTSEC-2023-0071",
 
+    # notify-rust 4.17.0 -> zbus 5 -> these standalone crates. Reviewed
+    # 2026-10-19: the 2026-10-17 advisories announce their merge into zbus 6,
+    # not a vulnerability; there are no patched standalone versions. Keep
+    # this exception limited to those maintenance notices and revisit when
+    # notify-rust migrates to zbus 6. Upstream migration announcement:
+    # https://github.com/z-galaxy/zbus/issues/2043
+    "RUSTSEC-2026-0370", # zvariant
+    "RUSTSEC-2026-0371", # zbus_names
+    "RUSTSEC-2026-0372", # zvariant_derive
+
     # Transitive through zellij-tile 0.44.3 -> zellij-utils -> clap 3.
     # zellij-tile 0.44.3 is the latest plugin API crate as of v0.8.0, and
     # these are unmaintained advisories rather than memory-safety CVEs.
