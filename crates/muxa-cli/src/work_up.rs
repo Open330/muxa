@@ -478,6 +478,7 @@ pub(crate) async fn reconcile_run(
                             anyhow::anyhow!("pipeline agent {:?}: {error}", claim.agent.alias)
                         })?;
                     crate::agent_launch::start(StartRequest {
+                        purpose: muxa::collaboration::LaunchPurpose::Primary,
                         socket: client.socket().to_path_buf(),
                         agent: program,
                         options: Vec::new(),
@@ -1251,6 +1252,7 @@ fn launch(
     let direction = SplitDirection::parse(agent.direction.as_deref())
         .map_err(|error| anyhow::anyhow!("pipeline agent {:?}: {error}", agent.alias))?;
     let result = crate::agent_launch::start(StartRequest {
+        purpose: muxa::collaboration::LaunchPurpose::Primary,
         socket: socket.to_path_buf(),
         agent: program,
         // Already resolved against `[agent.<program>]` in `resolve`.

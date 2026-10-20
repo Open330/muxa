@@ -5,6 +5,7 @@ use super::*;
 
 fn participant(pane: &str, session: &str) -> Participant {
     Participant {
+        launch_purpose: crate::collaboration::LaunchPurpose::Worker,
         agent_kind: AgentKind::Codex,
         agent_session_id: session.into(),
         pane: pane.into(),

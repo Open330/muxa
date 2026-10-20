@@ -1790,6 +1790,9 @@ async fn wake_idle_collaboration_peers_with_inflight(
     .await
     .unwrap_or_default();
     collaboration.enrich_participants(&mut participants).await;
+    collaboration
+        .enrich_launch_purposes(&mut participants, &panes)
+        .await;
 
     for request in requests {
         let Some(recipient) =
@@ -1798,6 +1801,9 @@ async fn wake_idle_collaboration_peers_with_inflight(
             continue;
         };
         let recipient = &recipient;
+        if !request.from.console && !recipient.accepts_peer_work() {
+            continue;
+        }
         let wake_key = collaboration_wake_key(recipient);
         if wake_inflight.contains(&wake_key) {
             continue;
@@ -2217,7 +2223,17 @@ fn ready_collaboration_recipient(
     }
     idle_pending_recipient(participants, &request.to)
         .cloned()
-        .or_else(|| muxa::collaboration::pending_recipient_ready(&request.to, agents, panes))
+        .or_else(|| {
+            let mut ready =
+                muxa::collaboration::pending_recipient_ready(&request.to, agents, panes)?;
+            if let Some(enriched) = participants
+                .iter()
+                .find(|p| p.pane == ready.pane && p.socket == ready.socket && p.room == ready.room)
+            {
+                ready.launch_purpose = enriched.launch_purpose;
+            }
+            Some(ready)
+        })
 }
 
 /// The idle agent that may adopt a request still addressed to a launching
@@ -3506,6 +3522,7 @@ mod tests {
         window: &str,
     ) -> muxa::collaboration::Participant {
         muxa::collaboration::Participant {
+            launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
             agent_kind: AgentKind::Codex,
             agent_session_id: session.into(),
             pane: pane.into(),
@@ -3699,6 +3716,32 @@ mod tests {
             .await;
     }
 
+    fn worker_participants(
+        agents: &[muxa::Agent],
+        panes: &[PaneInfo],
+    ) -> Vec<muxa::collaboration::Participant> {
+        let mut participants = muxa::collaboration::participants_from(agents, panes);
+        for participant in &mut participants {
+            participant.launch_purpose = muxa::collaboration::LaunchPurpose::Worker;
+        }
+        participants
+    }
+
+    async fn authorize_test_workers(
+        mailbox: &CollaborationStore,
+        participants: &[muxa::collaboration::Participant],
+    ) {
+        for participant in participants
+            .iter()
+            .filter(|p| !muxa::collaboration::is_pending_session(&p.agent_session_id))
+        {
+            mailbox
+                .set_purpose(participant, muxa::collaboration::LaunchPurpose::Worker)
+                .await
+                .unwrap();
+        }
+    }
+
     async fn deliver_quiet_progress_burst(
         mailbox: &CollaborationStore,
         store: &muxa::SharedStore,
@@ -3752,8 +3795,7 @@ mod tests {
             add_agent(&store, "%1", "sender", AgentKind::Codex).await;
             add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
             let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
-            let participants =
-                muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+            let participants = worker_participants(&store.snapshot().await, &panes);
             let sender = participants
                 .iter()
                 .find(|p| p.pane == "%1")
@@ -3765,6 +3807,7 @@ mod tests {
                 .unwrap()
                 .clone();
             let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+            authorize_test_workers(&mailbox, &participants).await;
             let sends = Arc::new(Mutex::new(Vec::new()));
             let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
                 panes,
@@ -3850,7 +3893,7 @@ mod tests {
         add_capped_agent(&store, "%1", "sender").await;
         add_capped_agent(&store, "%2", "recipient").await;
         let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
-        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let participants = worker_participants(&store.snapshot().await, &panes);
         let sender = participants
             .iter()
             .find(|p| p.pane == "%1")
@@ -3862,6 +3905,7 @@ mod tests {
             .unwrap()
             .clone();
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
         mailbox
             .create(
                 sender,
@@ -3900,7 +3944,7 @@ mod tests {
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
         add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
         let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
-        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let participants = worker_participants(&store.snapshot().await, &panes);
         let sender = participants
             .iter()
             .find(|participant| participant.pane == "%1")
@@ -3912,6 +3956,7 @@ mod tests {
             .unwrap()
             .clone();
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
         let sends = Arc::new(Mutex::new(Vec::new()));
         let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
             panes,
@@ -4017,14 +4062,88 @@ mod tests {
         assert_eq!(wake_inflight.len(), 1, "other panes are untouched");
     }
 
+    #[tokio::test]
+    async fn primary_receives_no_peer_prompt_in_any_payload_mode() {
+        for payload in [
+            CollaborationWakePayload::Notice,
+            CollaborationWakePayload::OperatorFull,
+            CollaborationWakePayload::Full,
+        ] {
+            let store = muxa::Store::shared();
+            add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+            add_agent(&store, "%2", "human", AgentKind::ClaudeCode).await;
+            let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+            let participants =
+                muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+            let sender = participants
+                .iter()
+                .find(|p| p.pane == "%1")
+                .unwrap()
+                .clone();
+            let recipient = participants
+                .iter()
+                .find(|p| p.pane == "%2")
+                .unwrap()
+                .clone();
+            let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+            let request = mailbox
+                .create(
+                    sender,
+                    recipient.clone(),
+                    NewRequest {
+                        body: "peer must not interrupt human".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let sends = Arc::new(Mutex::new(Vec::new()));
+            let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+                panes,
+                sends: sends.clone(),
+            });
+            wake_idle_collaboration_peers_with_inflight(
+                &mailbox,
+                &store,
+                &[backend],
+                payload,
+                &mut HashSet::new(),
+            )
+            .await;
+            assert!(sends.lock().unwrap().is_empty());
+            assert_eq!(
+                mailbox
+                    .peek_for(&recipient, &request.id)
+                    .await
+                    .unwrap()
+                    .status,
+                muxa::collaboration::RequestStatus::Queued
+            );
+        }
+    }
+
     /// The spawn deadlock, end to end: a pane muxa launched carries only a
     /// synthetic row — no session has registered, so it is not a participant —
     /// yet the request queued against it is delivered as soon as the pane
     /// reads idle. Without this the sender would wait for a registration that
     /// codex cannot produce until something types at it.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // end-to-end wake setup is intentionally kept in one scenario
     async fn collaboration_waker_delivers_to_a_launched_pane_before_it_registers() {
+        struct Worker(std::process::Child);
+        impl Drop for Worker {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let worker = Worker(
+            std::process::Command::new("bash")
+                .args(["-c", "exec -a 'codex --no-daemon' sleep 30"])
+                .spawn()
+                .unwrap(),
+        );
         let store = muxa::Store::shared();
         add_agent(&store, "%1", "sender", AgentKind::ClaudeCode).await;
         add_agent(
@@ -4036,9 +4155,11 @@ mod tests {
         .await;
         let mut launched = collaboration_pane("%2", "1");
         launched.agent_role = Some("peer".into());
+        launched.agent_program = Some("codex".into());
+        launched.pane_pid = worker.0.id();
         let panes = vec![collaboration_pane("%1", "0"), launched];
         let agents = store.snapshot().await;
-        let participants = muxa::collaboration::participants_from(&agents, &panes);
+        let participants = worker_participants(&agents, &panes);
         assert!(
             participants
                 .iter()
@@ -4061,6 +4182,15 @@ mod tests {
         .expect("a launched agent pane is addressable by pane id");
 
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
+        mailbox
+            .register_worker_launch(
+                uuid::Uuid::new_v4().to_string(),
+                panes[1].clone(),
+                AgentKind::Codex,
+            )
+            .await
+            .unwrap();
         let sends = Arc::new(Mutex::new(Vec::new()));
         let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
             panes,
@@ -4135,7 +4265,20 @@ mod tests {
         .into_iter()
         .find(|participant| participant.pane == "%2")
         .expect("the hook row registers the pane");
-        let inbox = mailbox.claim_for(&registered).await.unwrap();
+        mailbox
+            .observe_worker_hook(&AgentId {
+                kind: AgentKind::Codex,
+                session_id: "codex-session".into(),
+                surface: None,
+                pane: Some("%2".into()),
+                tmux_socket: Some("default".into()),
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        let mut registered = vec![registered];
+        mailbox.enrich_launch_purposes(&mut registered, &[]).await;
+        let inbox = mailbox.claim_for(&registered[0]).await.unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].id, request.id);
 
@@ -4150,7 +4293,7 @@ mod tests {
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
         add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
         let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
-        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let participants = worker_participants(&store.snapshot().await, &panes);
         let sender = participants
             .iter()
             .find(|participant| participant.pane == "%1")
@@ -4162,6 +4305,7 @@ mod tests {
             .unwrap()
             .clone();
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
         let request = mailbox
             .create(
                 sender.clone(),
@@ -4278,7 +4422,7 @@ mod tests {
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
         add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
         let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
-        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let participants = worker_participants(&store.snapshot().await, &panes);
         let sender = participants
             .iter()
             .find(|participant| participant.pane == "%1")
@@ -4291,6 +4435,7 @@ mod tests {
             .clone();
         let console = muxa::collaboration::Participant::console(sender.room.clone());
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
         let operator_request = mailbox
             .create_with_provenance(
                 console,
@@ -4367,7 +4512,7 @@ mod tests {
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
         add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
         let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
-        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let participants = worker_participants(&store.snapshot().await, &panes);
         let sender = participants
             .iter()
             .find(|participant| participant.pane == "%1")
@@ -4379,6 +4524,7 @@ mod tests {
             .unwrap()
             .clone();
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
         let agent_request = mailbox
             .create(
                 sender,
@@ -4442,7 +4588,7 @@ mod tests {
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
         add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
         let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
-        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let participants = worker_participants(&store.snapshot().await, &panes);
         let sender = participants
             .iter()
             .find(|participant| participant.pane == "%1")
@@ -4454,6 +4600,7 @@ mod tests {
             .unwrap()
             .clone();
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
         for body in ["first body", "second body"] {
             mailbox
                 .create(
@@ -4540,7 +4687,7 @@ mod tests {
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
         add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
         let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
-        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let participants = worker_participants(&store.snapshot().await, &panes);
         let sender = participants
             .iter()
             .find(|participant| participant.pane == "%1")
@@ -4552,6 +4699,7 @@ mod tests {
             .unwrap()
             .clone();
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
         let request = mailbox
             .create(
                 sender.clone(),
@@ -4653,7 +4801,7 @@ mod tests {
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
         add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
         let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
-        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let participants = worker_participants(&store.snapshot().await, &panes);
         let find = |pane: &str| {
             participants
                 .iter()
@@ -4663,6 +4811,7 @@ mod tests {
         };
         let (sender, recipient) = (find("%1"), find("%2"));
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
         let mut ids = Vec::new();
         for body in ["abandoned", "first", "second"] {
             let request = mailbox
@@ -4731,8 +4880,7 @@ mod tests {
             add_agent(&store, "%1", "sender", AgentKind::Codex).await;
             add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
             let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
-            let participants =
-                muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+            let participants = worker_participants(&store.snapshot().await, &panes);
             let find = |pane: &str| {
                 participants
                     .iter()
@@ -4742,6 +4890,7 @@ mod tests {
             };
             let (sender, recipient) = (find("%1"), find("%2"));
             let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+            authorize_test_workers(&mailbox, &participants).await;
             let request = mailbox
                 .create(
                     sender.clone(),
@@ -4819,7 +4968,7 @@ mod tests {
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
         add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
         let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
-        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let participants = worker_participants(&store.snapshot().await, &panes);
         let find = |pane: &str| {
             participants
                 .iter()
@@ -4829,6 +4978,7 @@ mod tests {
         };
         let (sender, recipient) = (find("%1"), find("%2"));
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
         let request = mailbox
             .create(
                 sender.clone(),
@@ -4942,8 +5092,9 @@ mod tests {
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
         add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
         let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
-        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let participants = worker_participants(&store.snapshot().await, &panes);
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
         let template = mailbox
             .create(
                 participants[0].clone(),
@@ -4994,7 +5145,7 @@ mod tests {
         add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
         let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
         let agents = store.snapshot().await;
-        let participants = muxa::collaboration::participants_from(&agents, &panes);
+        let participants = worker_participants(&agents, &panes);
         let sender = participants
             .iter()
             .find(|participant| participant.pane == "%1")
@@ -5006,6 +5157,11 @@ mod tests {
             .unwrap()
             .clone();
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
+        mailbox
+            .set_purpose(&sender, muxa::collaboration::LaunchPurpose::Primary)
+            .await
+            .unwrap();
         let request = mailbox
             .create_with_provenance(
                 sender,
@@ -5120,7 +5276,7 @@ mod tests {
         add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
         let panes = vec![collaboration_pane("%2", "1")];
         let agents = store.snapshot().await;
-        let participants = muxa::collaboration::participants_from(&agents, &panes);
+        let participants = worker_participants(&agents, &panes);
         let recipient = participants[0].clone();
         let console = muxa::collaboration::resolve_origin(
             &muxa::collaboration::CollaborationOrigin {
@@ -5134,6 +5290,7 @@ mod tests {
         )
         .unwrap();
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
         let request = mailbox
             .create(
                 console.clone(),

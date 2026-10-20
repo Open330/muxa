@@ -5,6 +5,35 @@ request/reply messages between its top-level agents. tmux supplies topology;
 the message body travels through muxad's owner-only Unix socket and local
 mailbox, not through terminal screen scraping.
 
+## Human task priority
+
+Agent sessions default to `primary`. Incoming peer work stays queued without
+injecting a prompt or being claimed by the generic inbox. Human console requests
+and terminal replies to the primary's own outgoing requests still work.
+
+Automatic, provider and role selection choose only `worker` sessions. Peers
+created with `spawn_if_missing=true` are workers; that flag requires existing
+user authorization to launch an agent. General `start` and Work pipelines remain
+primary unless explicitly configured. There is no automatic worker pool.
+
+Use `muxa start --agent claude --purpose worker` to launch a worker, or
+`muxa identity purpose worker` inside an existing dedicated worker session.
+`muxa identity purpose primary` protects that session again. Purpose is persisted
+for the exact provider session; a new session does not inherit it from a pane,
+role or alias. A launched worker's first session binds once to its actual CLI
+process; restarting or reusing the pane does not grant worker purpose.
+
+Explicit pane/alias targets can address a primary, but their requests remain
+queued. Accept one deliberately with `muxa msg accept REQUEST --json` or
+`muxa_inbox(request_id=REQUEST)`. Already claimed work stays with its owner.
+New peers use configured provider defaults; conversation history, exact model
+and account settings are not cloned from the primary.
+
+
+Codex workers use `--no-daemon` and bind only from their own pane-bearing hooks;
+shared-server threads cannot take their launch grants.
+
+
 ## The whole model
 
 - One tmux window is one collaboration room. In the managed Muxa model, that

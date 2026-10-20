@@ -20670,6 +20670,7 @@ mod tests {
         alias: Option<&str>,
     ) -> Participant {
         Participant {
+            launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
             agent_kind: AgentKind::Codex,
             agent_session_id: session_id.into(),
             pane: pane.into(),
@@ -27939,6 +27940,7 @@ sort = ["state"]
 
     fn collab_participant(pane: &str, session: &str, window: &str) -> Participant {
         Participant {
+            launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
             agent_kind: AgentKind::ClaudeCode,
             agent_session_id: format!("agent-{pane}"),
             pane: pane.into(),

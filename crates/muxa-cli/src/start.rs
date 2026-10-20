@@ -68,6 +68,7 @@ pub(crate) async fn run(
         .await?;
         crate::agent_launch::run(
             StartArgs {
+                purpose: muxa::collaboration::LaunchPurpose::Primary,
                 agent: program,
                 host: LaunchHost::Tmux,
                 placement: if std::env::var_os("TMUX").is_some() {

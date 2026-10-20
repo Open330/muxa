@@ -4,6 +4,32 @@
 request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 범위를 표현하고,
 실제 메시지는 `muxad`의 owner-only Unix socket과 local mailbox를 통과합니다.
 
+## 사람의 작업 우선 처리
+
+에이전트 세션은 기본적으로 `primary`입니다. 다른 에이전트가 보낸 요청은
+대기 상태로 보관하며 프롬프트를 주입하거나 일반 inbox 조회로 자동 수락하지
+않습니다. 사람이 console에서 보낸 요청과 자신이 보낸 요청의 최종 응답 알림은
+계속 전달합니다.
+
+자동·provider·role 선택은 `worker`만 대상으로 합니다. 사전에 에이전트 생성이
+허용된 `spawn_if_missing=true` 경로로 만든 peer는 worker입니다. 일반 start와
+Work pipeline은 기본적으로 primary이며 별도 worker pool을 만들지 않습니다.
+
+전용 worker는 `muxa start --agent claude --purpose worker`로 실행하거나 해당 세션에서
+`muxa identity purpose worker`로 지정합니다. `primary`로 다시 변경할 수 있습니다.
+목적은 정확한 provider 세션에 저장하며 pane, role, alias나 새 세션으로 상속하지
+않습니다. 새 worker의 첫 세션만 실제 CLI 프로세스에 한 번 결합합니다.
+
+pane·alias로 primary를 직접 지정한 요청도 대기합니다. 작업을 받아도 될 때
+`muxa msg accept REQUEST --json` 또는 `muxa_inbox(request_id=REQUEST)`로 하나만
+명시적으로 수락합니다. 이미 수락한 작업의 소유권은 유지합니다. 새 peer는
+provider 설정의 기본값을 사용하며 기존 대화·정확한 모델·계정을 복제하지 않습니다.
+
+
+Codex worker는 `--no-daemon`으로 분리하며 자신의 pane을 보고하는 hook으로만
+결합합니다. 공유 서버의 다른 세션이 worker 등록을 가져갈 수 없습니다.
+
+
 ## 이것만 기억하세요
 
 - tmux window 하나가 협업 room 하나입니다. Muxa managed model에서 이 window는

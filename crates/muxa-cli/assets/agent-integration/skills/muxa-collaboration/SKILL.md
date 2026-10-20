@@ -56,6 +56,12 @@ capability change or an unknown-tool/argument error.
 5. Inspect replies against the actual files and relevant checks. Apply valid
    findings, explain rejected findings when material, and integrate the result.
 
+Human sessions default to protected `primary`; automatic/provider/role routing
+uses dedicated `worker` sessions. Authorized spawned peers are workers, using
+configured provider defaults. Explicit primary targets stay queued. Inspect IDs
+with message lists and accept just one with `muxa_inbox(request_id=...)` only when
+the human task permits it; do not promote a human session merely to drain inbox.
+
 For requests addressed to you, claim/read with `muxa_inbox` unless already
 claimed and delivered in full. Honor kind/work_mode/paths. Only when
 `expects_reply=true`, finish with one terminal `muxa_reply` (`completed`,

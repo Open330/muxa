@@ -37,7 +37,7 @@ use crate::collaboration::{
 use crate::collaboration_audit::{
     CollaborationAuditContext, CollaborationAuditLog, CollaborationAuditOperation,
 };
-use crate::event::{AgentEvent, PROTOCOL_VERSION};
+use crate::event::{AgentEvent, AgentKind, PROTOCOL_VERSION};
 use crate::fleet::{
     FleetCommandResult, FleetOperation, FleetRuntime, FleetSnapshot, FleetUpdate, LabelSelector,
 };
@@ -586,8 +586,21 @@ enum RequestBody {
         rule: AutomationRule,
         pane: String,
     },
+    #[serde(alias = "collaboration_accept")]
     CollaborationInbox {
         origin: CollaborationOrigin,
+        #[serde(default)]
+        request_id: Option<String>,
+    },
+    CollaborationPurpose {
+        origin: CollaborationOrigin,
+        purpose: collaboration::LaunchPurpose,
+    },
+    CollaborationWorkerLaunch {
+        pane: String,
+        socket: Option<String>,
+        agent_kind: AgentKind,
+        launch_id: String,
     },
     /// Long-lived, content-free durable-mailbox invalidation stream. Reading
     /// actual requests still goes through the normal participant/operator
@@ -787,6 +800,7 @@ const CAPABILITIES: &[&str] = &[
     "needs_choice",
     "rate_limited",
     "collaboration_mailbox",
+    collaboration::HUMAN_PRIORITY_CAPABILITY,
     "collaboration_expire_v1",
     "collaboration_lifecycle",
     "collaboration_wait",
@@ -2702,6 +2716,9 @@ async fn collaboration_participants(
         .unwrap_or_default();
     }
     collaboration.enrich_participants(&mut participants).await;
+    collaboration
+        .enrich_launch_purposes(&mut participants, &panes)
+        .await;
     CollaborationTopology {
         participants,
         panes,
@@ -3239,6 +3256,9 @@ async fn handle(
                     if in_scope {
                         tracing::debug!(?event, "ingest");
                         store.apply(&event).await;
+                        if let Err(error) = collaboration.observe_worker_hook(event.id()).await {
+                            tracing::warn!(%error, "worker hook binding failed; session stays protected");
+                        }
                         // A Codex thread behind the shared app-server arrives
                         // paneless; bind it now, before a sibling started in
                         // the same cwd makes the evidence ambiguous.
@@ -4281,7 +4301,7 @@ async fn handle(
                     .await;
                     response
                 }
-                RequestBody::CollaborationInbox { origin } => {
+                RequestBody::CollaborationInbox { origin, request_id } => {
                     kind = "collaboration_inbox";
                     collaboration_actor.observe_pane(&backends).await;
                     let audit_context = CollaborationAuditContext::new(
@@ -4296,7 +4316,14 @@ async fn handle(
                     )
                     .await;
                     let response = match topology.resolve_origin(&origin) {
-                        Ok(current) => match collaboration.claim_for(&current).await {
+                        Ok(current) => match if let Some(id) = request_id.as_deref() {
+                            collaboration
+                                .claim_by_id(&current, id)
+                                .await
+                                .map(|request| vec![request])
+                        } else {
+                            collaboration.claim_for(&current).await
+                        } {
                             Ok(requests) => Response::with_collaboration_requests(requests),
                             Err(error) => Response::err(error.to_string()),
                         },
@@ -4310,6 +4337,63 @@ async fn handle(
                     )
                     .await;
                     response
+                }
+                RequestBody::CollaborationPurpose { origin, purpose } => {
+                    kind = "collaboration_purpose";
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
+                    match topology.resolve_origin(&origin) {
+                        Ok(current) => match collaboration.set_purpose(&current, purpose).await {
+                            Ok(()) => Response::ok(),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::CollaborationWorkerLaunch {
+                    pane,
+                    socket,
+                    agent_kind,
+                    launch_id,
+                } => {
+                    kind = "collaboration_worker_launch";
+                    let topology =
+                        collaboration_participants(&store, &backends, &collaboration, None).await;
+                    let candidates: Vec<_> = topology
+                        .panes
+                        .iter()
+                        .filter(|p| p.pane_id == pane && p.socket == socket)
+                        .collect();
+                    match candidates.first() {
+                        Some(first)
+                            if candidates.iter().all(|p| {
+                                p.pane_pid == first.pane_pid && p.window_id == first.window_id
+                            }) =>
+                        {
+                            match collaboration
+                                .register_worker_launch(launch_id, (*first).clone(), agent_kind)
+                                .await
+                            {
+                                Ok(()) => {
+                                    let _ = collaboration_participants(
+                                        &store,
+                                        &backends,
+                                        &collaboration,
+                                        None,
+                                    )
+                                    .await;
+                                    Response::ok()
+                                }
+                                Err(error) => Response::err(error.to_string()),
+                            }
+                        }
+                        _ => Response::err("worker pane endpoint is absent or ambiguous"),
+                    }
                 }
                 RequestBody::CollaborationSubscribe => {
                     kind = "collaboration_subscribe";
@@ -6296,6 +6380,29 @@ impl Client {
         serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
     }
 
+    pub async fn collaboration_claim(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+    ) -> Result<Vec<CollaborationRequest>, RuntimeError> {
+        let resp = self
+            .call_checked(&serde_json::json!({"protocol": PROTOCOL_VERSION,
+            "kind":"collaboration_accept", "origin":origin, "request_id":request_id}))
+            .await?;
+        serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_purpose(
+        &self,
+        origin: &CollaborationOrigin,
+        purpose: collaboration::LaunchPurpose,
+    ) -> Result<(), RuntimeError> {
+        self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,
+            "kind":"collaboration_purpose", "origin":origin, "purpose":purpose}))
+            .await?;
+        Ok(())
+    }
+
     pub async fn collaboration_inbox(
         &self,
         origin: &CollaborationOrigin,
@@ -7855,6 +7962,24 @@ mod tests {
                 .unread,
             1
         );
+        assert!(
+            client
+                .collaboration_inbox(&recipient)
+                .await
+                .unwrap()
+                .is_empty(),
+            "primary inbox must not auto-claim peer work"
+        );
+        let accepted = client
+            .collaboration_claim(&recipient, &request.id)
+            .await
+            .unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].id, request.id);
+        client
+            .collaboration_purpose(&recipient, collaboration::LaunchPurpose::Worker)
+            .await
+            .unwrap();
         let inbox = client.collaboration_inbox(&recipient).await.unwrap();
         assert_eq!(inbox[0].status, RequestStatus::Claimed);
         let waiting_client = client.clone();

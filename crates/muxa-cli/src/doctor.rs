@@ -1232,6 +1232,7 @@ mod tests {
 
     fn test_participant(pane: &str, session: &str) -> muxa::collaboration::Participant {
         muxa::collaboration::Participant {
+            launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
             agent_kind: muxa::AgentKind::Codex,
             agent_session_id: session.into(),
             pane: pane.into(),

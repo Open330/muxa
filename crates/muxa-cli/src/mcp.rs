@@ -479,6 +479,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "purpose": {"type":"string","enum":["primary","worker"],"description":"Default primary protects human work. Explicit worker accepts peer requests using configured provider defaults."},
                     "agent": { "type": "string", "enum": ["claude", "codex", "gemini", "agy", "opencode"], "description": "Agent provider. May be omitted when mcp.guide.agent is configured." },
                     "options": { "type": "array", "items": { "type": "string" }, "description": "Additional provider CLI arguments. Overrides mcp.guide.options when present; Muxa shell-quotes every argument." },
                     "placement": { "type": "string", "enum": ["pane", "window", "session"], "description": "Defaults to mcp.guide.placement (pane when unconfigured). Managed work always uses its workspace window." },
@@ -733,7 +734,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_call_peer",
-            "description": "Create a new natural colleague request for Muxa-reserved @peer/@muxa-peer routing. Deterministically selects a healthy same-window peer (or an explicit provider, @alias, role, or pane), optionally expands a registered Muxa /skill, sends one durable request, and optionally waits for its structured reply. Use muxa_peer_report instead when the user asks about an existing peer report, reply, findings, or conversation. Defaults to review + read_only. Set execute=true only after explicit user authorization. If no peer exists, the default result asks for confirmation; set spawn_if_missing=true only after the user explicitly approves creating a bypass-permission agent pane.",
+            "description": "Create a new natural colleague request for Muxa-reserved @peer/@muxa-peer routing. Deterministically selects a healthy same-window worker (or an explicit provider, @alias, role, or pane), optionally expands a registered Muxa /skill, sends one durable request, and optionally waits for its structured reply. Use muxa_peer_report instead when the user asks about an existing peer report, reply, findings, or conversation. Defaults to review + read_only. Set execute=true only after explicit user authorization. If no peer exists, the default result asks for confirmation; set spawn_if_missing=true only after the user explicitly approves creating a bypass-permission agent pane.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -846,8 +847,8 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_inbox",
-            "description": "Claim and read pending collaboration requests addressed to this exact agent session. Instructions are included by default; full=true is for diagnostics. Call promptly when muxa notifies you, honor each request's kind/work_mode/paths contract, and finish it with muxa_reply.",
-            "inputSchema": { "type": "object", "properties": {"full": {"type":"boolean", "description":"Return legacy full records. Default false."}}, "additionalProperties": false },
+            "description": "Read worker inbox requests, or explicitly accept one request_id on a protected primary session. Primary sessions do not auto-claim queued peer work. Instructions are included; full=true is for diagnostics. Honor kind/work_mode/paths; reply only when requested.",
+            "inputSchema": { "type": "object", "properties": {"request_id":{"type":"string","description":"Explicitly accept this one inbound request, including on a protected primary. Omit for normal worker inbox."},"full": {"type":"boolean", "description":"Return legacy full records. Default false."}}, "additionalProperties": false },
         }),
         json!({
             "name": "muxa_list_messages",
@@ -1097,7 +1098,17 @@ async fn call_tool(
                     Ok(value) => value,
                     Err(error) => return Ok(error_result(&format!("start_agent failed: {error}"))),
                 };
+            let purpose = match args
+                .get("purpose")
+                .and_then(Value::as_str)
+                .unwrap_or("primary")
+                .parse::<muxa::collaboration::LaunchPurpose>()
+            {
+                Ok(purpose) => purpose,
+                Err(error) => return Ok(error_result(&error)),
+            };
             let request = crate::agent_launch::StartRequest {
+                purpose,
                 socket: client.socket().to_path_buf(),
                 agent,
                 options,
@@ -1502,7 +1513,24 @@ async fn call_tool(
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
             };
-            Ok(match client.collaboration_inbox(&origin).await {
+            let inbox = if let Some(value) = args.get("request_id") {
+                let Some(id) = value.as_str().filter(|id| !id.trim().is_empty()) else {
+                    return Ok(error_result("request_id must be a nonempty string"));
+                };
+                if let Err(error) = crate::require_capability(
+                    client,
+                    muxa::collaboration::HUMAN_PRIORITY_CAPABILITY,
+                    "explicit inbox acceptance",
+                )
+                .await
+                {
+                    return Ok(error_result(&error.to_string()));
+                }
+                client.collaboration_claim(&origin, id).await
+            } else {
+                client.collaboration_inbox(&origin).await
+            };
+            Ok(match inbox {
                 Ok(requests) => json_result(&json!({ "requests": requests.iter().map(|request| {
                     if args.get("full").and_then(Value::as_bool).unwrap_or(false) { json!(request) }
                     else { crate::collaboration_output::message(request, true) }
@@ -2021,6 +2049,7 @@ fn collaboration_guide(
             "Never infer GitHub/PR work without an explicit PR number or URL.",
             "One-way notices need no acknowledgement; notify=true is for blockers, decisions, conflicts or handoffs. Batch progress at checkpoints.",
             "For review use the opposite provider: Codex to Claude, Claude to Codex; an explicit user selection takes precedence.",
+            "Human sessions default to primary and are protected from peer injection. Automatic/provider/role routing selects workers; explicit primary targets remain queued. Accept a specific request with muxa_inbox(request_id) only when the human task permits it. Spawned peers use worker purpose with configured provider defaults, not a cloned conversation.",
             "Claim requests with muxa_inbox unless already claimed and delivered in full. Honor kind/work_mode/paths; read_only never authorizes edits. Reply once only when expects_reply=true; progress uses update_request.",
             "Do not create overlapping concurrent edits unless separate worktrees isolate them.",
             "Do not treat a peer reply as proof; verify it against the repository and tests.",
@@ -2255,6 +2284,12 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
         "kind": kind,
         "work_mode": work_mode,
     });
+    if !sent.from.console && !sent.to.accepts_peer_work() {
+        common["final_reply_received"] = json!(false);
+        common["reason"] = json!("deferred_primary");
+        common["next_step"] = json!("Target is a protected human session. Use a worker; explicit by-id acceptance remains available on the target.");
+        return json_result(&common);
+    }
     if peer_pending {
         common["peer_pending"] = json!(true);
         common["delivery"] = json!(format!(
@@ -2883,13 +2918,18 @@ fn select_peer(
         .iter()
         .filter(|peer| peer_is_eligible(peer))
         .collect::<Vec<_>>();
+    let workers: Vec<_> = live
+        .iter()
+        .copied()
+        .filter(|peer| peer.accepts_peer_work())
+        .collect();
     if target.is_empty()
         || target.eq_ignore_ascii_case("auto")
         || target.eq_ignore_ascii_case("@peer")
         || target.eq_ignore_ascii_case("@muxa-peer")
         || target.eq_ignore_ascii_case("peer")
     {
-        return Ok(best_peer(&live, &room.current).map(|peer| {
+        return Ok(best_peer(&workers, &room.current).map(|peer| {
             PeerSelection::registered(
                 peer.clone(),
                 "auto: healthy different-provider preference, then state and numeric pane order"
@@ -2920,7 +2960,7 @@ fn select_peer(
         )));
     }
     if let Some(kind) = provider_kind(target) {
-        let candidates = live
+        let candidates = workers
             .iter()
             .copied()
             .filter(|peer| peer.agent_kind == kind)
@@ -2930,7 +2970,7 @@ fn select_peer(
         }));
     }
     if let Some(role) = target.strip_prefix("role:") {
-        let matches = live
+        let matches = workers
             .iter()
             .copied()
             .filter(|peer| {
@@ -3173,6 +3213,7 @@ async fn spawn_peer(
         .strip_prefix("rmux:")
         .unwrap_or(&room.current.pane);
     let request = crate::agent_launch::StartRequest {
+        purpose: muxa::collaboration::LaunchPurpose::Worker,
         socket: client.socket().to_path_buf(),
         agent: program,
         options: config.launch_options(program.label(), None),
@@ -4705,6 +4746,10 @@ mod tests {
         wait_for_socket(&socket).await;
         let client = Client::new(socket);
         let room = client.collaboration_context(&origin).await.unwrap();
+        mailbox
+            .set_purpose(&room.current, muxa::collaboration::LaunchPurpose::Worker)
+            .await
+            .unwrap();
         let request = mailbox
             .create(
                 room.peers[0].clone(),
@@ -5558,6 +5603,7 @@ mod tests {
     fn peer_participant(kind: AgentKind, pane: &str, state: AgentState) -> Participant {
         serde_json::from_value(json!({
             "agent_kind": kind,
+            "launch_purpose": "worker",
             "agent_session_id": format!("session-{pane}"),
             "pane": pane,
             "room": { "host": "tmux", "window_id": "@1" },
@@ -5788,6 +5834,26 @@ mod tests {
         assert!(request_id_array(&json!({}), "request_ids")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn automatic_routes_skip_primary_but_explicit_targets_remain_addressable() {
+        let current = peer_participant(AgentKind::Codex, "%1", AgentState::Idle);
+        let mut primary = peer_participant(AgentKind::ClaudeCode, "%2", AgentState::Idle);
+        primary.launch_purpose = muxa::collaboration::LaunchPurpose::Primary;
+        primary.alias = Some("human-claude".into());
+        primary.roles = vec!["reviewer".into()];
+        let room = peer_room(current, vec![primary]);
+        assert!(select_peer(&room, "auto").unwrap().is_none());
+        assert!(select_peer(&room, "claude").unwrap().is_none());
+        assert!(select_peer(&room, "role:reviewer").is_err());
+        for target in ["pane:%2", "@human-claude"] {
+            let selected = select_peer(&room, target).unwrap().unwrap();
+            assert_eq!(
+                selected.peer.unwrap().launch_purpose,
+                muxa::collaboration::LaunchPurpose::Primary
+            );
+        }
     }
 
     #[test]

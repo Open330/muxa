@@ -500,6 +500,12 @@ struct PruneArgs {
 
 #[derive(Debug, Subcommand)]
 enum MsgCmd {
+    /// Explicitly accept one peer request on this session, including a protected primary.
+    Accept {
+        request_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Ask for required human attention; shown in connected Fleet operator inboxes.
     Attention {
         body: String,
@@ -910,6 +916,10 @@ enum WorkspaceCmd {
 
 #[derive(Debug, Subcommand)]
 enum IdentityCmd {
+    /// Set this exact session to primary (protected) or worker.
+    Purpose {
+        purpose: muxa::collaboration::LaunchPurpose,
+    },
     /// Show this agent's current identity and room peers.
     Show {
         #[arg(long)]
@@ -1892,6 +1902,20 @@ async fn cmd_peers(client: &Client, json: bool) -> Result<()> {
 async fn cmd_identity(client: &Client, action: IdentityCmd) -> Result<()> {
     let origin = collaboration_origin(client).await?;
     let (room, json) = match action {
+        IdentityCmd::Purpose { purpose } => {
+            require_capability(
+                client,
+                muxa::collaboration::HUMAN_PRIORITY_CAPABILITY,
+                "identity purpose",
+            )
+            .await?;
+            client.collaboration_purpose(&origin, purpose).await?;
+            println!(
+                "purpose: {}",
+                serde_json::to_value(purpose)?.as_str().unwrap_or("primary")
+            );
+            return Ok(());
+        }
         IdentityCmd::Show { json } => (client.collaboration_context(&origin).await?, json),
         IdentityCmd::Set { alias, roles } => (
             client
@@ -2054,6 +2078,31 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
     }
     let origin = collaboration_origin(client).await?;
     match action {
+        MsgCmd::Accept { request_id, json } => {
+            require_capability(
+                client,
+                muxa::collaboration::HUMAN_PRIORITY_CAPABILITY,
+                "msg accept",
+            )
+            .await?;
+            let requests = client.collaboration_claim(&origin, &request_id).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &requests
+                            .iter()
+                            .map(|r| collaboration_output::message(r, true))
+                            .collect::<Vec<_>>()
+                    )?
+                );
+            } else {
+                for request in requests {
+                    println!("{}", render_inbox_request(&request));
+                }
+            }
+        }
+
         MsgCmd::Attention { body, action, json } => {
             mcp_output::require_human_actions(client)
                 .await
@@ -2514,6 +2563,13 @@ fn print_collaboration_receipt(
     }
     match request.status {
         RequestStatus::Cancelled => println!("cancelled  {}", request.id),
+        RequestStatus::Queued if !request.from.console && !request.to.accepts_peer_work() => {
+            println!(
+                "queued  {}  to {}  (protected primary; explicit acceptance required)",
+                request.id,
+                request.to.label()
+            );
+        }
         // A reply on the request means this was `msg reply`, not `msg send`.
         _ if request.reply.is_some() => {
             println!("replied  {}  to {}", request.id, request.from.label());
@@ -5650,6 +5706,7 @@ mod tests {
 
     fn collaboration_participant(pane: &str, window: &str) -> Participant {
         Participant {
+            launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
             agent_kind: AgentKind::Codex,
             agent_session_id: format!("agent-{pane}"),
             pane: pane.to_string(),

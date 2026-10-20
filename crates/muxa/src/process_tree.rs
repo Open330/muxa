@@ -148,18 +148,45 @@ pub fn scan_codex_panes(panes: &[PaneInfo]) -> CodexPaneScan {
             let processes = table.descendants(pane.pane_pid, MAX_DEPTH, MAX_NODES);
             #[cfg(target_os = "linux")]
             let processes = read_descendants(pane.pane_pid);
+            #[cfg(target_os = "linux")]
+            let root = read_proc(pane.pane_pid, 0);
+            #[cfg(not(target_os = "linux"))]
+            let root = table.get(pane.pane_pid).cloned();
+            // A directly exec'd TUI can itself be the pane root process.
+            let processes: Vec<ProcessInfo> = root.into_iter().chain(processes).collect();
             (pane, processes)
         })
         .collect();
     let hosts = scanned
         .iter()
-        .filter(|(_, processes)| processes.iter().any(is_interactive_codex))
+        .filter(|(_, processes)| {
+            processes.iter().any(is_interactive_codex) && !isolated_codex_host(processes)
+        })
         .map(|(pane, _)| (*pane).clone())
         .collect();
     CodexPaneScan {
-        resume_bindings: unique_resume_bindings(scanned.into_iter()),
+        resume_bindings: unique_resume_bindings(
+            scanned
+                .into_iter()
+                .filter(|(_, processes)| !isolated_codex_host(processes)),
+        ),
         hosts,
     }
+}
+
+// A no-daemon TUI owns its hooks and cannot host a shared-server thread.
+// Ignore nested helpers: the outermost interactive TUI owns this pane.
+fn isolated_codex_host(processes: &[ProcessInfo]) -> bool {
+    processes
+        .iter()
+        .filter(|process| is_interactive_codex(process))
+        .min_by_key(|process| (process.depth, process.pid))
+        .is_some_and(|process| {
+            process
+                .cmdline
+                .split_whitespace()
+                .any(|arg| arg == "--no-daemon")
+        })
 }
 
 /// A Codex TUI (`codex`, `codex --yolo`, `codex resume …`) rather than a
@@ -438,7 +465,7 @@ fn read_children(pid: u32) -> Vec<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_proc(pid: u32, depth: u8) -> Option<ProcessInfo> {
+pub(crate) fn read_proc(pid: u32, depth: u8) -> Option<ProcessInfo> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let parent_pid = parse_ppid(&status)?;
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
@@ -525,6 +552,14 @@ mod tests {
                 .is_empty(),
             "same session in multiple servers must remain ambiguous"
         );
+    }
+
+    #[test]
+    fn isolated_codex_panes_cannot_host_paneless_shared_threads() {
+        let isolated = proc(20, 10, 1, "codex", "codex --no-daemon --yolo");
+        assert!(isolated_codex_host(std::slice::from_ref(&isolated)));
+        let shared = proc(15, 10, 0, "codex", "codex --yolo");
+        assert!(!isolated_codex_host(&[shared, isolated]));
     }
 
     #[test]

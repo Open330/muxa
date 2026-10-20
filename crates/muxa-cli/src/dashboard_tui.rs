@@ -5272,6 +5272,7 @@ mod tests {
         roles: &[&str],
     ) -> Participant {
         Participant {
+            launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
             agent_kind: AgentKind::Codex,
             agent_session_id: session_id.into(),
             pane: pane.into(),

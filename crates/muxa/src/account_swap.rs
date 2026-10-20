@@ -536,7 +536,7 @@ pub fn relaunch_line(
 
 /// Whether `process` is the interactive `kind` agent (not Codex's
 /// app-server or a headless `exec` run).
-fn is_agent_process(process: &ProcessInfo, kind: AgentKind) -> bool {
+pub(crate) fn is_agent_process(process: &ProcessInfo, kind: AgentKind) -> bool {
     let mut tokens = process.cmdline.split_whitespace();
     // `node …/bin/codex` — the npm shim — names the agent in its second word.
     let named = tokens

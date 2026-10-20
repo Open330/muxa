@@ -4,6 +4,10 @@
 //! the concrete agent session occupying a pane so a later process reusing the
 //! pane never inherits stale work.
 
+mod purpose;
+use purpose::{load_purposes, PurposeGrant};
+pub use purpose::{LaunchPurpose, HUMAN_PRIORITY_CAPABILITY};
+
 use crate::event::{AgentKind, AgentState};
 use crate::state::Agent;
 use crate::tmux::PaneInfo;
@@ -404,6 +408,9 @@ pub struct RoomId {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Participant {
+    /// Unknown and human-facing sessions are protected from inbound peer work.
+    #[serde(default)]
+    pub launch_purpose: LaunchPurpose,
     pub agent_kind: AgentKind,
     pub agent_session_id: String,
     pub pane: String,
@@ -440,6 +447,7 @@ impl Participant {
     /// console to another window does not fork its identity.
     pub fn console(room: RoomId) -> Self {
         Self {
+            launch_purpose: LaunchPurpose::Primary,
             agent_kind: AgentKind::Unknown,
             agent_session_id: CONSOLE_SESSION_ID.to_string(),
             pane: CONSOLE_PANE.to_string(),
@@ -454,6 +462,10 @@ impl Participant {
             roles: Vec::new(),
             console: true,
         }
+    }
+
+    pub fn accepts_peer_work(&self) -> bool {
+        self.console || self.launch_purpose == LaunchPurpose::Worker
     }
 
     pub fn label(&self) -> String {
@@ -1272,6 +1284,7 @@ fn prepare_database_file(_path: &Path) -> Result<(), CollaborationError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // Keep additive mailbox schema initialization together.
 fn open_database(path: &Path) -> Result<Connection, CollaborationError> {
     if let Some(parent) = path
         .parent()
@@ -1365,6 +1378,7 @@ fn open_database(path: &Path) -> Result<Connection, CollaborationError> {
              identity_key TEXT PRIMARY KEY,
              payload TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS collaboration_purposes (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS collaboration_metadata (
              key TEXT PRIMARY KEY,
              value TEXT NOT NULL
@@ -2007,6 +2021,7 @@ pub struct CollaborationStore {
     database_path: Option<PathBuf>,
     requests: RwLock<HashMap<String, CollaborationRequest>>,
     identities: RwLock<Vec<CollaborationIdentity>>,
+    purposes: RwLock<Vec<PurposeGrant>>,
     /// Serializes each in-memory mutation with its durable row update. Wake
     /// scans also take this lock, so an unpersisted request is never visible
     /// to the delivery loop.
@@ -2048,6 +2063,7 @@ impl CollaborationStore {
             database_path: None,
             requests: RwLock::new(HashMap::new()),
             identities: RwLock::new(Vec::new()),
+            purposes: RwLock::new(Vec::new()),
             reservations: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
             reply_wake_tokens: AtomicU64::new(1),
@@ -2113,11 +2129,13 @@ impl CollaborationStore {
             request.normalize_loaded_reply_wake();
         }
         let (changes, _) = watch::channel(0);
+        let purposes = load_purposes(database_path.as_deref())?;
         let store = Arc::new(Self {
             opts: options,
             database_path,
             requests: RwLock::new(requests),
             identities: RwLock::new(identities),
+            purposes: RwLock::new(purposes),
             reservations: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
             reply_wake_tokens: AtomicU64::new(1),
@@ -2580,6 +2598,36 @@ impl CollaborationStore {
         &self,
         caller: &Participant,
     ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
+        self.claim_selected(caller, None).await
+    }
+
+    pub async fn claim_by_id(
+        &self,
+        caller: &Participant,
+        request_id: &str,
+    ) -> Result<CollaborationRequest, CollaborationError> {
+        if let Some(request) = self
+            .claim_selected(caller, Some(request_id))
+            .await?
+            .into_iter()
+            .next()
+        {
+            return Ok(request);
+        }
+        // Distinguish a missing/foreign id from an already finished request,
+        // without acknowledging a reply just to explain acceptance failure.
+        let request = self.peek_for(caller, request_id).await?;
+        if !addresses(&request.to, caller) {
+            return Err(CollaborationError::NotParticipant(request_id.to_string()));
+        }
+        Err(CollaborationError::AlreadyTerminal(request_id.to_string()))
+    }
+
+    async fn claim_selected(
+        &self,
+        caller: &Participant,
+        selected: Option<&str>,
+    ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
         self.ensure_enabled()?;
         let _transaction = self.transaction_lock.lock().await;
         let previous = self.requests.read().await.clone();
@@ -2590,6 +2638,11 @@ impl CollaborationStore {
             let mut requests = self.requests.write().await;
             for request in requests.values_mut() {
                 if addresses(&request.to, caller)
+                    && selected.is_none_or(|id| request.id == id)
+                    && (selected.is_some()
+                        || request.from.console
+                        || caller.accepts_peer_work()
+                        || request.status == RequestStatus::Claimed)
                     && matches!(
                         request.status,
                         RequestStatus::Queued | RequestStatus::Claimed
@@ -2651,7 +2704,10 @@ impl CollaborationStore {
             if !addresses(&request.to, caller) {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
-            if request.status != RequestStatus::Queued || request.notified_at.is_some() {
+            if (!request.from.console && !caller.accepts_peer_work())
+                || request.status != RequestStatus::Queued
+                || request.notified_at.is_some()
+            {
                 None
             } else {
                 pin_pending_recipient(request, caller);
@@ -3544,6 +3600,7 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
         };
         let socket = pane.socket.clone().or(agent_socket);
         let participant = Participant {
+            launch_purpose: LaunchPurpose::Primary,
             agent_kind: agent.kind,
             agent_session_id: agent.session_id.clone(),
             pane: pane_id.clone(),
@@ -3755,7 +3812,12 @@ pub fn resolve_target(
         .filter(|candidate| candidate.room == sender.room && !candidate.same_endpoint(sender))
         .collect();
     if selector == "peer" {
-        return match peers.as_slice() {
+        let workers: Vec<_> = peers
+            .iter()
+            .copied()
+            .filter(|peer| peer.accepts_peer_work())
+            .collect();
+        return match workers.as_slice() {
             [peer] => Ok((*peer).clone()),
             [] => Err(CollaborationError::NoPeer),
             _ => Err(CollaborationError::AmbiguousTarget(selector.to_string())),
@@ -3784,6 +3846,7 @@ pub fn resolve_target(
                     .roles
                     .iter()
                     .any(|value| value.eq_ignore_ascii_case(role))
+                    && candidate.accepts_peer_work()
             })
             .collect();
         return select_target(matches, selector);
@@ -4043,6 +4106,7 @@ fn muxa_launched_agent_pane(pane: &PaneInfo, row: Option<&Agent>) -> bool {
 /// Build the pane-scoped participant a pending recipient is addressed as.
 fn pane_participant(pane: &PaneInfo, socket: Option<String>, row: Option<&Agent>) -> Participant {
     Participant {
+        launch_purpose: LaunchPurpose::Primary,
         agent_kind: row.map_or_else(
             || {
                 pane.agent_program
@@ -4687,6 +4751,7 @@ mod tests {
 
     fn participant(pane: &str, session: &str) -> Participant {
         Participant {
+            launch_purpose: LaunchPurpose::Worker,
             agent_kind: AgentKind::Codex,
             agent_session_id: session.into(),
             pane: pane.into(),
@@ -4822,8 +4887,21 @@ mod tests {
             managed_pane("%1", "implementer", "impl"),
             managed_pane("%2", "reviewer", "review"),
         ];
-        let participants = participants_from(&store.snapshot().await, &panes);
+        let mut participants = participants_from(&store.snapshot().await, &panes);
         assert_eq!(participants.len(), 2);
+        assert!(
+            resolve_target(
+                &participants[1],
+                "role:implementer",
+                &participants,
+                CollaborationScope::Window
+            )
+            .is_err(),
+            "role metadata alone never grants worker purpose"
+        );
+        for participant in &mut participants {
+            participant.launch_purpose = LaunchPurpose::Worker;
+        }
 
         let reviewer = participants
             .iter()
@@ -5358,8 +5436,10 @@ mod tests {
             pane.agent_alias = Some("review".into());
             pane.agent_role = Some("reviewer".into());
             let panes = vec![pane.clone()];
-            let pending = participants_from(&[], &panes).remove(0);
+            let mut pending = participants_from(&[], &panes).remove(0);
             assert_eq!(pending.agent_kind, kind);
+            assert_eq!(pending.launch_purpose, LaunchPurpose::Primary);
+            pending.launch_purpose = LaunchPurpose::Worker;
             assert_eq!(pending.state, AgentState::Starting);
             assert!(is_pending_session(&pending.agent_session_id));
             let sender = participant("%1", "sender");
@@ -5422,7 +5502,7 @@ mod tests {
             other_server.socket = Some("other".into());
             assert!(!addresses(&pending, &other_server));
             assert!(mailbox.claim_for(&other_server).await.unwrap().is_empty());
-            let claimed = mailbox.claim_for(&real[0]).await.unwrap();
+            let claimed = [mailbox.claim_by_id(&real[0], &request.id).await.unwrap()];
             assert_eq!(claimed.len(), 1);
             assert_eq!(claimed[0].id, request.id);
             assert_eq!(

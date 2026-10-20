@@ -3156,6 +3156,7 @@ mod tests {
         window_id: &str,
     ) -> Participant {
         Participant {
+            launch_purpose: crate::collaboration::LaunchPurpose::Primary,
             agent_kind: AgentKind::Codex,
             agent_session_id: agent_session_id.to_string(),
             pane: pane.to_string(),

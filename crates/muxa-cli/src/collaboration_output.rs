@@ -51,6 +51,12 @@ pub(crate) fn receipt(request: &CollaborationRequest) -> Value {
     if let Some(parent) = &request.delegation_parent {
         value["delegation_parent"] = json!(parent);
     }
+    if request.status == RequestStatus::Queued
+        && !request.from.console
+        && !request.to.accepts_peer_work()
+    {
+        value["deferred"] = json!("protected_primary");
+    }
     value
 }
 

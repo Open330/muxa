@@ -228,7 +228,7 @@ mod tests {
         let mut agent = store.snapshot().await.remove(0);
         agent.state = AgentState::Working;
         let participant = serde_json::from_value(serde_json::json!({
-            "agent_kind":"codex", "agent_session_id":session, "pane":pane, "socket":"default",
+            "launch_purpose":"worker", "agent_kind":"codex", "agent_session_id":session, "pane":pane, "socket":"default",
             "room":{"host":"tmux","socket":"default","window_id":"@1"}, "state":"working"
         }))
         .unwrap();

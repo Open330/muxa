@@ -222,6 +222,9 @@ fn pane_shape(target: &str) -> Option<(u32, u32)> {
 
 #[derive(Debug, clap::Args)]
 pub struct StartArgs {
+    /// Primary protects human work; worker explicitly accepts peer work.
+    #[arg(long, default_value = "primary")]
+    pub purpose: muxa::collaboration::LaunchPurpose,
     /// Known agent CLI to launch. codex expands the local cx profile (codex --yolo).
     #[arg(long, value_enum)]
     pub agent: AgentProgram,
@@ -317,6 +320,7 @@ pub struct WorkStartArgs {
 
 #[derive(Debug, Clone)]
 pub struct StartRequest {
+    pub purpose: muxa::collaboration::LaunchPurpose,
     pub agent: AgentProgram,
     /// Additional provider CLI arguments after Muxa's built-in profile and
     /// before the optional initial prompt.
@@ -361,6 +365,7 @@ impl StartRequest {
     /// pipeline or an MCP call does.
     pub fn from_args(args: &StartArgs, socket: &Path, cfg: &muxa::config::Config) -> Self {
         Self {
+            purpose: args.purpose,
             agent: args.agent,
             options: cfg.launch_options(args.agent.label(), explicit_options(&args.options)),
             placement: args.placement,
@@ -464,7 +469,13 @@ pub async fn run(
     cfg: &muxa::config::Config,
 ) -> Result<()> {
     match args.host.resolve(muxa::backend::detect_host_env()) {
-        LaunchHost::Native => run_native(args, client, socket_path, cfg).await,
+        LaunchHost::Native => {
+            anyhow::ensure!(
+                args.purpose == muxa::collaboration::LaunchPurpose::Primary,
+                "worker purpose currently requires a tmux/rmux agent pane"
+            );
+            run_native(args, client, socket_path, cfg).await
+        }
         LaunchHost::Tmux => run_tmux(args, socket_path, cfg),
         LaunchHost::Auto => unreachable!("auto launch host is resolved above"),
     }
@@ -607,6 +618,7 @@ pub fn run_work_start(
 ) -> Result<()> {
     let json = args.json;
     let result = start(StartRequest {
+        purpose: muxa::collaboration::LaunchPurpose::Primary,
         socket: socket.to_path_buf(),
         agent: args.agent,
         options: cfg.launch_options(args.agent.label(), explicit_options(&args.options)),
@@ -649,6 +661,24 @@ pub fn run_work_start(
 /// `spawn_blocking` by async callers.
 #[allow(clippy::too_many_lines)] // launch, metadata stamping, and rollback form one physical transaction
 pub fn start(mut request: StartRequest) -> Result<StartResult> {
+    if request.purpose == muxa::collaboration::LaunchPurpose::Worker {
+        // Dedicated workers must report their own pane, rather than inherit
+        // a human TUI's environment through Codex's shared app-server.
+        if request.agent == AgentProgram::Codex
+            && !request.options.iter().any(|arg| arg == "--no-daemon")
+        {
+            request.options.push("--no-daemon".into());
+        }
+        let hello = muxa::ipc::blocking_call(&request.socket,
+            &serde_json::json!({"protocol":muxa::event::PROTOCOL_VERSION,"kind":"hello","client":"muxa-cli"}),
+            std::time::Duration::from_secs(2)).context("worker purpose capability check failed")?;
+        anyhow::ensure!(
+            hello["capabilities"].as_array().is_some_and(|caps| caps
+                .iter()
+                .any(|cap| cap == muxa::collaboration::HUMAN_PRIORITY_CAPABILITY)),
+            "worker launch requires an upgraded muxad with human-priority support"
+        );
+    }
     let PreparedLaunch {
         cwd,
         workspace,
@@ -759,6 +789,12 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     // now, using discovery's placeholder so a later real hook replaces it.
     // Missing/older daemons remain supported; periodic discovery retries.
     register_launched_agent(&request, &pane);
+    if request.purpose == muxa::collaboration::LaunchPurpose::Worker {
+        if let Err(error) = register_worker_purpose(&request, &pane) {
+            crate::tmux_work::cleanup_pane(&pane);
+            return Err(error).context("register worker launch purpose");
+        }
+    }
     // Minting belongs to the agent's session-start hook, which reaches the
     // room's arbiter. Doing it here too would allocate from a namespace this
     // process cannot see all of — the bug the arbiter exists to close — so an
@@ -784,6 +820,36 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         cwd,
         prompt_supplied: prompt.is_some(),
     })
+}
+
+fn register_worker_purpose(request: &StartRequest, pane: &str) -> Result<()> {
+    use muxa::backend::PaneBackend;
+    let observed = if let Some(rmux) = crate::mux_control::ambient_rmux() {
+        rmux.resolve_pane(&format!("rmux:{pane}"))
+    } else {
+        muxa::TmuxBackend::new().resolve_pane(pane)
+    }
+    .context("worker pane is not observable")?;
+    let kind = muxa::discovery::classify_command(request.agent.label())
+        .context("unknown worker provider")?;
+    let result = muxa::ipc::blocking_call(
+        &request.socket,
+        &serde_json::json!({
+            "protocol":muxa::event::PROTOCOL_VERSION,"kind":"collaboration_worker_launch",
+            "pane":observed.pane_id,"socket":observed.socket,"agent_kind":kind,
+            "launch_id":uuid::Uuid::new_v4().to_string(),
+        }),
+        std::time::Duration::from_secs(5),
+    )
+    .context("worker purpose registration timed out")?;
+    anyhow::ensure!(
+        result["ok"] == true,
+        "{}",
+        result["error"]
+            .as_str()
+            .unwrap_or("worker registration failed")
+    );
+    Ok(())
 }
 
 fn register_launched_agent(request: &StartRequest, pane: &str) {
@@ -1184,6 +1250,7 @@ mod tests {
     #[test]
     fn agent_start_carries_the_callers_socket() {
         let args = StartArgs {
+            purpose: muxa::collaboration::LaunchPurpose::Primary,
             agent: AgentProgram::Codex,
             host: LaunchHost::Tmux,
             placement: Placement::Pane,
@@ -1247,6 +1314,7 @@ mod tests {
 
     fn request(agent: AgentProgram, placement: Placement) -> StartRequest {
         StartRequest {
+            purpose: muxa::collaboration::LaunchPurpose::Primary,
             socket: muxa::paths::default_socket(),
             agent,
             options: Vec::new(),

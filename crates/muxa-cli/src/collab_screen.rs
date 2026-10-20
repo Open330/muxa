@@ -565,6 +565,7 @@ mod tests {
 
     fn participant(pane: &str, session: &str, window: &str) -> Participant {
         Participant {
+            launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
             agent_kind: AgentKind::ClaudeCode,
             agent_session_id: format!("session-{pane}"),
             pane: pane.into(),
