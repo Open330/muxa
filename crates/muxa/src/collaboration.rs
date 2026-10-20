@@ -3276,7 +3276,11 @@ impl CollaborationStore {
             *self.requests.write().await = previous;
             return Err(error);
         }
-        self.publish_change();
+        // Deliberately unpublished: a reservation is the waker's own
+        // bookkeeping, and the waker rescans on every published change. If it
+        // were published, a pane that keeps refusing input would be reserved,
+        // released and retried in a tight loop instead of on the next idle
+        // transition or periodic reconcile, as a failed wake always was.
         Ok(Some(batch))
     }
 
@@ -3325,7 +3329,12 @@ impl CollaborationStore {
         // reservation would strand it with no attempt left to settle it. The
         // row on disk still says reserved, which the next load turns into owed.
         let result = self.persist_requests(&changed);
-        self.publish_change();
+        // Only a delivery is news to readers (`reply_notified_at`). Returning
+        // a failed attempt to owed is unpublished for the reason given in
+        // `reserve_reply_wakes`.
+        if sent {
+            self.publish_change();
+        }
         result
     }
 

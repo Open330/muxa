@@ -3606,6 +3606,59 @@ mod tests {
         }
     }
 
+    /// Records every attempt and accepts input only while `accepting` is set,
+    /// like a pane whose application is not taking keystrokes.
+    struct RefusingWakeBackend {
+        panes: Vec<PaneInfo>,
+        attempts: Arc<Mutex<Vec<(String, String)>>>,
+        accepting: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl PaneBackend for RefusingWakeBackend {
+        fn kind(&self) -> HostKind {
+            HostKind::Tmux
+        }
+
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            self.panes.clone()
+        }
+
+        fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
+            self.panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .cloned()
+        }
+
+        fn capture_pane(&self, _pane_id: &str) -> Option<String> {
+            None
+        }
+
+        fn pane_pid_map(&self) -> HashMap<u32, String> {
+            HashMap::new()
+        }
+
+        fn current_pane(&self) -> Option<String> {
+            None
+        }
+
+        fn focus_pane(&self, _pane_id: &str) -> bool {
+            false
+        }
+
+        fn send_text(&self, pane_id: &str, text: &str) -> bool {
+            self.attempts
+                .lock()
+                .unwrap()
+                .push((pane_id.into(), text.into()));
+            self.accepting.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn caps(&self) -> BackendCaps {
+            BackendCaps::default()
+        }
+    }
+
     fn collaboration_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
@@ -4754,6 +4807,132 @@ mod tests {
                 "the wake stays owed (replaced={replaced})"
             );
         }
+    }
+
+    /// The running waker, not one pass: a pane that refuses input must not
+    /// turn the reservation bookkeeping into a retry loop. The reply stays
+    /// owed and is delivered once when the sender next goes idle.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one end-to-end run of the waker task
+    async fn a_refusing_pane_is_retried_on_the_next_idle_turn_not_in_a_loop() {
+        let store = muxa::Store::shared();
+        add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let find = |pane: &str| {
+            participants
+                .iter()
+                .find(|participant| participant.pane == pane)
+                .unwrap()
+                .clone()
+        };
+        let (sender, recipient) = (find("%1"), find("%2"));
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        mailbox.claim_for(&recipient).await.unwrap();
+
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let accepting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backend: muxa::SharedBackend = Arc::new(RefusingWakeBackend {
+            panes,
+            attempts: attempts.clone(),
+            accepting: accepting.clone(),
+        });
+        let mut cfg = Config::default();
+        cfg.collaboration.enabled = true;
+        cfg.collaboration.wake = CollaborationWake::IdleOnly;
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let waker = spawn_collaboration_waker_task(
+            &cfg,
+            mailbox.clone(),
+            store.clone(),
+            vec![backend],
+            &shutdown_tx,
+        )
+        .unwrap();
+
+        mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "done".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let refused = attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(pane, text)| pane == "%1" && text.contains(&request.id))
+            .count();
+        assert!(
+            (1..=2).contains(&refused),
+            "expected one attempt per published change, saw {refused}"
+        );
+        assert_eq!(mailbox.pending_reply_unnotified().await.len(), 1);
+
+        accepting.store(true, std::sync::atomic::Ordering::SeqCst);
+        let id = AgentId {
+            kind: AgentKind::Codex,
+            session_id: "sender".into(),
+            surface: None,
+            pane: Some("%1".into()),
+            tmux_socket: Some("default".into()),
+            cwd: Some("/repo".into()),
+        };
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id.clone(),
+                prompt: "other work".into(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id,
+                response: None,
+                recap: None,
+                ai_title: None,
+                idle_confirmed: true,
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !mailbox.pending_reply_unnotified().await.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the next idle turn delivers the owed reply");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = shutdown_tx.send(());
+        let _ = waker.await;
+        let delivered = attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(pane, text)| pane == "%1" && text.contains(&request.id))
+            .count();
+        assert_eq!(
+            delivered,
+            refused + 1,
+            "delivered exactly once after the refusals"
+        );
     }
 
     #[tokio::test]
