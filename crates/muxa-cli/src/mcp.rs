@@ -3580,6 +3580,7 @@ fn new_request_from_args(
         artifacts: string_array(args, "artifacts"),
         links: string_array(args, "links"),
         air_artifacts,
+        withdraw_reply_wakes: Vec::new(),
     })
 }
 

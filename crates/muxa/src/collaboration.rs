@@ -9,7 +9,7 @@ use crate::state::Agent;
 use crate::tmux::PaneInfo;
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -178,6 +178,49 @@ fn dispatch_matches(
         && existing.artifacts == input.artifacts
         && existing.links == input.links
         && existing.air_artifacts == input.air_artifacts
+        && existing.withdrew_reply_wakes == normalize_withdrawals(&input.withdraw_reply_wakes)
+}
+
+/// Release the reply wake of each listed request as withdrawn, returning the
+/// rows that changed. A wake already released keeps its first reason; a
+/// reservation in flight is voided.
+fn withdraw_reply_wakes_in(
+    requests: &mut HashMap<String, CollaborationRequest>,
+    ids: &[String],
+    now: OffsetDateTime,
+) -> Vec<CollaborationRequest> {
+    ids.iter()
+        .filter_map(|id| {
+            let request = requests.get_mut(id)?;
+            if matches!(request.reply_wake, Some(ReplyWake::Released { .. })) {
+                return None;
+            }
+            request.reply_wake = Some(ReplyWake::Released {
+                reason: ReplyWakeRelease::Withdrawn,
+                at: now,
+            });
+            Some(request.clone())
+        })
+        .collect()
+}
+
+fn sort_by_reply_time(requests: &mut [CollaborationRequest]) {
+    requests.sort_by(|left, right| {
+        let key = |request: &CollaborationRequest| request.reply.as_ref().map(|reply| reply.at);
+        key(left)
+            .cmp(&key(right))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+/// Trimmed, de-duplicated, order-preserving withdrawal ids.
+fn normalize_withdrawals(ids: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    ids.iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty() && seen.insert(*id))
+        .map(str::to_string)
+        .collect()
 }
 
 fn same_participant_pair(
@@ -562,6 +605,62 @@ pub enum WakeDeliveryState {
     PromptWritten,
 }
 
+/// The sender's claim on being woken for a request's terminal reply.
+///
+/// Absent means the wake is still owed once the request carries a terminal
+/// reply. `Reserved` is one delivery attempt that the store handed to the
+/// daemon's waker; only that attempt's token may complete it, so a read or
+/// withdrawal that lands mid-attempt is never undone by the attempt's
+/// outcome. `Released` is final: the sender read the reply, said it no longer
+/// wants the wake, or was told.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum ReplyWake {
+    Reserved {
+        token: u64,
+    },
+    Released {
+        reason: ReplyWakeRelease,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyWakeRelease {
+    /// The sender retrieved the reply before any wake landed.
+    Read,
+    /// The sender withdrew its interest; the reply stays readable and unread.
+    Withdrawn,
+    /// A wake prompt reached the sender's pane.
+    Delivered,
+}
+
+/// Replies the store reserved for one wake prompt to one sender. Holds no
+/// lock; [`CollaborationStore::complete_reply_wakes`] settles exactly these
+/// members, and only those still carrying this batch's token.
+#[derive(Debug, Clone)]
+pub struct ReplyWakeBatch {
+    pub token: u64,
+    /// Reserved replies, oldest reply first.
+    pub requests: Vec<CollaborationRequest>,
+    /// Further owed replies for the same sender that did not fit this batch.
+    /// They stay owed and are offered by a later batch.
+    pub remaining: usize,
+}
+
+/// Most replies a single wake prompt advertises.
+pub const REPLY_WAKE_BATCH_LIMIT: usize = 5;
+
+/// Most request ids one withdrawal names.
+pub const MAX_REPLY_WAKE_WITHDRAWALS: usize = 16;
+
+/// `hello` capability: the daemon supports withdrawing reply-wake interest,
+/// alone or alongside a send. A client must not send `withdraw_reply_wakes`
+/// to a daemon without it, which would silently ignore the field.
+pub const REPLY_WAKE_WITHDRAW_CAPABILITY: &str = "collaboration_reply_withdraw_v1";
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestMailbox {
@@ -699,6 +798,10 @@ pub struct CollaborationRequest {
     pub links: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub air_artifacts: Vec<AirArtifactReference>,
+    /// Earlier requests by the same sender whose reply wake was withdrawn
+    /// when this one was sent. Informational: it does not mark them replaced.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withdrew_reply_wakes: Vec<String>,
     pub status: RequestStatus,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -734,6 +837,11 @@ pub struct CollaborationRequest {
         with = "time::serde::rfc3339::option"
     )]
     pub reply_read_at: Option<OffsetDateTime>,
+    /// Whether the sender is still owed a wake for the terminal reply. Rows
+    /// written before this field existed derive it from the two timestamps
+    /// above on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_wake: Option<ReplyWake>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<CollaborationReply>,
 }
@@ -747,6 +855,61 @@ pub enum HumanAction {
 }
 
 impl CollaborationRequest {
+    /// Whether the sender is still owed a wake for this request's reply.
+    ///
+    /// A console sender is excluded: it has no pane to type into, so the wake
+    /// could never be delivered. Its reply is read off the request instead.
+    pub fn reply_wake_owed(&self) -> bool {
+        self.status.is_terminal()
+            && self.reply.is_some()
+            && self.reply_wake.is_none()
+            && !self.from.console
+    }
+
+    /// Fill `reply_wake` for a row loaded from disk. A reservation names an
+    /// attempt by a previous daemon whose outcome is unknown, so it is owed
+    /// again (a wake that did land may repeat, as before this state existed).
+    /// Rows from before the field derive it from their timestamps.
+    fn normalize_loaded_reply_wake(&mut self) {
+        match self.reply_wake {
+            Some(ReplyWake::Released { .. }) => {}
+            Some(ReplyWake::Reserved { .. }) | None => {
+                self.reply_wake = if let Some(at) = self.reply_read_at {
+                    Some(ReplyWake::Released {
+                        reason: ReplyWakeRelease::Read,
+                        at,
+                    })
+                } else {
+                    self.reply_notified_at.map(|at| ReplyWake::Released {
+                        reason: ReplyWakeRelease::Delivered,
+                        at,
+                    })
+                };
+            }
+        }
+    }
+
+    /// Record that the sender has the reply. Releases an owed wake and voids
+    /// one in flight: that attempt's completion then finds no reservation of
+    /// its own to settle. A wake already released keeps its first reason.
+    pub(crate) fn mark_reply_read(&mut self, now: OffsetDateTime) {
+        self.reply_read_at.get_or_insert(now);
+        self.reply_notified_at.get_or_insert(now);
+        if !matches!(self.reply_wake, Some(ReplyWake::Released { .. })) {
+            self.reply_wake = Some(ReplyWake::Released {
+                reason: ReplyWakeRelease::Read,
+                at: now,
+            });
+        }
+    }
+
+    /// Whether the sender may withdraw this request's reply wake. Human
+    /// decisions and interrupted-peer recovery have their own workflows;
+    /// muting them could hide an answer the sender is required to act on.
+    fn reply_wake_withdrawable(&self) -> bool {
+        !self.to.console && self.human_action.is_none() && self.interruption.is_none()
+    }
+
     /// Whether the recipient needs a wake; terminal replies use their own path.
     pub fn should_notify(&self) -> bool {
         self.notify
@@ -840,6 +1003,11 @@ pub struct NewRequest {
     pub links: Vec<String>,
     #[serde(default)]
     pub air_artifacts: Vec<AirArtifactReference>,
+    /// The sender's own earlier requests whose reply wake this request
+    /// replaces. Withdrawn in the same transaction that stores this request;
+    /// the earlier work and its reply are untouched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withdraw_reply_wakes: Vec<String>,
 }
 
 impl Default for NewRequest {
@@ -864,6 +1032,7 @@ impl Default for NewRequest {
             artifacts: Vec::new(),
             links: Vec::new(),
             air_artifacts: Vec::new(),
+            withdraw_reply_wakes: Vec::new(),
         }
     }
 }
@@ -987,6 +1156,12 @@ pub enum CollaborationError {
     AlreadyTerminal(String),
     #[error("request {0} has already been claimed and can no longer be cancelled")]
     AlreadyClaimed(String),
+    #[error(
+        "request {0} is a human decision or peer-recovery request; its reply wake cannot be withdrawn"
+    )]
+    ReplyWakeNotWithdrawable(String),
+    #[error("a request may withdraw at most {0} reply wakes")]
+    TooManyWithdrawals(usize),
     #[error("invalid collaboration alias {0:?}; use 1-32 letters, digits, '.', '_', or '-'")]
     InvalidAlias(String),
     #[error("invalid collaboration role {0:?}; use 1-32 letters, digits, '.', '_', or '-'")]
@@ -1823,6 +1998,9 @@ pub struct CollaborationStore {
     /// scans also take this lock, so an unpersisted request is never visible
     /// to the delivery loop.
     transaction_lock: Mutex<()>,
+    /// Source of [`ReplyWake::Reserved`] tokens. Reservations never outlive
+    /// the store instance: [`Self::load`] turns persisted ones back into owed.
+    reply_wake_tokens: AtomicU64,
     /// Handles issued but not yet visible in a pane scan.
     ///
     /// The daemon arbitrates the namespace but does not write pane options;
@@ -1859,6 +2037,7 @@ impl CollaborationStore {
             identities: RwLock::new(Vec::new()),
             reservations: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
+            reply_wake_tokens: AtomicU64::new(1),
             changes,
         })
     }
@@ -1916,6 +2095,10 @@ impl CollaborationStore {
                 snapshot.identities,
             )
         };
+        let mut requests = requests;
+        for request in requests.values_mut() {
+            request.normalize_loaded_reply_wake();
+        }
         let (changes, _) = watch::channel(0);
         let store = Arc::new(Self {
             opts: options,
@@ -1924,6 +2107,7 @@ impl CollaborationStore {
             identities: RwLock::new(identities),
             reservations: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
+            reply_wake_tokens: AtomicU64::new(1),
             changes,
         });
         if let Some(days) = store.opts.retention_days {
@@ -2220,6 +2404,9 @@ impl CollaborationStore {
                 Err(CollaborationError::DispatchConflict(id))
             };
         }
+        let withdrawals = normalize_withdrawals(&input.withdraw_reply_wakes);
+        self.validate_reply_wake_withdrawals(&from, &withdrawals)
+            .await?;
         let supplied_thread_id = normalize_optional_id(input.thread_id);
         let parent_request_id = normalize_optional_id(input.parent_request_id);
         let thread_id = if let Some(parent_request_id) = parent_request_id.as_deref() {
@@ -2278,6 +2465,7 @@ impl CollaborationStore {
             artifacts: input.artifacts,
             links: input.links,
             air_artifacts: input.air_artifacts,
+            withdrew_reply_wakes: withdrawals,
             status: RequestStatus::Queued,
             created_at: now,
             claimed_at: None,
@@ -2285,18 +2473,90 @@ impl CollaborationStore {
             notified_at: None,
             reply_notified_at: None,
             reply_read_at: None,
+            reply_wake: None,
             reply: None,
         };
-        self.requests
-            .write()
-            .await
-            .insert(request.id.clone(), request.clone());
-        if let Err(error) = self.persist_requests(std::slice::from_ref(&request)) {
+        let changed = {
+            let mut requests = self.requests.write().await;
+            let mut changed =
+                withdraw_reply_wakes_in(&mut requests, &request.withdrew_reply_wakes, now);
+            requests.insert(request.id.clone(), request.clone());
+            changed.push(request.clone());
+            changed
+        };
+        if let Err(error) = self.persist_requests(&changed) {
             *self.requests.write().await = previous;
             return Err(error);
         }
         self.publish_change();
         Ok(request)
+    }
+
+    /// Check that `caller` may withdraw the reply wake of every request in
+    /// `ids`, before anything changes. All or nothing: one bad id rejects
+    /// the whole operation.
+    async fn validate_reply_wake_withdrawals(
+        &self,
+        caller: &Participant,
+        ids: &[String],
+    ) -> Result<(), CollaborationError> {
+        if ids.len() > MAX_REPLY_WAKE_WITHDRAWALS {
+            return Err(CollaborationError::TooManyWithdrawals(
+                MAX_REPLY_WAKE_WITHDRAWALS,
+            ));
+        }
+        let requests = self.requests.read().await;
+        for id in ids {
+            let request = requests
+                .get(id)
+                .ok_or_else(|| CollaborationError::NotFound(id.clone()))?;
+            if caller.console || !request.from.same_session(caller) {
+                return Err(CollaborationError::NotParticipant(id.clone()));
+            }
+            if !request.reply_wake_withdrawable() {
+                return Err(CollaborationError::ReplyWakeNotWithdrawable(id.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop waking `caller` for the replies to its own requests `ids`,
+    /// whatever their status, including replies that have not arrived yet.
+    ///
+    /// This only withdraws notification interest. The recipient's work, the
+    /// reply, its unread state and `wait` results are unchanged; a queued
+    /// request still needs [`Self::cancel_for`] to stop the recipient. A wake
+    /// already being typed into the pane cannot be recalled.
+    pub async fn withdraw_reply_wakes(
+        &self,
+        caller: &Participant,
+        ids: &[String],
+    ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
+        self.ensure_enabled()?;
+        let ids = normalize_withdrawals(ids);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _transaction = self.transaction_lock.lock().await;
+        self.validate_reply_wake_withdrawals(caller, &ids).await?;
+        let previous = self.requests.read().await.clone();
+        let (changed, result) = {
+            let mut requests = self.requests.write().await;
+            let changed = withdraw_reply_wakes_in(&mut requests, &ids, OffsetDateTime::now_utc());
+            let result: Vec<_> = ids
+                .iter()
+                .filter_map(|id| requests.get(id).cloned())
+                .collect();
+            (changed, result)
+        };
+        if !changed.is_empty() {
+            if let Err(error) = self.persist_requests(&changed) {
+                *self.requests.write().await = previous;
+                return Err(error);
+            }
+            self.publish_change();
+        }
+        Ok(result)
     }
 
     pub async fn claim_for(
@@ -2613,9 +2873,7 @@ impl CollaborationStore {
                 && request.reply_read_at.is_none()
             {
                 previous = Some(request.clone());
-                let now = OffsetDateTime::now_utc();
-                request.reply_read_at = Some(now);
-                request.reply_notified_at.get_or_insert(now);
+                request.mark_reply_read(OffsetDateTime::now_utc());
             }
             request.clone()
         };
@@ -2928,12 +3186,10 @@ impl CollaborationStore {
             .collect()
     }
 
-    /// Replies still owed a wake to their sender.
+    /// Replies still owed a wake to their sender, oldest reply first.
     ///
-    /// A console sender is excluded rather than skipped downstream: it has no
-    /// pane to type into, so it would never be marked notified and would be
-    /// re-scanned on every daemon tick for the life of the mailbox. Its reply
-    /// is delivered by being readable in the recipient's mailbox.
+    /// A scan result only says who might be owed; whether a wake is actually
+    /// sent is decided by [`Self::reserve_reply_wakes`] at delivery time.
     pub async fn pending_reply_unnotified(&self) -> Vec<CollaborationRequest> {
         let _transaction = self.transaction_lock.lock().await;
         let mut requests: Vec<_> = self
@@ -2941,16 +3197,123 @@ impl CollaborationStore {
             .read()
             .await
             .values()
-            .filter(|request| {
-                request.status.is_terminal()
-                    && request.reply.is_some()
-                    && request.reply_notified_at.is_none()
-                    && !request.from.console
-            })
+            .filter(|request| request.reply_wake_owed())
             .cloned()
             .collect();
-        requests.sort_by_key(|request| request.created_at);
+        sort_by_reply_time(&mut requests);
         requests
+    }
+
+    /// Reserve the replies still owed to `sender` for one wake prompt.
+    ///
+    /// This is the delivery decision: a reply read or withdrawn since the
+    /// caller's scan is no longer owed and is not offered. Returns `None` when
+    /// nothing is owed or `sender` already has a batch in flight. At most
+    /// [`REPLY_WAKE_BATCH_LIMIT`] replies are reserved; the rest stay owed.
+    pub async fn reserve_reply_wakes(
+        &self,
+        sender: &Participant,
+    ) -> Result<Option<ReplyWakeBatch>, CollaborationError> {
+        let _transaction = self.transaction_lock.lock().await;
+        let previous = self.requests.read().await.clone();
+        let batch = {
+            let mut requests = self.requests.write().await;
+            let mine = |request: &CollaborationRequest| request.from.same_endpoint(sender);
+            if requests.values().any(|request| {
+                mine(request) && matches!(request.reply_wake, Some(ReplyWake::Reserved { .. }))
+            }) {
+                return Ok(None);
+            }
+            let mut owed: Vec<_> = requests
+                .values()
+                .filter(|request| mine(request) && request.reply_wake_owed())
+                .map(|request| {
+                    (
+                        request.reply.as_ref().map(|reply| reply.at),
+                        request.id.clone(),
+                    )
+                })
+                .collect();
+            if owed.is_empty() {
+                return Ok(None);
+            }
+            owed.sort();
+            let remaining = owed.len().saturating_sub(REPLY_WAKE_BATCH_LIMIT);
+            let token = self.reply_wake_tokens.fetch_add(1, Ordering::Relaxed);
+            let reserved: Vec<_> = owed
+                .into_iter()
+                .take(REPLY_WAKE_BATCH_LIMIT)
+                .filter_map(|(_, id)| {
+                    let request = requests.get_mut(&id)?;
+                    request.reply_wake = Some(ReplyWake::Reserved { token });
+                    Some(request.clone())
+                })
+                .collect();
+            ReplyWakeBatch {
+                token,
+                requests: reserved,
+                remaining,
+            }
+        };
+        if let Err(error) = self.persist_requests(&batch.requests) {
+            *self.requests.write().await = previous;
+            return Err(error);
+        }
+        self.publish_change();
+        Ok(Some(batch))
+    }
+
+    /// Settle a reserved batch. `sent` means the prompt reached the pane:
+    /// its members are released as delivered. Otherwise they are owed again.
+    ///
+    /// Only members still holding this batch's token change. One the sender
+    /// read or withdrew meanwhile keeps that outcome, so a failed attempt
+    /// cannot resurrect it and a successful one cannot overwrite it.
+    pub async fn complete_reply_wakes(
+        &self,
+        batch: &ReplyWakeBatch,
+        sent: bool,
+    ) -> Result<(), CollaborationError> {
+        let _transaction = self.transaction_lock.lock().await;
+        let previous = self.requests.read().await.clone();
+        let changed: Vec<_> = {
+            let mut requests = self.requests.write().await;
+            let now = OffsetDateTime::now_utc();
+            batch
+                .requests
+                .iter()
+                .filter_map(|member| {
+                    let request = requests.get_mut(&member.id)?;
+                    if request.reply_wake != Some(ReplyWake::Reserved { token: batch.token }) {
+                        return None;
+                    }
+                    if sent {
+                        request.reply_wake = Some(ReplyWake::Released {
+                            reason: ReplyWakeRelease::Delivered,
+                            at: now,
+                        });
+                        request.reply_notified_at.get_or_insert(now);
+                    } else {
+                        request.reply_wake = None;
+                    }
+                    Some(request.clone())
+                })
+                .collect()
+        };
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let result = self.persist_requests(&changed);
+        if result.is_err() && !sent {
+            // Nothing reached the pane, so restoring the reservation loses
+            // nothing; it is voided on the next load.
+            *self.requests.write().await = previous;
+            return result;
+        }
+        // A delivered prompt cannot be recalled. Keep the in-memory release
+        // even if persistence failed, so this daemon does not type it again.
+        self.publish_change();
+        result
     }
 
     pub async fn mark_notified(&self, request_id: &str) -> Result<(), CollaborationError> {
@@ -2978,31 +3341,6 @@ impl CollaborationStore {
             // The terminal injection already happened. Keep the in-memory
             // marker even if disk persistence fails so the live daemon does
             // not inject the same wake on the next revision/reconcile scan.
-            let result = self.persist_requests(std::slice::from_ref(&changed));
-            self.publish_change();
-            result?;
-        }
-        Ok(())
-    }
-
-    pub async fn mark_reply_notified(&self, request_id: &str) -> Result<(), CollaborationError> {
-        let _transaction = self.transaction_lock.lock().await;
-        let changed = {
-            let mut requests = self.requests.write().await;
-            requests.get_mut(request_id).and_then(|request| {
-                if request.status.is_terminal()
-                    && request.reply.is_some()
-                    && request.reply_notified_at.is_none()
-                {
-                    request.reply_notified_at = Some(OffsetDateTime::now_utc());
-                    Some(request.clone())
-                } else {
-                    None
-                }
-            })
-        };
-        if let Some(changed) = changed {
-            // As above, a delivered side effect cannot be rolled back.
             let result = self.persist_requests(std::slice::from_ref(&changed));
             self.publish_change();
             result?;
@@ -7475,4 +7813,6 @@ mod tests {
 }
 
 mod recovery;
+#[cfg(test)]
+mod reply_wake_tests;
 pub use recovery::PeerInterruption;

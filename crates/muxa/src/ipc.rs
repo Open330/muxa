@@ -7585,6 +7585,7 @@ mod tests {
                             artifacts: Vec::new(),
                             links: Vec::new(),
                             air_artifacts: Vec::new(),
+                            withdraw_reply_wakes: Vec::new(),
                         },
                     )
                     .await
@@ -7733,6 +7734,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await
@@ -7762,6 +7764,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await
@@ -7861,6 +7864,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await
@@ -7914,6 +7918,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await

@@ -1397,6 +1397,7 @@ fn handle_key(
                             artifacts: Vec::new(),
                             links: Vec::new(),
                             air_artifacts: Vec::new(),
+                            withdraw_reply_wakes: Vec::new(),
                         };
                         if app.message_broadcast {
                             let targets = std::mem::take(&mut app.message_targets);
@@ -4880,6 +4881,7 @@ mod tests {
             artifacts: Vec::new(),
             links: Vec::new(),
             air_artifacts: Vec::new(),
+            withdraw_reply_wakes: Vec::new(),
         }
     }
 

@@ -87,6 +87,7 @@ fn recovery_action(
     action.notified_at = None;
     action.reply_notified_at = None;
     action.reply_read_at = None;
+    action.reply_wake = None;
     action.wake_delivery = None;
     action.reply = None;
     action.updates.clear();
@@ -177,8 +178,7 @@ impl CollaborationStore {
                         if action.reply.is_some() {
                             // The daemon has delivered its own request's answer
                             // to the parent; there is no service pane to wake.
-                            refreshed.reply_read_at.get_or_insert(now);
-                            refreshed.reply_notified_at.get_or_insert(now);
+                            refreshed.mark_reply_read(now);
                         }
                         if refreshed != *action {
                             changed.push(refreshed);

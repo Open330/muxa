@@ -1853,8 +1853,13 @@ async fn wake_idle_collaboration_peers_with_inflight(
     .await;
 }
 
-/// Tell each sender that a terminal reply is waiting. Reply bodies always stay
-/// in the mailbox, so this is a notice pass with no payload policy.
+/// Tell each sender that terminal replies are waiting. Reply bodies always
+/// stay in the mailbox, so this is a notice pass with no payload policy.
+///
+/// `replies` is only a hint of who may be owed. The store decides what each
+/// wake carries when it reserves the batch, so a reply the sender read or
+/// withdrew after the scan is not announced, and replies that piled up while
+/// the sender was busy arrive as one prompt rather than one per idle turn.
 async fn wake_senders_of_ready_replies(
     collaboration: &CollaborationStore,
     participants: &[muxa::collaboration::Participant],
@@ -1863,40 +1868,105 @@ async fn wake_senders_of_ready_replies(
     wake_inflight: &mut HashSet<(String, Option<String>, String)>,
     store: &muxa::Store,
 ) {
-    for request in replies {
+    let mut senders = Vec::new();
+    for request in &replies {
         let Some(sender) = idle_collaboration_participant(participants, &request.from) else {
             continue;
         };
         let wake_key = collaboration_wake_key(sender);
+        if !senders.contains(&wake_key) {
+            senders.push(wake_key);
+        }
+    }
+    for wake_key in senders {
         if wake_inflight.contains(&wake_key) {
             continue;
         }
-        let prompt = format!(
-            "[muxa:{}] {:?} reply from {} is ready. Read it with muxa_wait_reply (MCP) or `muxa msg wait {}`.",
-            request.id,
-            request.status,
-            request.to.label(),
-            request.id,
-        );
+        let Some(sender) = participants
+            .iter()
+            .find(|participant| collaboration_wake_key(participant) == wake_key)
+        else {
+            continue;
+        };
+        let batch = match collaboration.reserve_reply_wakes(sender).await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(pane = sender.pane, %error, "failed to reserve reply wake");
+                continue;
+            }
+        };
+        let prompt = reply_wake_prompt(&batch, time::OffsetDateTime::now_utc());
         let (sent, submitted) = send_collaboration_wake(sender, &prompt, backends, store).await;
         if submitted {
             wake_inflight.insert(wake_key);
         }
+        if let Err(error) = collaboration.complete_reply_wakes(&batch, sent).await {
+            tracing::warn!(pane = sender.pane, %error, "failed to persist reply wake outcome");
+        }
         if sent {
-            if let Err(error) = collaboration.mark_reply_notified(&request.id).await {
-                tracing::warn!(
-                    request_id = request.id,
-                    %error,
-                    "failed to persist reply wake marker",
-                );
-            }
             tracing::debug!(
-                request_id = request.id,
+                request_ids = ?batch.requests.iter().map(|request| &request.id).collect::<Vec<_>>(),
                 pane = sender.pane,
                 submitted,
                 "collaboration reply wake delivered",
             );
         }
+    }
+}
+
+/// The wake text for one reserved batch. A single reply keeps the long-
+/// standing one-line form. Each entry names how long ago it was requested
+/// once that is long enough to matter, so a sender that moved on can tell
+/// at a glance which result it is looking at.
+fn reply_wake_prompt(
+    batch: &muxa::collaboration::ReplyWakeBatch,
+    now: time::OffsetDateTime,
+) -> String {
+    let entry = |request: &CollaborationRequest| {
+        format!(
+            "{:?} reply from {}{}",
+            request.status,
+            request.to.label(),
+            requested_ago(request.created_at, now)
+                .map(|ago| format!(" (requested {ago} ago)"))
+                .unwrap_or_default(),
+        )
+    };
+    if let ([request], 0) = (batch.requests.as_slice(), batch.remaining) {
+        return format!(
+            "[muxa:{}] {} is ready. Read it with muxa_wait_reply (MCP) or `muxa msg wait {}`.",
+            request.id,
+            entry(request),
+            request.id,
+        );
+    }
+    let entries = batch
+        .requests
+        .iter()
+        .map(|request| format!("{}: {}", request.id, entry(request)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let more = if batch.remaining == 0 {
+        String::new()
+    } else {
+        format!(" {} more will follow.", batch.remaining)
+    };
+    format!(
+        "[muxa] {} replies are ready: {entries}.{more} Read each with muxa_wait_reply (MCP) or `muxa msg wait ID`.",
+        batch.requests.len(),
+    )
+}
+
+/// Coarse age of a request, or `None` while it is recent enough that the
+/// sender is plainly still waiting on it.
+fn requested_ago(created_at: time::OffsetDateTime, now: time::OffsetDateTime) -> Option<String> {
+    let minutes = (now - created_at).whole_minutes();
+    match minutes {
+        ..30 => None,
+        30..120 => Some(format!("{minutes}m")),
+        120..2880 => Some(format!("{}h", minutes / 60)),
+        _ => Some(format!("{}d", minutes / 1440)),
     }
 }
 
@@ -3822,6 +3892,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await
@@ -3970,6 +4041,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await
@@ -4052,6 +4124,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await
@@ -4113,6 +4186,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await
@@ -4179,6 +4253,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
                 Some(CollaborationProvenance {
                     client_kind: CollaborationClientKind::Watch,
@@ -4266,6 +4341,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await
@@ -4341,6 +4417,7 @@ mod tests {
                         artifacts: Vec::new(),
                         links: Vec::new(),
                         air_artifacts: Vec::new(),
+                        withdraw_reply_wakes: Vec::new(),
                     },
                 )
                 .await
@@ -4482,6 +4559,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await
@@ -4503,6 +4581,133 @@ mod tests {
             mailbox.pending_unnotified().await,
             [] as [muxa::collaboration::CollaborationRequest; 0]
         );
+    }
+
+    /// Replies that piled up while the sender worked arrive as one prompt,
+    /// and one the sender withdrew (it moved on) is not announced at all.
+    #[tokio::test]
+    async fn piled_up_replies_wake_once_and_skip_withdrawn_ones() {
+        let store = muxa::Store::shared();
+        add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let find = |pane: &str| {
+            participants
+                .iter()
+                .find(|participant| participant.pane == pane)
+                .unwrap()
+                .clone()
+        };
+        let (sender, recipient) = (find("%1"), find("%2"));
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let mut ids = Vec::new();
+        for body in ["abandoned", "first", "second"] {
+            let request = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: body.into(),
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            ids.push(request.id);
+        }
+        mailbox.claim_for(&recipient).await.unwrap();
+        mailbox
+            .withdraw_reply_wakes(&sender, &ids[..1])
+            .await
+            .unwrap();
+        for id in &ids {
+            mailbox
+                .reply(
+                    &recipient,
+                    id,
+                    RequestStatus::Completed,
+                    "done".into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+            panes,
+            sends: sends.clone(),
+        });
+        for _ in 0..2 {
+            wake_idle_collaboration_peers(&mailbox, &store, std::slice::from_ref(&backend)).await;
+        }
+        {
+            let sends = sends.lock().unwrap();
+            assert_eq!(sends.len(), 2, "one prompt and one submit: {sends:?}");
+            assert_eq!(sends[0].0, "%1");
+            assert!(
+                sends[0].1.starts_with("[muxa] 2 replies are ready: "),
+                "{}",
+                sends[0].1
+            );
+            assert!(sends[0].1.contains(&ids[1]) && sends[0].1.contains(&ids[2]));
+            assert!(!sends[0].1.contains(&ids[0]), "withdrawn reply announced");
+            assert_eq!(sends[1], ("%1".into(), "\r".into()));
+        }
+        assert_eq!(mailbox.unread_reply_count(&sender).await, 3);
+    }
+
+    #[tokio::test]
+    async fn reply_wake_prompt_names_stale_requests() {
+        let now = time::OffsetDateTime::now_utc();
+        let store = muxa::Store::shared();
+        add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let template = mailbox
+            .create(
+                participants[0].clone(),
+                participants[1].clone(),
+                NewRequest {
+                    body: "b".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let request = |id: &str, age_minutes: i64| {
+            let mut request = template.clone();
+            request.id = id.into();
+            request.status = RequestStatus::Completed;
+            request.created_at = now - time::Duration::minutes(age_minutes);
+            request
+        };
+        let single = muxa::collaboration::ReplyWakeBatch {
+            token: 1,
+            requests: vec![request("req_a", 5)],
+            remaining: 0,
+        };
+        assert_eq!(
+            reply_wake_prompt(&single, now),
+            format!(
+                "[muxa:req_a] Completed reply from {} is ready. Read it with muxa_wait_reply (MCP) or `muxa msg wait req_a`.",
+                single.requests[0].to.label()
+            ),
+            "a fresh single reply keeps the established text"
+        );
+        let stale = muxa::collaboration::ReplyWakeBatch {
+            token: 2,
+            requests: vec![request("req_b", 9 * 60)],
+            remaining: 3,
+        };
+        let prompt = reply_wake_prompt(&stale, now);
+        assert!(prompt.contains("req_b: Completed reply from"), "{prompt}");
+        assert!(prompt.contains("(requested 9h ago)"), "{prompt}");
+        assert!(prompt.contains("3 more will follow."), "{prompt}");
     }
 
     #[tokio::test]
@@ -4549,6 +4754,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
                 Some(CollaborationProvenance {
                     client_kind: CollaborationClientKind::Watch,
@@ -4676,6 +4882,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await

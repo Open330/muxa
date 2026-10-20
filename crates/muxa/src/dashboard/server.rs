@@ -3210,6 +3210,7 @@ mod tests {
                             artifacts: vec!["artifact-request-secret".to_string()],
                             links: vec!["https://private.invalid/review".to_string()],
                             air_artifacts: Vec::new(),
+                            withdraw_reply_wakes: Vec::new(),
                         },
                     )
                     .await
@@ -3241,6 +3242,7 @@ mod tests {
                         artifacts: Vec::new(),
                         links: Vec::new(),
                         air_artifacts: Vec::new(),
+                        withdraw_reply_wakes: Vec::new(),
                     },
                 )
                 .await

@@ -2933,6 +2933,7 @@ async fn collaboration_send(
         artifacts: Vec::new(),
         links: Vec::new(),
         air_artifacts: Vec::new(),
+        withdraw_reply_wakes: Vec::new(),
     };
     match client.collaboration_send(&origin, &target, &request).await {
         Ok(request) => ActionOutcome::Ok(format!(
@@ -5331,7 +5332,9 @@ mod tests {
             notified_at: None,
             reply_notified_at: None,
             reply_read_at: None,
+            reply_wake: None,
             reply: None,
+            withdrew_reply_wakes: Vec::new(),
         }
     }
 

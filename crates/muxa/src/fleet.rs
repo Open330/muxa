@@ -1547,6 +1547,7 @@ mod tests {
                 artifacts: Vec::new(),
                 links: Vec::new(),
                 air_artifacts: Vec::new(),
+                withdraw_reply_wakes: Vec::new(),
             }),
         };
         let encoded = serde_json::to_string(&request).unwrap();
