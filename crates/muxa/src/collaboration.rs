@@ -2558,10 +2558,27 @@ impl CollaborationStore {
         caller: &Participant,
         request_id: &str,
     ) -> Result<CollaborationRequest, CollaborationError> {
+        self.read_for(caller, request_id, true).await
+    }
+
+    /// Observe instructions/progress without acknowledging an unseen reply.
+    pub async fn peek_for(
+        &self,
+        caller: &Participant,
+        request_id: &str,
+    ) -> Result<CollaborationRequest, CollaborationError> {
+        self.read_for(caller, request_id, false).await
+    }
+
+    async fn read_for(
+        &self,
+        caller: &Participant,
+        request_id: &str,
+        mark_reply_read: bool,
+    ) -> Result<CollaborationRequest, CollaborationError> {
         self.ensure_enabled()?;
         let _transaction = self.transaction_lock.lock().await;
-        let previous = self.requests.read().await.clone();
-        let mut changed = false;
+        let mut previous = None;
         let request = {
             let mut requests = self.requests.write().await;
             // Participants may await the daemon's linked human decision, but
@@ -2590,17 +2607,24 @@ impl CollaborationStore {
             {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
-            if is_sender && request.reply.is_some() && request.reply_read_at.is_none() {
+            if mark_reply_read
+                && is_sender
+                && request.reply.is_some()
+                && request.reply_read_at.is_none()
+            {
+                previous = Some(request.clone());
                 let now = OffsetDateTime::now_utc();
                 request.reply_read_at = Some(now);
                 request.reply_notified_at.get_or_insert(now);
-                changed = true;
             }
             request.clone()
         };
-        if changed {
+        if let Some(previous) = previous {
             if let Err(error) = self.persist_requests(std::slice::from_ref(&request)) {
-                *self.requests.write().await = previous;
+                self.requests
+                    .write()
+                    .await
+                    .insert(request_id.to_string(), previous);
                 return Err(error);
             }
             self.publish_change();
@@ -5195,6 +5219,15 @@ mod tests {
         );
         assert_eq!(mailbox.unread_reply_count(&sender).await, 1);
         assert_eq!(mailbox.pending_reply_unnotified().await.len(), 1);
+        let peeked = mailbox.peek_for(&sender, &request.id).await.unwrap();
+        assert!(peeked.reply_read_at.is_none());
+        assert!(peeked.reply_notified_at.is_none());
+        assert_eq!(mailbox.unread_reply_count(&sender).await, 1);
+        assert_eq!(mailbox.pending_reply_unnotified().await.len(), 1);
+        assert!(mailbox
+            .peek_for(&participant("%3", "stranger"), &request.id)
+            .await
+            .is_err());
         assert_eq!(
             mailbox
                 .get_for(&sender, &request.id)
@@ -5955,6 +5988,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let peeked = store.peek_for(&sender, &request.id).await.unwrap();
+            assert!(peeked.reply_read_at.is_none());
+            assert!(peeked.reply_notified_at.is_none());
             let console = console_in_window("@2");
             let listed = store
                 .list_for(&console, RequestMailbox::All, MailboxScope::All)

@@ -618,6 +618,11 @@ enum RequestBody {
         origin: CollaborationOrigin,
         request_id: String,
     },
+    /// Exact non-acknowledging read for instructions and incremental progress.
+    CollaborationPeek {
+        origin: CollaborationOrigin,
+        request_id: String,
+    },
     CollaborationUpdate {
         origin: CollaborationOrigin,
         request_id: String,
@@ -778,6 +783,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_expire_v1",
     "collaboration_lifecycle",
     "collaboration_wait",
+    "collaboration_peek",
     "collaboration_subscribe",
     "collaboration_dispatch_v1",
     "orchestration_v1",
@@ -4480,6 +4486,37 @@ async fn handle(
                     .await;
                     response
                 }
+                RequestBody::CollaborationPeek { origin, request_id } => {
+                    kind = "collaboration_peek";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::Peek,
+                        origin.clone(),
+                    );
+                    audit_context.request_id = Some(request_id.clone());
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
+                    let response = match topology.resolve_origin(&origin) {
+                        Ok(current) => match collaboration.peek_for(&current, &request_id).await {
+                            Ok(request) => Response::with_collaboration_request(request),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
+                }
                 RequestBody::CollaborationWait {
                     origin,
                     request_id,
@@ -6306,6 +6343,22 @@ impl Client {
         serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
     }
 
+    /// Read without marking the reply read; older daemons reject this operation.
+    pub async fn collaboration_peek(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+    ) -> Result<CollaborationRequest, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_peek",
+            "origin": origin,
+            "request_id": request_id,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
+    }
+
     /// Wait for a request to become terminal through muxad's collaboration
     /// revision signal. The daemon returns the latest request on timeout, so
     /// callers distinguish completion from timeout via `status.is_terminal()`.
@@ -7381,6 +7434,87 @@ mod tests {
         );
         shutdown.send(()).unwrap();
         serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn progress_peek_over_ipc_preserves_unread_reply_and_checks_participation() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("peek.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        add_collaboration_agent(&store, "%3", "stranger", AgentKind::GeminiCli).await;
+        let backend: SharedBackend = Arc::new(CollaborationTestBackend {
+            panes: vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+                collaboration_test_pane("%3", "2"),
+            ],
+        });
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let audit = CollaborationAuditLog::in_memory();
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox.clone())
+            .with_collaboration_audit(audit.clone());
+        let (shutdown, rx) = broadcast::channel(1);
+        let daemon = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let origin = |pane: &str| CollaborationOrigin {
+            pane: pane.into(),
+            socket: Some("default".into()),
+            console: false,
+            agent_session_id: None,
+        };
+        let request = client
+            .collaboration_send(
+                &origin("%1"),
+                "pane:%2",
+                &NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        client.collaboration_inbox(&origin("%2")).await.unwrap();
+        client
+            .collaboration_reply(
+                &origin("%2"),
+                &request.id,
+                RequestStatus::Completed,
+                "final report",
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        let peek = client
+            .collaboration_peek(&origin("%1"), &request.id)
+            .await
+            .unwrap();
+        assert!(peek.reply_read_at.is_none());
+        assert!(peek.reply_notified_at.is_none());
+        assert_eq!(mailbox.unread_reply_count(&request.from).await, 1);
+        assert_eq!(mailbox.pending_reply_unnotified().await.len(), 1);
+        assert!(client
+            .collaboration_peek(&origin("%3"), &request.id)
+            .await
+            .is_err());
+        assert!(audit
+            .entries()
+            .await
+            .iter()
+            .any(|entry| entry.operation == CollaborationAuditOperation::Peek && entry.ok));
+        assert!(client
+            .collaboration_get(&origin("%1"), &request.id)
+            .await
+            .unwrap()
+            .reply_read_at
+            .is_some());
+        shutdown.send(()).unwrap();
+        daemon.await.unwrap();
     }
 
     #[tokio::test]

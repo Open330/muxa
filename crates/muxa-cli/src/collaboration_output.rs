@@ -114,6 +114,14 @@ pub(crate) fn message(request: &CollaborationRequest, include_body: bool) -> Val
     value
 }
 
+/// Progress reads never repeat routing, instructions, or a potentially large reply.
+pub(crate) fn progress(request: &CollaborationRequest, after: u64) -> Value {
+    let mut value = mutation_receipt(request);
+    value["updates"] = updates(request, after);
+    value["first_retained_sequence"] = json!(request.updates.first().map(|u| u.sequence));
+    value
+}
+
 pub(crate) fn updates(request: &CollaborationRequest, after: u64) -> Value {
     json!(request
         .updates

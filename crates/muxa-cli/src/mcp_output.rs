@@ -55,6 +55,12 @@ pub fn validate_message_read(args: &Value) -> Result<(), &'static str> {
     {
         return Err("include_body requires an exact request_id; use inbox for pending instructions or full=true for explicit full history");
     }
+    if args
+        .get("after_update")
+        .is_some_and(|value| value.as_u64().is_none())
+    {
+        return Err("after_update must be a non-negative integer");
+    }
     Ok(())
 }
 
@@ -212,6 +218,9 @@ mod tests {
             json!({"include_body":true}),
             json!({"include_body":true,"request_id":" "}),
             json!({"after_update":0}),
+            json!({"after_update":-1,"request_id":"req-1"}),
+            json!({"after_update":"0","request_id":"req-1"}),
+            json!({"after_update":null,"request_id":"req-1"}),
         ] {
             assert!(validate_message_read(&args).is_err());
         }

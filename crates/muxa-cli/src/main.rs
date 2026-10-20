@@ -2315,7 +2315,11 @@ async fn cmd_msg_list(
     };
     let mailbox = collaboration_mailbox(mailbox)?;
     let requests = if let Some(id) = request_id {
-        let request = client.collaboration_get(&listing_origin, id).await?;
+        let request = if after_update.is_some() {
+            client.collaboration_peek(&listing_origin, id).await?
+        } else {
+            client.collaboration_get(&listing_origin, id).await?
+        };
         if matches!(scope, MailboxScope::Room) {
             let room = client
                 .collaboration_context(&listing_origin)
@@ -2328,10 +2332,7 @@ async fn cmd_msg_list(
         }
         if let Some(after) = after_update {
             if json {
-                let mut value = collaboration_output::mutation_receipt(&request);
-                value["updates"] = collaboration_output::updates(&request, after);
-                value["first_retained_sequence"] =
-                    serde_json::json!(request.updates.first().map(|u| u.sequence));
+                let value = collaboration_output::progress(&request, after);
                 println!("{}", serde_json::to_string(&value)?);
             } else {
                 if !request.updates.iter().any(|u| u.sequence > after) {

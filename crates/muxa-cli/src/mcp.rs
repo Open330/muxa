@@ -1501,7 +1501,15 @@ async fn call_tool(
                 Err(error) => return Ok(error_result(&error)),
             };
             if let Some(id) = args.get("request_id").and_then(Value::as_str) {
-                return Ok(match client.collaboration_get(&origin, id).await {
+                // Incremental reads omit the reply: never acknowledge it implicitly.
+                let request = if args.get("after_update").is_some()
+                    && args.get("full").and_then(Value::as_bool) != Some(true)
+                {
+                    client.collaboration_peek(&origin, id).await
+                } else {
+                    client.collaboration_get(&origin, id).await
+                };
+                return Ok(match request {
                     Ok(request) => json_result(&message_view(&request, &args)),
                     Err(error) => error_result(&format!("list_messages failed: {error}")),
                 });
@@ -4165,6 +4173,9 @@ fn message_view(request: &CollaborationRequest, args: &Value) -> Value {
     if args.get("full").and_then(Value::as_bool).unwrap_or(false) {
         return json!(request);
     }
+    if let Some(after) = args.get("after_update").and_then(Value::as_u64) {
+        return crate::collaboration_output::progress(request, after);
+    }
     let mut value = crate::collaboration_output::message(
         request,
         args.get("include_body")
@@ -4175,10 +4186,6 @@ fn message_view(request: &CollaborationRequest, args: &Value) -> Value {
         if let Some(reply) = &request.reply {
             value["reply"] = json!(reply);
         }
-    }
-    if let Some(after) = args.get("after_update").and_then(Value::as_u64) {
-        value["updates"] = crate::collaboration_output::updates(request, after);
-        value["first_retained_sequence"] = json!(request.updates.first().map(|u| u.sequence));
     }
     value
 }
@@ -4295,6 +4302,40 @@ mod tests {
         );
         assert_eq!(
             message_view(&request, &json!({"full":true})),
+            json!(request)
+        );
+    }
+
+    #[test]
+    fn incremental_reads_do_not_repeat_completed_reply_or_instructions() {
+        let mut request = crate::collaboration_output::fixture();
+        request.status = RequestStatus::Completed;
+        request.reply = Some(muxa::collaboration::CollaborationReply {
+            status: RequestStatus::Completed,
+            body: "large final reply".repeat(4096),
+            artifacts: vec![],
+            air_artifacts: vec![],
+            at: time::OffsetDateTime::UNIX_EPOCH,
+        });
+        let args = json!({"request_id":request.id,"after_update":0,"include_body":true});
+        let progress = message_view(&request, &args);
+        assert_eq!(progress["final_reply_received"], true);
+        assert_eq!(progress["reported_status"], "completed");
+        assert_eq!(progress["updates"], json!([]));
+        for key in ["reply", "body", "from", "to", "paths"] {
+            assert!(progress.get(key).is_none(), "unexpected {key}");
+        }
+        let before = message_view(&request, &json!({"request_id":request.id}));
+        let before_bytes = serde_json::to_vec(&before).unwrap().len();
+        let after_bytes = serde_json::to_vec(&progress).unwrap().len();
+        eprintln!("incremental_read_bytes: before={before_bytes}, after={after_bytes}");
+        assert!(after_bytes < 256);
+        assert_eq!(
+            message_view(&request, &json!({"request_id":request.id}))["reply"]["body"],
+            request.reply.as_ref().unwrap().body
+        );
+        assert_eq!(
+            message_view(&request, &json!({"after_update":0,"full":true})),
             json!(request)
         );
     }
