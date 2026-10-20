@@ -213,6 +213,17 @@ fn sort_by_reply_time(requests: &mut [CollaborationRequest]) {
     });
 }
 
+/// A blank id is a caller mistake, not something to skip: dropping it would
+/// let the rest of an all-or-nothing withdrawal go through.
+fn reject_blank_withdrawals(ids: &[String]) -> Result<(), CollaborationError> {
+    if ids.iter().any(|id| id.trim().is_empty()) {
+        return Err(CollaborationError::InvalidWithdrawal(
+            "request ids must not be blank".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Trimmed, de-duplicated, order-preserving withdrawal ids.
 fn normalize_withdrawals(ids: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -1162,6 +1173,8 @@ pub enum CollaborationError {
     ReplyWakeNotWithdrawable(String),
     #[error("a request may withdraw at most {0} reply wakes")]
     TooManyWithdrawals(usize),
+    #[error("invalid reply-wake withdrawal: {0}")]
+    InvalidWithdrawal(String),
     #[error("invalid collaboration alias {0:?}; use 1-32 letters, digits, '.', '_', or '-'")]
     InvalidAlias(String),
     #[error("invalid collaboration role {0:?}; use 1-32 letters, digits, '.', '_', or '-'")]
@@ -2392,6 +2405,7 @@ impl CollaborationStore {
             ));
         }
         validate_air_artifact_references(&input.air_artifacts)?;
+        reject_blank_withdrawals(&input.withdraw_reply_wakes)?;
         let _transaction = self.transaction_lock.lock().await;
         let previous = self.requests.read().await.clone();
         let now = OffsetDateTime::now_utc();
@@ -2533,9 +2547,12 @@ impl CollaborationStore {
         ids: &[String],
     ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
         self.ensure_enabled()?;
+        reject_blank_withdrawals(ids)?;
         let ids = normalize_withdrawals(ids);
         if ids.is_empty() {
-            return Ok(Vec::new());
+            return Err(CollaborationError::InvalidWithdrawal(
+                "name at least one request id".into(),
+            ));
         }
         let _transaction = self.transaction_lock.lock().await;
         self.validate_reply_wake_withdrawals(caller, &ids).await?;
@@ -3275,7 +3292,6 @@ impl CollaborationStore {
         sent: bool,
     ) -> Result<(), CollaborationError> {
         let _transaction = self.transaction_lock.lock().await;
-        let previous = self.requests.read().await.clone();
         let changed: Vec<_> = {
             let mut requests = self.requests.write().await;
             let now = OffsetDateTime::now_utc();
@@ -3303,15 +3319,12 @@ impl CollaborationStore {
         if changed.is_empty() {
             return Ok(());
         }
+        // Keep the settled state in memory even if persisting it fails. A
+        // delivered prompt cannot be recalled, so this daemon must not type it
+        // again; a failed one must stay retryable, and restoring the
+        // reservation would strand it with no attempt left to settle it. The
+        // row on disk still says reserved, which the next load turns into owed.
         let result = self.persist_requests(&changed);
-        if result.is_err() && !sent {
-            // Nothing reached the pane, so restoring the reservation loses
-            // nothing; it is voided on the next load.
-            *self.requests.write().await = previous;
-            return result;
-        }
-        // A delivered prompt cannot be recalled. Keep the in-memory release
-        // even if persistence failed, so this daemon does not type it again.
         self.publish_change();
         result
     }
@@ -3458,6 +3471,37 @@ impl CollaborationStore {
 /// Muxa-launched CLIs without a real hook become pending peers when process
 /// discovery confirms their provider. Wrapper discovery reads the process
 /// table, so async callers must run this on a blocking worker.
+/// Whether `participant` is still the idle agent session that owns its pane,
+/// judged from the live agent rows for that pane. The waker resolves
+/// participants from a scan and then awaits a reservation; by the time it
+/// would type, the agent may have started work or been replaced by a new
+/// session in the same pane. Mirrors [`participants_from`]: the most recently
+/// active tracked agent on the pane (and socket, when both are known) wins.
+pub fn still_idle_owner(pane_agents: &[Agent], participant: &Participant) -> bool {
+    pane_agents
+        .iter()
+        .filter(|agent| {
+            agent.pane.as_deref() == Some(participant.pane.as_str())
+                && agent.state != AgentState::Stopped
+                && agent.kind != AgentKind::Task
+                && !agent
+                    .session_id
+                    .starts_with(crate::state::SYNTHETIC_SESSION_PREFIX)
+                && match (agent.tmux_socket.as_deref(), participant.socket.as_deref()) {
+                    (Some(endpoint), Some(socket)) => crate::backend::pane_endpoints_match(
+                        Some(&participant.pane),
+                        socket,
+                        &crate::backend::pane_endpoint_identity(Some(&participant.pane), endpoint),
+                    ),
+                    _ => true,
+                }
+        })
+        .max_by_key(|agent| agent.last_activity_at)
+        .is_some_and(|agent| {
+            agent.session_id == participant.agent_session_id && agent.state == AgentState::Idle
+        })
+}
+
 pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participant> {
     let mut resolved: HashMap<(Option<String>, String), (OffsetDateTime, Participant)> =
         HashMap::new();

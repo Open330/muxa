@@ -523,3 +523,100 @@ fn legacy_request(pair: &Pair) -> CollaborationRequest {
         reply: None,
     }
 }
+
+/// A failed attempt whose release also fails to persist must stay
+/// retryable by this daemon. Restoring the reservation instead would leave
+/// it with no attempt to settle it, blocking the sender until a restart.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_attempt_stays_retryable_when_its_release_cannot_persist() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let options = CollaborationOptions {
+        path: Some(dir.path().join("mailbox.json")),
+        ..Default::default()
+    };
+    let pair = Pair::with(CollaborationStore::load(options).await.unwrap());
+    let request = pair.answered("review").await;
+    let batch = pair.reserve().await.unwrap();
+
+    let database = pair.store.database_path.clone().unwrap();
+    let read_only = std::fs::Permissions::from_mode(0o444);
+    std::fs::set_permissions(&database, read_only).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let outcome = pair.store.complete_reply_wakes(&batch, false).await;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(outcome.is_err(), "the fault must actually hit persistence");
+
+    let retry = pair.reserve().await.expect("still owed, without a reload");
+    assert_eq!(ids(&retry), [request.id.as_str()]);
+}
+
+#[tokio::test]
+async fn blank_withdrawal_ids_reject_the_whole_operation() {
+    let pair = Pair::new();
+    let owned = pair.answered("owned").await;
+    let before = pair.store.requests.read().await.len();
+    for ids in [vec![owned.id.as_str(), " "], vec![""]] {
+        assert!(matches!(
+            pair.ask_withdrawing("replacement", &ids).await,
+            Err(CollaborationError::InvalidWithdrawal(_))
+        ));
+        let owned_ids: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
+        assert!(matches!(
+            pair.store
+                .withdraw_reply_wakes(&pair.sender, &owned_ids)
+                .await,
+            Err(CollaborationError::InvalidWithdrawal(_))
+        ));
+    }
+    assert!(matches!(
+        pair.store.withdraw_reply_wakes(&pair.sender, &[]).await,
+        Err(CollaborationError::InvalidWithdrawal(_))
+    ));
+    assert_eq!(pair.store.requests.read().await.len(), before);
+    assert_eq!(pair.wake_of(&owned.id).await, None);
+}
+
+async fn agent_on(pane: &str, session: &str) -> Agent {
+    let store = crate::Store::shared();
+    store
+        .apply(&crate::event::AgentEvent::Started {
+            id: crate::event::AgentId {
+                kind: AgentKind::Codex,
+                session_id: session.into(),
+                surface: None,
+                pane: Some(pane.into()),
+                tmux_socket: Some("default".into()),
+                cwd: Some("/repo".into()),
+            },
+            at: OffsetDateTime::now_utc(),
+        })
+        .await;
+    let mut agent = store.snapshot().await.remove(0);
+    agent.state = AgentState::Idle;
+    agent
+}
+
+/// The waker's participant list is a scan; this is the check it makes right
+/// before typing.
+#[tokio::test]
+async fn still_idle_owner_requires_the_same_session_idle_now() {
+    let sender = participant("%1", "sender");
+    let idle = agent_on("%1", "sender").await;
+    assert!(still_idle_owner(std::slice::from_ref(&idle), &sender));
+
+    let mut working = idle.clone();
+    working.state = AgentState::Working;
+    assert!(!still_idle_owner(&[working], &sender));
+
+    // `/new` in the same pane: a newer session now owns it.
+    let mut replacement = agent_on("%1", "fresh-session").await;
+    replacement.last_activity_at = idle.last_activity_at + time::Duration::seconds(1);
+    assert!(!still_idle_owner(&[idle.clone(), replacement], &sender));
+
+    let mut stopped = idle;
+    stopped.state = AgentState::Stopped;
+    assert!(!still_idle_owner(&[stopped], &sender));
+}

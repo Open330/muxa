@@ -1656,12 +1656,15 @@ async fn call_tool(
             )
         }
         "muxa_withdraw_reply_wake" => {
-            let request_ids = string_array(&args, "request_ids");
-            if request_ids.is_empty() {
-                return Ok(error_result(
-                    "withdraw_reply_wake requires a non-empty `request_ids` array",
-                ));
-            }
+            let request_ids = match request_id_array(&args, "request_ids") {
+                Ok(Some(ids)) if !ids.is_empty() => ids,
+                Ok(_) => {
+                    return Ok(error_result(
+                        "withdraw_reply_wake requires a non-empty `request_ids` array",
+                    ))
+                }
+                Err(error) => return Ok(error_result(&error)),
+            };
             if let Err(error) =
                 crate::mcp_output::require_reply_wake_withdraw(client, &request_ids).await
             {
@@ -3646,8 +3649,30 @@ fn new_request_from_args(
         artifacts: string_array(args, "artifacts"),
         links: string_array(args, "links"),
         air_artifacts,
-        withdraw_reply_wakes: string_array(args, "withdraw_reply_wakes"),
+        withdraw_reply_wakes: request_id_array(args, "withdraw_reply_wakes")?.unwrap_or_default(),
     })
+}
+
+/// A strictly typed list of request ids. Unlike [`string_array`], a wrong
+/// type, a non-string member or a blank id is an error: these lists drive
+/// all-or-nothing mutations, which must not quietly act on a subset.
+fn request_id_array(args: &Value, key: &str) -> std::result::Result<Option<Vec<String>>, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    let Some(items) = value.as_array() else {
+        return Err(format!("{key} must be an array of request ids"));
+    };
+    items
+        .iter()
+        .map(|item| match item.as_str() {
+            Some(id) if !id.trim().is_empty() => Ok(id.to_string()),
+            _ => Err(format!(
+                "{key} must contain only non-blank request id strings"
+            )),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 fn optional_string(args: &Value, key: &str) -> std::result::Result<Option<String>, String> {
@@ -5729,6 +5754,40 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "parent_request_id must be a string");
+    }
+
+    /// Withdrawals drive an all-or-nothing mutation. A malformed list must
+    /// fail the call, never shrink to the members that happened to parse.
+    #[test]
+    fn withdraw_reply_wakes_rejects_any_malformed_member() {
+        let parse = |withdraw: Value| {
+            new_request_from_args(
+                &json!({ "withdraw_reply_wakes": withdraw }),
+                RequestKind::Question,
+                "question".into(),
+                true,
+                WorkMode::ReadOnly,
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        assert_eq!(
+            parse(json!(["req_a", "req_b"]))
+                .unwrap()
+                .withdraw_reply_wakes,
+            ["req_a", "req_b"]
+        );
+        for bad in [
+            json!(["req_a", 42]),
+            json!("req_a"),
+            json!(["req_a", " "]),
+            json!([null]),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad} was accepted");
+        }
+        assert!(request_id_array(&json!({}), "request_ids")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

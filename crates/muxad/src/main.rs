@@ -1896,6 +1896,15 @@ async fn wake_senders_of_ready_replies(
                 continue;
             }
         };
+        // `participants` came from a scan taken before the reservation. Type
+        // nothing into a pane whose agent has since started work or been
+        // replaced; its replies stay owed for its next idle turn.
+        if !muxa::collaboration::still_idle_owner(&store.by_pane(&sender.pane).await, sender) {
+            if let Err(error) = collaboration.complete_reply_wakes(&batch, false).await {
+                tracing::warn!(pane = sender.pane, %error, "failed to release reply wake");
+            }
+            continue;
+        }
         let prompt = reply_wake_prompt(&batch, time::OffsetDateTime::now_utc());
         let (sent, submitted) = send_collaboration_wake(sender, &prompt, backends, store).await;
         if submitted {
@@ -4657,6 +4666,94 @@ mod tests {
             assert_eq!(sends[1], ("%1".into(), "\r".into()));
         }
         assert_eq!(mailbox.unread_reply_count(&sender).await, 3);
+    }
+
+    /// The waker resolves the sender from a scan, then reserves. If the
+    /// sender started a turn (or its pane got a new session) in between,
+    /// nothing may be typed and the reply stays owed for its next idle turn.
+    #[tokio::test]
+    async fn a_sender_busy_again_since_the_scan_gets_no_reply_wake() {
+        for replaced in [false, true] {
+            let store = muxa::Store::shared();
+            add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+            add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+            let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+            let participants =
+                muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+            let find = |pane: &str| {
+                participants
+                    .iter()
+                    .find(|participant| participant.pane == pane)
+                    .unwrap()
+                    .clone()
+            };
+            let (sender, recipient) = (find("%1"), find("%2"));
+            let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+            let request = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "review".into(),
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            mailbox.claim_for(&recipient).await.unwrap();
+            mailbox
+                .reply(
+                    &recipient,
+                    &request.id,
+                    RequestStatus::Completed,
+                    "done".into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+            let replies = mailbox.pending_reply_unnotified().await;
+
+            if replaced {
+                add_agent(&store, "%1", "fresh-session", AgentKind::Codex).await;
+            } else {
+                store
+                    .apply(&AgentEvent::PromptSubmitted {
+                        id: AgentId {
+                            kind: AgentKind::Codex,
+                            session_id: "sender".into(),
+                            surface: None,
+                            pane: Some("%1".into()),
+                            tmux_socket: Some("default".into()),
+                            cwd: Some("/repo".into()),
+                        },
+                        prompt: "next task".into(),
+                        at: OffsetDateTime::now_utc(),
+                    })
+                    .await;
+            }
+
+            let sends = Arc::new(Mutex::new(Vec::new()));
+            let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+                panes,
+                sends: sends.clone(),
+            });
+            wake_senders_of_ready_replies(
+                &mailbox,
+                &participants,
+                std::slice::from_ref(&backend),
+                replies,
+                &mut HashSet::new(),
+                &store,
+            )
+            .await;
+            assert!(sends.lock().unwrap().is_empty(), "replaced={replaced}");
+            assert_eq!(
+                mailbox.pending_reply_unnotified().await.len(),
+                1,
+                "the wake stays owed (replaced={replaced})"
+            );
+        }
     }
 
     #[tokio::test]
