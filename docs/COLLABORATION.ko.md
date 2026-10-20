@@ -210,6 +210,10 @@ muxa msg list --scope all --since 7d --work CAL-7345 --kind review \
 
 # 아직 상대가 claim하지 않은 요청 취소
 muxa msg cancel req_...
+
+# 포기했거나 다시 보낸 요청: 늦게 온 답장이 더는 깨우지 않음(작업·답장은 그대로)
+muxa msg send peer "쓰기 권한으로 다시 요청" --withdraw req_...
+muxa msg withdraw req_...
 ```
 
 `muxa msg inbox`의 텍스트 출력에는 작업 본문과 함께 답변 의무, 허용 경로, 첨부 자료가 표시됩니다. `muxa msg wait --timeout SECONDS`는 `--timeout-secs SECONDS`의 별칭입니다.
@@ -291,6 +295,7 @@ watch composer는 `? QUESTION`, `◆ REVIEW`, `▶ TASK`, `! NOTICE`를 서로 �
 | `muxa_list_messages` | incoming/sent/all request 상태 조회(미claim) |
 | `muxa_reply` | completed/blocked/declined/failed 구조화 응답 |
 | `muxa_wait_reply` | event-driven 방식으로 요청의 terminal reply 대기 |
+| `muxa_withdraw_reply_wake` | 포기했거나 대체한 내 요청의 답장 wake 철회(작업·답장은 유지) |
 | `muxa_cancel_message` | 아직 queued인 발신 요청 취소 |
 
 ## Agent 대화에서 자연스럽게 호출하기

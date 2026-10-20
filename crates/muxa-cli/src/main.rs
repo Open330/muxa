@@ -556,6 +556,10 @@ enum MsgCmd {
         /// Defaults to quiet for notice, enabled for other kinds; still respects idle-only wake.
         #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
         notify: Option<bool>,
+        /// Your earlier request this one replaces: its late reply will not
+        /// wake you. Its work and reply are unchanged. Repeatable.
+        #[arg(long = "withdraw", value_name = "REQUEST")]
+        withdraw: Vec<String>,
         /// Print the stored request instead of a one-line receipt.
         #[arg(long)]
         json: bool,
@@ -661,6 +665,16 @@ enum MsgCmd {
     Cancel {
         request_id: String,
         /// Print the stored request instead of a one-line receipt.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop being woken for replies to your own requests you no longer need,
+    /// for example ones you gave up on or re-sent. Their work, replies and
+    /// `msg wait` results are unchanged; use `cancel` to stop queued work.
+    Withdraw {
+        #[arg(required = true, value_name = "REQUEST")]
+        request_ids: Vec<String>,
+        /// Print the affected requests as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -2077,8 +2091,17 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             air_refs,
             no_reply,
             notify,
+            withdraw,
             json,
         } => {
+            if !withdraw.is_empty() {
+                require_capability(
+                    client,
+                    muxa::collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY,
+                    "msg send --withdraw",
+                )
+                .await?;
+            }
             if target.eq_ignore_ascii_case("human") {
                 mcp_output::require_human_actions(client)
                     .await
@@ -2116,7 +2139,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                         run_id: run,
                         artifacts,
                         links,
-                        withdraw_reply_wakes: Vec::new(),
+                        withdraw_reply_wakes: withdraw,
                     },
                 )
                 .await?;
@@ -2239,6 +2262,36 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
         MsgCmd::Cancel { request_id, json } => {
             let request = client.collaboration_cancel(&origin, &request_id).await?;
             print_collaboration_receipt(&request, json)?;
+        }
+        MsgCmd::Withdraw { request_ids, json } => {
+            require_capability(
+                client,
+                muxa::collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY,
+                "msg withdraw",
+            )
+            .await?;
+            let requests = client
+                .collaboration_withdraw_reply_wakes(&origin, &request_ids)
+                .await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &requests
+                            .iter()
+                            .map(collaboration_output::mutation_receipt)
+                            .collect::<Vec<_>>()
+                    )?
+                );
+            } else {
+                for request in requests {
+                    println!(
+                        "withdrawn  {}  {}  (reply wake off; work and reply unchanged)",
+                        request.id,
+                        format!("{:?}", request.status).to_lowercase()
+                    );
+                }
+            }
         }
         MsgCmd::Expire { .. } => unreachable!("handled before resolving an origin"),
     }
@@ -2471,8 +2524,16 @@ fn print_collaboration_receipt(
             } else {
                 "no reply expected"
             };
+            let withdrew = if request.withdrew_reply_wakes.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; reply wake withdrawn for {}",
+                    request.withdrew_reply_wakes.join(", ")
+                )
+            };
             println!(
-                "sent  {}  to {}  ({awaiting})",
+                "sent  {}  to {}  ({awaiting}{withdrew})",
                 request.id,
                 request.to.label()
             );

@@ -203,11 +203,12 @@ it:
 | `muxa_peer_report` | `target?`, `request_id?`, `full?` | Read a received final reply without repeating the original request. `full=true` returns the legacy full record. |
 | `muxa_set_identity` | `alias?`, `roles?` | Replace this exact session's room-local alias and role set; empty input clears it. |
 | `muxa_request_attention` | `body`, `action?`, `dispatch_id?`, `parent_request_id?` | Request required human approval, choice or information; delivered to connected Fleet operator clients. Reuse a UUID dispatch ID on retry; wait for and read the actual human reply. |
-| `muxa_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?`, `air_artifacts?` | Create a durable same-window peer request. |
+| `muxa_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?`, `air_artifacts?`, `withdraw_reply_wakes?` | Create a durable same-window peer request. `withdraw_reply_wakes` names your own earlier requests it replaces; their late replies stop waking you. |
 | `muxa_inbox` | `full?` | Claim and read instructions, authority, paths and attachments addressed to this session. `full=true` includes audit metadata. |
 | `muxa_list_messages` | `mailbox?`, `request_id?`, `limit?`, `offset?`, `include_body?`, `after_update?`, `full?` | List newest metadata records without claiming (default 20, max 100). Read an exact request or incremental progress explicitly. |
 | `muxa_reply` | `request_id`, `status`, `body`, `artifacts?`, `air_artifacts?` | Return a structured terminal response. |
 | `muxa_wait_reply` | `request_id`, `timeout_secs?` | Event-driven wait for a structured peer response. |
+| `muxa_withdraw_reply_wake` | `request_ids` | Stop being woken for replies to your own requests you gave up on or replaced. Work, replies and `muxa_wait_reply` results are unchanged. |
 | `muxa_cancel_message` | `request_id` | Cancel a sent request while it is still queued. |
 
 `muxa_send_prompt` is refused (surfaced to the model as a tool error) when the

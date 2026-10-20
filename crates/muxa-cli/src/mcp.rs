@@ -756,6 +756,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "run_id": { "type": "string", "description": "Specific execution/run id for this request." },
                     "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Generic artifact identifiers or locators attached to the request." },
                     "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." },
+                    "withdraw_reply_wakes": { "type": "array", "maxItems": 16, "items": { "type": "string" }, "description": "Your own earlier request ids this request replaces (for example one you gave up on after it was blocked). Their late replies will not wake you; their work, replies and muxa_wait_reply results are unchanged. Applied atomically with this send." },
                     "air_artifacts": {
                         "type": "array",
                         "maxItems": 8,
@@ -831,6 +832,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "run_id": { "type": "string", "description": "Specific execution/run id for this request." },
                     "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Generic artifact identifiers or locators attached to the request." },
                     "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." },
+                    "withdraw_reply_wakes": { "type": "array", "maxItems": 16, "items": { "type": "string" }, "description": "Your own earlier request ids this request replaces (for example one you gave up on after it was blocked). Their late replies will not wake you; their work, replies and muxa_wait_reply results are unchanged. Applied atomically with this send." },
                     "air_artifacts": {
                         "type": "array",
                         "maxItems": 8,
@@ -895,6 +897,18 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600 }
                 },
                 "required": ["request_id"],
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_withdraw_reply_wake",
+            "description": "Stop being woken for the replies to your own earlier requests that you no longer need, such as ones you gave up on or replaced. Works whatever their status. Only notification interest is withdrawn: the recipient's work, the reply, and muxa_wait_reply results are unchanged. Use muxa_cancel_message to stop queued work. When sending the replacement, prefer withdraw_reply_wakes on that send instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_ids": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string" } }
+                },
+                "required": ["request_ids"],
                 "additionalProperties": false
             },
         }),
@@ -1468,6 +1482,14 @@ async fn call_tool(
                 Ok(request) => request,
                 Err(error) => return Ok(error_result(&error)),
             };
+            if let Err(error) = crate::mcp_output::require_reply_wake_withdraw(
+                client,
+                &request.withdraw_reply_wakes,
+            )
+            .await
+            {
+                return Ok(error_result(&error));
+            }
             Ok(
                 match client.collaboration_send(&origin, target, &request).await {
                     Ok(request) => json_result(&request_ack(&request)),
@@ -1630,6 +1652,37 @@ async fn call_tool(
                         json_result(&crate::collaboration_output::mutation_receipt(&request))
                     }
                     Err(error) => error_result(&format!("cancel_message failed: {error}")),
+                },
+            )
+        }
+        "muxa_withdraw_reply_wake" => {
+            let request_ids = string_array(&args, "request_ids");
+            if request_ids.is_empty() {
+                return Ok(error_result(
+                    "withdraw_reply_wake requires a non-empty `request_ids` array",
+                ));
+            }
+            if let Err(error) =
+                crate::mcp_output::require_reply_wake_withdraw(client, &request_ids).await
+            {
+                return Ok(error_result(&error));
+            }
+            let origin = match resolve_collaboration_origin(client).await {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(
+                match client
+                    .collaboration_withdraw_reply_wakes(&origin, &request_ids)
+                    .await
+                {
+                    Ok(requests) => json_result(&json!({
+                        "withdrawn": requests
+                            .iter()
+                            .map(crate::collaboration_output::mutation_receipt)
+                            .collect::<Vec<_>>(),
+                    })),
+                    Err(error) => error_result(&format!("withdraw_reply_wake failed: {error}")),
                 },
             )
         }
@@ -1870,6 +1923,7 @@ fn collaboration_guide(
             "reported_status": "Recipient-declared completed/blocked/declined/failed. Muxa does not judge the work.",
             "timeout": "The wait ended; work is unchanged. Prefer completion wakes or substantive checkpoints. If waiting in the foreground, use 30-60 seconds; a 1-second probe is for an expected result, not a polling loop. Do not renew waits blindly.",
             "progress": "Use update_request (CLI: msg update REQUEST BODY) for consolidated guidance/progress on the same request; reply once at the end. No receipt acknowledgements or unchanged status messages.",
+            "abandon": "When you give up on or replace your own request, name it in withdraw_reply_wakes on the replacement (CLI: msg send --withdraw REQUEST), or call muxa_withdraw_reply_wake. Its late reply then stays readable but does not wake you. Nothing else changes.",
             "reads": "Reports omit original requests. Lists default to 20 metadata records; request_id + include_body reads instructions, full=true opts into legacy records.",
             "cli": "muxa msg wait REQUEST --body [--output FILE] prints the reply directly. Keep exit status/stderr; do not hide errors with grep or retry sends after empty filtered output. --notify means true; --notify false is quiet. Never judge completion from body keywords.",
             "authority": "execute=true and bypass-permission spawning require existing explicit authorization. Preserve request identity on retry; a timeout never authorizes duplicate work.",
@@ -2119,6 +2173,11 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
             Ok(request) => request,
             Err(error) => return error_result(&error),
         };
+    if let Err(error) =
+        crate::mcp_output::require_reply_wake_withdraw(client, &request.withdraw_reply_wakes).await
+    {
+        return error_result(&error);
+    }
     let origin = match resolve_collaboration_origin(client).await {
         Ok(origin) => origin,
         Err(error) => return error_result(&error),
@@ -2333,6 +2392,13 @@ async fn fleet_call_peer(
             Ok(request) => request,
             Err(error) => return error_result(&error),
         };
+    if !request.withdraw_reply_wakes.is_empty() {
+        // The withdrawn requests live in this host's mailbox and the new one
+        // in the remote host's; there is no transaction spanning both.
+        return error_result(
+            "fleet_call_peer cannot withdraw reply wakes; call muxa_withdraw_reply_wake on the host that holds those requests",
+        );
+    }
 
     if let Ok(origin) = resolve_collaboration_origin(client).await {
         if let Ok(room) = client.collaboration_context(&origin).await {
@@ -3580,7 +3646,7 @@ fn new_request_from_args(
         artifacts: string_array(args, "artifacts"),
         links: string_array(args, "links"),
         air_artifacts,
-        withdraw_reply_wakes: Vec::new(),
+        withdraw_reply_wakes: string_array(args, "withdraw_reply_wakes"),
     })
 }
 
@@ -5139,6 +5205,7 @@ mod tests {
                 "muxa_list_messages",
                 "muxa_reply",
                 "muxa_wait_reply",
+                "muxa_withdraw_reply_wake",
                 "muxa_cancel_message",
             ],
         );

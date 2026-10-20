@@ -116,6 +116,24 @@ pub async fn require_human_actions(client: &Client) -> Result<(), String> {
     Err("running muxad has not advertised human-action support; ask in the existing user conversation or upgrade the daemon. Do not retry peer aliases or impersonate the console".into())
 }
 
+/// Refuse to send withdrawals to a daemon that would silently drop them.
+pub async fn require_reply_wake_withdraw(client: &Client, ids: &[String]) -> Result<(), String> {
+    if ids.is_empty()
+        || client
+            .hello(Duration::from_secs(2))
+            .await
+            .is_ok_and(|hello| {
+                hello
+                    .capabilities
+                    .iter()
+                    .any(|c| c == muxa::collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY)
+            })
+    {
+        return Ok(());
+    }
+    Err("running muxad cannot withdraw reply wakes; upgrade the daemon, or send without withdraw_reply_wakes".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

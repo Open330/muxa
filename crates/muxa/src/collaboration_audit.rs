@@ -37,6 +37,7 @@ pub enum CollaborationAuditOperation {
     Peek,
     Wait,
     Cancel,
+    WithdrawReplyWakes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

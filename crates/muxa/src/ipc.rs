@@ -641,6 +641,13 @@ enum RequestBody {
         origin: CollaborationOrigin,
         request_id: String,
     },
+    /// Stop waking the caller for replies to its own listed requests.
+    /// Releases notification interest only; see
+    /// [`crate::collaboration::CollaborationStore::withdraw_reply_wakes`].
+    CollaborationWithdrawReplyWakes {
+        origin: CollaborationOrigin,
+        request_ids: Vec<String>,
+    },
     /// Operator housekeeping: expire never-claimed requests older than
     /// `older_than_secs`. Answers with the affected requests.
     CollaborationExpire {
@@ -797,6 +804,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_update",
     "collaboration_peer_recovery",
     collaboration::HUMAN_ACTIONS_CAPABILITY,
+    collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY,
     "pipeline_runs_v1",
     "pipeline_subscribe",
     "work_control_v1",
@@ -4609,6 +4617,43 @@ async fn handle(
                     .await;
                     response
                 }
+                RequestBody::CollaborationWithdrawReplyWakes {
+                    origin,
+                    request_ids,
+                } => {
+                    kind = "collaboration_withdraw_reply_wakes";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::WithdrawReplyWakes,
+                        origin.clone(),
+                    );
+                    audit_context.request_id = request_ids.first().cloned();
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
+                    let response = match topology.resolve_origin(&origin) {
+                        Ok(current) => match collaboration
+                            .withdraw_reply_wakes(&current, &request_ids)
+                            .await
+                        {
+                            Ok(requests) => Response::with_collaboration_requests(requests),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
+                }
                 RequestBody::SpawnSession {
                     command,
                     args,
@@ -6452,6 +6497,24 @@ impl Client {
         serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
     }
 
+    /// Withdraw the caller's interest in replies to its own requests. The
+    /// caller must first confirm the daemon advertises
+    /// [`crate::collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY`].
+    pub async fn collaboration_withdraw_reply_wakes(
+        &self,
+        origin: &CollaborationOrigin,
+        request_ids: &[String],
+    ) -> Result<Vec<CollaborationRequest>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_withdraw_reply_wakes",
+            "origin": origin,
+            "request_ids": request_ids,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
+    }
+
     pub async fn snapshot_with_timeout(
         &self,
         deadline: Duration,
@@ -7885,6 +7948,76 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+
+        // Giving up on a request: the replacement withdraws its reply wake in
+        // the same send, and a standalone withdrawal releases another one.
+        // Only the sender may do either; neither touches the work.
+        assert!(client
+            .hello(Duration::from_secs(2))
+            .await
+            .unwrap()
+            .capabilities
+            .iter()
+            .any(|tag| tag == collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY));
+        let abandoned = client
+            .collaboration_send(
+                &sender,
+                "@reviewer",
+                &NewRequest {
+                    body: "first attempt".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let replacement = client
+            .collaboration_send(
+                &sender,
+                "@reviewer",
+                &NewRequest {
+                    body: "second attempt".into(),
+                    withdraw_reply_wakes: vec![abandoned.id.clone()],
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replacement.withdrew_reply_wakes,
+            std::slice::from_ref(&abandoned.id)
+        );
+        assert!(client
+            .collaboration_withdraw_reply_wakes(&recipient, std::slice::from_ref(&replacement.id))
+            .await
+            .is_err());
+        let withdrawn = client
+            .collaboration_withdraw_reply_wakes(&sender, std::slice::from_ref(&replacement.id))
+            .await
+            .unwrap();
+        assert_eq!(withdrawn.len(), 1);
+        assert_eq!(withdrawn[0].status, RequestStatus::Queued);
+        for request in [&abandoned, &replacement] {
+            let observed = client
+                .collaboration_list(&sender, RequestMailbox::Sent)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.id == request.id)
+                .unwrap();
+            assert!(matches!(
+                observed.reply_wake,
+                Some(collaboration::ReplyWake::Released {
+                    reason: collaboration::ReplyWakeRelease::Withdrawn,
+                    ..
+                })
+            ));
+        }
+        for request in [&abandoned, &replacement] {
+            client
+                .collaboration_cancel(&sender, &request.id)
+                .await
+                .unwrap();
+        }
 
         // The console may target the pane it was opened from. That pane stays
         // audit provenance, but the represented identity must remain the
