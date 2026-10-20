@@ -34,8 +34,10 @@ pub enum CollaborationAuditOperation {
     Reply,
     Update,
     Get,
+    Peek,
     Wait,
     Cancel,
+    WithdrawReplyWakes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

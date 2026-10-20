@@ -756,6 +756,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "run_id": { "type": "string", "description": "Specific execution/run id for this request." },
                     "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Generic artifact identifiers or locators attached to the request." },
                     "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." },
+                    "withdraw_reply_wakes": { "type": "array", "maxItems": 16, "items": { "type": "string" }, "description": "Your own earlier request ids this request replaces (for example one you gave up on after it was blocked). Their late replies will not wake you; their work, replies and muxa_wait_reply results are unchanged. Applied atomically with this send." },
                     "air_artifacts": {
                         "type": "array",
                         "maxItems": 8,
@@ -831,6 +832,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "run_id": { "type": "string", "description": "Specific execution/run id for this request." },
                     "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Generic artifact identifiers or locators attached to the request." },
                     "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." },
+                    "withdraw_reply_wakes": { "type": "array", "maxItems": 16, "items": { "type": "string" }, "description": "Your own earlier request ids this request replaces (for example one you gave up on after it was blocked). Their late replies will not wake you; their work, replies and muxa_wait_reply results are unchanged. Applied atomically with this send." },
                     "air_artifacts": {
                         "type": "array",
                         "maxItems": 8,
@@ -895,6 +897,18 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600 }
                 },
                 "required": ["request_id"],
+                "additionalProperties": false
+            },
+        }),
+        json!({
+            "name": "muxa_withdraw_reply_wake",
+            "description": "Stop being woken for the replies to your own earlier requests that you no longer need, such as ones you gave up on or replaced. Works whatever their status. Only notification interest is withdrawn: the recipient's work, the reply, and muxa_wait_reply results are unchanged. Use muxa_cancel_message to stop queued work. When sending the replacement, prefer withdraw_reply_wakes on that send instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_ids": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string" } }
+                },
+                "required": ["request_ids"],
                 "additionalProperties": false
             },
         }),
@@ -1468,6 +1482,14 @@ async fn call_tool(
                 Ok(request) => request,
                 Err(error) => return Ok(error_result(&error)),
             };
+            if let Err(error) = crate::mcp_output::require_reply_wake_withdraw(
+                client,
+                &request.withdraw_reply_wakes,
+            )
+            .await
+            {
+                return Ok(error_result(&error));
+            }
             Ok(
                 match client.collaboration_send(&origin, target, &request).await {
                     Ok(request) => json_result(&request_ack(&request)),
@@ -1501,7 +1523,15 @@ async fn call_tool(
                 Err(error) => return Ok(error_result(&error)),
             };
             if let Some(id) = args.get("request_id").and_then(Value::as_str) {
-                return Ok(match client.collaboration_get(&origin, id).await {
+                // Incremental reads omit the reply: never acknowledge it implicitly.
+                let request = if args.get("after_update").is_some()
+                    && args.get("full").and_then(Value::as_bool) != Some(true)
+                {
+                    client.collaboration_peek(&origin, id).await
+                } else {
+                    client.collaboration_get(&origin, id).await
+                };
+                return Ok(match request {
                     Ok(request) => json_result(&message_view(&request, &args)),
                     Err(error) => error_result(&format!("list_messages failed: {error}")),
                 });
@@ -1622,6 +1652,40 @@ async fn call_tool(
                         json_result(&crate::collaboration_output::mutation_receipt(&request))
                     }
                     Err(error) => error_result(&format!("cancel_message failed: {error}")),
+                },
+            )
+        }
+        "muxa_withdraw_reply_wake" => {
+            let request_ids = match request_id_array(&args, "request_ids") {
+                Ok(Some(ids)) if !ids.is_empty() => ids,
+                Ok(_) => {
+                    return Ok(error_result(
+                        "withdraw_reply_wake requires a non-empty `request_ids` array",
+                    ))
+                }
+                Err(error) => return Ok(error_result(&error)),
+            };
+            if let Err(error) =
+                crate::mcp_output::require_reply_wake_withdraw(client, &request_ids).await
+            {
+                return Ok(error_result(&error));
+            }
+            let origin = match resolve_collaboration_origin(client).await {
+                Ok(origin) => origin,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            Ok(
+                match client
+                    .collaboration_withdraw_reply_wakes(&origin, &request_ids)
+                    .await
+                {
+                    Ok(requests) => json_result(&json!({
+                        "withdrawn": requests
+                            .iter()
+                            .map(crate::collaboration_output::mutation_receipt)
+                            .collect::<Vec<_>>(),
+                    })),
+                    Err(error) => error_result(&format!("withdraw_reply_wake failed: {error}")),
                 },
             )
         }
@@ -1862,6 +1926,7 @@ fn collaboration_guide(
             "reported_status": "Recipient-declared completed/blocked/declined/failed. Muxa does not judge the work.",
             "timeout": "The wait ended; work is unchanged. Prefer completion wakes or substantive checkpoints. If waiting in the foreground, use 30-60 seconds; a 1-second probe is for an expected result, not a polling loop. Do not renew waits blindly.",
             "progress": "Use update_request (CLI: msg update REQUEST BODY) for consolidated guidance/progress on the same request; reply once at the end. No receipt acknowledgements or unchanged status messages.",
+            "abandon": "When you give up on or replace your own request, name it in withdraw_reply_wakes on the replacement (CLI: msg send --withdraw REQUEST), or call muxa_withdraw_reply_wake. Its late reply then stays readable but does not wake you. Nothing else changes.",
             "reads": "Reports omit original requests. Lists default to 20 metadata records; request_id + include_body reads instructions, full=true opts into legacy records.",
             "cli": "muxa msg wait REQUEST --body [--output FILE] prints the reply directly. Keep exit status/stderr; do not hide errors with grep or retry sends after empty filtered output. --notify means true; --notify false is quiet. Never judge completion from body keywords.",
             "authority": "execute=true and bypass-permission spawning require existing explicit authorization. Preserve request identity on retry; a timeout never authorizes duplicate work.",
@@ -2111,6 +2176,11 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
             Ok(request) => request,
             Err(error) => return error_result(&error),
         };
+    if let Err(error) =
+        crate::mcp_output::require_reply_wake_withdraw(client, &request.withdraw_reply_wakes).await
+    {
+        return error_result(&error);
+    }
     let origin = match resolve_collaboration_origin(client).await {
         Ok(origin) => origin,
         Err(error) => return error_result(&error),
@@ -2325,6 +2395,13 @@ async fn fleet_call_peer(
             Ok(request) => request,
             Err(error) => return error_result(&error),
         };
+    if !request.withdraw_reply_wakes.is_empty() {
+        // The withdrawn requests live in this host's mailbox and the new one
+        // in the remote host's; there is no transaction spanning both.
+        return error_result(
+            "fleet_call_peer cannot withdraw reply wakes; call muxa_withdraw_reply_wake on the host that holds those requests",
+        );
+    }
 
     if let Ok(origin) = resolve_collaboration_origin(client).await {
         if let Ok(room) = client.collaboration_context(&origin).await {
@@ -3572,7 +3649,30 @@ fn new_request_from_args(
         artifacts: string_array(args, "artifacts"),
         links: string_array(args, "links"),
         air_artifacts,
+        withdraw_reply_wakes: request_id_array(args, "withdraw_reply_wakes")?.unwrap_or_default(),
     })
+}
+
+/// A strictly typed list of request ids. Unlike [`string_array`], a wrong
+/// type, a non-string member or a blank id is an error: these lists drive
+/// all-or-nothing mutations, which must not quietly act on a subset.
+fn request_id_array(args: &Value, key: &str) -> std::result::Result<Option<Vec<String>>, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    let Some(items) = value.as_array() else {
+        return Err(format!("{key} must be an array of request ids"));
+    };
+    items
+        .iter()
+        .map(|item| match item.as_str() {
+            Some(id) if !id.trim().is_empty() => Ok(id.to_string()),
+            _ => Err(format!(
+                "{key} must contain only non-blank request id strings"
+            )),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 fn optional_string(args: &Value, key: &str) -> std::result::Result<Option<String>, String> {
@@ -4165,6 +4265,9 @@ fn message_view(request: &CollaborationRequest, args: &Value) -> Value {
     if args.get("full").and_then(Value::as_bool).unwrap_or(false) {
         return json!(request);
     }
+    if let Some(after) = args.get("after_update").and_then(Value::as_u64) {
+        return crate::collaboration_output::progress(request, after);
+    }
     let mut value = crate::collaboration_output::message(
         request,
         args.get("include_body")
@@ -4175,10 +4278,6 @@ fn message_view(request: &CollaborationRequest, args: &Value) -> Value {
         if let Some(reply) = &request.reply {
             value["reply"] = json!(reply);
         }
-    }
-    if let Some(after) = args.get("after_update").and_then(Value::as_u64) {
-        value["updates"] = crate::collaboration_output::updates(request, after);
-        value["first_retained_sequence"] = json!(request.updates.first().map(|u| u.sequence));
     }
     value
 }
@@ -4295,6 +4394,40 @@ mod tests {
         );
         assert_eq!(
             message_view(&request, &json!({"full":true})),
+            json!(request)
+        );
+    }
+
+    #[test]
+    fn incremental_reads_do_not_repeat_completed_reply_or_instructions() {
+        let mut request = crate::collaboration_output::fixture();
+        request.status = RequestStatus::Completed;
+        request.reply = Some(muxa::collaboration::CollaborationReply {
+            status: RequestStatus::Completed,
+            body: "large final reply".repeat(4096),
+            artifacts: vec![],
+            air_artifacts: vec![],
+            at: time::OffsetDateTime::UNIX_EPOCH,
+        });
+        let args = json!({"request_id":request.id,"after_update":0,"include_body":true});
+        let progress = message_view(&request, &args);
+        assert_eq!(progress["final_reply_received"], true);
+        assert_eq!(progress["reported_status"], "completed");
+        assert_eq!(progress["updates"], json!([]));
+        for key in ["reply", "body", "from", "to", "paths"] {
+            assert!(progress.get(key).is_none(), "unexpected {key}");
+        }
+        let before = message_view(&request, &json!({"request_id":request.id}));
+        let before_bytes = serde_json::to_vec(&before).unwrap().len();
+        let after_bytes = serde_json::to_vec(&progress).unwrap().len();
+        eprintln!("incremental_read_bytes: before={before_bytes}, after={after_bytes}");
+        assert!(after_bytes < 256);
+        assert_eq!(
+            message_view(&request, &json!({"request_id":request.id}))["reply"]["body"],
+            request.reply.as_ref().unwrap().body
+        );
+        assert_eq!(
+            message_view(&request, &json!({"after_update":0,"full":true})),
             json!(request)
         );
     }
@@ -5097,6 +5230,7 @@ mod tests {
                 "muxa_list_messages",
                 "muxa_reply",
                 "muxa_wait_reply",
+                "muxa_withdraw_reply_wake",
                 "muxa_cancel_message",
             ],
         );
@@ -5620,6 +5754,40 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "parent_request_id must be a string");
+    }
+
+    /// Withdrawals drive an all-or-nothing mutation. A malformed list must
+    /// fail the call, never shrink to the members that happened to parse.
+    #[test]
+    fn withdraw_reply_wakes_rejects_any_malformed_member() {
+        let parse = |withdraw: Value| {
+            new_request_from_args(
+                &json!({ "withdraw_reply_wakes": withdraw }),
+                RequestKind::Question,
+                "question".into(),
+                true,
+                WorkMode::ReadOnly,
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        assert_eq!(
+            parse(json!(["req_a", "req_b"]))
+                .unwrap()
+                .withdraw_reply_wakes,
+            ["req_a", "req_b"]
+        );
+        for bad in [
+            json!(["req_a", 42]),
+            json!("req_a"),
+            json!(["req_a", " "]),
+            json!([null]),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad} was accepted");
+        }
+        assert!(request_id_array(&json!({}), "request_ids")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

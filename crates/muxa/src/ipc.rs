@@ -618,6 +618,11 @@ enum RequestBody {
         origin: CollaborationOrigin,
         request_id: String,
     },
+    /// Exact non-acknowledging read for instructions and incremental progress.
+    CollaborationPeek {
+        origin: CollaborationOrigin,
+        request_id: String,
+    },
     CollaborationUpdate {
         origin: CollaborationOrigin,
         request_id: String,
@@ -635,6 +640,13 @@ enum RequestBody {
     CollaborationCancel {
         origin: CollaborationOrigin,
         request_id: String,
+    },
+    /// Stop waking the caller for replies to its own listed requests.
+    /// Releases notification interest only; see
+    /// [`crate::collaboration::CollaborationStore::withdraw_reply_wakes`].
+    CollaborationWithdrawReplyWakes {
+        origin: CollaborationOrigin,
+        request_ids: Vec<String>,
     },
     /// Operator housekeeping: expire never-claimed requests older than
     /// `older_than_secs`. Answers with the affected requests.
@@ -778,6 +790,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_expire_v1",
     "collaboration_lifecycle",
     "collaboration_wait",
+    "collaboration_peek",
     "collaboration_subscribe",
     "collaboration_dispatch_v1",
     "orchestration_v1",
@@ -791,6 +804,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_update",
     "collaboration_peer_recovery",
     collaboration::HUMAN_ACTIONS_CAPABILITY,
+    collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY,
     "pipeline_runs_v1",
     "pipeline_subscribe",
     "work_control_v1",
@@ -4480,6 +4494,37 @@ async fn handle(
                     .await;
                     response
                 }
+                RequestBody::CollaborationPeek { origin, request_id } => {
+                    kind = "collaboration_peek";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::Peek,
+                        origin.clone(),
+                    );
+                    audit_context.request_id = Some(request_id.clone());
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
+                    let response = match topology.resolve_origin(&origin) {
+                        Ok(current) => match collaboration.peek_for(&current, &request_id).await {
+                            Ok(request) => Response::with_collaboration_request(request),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
+                }
                 RequestBody::CollaborationWait {
                     origin,
                     request_id,
@@ -4561,6 +4606,43 @@ async fn handle(
                                 Err(error) => Response::err(error.to_string()),
                             }
                         }
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
+                }
+                RequestBody::CollaborationWithdrawReplyWakes {
+                    origin,
+                    request_ids,
+                } => {
+                    kind = "collaboration_withdraw_reply_wakes";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::WithdrawReplyWakes,
+                        origin.clone(),
+                    );
+                    audit_context.request_id = request_ids.first().cloned();
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                    )
+                    .await;
+                    let response = match topology.resolve_origin(&origin) {
+                        Ok(current) => match collaboration
+                            .withdraw_reply_wakes(&current, &request_ids)
+                            .await
+                        {
+                            Ok(requests) => Response::with_collaboration_requests(requests),
+                            Err(error) => Response::err(error.to_string()),
+                        },
                         Err(error) => Response::err(error.to_string()),
                     };
                     record_collaboration_audit(
@@ -6306,6 +6388,22 @@ impl Client {
         serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
     }
 
+    /// Read without marking the reply read; older daemons reject this operation.
+    pub async fn collaboration_peek(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+    ) -> Result<CollaborationRequest, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_peek",
+            "origin": origin,
+            "request_id": request_id,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
+    }
+
     /// Wait for a request to become terminal through muxad's collaboration
     /// revision signal. The daemon returns the latest request on timeout, so
     /// callers distinguish completion from timeout via `status.is_terminal()`.
@@ -6397,6 +6495,24 @@ impl Client {
         });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Withdraw the caller's interest in replies to its own requests. The
+    /// caller must first confirm the daemon advertises
+    /// [`crate::collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY`].
+    pub async fn collaboration_withdraw_reply_wakes(
+        &self,
+        origin: &CollaborationOrigin,
+        request_ids: &[String],
+    ) -> Result<Vec<CollaborationRequest>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "collaboration_withdraw_reply_wakes",
+            "origin": origin,
+            "request_ids": request_ids,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
     }
 
     pub async fn snapshot_with_timeout(
@@ -7384,6 +7500,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn progress_peek_over_ipc_preserves_unread_reply_and_checks_participation() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("peek.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        add_collaboration_agent(&store, "%3", "stranger", AgentKind::GeminiCli).await;
+        let backend: SharedBackend = Arc::new(CollaborationTestBackend {
+            panes: vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+                collaboration_test_pane("%3", "2"),
+            ],
+        });
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let audit = CollaborationAuditLog::in_memory();
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox.clone())
+            .with_collaboration_audit(audit.clone());
+        let (shutdown, rx) = broadcast::channel(1);
+        let daemon = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let origin = |pane: &str| CollaborationOrigin {
+            pane: pane.into(),
+            socket: Some("default".into()),
+            console: false,
+            agent_session_id: None,
+        };
+        let request = client
+            .collaboration_send(
+                &origin("%1"),
+                "pane:%2",
+                &NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        client.collaboration_inbox(&origin("%2")).await.unwrap();
+        client
+            .collaboration_reply(
+                &origin("%2"),
+                &request.id,
+                RequestStatus::Completed,
+                "final report",
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        let peek = client
+            .collaboration_peek(&origin("%1"), &request.id)
+            .await
+            .unwrap();
+        assert!(peek.reply_read_at.is_none());
+        assert!(peek.reply_notified_at.is_none());
+        assert_eq!(mailbox.unread_reply_count(&request.from).await, 1);
+        assert_eq!(mailbox.pending_reply_unnotified().await.len(), 1);
+        assert!(client
+            .collaboration_peek(&origin("%3"), &request.id)
+            .await
+            .is_err());
+        assert!(audit
+            .entries()
+            .await
+            .iter()
+            .any(|entry| entry.operation == CollaborationAuditOperation::Peek && entry.ok));
+        assert!(client
+            .collaboration_get(&origin("%1"), &request.id)
+            .await
+            .unwrap()
+            .reply_read_at
+            .is_some());
+        shutdown.send(()).unwrap();
+        daemon.await.unwrap();
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)] // explicit wire-compatibility request fixtures
     async fn widening_a_listing_over_ipc_is_console_only() {
         let dir = tempdir().unwrap();
@@ -7451,6 +7648,7 @@ mod tests {
                             artifacts: Vec::new(),
                             links: Vec::new(),
                             air_artifacts: Vec::new(),
+                            withdraw_reply_wakes: Vec::new(),
                         },
                     )
                     .await
@@ -7599,6 +7797,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await
@@ -7628,6 +7827,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await
@@ -7727,6 +7927,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await
@@ -7747,6 +7948,76 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+
+        // Giving up on a request: the replacement withdraws its reply wake in
+        // the same send, and a standalone withdrawal releases another one.
+        // Only the sender may do either; neither touches the work.
+        assert!(client
+            .hello(Duration::from_secs(2))
+            .await
+            .unwrap()
+            .capabilities
+            .iter()
+            .any(|tag| tag == collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY));
+        let abandoned = client
+            .collaboration_send(
+                &sender,
+                "@reviewer",
+                &NewRequest {
+                    body: "first attempt".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let replacement = client
+            .collaboration_send(
+                &sender,
+                "@reviewer",
+                &NewRequest {
+                    body: "second attempt".into(),
+                    withdraw_reply_wakes: vec![abandoned.id.clone()],
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replacement.withdrew_reply_wakes,
+            std::slice::from_ref(&abandoned.id)
+        );
+        assert!(client
+            .collaboration_withdraw_reply_wakes(&recipient, std::slice::from_ref(&replacement.id))
+            .await
+            .is_err());
+        let withdrawn = client
+            .collaboration_withdraw_reply_wakes(&sender, std::slice::from_ref(&replacement.id))
+            .await
+            .unwrap();
+        assert_eq!(withdrawn.len(), 1);
+        assert_eq!(withdrawn[0].status, RequestStatus::Queued);
+        for request in [&abandoned, &replacement] {
+            let observed = client
+                .collaboration_list(&sender, RequestMailbox::Sent)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.id == request.id)
+                .unwrap();
+            assert!(matches!(
+                observed.reply_wake,
+                Some(collaboration::ReplyWake::Released {
+                    reason: collaboration::ReplyWakeRelease::Withdrawn,
+                    ..
+                })
+            ));
+        }
+        for request in [&abandoned, &replacement] {
+            client
+                .collaboration_cancel(&sender, &request.id)
+                .await
+                .unwrap();
+        }
 
         // The console may target the pane it was opened from. That pane stays
         // audit provenance, but the represented identity must remain the
@@ -7780,6 +8051,7 @@ mod tests {
                     artifacts: Vec::new(),
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
+                    withdraw_reply_wakes: Vec::new(),
                 },
             )
             .await

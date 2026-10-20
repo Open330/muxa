@@ -110,6 +110,9 @@ recipient's attention (CLI: `--notify` or `--notify true`; `--notify false` is q
 it never authorizes interrupting a busy agent. `notify=false` explicitly records a
 message without waking. Wake delivery and `expects_reply` are independent.
 Terminal replies already wake the requester; do not send a second completion notice.
+When you give up on or replace your own request, name it in `withdraw_reply_wakes`
+on the replacement (CLI: `msg send --withdraw REQ`) or call `muxa_withdraw_reply_wake`,
+so its late reply stays readable without waking you. Nothing else about it changes.
 The coordinator reports meaningful outcomes and needed decisions to the user, not
 an update for every peer message. Inspect only the relevant installed schema before using an unfamiliar option.
 

@@ -55,6 +55,12 @@ pub fn validate_message_read(args: &Value) -> Result<(), &'static str> {
     {
         return Err("include_body requires an exact request_id; use inbox for pending instructions or full=true for explicit full history");
     }
+    if args
+        .get("after_update")
+        .is_some_and(|value| value.as_u64().is_none())
+    {
+        return Err("after_update must be a non-negative integer");
+    }
     Ok(())
 }
 
@@ -108,6 +114,24 @@ pub async fn require_human_actions(client: &Client) -> Result<(), String> {
         return Ok(());
     }
     Err("running muxad has not advertised human-action support; ask in the existing user conversation or upgrade the daemon. Do not retry peer aliases or impersonate the console".into())
+}
+
+/// Refuse to send withdrawals to a daemon that would silently drop them.
+pub async fn require_reply_wake_withdraw(client: &Client, ids: &[String]) -> Result<(), String> {
+    if ids.is_empty()
+        || client
+            .hello(Duration::from_secs(2))
+            .await
+            .is_ok_and(|hello| {
+                hello
+                    .capabilities
+                    .iter()
+                    .any(|c| c == muxa::collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY)
+            })
+    {
+        return Ok(());
+    }
+    Err("running muxad cannot withdraw reply wakes; upgrade the daemon, or send without withdraw_reply_wakes".into())
 }
 
 #[cfg(test)]
@@ -212,6 +236,9 @@ mod tests {
             json!({"include_body":true}),
             json!({"include_body":true,"request_id":" "}),
             json!({"after_update":0}),
+            json!({"after_update":-1,"request_id":"req-1"}),
+            json!({"after_update":"0","request_id":"req-1"}),
+            json!({"after_update":null,"request_id":"req-1"}),
         ] {
             assert!(validate_message_read(&args).is_err());
         }

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Old peer replies no longer keep coming back. A reply the sender already
+  read with `wait` is no longer announced afterwards, and replies that piled
+  up while the sender was busy arrive as one wake (up to five, oldest first)
+  instead of one per idle turn. Each entry says how long ago a stale request
+  was made. Whether a wake is sent is now decided by the mailbox at delivery
+  time, so a read or withdrawal in the meantime always wins.
+
+### Added
+
+- `muxa msg withdraw REQ…`, `muxa msg send --withdraw REQ`, the
+  `muxa_withdraw_reply_wake` MCP tool and `withdraw_reply_wakes` on
+  `muxa_send_message`/`muxa_call_peer` let an agent say it gave up on or
+  replaced its own request. The late reply stays readable and unread but no
+  longer wakes it; the recipient's work is untouched. Human decisions and
+  peer recovery are excluded, and Fleet sends reject withdrawals.
+
 ## [0.9.1] - 2026-10-19
 
 ### Added

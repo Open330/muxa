@@ -237,6 +237,8 @@ muxa msg list --scope all      # every room this daemon holds
 muxa msg list --scope all --since 7d --work CAL-7345 --kind review \
   --status completed --limit 50 --offset 0
 muxa msg cancel req_... # queued requests only
+muxa msg send peer "retry with write access" --withdraw req_...  # replaces req_...
+muxa msg withdraw req_...  # gave up on it: its late reply will not wake you
 ```
 
 `muxa msg inbox` text output includes the reply obligation, permitted paths and attachments alongside the task. `muxa msg wait --timeout SECONDS` is an alias for `--timeout-secs SECONDS`.
@@ -324,6 +326,7 @@ worktrees remain the safest choice for concurrent edits.
 | `muxa_list_messages` | List incoming, sent, or all requests without claiming. |
 | `muxa_reply` | Return a completed/blocked/declined/failed response. |
 | `muxa_wait_reply` | Event-driven wait for the structured terminal response. |
+| `muxa_withdraw_reply_wake` | Stop being woken for replies to your own requests you gave up on or replaced; work and replies are unchanged. |
 | `muxa_cancel_message` | Cancel a sent request while it is still queued. |
 
 `muxa_send_message` and `muxa_call_peer` accept the same optional causal and

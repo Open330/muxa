@@ -203,11 +203,12 @@ it:
 | `muxa_peer_report` | `target?`, `request_id?`, `full?` | Read a received final reply without repeating the original request. `full=true` returns the legacy full record. |
 | `muxa_set_identity` | `alias?`, `roles?` | Replace this exact session's room-local alias and role set; empty input clears it. |
 | `muxa_request_attention` | `body`, `action?`, `dispatch_id?`, `parent_request_id?` | Request required human approval, choice or information; delivered to connected Fleet operator clients. Reuse a UUID dispatch ID on retry; wait for and read the actual human reply. |
-| `muxa_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?`, `air_artifacts?` | Create a durable same-window peer request. |
+| `muxa_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?`, `air_artifacts?`, `withdraw_reply_wakes?` | Create a durable same-window peer request. `withdraw_reply_wakes` names your own earlier requests it replaces; their late replies stop waking you. |
 | `muxa_inbox` | `full?` | Claim and read instructions, authority, paths and attachments addressed to this session. `full=true` includes audit metadata. |
 | `muxa_list_messages` | `mailbox?`, `request_id?`, `limit?`, `offset?`, `include_body?`, `after_update?`, `full?` | List newest metadata records without claiming (default 20, max 100). Read an exact request or incremental progress explicitly. |
 | `muxa_reply` | `request_id`, `status`, `body`, `artifacts?`, `air_artifacts?` | Return a structured terminal response. |
 | `muxa_wait_reply` | `request_id`, `timeout_secs?` | Event-driven wait for a structured peer response. |
+| `muxa_withdraw_reply_wake` | `request_ids` | Stop being woken for replies to your own requests you gave up on or replaced. Work, replies and `muxa_wait_reply` results are unchanged. |
 | `muxa_cancel_message` | `request_id` | Cancel a sent request while it is still queued. |
 
 `muxa_send_prompt` is refused (surfaced to the model as a tool error) when the
@@ -315,7 +316,13 @@ Lists return at most 20 metadata records by default, with `has_more` and
 `next_offset`; set `include_body=true` with an exact `request_id` for instructions (or explicitly use `full=true` for bulk diagnostics). An exact `request_id`
 read also returns an existing reply. For progress, use that ID with
 `after_update`, then resume with `next_after_update`; `first_retained_sequence`
-identifies the beginning of retained progress. `full=true` returns legacy records.
+identifies the beginning of retained progress. Incremental reads return the compact
+status receipt and new updates, without routing, original instructions or final
+reply bodies, even with `include_body=true`. They do not mark an unseen final
+reply as read or suppress its notification. Retrieve that reply with
+`muxa_wait_reply` or `muxa_peer_report`. Incremental reads require a daemon with
+`collaboration_peek`; older daemons reject them rather than acknowledge an unseen
+reply. `full=true` returns legacy records (including reply acknowledgement).
 
 The durable store and daemon IPC keep their existing lifecycle statuses for
 compatibility. Agent-facing default views no longer expose a generic
@@ -560,3 +567,20 @@ socket is owner-only (`0600`), so only your user can reach it and there is no
 network exposure; treat socket and MCP access as equivalent to shell access.
 The server never starts against an absent daemon. See `PROTOCOL.md` (Control
 methods) for the underlying `send_prompt` / `capture` / `subscribe` IPC.
+
+### Checking collaboration cost locally
+
+Run `python3 scripts/collaboration-cost-audit.py --hours 24` from the checkout
+to break existing daemon audit calls down by client and operation. `watch` calls
+are UI traffic; raw IPC counts are not model token counts. To measure recorded
+model-facing tool results, add `--session /path/to/session.jsonl` for each Codex
+or Claude session (repeat as needed). `--json` produces a comparable report.
+
+The report counts UTF-8 output bytes, maximum response sizes, and identical
+results for the same arguments within five minutes. Repeats are investigation
+candidates: polling can be necessary and provider caching/billing is unknown.
+Shell/exec measurements are explicitly marked mixed because they can contain
+other output. Coverage is limited to supplied files; absent session data cannot
+establish token savings. Reports contain aggregates and tool names, not message
+bodies or tool arguments. The script only reads existing local logs; it adds no
+runtime telemetry, network request, mailbox read, or scheduled task.

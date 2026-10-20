@@ -415,6 +415,7 @@ Capability tags currently advertised:
 | `needs_choice`   | server emits `NotificationLevel::needs_choice` (otherwise: `needs_input`). |
 | `rate_limited`   | server emits the `rate_limited` event type and the `rate_limit_*` fields on `Agent`. |
 | `collaboration_wait` | server accepts event-driven bounded waits for durable request completion. |
+| `collaboration_peek` | exact participant-authorized read without acknowledging a reply; used for incremental progress. |
 | `work_control_v1` | server accepts `work_up` / `work_up_status`. |
 | `work_command_v1` | server accepts `work_command` and the `host` field on `work_up`. |
 | `restart`        | server accepts `restart` and can re-exec itself in place. |
@@ -624,6 +625,12 @@ persisted before an optional idle-only wake prompt is injected.
 `collaboration_list` is non-claiming and accepts `incoming`, `sent`, or `all`.
 `collaboration_cancel` succeeds only while the request is still `queued`.
 Terminal replies also receive an idle-only wake; a sender-side
+`collaboration_peek` accepts the same `origin` and `request_id` as
+`collaboration_get`, with the same participant/linked recovery observer access
+rules, but leaves reply read/notified markers unchanged. Its audit operation is
+`peek`. It does not claim work. Older daemons reject this new operation; clients
+must not fall back to an acknowledging read for progress-only requests.
+
 `collaboration_get` or terminal `collaboration_wait` acknowledges the reply so
 it is not woken again. `collaboration_wait` subscribes before its first read,
 then blocks on a monotonic mailbox revision instead of polling. The mailbox is
