@@ -4,7 +4,8 @@
 //! shim puts it on whichever account `aas active` names — even while that
 //! account is capped, so every new worker starts already stopped.
 //! `[agent.<program>].account` lets muxa choose instead: `auto` takes the
-//! best-ranked eligible account from `aas candidates`, a name pins one.
+//! best-ranked eligible account from `aas candidates`, a name pins one of
+//! that provider's accounts.
 //!
 //! `aas` stays optional. It is never linked, only run, and only when the
 //! provider's config asks for it; when it is missing, slow, or has nothing
@@ -111,6 +112,20 @@ pub fn choose(candidates: &[Candidate], provider: &str) -> Result<String, String
         })
 }
 
+/// A pinned account, used whatever its quota, but only for its own
+/// provider: `aas e` picks the CLI from the account, so `jelly@claude`
+/// under `[agent.codex]` would start Claude with Codex's arguments.
+fn pinned(candidates: &[Candidate], name: &str, provider: &str) -> Result<String, String> {
+    match candidates.iter().find(|c| c.name == name) {
+        Some(c) if c.provider == provider => Ok(name.to_owned()),
+        Some(c) => Err(format!(
+            "{name} is a {} account, not {provider}",
+            c.provider
+        )),
+        None => Err(format!("aas has no {provider} account named {name}")),
+    }
+}
+
 /// Decide where a new agent starts. `Err` is the reason it starts bare.
 pub fn decide(route: &AccountRoute) -> Result<RoutedLaunch, String> {
     decide_with(route, |aas, provider| {
@@ -123,9 +138,10 @@ fn decide_with(
     query: impl FnOnce(&str, &str) -> Result<Vec<Candidate>, String>,
 ) -> Result<RoutedLaunch, String> {
     let aas = find_aas(&route.aas).ok_or_else(|| format!("`{}` not found", route.aas))?;
+    let candidates = query(&aas, &route.provider)?;
     let account = match &route.choice {
-        SpawnAccount::Named(name) => name.clone(),
-        SpawnAccount::Auto => choose(&query(&aas, &route.provider)?, &route.provider)?,
+        SpawnAccount::Named(name) => pinned(&candidates, name, &route.provider)?,
+        SpawnAccount::Auto => choose(&candidates, &route.provider)?,
     };
     Ok(RoutedLaunch { aas, account })
 }
@@ -225,12 +241,27 @@ mod tests {
     }
 
     #[test]
-    fn a_named_account_never_queries() {
+    fn a_named_account_is_used_capped_or_not_but_only_for_its_provider() {
+        let list = || {
+            Ok(vec![
+                candidate("pin@claude", "claude", false),
+                candidate("cx@codex", "codex", true),
+            ])
+        };
         let routed = decide_with(&route(SpawnAccount::Named("pin@claude".into())), |_, _| {
-            panic!("a pinned account needs no candidates")
+            list()
         })
         .unwrap();
         assert_eq!(routed.account, "pin@claude");
+        let other = decide_with(&route(SpawnAccount::Named("cx@codex".into())), |_, _| {
+            list()
+        });
+        assert_eq!(
+            other.unwrap_err(),
+            "cx@codex is a codex account, not claude"
+        );
+        let missing = decide_with(&route(SpawnAccount::Named("nope".into())), |_, _| list());
+        assert_eq!(missing.unwrap_err(), "aas has no claude account named nope");
     }
 
     #[test]

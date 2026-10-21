@@ -170,7 +170,8 @@ With [`aas`](ACCOUNT_SWAP.md) managing several accounts, a bare `claude` lands
 on whichever account `aas active` names, even while that one is capped.
 `account` makes every launch path above start `aas e <account> …` instead.
 `auto` takes the best-ranked eligible account from `aas candidates` (it never
-changes `aas active`); a name pins one. `claude` and `codex` only.
+changes `aas active`); a name pins one of that provider's accounts, used even
+when capped. `claude` and `codex` only.
 
 `aas` stays optional: it is run, never linked, and only when `account` is set.
 When it is missing, takes longer than 5 seconds, or has no account with quota

@@ -133,7 +133,7 @@ account = "auto"          # 또는 고정 계정: "jelly@claude"
 뜹니다. 그 계정이 한도에 걸려 있어도 마찬가지입니다. `account`를 설정하면 위의 모든
 실행 경로가 `aas e <account> …`로 시작합니다. `auto`는 `aas candidates`에서 순위가
 가장 높은 eligible 계정을 고르고(`aas active`는 바꾸지 않음), 이름을 쓰면 그 계정으로
-고정합니다. `claude`, `codex`만 지원합니다.
+고정합니다(같은 provider 계정만, 한도와 무관하게 사용). `claude`, `codex`만 지원합니다.
 
 `aas`는 선택 사항입니다. 링크하지 않고 실행만 하며, `account`가 있을 때만 호출합니다.
 `aas`가 없거나, 5초 안에 답하지 않거나, 한도가 남은 계정이 없으면 예전처럼 맨 CLI로

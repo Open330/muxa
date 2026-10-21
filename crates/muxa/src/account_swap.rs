@@ -632,14 +632,23 @@ pub fn query_candidates(aas: &str, provider: &str) -> Result<Vec<Candidate>, Str
     query_candidates_within(&program, provider, QUERY_TIMEOUT)
 }
 
-/// [`query_candidates`] against an already resolved `program`, killed and
-/// reaped once `timeout` passes so a hung `aas` cannot hold a caller.
+/// [`query_candidates`] against an already resolved `program`, given up on
+/// once `timeout` passes so a hung `aas` cannot hold a caller. The deadline
+/// covers reading its output too: a helper it left behind can hold the
+/// pipes open after `aas` itself exits.
 pub fn query_candidates_within(
     program: &str,
     provider: &str,
     timeout: Duration,
 ) -> Result<Vec<Candidate>, String> {
     use std::io::Read;
+    let deadline = Instant::now() + timeout;
+    let late = || {
+        format!(
+            "`{program} candidates` did not answer within {}s",
+            timeout.as_secs()
+        )
+    };
     let mut child = std::process::Command::new(program)
         .args(["candidates", "--json", "--provider", provider])
         .stdin(std::process::Stdio::null())
@@ -647,43 +656,44 @@ pub fn query_candidates_within(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|error| format!("could not run `{program} candidates`: {error}"))?;
-    // Drained on their own threads so a full pipe cannot stall the child;
-    // killing it on timeout closes the write ends and ends them.
+    // Drained on their own threads so a full pipe cannot stall the child.
+    // A reader still blocked at the deadline is abandoned, not joined.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut pipe) = pipe {
                 let _ = pipe.read_to_end(&mut buf);
             }
-            buf
-        })
+            let _ = sender.send(buf);
+        });
+        receiver
     };
     let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
     let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
-    let started = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < timeout => {
+            Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Ok(None) => {
+            outcome => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!(
-                    "`{program} candidates` did not answer within {}s",
-                    timeout.as_secs()
-                ));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("`{program} candidates` failed: {error}"));
+                return Err(match outcome {
+                    Err(error) => format!("`{program} candidates` failed: {error}"),
+                    _ => late(),
+                });
             }
         }
     };
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
+    let collect = |receiver: std::sync::mpsc::Receiver<Vec<u8>>| {
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| late())
+    };
+    let stdout = collect(stdout)?;
+    let stderr = collect(stderr)?;
     if !status.success() {
         return Err(format!(
             "`{program} candidates` failed: {}",
@@ -695,34 +705,35 @@ pub fn query_candidates_within(
 
 /// Where the configured `aas` is: a path as given, a bare name looked up
 /// on `PATH` and then where `aas` is usually installed — a
-/// launchd-started daemon has a minimal `PATH`. `None` when none exists.
+/// launchd-started daemon has a minimal `PATH`. Always absolute, because a
+/// launch runs it from another directory. `None` when none exists.
 #[must_use]
 pub fn find_aas(configured: &str) -> Option<String> {
-    if configured.contains(['/', '\\']) {
-        return std::path::Path::new(configured)
-            .is_file()
-            .then(|| configured.to_owned());
-    }
-    if cfg!(windows) {
+    let found = if configured.contains(['/', '\\']) {
+        Some(std::path::PathBuf::from(configured)).filter(|path| path.is_file())
+    } else if cfg!(windows) {
         // `aas.exe` / `aas.cmd`: PATH lookup has to try the extensions.
-        return crate::shell::find_program(configured).map(|path| path.display().to_string());
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .unwrap_or_default()
-        .into_iter()
-        .chain(
-            [
-                "/opt/homebrew/bin".to_owned(),
-                "/usr/local/bin".to_owned(),
-                format!("{home}/.cargo/bin"),
-                format!("{home}/.local/bin"),
-            ]
-            .map(std::path::PathBuf::from),
-        )
-        .map(|dir| dir.join(configured))
-        .find(|path| path.is_file())
+        crate::shell::find_program(configured)
+    } else {
+        let home = std::env::var("HOME").unwrap_or_default();
+        std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .chain(
+                [
+                    "/opt/homebrew/bin".to_owned(),
+                    "/usr/local/bin".to_owned(),
+                    format!("{home}/.cargo/bin"),
+                    format!("{home}/.local/bin"),
+                ]
+                .map(std::path::PathBuf::from),
+            )
+            .map(|dir| dir.join(configured))
+            .find(|path| path.is_file())
+    }?;
+    std::path::absolute(found)
+        .ok()
         .map(|path| path.display().to_string())
 }
 
@@ -1569,5 +1580,79 @@ mod tests {
             AccountChoice::parse("jelly@claude"),
             AccountChoice::Named("jelly@claude".into())
         );
+    }
+
+    #[cfg(unix)]
+    fn fake_aas(name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("muxa-aas-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aas");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_query_deadline_covers_a_helper_holding_the_pipes() {
+        let aas = fake_aas("helper", "sleep 3 &\nprintf '{\"accounts\":[]}'\nexit 0");
+        let started = Instant::now();
+        let outcome =
+            query_candidates_within(aas.to_str().unwrap(), "claude", Duration::from_millis(300));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(outcome.unwrap_err().contains("did not answer"));
+        std::fs::remove_dir_all(aas.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_query_reads_a_prompt_answer_and_kills_a_hung_one() {
+        let ok = fake_aas(
+            "ok",
+            "printf '{\"accounts\":[{\"name\":\"a@claude\",\"provider\":\"claude\",\"eligible\":true}]}'",
+        );
+        let list = query_candidates_within(ok.to_str().unwrap(), "claude", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(list[0].name, "a@claude");
+        let hung = fake_aas("hung", "exec sleep 30");
+        let started = Instant::now();
+        let outcome =
+            query_candidates_within(hung.to_str().unwrap(), "claude", Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(outcome.unwrap_err().contains("did not answer"));
+        for path in [ok, hung] {
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_aas_answers_with_an_absolute_path() {
+        let aas = fake_aas("relative", "true");
+        let dir = aas.parent().unwrap().to_owned();
+        // A relative configured path, resolved against this process's cwd.
+        let cwd = std::env::current_dir().unwrap();
+        let relative = pathdiff(&aas, &cwd);
+        let found = find_aas(&relative).unwrap();
+        assert!(std::path::Path::new(&found).is_absolute(), "{found}");
+        assert!(std::path::Path::new(&found).is_file(), "{found}");
+        assert_eq!(find_aas(&format!("{}/missing", dir.display())), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `target` relative to `base`, through enough `..` to reach the root.
+    #[cfg(unix)]
+    fn pathdiff(target: &std::path::Path, base: &std::path::Path) -> String {
+        let ups = base.components().count().saturating_sub(1);
+        format!(
+            "{}{}",
+            "../".repeat(ups),
+            target.display().to_string().trim_start_matches('/')
+        )
     }
 }
