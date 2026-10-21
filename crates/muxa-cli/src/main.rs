@@ -918,10 +918,8 @@ enum WorkspaceCmd {
 enum IdentityCmd {
     /// Set this exact session to primary (protected) or worker.
     ///
-    /// With `--session`, the operator sets exact live agent sessions
-    /// instead, for example muxa-launched workers that predate purposes.
-    /// Refused when run from inside an agent's pane (a guard against
-    /// accidental promotion, not authentication).
+    /// With `--session`, set exact live agent sessions instead, for example
+    /// muxa-launched workers that predate purposes. Audited with the caller.
     Purpose {
         purpose: muxa::collaboration::LaunchPurpose,
         /// Agent session id to set (operator only). Repeatable.

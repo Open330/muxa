@@ -75,7 +75,7 @@ options = ['--model', 'x']    # optional; provider CLI arguments for this pane,
                               # the operator named a model — panes inherit the
                               # provider default, and a model is their bill.
 direction = 'auto'            # optional: auto (default), right, or down
-purpose = 'worker'            # optional: primary (default) or worker; worker takes peer requests itself
+purpose = 'worker'            # optional: worker (default with a role) takes peer requests; primary stays protected
 after   = ['impl']            # optional: aliases that must report finishing
                               # before this one starts. Omit for work that is
                               # genuinely parallel; use it when one agent must
@@ -117,7 +117,7 @@ emits and `muxa work pipeline set --from-json` reads:
       "options": [],                  // provider CLI arguments for this pane, replacing
                                       // [agent.<program>].options; [] to inherit it
       "direction": "auto",            // "auto" (default), "right", "down", or null
-      "purpose": "worker",            // "primary" (default) or "worker" (takes peer requests), or null
+      "purpose": "worker",            // "worker" (default with a role) or "primary" (protected), or null
       "after": ["plan"]               // aliases that must report finishing first; [] for parallel work
     }}
   ]

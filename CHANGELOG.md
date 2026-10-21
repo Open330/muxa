@@ -10,9 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Requests to muxa-launched workers no longer sit queued forever as
-  `deferred: protected_primary`. Pipeline agents can declare
-  `purpose = "worker"`, and the operator can promote exact existing sessions
-  from a non-agent terminal with `muxa identity purpose worker --session ID`.
+  `deferred: protected_primary`. Pipeline agents with a `role` launch as
+  workers (`purpose = "primary"` opts out), and exact existing sessions can
+  be promoted with `muxa identity purpose worker --session ID`.
   Queued requests are delivered on the session's next idle turn. `work up`
   refuses worker agents on a daemon too old to keep their purpose.
 - The daemon no longer rewrites `state.json` (about 110KB) on every hook
