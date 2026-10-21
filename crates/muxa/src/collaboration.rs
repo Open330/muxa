@@ -1384,7 +1384,11 @@ fn open_database(path: &Path) -> Result<Connection, CollaborationError> {
              value TEXT NOT NULL
          );",
     )?;
-    connection.pragma_update(None, "user_version", COLLABORATION_DATABASE_SCHEMA_VERSION)?;
+    // Every persist opens the database. Writing an unchanged user_version
+    // would still be a committed, fsync'd write transaction each time.
+    if version != COLLABORATION_DATABASE_SCHEMA_VERSION {
+        connection.pragma_update(None, "user_version", COLLABORATION_DATABASE_SCHEMA_VERSION)?;
+    }
     secure_database_files(path)?;
     Ok(connection)
 }
@@ -7945,6 +7949,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod database_tests;
 mod recovery;
 #[cfg(test)]
 mod reply_wake_tests;

@@ -265,6 +265,10 @@ enum Change {
     Material,
 }
 
+fn canonical_order(agents: &mut [Agent]) {
+    agents.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+}
+
 fn serialize_agents(agents: &[Agent]) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     let to_bytes = |agents: &[Agent]| {
         serde_json::to_vec(agents)
@@ -392,7 +396,11 @@ impl Snapshotter {
     /// are logged but never propagated: a write failure shouldn't take down
     /// the daemon, and the next dirty signal will retry naturally.
     async fn flush(&mut self, force: bool) {
-        let agents = self.store.snapshot().await;
+        // The registry is a hash map, so its iteration order is not stable
+        // between snapshots. Sort so identical content serializes to
+        // identical bytes; the file is written in the same order.
+        let mut agents = self.store.snapshot().await;
+        canonical_order(&mut agents);
         let (exact, material) = match serialize_agents(&agents) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -437,6 +445,10 @@ impl Snapshotter {
                 );
             }
             Err(e) => {
+                // Keep the old baseline so the change is still pending, and
+                // retry on the slow cadence rather than at once: a failing
+                // disk must not turn the deadline into a busy loop.
+                self.activity_due = Some(tokio::time::Instant::now() + self.opts.activity_interval);
                 warn!(
                     error = %e,
                     path = %self.opts.path.display(),
@@ -794,5 +806,108 @@ mod tests {
         tx.send(()).unwrap();
         task.await.unwrap();
         assert_eq!(on_disk_activity(&path, "a").await, last);
+    }
+
+    #[tokio::test]
+    async fn identical_registries_serialize_identically_in_any_order() {
+        let store = Store::shared();
+        let t = datetime!(2026-04-28 00:00 UTC);
+        for index in 0..40 {
+            store
+                .apply(&started_event(
+                    &format!("s{index}"),
+                    &format!("%{index}"),
+                    t,
+                ))
+                .await;
+        }
+        let mut forward = store.snapshot().await;
+        let mut reversed: Vec<_> = forward.iter().rev().cloned().collect();
+        canonical_order(&mut forward);
+        canonical_order(&mut reversed);
+        assert_eq!(
+            serialize_agents(&forward).unwrap(),
+            serialize_agents(&reversed).unwrap()
+        );
+    }
+
+    fn spawn_writer(
+        store: &SharedStore,
+        path: &Path,
+        activity_interval: Duration,
+    ) -> (Metrics, broadcast::Sender<()>, tokio::task::JoinHandle<()>) {
+        let metrics = Metrics::new();
+        let (tx, rx) = broadcast::channel::<()>(1);
+        let task = tokio::spawn(
+            Snapshotter::new(
+                store.clone(),
+                store.dirty(),
+                SnapshotterOptions {
+                    path: path.to_path_buf(),
+                    debounce: Duration::from_millis(10),
+                    activity_interval,
+                },
+            )
+            .with_metrics(metrics.clone())
+            .run(rx),
+        );
+        (metrics, tx, task)
+    }
+
+    /// Steady heartbeats must not keep postponing the activity flush: the
+    /// deadline is set by the first held-back change, not the latest.
+    #[tokio::test]
+    async fn continuous_activity_is_flushed_on_schedule_not_postponed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        let store = Store::shared();
+        let interval = Duration::from_millis(300);
+        let (metrics, tx, task) = spawn_writer(&store, &path, interval);
+        let t = datetime!(2026-04-28 00:00 UTC);
+        store.apply(&started_event("a", "%1", t)).await;
+        store.apply(&tool_event("a", t)).await;
+        wait_for(&metrics, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let settled = writes(&metrics);
+
+        let started = tokio::time::Instant::now();
+        let mut beat = 1;
+        while started.elapsed() < interval * 2 + Duration::from_millis(100) {
+            store
+                .apply(&tool_event("a", t + time::Duration::seconds(beat)))
+                .await;
+            beat += 1;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let flushed = writes(&metrics) - settled;
+        assert!(
+            (2..=3).contains(&flushed),
+            "expected one flush per interval under steady heartbeats, saw {flushed}"
+        );
+        tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    /// A failed write keeps the change pending and retries it on the slow
+    /// cadence, without waiting for another dirty signal.
+    #[tokio::test]
+    async fn a_failed_write_is_retried_later() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        let store = Store::shared();
+        let (metrics, tx, task) = spawn_writer(&store, &path, Duration::from_millis(200));
+        let t = datetime!(2026-04-28 00:00 UTC);
+
+        // A directory in the file's place makes the rename fail.
+        tokio::fs::create_dir(&path).await.unwrap();
+        store.apply(&started_event("a", "%1", t)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(writes(&metrics), 0);
+        tokio::fs::remove_dir(&path).await.unwrap();
+
+        wait_for(&metrics, 1).await;
+        assert_eq!(on_disk_activity(&path, "a").await, t);
+        tx.send(()).unwrap();
+        task.await.unwrap();
     }
 }
