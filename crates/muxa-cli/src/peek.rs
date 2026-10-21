@@ -739,7 +739,17 @@ fn apply_collaboration(
                     peer.agent_session_id == other.agent_session_id && peer.socket == other.socket
                 })
                 .map_or_else(
-                    || other.label.clone(),
+                    || {
+                        if overview.participants.iter().any(|peer| {
+                            peer.pane == other.pane
+                                && peer.socket == other.socket
+                                && peer.agent_session_id != other.agent_session_id
+                        }) {
+                            format!("{} [previous session]", other.label)
+                        } else {
+                            other.label.clone()
+                        }
+                    },
                     muxa::collaboration::Participant::label,
                 );
             let state = if link.reply_received {
@@ -1838,6 +1848,7 @@ mod tests {
         apply_collaboration(&mut cells, &overview);
         assert!(cells[1].collaboration.links.is_empty());
         assert_eq!(cells[0].collaboration.links.len(), 1);
+        assert!(cells[0].collaboration.links[0].contains("[previous session]"));
         overview.links.clear();
         apply_collaboration(&mut cells, &overview);
         assert!(cells.iter().all(|cell| cell.collaboration.links.is_empty()));
