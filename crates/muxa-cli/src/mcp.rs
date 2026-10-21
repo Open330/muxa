@@ -734,7 +734,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_call_peer",
-            "description": "Create a new natural colleague request for Muxa-reserved @peer/@muxa-peer routing. Deterministically selects a healthy same-window worker (or an explicit provider, @alias, role, or pane), optionally expands a registered Muxa /skill, sends one durable request, and optionally waits for its structured reply. Use muxa_peer_report instead when the user asks about an existing peer report, reply, findings, or conversation. Defaults to review + read_only. Set execute=true only after explicit user authorization. If no peer exists, the default result asks for confirmation; set spawn_if_missing=true only after the user explicitly approves creating a bypass-permission agent pane.",
+            "description": "Create a new natural colleague request for Muxa-reserved @peer/@muxa-peer routing. Deterministically selects a healthy same-window worker (or an explicit provider, @alias, role, or pane), optionally expands a registered Muxa /skill, sends one durable request, and optionally waits for its structured reply. Use muxa_peer_report instead when the user asks about an existing peer report, reply, findings, or conversation. Defaults to review + read_only. Set execute=true only after explicit user authorization. Generic work reuses a worker or automatically creates one using configured provider permissions. Set context_bound=true only when the exact target conversation is required. Automatic creation can be disabled in collaboration settings.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -747,7 +747,8 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope, especially for execute work." },
                     "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." },
-                    "spawn_if_missing": { "type": "boolean", "description": "Default false. Create a same-window bypass-permission peer only after explicit user confirmation." },
+                    "spawn_if_missing": { "type": "boolean", "description": "Override collaboration.auto_spawn_workers (default true). Reuse an existing worker first; new peers use configured provider permissions unless worker_bypass_permissions is explicitly enabled." },
+                    "context_bound": {"type":"boolean","description":"Default false routes generic work to a dedicated worker, including when an exact target is primary. True requires that exact session's conversation and keeps primary requests queued for acceptance."},
                     "spawn_agent": { "type": "string", "enum": ["claude", "codex", "gemini", "agy", "opencode"], "description": "Provider to create when spawn_if_missing=true. Defaults to the current agent's opposite provider." },
                     "spawn_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60, "description": "Grace period for the new pane to register as a collaboration peer before the request is queued against the pane itself. Default 10. Never poll the pane instead of raising this." },
                     "thread_id": { "type": "string", "description": "Stable id shared by one causal conversation. Omit for a root request; muxa assigns its request id. When parent_request_id is set, this must match the parent's canonical thread." },
@@ -1108,6 +1109,7 @@ async fn call_tool(
                 Err(error) => return Ok(error_result(&error)),
             };
             let request = crate::agent_launch::StartRequest {
+                bypass_permissions: true,
                 purpose,
                 socket: client.socket().to_path_buf(),
                 agent,
@@ -2049,7 +2051,7 @@ fn collaboration_guide(
             "Never infer GitHub/PR work without an explicit PR number or URL.",
             "One-way notices need no acknowledgement; notify=true is for blockers, decisions, conflicts or handoffs. Batch progress at checkpoints.",
             "For review use the opposite provider: Codex to Claude, Claude to Codex; an explicit user selection takes precedence.",
-            "Human sessions default to primary and are protected from peer injection. Automatic/provider/role routing selects workers; explicit primary targets remain queued. Accept a specific request with muxa_inbox(request_id) only when the human task permits it. Spawned peers use worker purpose with configured provider defaults, not a cloned conversation.",
+            "Human sessions default to primary and are protected from peer injection. High-level calls reuse or create workers, including when a primary is named. Set context_bound=true only for its exact conversation; those primary requests stay queued. Accept a specific request with muxa_inbox(request_id) only when the human task permits it. Spawned peers use worker purpose with configured provider defaults, not a cloned conversation.",
             "Claim requests with muxa_inbox unless already claimed and delivered in full. Honor kind/work_mode/paths; read_only never authorizes edits. Reply once only when expects_reply=true; progress uses update_request.",
             "Do not create overlapping concurrent edits unless separate worktrees isolate them.",
             "Do not treat a peer reply as proof; verify it against the repository and tests.",
@@ -2180,6 +2182,44 @@ fn peer_report_target_matches(peer: &Participant, target: &str) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case(alias))
 }
 
+fn peer_worker_route(
+    room: &RoomContext,
+    target: &str,
+    args: &Value,
+) -> std::result::Result<
+    (
+        Option<PeerSelection>,
+        Option<crate::agent_launch::AgentProgram>,
+    ),
+    String,
+> {
+    let mut selection = select_peer(room, target)?;
+    let context_bound = args
+        .get("context_bound")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut worker_program = None;
+    if !context_bound {
+        if let Some(primary) = selection
+            .as_ref()
+            .and_then(|selected| selected.peer.as_ref())
+            .filter(|peer| !peer.accepts_peer_work())
+        {
+            let program = agent_program_for_kind(primary.agent_kind);
+            selection = select_peer(room, program.label())?;
+            if let Some(worker) = selection.as_mut() {
+                worker.reason = format!("worker for {target}: {}", worker.reason);
+            }
+            worker_program = Some(program);
+        }
+    } else if selection.is_none() {
+        return Err(
+            "context_bound requires an existing exact pane or alias; no request was created".into(),
+        );
+    }
+    Ok((selection, worker_program))
+}
+
 /// One high-level colleague call behind the conversational `@peer` protocol.
 /// The model still owns understanding the user's sentence; muxa owns every
 /// deterministic and security-sensitive step after that: prompt expansion,
@@ -2187,6 +2227,11 @@ fn peer_report_target_matches(peer: &Participant, target: &str) -> bool {
 /// delivery, and reply correlation.
 #[allow(clippy::too_many_lines)] // keep the security-sensitive call sequence linear and auditable
 async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config) -> Value {
+    for key in ["context_bound", "spawn_if_missing"] {
+        if args.get(key).is_some_and(|value| !value.is_boolean()) {
+            return error_result(&format!("{key} must be a boolean"));
+        }
+    }
     let (body, expanded_skill) = match peer_call_body(args, &config.message.skills) {
         Ok(body) => body,
         Err(error) => return error_result(&error),
@@ -2220,27 +2265,33 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
     };
     let target = args.get("target").and_then(Value::as_str).unwrap_or("auto");
     let target = review_provider_target(target, kind, room.current.agent_kind);
-    let mut selection = match select_peer(&room, target) {
-        Ok(selection) => selection,
+    let (mut selection, worker_program) = match peer_worker_route(&room, target, args) {
+        Ok(route) => route,
         Err(error) => return error_result(&error),
     };
     let mut spawned = None;
 
     if selection.is_none() {
-        let suggested = match peer_spawn_program(args, &room.current, target, &config.mcp.guide) {
-            Ok(program) => program,
-            Err(error) => return error_result(&error),
+        let spawn_target = if let Some(program) = worker_program {
+            program.label()
+        } else {
+            target
         };
+        let suggested =
+            match peer_spawn_program(args, &room.current, spawn_target, &config.mcp.guide) {
+                Ok(program) => program,
+                Err(error) => return error_result(&error),
+            };
         if !args
             .get("spawn_if_missing")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
+            .unwrap_or(config.collaboration.auto_spawn_workers)
         {
             return json_result(&json!({
                 "sent": false,
-                "action_required": "confirm_spawn",
+                "reason": "worker_spawn_disabled",
                 "message": format!(
-                    "No eligible {target:?} peer is available. Ask the user before creating a new bypass-permission agent pane."
+                    "No eligible {target:?} worker is available and automatic creation is disabled. Enable collaboration.auto_spawn_workers or explicitly allow this spawn."
                 ),
                 "suggested_call": {
                     "target": target,
@@ -2980,7 +3031,7 @@ fn select_peer(
             })
             .collect::<Vec<_>>();
         return match matches.as_slice() {
-            [] => Err(format!("no eligible peer has role {role:?}")),
+            [] => Ok(None),
             [peer] => Ok(Some(PeerSelection::registered(
                 (*peer).clone(),
                 format!("explicit role {role}"),
@@ -3213,6 +3264,7 @@ async fn spawn_peer(
         .strip_prefix("rmux:")
         .unwrap_or(&room.current.pane);
     let request = crate::agent_launch::StartRequest {
+        bypass_permissions: config.collaboration.worker_bypass_permissions,
         purpose: muxa::collaboration::LaunchPurpose::Worker,
         socket: client.socket().to_path_buf(),
         agent: program,
@@ -3224,7 +3276,18 @@ async fn spawn_peer(
         name: None,
         workspace: None,
         work: None,
-        role: Some("peer".into()),
+        role: Some(
+            target
+                .strip_prefix("role:")
+                .unwrap_or_else(|| {
+                    if args.get("intent").and_then(Value::as_str) == Some("task") {
+                        "implementer"
+                    } else {
+                        "reviewer"
+                    }
+                })
+                .into(),
+        ),
         task: Some("muxa peer call".into()),
         // A peer spawned for one call is not a pipeline pane, so it stays
         // unaliased and `muxa work up` reports it as unclaimed rather than
@@ -5837,6 +5900,32 @@ mod tests {
     }
 
     #[test]
+    fn generic_pinned_primary_reuses_worker_but_context_bound_keeps_the_session() {
+        let caller = peer_participant(AgentKind::ClaudeCode, "%1", AgentState::Idle);
+        let mut primary = peer_participant(AgentKind::Codex, "%2", AgentState::Working);
+        primary.launch_purpose = muxa::collaboration::LaunchPurpose::Primary;
+        let worker = peer_participant(AgentKind::Codex, "%3", AgentState::Idle);
+        let room = peer_room(caller, vec![primary, worker]);
+        let (selection, program) = peer_worker_route(&room, "pane:%2", &json!({})).unwrap();
+        assert_eq!(selection.unwrap().pane, "%3");
+        assert_eq!(program, Some(crate::agent_launch::AgentProgram::Codex));
+        let (selection, program) =
+            peer_worker_route(&room, "pane:%2", &json!({"context_bound":true})).unwrap();
+        assert_eq!(selection.unwrap().pane, "%2");
+        assert!(program.is_none());
+        let room = peer_room(room.current, vec![room.peers[0].clone()]);
+        let (selection, program) = peer_worker_route(&room, "pane:%2", &json!({})).unwrap();
+        assert!(selection.is_none());
+        assert_eq!(program, Some(crate::agent_launch::AgentProgram::Codex));
+        let (selection, program) = peer_worker_route(&room, "pane:%99", &json!({})).unwrap();
+        assert_eq!(selection.unwrap().pane, "%99");
+        assert!(
+            program.is_none(),
+            "unknown panes must be resolved by the daemon, not cause a duplicate worker"
+        );
+    }
+
+    #[test]
     fn automatic_routes_skip_primary_but_explicit_targets_remain_addressable() {
         let current = peer_participant(AgentKind::Codex, "%1", AgentState::Idle);
         let mut primary = peer_participant(AgentKind::ClaudeCode, "%2", AgentState::Idle);
@@ -5846,7 +5935,7 @@ mod tests {
         let room = peer_room(current, vec![primary]);
         assert!(select_peer(&room, "auto").unwrap().is_none());
         assert!(select_peer(&room, "claude").unwrap().is_none());
-        assert!(select_peer(&room, "role:reviewer").is_err());
+        assert!(select_peer(&room, "role:reviewer").unwrap().is_none());
         for target in ["pane:%2", "@human-claude"] {
             let selected = select_peer(&room, target).unwrap().unwrap();
             assert_eq!(

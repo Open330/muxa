@@ -12,11 +12,13 @@ injecting a prompt or being claimed by the generic inbox. Human console requests
 and terminal replies to the primary's own outgoing requests still work.
 
 Automatic, provider and role selection choose only `worker` sessions. Peers
-created with `spawn_if_missing=true` are workers; that flag requires existing
-user authorization to launch an agent. Work pipeline agents that have a `role`
-launch as workers; set `purpose = "primary"` on one to keep it protected.
-General `start` and role-less pipeline agents remain primary. There is no
-automatic worker pool.
+created by `muxa_call_peer` are workers. Missing workers are created by default
+using configured provider permissions, without injected bypass flags. Set
+`collaboration.auto_spawn_workers=false` to disable creation, or override it per
+call with `spawn_if_missing`. Explicit `worker_bypass_permissions=true` enables
+bypass flags for these workers. Work pipeline agents that have a `role` launch
+as workers; set `purpose = "primary"` on one to keep it protected. General
+`start` and role-less pipeline agents remain primary. There is no worker pool.
 
 Use `muxa start --agent claude --purpose worker` to launch a worker, or
 `muxa identity purpose worker` inside an existing dedicated worker session.
@@ -32,12 +34,19 @@ change is audited with the caller. Queued requests to a promoted session are
 delivered on its next
 idle turn, without being re-sent.
 
-Explicit pane/alias targets can address a primary, but their requests remain
-queued. Accept one deliberately with `muxa msg accept REQUEST --json` or
+High-level calls naming a primary reuse or create a worker of the same provider
+for generic work. Set `context_bound=true` only when the exact target conversation
+is required. Those requests and low-level exact-pane/alias messages remain
+queued on the primary. Accept one deliberately with `muxa msg accept REQUEST --json` or
 `muxa_inbox(request_id=REQUEST)`. Already claimed work stays with its owner.
 New peers use configured provider defaults; conversation history, exact model
 and account settings are not cloned from the primary.
 
+
+`prefix + q` (`muxa peek`) displays registered roles and primary/worker purpose,
+plus up to three actual incoming/outgoing requests per card with their delivery
+or reply status. It reads one bounded metadata snapshot per refresh without
+request bodies or claiming/acknowledging messages. Roles alone do not imply a link.
 
 Codex workers use `--no-daemon` and bind only from their own pane-bearing hooks;
 shared-server threads cannot take their launch grants.
@@ -401,11 +410,10 @@ The high-level tool keeps the mailbox semantics below while removing the need
 for the model to compose several low-level calls. It defaults to
 `kind=review`, `work_mode=read_only`, selects a healthy peer deterministically,
 and waits for the structured reply. Execute mode requires an explicit task
-authorization. If no eligible peer exists, Muxa asks for confirmation instead
-of silently creating one; `spawn_if_missing=true` is valid only after that
-confirmation. Restart existing agents after changing skills or upgrading Muxa
-because their MCP process loads tools and templates at startup.
-For a confirmed automatic spawn, Muxa arms the daemon transition subscription
+authorization. If no eligible worker exists, Muxa creates one by default using
+the configured provider permissions. Refresh MCP connections after upgrading
+Muxa so existing agents receive the current tool schemas and instructions.
+For an automatic spawn, Muxa arms the daemon transition subscription
 before creating the pane and re-reads room context only when that pane's agent
 registers; there is no fixed 500 ms registration loop. Registration is a grace
 period, not a precondition: `spawn_timeout_secs` (default 10) bounds how long

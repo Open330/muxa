@@ -479,6 +479,7 @@ pub(crate) async fn reconcile_run(
                             anyhow::anyhow!("pipeline agent {:?}: {error}", claim.agent.alias)
                         })?;
                     crate::agent_launch::start(StartRequest {
+                        bypass_permissions: true,
                         purpose: claim.agent.purpose,
                         socket: client.socket().to_path_buf(),
                         agent: program,
@@ -1253,6 +1254,7 @@ fn launch(
     let direction = SplitDirection::parse(agent.direction.as_deref())
         .map_err(|error| anyhow::anyhow!("pipeline agent {:?}: {error}", agent.alias))?;
     let result = crate::agent_launch::start(StartRequest {
+        bypass_permissions: true,
         purpose: agent.purpose,
         socket: socket.to_path_buf(),
         agent: program,

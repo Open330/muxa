@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- High-level peer calls reuse workers and create a missing worker using configured
+  provider permissions by default, without adding bypass flags. Naming a protected
+  primary sends generic work to a same-provider worker; `context_bound=true`
+  preserves requests that need that primary's exact conversation. Low-level
+  exact-recipient messages and existing queued requests retain their ownership.
 - Requests to muxa-launched workers no longer sit queued forever as
   `deferred: protected_primary`. Pipeline agents with a `role` launch as
   workers (`purpose = "primary"` opts out), and exact existing sessions can
@@ -30,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `prefix + q` / `muxa peek` shows registered roles, primary/worker purpose,
+  incoming/outgoing request links and reported reply state. It uses a bounded
+  metadata snapshot without reading bodies or consuming messages.
 - `muxa msg withdraw REQ…`, `muxa msg send --withdraw REQ`, the
   `muxa_withdraw_reply_wake` MCP tool and `withdraw_reply_wakes` on
   `muxa_send_message`/`muxa_call_peer` let an agent say it gave up on or

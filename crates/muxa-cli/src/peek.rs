@@ -100,9 +100,17 @@ pub(crate) struct Args {
     expanded: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PeekCollaboration {
+    roles: Vec<String>,
+    purpose: Option<muxa::collaboration::LaunchPurpose>,
+    links: Vec<String>,
+}
+
 /// One pane's worth of overlay: where to draw, and what to say.
 #[derive(Debug, Clone)]
 pub(crate) struct PeekCell {
+    pub collaboration: PeekCollaboration,
     pub geo: PaneGeometry,
     /// The agent whose story this box tells. `None` for a pane running a
     /// plain shell, which gets a bare digit badge instead of a box —
@@ -156,6 +164,7 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
         muxa::backend::rmux::endpoint_from_env().as_deref(),
     );
     attach_prompt_times(client, &mut cells).await;
+    attach_collaboration(client, &mut cells).await;
 
     if plain {
         for line in plain_lines(&cells) {
@@ -521,6 +530,7 @@ async fn drive(
                     muxa::backend::rmux::endpoint_from_env().as_deref(),
                 );
                 attach_prompt_times(client, &mut next).await;
+                attach_collaboration(client, &mut next).await;
                 // Agent state is cheap to re-read and worth keeping live.
                 // Backdrops are neither: one `capture-pane` per pane per
                 // second buys a flicker of scrollback nobody is reading
@@ -649,6 +659,7 @@ fn build_cells_on(panes: Vec<PaneGeometry>, agents: &[Agent], rmux: Option<&str>
             });
             let extra = mine.len().saturating_sub(1);
             PeekCell {
+                collaboration: PeekCollaboration::default(),
                 agent: mine.first().map(|a| (*a).clone()),
                 extra,
                 last_prompt_at: None,
@@ -657,6 +668,120 @@ fn build_cells_on(panes: Vec<PaneGeometry>, agents: &[Agent], rmux: Option<&str>
             }
         })
         .collect()
+}
+
+/// One bounded metadata read for the entire window; never claims requests or reads bodies.
+async fn attach_collaboration(client: &Client, cells: &mut [PeekCell]) {
+    let Some(agent) = cells.iter().find_map(|cell| cell.agent.as_ref()) else {
+        return;
+    };
+    let Some(pane) = agent.pane.clone() else {
+        return;
+    };
+    let origin = muxa::collaboration::CollaborationOrigin {
+        pane,
+        socket: agent.tmux_socket.clone(),
+        console: true,
+        agent_session_id: None,
+    };
+    if let Ok(Ok(overview)) =
+        tokio::time::timeout(PEEK_IPC_TIMEOUT, client.collaboration_overview(&origin)).await
+    {
+        apply_collaboration(cells, &overview);
+    }
+}
+
+fn apply_collaboration(
+    cells: &mut [PeekCell],
+    overview: &muxa::collaboration::CollaborationOverview,
+) {
+    use muxa::collaboration::{is_pending_session, RequestStatus};
+    for cell in cells {
+        cell.collaboration = PeekCollaboration::default();
+        let Some(agent) = cell.agent.as_ref() else {
+            continue;
+        };
+        let Some(participant) = overview.participants.iter().find(|participant| {
+            Some(&participant.pane) == agent.pane.as_ref()
+                && match (agent.tmux_socket.as_deref(), participant.socket.as_deref()) {
+                    (Some(actual), Some(expected)) => {
+                        muxa::backend::pane_endpoints_match(agent.pane.as_deref(), actual, expected)
+                    }
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                }
+                && (participant.agent_session_id == agent.session_id
+                    || agent
+                        .session_id
+                        .starts_with(muxa::state::SYNTHETIC_SESSION_PREFIX)
+                        && is_pending_session(&participant.agent_session_id))
+        }) else {
+            continue;
+        };
+        cell.collaboration.roles.clone_from(&participant.roles);
+        cell.collaboration.purpose = Some(participant.launch_purpose);
+        if participant.alias.is_some() {
+            cell.geo.alias.clone_from(&participant.alias);
+        }
+        for link in &overview.links {
+            let outbound = link.from.agent_session_id == participant.agent_session_id
+                && link.from.socket == participant.socket;
+            let inbound = link.to.agent_session_id == participant.agent_session_id
+                && link.to.socket == participant.socket;
+            if !outbound && !inbound {
+                continue;
+            }
+            let other = if outbound { &link.to } else { &link.from };
+            let label = overview
+                .participants
+                .iter()
+                .find(|peer| {
+                    peer.agent_session_id == other.agent_session_id && peer.socket == other.socket
+                })
+                .map_or_else(
+                    || other.label.clone(),
+                    muxa::collaboration::Participant::label,
+                );
+            let state = if link.reply_received {
+                format!("reply received / {:?}", link.status).to_ascii_lowercase()
+            } else if link.status == RequestStatus::Completed {
+                "delivered".into()
+            } else {
+                format!("{:?}", link.status).to_ascii_lowercase()
+            };
+            cell.collaboration.links.push(format!(
+                "{} {} · {:?} · {}",
+                if outbound { "→" } else { "←" },
+                label,
+                link.kind,
+                state
+            ));
+            if cell.collaboration.links.len() == 3 {
+                break;
+            }
+        }
+    }
+}
+
+fn collaboration_lines(cell: &PeekCell) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(purpose) = cell.collaboration.purpose {
+        let roles = if cell.collaboration.roles.is_empty() {
+            "agent".into()
+        } else {
+            cell.collaboration.roles.join(", ")
+        };
+        lines.push(format!(
+            "{} · {}",
+            roles,
+            match purpose {
+                muxa::collaboration::LaunchPurpose::Primary => "primary",
+                muxa::collaboration::LaunchPurpose::Worker => "worker",
+            }
+        ));
+    }
+    lines.extend(cell.collaboration.links.iter().cloned());
+    lines
 }
 
 /// Read each visible pane's screen into its cell.
@@ -1201,6 +1326,17 @@ pub(crate) fn body_text(cell: &PeekCell, width: u16, height: u16) -> Text<'stati
         return Text::default();
     };
     let mut lines: Vec<Line> = Vec::new();
+    for relation in collaboration_lines(cell).iter().take(3) {
+        push_tier(
+            &mut lines,
+            &mut budget,
+            relation,
+            "",
+            1,
+            Style::default().fg(Color::Yellow),
+            width,
+        );
+    }
 
     if let Some(summary) = summary_source(agent) {
         // A tall pane can afford a second line of summary; a short one
@@ -1441,7 +1577,16 @@ pub(crate) fn plain_lines(cells: &[PeekCell]) -> Vec<String> {
             );
             format!(
                 "{} {} {} {:<12} {:>15}  {}",
-                cell.geo.pane_index, cell.geo.pane_id, glyph, label, age, summary
+                cell.geo.pane_index,
+                cell.geo.pane_id,
+                glyph,
+                label,
+                age,
+                if collaboration_lines(cell).is_empty() {
+                    summary
+                } else {
+                    format!("{} | {}", collaboration_lines(cell).join(" | "), summary)
+                }
             )
         })
         .collect()
@@ -1637,6 +1782,107 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn collaboration_cards_show_real_links_and_reject_recycled_sessions() {
+        use muxa::collaboration::{
+            CollaborationEndpoint, CollaborationLink, CollaborationOverview, LaunchPurpose,
+            Participant, RequestKind, RequestStatus,
+        };
+        let mut first = agent("%0", AgentState::Idle);
+        first.tmux_socket = Some("default".into());
+        let mut second = agent("%1", AgentState::Idle);
+        second.tmux_socket = Some("default".into());
+        let participant = |a: &Agent, alias: &str, role: &str| -> Participant {
+            serde_json::from_value(serde_json::json!({
+                "agent_kind": "claude_code", "agent_session_id": a.session_id,
+                "pane": a.pane, "socket": "default", "state": "idle",
+                "room": {"host": "tmux", "socket": "default", "window_id": "@1"},
+                "alias": alias, "roles": [role], "launch_purpose": "worker"
+            }))
+            .unwrap()
+        };
+        let from = participant(&first, "builder", "implementer");
+        let to = participant(&second, "critic", "reviewer");
+        let mut overview = CollaborationOverview {
+            participants: vec![from.clone(), to.clone()],
+            links: vec![CollaborationLink {
+                request_id: "req-test".into(),
+                from: CollaborationEndpoint::from(&from),
+                to: CollaborationEndpoint::from(&to),
+                kind: RequestKind::Review,
+                status: RequestStatus::Blocked,
+                reply_received: true,
+            }],
+        };
+        let mut cells: Vec<_> = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(i, a)| PeekCell {
+                geo: geo(&i.to_string(), 0, 0, 80, 24, true),
+                agent: Some(a),
+                extra: 0,
+                last_prompt_at: None,
+                capture: Vec::new(),
+                collaboration: PeekCollaboration::default(),
+            })
+            .collect();
+        apply_collaboration(&mut cells, &overview);
+        let rendered = plain_lines(&cells).join("\n");
+        assert!(rendered.contains("implementer · worker"));
+        assert!(rendered.contains("reviewer · worker"));
+        assert!(rendered.contains("→ critic"));
+        assert!(rendered.contains("← builder"));
+        assert!(rendered.contains("reply received / blocked"));
+        assert_eq!(cells[0].collaboration.purpose, Some(LaunchPurpose::Worker));
+        cells[1].agent.as_mut().unwrap().session_id = "replacement".into();
+        overview.participants[1].agent_session_id = "replacement".into();
+        apply_collaboration(&mut cells, &overview);
+        assert!(cells[1].collaboration.links.is_empty());
+        assert_eq!(cells[0].collaboration.links.len(), 1);
+        overview.links.clear();
+        apply_collaboration(&mut cells, &overview);
+        assert!(cells.iter().all(|cell| cell.collaboration.links.is_empty()));
+    }
+
+    #[test]
+    fn collaboration_overlay_renders_roles_and_links_within_small_viewports() {
+        let cell = PeekCell {
+            geo: geo("0", 0, 0, 80, 24, true),
+            agent: Some(agent("%0", AgentState::Idle)),
+            extra: 0,
+            last_prompt_at: None,
+            capture: Vec::new(),
+            collaboration: PeekCollaboration {
+                roles: vec!["reviewer".into()],
+                purpose: Some(muxa::collaboration::LaunchPurpose::Worker),
+                links: vec!["← implementer · Review · claimed".into()],
+            },
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render_cell(f, &cell, f.area(), false))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("reviewer · worker"));
+        assert!(rendered.contains("← implementer · Review · claimed"));
+        for width in [0, 1, 4, 12, 80] {
+            for height in [0, 1, 2, 3, 12] {
+                let body = body_text(&cell, width, height);
+                assert!(body.lines.len() <= usize::from(height));
+                assert!(body
+                    .lines
+                    .iter()
+                    .all(|line| line.width() <= usize::from(width)));
+            }
+        }
+    }
+
+    #[test]
     fn expanded_wrap_preserves_indentation_newlines_and_unicode() {
         let text = "  한글🙂abc\n\n    tail";
         let rows = wrap_full(text, 8);
@@ -1653,6 +1899,7 @@ mod tests {
             "long response\n".repeat(100)
         ));
         let cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
             geo: geo("0", 0, 0, 80, 24, true),
             agent: Some(a),
             extra: 0,
@@ -1996,6 +2243,7 @@ mod tests {
         a.last_prompt = Some("fix the token check".into());
         a.last_response = Some("added a JWT expiry guard".into());
         let cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
             geo: geo("0", 0, 0, 40, 10, true),
             agent: Some(a),
             extra: 0,
@@ -2030,6 +2278,7 @@ mod tests {
         a.kind = muxa::AgentKind::Codex;
         assert!(a.recap.is_none());
         let mut cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
             geo: geo("0", 0, 0, 40, 10, true),
             agent: Some(a),
             extra: 0,
@@ -2057,6 +2306,7 @@ mod tests {
         a.last_prompt = Some("word ".repeat(200));
         a.last_response = Some("word ".repeat(200));
         let cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
             geo: geo("0", 0, 0, 40, 10, true),
             agent: Some(a),
             extra: 0,
@@ -2080,6 +2330,7 @@ mod tests {
         let mut a = agent("%0", AgentState::Working);
         a.last_prompt = Some("only a prompt".into());
         let cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
             geo: geo("0", 0, 0, 40, 10, true),
             agent: Some(a),
             extra: 0,
@@ -2144,6 +2395,7 @@ mod tests {
     #[test]
     fn meta_strip_drops_when_nothing_is_known() {
         let cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
             geo: geo("0", 0, 0, 40, 10, true),
             agent: Some(agent("%0", AgentState::Working)),
             extra: 0,
@@ -2349,6 +2601,7 @@ mod tests {
         a.last_response = Some("word ".repeat(200));
         a.model = Some("Opus".into());
         let cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
             geo: geo("0", 0, 0, 40, 30, true),
             agent: Some(a),
             extra: 0,
@@ -2372,6 +2625,7 @@ mod tests {
         // A pane whose agent has nothing to say should not reserve rows it
         // will only render blank.
         let quiet = PeekCell {
+            collaboration: PeekCollaboration::default(),
             geo: geo("0", 0, 0, 40, 24, true),
             agent: Some(agent("%0", AgentState::Idle)),
             extra: 0,

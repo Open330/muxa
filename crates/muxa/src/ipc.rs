@@ -612,6 +612,9 @@ enum RequestBody {
     /// actual requests still goes through the normal participant/operator
     /// authorization paths.
     CollaborationSubscribe,
+    CollaborationOverview {
+        origin: CollaborationOrigin,
+    },
     CollaborationList {
         origin: CollaborationOrigin,
         #[serde(default)]
@@ -807,6 +810,7 @@ const CAPABILITIES: &[&str] = &[
     "rate_limited",
     "collaboration_mailbox",
     collaboration::HUMAN_PRIORITY_CAPABILITY,
+    "collaboration_overview_v1",
     "collaboration_expire_v1",
     "collaboration_lifecycle",
     "collaboration_wait",
@@ -944,6 +948,8 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_requests: Option<Vec<CollaborationRequest>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_overview: Option<collaboration::CollaborationOverview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_request: Option<CollaborationRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ask_entries: Option<Vec<AskEntry>>,
@@ -1038,6 +1044,7 @@ impl Response {
             room: None,
             handle: None,
             collaboration_requests: None,
+            collaboration_overview: None,
             collaboration_request: None,
             ask_entries: None,
             ask_entry: None,
@@ -4494,6 +4501,25 @@ async fn handle(
                     .await
                     .unwrap_or(Ok(()));
                 }
+                RequestBody::CollaborationOverview { origin } => {
+                    kind = "collaboration_overview";
+                    let topology =
+                        collaboration_participants(&store, &backends, &collaboration, None).await;
+                    match topology.resolve_origin(&origin) {
+                        Ok(current) => match collaboration
+                            .overview_for(&current, &topology.participants)
+                            .await
+                        {
+                            Ok(overview) => {
+                                let mut response = Response::ok();
+                                response.collaboration_overview = Some(overview);
+                                response
+                            }
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
                 RequestBody::CollaborationList {
                     origin,
                     mailbox,
@@ -6506,6 +6532,16 @@ impl Client {
         serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
     }
 
+    /// Body-free room relationship data for an operator surface.
+    pub async fn collaboration_overview(
+        &self,
+        origin: &CollaborationOrigin,
+    ) -> Result<collaboration::CollaborationOverview, RuntimeError> {
+        let response = self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"collaboration_overview","origin":origin})).await?;
+        serde_json::from_value(response["collaboration_overview"].clone())
+            .map_err(RuntimeError::Json)
+    }
+
     /// One participant's mailbox — the caller's own.
     pub async fn collaboration_list(
         &self,
@@ -8195,6 +8231,25 @@ mod tests {
             )
             .await
             .unwrap();
+        let console_origin = CollaborationOrigin {
+            console: true,
+            ..sender.clone()
+        };
+        let overview = client
+            .collaboration_overview(&console_origin)
+            .await
+            .unwrap();
+        assert!(overview
+            .participants
+            .iter()
+            .any(|peer| peer.alias.as_deref() == Some("reviewer")));
+        assert!(overview
+            .links
+            .iter()
+            .any(|link| link.request_id == queued.id && link.status == RequestStatus::Queued));
+        let wire = serde_json::to_value(&overview).unwrap();
+        assert!(wire["links"][0].get("body").is_none());
+        assert!(client.collaboration_overview(&sender).await.is_err());
         assert_eq!(queued.workspace_id.as_deref(), Some("explicit-workspace"));
         assert_eq!(queued.work_id.as_deref(), Some("explicit-work"));
         assert_eq!(queued.run_id.as_deref(), Some("explicit-run"));

@@ -749,6 +749,11 @@ pub struct PipelineAgentConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CollaborationConfig {
     pub enabled: bool,
+    /// Create a dedicated peer when no worker is available. Existing workers are reused.
+    pub auto_spawn_workers: bool,
+    /// Explicitly opt automatic peers into Muxa's bypass launch profile.
+    /// Otherwise provider permission defaults and configured options apply.
+    pub worker_bypass_permissions: bool,
     /// Indexed mailbox database. The historical default remains
     /// `$XDG_DATA_HOME/muxa/collaboration.json`; muxa imports that JSON once
     /// into `collaboration.sqlite3` and keeps the JSON as a migration backup.
@@ -782,6 +787,8 @@ impl Default for CollaborationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            auto_spawn_workers: true,
+            worker_bypass_permissions: false,
             path: None,
             wake: CollaborationWake::IdleOnly,
             wake_payload: CollaborationWakePayload::OperatorFull,
@@ -2441,6 +2448,19 @@ fn parse_width_string(raw: &str) -> WidthSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_workers_use_provider_permissions_unless_configured() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.collaboration.auto_spawn_workers);
+        assert!(!config.collaboration.worker_bypass_permissions);
+        let config: Config = toml::from_str(
+            "[collaboration]\nauto_spawn_workers = false\nworker_bypass_permissions = true\n",
+        )
+        .unwrap();
+        assert!(!config.collaboration.auto_spawn_workers);
+        assert!(config.collaboration.worker_bypass_permissions);
+    }
 
     // WS-F: snapshot
     #[test]

@@ -378,6 +378,8 @@ uses its existing login or provider environment as before.
 ```toml
 [collaboration]
 enabled = true
+auto_spawn_workers = true
+worker_bypass_permissions = false
 wake = "idle_only" # idle_only | never
 wake_payload = "operator_full" # notice | operator_full | full
 scope = "window"   # window | host
@@ -385,6 +387,12 @@ max_message_bytes = 16384
 # path = "$XDG_DATA_HOME/muxa/collaboration.json"
 # retention_days = 90 # omitted: retain indefinitely
 ```
+
+`auto_spawn_workers` lets high-level peer calls reuse a worker or create one
+when missing. `worker_bypass_permissions` defaults to false: worker launches
+inherit provider permissions/options and do not add bypass flags. Enable it
+explicitly to use Muxa's bypass profile for automatic workers. These settings
+do not change manual launches or pipeline launch profiles.
 
 Opt-in durable request/reply between agents in the same stable tmux window.
 The historical optional `path` default is

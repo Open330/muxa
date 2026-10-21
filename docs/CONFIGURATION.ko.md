@@ -277,6 +277,8 @@ Code/Codex 로그인 또는 provider 환경을 그대로 사용합니다.
 ```toml
 [collaboration]
 enabled = true
+auto_spawn_workers = true
+worker_bypass_permissions = false
 wake = "idle_only" # idle_only | never
 wake_payload = "operator_full" # notice | operator_full | full
 scope = "window"   # window | host
@@ -284,6 +286,11 @@ max_message_bytes = 16384
 # path = "$XDG_DATA_HOME/muxa/collaboration.json"
 # retention_days = 90 # 생략하면 영구 보존
 ```
+
+`auto_spawn_workers`는 고수준 peer 호출에서 worker를 재사용하고 없으면 생성하게 합니다.
+`worker_bypass_permissions`는 기본 false로, provider의 권한과 옵션을 사용하며 bypass
+플래그를 추가하지 않습니다. 자동 worker에 Muxa bypass 프로필을 적용하려면 명시적으로
+켜세요. 수동 실행과 pipeline 실행 프로필은 이 설정의 영향을 받지 않습니다.
 
 같은 stable tmux window에 있는 agent 사이의 durable request/reply 기능입니다.
 과거 optional `path` 기본값은 `$XDG_DATA_HOME/muxa/collaboration.json`입니다.

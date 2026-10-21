@@ -11,7 +11,8 @@ identity (`room.self`: pane, tmux session, window), same-window peers, and the u
 launch preferences, so separate `muxa_guide`/`muxa_room_context` calls are redundant.
 For independent review, use the opposite provider: Codex selects Claude and
 Claude selects Codex unless the user explicitly requests another provider. A
-new launch still requires authorization. Detailed workflow examples are opt-in
+worker launch uses configured provider permissions; bypass launch and edits
+still require authorization. Detailed workflow examples are opt-in
 via `muxa_collaboration_guide(workflows=true)`.
 Later, refresh peers and unread counts with `muxa_room_context` only when they may
 have changed. Report your location from `self`; never derive it from `$TMUX_PANE` or
@@ -57,8 +58,11 @@ capability change or an unknown-tool/argument error.
    findings, explain rejected findings when material, and integrate the result.
 
 Human sessions default to protected `primary`; automatic/provider/role routing
-uses dedicated `worker` sessions. Authorized spawned peers are workers, using
-configured provider defaults. Explicit primary targets stay queued. Inspect IDs
+uses dedicated `worker` sessions. High-level `muxa_call_peer` reuses a worker
+or creates one by default, using configured provider permissions without adding
+bypass flags. Naming a primary routes generic work to a same-provider worker;
+use `context_bound=true` only when that exact conversation is required. Those
+primary requests and low-level exact-pane messages stay queued. Inspect IDs
 with message lists and accept just one with `muxa_inbox(request_id=...)` only when
 the human task permits it; do not promote a human session merely to drain inbox.
 
@@ -147,11 +151,13 @@ this protocol is unavailable. Keep remote host/request identity together.
 ## Authority and unavailable capabilities
 
 Existing explicit user authorization remains valid within the same scope; do not
-ask for it again. Spawning through Muxa currently creates a bypass-permission
-agent: set `spawn_if_missing=true` only when that launch is explicitly authorized.
-If the tool returns `confirm_spawn` and that authorization is missing, explain
-the proposed launch and ask. A general request for a review alone does not grant
-editing or bypass-permission launch authority.
+ask for it again. An authorized peer task may reuse or create a worker through
+`muxa_call_peer` with configured provider permissions. Automatic creation defaults
+to enabled (`collaboration.auto_spawn_workers`); `spawn_if_missing` overrides it
+per call. `collaboration.worker_bypass_permissions=true` explicitly enables
+bypass flags for these workers. Direct `muxa_start_agent` launches still use
+bypass flags and require authorization for that launch. A review does not grant
+editing authority. Never add bypass flags to work around a permission prompt.
 
 When MCP is missing, report that setup/restart is needed and use `muxa doctor`
 for diagnosis if shell access is available. CLI mailbox equivalents are usable

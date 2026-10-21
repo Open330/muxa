@@ -199,7 +199,7 @@ it:
 | `muxa_wait_for_change` | `timeout_secs?`, `pane?`, `until?`, `include_capture?` | Wait for any change or a focused settled/idle/blocked/stopped state, optionally returning the screen. |
 | `muxa_collaboration_guide` | `workflows?` | Return identity, preferences, guardrails and running-daemon capabilities. `workflows=true` adds detailed examples; human-action guidance requires `capabilities.human_actions=true`. |
 | `muxa_room_context` | — | Identify self, list same-window peers, and report unread request/reply counts. |
-| `muxa_call_peer` | `target?`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?`, `spawn_if_missing?`, `spawn_agent?`, `spawn_timeout_secs?`, `air_artifacts?` | Expand a registered skill, select a peer, send a durable request, optionally wait for its reply, and explicitly spawn an agent when no peer exists. |
+| `muxa_call_peer` | `target?`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?`, `spawn_if_missing?`, `context_bound?`, `spawn_agent?`, `spawn_timeout_secs?`, `air_artifacts?` | Expand a registered skill, select a peer, send a durable request, optionally wait for its reply, and reuse or create a dedicated worker with configured provider permissions. |
 | `muxa_peer_report` | `target?`, `request_id?`, `full?` | Read a received final reply without repeating the original request. `full=true` returns the legacy full record. |
 | `muxa_set_identity` | `alias?`, `roles?` | Replace this exact session's room-local alias and role set; empty input clears it. |
 | `muxa_request_attention` | `body`, `action?`, `dispatch_id?`, `parent_request_id?` | Request required human approval, choice or information; delivered to connected Fleet operator clients. Reuse a UUID dispatch ID on retry; wait for and read the actual human reply. |
@@ -250,11 +250,16 @@ GitHub is not a fallback transport.
 
 The safe default is `intent="review"` with a read-only contract. `execute=true`
 is accepted only with `intent="task"`, so a conversational review cannot
-silently acquire edit authority. When there is no eligible peer, the tool
-returns `action_required="confirm_spawn"`; only repeat the call with
-`spawn_if_missing=true` after the user explicitly confirms creating a pane.
-An earlier explicit authorization for that bypass-permission launch remains
-valid within the same scope; do not ask the user to repeat it.
+silently acquire edit authority. Calls reuse eligible workers and create one
+when missing by default (`collaboration.auto_spawn_workers=true`). New workers
+use configured provider permissions; bypass flags are added only with explicit
+`collaboration.worker_bypass_permissions=true`. `spawn_if_missing` overrides
+automatic creation per call. When creation is disabled, no request is sent and
+the tool returns `reason="worker_spawn_disabled"`.
+Naming a primary routes generic work to a worker of the same provider. Set
+`context_bound=true` when the exact target conversation is necessary; primary
+requests then remain queued for explicit acceptance. Low-level exact-pane
+messages retain their pinned recipient.
 Automatic spawning defaults to the other provider when possible. Before it
 creates the pane, the tool arms muxad's transition stream and then re-reads the
 authoritative room only when the spawned pane registers. This removes the old

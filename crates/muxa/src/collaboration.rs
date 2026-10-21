@@ -4,6 +4,8 @@
 //! the concrete agent session occupying a pane so a later process reusing the
 //! pane never inherits stale work.
 
+mod overview;
+pub use overview::{CollaborationEndpoint, CollaborationLink, CollaborationOverview};
 mod purpose;
 use purpose::{load_purposes, PurposeGrant};
 pub use purpose::{
@@ -4294,6 +4296,119 @@ fn valid_identity_token(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn overview_is_body_free_room_scoped_and_does_not_consume_messages() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let mut outside = participant("%3", "outside");
+        outside.room.window_id = "@other".into();
+        let participants = vec![sender.clone(), recipient.clone(), outside.clone()];
+        let console = Participant::console(sender.room.clone());
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "SECRET REQUEST BODY".into(),
+                    expects_reply: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        mailbox
+            .create(
+                outside.clone(),
+                outside,
+                NewRequest {
+                    body: "OTHER ROOM BODY".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            mailbox.overview_for(&sender, &participants).await,
+            Err(CollaborationError::ScopeDenied)
+        ));
+        let overview = mailbox.overview_for(&console, &participants).await.unwrap();
+        assert_eq!(overview.participants.len(), 2);
+        assert_eq!(overview.links.len(), 1);
+        assert_eq!(overview.links[0].status, RequestStatus::Queued);
+        assert!(!serde_json::to_string(&overview).unwrap().contains("BODY"));
+        assert_eq!(mailbox.claim_for(&recipient).await.unwrap().len(), 1);
+        mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Blocked,
+                "SECRET REPLY BODY".into(),
+                vec![],
+                vec![],
+            )
+            .await
+            .unwrap();
+        let overview = mailbox.overview_for(&console, &participants).await.unwrap();
+        assert!(overview.links[0].reply_received);
+        assert_eq!(overview.links[0].status, RequestStatus::Blocked);
+        assert!(!serde_json::to_string(&overview).unwrap().contains("BODY"));
+        assert_eq!(mailbox.unread_reply_count(&sender).await, 1);
+        assert_eq!(mailbox.pending_reply_unnotified().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn overview_caps_links_and_keeps_active_work_before_terminal_history() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let active = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "active".into(),
+                    expects_reply: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for _ in 0..70 {
+            let notice = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "notice".into(),
+                        kind: RequestKind::Notice,
+                        expects_reply: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            mailbox.claim_for(&recipient).await.unwrap();
+            // Notices become terminal when delivered, independent of a reply.
+            assert!(mailbox
+                .peek_for(&sender, &notice.id)
+                .await
+                .unwrap()
+                .status
+                .is_terminal());
+        }
+        let overview = mailbox
+            .overview_for(
+                &Participant::console(sender.room.clone()),
+                &[sender, recipient],
+            )
+            .await
+            .unwrap();
+        assert_eq!(overview.links.len(), 64);
+        assert_eq!(overview.links[0].request_id, active.id);
+        assert!(!overview.links[0].status.is_terminal());
+    }
+
     #[tokio::test]
     async fn history_search_filters_before_pagination_in_memory_and_sqlite() {
         for durable in [false, true] {

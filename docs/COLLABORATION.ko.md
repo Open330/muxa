@@ -11,10 +11,13 @@ request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 
 않습니다. 사람이 console에서 보낸 요청과 자신이 보낸 요청의 최종 응답 알림은
 계속 전달합니다.
 
-자동·provider·role 선택은 `worker`만 대상으로 합니다. 사전에 에이전트 생성이
-허용된 `spawn_if_missing=true` 경로로 만든 peer는 worker입니다. 일반 start와
+자동·provider·role 선택은 `worker`만 대상으로 합니다. `muxa_call_peer`는 기존
+worker를 재사용하고 없으면 기본적으로 생성합니다. provider 권한 설정을 그대로
+사용하며 bypass 플래그를 추가하지 않습니다. `collaboration.auto_spawn_workers=false`로
+자동 생성을 끄거나 호출별 `spawn_if_missing`으로 덮어쓸 수 있습니다.
+`worker_bypass_permissions=true`를 명시한 경우에만 worker에 bypass 플래그를 추가합니다.
 `role`이 있는 Work pipeline 에이전트는 worker로 뜹니다. 보호하려면 `purpose = "primary"`를
-지정합니다. 일반 start와 role 없는 pipeline 에이전트는 primary이며, 별도 worker pool은
+지정합니다. 일반 start와 role 없는 pipeline 에이전트는 primary이며 별도 worker pool은
 만들지 않습니다.
 
 전용 worker는 `muxa start --agent claude --purpose worker`로 실행하거나 해당 세션에서
@@ -27,11 +30,18 @@ request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 
 에이전트에게 지시해 실행시킬 수 있고, 변경은 호출자와 함께 audit에 남습니다. 승격된 세션의
 대기 요청은 다시 보내지 않아도 다음 idle 때 전달됩니다.
 
-pane·alias로 primary를 직접 지정한 요청도 대기합니다. 작업을 받아도 될 때
+고수준 호출에서 primary를 지정해도 일반 작업은 같은 provider의 worker로 보냅니다.
+기존 대화가 꼭 필요할 때만 `context_bound=true`를 지정합니다. 이 요청과 저수준
+pane·alias 직접 지정 메시지는 primary에서 대기합니다. 작업을 받아도 될 때
 `muxa msg accept REQUEST --json` 또는 `muxa_inbox(request_id=REQUEST)`로 하나만
 명시적으로 수락합니다. 이미 수락한 작업의 소유권은 유지합니다. 새 peer는
 provider 설정의 기본값을 사용하며 기존 대화·정확한 모델·계정을 복제하지 않습니다.
 
+
+`prefix + q` (`muxa peek`)는 등록된 역할과 primary/worker 목적, 실제 요청의
+송수신 상대와 전달·응답 상태를 카드별 최대 3건 표시합니다. 갱신마다 본문 없는
+메타데이터를 한 번 조회하며 메시지를 수락하거나 읽음 처리하지 않습니다.
+역할만 등록되어 있다고 연결 관계를 만들어 표시하지 않습니다.
 
 Codex worker는 `--no-daemon`으로 분리하며 자신의 pane을 보고하는 hook으로만
 결합합니다. 공유 서버의 다른 세션이 worker 등록을 가져갈 수 없습니다.
@@ -353,11 +363,10 @@ agent 재시작이며 GitHub를 대체 transport로 사용하지 않습니다.
 이 고수준 도구는 아래 mailbox 의미를 유지하면서 model이 여러 저수준 호출을 직접
 조립하지 않아도 되게 합니다. 기본값은 `kind=review`,
 `work_mode=read_only`이며 정상 peer를 결정적으로 선택하고 구조화된 응답을
-기다립니다. execute mode에는 명시적인 task 승인이 필요합니다. 적합한 peer가 없을
-때 Muxa는 자동으로 만들지 않고 확인을 요청하며, 사용자가 승인한 뒤에만
-`spawn_if_missing=true`로 다시 호출할 수 있습니다. MCP process는 시작할 때 도구와
-스킬을 읽으므로 스킬 변경이나 Muxa 업그레이드 뒤에는 기존 agent를 재시작하세요.
-승인된 자동 spawn에서는 pane을 만들기 전에 daemon transition stream을 먼저 구독하고,
+기다립니다. execute mode에는 명시적인 task 승인이 필요합니다. 적합한 worker가
+없으면 기본적으로 provider 권한 설정을 사용해 생성합니다. 업그레이드 뒤에는 MCP
+연결을 갱신해 최신 도구와 지침을 반영하세요.
+자동 spawn에서는 pane을 만들기 전에 daemon transition stream을 먼저 구독하고,
 해당 pane의 agent 등록 이벤트가 왔을 때만 room context를 다시 읽습니다. 기존의
 500ms 등록 polling loop는 사용하지 않습니다. 등록은 전제 조건이 아니라 유예
 구간입니다. `spawn_timeout_secs`(기본 10초) 안에 등록되지 않으면 request는 session이

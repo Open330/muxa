@@ -53,6 +53,7 @@ impl AgentProgram {
         }
     }
 
+    #[cfg(test)]
     fn launch_argv(self, options: &[String], prompt: Option<&str>) -> Vec<String> {
         let launch = self.native_launch(options, prompt);
         std::iter::once(launch.command).chain(launch.args).collect()
@@ -64,17 +65,30 @@ impl AgentProgram {
     }
 
     fn native_launch(self, options: &[String], prompt: Option<&str>) -> NativeLaunch {
-        let mut args = match self {
-            Self::Claude | Self::Antigravity => {
-                vec!["--dangerously-skip-permissions".into()]
+        self.permission_launch(options, prompt, true)
+    }
+
+    fn permission_launch(
+        self,
+        options: &[String],
+        prompt: Option<&str>,
+        bypass: bool,
+    ) -> NativeLaunch {
+        let mut args = if bypass {
+            match self {
+                Self::Claude | Self::Antigravity => {
+                    vec!["--dangerously-skip-permissions".into()]
+                }
+                Self::Codex => vec!["--yolo".into()],
+                Self::Gemini => vec![
+                    "--approval-mode".into(),
+                    "yolo".into(),
+                    "--skip-trust".into(),
+                ],
+                Self::Opencode => Vec::new(),
             }
-            Self::Codex => vec!["--yolo".into()],
-            Self::Gemini => vec![
-                "--approval-mode".into(),
-                "yolo".into(),
-                "--skip-trust".into(),
-            ],
-            Self::Opencode => Vec::new(),
+        } else {
+            Vec::new()
         };
         args.extend(options.iter().cloned());
         if let Some(prompt) = prompt {
@@ -320,6 +334,7 @@ pub struct WorkStartArgs {
 
 #[derive(Debug, Clone)]
 pub struct StartRequest {
+    pub bypass_permissions: bool,
     pub purpose: muxa::collaboration::LaunchPurpose,
     pub agent: AgentProgram,
     /// Additional provider CLI arguments after Muxa's built-in profile and
@@ -365,6 +380,7 @@ impl StartRequest {
     /// pipeline or an MCP call does.
     pub fn from_args(args: &StartArgs, socket: &Path, cfg: &muxa::config::Config) -> Self {
         Self {
+            bypass_permissions: true,
             purpose: args.purpose,
             agent: args.agent,
             options: cfg.launch_options(args.agent.label(), explicit_options(&args.options)),
@@ -618,6 +634,7 @@ pub fn run_work_start(
 ) -> Result<()> {
     let json = args.json;
     let result = start(StartRequest {
+        bypass_permissions: true,
         purpose: muxa::collaboration::LaunchPurpose::Primary,
         socket: socket.to_path_buf(),
         agent: args.agent,
@@ -694,8 +711,15 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     // Replace tmux's command shell, so the pane's foreground command and PID
     // describe the CLI even before it emits a hook. rmux on Windows hands the
     // line to PowerShell, which has no `exec`; there the program just runs.
-    let command = muxa::shell::Dialect::native()
-        .exec_line(&request.agent.launch_argv(&request.options, prompt));
+    let command = muxa::shell::Dialect::native().exec_line(&{
+        let launch =
+            request
+                .agent
+                .permission_launch(&request.options, prompt, request.bypass_permissions);
+        std::iter::once(launch.command)
+            .chain(launch.args)
+            .collect::<Vec<_>>()
+    });
     let args = tmux_args(&request, &cwd, &command)?;
     let output = crate::mux_control::ambient_command_with_args(&args)?
         .output()
@@ -1314,6 +1338,7 @@ mod tests {
 
     fn request(agent: AgentProgram, placement: Placement) -> StartRequest {
         StartRequest {
+            bypass_permissions: true,
             purpose: muxa::collaboration::LaunchPurpose::Primary,
             socket: muxa::paths::default_socket(),
             agent,
@@ -1353,6 +1378,44 @@ mod tests {
         assert_eq!(
             gemini.args,
             ["--approval-mode", "yolo", "--skip-trust", "-i", "review it"]
+        );
+    }
+
+    #[test]
+    fn automatic_workers_do_not_inject_bypass_flags() {
+        for program in [
+            AgentProgram::Codex,
+            AgentProgram::Claude,
+            AgentProgram::Gemini,
+            AgentProgram::Antigravity,
+        ] {
+            let launch = program.permission_launch(
+                &["--model".into(), "configured".into()],
+                Some("review"),
+                false,
+            );
+            assert!(!launch.args.iter().any(|arg| [
+                "--yolo",
+                "--dangerously-skip-permissions",
+                "yolo",
+                "--skip-trust"
+            ]
+            .contains(&arg.as_str())));
+            assert!(launch
+                .args
+                .windows(2)
+                .any(|args| args == ["--model", "configured"]));
+        }
+        assert!(AgentProgram::Codex
+            .permission_launch(&[], None, true)
+            .args
+            .contains(&"--yolo".into()));
+        assert!(
+            AgentProgram::Codex
+                .permission_launch(&["--yolo".into()], None, false)
+                .args
+                .contains(&"--yolo".into()),
+            "explicit provider options remain authoritative"
         );
     }
 
