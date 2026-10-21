@@ -3212,6 +3212,7 @@ mod tests {
                             links: vec!["https://private.invalid/review".to_string()],
                             air_artifacts: Vec::new(),
                             withdraw_reply_wakes: Vec::new(),
+                            recipient_slot: None,
                         },
                     )
                     .await
@@ -3244,6 +3245,7 @@ mod tests {
                         links: Vec::new(),
                         air_artifacts: Vec::new(),
                         withdraw_reply_wakes: Vec::new(),
+                        recipient_slot: None,
                     },
                 )
                 .await

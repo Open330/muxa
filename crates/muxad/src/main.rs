@@ -1798,6 +1798,8 @@ async fn wake_idle_collaboration_peers_with_inflight(
         let Some(recipient) =
             ready_collaboration_recipient(&participants, &agents, &panes, &request)
         else {
+            follow_vanished_recipient(collaboration, &request, &participants, &agents, &panes)
+                .await;
             continue;
         };
         let recipient = &recipient;
@@ -1857,6 +1859,38 @@ async fn wake_idle_collaboration_peers_with_inflight(
         store,
     )
     .await;
+}
+
+/// Readdress an undelivered request whose pinned recipient is gone: to the
+/// same session if it moved panes, or to the slot's single live successor
+/// for a slot-addressed request. The store's change signal brings the
+/// request back through the waker, now aimed at a live recipient.
+async fn follow_vanished_recipient(
+    collaboration: &CollaborationStore,
+    request: &CollaborationRequest,
+    participants: &[muxa::collaboration::Participant],
+    agents: &[muxa::state::Agent],
+    panes: &[muxa::tmux::PaneInfo],
+) {
+    let Some(successor) = muxa::collaboration::successor_for(request, participants, agents, panes)
+    else {
+        return;
+    };
+    match collaboration
+        .rebind_recipient(&request.id, &request.to, successor)
+        .await
+    {
+        Ok(Some(rebound)) => tracing::info!(
+            request_id = rebound.id,
+            from = request.to.pane,
+            to = rebound.to.pane,
+            "collaboration request followed its recipient",
+        ),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(request_id = request.id, %error, "failed to readdress request");
+        }
+    }
 }
 
 /// Tell each sender that terminal replies are waiting. Reply bodies always
@@ -3743,6 +3777,87 @@ mod tests {
         }
     }
 
+    /// The junia case: a coordinator's review request to a window's reviewer
+    /// whose pane was replaced before it was delivered. Addressed by role,
+    /// it follows to the new reviewer in the same work; nothing is sent to
+    /// the vanished pane.
+    #[tokio::test]
+    async fn a_role_addressed_request_follows_a_replaced_reviewer() {
+        let store = muxa::Store::shared();
+        add_agent(&store, "%1", "coordinator", AgentKind::ClaudeCode).await;
+        add_agent(&store, "%2", "old-reviewer", AgentKind::Codex).await;
+        let stamp = |mut pane: PaneInfo| {
+            pane.workspace_id = Some("junia".into());
+            pane.work_id = Some("S1".into());
+            pane.agent_role = Some("reviewer".into());
+            pane
+        };
+        let coordinator_pane = collaboration_pane("%1", "0");
+        let old_pane = stamp(collaboration_pane("%2", "1"));
+        let panes = vec![coordinator_pane.clone(), old_pane];
+        let participants = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
+        let coordinator = participants
+            .iter()
+            .find(|p| p.pane == "%1")
+            .unwrap()
+            .clone();
+        let old = participants
+            .iter()
+            .find(|p| p.pane == "%2")
+            .unwrap()
+            .clone();
+        let request = mailbox
+            .create(
+                coordinator.clone(),
+                old.clone(),
+                NewRequest {
+                    body: "review S1".into(),
+                    recipient_slot: Some(muxa::collaboration::RecipientSlot::of(
+                        &old,
+                        &panes,
+                        Some("reviewer"),
+                        None,
+                    )),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The reviewer pane goes away and a new reviewer session starts in a
+        // new pane of the same work window.
+        store.forget_agent("old-reviewer").await;
+        add_agent(&store, "%3", "new-reviewer", AgentKind::Codex).await;
+        let new_pane = stamp(collaboration_pane("%3", "1"));
+        let panes = vec![coordinator_pane, new_pane];
+        let fresh = muxa::collaboration::participants_from(&store.snapshot().await, &panes);
+        authorize_test_workers(&mailbox, &fresh).await;
+
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+            panes,
+            sends: sends.clone(),
+        });
+        for _ in 0..2 {
+            wake_idle_collaboration_peers(&mailbox, &store, std::slice::from_ref(&backend)).await;
+        }
+        {
+            let sends = sends.lock().unwrap();
+            assert!(sends.iter().all(|(pane, _)| pane != "%2"), "{sends:?}");
+            assert!(
+                sends
+                    .iter()
+                    .any(|(pane, text)| pane == "%3" && text.contains(&request.id)),
+                "the new reviewer was not woken: {sends:?}"
+            );
+        }
+        let stored = mailbox.get_for(&coordinator, &request.id).await.unwrap();
+        assert_eq!(stored.to.agent_session_id, "new-reviewer");
+        assert_eq!(stored.rebound_from, ["old-reviewer"]);
+    }
+
     async fn deliver_quiet_progress_burst(
         mailbox: &CollaborationStore,
         store: &muxa::SharedStore,
@@ -4001,6 +4116,7 @@ mod tests {
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
+                    recipient_slot: None,
                 },
             )
             .await
@@ -4235,6 +4351,7 @@ mod tests {
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
+                    recipient_slot: None,
                 },
             )
             .await
@@ -4332,6 +4449,7 @@ mod tests {
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
+                    recipient_slot: None,
                 },
             )
             .await
@@ -4394,6 +4512,7 @@ mod tests {
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
+                    recipient_slot: None,
                 },
             )
             .await
@@ -4462,6 +4581,7 @@ mod tests {
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
+                    recipient_slot: None,
                 },
                 Some(CollaborationProvenance {
                     client_kind: CollaborationClientKind::Watch,
@@ -4551,6 +4671,7 @@ mod tests {
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
+                    recipient_slot: None,
                 },
             )
             .await
@@ -4628,6 +4749,7 @@ mod tests {
                         links: Vec::new(),
                         air_artifacts: Vec::new(),
                         withdraw_reply_wakes: Vec::new(),
+                        recipient_slot: None,
                     },
                 )
                 .await
@@ -4771,6 +4893,7 @@ mod tests {
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
+                    recipient_slot: None,
                 },
             )
             .await
@@ -5188,6 +5311,7 @@ mod tests {
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
+                    recipient_slot: None,
                 },
                 Some(CollaborationProvenance {
                     client_kind: CollaborationClientKind::Watch,
@@ -5317,6 +5441,7 @@ mod tests {
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
+                    recipient_slot: None,
                 },
             )
             .await

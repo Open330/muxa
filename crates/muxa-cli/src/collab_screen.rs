@@ -623,6 +623,8 @@ mod tests {
             reply_wake: None,
             reply: None,
             withdrew_reply_wakes: Vec::new(),
+            rebound_from: Vec::new(),
+            to_slot: None,
         }
     }
 

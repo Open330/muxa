@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Address a role in a work instead of a pane:
+  `muxa msg send callabo/CAL-8111/implementer …` (also `…/role@alias` and
+  `…/@alias`, and on `muxa_send_message`/`muxa_call_peer`).
+
 ### Fixed
 
 - High-level peer calls reuse workers and create a missing worker using configured
@@ -14,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primary sends generic work to a same-provider worker; `context_bound=true`
   preserves requests that need that primary's exact conversation. Low-level
   exact-recipient messages and existing queued requests retain their ownership.
+- Requests no longer strand on a vanished pane. Before delivery, a request
+  follows its recipient's session to a new pane. A request sent to a role,
+  alias or path moves to the one live worker now holding that slot when the
+  original session is gone, for example a replaced reviewer. Delivered
+  requests never move, and ambiguous slots are never guessed.
 - Requests to muxa-launched workers no longer sit queued forever as
   `deferred: protected_primary`. Pipeline agents with a `role` launch as
   workers (`purpose = "primary"` opts out), and exact existing sessions can

@@ -9459,6 +9459,7 @@ async fn run_watch_collaboration_broadcast(
             links: Vec::new(),
             air_artifacts: Vec::new(),
             withdraw_reply_wakes: Vec::new(),
+            recipient_slot: None,
         };
         let outcome = client
             .collaboration_send(origin, &format!("pane:{pane}"), &request)
@@ -9525,6 +9526,7 @@ async fn run_watch_collaboration_single(
                 links: Vec::new(),
                 air_artifacts: Vec::new(),
                 withdraw_reply_wakes: Vec::new(),
+                recipient_slot: None,
             };
             match client.collaboration_send(&origin, &target, &request).await {
                 Ok(request) => ActionOutcome::Ok(format!(
@@ -20734,6 +20736,8 @@ mod tests {
             reply_wake: None,
             reply: None,
             withdrew_reply_wakes: Vec::new(),
+            rebound_from: Vec::new(),
+            to_slot: None,
         }
     }
 
@@ -28003,6 +28007,8 @@ sort = ["state"]
             reply_wake: None,
             reply: None,
             withdrew_reply_wakes: Vec::new(),
+            rebound_from: Vec::new(),
+            to_slot: None,
         }
     }
 

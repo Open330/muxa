@@ -738,7 +738,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "Default auto. Accepts auto/peer, codex/claude/gemini/agy/opencode (with or without @), pane:%N/%N, @alias, or role:<name>." },
+                    "target": { "type": "string", "description": "Default auto. Accepts auto/peer, codex/claude/gemini/agy/opencode (with or without @), pane:%N/%N, @alias, role:<name>, or a workspace/work/role[@alias] path." },
                     "intent": { "type": "string", "enum": ["review", "question", "task"], "description": "Default review." },
                     "body": { "type": "string", "description": "Request-specific instruction. Optional when skill is supplied." },
                     "skill": { "type": "string", "description": "Registered Muxa message skill name, with or without leading /. Its prompt is expanded before sending." },
@@ -819,7 +819,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "peer, pane:%N, %N, @alias, role:<name>, or human for an operator decision" },
+                    "target": { "type": "string", "description": "peer, pane:%N, %N, @alias, role:<name>, a workspace/work/role[@alias] path (follows a replaced holder until delivered), or human for an operator decision" },
                     "kind": { "type": "string", "enum": ["question", "review", "task", "notice"] },
                     "body": { "type": "string" },
                     "expects_reply": { "type": "boolean", "description": "Default true except notice. Independent of notify." },
@@ -3754,6 +3754,7 @@ fn new_request_from_args(
         links: string_array(args, "links"),
         air_artifacts,
         withdraw_reply_wakes: request_id_array(args, "withdraw_reply_wakes")?.unwrap_or_default(),
+        recipient_slot: None,
     })
 }
 

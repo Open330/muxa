@@ -2541,13 +2541,48 @@ impl CollaborationTopology {
         }
     }
 
-    /// Resolve a send target, falling back to an explicit pane that muxa
-    /// launched but whose agent has not registered a session yet.
-    ///
-    /// The fallback only ever runs after the ordinary resolution failed, and
-    /// it returns that original error when it does not apply — an unroutable
-    /// target must keep reporting why it was unroutable.
-    fn resolve_target(
+    /// Resolve `target`, and the logical slot to record when it named one:
+    /// a `workspace/work/role[@alias]` path, `@alias` or `role:<role>`.
+    /// Pane targets pin a session and record no slot.
+    fn resolve_target_with_slot(
+        &self,
+        sender: &collaboration::Participant,
+        target: &str,
+        scope: crate::config::CollaborationScope,
+    ) -> Result<
+        (
+            collaboration::Participant,
+            Option<collaboration::RecipientSlot>,
+        ),
+        collaboration::CollaborationError,
+    > {
+        if let Some(resolved) =
+            collaboration::resolve_slot_path(sender, target, &self.participants, &self.panes)
+        {
+            // A path names its work explicitly, like a pane id, so it reaches
+            // other windows under the same scope rule as pane targets.
+            return resolved.and_then(|(recipient, slot)| {
+                if scope == crate::config::CollaborationScope::Window
+                    && recipient.room != sender.room
+                {
+                    return Err(collaboration::CollaborationError::UnknownTarget(
+                        target.to_string(),
+                    ));
+                }
+                Ok((recipient, Some(slot)))
+            });
+        }
+        let recipient = self.resolve_pinned_target(sender, target, scope)?;
+        let alias = target
+            .strip_prefix('@')
+            .or_else(|| target.strip_prefix("alias:"));
+        let role = target.strip_prefix("role:");
+        let slot = (alias.is_some() || role.is_some())
+            .then(|| collaboration::RecipientSlot::of(&recipient, &self.panes, role, alias));
+        Ok((recipient, slot))
+    }
+
+    fn resolve_pinned_target(
         &self,
         sender: &collaboration::Participant,
         target: &str,
@@ -4312,11 +4347,12 @@ async fn handle(
                     .await;
                     let result = topology.resolve_origin(&origin).and_then(|sender| {
                         topology
-                            .resolve_target(&sender, &target, collaboration.scope())
-                            .map(|recipient| (sender, recipient))
+                            .resolve_target_with_slot(&sender, &target, collaboration.scope())
+                            .map(|(recipient, slot)| (sender, recipient, slot))
                     });
                     let response = match result {
-                        Ok((sender, recipient)) => {
+                        Ok((sender, recipient, slot)) => {
+                            request.recipient_slot = slot;
                             // A console represents the operator, so stamp the
                             // pane it dispatches to. Agent-originated sends are
                             // stamped from the sending execution surface.
@@ -7732,6 +7768,10 @@ mod tests {
             .await
             .unwrap();
         assert!(request.from.console);
+        assert!(
+            request.to_slot.is_none(),
+            "a pane target pins a session, no slot"
+        );
         client
             .collaboration_inbox(&origin("%1", false))
             .await
@@ -7930,6 +7970,7 @@ mod tests {
                             links: Vec::new(),
                             air_artifacts: Vec::new(),
                             withdraw_reply_wakes: Vec::new(),
+                            recipient_slot: None,
                         },
                     )
                     .await
@@ -8079,6 +8120,7 @@ mod tests {
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
+                    recipient_slot: None,
                 },
             )
             .await
@@ -8109,12 +8151,20 @@ mod tests {
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
+                    recipient_slot: None,
                 },
             )
             .await
             .unwrap();
         assert_eq!(request.workspace_id.as_deref(), Some("callabo"));
         assert_eq!(request.work_id.as_deref(), Some("CAL-7345"));
+        // `@reviewer` names a slot, recorded beside the session it reached.
+        let slot = request
+            .to_slot
+            .as_ref()
+            .expect("an alias target records its slot");
+        assert_eq!(slot.alias.as_deref(), Some("reviewer"));
+        assert_eq!(slot.room, request.to.room);
         assert_eq!(request.run_id.as_deref(), Some("tmux:default:@1"));
         let provenance = request.provenance.as_ref().unwrap();
         assert_eq!(provenance.client_kind, CollaborationClientKind::Watch);
@@ -8227,6 +8277,7 @@ mod tests {
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
+                    recipient_slot: None,
                 },
             )
             .await
@@ -8251,6 +8302,14 @@ mod tests {
         assert!(wire["links"][0].get("body").is_none());
         assert!(client.collaboration_overview(&sender).await.is_err());
         assert_eq!(queued.workspace_id.as_deref(), Some("explicit-workspace"));
+        assert_eq!(
+            queued
+                .to_slot
+                .as_ref()
+                .and_then(|slot| slot.role.as_deref()),
+            Some("rust"),
+            "a role target records its slot"
+        );
         assert_eq!(queued.work_id.as_deref(), Some("explicit-work"));
         assert_eq!(queued.run_id.as_deref(), Some("explicit-run"));
         assert_eq!(
@@ -8370,6 +8429,7 @@ mod tests {
                     links: Vec::new(),
                     air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
+                    recipient_slot: None,
                 },
             )
             .await

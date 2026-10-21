@@ -252,6 +252,22 @@ Keep the backend prefix returned by Muxa. Requests are also pinned to the
 target's current agent session, so a new process reusing that pane cannot
 inherit old work.
 
+To address whoever holds a role in a work rather than one pane, use a path:
+`workspace/work/role`, `workspace/work/role@alias` or `workspace/work/@alias`,
+for example `muxa msg send callabo/CAL-8111/implementer "status?"`. It must
+match exactly one live agent and follows the same scope rule as pane targets.
+Such requests, and those sent to `@alias` or `role:`, remember the slot they
+named. Until a request is delivered (unclaimed, no wake sent yet), it follows
+its recipient:
+
+- to the same agent session if that session moved to another pane;
+- to the one live worker now holding the slot if the original session is
+  gone, for example a reviewer that was replaced.
+
+It never moves a request that was already delivered, never picks between
+several holders, and never sends to a protected primary. A pane target still
+pins its session and follows only the session itself to a new pane.
+
 An exact agent session can also register its own room-local alias and
 advisory roles, which override the minted one for routing:
 
